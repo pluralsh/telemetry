@@ -46,7 +46,6 @@ var _ = Describe("Line Controller", func() {
 		{name: "standalone", mode: telemetryv1alpha1.LineModeStandalone},
 		{name: "sharded", mode: telemetryv1alpha1.LineModeSharded},
 	} {
-		test := test
 		It("reconciles a "+test.name+" Line with server-compatible routes and storage", func() {
 			name := "line-" + test.name + "-envtest"
 			password := &corev1.Secret{

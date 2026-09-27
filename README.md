@@ -1,94 +1,52 @@
-# Telemetry
+# Plural Telemetry
 
-Telemetry is a Rust workspace for observability products. Meter provides metrics, Line provides
-logs, and Track is reserved for traces. Meter and Line are implemented and deployable.
+Plural Telemetry is a Rust implementation of common observability products, in particular modeled after open source stores like prometheus, loki and tempo for the main observability pillars of logs, metrics and traces.
 
-## Meter status and architecture
+All data stores are built with s3 as the backend storage, using the [slatedb](https://slatedb.io/) project as its ultimate WAL + LSM tree implementation
 
-Meter is a namespace-isolated metrics service backed by SlateDB. Its current server combines:
+The project breakdown is, following a musical theme:
 
-- Prometheus remote-write ingestion and OTLP/HTTP protobuf metrics ingestion.
-- Prometheus-style instant/range PromQL, series and label discovery, metadata, and federation
-  HTTP APIs.
-- Deterministic virtual sharding with standalone, fixed static, and Kubernetes-managed ownership.
-- Separate scalable writer and global-reader roles over shared object storage. A reader opens all
-  shard readers and plans a query globally once.
-- Local filesystem, in-memory, and S3 object stores, with optional Foyer memory or hybrid
-  memory/disk caches.
-- Configurable write acknowledgement through applied, written, and object-store-durable stages,
-  plus periodic durable flushing.
-- Per-namespace and global HTTP Basic credentials, external JWT authorization, and an independent
-  internal writer-to-writer gRPC token.
+1. Meter - Prometheus compatible datastore with built-in OTLP ingest as well as remote write
+2. Line - Loki-compatible log store
+3. Track - Tempo-compatible metrics store
 
-Workspace crates:
+We might add other interesting slatedb + rust projects in here as well, but they'll all be datastore focused as a core guiding principle.  Many of these are also inspired or utilize implementations from the [Opendata](https://www.opendata.dev/) project to bootstrap the implementation.
 
-- `common`: byte encoding, SlateDB factories/configuration, and write coordination.
-- `proto`: internal tonic/prost writer API.
-- `sharding`: virtual-shard planning, assignment, Kubernetes coordination, leasing, and ownership.
-- `meter`: namespace-aware TSDB, ingestion conversion, and sharded query engine.
-- `meter-server`: Axum/tonic server and `meter-server` binary.
-- `line`: namespace-aware log storage and Loki-compatible query engine.
-- `line-server`: Axum/tonic server and `line-server` binary.
-- `track`: future traces product placeholder.
+## Productionization
 
-Meter targets the API surface listed below; it does not claim complete Prometheus server or PromQL
-compatibility.
+There are a few things we've explicitly added to enhance slatedb and make these datastores ready for real use:
 
-## Namespaces and routes
+1. Sharding - slatedb is single writer, multi-reader as a core design constraint.  Since this is observability focused, we want to be able to solve for multi-writer as a core need.  More documentation below.
+2. Multi-tenancy - simple namespace path multi-tenancy allows you to share the same db across overlapping metrics datasets w/o much configuration overhead.
+3. Authentication - common limitation of a lot of observability dbs, and pairs with multitenancy. Both basic auth and JWKS-based RSA signed JWT is supported.
 
-Only namespaces declared in configuration are opened, with separate storage and query state.
-Read routes are rooted at `/read/ns/{namespace}` and write routes at
-`/write/ns/{namespace}`:
+## Deployment
 
-- Writes: `/write/ns/{namespace}/api/v1/write` and
-  `/write/ns/{namespace}/v1/metrics`.
-- Queries: `/read/ns/{namespace}/api/v1/query` and
-  `/read/ns/{namespace}/api/v1/query_range`.
-- Discovery/metadata: below `/read/ns/{namespace}` at `/api/v1/series`, `/api/v1/labels`,
-  `/api/v1/label/{name}/values`, `/api/v1/metadata`, and `/federate`.
+Deployment is explicitly meant to be kubernetes based, since the sharding implementation leverages the k8s api.  We provide a full operator that configures each datastore in the two main deployment modes:
 
-An optional `path_prefix`, such as `/meter`, can scope both public route trees. `/-/healthy`,
-`/-/ready`, and `/metrics` remain unprefixed. Writer mode installs only write routes; reader mode
-installs only read routes; standalone installs both.
+* standalone - single node reader + writer
+* sharded - configurable scale out readers and writers
 
-## Run and configure
+The operator manages annoyances like configuration setup, scaling, and pvc resizing - slatedb supports NVME-based caching that is seamlessly configurable via statefulsets.
 
-The complete field-by-field YAML reference, defaults, units, variants, mode constraints, and
-authentication behavior is in [config/README.md](config/README.md). Start Meter from the fully
-commented [config/meter.example.yaml](config/meter.example.yaml):
+See [Operator Docs](go/operator/docs/api.md) for full API documentation.
 
-```sh
-cp config/meter.example.yaml config/meter.yaml
-mise exec -- cargo run --package meter-server -- --config config/meter.yaml
-```
+## Sharding
 
-For Line, start from [config/line.example.yaml](config/line.example.yaml):
+Sharding is implemented on top of kubernetes for coordination, and supports shard assignment via a virtual shard -> physical shard mapping, with configurable shard ranges assigned to active writers.
 
-```sh
-cp config/line.example.yaml config/line.yaml
-mise exec -- cargo run --package line-server -- --config config/line.yaml
-```
+We utilize a few k8s api primitives to do this:
 
-Use environment variables or mounted files for production secrets. The Meter
-`crates/meter-server/Dockerfile` runtime runs `meter-server`; mount configuration at
-`/app/config/meter.yaml`. The Line `crates/line-server/Dockerfile` runtime runs `line-server` and
-defaults to `/app/config/line.example.yaml`.
+1. Statefulset durable naming - this allows us to ensure writers have consistent network identities across scaling decisions.
+2. Configmaps for source of truth on shard range assignments.
+3. Leases for ownership of physical shards.
 
-Deployment roles:
+K8s effectively provides an already CP datastore to manage that minimal configuration, and removes the additional need to provide a zookeeper or etcd store.  It's also a ubiquitous deployment pattern for hosted, third-party software, so effectively allows us to provide that guarantee with no net new dependencies.
 
-- `standalone`: one process owns all virtual shards and serves reads and writes. Multiple
-  standalone processes must not concurrently open the same dataset.
-- `writer`: serves ingestion and internal gRPC, opening only locally owned shards.
-- `reader`: serves query/read APIs and opens every shard read-only without fencing writers.
+## Installation
 
-Static sharding uses an identical fixed owner map on every process. Kubernetes sharding discovers
-writer StatefulSet members, publishes contiguous range assignments through a watched ConfigMap,
-and protects the coordinator and each independently writable shard with stable, watched Leases.
-Split deployments require object storage shared by all writers and readers.
-
-## Helm
-
-Install the Kubebuilder operator, including its `Meter` and `NamespaceAuthentication` CRDs:
+Install the telemetry-operator operator, including the `Meter`, `Line`, and
+`NamespaceAuthentication` CRDs:
 
 ```sh
 helm upgrade --install telemetry-operator oci://ghcr.io/pluralsh/charts/telemetry-operator \
@@ -97,86 +55,199 @@ helm upgrade --install telemetry-operator oci://ghcr.io/pluralsh/charts/telemetr
   --create-namespace
 ```
 
-Then apply a `Meter` and, optionally, namespace-scoped Basic authentication:
+Create a `Meter` instance. This example uses S3-compatible object storage, so
+the referenced `meter-s3` Secret must exist in the same namespace:
 
-```sh
-kubectl apply -f go/operator/config/samples/telemetry_v1alpha1_meter.yaml
-kubectl create secret generic prometheus-basic-auth --from-literal=password=change-me
-kubectl apply -f go/operator/config/samples/telemetry_v1alpha1_namespaceauthentication.yaml
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Meter
+metadata:
+  name: meter-sample
+spec:
+  mode: Sharded
+  version: 0.1.0
+  config:
+    storage:
+      path: meter
+      objectStore:
+        type: Aws
+        aws:
+          region: us-east-1
+          bucket: meter
+          accessKeyIDSecretRef:
+            name: meter-s3
+            key: access-key-id
+          secretAccessKeySecretRef:
+            name: meter-s3
+            key: secret-access-key
+    namespaces:
+      - default
+  ingress:
+    enabled: true
+    hostname: meter.example.com
+    ingressClass: nginx
+    pathPrefix: /meter
+    tls:
+      enabled: true
+      secretName: meter-sample-tls
+  writer:
+    replicas: 3
+    dataVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+    cacheVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+  reader:
+    replicas: 2
+    dataVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+    cacheVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
 ```
 
-See the [operator chart documentation](chart/telemetry-operator/README.md) for image and RBAC
-settings. The direct Meter chart supports one-pod `standalone` and Kubernetes-coordinated
-`sharded` topologies:
+Create a standalone `Line` instance:
 
-```sh
-helm install meter oci://ghcr.io/pluralsh/charts/meter \
-  --version 0.1.0 --namespace telemetry --create-namespace
-helm install meter oci://ghcr.io/pluralsh/charts/meter \
-  --version 0.1.0 --namespace telemetry --create-namespace \
-  --set mode=sharded
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Line
+metadata:
+  name: line-sample
+spec:
+  mode: Standalone
+  version: 0.1.0
+  config:
+    namespaces:
+      - default
+    storage:
+      objectStore:
+        type: Local
+  ingress:
+    enabled: false
+  writer:
+    replicas: 1
+    dataVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
 ```
 
-For sharded use, configure a shared object store and the internal token. The chart generates
-role-specific Meter YAML, Services, StatefulSets, and namespace-scoped RBAC. See
-[chart/meter/README.md](chart/meter/README.md) for values, storage caveats, and secure secret/JWKS
-mounting.
+Authentication is configured per datastore namespace. The following resources
+grant read access to the `default` namespace using passwords stored in
+Kubernetes Secrets:
 
-## Authentication
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: prometheus-reader
+spec:
+  dataStoreRef:
+    kind: Meter
+    name: meter-sample
+  namespace: default
+  username: prometheus
+  permission: read
+  secretKeyRef:
+    name: prometheus-basic-auth
+    key: password
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: loki-reader
+spec:
+  dataStoreRef:
+    kind: Line
+    name: line-sample
+  namespace: default
+  username: loki
+  permission: read
+  secretKeyRef:
+    name: loki-basic-auth
+    key: password
+```
 
-Meter and Line deny anonymous namespace HTTP reads and writes by default. Health and readiness
-endpoints remain public. Set `auth.unauthenticated: true` only for deployments that intentionally
-allow anonymous namespace access; empty credential lists do not open access.
+## Testing Strategy
 
-HTTP Basic credentials can be global or namespace-specific and separately scoped to reads and
-writes. Bearer credentials are JWTs verified against a configured JWKS file or URL; tokens require
-expiration, namespace-regex, and `read`/`write` permission claims. Optional issuer and audience
-checks are supported. URL key sets refresh periodically and on unknown key IDs; file key sets are
-loaded at startup. See the [configuration reference](config/README.md#external-jwtjwks) for exact
-claim, algorithm, and refresh semantics.
+In addition to robust unit tests, we implement an oracle based testing strategy against reference implementations.  Each of Meter, Line, and Track are tested against their peer, prometheus, loki and mimir. Those test suites will grow in time but include basic query behavior, ingestion logic, and more.
 
-## Development and verification
+Performance and scalability tests are to be implemented in time.
 
-Rust and Go 1.27 are managed by [mise](https://mise.jdx.dev/) using `mise.toml`.
+## Local Development
+
+Install the pinned Go, Kubebuilder, Python, and Rust toolchains with
+[mise](https://mise.jdx.dev/):
 
 ```sh
 mise install
-mise exec -- cargo fmt --all --check
-mise exec -- cargo check --workspace --all-targets --all-features --locked
-mise exec -- cargo test --workspace --all-features --locked
-mise exec -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-The operator lives in `go/operator` and follows the standard Kubebuilder workflow. Generate
-DeepCopy code and CRDs, format and vet Go, and run focused unit plus envtest controller tests with:
+Run the basic Rust checks through mise:
 
 ```sh
-mise exec -- sh -c 'cd go/operator && make generate manifests crd-docs fmt vet test'
+mise exec -- cargo fmt --all --check
+mise exec -- cargo check --workspace --all-targets --all-features --locked
+mise exec -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+mise exec -- cargo test --workspace --all-features --locked
 ```
 
-`make test` downloads matching envtest control-plane binaries and excludes the generated Kind e2e
-package. After changing API markers, copy the generated CRDs from
-`go/operator/config/crd/bases/` to `chart/telemetry-operator/crds/`, keeping them byte-identical.
-The generated CRD API reference is written to
-[`go/operator/docs/api.md`](go/operator/docs/api.md).
-The sample [Meter](go/operator/config/samples/telemetry_v1alpha1_meter.yaml) and
-[NamespaceAuthentication](go/operator/config/samples/telemetry_v1alpha1_namespaceauthentication.yaml)
-resources are useful starting points.
+## Regression Tests
 
-CI runs formatting, workspace checks, Clippy, all-feature unit/integration tests, and the Python
-Docker regression harness, plus operator generation, manifests, formatting, vet, envtest, and Helm
-chart checks. Run it with `mise exec -- python -m pytest tests/regression`; the harness preserves
-Meter's Prometheus differential, sharding, auth, OTLP, and isolation coverage alongside pinned
-single-node Loki-versus-Line log and metric differential coverage. Lifecycle/config assets live
-beneath `tests/regression/products/`, while product-specific wire fixtures, normalization, and
-orchestration are shared from `tests/regression/harness/`.
-See [tests/regression/README.md](tests/regression/README.md).
+Install the regression harness dependencies after running the mise setup above:
 
-`tests/kind/test.sh` is an optional, manually dispatched kind scenario covering lease-backed
-assignment, authenticated forwarding, writer scaling `1 -> 3 -> 1`, and reads after shard handoff.
-It is intentionally outside normal Cargo and pull-request CI. Current black-box coverage is a
-focused compatibility subset, not an exhaustive Prometheus conformance suite or long-duration
-performance/chaos test.
+```sh
+mise exec -- python -m pip install -r tests/regression/requirements.txt
+```
+
+Run the fast, self-contained regression unit tests:
+
+```sh
+mise exec -- python -m pytest tests/regression/test_unit
+```
+
+Run the live compatibility suites, which require Docker and Docker Compose:
+
+```sh
+mise exec -- python -m pytest tests/regression/test_live
+```
+
+The extended live suite adds slower restart and retention coverage:
+
+```sh
+mise exec -- python -m pytest tests/regression/test_live --extended
+```
+
+The optional Kubernetes handoff regression requires Docker and
+[kind](https://kind.sigs.k8s.io/):
+
+```sh
+mise exec -- tests/kind/test.sh
+```
+
+See [the regression harness documentation](tests/regression/README.md) for
+suite coverage, ports, and troubleshooting details.
 
 ## Attribution
 

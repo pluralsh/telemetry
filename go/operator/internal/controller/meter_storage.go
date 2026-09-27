@@ -30,6 +30,7 @@ func (r *MeterReconciler) reconcileStatefulSet(ctx context.Context, meter *telem
 	desired, err := resources.StatefulSet(resources.StatefulSetInput{
 		Meter: meter, Component: component, ConfigSecretName: secretName,
 		InternalTokenSecretName: internalSecretName, InternalTokenSecretKey: internalSecretKey,
+		DefaultProductVersion: r.DefaultProductVersion,
 	})
 	if err != nil {
 		var volumeErr *resources.VolumeError

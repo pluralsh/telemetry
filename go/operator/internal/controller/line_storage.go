@@ -20,6 +20,7 @@ func (r *LineReconciler) reconcileStatefulSet(ctx context.Context, line *telemet
 	desired, err := resources.StatefulSet(resources.StatefulSetInput{
 		Line: line, Component: component, ConfigSecretName: secretName,
 		InternalTokenSecretName: internalSecretName, InternalTokenSecretKey: internalSecretKey,
+		DefaultProductVersion: r.DefaultProductVersion,
 	})
 	if err != nil {
 		var volumeErr *resources.VolumeError

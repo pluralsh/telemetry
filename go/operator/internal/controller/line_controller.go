@@ -42,7 +42,8 @@ import (
 
 type LineReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme                *runtime.Scheme
+	DefaultProductVersion string
 }
 
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=lines,verbs=get;list;watch;create;update;patch;delete
@@ -259,7 +260,7 @@ func (r *LineReconciler) removeObsoleteResources(ctx context.Context, line *tele
 }
 
 func (r *LineReconciler) reconcileInternalToken(ctx context.Context, line *telemetryv1alpha1.Line) (string, string, []byte, error) {
-	helper := &MeterReconciler{Client: r.Client, Scheme: r.Scheme}
+	helper := &MeterReconciler{Client: r.Client, Scheme: r.Scheme, DefaultProductVersion: r.DefaultProductVersion}
 	generatedName := resources.Name(line.Name, suffixInternalToken)
 	if ref := line.Spec.Config.Auth.InternalTokenSecretRef; ref != nil {
 		token, err := helper.secretValue(ctx, line.Namespace, *ref)
@@ -285,7 +286,7 @@ func (r *LineReconciler) reconcileInternalToken(ctx context.Context, line *telem
 }
 
 func (r *LineReconciler) resolveConfigInput(ctx context.Context, line *telemetryv1alpha1.Line, auths []telemetryv1alpha1.NamespaceAuthentication, token []byte) (productconfig.Input, error) {
-	helper := &MeterReconciler{Client: r.Client, Scheme: r.Scheme}
+	helper := &MeterReconciler{Client: r.Client, Scheme: r.Scheme, DefaultProductVersion: r.DefaultProductVersion}
 	global, err := helper.resolveAccess(ctx, line.Namespace, line.Spec.Config.Auth.Global)
 	if err != nil {
 		return productconfig.Input{}, err

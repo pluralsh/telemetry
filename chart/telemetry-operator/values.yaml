@@ -5,6 +5,10 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Image tag used when a managed product omits spec.version. An empty value uses
+# the chart appVersion so operator and datastore releases stay in lockstep.
+defaultProductVersion: ""
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

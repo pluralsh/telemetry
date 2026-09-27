@@ -15,8 +15,11 @@ import (
 
 const (
 	testMeterName       = "example"
+	testLineName        = "logs"
 	testNamespace       = "test"
 	testObjectStoreName = "meter"
+	testTokenSecretName = "token"
+	testDedicatedKey    = "dedicated"
 )
 
 func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
@@ -46,6 +49,41 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	}
 	if hasVolume(statefulSet.Spec.Template.Spec.Volumes, "data") || hasVolume(statefulSet.Spec.Template.Spec.Volumes, "cache") {
 		t.Fatal("pod volumes shadow default claim templates")
+	}
+}
+
+func TestStatefulSetProductVersionPrecedence(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace}}
+	input := StatefulSetInput{
+		Meter: meter, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
+		DefaultProductVersion: "1.2.3",
+	}
+	statefulSet, err := StatefulSet(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:1.2.3" {
+		t.Fatalf("configured default image = %q, want release version", image)
+	}
+
+	meter.Spec.Image.Tag = "2.0.0"
+	statefulSet, err = StatefulSet(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:2.0.0" {
+		t.Fatalf("deprecated image tag image = %q, want explicit tag", image)
+	}
+
+	meter.Spec.Image.Tag = ""
+	meter.Spec.Version = "3.0.0"
+	statefulSet, err = StatefulSet(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:3.0.0" {
+		t.Fatalf("spec.version image = %q, want canonical explicit version", image)
 	}
 }
 
@@ -111,27 +149,27 @@ func TestIngressRoutesShardedWritesAndReads(t *testing.T) {
 
 func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 	line := &telemetryv1alpha1.Line{
-		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testLineName, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.LineSpec{Ingress: telemetryv1alpha1.IngressSpec{
 			Enabled: true, Hostname: "logs.example.com",
 		}},
 	}
 	statefulSet, err := StatefulSet(StatefulSetInput{
-		Line: line, Component: ComponentStandalone, ConfigSecretName: "config",
-		InternalTokenSecretName: "token", InternalTokenSecretKey: TokenKey,
+		Line: line, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	container := statefulSet.Spec.Template.Spec.Containers[0]
-	if container.Name != "line" || container.Image != "ghcr.io/pluralsh/line:0.1.0" {
+	if container.Name != LineDescriptor.Name || container.Image != "ghcr.io/pluralsh/line:0.1.0" {
 		t.Fatalf("unexpected Line container: %#v", container)
 	}
 	if container.Ports[0].ContainerPort != 3100 || container.Ports[1].ContainerPort != 9091 {
 		t.Fatalf("unexpected Line ports: %#v", container.Ports)
 	}
 	if !lo.ContainsBy(container.VolumeMounts, func(mount corev1.VolumeMount) bool {
-		return mount.Name == "config" && mount.MountPath == "/etc/line/line.yaml" && mount.SubPath == "line.yaml"
+		return mount.Name == volumeConfig && mount.MountPath == "/etc/line/line.yaml" && mount.SubPath == "line.yaml"
 	}) {
 		t.Fatalf("Line config mount is missing: %#v", container.VolumeMounts)
 	}
@@ -172,7 +210,7 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 		{
 			name: "Line",
 			input: StatefulSetInput{Line: &telemetryv1alpha1.Line{
-				ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testNamespace},
+				ObjectMeta: metav1.ObjectMeta{Name: testLineName, Namespace: testNamespace},
 				Spec: telemetryv1alpha1.LineSpec{
 					Version: "2.3.4+build.5",
 					Image: telemetryv1alpha1.ImageSpec{
@@ -181,18 +219,18 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 						PullPolicy: corev1.PullAlways,
 					},
 					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "line", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+						Containers: []corev1.Container{{Name: LineDescriptor.Name, Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
 					}}},
 				},
 			}},
-			container: "line",
+			container: LineDescriptor.Name,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			test.input.Component = ComponentStandalone
-			test.input.ConfigSecretName = "config"
-			test.input.InternalTokenSecretName = "token"
+			test.input.ConfigSecretName = volumeConfig
+			test.input.InternalTokenSecretName = testTokenSecretName
 			test.input.InternalTokenSecretKey = TokenKey
 			statefulSet, err := StatefulSet(test.input)
 			if err != nil {
@@ -254,9 +292,9 @@ func TestReplicaDefaultsOverridesAndStandaloneSafety(t *testing.T) {
 }
 
 func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
-	templateToleration := corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "old", Effect: corev1.TaintEffectNoSchedule}
-	duplicateTemplateToleration := corev1.Toleration{Key: "dedicated", Value: "newer-template", Effect: corev1.TaintEffectNoSchedule}
-	firstClassToleration := corev1.Toleration{Key: "dedicated", Value: "telemetry", Effect: corev1.TaintEffectNoSchedule}
+	templateToleration := corev1.Toleration{Key: testDedicatedKey, Operator: corev1.TolerationOpEqual, Value: "old", Effect: corev1.TaintEffectNoSchedule}
+	duplicateTemplateToleration := corev1.Toleration{Key: testDedicatedKey, Value: "newer-template", Effect: corev1.TaintEffectNoSchedule}
+	firstClassToleration := corev1.Toleration{Key: testDedicatedKey, Value: "telemetry", Effect: corev1.TaintEffectNoSchedule}
 	retainedToleration := corev1.Toleration{Key: "spot", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}
 	workload := telemetryv1alpha1.WorkloadSpec{
 		NodeSelector: map[string]string{"topology.kubernetes.io/zone": "first-class", "kubernetes.io/arch": "arm64"},
@@ -268,12 +306,12 @@ func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
 	}
 	inputs := []StatefulSetInput{
 		{Meter: &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: "metrics"}, Spec: telemetryv1alpha1.MeterSpec{Writer: workload}}},
-		{Line: &telemetryv1alpha1.Line{ObjectMeta: metav1.ObjectMeta{Name: "logs"}, Spec: telemetryv1alpha1.LineSpec{Writer: workload}}},
+		{Line: &telemetryv1alpha1.Line{ObjectMeta: metav1.ObjectMeta{Name: testLineName}, Spec: telemetryv1alpha1.LineSpec{Writer: workload}}},
 	}
 	for _, input := range inputs {
 		input.Component = ComponentStandalone
-		input.ConfigSecretName = "config"
-		input.InternalTokenSecretName = "token"
+		input.ConfigSecretName = volumeConfig
+		input.InternalTokenSecretName = testTokenSecretName
 		input.InternalTokenSecretKey = TokenKey
 		statefulSet, err := StatefulSet(input)
 		if err != nil {
@@ -418,8 +456,8 @@ func TestStatefulSetInjectsGCPServiceAccount(t *testing.T) {
 func mustStatefulSet(t *testing.T, meter *telemetryv1alpha1.Meter) *appsv1.StatefulSet {
 	t.Helper()
 	statefulSet, err := StatefulSet(StatefulSetInput{
-		Meter: meter, Component: ComponentStandalone, ConfigSecretName: "config",
-		InternalTokenSecretName: "token", InternalTokenSecretKey: TokenKey,
+		Meter: meter, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -22,6 +22,7 @@ const (
 
 	sourceFile     = "file"
 	modeStandalone = "standalone"
+	modeWriter     = "writer"
 )
 
 type Credential struct {
@@ -71,7 +72,7 @@ func Render(input Input) (Result, error) {
 		return renderLine(input)
 	}
 	if input.Meter == nil {
-		return Result{}, fmt.Errorf("Meter or Line is required")
+		return Result{}, fmt.Errorf("meter or line is required")
 	}
 	descriptor := resources.MeterDescriptor
 	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
@@ -132,14 +133,14 @@ func Render(input Input) (Result, error) {
 	}
 	writerMode := modeStandalone
 	if mode(input.Meter) == telemetryv1alpha1.MeterModeSharded {
-		writerMode = "writer"
+		writerMode = modeWriter
 	}
 	var err error
 	data[MeterKey], err = makeConfig(writerMode)
 	if err != nil {
 		return Result{}, fmt.Errorf("render meter config: %w", err)
 	}
-	if writerMode == "writer" {
+	if writerMode == modeWriter {
 		data[ReaderKey], err = makeConfig("reader")
 		if err != nil {
 			return Result{}, fmt.Errorf("render reader config: %w", err)
@@ -237,14 +238,14 @@ func renderLine(input Input) (Result, error) {
 	}
 	writerMode := modeStandalone
 	if resources.Mode(line) == telemetryv1alpha1.ProductModeSharded {
-		writerMode = "writer"
+		writerMode = modeWriter
 	}
 	var err error
 	data[LineKey], err = makeConfig(writerMode)
 	if err != nil {
 		return Result{}, fmt.Errorf("render Line config: %w", err)
 	}
-	if writerMode == "writer" {
+	if writerMode == modeWriter {
 		data[ReaderKey], err = makeConfig("reader")
 		if err != nil {
 			return Result{}, fmt.Errorf("render Line reader config: %w", err)
@@ -363,7 +364,7 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 			Backend: modeStandalone,
 		}
 	}
-	writer := resourceName(name, "writer")
+	writer := resourceName(name, modeWriter)
 	return renderSharding{
 		VirtualShards: virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
 		Backend: "kubernetes", Namespace: namespace,

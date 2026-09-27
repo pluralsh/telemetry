@@ -14,17 +14,18 @@ on:
       - chart/**
 
 permissions:
-  contents: read
+  contents: write
   packages: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  publish:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    name: Publish ${{ matrix.name }}
+  publish-preview:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    name: Publish preview ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -49,7 +50,6 @@ jobs:
           echo "pr=0.0.0+pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           echo "sha=0.0.0+sha-${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
           echo "master=${chart_version}+master" >> "$GITHUB_OUTPUT"
-          echo "release=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Push PR chart
         if: ${{ github.event_name == 'pull_request' }}
         uses: appany/helm-oci-chart-releaser@v0.5.0
@@ -94,14 +94,69 @@ jobs:
           registry: ghcr.io
           registry_username: ${{ github.actor }}
           registry_password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push release chart
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    name: Release charts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "^1.21.3"
+          cache: false
+      - uses: azure/setup-helm@v5
+      - name: Bump Meter chart
+        uses: pluralsh/chart-releaser@v0.1.3
+        with:
+          path: ./chart/meter
+          release: ${{ github.ref_name }}
+      - name: Bump telemetry operator chart
+        uses: pluralsh/chart-releaser@v0.1.3
+        with:
+          path: ./chart/telemetry-operator
+          release: ${{ github.ref_name }}
+      - name: Resolve and verify chart versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="${GITHUB_REF_NAME#v}"
+          meter_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/meter/Chart.yaml)
+          operator_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/telemetry-operator/Chart.yaml)
+          meter_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/meter/Chart.yaml)
+          operator_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-operator/Chart.yaml)
+          test "$meter_app_version" = "$release"
+          test "$operator_app_version" = "$release"
+          echo "meter=$meter_version" >> "$GITHUB_OUTPUT"
+          echo "operator=$operator_version" >> "$GITHUB_OUTPUT"
+      - name: Push Meter release chart
         uses: appany/helm-oci-chart-releaser@v0.5.0
         with:
-          name: ${{ matrix.name }}
+          name: meter
           repository: pluralsh/charts
-          tag: ${{ steps.tags.outputs.release }}
-          path: ${{ matrix.path }}
+          tag: ${{ steps.versions.outputs.meter }}
+          path: chart/meter
           registry: ghcr.io
           registry_username: ${{ github.actor }}
           registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push telemetry operator release chart
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: telemetry-operator
+          repository: pluralsh/charts
+          tag: ${{ steps.versions.outputs.operator }}
+          path: chart/telemetry-operator
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create release metadata pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          title: Release ${{ github.ref_name }}
+          body: Automated chart metadata update for ${{ github.ref_name }}.
+          commit-message: Update charts for ${{ github.ref_name }}
+          branch: release-${{ github.ref_name }}
+          labels: release
+          base: main

@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
+	operatorversion "github.com/pluralsh/telemetry/go/operator/internal/version"
 )
 
 type Component string
@@ -81,6 +82,7 @@ type StatefulSetInput struct {
 	ConfigSecretName        string
 	InternalTokenSecretName string
 	InternalTokenSecretKey  string
+	DefaultProductVersion   string
 }
 
 type Descriptor struct {
@@ -453,8 +455,8 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 			others = append(others, container)
 		}
 	}
-	version := lo.CoalesceOrEmpty(meter.Version, meter.Image.Tag, "0.1.0")
-	meterContainer.Image = lo.CoalesceOrEmpty(meter.Image.Repository, meter.Descriptor.Image) + ":" + version
+	productVersion := lo.CoalesceOrEmpty(meter.Version, meter.Image.Tag, input.DefaultProductVersion, operatorversion.ProductVersion)
+	meterContainer.Image = lo.CoalesceOrEmpty(meter.Image.Repository, meter.Descriptor.Image) + ":" + productVersion
 	if meter.Image.PullPolicy != "" {
 		meterContainer.ImagePullPolicy = meter.Image.PullPolicy
 	} else if meterContainer.ImagePullPolicy == "" {

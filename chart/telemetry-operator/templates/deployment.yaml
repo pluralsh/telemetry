@@ -46,6 +46,7 @@ spec:
           command: ["/manager"]
           args:
             - --leader-elect={{ .Values.leaderElection.enabled }}
+            - --default-product-version={{ include "telemetry-operator.defaultProductVersion" . }}
             - --health-probe-bind-address=:8081
             - --metrics-bind-address={{ ternary .Values.metrics.bindAddress "0" .Values.metrics.enabled }}
             {{- if .Values.metrics.enabled }}

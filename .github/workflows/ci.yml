@@ -25,3 +25,23 @@ jobs:
       - run: mise exec -- cargo check --workspace --all-targets --all-features --locked
       - run: mise exec -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: mise exec -- cargo test --workspace --all-features --locked
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v5
+      - run: helm lint chart/meter
+      - run: helm lint chart/telemetry-operator
+      - name: Verify operator release version rendering
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm template telemetry-operator chart/telemetry-operator > /tmp/operator-default.yaml
+          grep -F -- 'image: "ghcr.io/pluralsh/telemetry-operator:0.1.0"' /tmp/operator-default.yaml
+          grep -F -- '- --default-product-version=0.1.0' /tmp/operator-default.yaml
+          helm template telemetry-operator chart/telemetry-operator \
+            --set image.tag=9.8.7 \
+            --set defaultProductVersion=9.8.6 > /tmp/operator-override.yaml
+          grep -F -- 'image: "ghcr.io/pluralsh/telemetry-operator:9.8.7"' /tmp/operator-override.yaml
+          grep -F -- '- --default-product-version=9.8.6' /tmp/operator-override.yaml

@@ -88,6 +88,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VERSION=${{ steps.metadata.outputs.version }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}

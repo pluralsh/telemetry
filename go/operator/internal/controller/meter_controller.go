@@ -49,7 +49,8 @@ import (
 // MeterReconciler reconciles a Meter object.
 type MeterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme                *runtime.Scheme
+	DefaultProductVersion string
 }
 
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=meters,verbs=get;list;watch;create;update;patch;delete

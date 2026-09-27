@@ -34,6 +34,9 @@ upgrades and remove CRDs manually only after preserving any custom resources.
 - `replicaCount` defaults to `1`; leader election is enabled by default.
 - `image.repository`, `image.tag`, and `image.pullPolicy` select the controller
   image. An empty tag uses the chart `appVersion`.
+- `defaultProductVersion` selects the image tag for managed resources that omit
+  `spec.version`. An empty value also uses the chart `appVersion`, keeping the
+  operator and datastore release versions aligned.
 - `imagePullSecrets` configures private registry credentials.
 - `serviceAccount` and `rbac` control identity and generated permissions.
 - `metrics.enabled` defaults to `false`; `bindAddress` and `secure` configure
@@ -56,7 +59,8 @@ For managed `Meter` and `Line` resources, `spec.version` is the canonical
 product image tag. It accepts SemVer 2.0 without a leading `v`, including
 prerelease and build metadata. Deprecated `spec.image.tag` remains an alias
 with the same validation; `spec.version` takes precedence and admission
-rejects conflicting values. Omitting both uses `0.1.0`.
+rejects conflicting values. Omitting both uses `defaultProductVersion`, which
+defaults to the chart `appVersion`.
 `spec.image.repository` defaults to the product's `ghcr.io/pluralsh/...`
 repository, and `spec.image.pullPolicy` defaults to `IfNotPresent`.
 

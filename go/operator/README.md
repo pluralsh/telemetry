@@ -11,7 +11,9 @@ such as `1.2.3` or `1.2.3-rc.1+build.7`; a leading `v` is rejected to match the
 repository's published image tags. The deprecated `spec.image.tag` remains an
 alias for existing resources and accepts the same SemVer syntax.
 `spec.version` takes precedence, and admission rejects resources that set both
-fields to different values. When neither is set, the operator uses `0.1.0`.
+fields to different values. When neither is set, the operator uses the
+`--default-product-version` value supplied at startup. Release builds default
+that flag to their own version.
 `spec.image.repository` defaults to
 `ghcr.io/pluralsh/meter` or `ghcr.io/pluralsh/line`, and
 `spec.image.pullPolicy` defaults to `IfNotPresent`. These first-class image

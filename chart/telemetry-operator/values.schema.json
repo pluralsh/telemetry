@@ -5,6 +5,7 @@
   "required": [
     "replicaCount",
     "image",
+    "defaultProductVersion",
     "imagePullSecrets",
     "nameOverride",
     "fullnameOverride",
@@ -41,6 +42,7 @@
         "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
       }
     },
+    "defaultProductVersion": {"type": "string"},
     "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
     "nameOverride": {"type": "string"},
     "fullnameOverride": {"type": "string"},
