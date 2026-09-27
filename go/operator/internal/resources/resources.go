@@ -29,20 +29,21 @@ const (
 	TokenKey             = "internal-token"
 	InternalTokenPath    = "/var/run/secrets/meter/internal-token"
 
-	volumeConfig        = "config"
-	volumeSecrets       = "secrets"
-	volumeInternalToken = "internal-token"
-	volumeData          = "data"
-	volumeCache         = "cache"
-	containerMeter      = "meter"
-	portHTTP            = "http"
-	portGRPC            = "grpc"
-	configPath          = "/etc/meter/meter.yaml"
-	secretsPath         = "/etc/meter/secrets"
-	dataPath            = "/var/lib/meter"
-	cachePath           = "/var/cache/meter"
-	verbGet             = "get"
-	defaultMeterImage   = "ghcr.io/pluralsh/meter"
+	volumeConfig              = "config"
+	volumeSecrets             = "secrets"
+	volumeInternalToken       = "internal-token"
+	volumeData                = "data"
+	volumeCache               = "cache"
+	containerMeter            = "meter"
+	portHTTP                  = "http"
+	portGRPC                  = "grpc"
+	configPath                = "/etc/meter/meter.yaml"
+	secretsPath               = "/etc/meter/secrets"
+	dataPath                  = "/var/lib/meter"
+	cachePath                 = "/var/cache/meter"
+	verbGet                   = "get"
+	defaultMeterImage         = "ghcr.io/pluralsh/meter"
+	meterUserID         int64 = 10001
 )
 
 var (
@@ -243,7 +244,9 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 	template.Annotations[ConfigHashAnnotation] = meter.Status.ConfigHash
 	spec := &template.Spec
 	spec.ServiceAccountName = meter.Name
-	spec.AutomountServiceAccountToken = lo.ToPtr(true)
+	if spec.AutomountServiceAccountToken == nil {
+		spec.AutomountServiceAccountToken = lo.ToPtr(Mode(meter) == telemetryv1alpha1.MeterModeSharded)
+	}
 	if spec.TerminationGracePeriodSeconds == nil {
 		spec.TerminationGracePeriodSeconds = lo.ToPtr(int64(30))
 	}
@@ -254,16 +257,19 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 		spec.SecurityContext.RunAsNonRoot = lo.ToPtr(true)
 	}
 	if spec.SecurityContext.RunAsUser == nil {
-		spec.SecurityContext.RunAsUser = lo.ToPtr(int64(10001))
+		spec.SecurityContext.RunAsUser = lo.ToPtr(meterUserID)
 	}
 	if spec.SecurityContext.RunAsGroup == nil {
-		spec.SecurityContext.RunAsGroup = lo.ToPtr(int64(10001))
+		spec.SecurityContext.RunAsGroup = lo.ToPtr(meterUserID)
 	}
 	if spec.SecurityContext.FSGroup == nil {
-		spec.SecurityContext.FSGroup = lo.ToPtr(int64(10001))
+		spec.SecurityContext.FSGroup = lo.ToPtr(meterUserID)
 	}
 	if spec.SecurityContext.FSGroupChangePolicy == nil {
 		spec.SecurityContext.FSGroupChangePolicy = lo.ToPtr(corev1.FSGroupChangeOnRootMismatch)
+	}
+	if spec.SecurityContext.SeccompProfile == nil {
+		spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	}
 
 	meterContainer := corev1.Container{Name: containerMeter}
@@ -284,21 +290,6 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 		meterContainer.ImagePullPolicy = corev1.PullIfNotPresent
 	}
 	meterContainer.Args = []string{"--config", configPath}
-	if meterContainer.SecurityContext == nil {
-		meterContainer.SecurityContext = &corev1.SecurityContext{}
-	}
-	if meterContainer.SecurityContext.AllowPrivilegeEscalation == nil {
-		meterContainer.SecurityContext.AllowPrivilegeEscalation = lo.ToPtr(false)
-	}
-	if meterContainer.SecurityContext.ReadOnlyRootFilesystem == nil {
-		meterContainer.SecurityContext.ReadOnlyRootFilesystem = lo.ToPtr(true)
-	}
-	if meterContainer.SecurityContext.Capabilities == nil {
-		meterContainer.SecurityContext.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}
-	}
-	if meterContainer.SecurityContext.SeccompProfile == nil {
-		meterContainer.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
-	}
 	meterContainer.Ports = mergeNamed(meterContainer.Ports, func(item corev1.ContainerPort) string { return item.Name },
 		corev1.ContainerPort{Name: portHTTP, ContainerPort: HTTPPort(meter), Protocol: corev1.ProtocolTCP},
 		corev1.ContainerPort{Name: portGRPC, ContainerPort: GRPCPort(meter), Protocol: corev1.ProtocolTCP})
@@ -318,6 +309,15 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 		meterContainer.ReadinessProbe = httpProbe("/-/ready", 2, 5, 2, 6)
 	}
 	spec.Containers = append([]corev1.Container{meterContainer}, others...)
+	for i := range spec.Containers {
+		spec.Containers[i].SecurityContext = secureContainerContext(spec.Containers[i].SecurityContext)
+	}
+	for i := range spec.InitContainers {
+		spec.InitContainers[i].SecurityContext = secureContainerContext(spec.InitContainers[i].SecurityContext)
+	}
+	for i := range spec.EphemeralContainers {
+		spec.EphemeralContainers[i].SecurityContext = secureContainerContext(spec.EphemeralContainers[i].SecurityContext)
+	}
 
 	required := []corev1.Volume{
 		{Name: volumeConfig, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}},
@@ -332,6 +332,40 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 	}
 	spec.Volumes = mergeNamed(spec.Volumes, func(item corev1.Volume) string { return item.Name }, required...)
 	return template
+}
+
+func secureContainerContext(context *corev1.SecurityContext) *corev1.SecurityContext {
+	if context == nil {
+		context = &corev1.SecurityContext{}
+	}
+	if context.AllowPrivilegeEscalation == nil {
+		context.AllowPrivilegeEscalation = lo.ToPtr(false)
+	}
+	if context.Privileged == nil {
+		context.Privileged = lo.ToPtr(false)
+	}
+	if context.ReadOnlyRootFilesystem == nil {
+		context.ReadOnlyRootFilesystem = lo.ToPtr(true)
+	}
+	if context.RunAsNonRoot == nil {
+		context.RunAsNonRoot = lo.ToPtr(true)
+	}
+	if context.RunAsUser == nil {
+		context.RunAsUser = lo.ToPtr(meterUserID)
+	}
+	if context.RunAsGroup == nil {
+		context.RunAsGroup = lo.ToPtr(meterUserID)
+	}
+	if context.Capabilities == nil {
+		context.Capabilities = &corev1.Capabilities{}
+	}
+	if !lo.Contains(context.Capabilities.Drop, corev1.Capability("ALL")) {
+		context.Capabilities.Drop = append(context.Capabilities.Drop, corev1.Capability("ALL"))
+	}
+	if context.SeccompProfile == nil {
+		context.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	}
+	return context
 }
 
 func httpProbe(path string, initial, period, timeout, failures int32) *corev1.Probe {

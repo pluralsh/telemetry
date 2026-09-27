@@ -28,7 +28,7 @@ trap cleanup EXIT INT TERM
 command -v kind >/dev/null
 command -v kubectl >/dev/null
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
-docker build --target runtime -t meter-regression:local "$ROOT"
+docker build -f "$ROOT/crates/meter-server/Dockerfile" -t meter-regression:local "$ROOT"
 kind load docker-image --name "$CLUSTER" meter-regression:local
 kubectl apply -f "$ROOT/tests/kind/manifests.yaml"
 kubectl -n "$NS" wait --for=condition=complete job/minio-init --timeout=180s

@@ -11,7 +11,7 @@ x-meter-environment: &meter-environment
 x-meter: &meter
   build:
     context: ../..
-    target: runtime
+    dockerfile: crates/meter-server/Dockerfile
   environment: *meter-environment
   depends_on:
     minio-init:
@@ -67,11 +67,6 @@ services:
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "18080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/-/ready"]
-      interval: 2s
-      timeout: 2s
-      retries: 60
 
   meter-writer-1:
     <<: *meter
@@ -81,11 +76,6 @@ services:
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "18081:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/-/ready"]
-      interval: 2s
-      timeout: 2s
-      retries: 60
 
   meter-reader:
     <<: *meter
@@ -95,16 +85,11 @@ services:
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "18082:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/-/ready"]
-      interval: 2s
-      timeout: 2s
-      retries: 60
 
   regression-runner:
     build:
       context: ../..
-      target: regression
+      dockerfile: crates/regression/Dockerfile
     profiles: ["test"]
     environment:
       PROMETHEUS_URL: http://prometheus:9090
@@ -114,11 +99,11 @@ services:
       prometheus:
         condition: service_healthy
       meter-writer-0:
-        condition: service_healthy
+        condition: service_started
       meter-writer-1:
-        condition: service_healthy
+        condition: service_started
       meter-reader:
-        condition: service_healthy
+        condition: service_started
 
 volumes:
   prometheus-data:

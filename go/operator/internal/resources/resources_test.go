@@ -63,7 +63,10 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
 		Status:     telemetryv1alpha1.MeterStatus{ConfigHash: "hash"},
 		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "meter", Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}}},
+			Spec: corev1.PodSpec{
+				Containers:     []corev1.Container{{Name: "meter", Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
+				InitContainers: []corev1.Container{{Name: "init"}},
+			},
 		}}},
 	}
 	statefulSet := mustStatefulSet(t, meter)
@@ -74,6 +77,23 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 	}
 	if template.Spec.SecurityContext == nil || template.Spec.SecurityContext.RunAsUser == nil || *template.Spec.SecurityContext.RunAsUser != 10001 {
 		t.Fatal("pod did not receive UID 10001")
+	}
+	if template.Spec.SecurityContext.SeccompProfile == nil || template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatal("pod did not receive the RuntimeDefault seccomp profile")
+	}
+	if template.Spec.AutomountServiceAccountToken == nil || *template.Spec.AutomountServiceAccountToken {
+		t.Fatal("standalone pod should not automount its service account token")
+	}
+	for _, secured := range append(template.Spec.Containers, template.Spec.InitContainers...) {
+		context := secured.SecurityContext
+		if context == nil ||
+			context.AllowPrivilegeEscalation == nil || *context.AllowPrivilegeEscalation ||
+			context.ReadOnlyRootFilesystem == nil || !*context.ReadOnlyRootFilesystem ||
+			context.RunAsNonRoot == nil || !*context.RunAsNonRoot ||
+			context.RunAsUser == nil || *context.RunAsUser != 10001 ||
+			context.Capabilities == nil || !lo.Contains(context.Capabilities.Drop, corev1.Capability("ALL")) {
+			t.Fatalf("container %q did not receive secure defaults: %#v", secured.Name, context)
+		}
 	}
 	if template.Annotations[ConfigHashAnnotation] != "hash" ||
 		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "CUSTOM" }) ||

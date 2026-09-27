@@ -3,15 +3,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT/tests/regression/docker-compose.yml")
-services=(prometheus meter-writer-0 meter-writer-1 meter-reader)
+urls=(
+  http://localhost:19090/-/ready
+  http://localhost:18080/-/ready
+  http://localhost:18081/-/ready
+  http://localhost:18082/-/ready
+)
 deadline=$((SECONDS + 180))
 
 while (( SECONDS < deadline )); do
   ready=true
-  for service in "${services[@]}"; do
-    cid="$("${COMPOSE[@]}" ps -q "$service")"
-    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
-    if [[ "$status" != "healthy" ]]; then
+  for url in "${urls[@]}"; do
+    if ! curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
       ready=false
       break
     fi

@@ -58,8 +58,9 @@ cp config/meter.example.yaml config/meter.yaml
 mise exec -- cargo run --package meter-server -- --config config/meter.yaml
 ```
 
-Use environment variables or mounted files for production secrets. The Dockerfile's default
-runtime runs `meter-server`; mount configuration at `/app/config/meter.yaml`.
+Use environment variables or mounted files for production secrets. The
+`crates/meter-server/Dockerfile` runtime runs `meter-server`; mount configuration at
+`/app/config/meter.yaml`.
 
 Deployment roles:
 

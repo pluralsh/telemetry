@@ -6,7 +6,6 @@ on:
       - .github/workflows/publish-images.yml
       - Cargo.lock
       - Cargo.toml
-      - Dockerfile
       - config/**
       - crates/**
       - go/operator/**
@@ -19,7 +18,6 @@ on:
       - .github/workflows/publish-images.yml
       - Cargo.lock
       - Cargo.toml
-      - Dockerfile
       - config/**
       - crates/**
       - go/operator/**
@@ -48,8 +46,8 @@ jobs:
           - name: meter
             image: ghcr.io/pluralsh/meter
             context: .
-            file: Dockerfile
-            target: runtime
+            file: crates/meter-server/Dockerfile
+            target: ""
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
             context: go/operator
