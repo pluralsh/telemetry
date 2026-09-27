@@ -2,7 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
-pub const DEFAULT_VIRTUAL_SHARDS: u32 = 64;
+pub const DEFAULT_VIRTUAL_SHARDS: u32 = 8;
+pub const DEFAULT_IO_CONCURRENCY_MULTIPLIER: u32 = 4;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
@@ -336,13 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_sixty_four_virtual_shards() {
-        assert_eq!(ShardingConfig::default().virtual_shards, 64);
+    fn config_defaults_to_eight_virtual_shards() {
+        assert_eq!(ShardingConfig::default().virtual_shards, 8);
         assert_eq!(
             serde_json::from_str::<ShardingConfig>("{}")
                 .unwrap()
                 .virtual_shards,
-            64
+            8
         );
     }
 

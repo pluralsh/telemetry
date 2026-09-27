@@ -93,7 +93,8 @@ write:
   remote_retries: 2
 
 sharding:
-  virtual_shards: 64 # Default 64; must be greater than zero.
+  virtual_shards: 8 # Default 8; must be greater than zero.
+  io_concurrency_multiplier: 4 # Default 4; global shard I/O permits per open shard.
   backend: standalone
 
   # Static split-deployment alternative. Ranges are half-open and must exactly
@@ -105,12 +106,12 @@ sharding:
   #     ordinal: 0
   #     endpoint: meter-0:9090
   #     start_shard: 0
-  #     end_shard: 32
+  #     end_shard: 4
   #   - id: meter-1
   #     ordinal: 1
   #     endpoint: meter-1:9090
-  #     start_shard: 32
-  #     end_shard: 64
+  #     start_shard: 4
+  #     end_shard: 8
 
   # Kubernetes alternative and all defaults. Writers are discovered from the
   # StatefulSet; assignments use a ConfigMap and ownership uses Leases.

@@ -177,8 +177,11 @@ type WriteSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds < self.leaseDurationSeconds",message="renewIntervalSeconds must be less than leaseDurationSeconds"
 type ShardingSpec struct {
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=64
+	// +kubebuilder:default=8
 	VirtualShards *int32 `json:"virtualShards,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=4
+	IOConcurrencyMultiplier *int32 `json:"ioConcurrencyMultiplier,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=15
 	LeaseDurationSeconds *int64 `json:"leaseDurationSeconds,omitempty"`

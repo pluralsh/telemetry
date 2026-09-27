@@ -19,6 +19,7 @@ data:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
       virtual_shards: {{ .Values.sharding.virtualShards }}
+      io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: standalone
     auth:
       unauthenticated: {{ .Values.config.auth.unauthenticated }}
@@ -56,6 +57,7 @@ data:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
       virtual_shards: {{ .Values.sharding.virtualShards }}
+      io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
       namespace: {{ .Release.Namespace | quote }}
       stateful_set: {{ include "meter.writerName" . | quote }}
@@ -103,6 +105,7 @@ data:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
       virtual_shards: {{ .Values.sharding.virtualShards }}
+      io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
       namespace: {{ .Release.Namespace | quote }}
       stateful_set: {{ include "meter.writerName" . | quote }}

@@ -355,13 +355,18 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 }
 
 func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
-	virtual := int32Value(spec.VirtualShards, 64)
+	virtual := int32Value(spec.VirtualShards, 8)
+	ioConcurrencyMultiplier := int32Value(spec.IOConcurrencyMultiplier, 4)
 	if component == modeStandalone {
-		return renderSharding{VirtualShards: virtual, Backend: modeStandalone}
+		return renderSharding{
+			VirtualShards: virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
+			Backend: modeStandalone,
+		}
 	}
 	writer := resourceName(name, "writer")
 	return renderSharding{
-		VirtualShards: virtual, Backend: "kubernetes", Namespace: namespace,
+		VirtualShards: virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
+		Backend: "kubernetes", Namespace: namespace,
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
 		OwnerPort: grpcPort, AssignmentConfigMap: resourceName(name, "writer-shard-assignments"),
 		CoordinatorLease: resourceName(name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(name, "writer-shard"),
@@ -503,6 +508,7 @@ type renderWrite struct {
 }
 type renderSharding struct {
 	VirtualShards            int32  `json:"virtual_shards"`
+	IOConcurrencyMultiplier  int32  `json:"io_concurrency_multiplier"`
 	Backend                  string `json:"backend"`
 	Namespace                string `json:"namespace,omitempty"`
 	StatefulSet              string `json:"stateful_set,omitempty"`

@@ -17,8 +17,8 @@ pub use backend::{
     StandaloneLeaseBackend, StaticOwnerResolver,
 };
 pub use model::{
-    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_VIRTUAL_SHARDS, ModelError, Owner,
-    ShardId, ShardMap, ShardRange, ShardingConfig,
+    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+    DEFAULT_VIRTUAL_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange, ShardingConfig,
 };
 pub use planner::{PlanError, balanced_contiguous};
 pub use runtime::{ManagerError, OwnershipManager, OwnershipManagerConfig, OwnershipState};

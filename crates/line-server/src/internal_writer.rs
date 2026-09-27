@@ -147,8 +147,11 @@ impl InternalWriter for AppState {
                 "non_owner: shard is not owned by this server",
             ));
         }
-        let options = ShardingOptions::new(self.config.sharding.virtual_shards)
-            .map_err(|error| Status::internal(error.to_string()))?;
+        let options = ShardingOptions::new(
+            self.config.sharding.virtual_shards,
+            self.config.sharding.io_concurrency_multiplier,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
         let mut batches = request
             .batches
             .into_iter()
@@ -242,7 +245,7 @@ mod tests {
 
     fn request(generation: u64, request_id: &str) -> WriteBatchRequest {
         let namespace = Namespace::new("tenant").unwrap();
-        let options = ShardingOptions::new(2).unwrap();
+        let options = ShardingOptions::new(2, 4).unwrap();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()

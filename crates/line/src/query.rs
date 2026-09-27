@@ -194,6 +194,7 @@ pub(crate) async fn query_databases(
     namespace: &Namespace,
     request: &QueryRequest,
     options: QueryOptions,
+    global_permits: Arc<Semaphore>,
 ) -> Result<QueryResult> {
     validate_request(request, &options)?;
     let query = logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
@@ -202,11 +203,19 @@ pub(crate) async fn query_databases(
     let exact = common_exact_matchers(&query);
     let indexed_terms = indexed_match_terms(&query);
     let exact_for_estimate = &exact;
+    let estimate_permits = Arc::clone(&global_permits);
     let estimates = stream::iter(databases.iter().cloned())
-        .map(|database| async move {
-            database
-                .estimate_pages(namespace, scan_start, request.end_ns, exact_for_estimate)
-                .await
+        .map(move |database| {
+            let permits = Arc::clone(&estimate_permits);
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
+                database
+                    .estimate_pages(namespace, scan_start, request.end_ns, exact_for_estimate)
+                    .await
+            }
         })
         .buffered(options.max_concurrency)
         .collect::<Vec<_>>()
@@ -231,6 +240,7 @@ pub(crate) async fn query_databases(
             .zip(estimates)
             .map(|(database, estimate)| {
                 let permits = Arc::clone(&permits);
+                let global_permits = Arc::clone(&global_permits);
                 let query = &query;
                 let exact = &exact;
                 let indexed_terms = &indexed_terms;
@@ -240,6 +250,10 @@ pub(crate) async fn query_databases(
                         .acquire_many_owned(weight)
                         .await
                         .map_err(|_| Error::Query("query scheduler closed".into()))?;
+                    let _global_permit = global_permits
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::Query("global query scheduler closed".into()))?;
                     load_rows(
                         &database,
                         namespace,

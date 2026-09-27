@@ -71,7 +71,10 @@ impl AppState {
         let db = Arc::new(
             ShardedLine::open(
                 config.line_config(),
-                ShardingOptions::new(config.sharding.virtual_shards)?,
+                ShardingOptions::new(
+                    config.sharding.virtual_shards,
+                    config.sharding.io_concurrency_multiplier,
+                )?,
                 shards,
             )
             .await?,
@@ -150,8 +153,11 @@ impl AppState {
         batches: Vec<LogBatch>,
         request_id: String,
     ) -> Result<(), ApiError> {
-        let options = ShardingOptions::new(self.config.sharding.virtual_shards)
-            .map_err(ApiError::internal)?;
+        let options = ShardingOptions::new(
+            self.config.sharding.virtual_shards,
+            self.config.sharding.io_concurrency_multiplier,
+        )
+        .map_err(ApiError::internal)?;
         let assignment = self.assignment.read().await.clone();
         let mut groups: HashMap<(Owner, ShardId), Vec<LogBatch>> = HashMap::new();
         for batch in batches {
@@ -412,6 +418,7 @@ mod tests {
             storage: StorageConfig::InMemory,
             sharding: ShardingConfig {
                 virtual_shards: 2,
+                io_concurrency_multiplier: 4,
                 kind: ShardingBackend::Static {
                     owner_id: owner_id.into(),
                     owners: vec![
@@ -441,7 +448,7 @@ mod tests {
     }
 
     fn batch_on_shard(namespace: &Namespace, shard: u32) -> LogBatch {
-        let options = ShardingOptions::new(2).unwrap();
+        let options = ShardingOptions::new(2, 4).unwrap();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()

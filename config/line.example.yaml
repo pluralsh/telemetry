@@ -36,7 +36,8 @@ write:
   remote_retries: 2
 
 sharding:
-  virtual_shards: 64
+  virtual_shards: 8
+  io_concurrency_multiplier: 4
   backend: standalone
 
 request:

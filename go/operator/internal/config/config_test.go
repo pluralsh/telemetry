@@ -41,7 +41,8 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", "flush_interval_seconds: 60",
-		"virtual_shards: 64", "type: Local", "path: /var/lib/meter/data",
+		"virtual_shards: 8", "io_concurrency_multiplier: 4",
+		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
 		"path: /etc/meter/secrets/global-read-0-password",
 		"path: /etc/meter/secrets/namespace-tenant-auth-password",
@@ -109,9 +110,17 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 }
 
 func TestRenderShardedRoles(t *testing.T) {
+	ioConcurrencyMultiplier := int32(7)
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
-		Spec:       telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeSharded},
+		Spec: telemetryv1alpha1.MeterSpec{
+			Mode: telemetryv1alpha1.MeterModeSharded,
+			Config: telemetryv1alpha1.MeterConfigSpec{
+				Sharding: telemetryv1alpha1.ShardingSpec{
+					IOConcurrencyMultiplier: &ioConcurrencyMultiplier,
+				},
+			},
+		},
 	}
 	result, err := Render(Input{Meter: meter, InternalToken: []byte("token")})
 	if err != nil {
@@ -119,6 +128,7 @@ func TestRenderShardedRoles(t *testing.T) {
 	}
 	if !strings.Contains(string(result.Data[MeterKey]), "mode: writer") ||
 		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
+		!strings.Contains(string(result.Data[MeterKey]), "io_concurrency_multiplier: 7") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
 	}

@@ -125,7 +125,10 @@ impl AppState {
             }
             _ => assignment_for(&config)?,
         };
-        let options = ShardingOptions::new(config.sharding.virtual_shards)?;
+        let options = ShardingOptions::new(
+            config.sharding.virtual_shards,
+            config.sharding.io_concurrency_multiplier,
+        )?;
         let mut writers = HashMap::new();
         let mut readers = HashMap::new();
         for namespace_config in &config.namespaces {
@@ -388,8 +391,11 @@ impl AppState {
     ) -> Result<(), ApiError> {
         let meter_namespace =
             Namespace::new(namespace).map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let options = ShardingOptions::new(self.config.sharding.virtual_shards)
-            .map_err(ApiError::internal)?;
+        let options = ShardingOptions::new(
+            self.config.sharding.virtual_shards,
+            self.config.sharding.io_concurrency_multiplier,
+        )
+        .map_err(ApiError::internal)?;
         let assignment = self.assignment.read().await.clone();
         let mut groups: HashMap<(Owner, ShardId), Vec<Series>> = HashMap::new();
         for item in series {
@@ -538,7 +544,10 @@ impl ShardLifecycle for MeterShardLifecycle {
         range: ShardRange,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
-        let options = ShardingOptions::new(self.config.sharding.virtual_shards)?;
+        let options = ShardingOptions::new(
+            self.config.sharding.virtual_shards,
+            self.config.sharding.io_concurrency_multiplier,
+        )?;
         {
             let mut draining = self.draining_shards.write().await;
             for shard in range.start().get()..range.end().get() {

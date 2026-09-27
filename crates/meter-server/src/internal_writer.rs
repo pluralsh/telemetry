@@ -128,8 +128,11 @@ impl InternalWriter for AppState {
         }
         let meter_namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let options = ShardingOptions::new(self.config.sharding.virtual_shards)
-            .map_err(|error| Status::internal(error.to_string()))?;
+        let options = ShardingOptions::new(
+            self.config.sharding.virtual_shards,
+            self.config.sharding.io_concurrency_multiplier,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
         let mut series = Vec::with_capacity(request.series.len());
         let mut samples = 0;
         for item in request.series {

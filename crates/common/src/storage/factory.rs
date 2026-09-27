@@ -440,7 +440,8 @@ pub async fn create_storage_read(
                 .with_options(reader_options)
                 .with_metrics_recorder(Arc::new(MetricsRsRecorder));
             if let Some(checkpoint_id) = runtime.checkpoint_id {
-                builder = builder.with_checkpoint_id(checkpoint_id);
+                builder =
+                    builder.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint_id));
             }
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);

@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 use common::storage::config::StorageConfig;
 pub use meter_server::config::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
 use serde::{Deserialize, Serialize};
-use sharding::DEFAULT_VIRTUAL_SHARDS;
+use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +99,7 @@ impl Default for KubernetesShardingConfig {
 #[serde(default)]
 pub struct ShardingConfig {
     pub virtual_shards: u32,
+    pub io_concurrency_multiplier: u32,
     #[serde(flatten)]
     pub kind: ShardingBackend,
 }
@@ -107,6 +108,7 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
+            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
             kind: ShardingBackend::Standalone,
         }
     }
@@ -261,6 +263,7 @@ impl Config {
             || self.request.max_in_flight_query_bytes == 0
             || self.write.remote_concurrency == 0
             || self.sharding.virtual_shards == 0
+            || self.sharding.io_concurrency_multiplier == 0
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),

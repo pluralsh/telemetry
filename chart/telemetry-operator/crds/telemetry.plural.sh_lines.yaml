@@ -292,6 +292,11 @@ spec:
                     type: integer
                   sharding:
                     properties:
+                      ioConcurrencyMultiplier:
+                        default: 4
+                        format: int32
+                        minimum: 1
+                        type: integer
                       leaseDurationSeconds:
                         default: 15
                         format: int64
@@ -303,7 +308,7 @@ spec:
                         minimum: 1
                         type: integer
                       virtualShards:
-                        default: 64
+                        default: 8
                         format: int32
                         minimum: 1
                         type: integer

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sharding::{DEFAULT_VIRTUAL_SHARDS, ShardId};
+use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
+use tokio::sync::Semaphore;
 
 use crate::query::query_databases;
 use crate::{
@@ -9,31 +10,51 @@ use crate::{
     QueryResult, Result, WriteReport,
 };
 
+fn shard_io_semaphore(shards: usize, multiplier: u32) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(
+        shards.max(1).saturating_mul(multiplier as usize),
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardingOptions {
     virtual_shards: u32,
+    io_concurrency_multiplier: u32,
 }
 
 impl Default for ShardingOptions {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
+            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
         }
     }
 }
 
 impl ShardingOptions {
-    pub fn new(virtual_shards: u32) -> Result<Self> {
+    pub fn new(virtual_shards: u32, io_concurrency_multiplier: u32) -> Result<Self> {
         if virtual_shards == 0 {
             return Err(Error::Invalid(
                 "virtual shard count must be greater than zero".to_owned(),
             ));
         }
-        Ok(Self { virtual_shards })
+        if io_concurrency_multiplier == 0 {
+            return Err(Error::Invalid(
+                "I/O concurrency multiplier must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            virtual_shards,
+            io_concurrency_multiplier,
+        })
     }
 
     pub const fn virtual_shards(self) -> u32 {
         self.virtual_shards
+    }
+
+    pub const fn io_concurrency_multiplier(self) -> u32 {
+        self.io_concurrency_multiplier
     }
 
     pub fn route(self, namespace: &Namespace, labels: &Labels) -> ShardId {
@@ -71,6 +92,7 @@ impl ShardingOptions {
 pub struct ShardedLine {
     options: ShardingOptions,
     shards: BTreeMap<ShardId, Arc<LogDb>>,
+    io_permits: Arc<Semaphore>,
 }
 
 impl ShardedLine {
@@ -86,6 +108,7 @@ impl ShardedLine {
         }
         Ok(Self {
             options,
+            io_permits: shard_io_semaphore(databases.len(), options.io_concurrency_multiplier()),
             shards: databases,
         })
     }
@@ -141,6 +164,7 @@ impl ShardedLine {
             namespace,
             request,
             options,
+            Arc::clone(&self.io_permits),
         )
         .await
     }
@@ -179,7 +203,7 @@ mod tests {
 
     #[test]
     fn routing_is_canonical_stable_and_namespace_scoped() {
-        let options = ShardingOptions::new(64).unwrap();
+        let options = ShardingOptions::new(64, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
         let a = Namespace::new("a").unwrap();
         let b = Namespace::new("b").unwrap();
         let canonical = labels(&[("a", "2"), ("z", "1")]);
@@ -189,9 +213,16 @@ mod tests {
         assert_eq!(options.route(&a, &canonical).get(), 39);
     }
 
+    #[test]
+    fn shard_io_budget_uses_configured_multiplier() {
+        assert_eq!(shard_io_semaphore(8, 4).available_permits(), 32);
+        assert_eq!(shard_io_semaphore(8, 2).available_permits(), 16);
+        assert_eq!(shard_io_semaphore(0, 4).available_permits(), 4);
+    }
+
     #[tokio::test]
     async fn writes_and_queries_across_shards_with_global_limits() {
-        let options = ShardingOptions::new(2).unwrap();
+        let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
         let database = ShardedLine::open(
             Config {
                 storage: StorageConfig::InMemory,

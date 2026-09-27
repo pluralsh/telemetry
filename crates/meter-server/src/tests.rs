@@ -17,8 +17,8 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDb
 use http_body_util::BodyExt;
 use proto::meter::internal::v1::internal_writer_server::InternalWriter;
 use sharding::{
-    AssignmentGeneration, AssignmentState, BoxError, FakeAssignmentStore, FakeLeaseBackend,
-    OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
+    AssignmentGeneration, AssignmentState, BoxError, DEFAULT_VIRTUAL_SHARDS, FakeAssignmentStore,
+    FakeLeaseBackend, OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
 };
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -473,7 +473,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
 
     let namespace = Namespace::new("alpha").unwrap();
     let mut storage = meter_config_for_namespace(&config, &namespace).storage;
-    storage.path = ShardingOptions::new(1)
+    storage.path = ShardingOptions::new(1, 4)
         .unwrap()
         .shard_path(&storage.path, ShardId::new(0))
         .unwrap();
@@ -606,7 +606,7 @@ async fn grpc_retries_are_idempotent() {
         .await
         .unwrap();
     let namespace = Namespace::new("alpha").unwrap();
-    let options = ShardingOptions::new(64).unwrap();
+    let options = ShardingOptions::new(DEFAULT_VIRTUAL_SHARDS, 4).unwrap();
     let mut item = Series::new(
         "idempotent_total",
         vec![Label::new("instance", "a")],

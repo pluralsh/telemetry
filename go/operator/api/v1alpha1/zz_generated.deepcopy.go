@@ -967,6 +967,11 @@ func (in *ShardingSpec) DeepCopyInto(out *ShardingSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.IOConcurrencyMultiplier != nil {
+		in, out := &in.IOConcurrencyMultiplier, &out.IOConcurrencyMultiplier
+		*out = new(int32)
+		**out = **in
+	}
 	if in.LeaseDurationSeconds != nil {
 		in, out := &in.LeaseDurationSeconds, &out.LeaseDurationSeconds
 		*out = new(int64)

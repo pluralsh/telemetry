@@ -787,7 +787,7 @@ impl StorageReader {
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
         if let Some(checkpoint_id) = checkpoint_id {
-            builder = builder.with_checkpoint_id(checkpoint_id);
+            builder = builder.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint_id));
         }
 
         if let Some(cache) =

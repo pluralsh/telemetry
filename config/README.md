@@ -102,8 +102,10 @@ not bytes. Default `268435456`.
 
 ## `sharding`
 
-- `sharding.virtual_shards`: number of deterministic virtual shards. Default `64`; must be greater
+- `sharding.virtual_shards`: number of deterministic virtual shards. Default `8`; must be greater
   than zero. Keep it identical across all processes sharing a dataset.
+- `sharding.io_concurrency_multiplier`: global shard I/O permits per open shard. Default `4`;
+  must be greater than zero. Increase it when I/O latency leaves shard operations idle.
 - `sharding.backend`: `standalone` (default), `static`, or `kubernetes`.
 
 `standalone` has no additional fields and assigns every shard to the process.

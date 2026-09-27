@@ -6,8 +6,9 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
-use sharding::{DEFAULT_VIRTUAL_SHARDS, ShardId};
+use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
 use slatedb::config::DbReaderOptions;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{SeriesId, TimeBucket};
@@ -29,33 +30,60 @@ use crate::{
 
 const SOURCE_BUCKET_BITS: u32 = 40;
 const SOURCE_BUCKET_MASK: u64 = (1 << SOURCE_BUCKET_BITS) - 1;
-const SHARD_QUERY_CONCURRENCY: usize = 8;
+
+fn shard_io_semaphore(shards: usize, multiplier: u32) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(
+        shards.max(1).saturating_mul(multiplier as usize),
+    ))
+}
+
+async fn acquire_io_permit(permits: &Arc<Semaphore>) -> OwnedSemaphorePermit {
+    permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("shard I/O semaphore must remain open")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardingOptions {
     virtual_shards: u32,
+    io_concurrency_multiplier: u32,
 }
 
 impl Default for ShardingOptions {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
+            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
         }
     }
 }
 
 impl ShardingOptions {
-    pub fn new(virtual_shards: u32) -> Result<Self> {
+    pub fn new(virtual_shards: u32, io_concurrency_multiplier: u32) -> Result<Self> {
         if virtual_shards == 0 {
             return Err(Error::InvalidInput(
                 "virtual shard count must be greater than zero".to_string(),
             ));
         }
-        Ok(Self { virtual_shards })
+        if io_concurrency_multiplier == 0 {
+            return Err(Error::InvalidInput(
+                "I/O concurrency multiplier must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            virtual_shards,
+            io_concurrency_multiplier,
+        })
     }
 
     pub const fn virtual_shards(self) -> u32 {
         self.virtual_shards
+    }
+
+    pub const fn io_concurrency_multiplier(self) -> u32 {
+        self.io_concurrency_multiplier
     }
 
     pub fn shard_path(self, base: &str, shard: ShardId) -> Result<String> {
@@ -100,6 +128,7 @@ pub struct ShardedMeter {
     options: ShardingOptions,
     writers: BTreeMap<ShardId, TimeSeriesDb>,
     readers: BTreeMap<ShardId, TimeSeriesDbReader>,
+    io_permits: Arc<Semaphore>,
 }
 
 pub type ShardedTimeseries = ShardedMeter;
@@ -124,6 +153,7 @@ impl ShardedMeter {
         Ok(Self {
             namespace,
             options,
+            io_permits: shard_io_semaphore(writers.len(), options.io_concurrency_multiplier()),
             writers,
             readers: BTreeMap::new(),
         })
@@ -157,6 +187,7 @@ impl ShardedMeter {
             namespace,
             options,
             writers: BTreeMap::new(),
+            io_permits: shard_io_semaphore(readers.len(), options.io_concurrency_multiplier()),
             readers,
         })
     }
@@ -259,9 +290,21 @@ impl ShardedMeter {
         matchers: &[&str],
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
+        let handles = self.read_handles();
+        let width = handles.len().max(1);
+        let mut pending = Vec::with_capacity(handles.len());
+        for reader in handles {
+            let permits = Arc::clone(&self.io_permits);
+            let range = range.clone();
+            pending.push(async move { reader.series(matchers, range, permits).await });
+        }
+        let results = stream::iter(pending)
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut unique = HashSet::new();
-        for reader in self.read_handles() {
-            unique.extend(reader.series(matchers, range.clone()).await?);
+        for labels in results {
+            unique.extend(labels);
         }
         let mut labels: Vec<_> = unique.into_iter().collect();
         labels.sort_by_key(|labels| format!("{labels:?}"));
@@ -273,9 +316,21 @@ impl ShardedMeter {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
+        let handles = self.read_handles();
+        let width = handles.len().max(1);
+        let mut pending = Vec::with_capacity(handles.len());
+        for reader in handles {
+            let permits = Arc::clone(&self.io_permits);
+            let range = range.clone();
+            pending.push(async move { reader.labels(matchers, range, permits).await });
+        }
+        let results = stream::iter(pending)
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut unique = HashSet::new();
-        for reader in self.read_handles() {
-            unique.extend(reader.labels(matchers, range.clone()).await?);
+        for labels in results {
+            unique.extend(labels);
         }
         let mut labels: Vec<_> = unique.into_iter().collect();
         labels.sort();
@@ -288,13 +343,25 @@ impl ShardedMeter {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let mut unique = HashSet::new();
-        for reader in self.read_handles() {
-            unique.extend(
+        let handles = self.read_handles();
+        let width = handles.len().max(1);
+        let mut pending = Vec::with_capacity(handles.len());
+        for reader in handles {
+            let permits = Arc::clone(&self.io_permits);
+            let range = range.clone();
+            pending.push(async move {
                 reader
-                    .label_values(label_name, matchers, range.clone())
-                    .await?,
-            );
+                    .label_values(label_name, matchers, range, permits)
+                    .await
+            });
+        }
+        let results = stream::iter(pending)
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut unique = HashSet::new();
+        for values in results {
+            unique.extend(values);
         }
         let mut values: Vec<_> = unique.into_iter().collect();
         values.sort();
@@ -305,9 +372,23 @@ impl ShardedMeter {
         &self,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        let handles = self.read_handles();
+        let width = handles.len().max(1);
+        let mut pending = Vec::with_capacity(handles.len());
+        for reader in handles {
+            let permits = Arc::clone(&self.io_permits);
+            pending.push(async move {
+                let _permit = acquire_io_permit(&permits).await;
+                reader.metadata(metric).await
+            });
+        }
+        let results = stream::iter(pending)
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut entries = Vec::new();
-        for reader in self.read_handles() {
-            for entry in reader.metadata(metric).await? {
+        for shard_entries in results {
+            for entry in shard_entries {
                 if !entries.contains(&entry) {
                     entries.push(entry);
                 }
@@ -327,25 +408,43 @@ impl ShardedMeter {
 
     async fn query_source(&self, ranges: &[(i64, i64)]) -> Result<MultiShardSeriesSource> {
         let readers = if self.readers.is_empty() {
-            let mut readers = Vec::with_capacity(self.writers.len());
+            let width = self.writers.len().max(1);
+            let mut pending = Vec::with_capacity(self.writers.len());
             for db in self.writers.values() {
-                readers.push(ShardQueryReader::Writer(
+                let permits = Arc::clone(&self.io_permits);
+                pending.push(async move {
+                    let _permit = acquire_io_permit(&permits).await;
                     db.read_engine()
                         .make_query_reader_for_ranges(ranges)
-                        .await?,
-                ));
+                        .await
+                        .map(ShardQueryReader::Writer)
+                });
             }
-            readers
+            stream::iter(pending)
+                .buffered(width)
+                .try_collect::<Vec<_>>()
+                .await?
         } else {
-            let mut readers = Vec::with_capacity(self.readers.len());
+            let width = self.readers.len().max(1);
+            let mut pending = Vec::with_capacity(self.readers.len());
             for db in self.readers.values() {
-                readers.push(ShardQueryReader::Reader(
-                    db.make_query_reader_for_ranges(ranges).await?,
-                ));
+                let permits = Arc::clone(&self.io_permits);
+                pending.push(async move {
+                    let _permit = acquire_io_permit(&permits).await;
+                    db.make_query_reader_for_ranges(ranges)
+                        .await
+                        .map(ShardQueryReader::Reader)
+                });
             }
-            readers
+            stream::iter(pending)
+                .buffered(width)
+                .try_collect::<Vec<_>>()
+                .await?
         };
-        Ok(MultiShardSeriesSource::new(readers))
+        Ok(MultiShardSeriesSource::new(
+            readers,
+            Arc::clone(&self.io_permits),
+        ))
     }
 }
 
@@ -452,16 +551,107 @@ impl QueryReader for ShardQueryReader {
     }
 }
 
+struct IoLimitedQueryReader<R> {
+    inner: R,
+    permits: Arc<Semaphore>,
+}
+
+impl<R> IoLimitedQueryReader<R> {
+    fn new(inner: R, permits: Arc<Semaphore>) -> Self {
+        Self { inner, permits }
+    }
+
+    async fn acquire(&self) -> OwnedSemaphorePermit {
+        acquire_io_permit(&self.permits).await
+    }
+}
+
+#[async_trait]
+impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
+    async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+        let _permit = self.acquire().await;
+        self.inner.list_buckets().await
+    }
+
+    async fn forward_index(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let _permit = self.acquire().await;
+        self.inner.forward_index(bucket, series_ids).await
+    }
+
+    async fn inverted_index(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Label],
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let _permit = self.acquire().await;
+        self.inner.inverted_index(bucket, terms).await
+    }
+
+    async fn all_inverted_index(
+        &self,
+        bucket: &TimeBucket,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let _permit = self.acquire().await;
+        self.inner.all_inverted_index(bucket).await
+    }
+
+    async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+        let _permit = self.acquire().await;
+        self.inner.label_values(bucket, label_name).await
+    }
+
+    async fn samples(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        metric_name: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        let _permit = self.acquire().await;
+        self.inner
+            .samples(bucket, series_id, metric_name, start_ms, end_ms)
+            .await
+    }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<SeriesSpec>> {
+        let _permit = self.acquire().await;
+        self.inner.forward_index_one(bucket, series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<RoaringBitmap>> {
+        let _permit = self.acquire().await;
+        self.inner.inverted_index_term(bucket, term).await
+    }
+}
+
 struct MultiShardSeriesSource {
-    sources: Arc<[Arc<QueryReaderSource<ShardQueryReader>>]>,
+    sources: Arc<[Arc<QueryReaderSource<IoLimitedQueryReader<ShardQueryReader>>>]>,
 }
 
 impl MultiShardSeriesSource {
-    fn new(readers: Vec<ShardQueryReader>) -> Self {
+    fn new(readers: Vec<ShardQueryReader>, permits: Arc<Semaphore>) -> Self {
         Self {
             sources: readers
                 .into_iter()
-                .map(|reader| Arc::new(QueryReaderSource::new(Arc::new(reader))))
+                .map(|reader| {
+                    Arc::new(QueryReaderSource::new(Arc::new(IoLimitedQueryReader::new(
+                        reader,
+                        Arc::clone(&permits),
+                    ))))
+                })
                 .collect(),
         }
     }
@@ -487,6 +677,7 @@ impl SeriesSource for MultiShardSeriesSource {
     ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
         let selector = selector.clone();
         let sources: Vec<_> = self.sources.iter().cloned().enumerate().collect();
+        let width = sources.len().max(1);
         stream::iter(sources.into_iter().map(move |(source_index, source)| {
             let selector = selector.clone();
             async move {
@@ -512,7 +703,7 @@ impl SeriesSource for MultiShardSeriesSource {
                     .await
             }
         }))
-        .buffered(SHARD_QUERY_CONCURRENCY)
+        .buffered(width)
         .flat_map(stream::iter)
     }
 
@@ -535,6 +726,7 @@ impl SeriesSource for MultiShardSeriesSource {
         }
 
         let sources = Arc::clone(&self.sources);
+        let width = sources.len().max(1);
         stream::iter(runs.into_iter().map(move |(source_index, range)| {
             let sources = Arc::clone(&sources);
             let series: Arc<[ResolvedSeriesRef]> = request.series[range.clone()]
@@ -565,7 +757,7 @@ impl SeriesSource for MultiShardSeriesSource {
                     .await
             }
         }))
-        .buffered(SHARD_QUERY_CONCURRENCY)
+        .buffered(width)
         .flat_map(stream::iter)
     }
 }
@@ -575,22 +767,32 @@ impl ReaderHandle<'_> {
         &self,
         matchers: &[&str],
         range: R,
+        permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        match self {
-            Self::Writer(db) => db.series(matchers, range).await,
-            Self::Reader(db) => db.series(matchers, range).await,
-        }
+        let (start, end) = crate::util::range_bounds_to_secs(range)?;
+        let reader = match self {
+            Self::Writer(db) => {
+                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
+            }
+            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+        };
+        crate::tsdb::discover_series(&IoLimitedQueryReader::new(reader, permits), matchers).await
     }
 
     async fn labels<R: RangeBounds<SystemTime>>(
         &self,
         matchers: Option<&[&str]>,
         range: R,
+        permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        match self {
-            Self::Writer(db) => db.labels(matchers, range).await,
-            Self::Reader(db) => db.labels(matchers, range).await,
-        }
+        let (start, end) = crate::util::range_bounds_to_secs(range)?;
+        let reader = match self {
+            Self::Writer(db) => {
+                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
+            }
+            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+        };
+        crate::tsdb::discover_labels(&IoLimitedQueryReader::new(reader, permits), matchers).await
     }
 
     async fn label_values<R: RangeBounds<SystemTime>>(
@@ -598,11 +800,21 @@ impl ReaderHandle<'_> {
         label_name: &str,
         matchers: Option<&[&str]>,
         range: R,
+        permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        match self {
-            Self::Writer(db) => db.label_values(label_name, matchers, range).await,
-            Self::Reader(db) => db.label_values(label_name, matchers, range).await,
-        }
+        let (start, end) = crate::util::range_bounds_to_secs(range)?;
+        let reader = match self {
+            Self::Writer(db) => {
+                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
+            }
+            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+        };
+        crate::tsdb::discover_label_values(
+            &IoLimitedQueryReader::new(reader, permits),
+            label_name,
+            matchers,
+        )
+        .await
     }
 
     async fn metadata(
@@ -639,7 +851,7 @@ mod tests {
         let sharded = ShardedMeter::open_writers(
             namespace.clone(),
             config("sharded"),
-            ShardingOptions::new(2).unwrap(),
+            ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap(),
             [ShardId::new(0), ShardId::new(1)],
         )
         .await
@@ -751,7 +963,15 @@ mod tests {
                 .unwrap(),
             "meter/shard-0003"
         );
-        assert!(ShardingOptions::new(0).is_err());
+        assert!(ShardingOptions::new(0, DEFAULT_IO_CONCURRENCY_MULTIPLIER).is_err());
+        assert!(ShardingOptions::new(DEFAULT_VIRTUAL_SHARDS, 0).is_err());
+    }
+
+    #[test]
+    fn shard_io_budget_uses_configured_multiplier() {
+        assert_eq!(shard_io_semaphore(8, 4).available_permits(), 32);
+        assert_eq!(shard_io_semaphore(8, 2).available_permits(), 16);
+        assert_eq!(shard_io_semaphore(0, 4).available_permits(), 4);
     }
 
     #[tokio::test]

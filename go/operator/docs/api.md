@@ -688,7 +688,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `virtualShards` _integer_ |  | 64 | Minimum: 1 <br /> |
+| `virtualShards` _integer_ |  | 8 | Minimum: 1 <br /> |
+| `ioConcurrencyMultiplier` _integer_ |  | 4 | Minimum: 1 <br /> |
 | `leaseDurationSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
 | `renewIntervalSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 | `watchPollIntervalSeconds` _integer_ |  | 2 | Minimum: 1 <br /> |

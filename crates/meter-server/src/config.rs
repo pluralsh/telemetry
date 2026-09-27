@@ -2,7 +2,7 @@ use std::{collections::HashSet, env, fmt, fs, net::SocketAddr, path::Path};
 
 use common::storage::config::SlateDbStorageConfig;
 use serde::{Deserialize, Serialize};
-use sharding::DEFAULT_VIRTUAL_SHARDS;
+use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +168,7 @@ impl Default for KubernetesShardingConfig {
 #[serde(default)]
 pub struct ShardingConfig {
     pub virtual_shards: u32,
+    pub io_concurrency_multiplier: u32,
     #[serde(flatten)]
     pub kind: ShardingBackend,
 }
@@ -176,6 +177,7 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
+            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
             kind: ShardingBackend::Standalone,
         }
     }
@@ -276,6 +278,11 @@ impl Config {
         if self.sharding.virtual_shards == 0 {
             return Err(ConfigError::Validation(
                 "sharding.virtual_shards must be greater than zero".to_owned(),
+            ));
+        }
+        if self.sharding.io_concurrency_multiplier == 0 {
+            return Err(ConfigError::Validation(
+                "sharding.io_concurrency_multiplier must be greater than zero".to_owned(),
             ));
         }
         if self.namespaces.is_empty() {
@@ -383,7 +390,8 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
-        assert_eq!(config.sharding.virtual_shards, 64);
+        assert_eq!(config.sharding.virtual_shards, 8);
+        assert_eq!(config.sharding.io_concurrency_multiplier, 4);
         assert!(!config.auth.unauthenticated);
         config.validate().unwrap();
         let invalid: Config =
