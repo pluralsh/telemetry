@@ -1,0 +1,187 @@
+# Supported deployment modes: standalone or sharded.
+mode: standalone
+
+image:
+  repository: ghcr.io/pluralsh/meter
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: true
+
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  annotations: {}
+  httpPort: 8080
+  grpcPort: 9090
+  headless:
+    annotations: {}
+    publishNotReadyAddresses: false
+
+writer:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+reader:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+standalone:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+config:
+  storage:
+    path: meter
+    object_store:
+      type: Local
+      path: /var/lib/meter/data
+    block_cache:
+      type: FoyerHybrid
+      memory_capacity: 536870912
+      disk_capacity: 10737418240
+      disk_path: /var/cache/meter
+    meta_cache:
+      type: FoyerMemory
+      capacity: 134217728
+  readerCacheCapacity: 268435456
+  write:
+    durability: written
+    flush_interval_seconds: 60
+    remote_concurrency: 16
+    remote_retries: 2
+  auth:
+    # Optional external JWT verification. For a file source, mount an existing
+    # Secret containing a public JWKS with extraVolumes/extraVolumeMounts.
+    # jwt:
+    #   jwks:
+    #     source: file
+    #     path: /var/run/secrets/meter-jwks/jwks.json
+    #   issuer: https://issuer.example/
+    #   audience: meter
+    #   refresh_interval_seconds: 300
+    #   request_timeout_seconds: 5
+    global:
+      read: []
+      write: []
+  namespaces:
+    - name: default
+      auth:
+        read: []
+        write: []
+
+sharding:
+  virtualShards: 64
+  leaseDurationSeconds: 15
+  renewIntervalSeconds: 5
+  watchPollIntervalSeconds: 2
+
+# Internal writer-to-writer authentication. When enabled, the token is mounted
+# as a file and is never written to the generated ConfigMap.
+internalToken:
+  enabled: false
+  value: ""
+  existingSecret: ""
+  key: token
+  mountPath: /var/run/secrets/meter/internal-token
+
+persistence:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  mountPath: /var/lib/meter
+
+cache:
+  persistence:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    annotations: {}
+  mountPath: /var/cache/meter
+  emptyDir:
+    medium: ""
+    sizeLimit: ""
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
+
+priorityClassName: ""
+runtimeClassName: ""
+terminationGracePeriodSeconds: 30
+nodeSelector: {}
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+
+extraEnv: []
+extraEnvFrom: []
+# Example secure local JWKS mount (the Secret must contain jwks.json):
+# extraVolumes:
+#   - name: jwt-jwks
+#     secret:
+#       secretName: meter-jwt-jwks
+# extraVolumeMounts:
+#   - name: jwt-jwks
+#     mountPath: /var/run/secrets/meter-jwks
+#     readOnly: true
+extraVolumes: []
+extraVolumeMounts: []

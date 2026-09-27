@@ -1,0 +1,46 @@
+name: Operator tests
+
+on:
+  pull_request:
+    paths:
+      - go/**
+      - chart/telemetry-operator/**
+      - mise.toml
+      - .github/workflows/operator-test.yml
+  push:
+    branches: [main]
+    paths:
+      - go/**
+      - chart/telemetry-operator/**
+      - mise.toml
+      - .github/workflows/operator-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go/operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/operator/go.mod
+          cache-dependency-path: go/operator/go.sum
+      - name: Generate, validate, and test
+        run: make generate manifests crd-docs fmt vet test
+      - name: Refresh chart CRDs
+        run: cp config/crd/bases/*.yaml ../../chart/telemetry-operator/crds/
+      - name: Verify generated files are current
+        working-directory: .
+        run: git diff --exit-code -- go/operator chart/telemetry-operator/crds
+      - uses: azure/setup-helm@v4
+      - name: Lint operator chart
+        working-directory: .
+        run: helm lint chart/telemetry-operator
+      - name: Render operator chart
+        working-directory: .
+        run: helm template telemetry-operator chart/telemetry-operator --include-crds > /dev/null

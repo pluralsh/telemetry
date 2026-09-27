@@ -1,0 +1,30 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "telemetry-operator.fullname" . }}
+  labels:
+    {{- include "telemetry-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["telemetry.plural.sh"]
+    resources: ["meters", "namespaceauthentications"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["telemetry.plural.sh"]
+    resources: ["meters/status", "namespaceauthentications/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["telemetry.plural.sh"]
+    resources: ["meters/finalizers", "namespaceauthentications/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["secrets", "services", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{- end }}

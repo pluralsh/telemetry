@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+      - run: mise exec -- cargo fmt --all --check
+      - run: mise exec -- cargo check --workspace --all-targets --all-features --locked
+      - run: mise exec -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: mise exec -- cargo test --workspace --all-features --locked
+
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Docker compatibility regression
+        run: tests/regression/test.sh

@@ -1,0 +1,14 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: prometheus-reader
+spec:
+  dataStoreRef:
+    kind: Meter
+    name: meter-sample
+  namespace: default
+  username: prometheus
+  permission: read
+  secretKeyRef:
+    name: prometheus-basic-auth
+    key: password

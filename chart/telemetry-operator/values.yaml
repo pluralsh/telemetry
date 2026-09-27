@@ -1,0 +1,78 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/pluralsh/telemetry-operator
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: true
+
+rbac:
+  create: true
+
+leaderElection:
+  enabled: true
+
+# The current manager watches namespaced resources in every namespace.
+watchClusterWide: true
+
+# Metrics are disabled by default and require no certificate management.
+metrics:
+  enabled: false
+  bindAddress: ":8443"
+  secure: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+priorityClassName: ""
+runtimeClassName: ""
+nodeSelector: {}
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+
+terminationGracePeriodSeconds: 10
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 1
+  failureThreshold: 3
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 1
+  failureThreshold: 3
+
+additionalArgs: []

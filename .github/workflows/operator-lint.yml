@@ -1,0 +1,34 @@
+name: Operator lint
+
+on:
+  pull_request:
+    paths:
+      - go/**
+      - mise.toml
+      - .github/workflows/operator-lint.yml
+  push:
+    branches: [main]
+    paths:
+      - go/**
+      - mise.toml
+      - .github/workflows/operator-lint.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go/operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/operator/go.mod
+          cache-dependency-path: go/operator/go.sum
+      - name: Verify lint configuration
+        run: make lint-config
+      - name: Run golangci-lint
+        run: make lint

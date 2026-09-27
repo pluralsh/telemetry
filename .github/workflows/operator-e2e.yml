@@ -1,0 +1,39 @@
+name: Operator e2e
+
+on:
+  pull_request:
+    paths:
+      - go/**
+      - chart/telemetry-operator/**
+      - mise.toml
+      - .github/workflows/operator-e2e.yml
+  push:
+    branches: [main]
+    paths:
+      - go/**
+      - chart/telemetry-operator/**
+      - mise.toml
+      - .github/workflows/operator-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: go/operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/operator/go.mod
+          cache-dependency-path: go/operator/go.sum
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: Run Kind e2e
+        run: make test-e2e

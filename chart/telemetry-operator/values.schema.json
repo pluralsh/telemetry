@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "replicaCount",
+    "image",
+    "imagePullSecrets",
+    "nameOverride",
+    "fullnameOverride",
+    "serviceAccount",
+    "rbac",
+    "leaderElection",
+    "watchClusterWide",
+    "metrics",
+    "podAnnotations",
+    "podLabels",
+    "podSecurityContext",
+    "securityContext",
+    "resources",
+    "priorityClassName",
+    "runtimeClassName",
+    "nodeSelector",
+    "affinity",
+    "tolerations",
+    "topologySpreadConstraints",
+    "terminationGracePeriodSeconds",
+    "livenessProbe",
+    "readinessProbe",
+    "additionalArgs"
+  ],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations", "automountServiceAccountToken"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object"},
+        "automountServiceAccountToken": {"type": "boolean"}
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create"],
+      "properties": {"create": {"type": "boolean"}}
+    },
+    "leaderElection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {"enabled": {"type": "boolean"}}
+    },
+    "watchClusterWide": {
+      "type": "boolean",
+      "const": true,
+      "description": "The current manager supports cluster-wide watches only."
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "bindAddress", "secure"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "bindAddress": {"type": "string", "minLength": 1},
+        "secure": {"type": "boolean"}
+      }
+    },
+    "podAnnotations": {"type": "object"},
+    "podLabels": {"type": "object"},
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "resources": {"type": "object"},
+    "priorityClassName": {"type": "string"},
+    "runtimeClassName": {"type": "string"},
+    "nodeSelector": {"type": "object"},
+    "affinity": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "topologySpreadConstraints": {"type": "array"},
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "livenessProbe": {"$ref": "#/definitions/probe"},
+    "readinessProbe": {"$ref": "#/definitions/probe"},
+    "additionalArgs": {"type": "array", "items": {"type": "string"}}
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "initialDelaySeconds": {"type": "integer", "minimum": 0},
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

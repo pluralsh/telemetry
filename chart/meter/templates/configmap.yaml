@@ -1,0 +1,129 @@
+{{- include "meter.validate" . -}}
+{{- if eq .Values.mode "standalone" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meter.standaloneConfigName" . }}
+  labels:
+    {{- include "meter.labels" . | nindent 4 }}
+data:
+  meter.yaml: |
+    mode: standalone
+    listeners:
+      http: 0.0.0.0:{{ .Values.service.httpPort }}
+      grpc: 0.0.0.0:{{ .Values.service.grpcPort }}
+    storage:
+      {{- toYaml .Values.config.storage | nindent 6 }}
+    reader_cache_capacity: {{ printf "%.0f" .Values.config.readerCacheCapacity }}
+    write:
+      {{- toYaml .Values.config.write | nindent 6 }}
+    sharding:
+      virtual_shards: {{ .Values.sharding.virtualShards }}
+      backend: standalone
+    auth:
+      {{- if .Values.internalToken.enabled }}
+      internal:
+        source: file
+        path: {{ .Values.internalToken.mountPath | quote }}
+      {{- end }}
+      {{- with .Values.config.auth.jwt }}
+      jwt:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      global:
+        {{- toYaml .Values.config.auth.global | nindent 8 }}
+    namespaces:
+      {{- toYaml .Values.config.namespaces | nindent 6 }}
+{{- else }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meter.writerConfigName" . }}
+  labels:
+    {{- include "meter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+data:
+  meter.yaml: |
+    mode: writer
+    listeners:
+      http: 0.0.0.0:{{ .Values.service.httpPort }}
+      grpc: 0.0.0.0:{{ .Values.service.grpcPort }}
+    storage:
+      {{- toYaml .Values.config.storage | nindent 6 }}
+    reader_cache_capacity: {{ printf "%.0f" .Values.config.readerCacheCapacity }}
+    write:
+      {{- toYaml .Values.config.write | nindent 6 }}
+    sharding:
+      virtual_shards: {{ .Values.sharding.virtualShards }}
+      backend: kubernetes
+      namespace: {{ .Release.Namespace | quote }}
+      stateful_set: {{ include "meter.writerName" . | quote }}
+      headless_service: {{ include "meter.headlessName" . | quote }}
+      owner_port: {{ .Values.service.grpcPort }}
+      assignment_config_map: {{ include "meter.assignmentName" . | quote }}
+      coordinator_lease: {{ include "meter.coordinatorLeaseName" . | quote }}
+      shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
+      lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}
+      renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
+      watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
+    auth:
+      {{- if .Values.internalToken.enabled }}
+      internal:
+        source: file
+        path: {{ .Values.internalToken.mountPath | quote }}
+      {{- end }}
+      {{- with .Values.config.auth.jwt }}
+      jwt:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      global:
+        {{- toYaml .Values.config.auth.global | nindent 8 }}
+    namespaces:
+      {{- toYaml .Values.config.namespaces | nindent 6 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meter.readerConfigName" . }}
+  labels:
+    {{- include "meter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+data:
+  meter.yaml: |
+    mode: reader
+    listeners:
+      http: 0.0.0.0:{{ .Values.service.httpPort }}
+      grpc: 0.0.0.0:{{ .Values.service.grpcPort }}
+    storage:
+      {{- toYaml .Values.config.storage | nindent 6 }}
+    reader_cache_capacity: {{ printf "%.0f" .Values.config.readerCacheCapacity }}
+    write:
+      {{- toYaml .Values.config.write | nindent 6 }}
+    sharding:
+      virtual_shards: {{ .Values.sharding.virtualShards }}
+      backend: kubernetes
+      namespace: {{ .Release.Namespace | quote }}
+      stateful_set: {{ include "meter.writerName" . | quote }}
+      headless_service: {{ include "meter.headlessName" . | quote }}
+      owner_port: {{ .Values.service.grpcPort }}
+      assignment_config_map: {{ include "meter.assignmentName" . | quote }}
+      coordinator_lease: {{ include "meter.coordinatorLeaseName" . | quote }}
+      shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
+      lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}
+      renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
+      watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
+    auth:
+      {{- if .Values.internalToken.enabled }}
+      internal:
+        source: file
+        path: {{ .Values.internalToken.mountPath | quote }}
+      {{- end }}
+      {{- with .Values.config.auth.jwt }}
+      jwt:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      global:
+        {{- toYaml .Values.config.auth.global | nindent 8 }}
+    namespaces:
+      {{- toYaml .Values.config.namespaces | nindent 6 }}
+{{- end }}

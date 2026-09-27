@@ -1,0 +1,66 @@
+[package]
+name = "meter"
+description = "Namespace-aware Prometheus-compatible time series database built on SlateDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+name = "meter"
+path = "src/lib.rs"
+
+[features]
+default = []
+testing = []
+remote-write = ["dep:prost", "dep:snap"]
+otel = ["dep:opentelemetry-proto", "dep:prost"]
+bench-internals = []
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+common = { path = "../common" }
+config.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+metrics.workspace = true
+moka.workspace = true
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+promql-parser.workspace = true
+regex.workspace = true
+regex-syntax.workspace = true
+reqwest.workspace = true
+roaring.workspace = true
+ryu.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+serde_yaml.workspace = true
+sharding = { path = "../sharding" }
+slatedb.workspace = true
+snap = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tsz.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+common = { path = "../common", features = ["test-utils"] }
+dashu-float.workspace = true
+fail.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+slatedb = { workspace = true, features = ["test-util"] }
+slatedb-common = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

@@ -1,0 +1,11 @@
+{
+  "keys": [
+    {
+      "kty": "oct",
+      "kid": "regression-hs256",
+      "alg": "HS256",
+      "use": "sig",
+      "k": "bWV0ZXItcmVncmVzc2lvbi10ZXN0LW9ubHktaHMyNTYtc2lnbmluZy1rZXk"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- telemetry_v1alpha1_meter.yaml
+- telemetry_v1alpha1_namespaceauthentication.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,30 @@
+[package]
+name = "sharding"
+description = "Reusable virtual-shard assignment and ownership for Meter, Loom, and Thread"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:serde_json"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+k8s-openapi = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

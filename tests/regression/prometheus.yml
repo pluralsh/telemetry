@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 1m
+  evaluation_interval: 1m
+
+otlp:
+  promote_resource_attributes:
+    - service.name
+
+scrape_configs: []

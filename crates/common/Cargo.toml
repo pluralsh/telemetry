@@ -1,0 +1,40 @@
+[package]
+name = "common"
+description = "Shared storage and write-coordination foundations for Telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+test-utils = ["dep:arc-swap"]
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap = { workspace = true, optional = true }
+async-trait.workspace = true
+bytes.workspace = true
+foyer.workspace = true
+futures.workspace = true
+metrics.workspace = true
+mixtrics.workspace = true
+serde.workspace = true
+slatedb.workspace = true
+slatedb-common.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+slatedb = { workspace = true, features = ["test-util"] }
+slatedb-common = { workspace = true, features = ["test-util"] }

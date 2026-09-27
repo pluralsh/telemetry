@@ -1,0 +1,107 @@
+name: Publish OCI charts
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/publish-charts.yml
+      - chart/**
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+    paths:
+      - .github/workflows/publish-charts.yml
+      - chart/**
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    name: Publish ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: meter
+            path: chart/meter
+          - name: telemetry-operator
+            path: chart/telemetry-operator
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v5
+      - name: Resolve chart tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_version=$(awk -F': *' '/^version:/ {print $2; exit}' "${{ matrix.path }}/Chart.yaml")
+          test -n "$chart_version"
+          echo "pr=0.0.0+pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "sha=0.0.0+sha-${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "master=${chart_version}+master" >> "$GITHUB_OUTPUT"
+          echo "release=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Push PR chart
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.tags.outputs.pr }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push PR SHA chart
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.tags.outputs.sha }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push master chart
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.tags.outputs.master }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push master SHA chart
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.tags.outputs.sha }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push release chart
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.tags.outputs.release }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,222 @@
+{{- define "meter.statefulset" -}}
+{{- $root := .root -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "meter.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+spec:
+  serviceName: {{ .serviceName }}
+  replicas: {{ .replicas }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "meter.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ .component }}
+  template:
+    metadata:
+      labels:
+        {{- include "meter.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ .component }}
+        {{- with $root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $root.Template.BasePath "/configmap.yaml") $root | sha256sum }}
+        {{- with $root.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "meter.serviceAccountName" $root }}
+      automountServiceAccountToken: {{ $root.Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $root.Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      {{- with $root.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: meter
+          image: {{ include "meter.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/meter/meter.yaml
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $root.Values.service.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ $root.Values.service.grpcPort }}
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with $root.Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $root.Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $root.Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: {{ $root.Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if $root.Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: {{ $root.Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/meter
+              readOnly: true
+            - name: data
+              mountPath: {{ $root.Values.persistence.mountPath }}
+            - name: cache
+              mountPath: {{ $root.Values.cache.mountPath }}
+            {{- if $root.Values.internalToken.enabled }}
+            - name: internal-token
+              mountPath: {{ $root.Values.internalToken.mountPath }}
+              subPath: internal-token
+              readOnly: true
+            {{- end }}
+            {{- with $root.Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .configName }}
+        {{- if not $root.Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- else if $root.Values.persistence.existingClaim }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $root.Values.persistence.existingClaim }}
+        {{- end }}
+        {{- if not $root.Values.cache.persistence.enabled }}
+        - name: cache
+          {{- if or $root.Values.cache.emptyDir.medium $root.Values.cache.emptyDir.sizeLimit }}
+          emptyDir:
+            {{- with $root.Values.cache.emptyDir.medium }}
+            medium: {{ . | quote }}
+            {{- end }}
+            {{- with $root.Values.cache.emptyDir.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- else if $root.Values.cache.persistence.existingClaim }}
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ $root.Values.cache.persistence.existingClaim }}
+        {{- end }}
+        {{- if $root.Values.internalToken.enabled }}
+        - name: internal-token
+          secret:
+            secretName: {{ include "meter.internalSecretName" $root }}
+            items:
+              - key: {{ $root.Values.internalToken.key }}
+                path: internal-token
+        {{- end }}
+        {{- with $root.Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if or (and $root.Values.persistence.enabled (not $root.Values.persistence.existingClaim)) (and $root.Values.cache.persistence.enabled (not $root.Values.cache.persistence.existingClaim)) }}
+  volumeClaimTemplates:
+    {{- if and $root.Values.persistence.enabled (not $root.Values.persistence.existingClaim) }}
+    - metadata:
+        name: data
+        {{- with $root.Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml $root.Values.persistence.accessModes | nindent 10 }}
+        {{- with $root.Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $root.Values.persistence.size }}
+    {{- end }}
+    {{- if and $root.Values.cache.persistence.enabled (not $root.Values.cache.persistence.existingClaim) }}
+    - metadata:
+        name: cache
+        {{- with $root.Values.cache.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml $root.Values.cache.persistence.accessModes | nindent 10 }}
+        {{- with $root.Values.cache.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $root.Values.cache.persistence.size }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{- if eq .Values.mode "standalone" }}
+{{ include "meter.statefulset" (dict "root" . "name" (include "meter.fullname" .) "component" "standalone" "replicas" 1 "resources" .Values.standalone.resources "configName" (include "meter.standaloneConfigName" .) "serviceName" (include "meter.standaloneHeadlessName" .)) }}
+{{- else }}
+{{ include "meter.statefulset" (dict "root" . "name" (include "meter.writerName" .) "component" "writer" "replicas" .Values.writer.replicas "resources" .Values.writer.resources "configName" (include "meter.writerConfigName" .) "serviceName" (include "meter.headlessName" .)) }}
+---
+{{ include "meter.statefulset" (dict "root" . "name" (include "meter.readerName" .) "component" "reader" "replicas" .Values.reader.replicas "resources" .Values.reader.resources "configName" (include "meter.readerConfigName" .) "serviceName" (include "meter.readerHeadlessName" .)) }}
+{{- end }}

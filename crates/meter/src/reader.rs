@@ -1,0 +1,1087 @@
+//! Read-only time series database access.
+//!
+//! This module provides [`TimeSeriesDbReader`], a read-only view of a time
+//! series database. It uses SlateDB's `DbReader` under the hood, which
+//! coexists with a production writer without fencing — unlike `Db::open()`,
+//! which always fences the previous writer.
+
+use std::collections::HashMap;
+use std::ops::RangeBounds;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use async_trait::async_trait;
+use common::storage::config::SlateDbStorageConfig;
+use futures::stream::{self, StreamExt};
+use moka::future::Cache;
+use uuid::Uuid;
+
+use crate::Namespace;
+use crate::error::{QueryError, Result};
+use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::minitsdb::MiniQueryReader;
+use crate::model::{
+    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, SeriesId,
+    TimeBucket,
+};
+use crate::query::{BucketQueryReader, QueryReader};
+use crate::storage::{StorageRead, StorageReader};
+use crate::tsdb::{
+    TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
+};
+
+// ── ReaderQueryReader ────────────────────────────────────────────────
+
+pub(crate) const DEFAULT_CACHE_CAPACITY: u64 = 50;
+
+/// QueryReader implementation for read-only access.
+///
+/// Wraps `Arc<MiniQueryReader>` per bucket (unlike `TsdbQueryReader` which
+/// uses owned `MiniQueryReader`).
+pub(crate) struct ReaderQueryReader {
+    mini_readers: HashMap<TimeBucket, Arc<MiniQueryReader<StorageReader>>>,
+}
+
+impl ReaderQueryReader {
+    fn new(readers: Vec<(TimeBucket, Arc<MiniQueryReader<StorageReader>>)>) -> Self {
+        Self {
+            mini_readers: readers.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl QueryReader for ReaderQueryReader {
+    async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+        Ok(self.mini_readers.keys().cloned().collect())
+    }
+
+    async fn forward_index(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index(series_ids).await
+    }
+
+    async fn inverted_index(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Label],
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index(terms).await
+    }
+
+    async fn all_inverted_index(
+        &self,
+        bucket: &TimeBucket,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.all_inverted_index().await
+    }
+
+    async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.label_values(label_name).await
+    }
+
+    async fn samples(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        metric_name: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.samples(series_id, metric_name, start_ms, end_ms).await
+    }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_one(series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<roaring::RoaringBitmap>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index_term(term).await
+    }
+}
+
+// ── TimeSeriesDbReader ───────────────────────────────────────────────
+
+/// A read-only view of a time series database.
+///
+/// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb)
+/// but without write operations. It uses SlateDB's `DbReader`, which opens the
+/// database without fencing — this means it can safely coexist with a production
+/// writer on the same storage path.
+///
+/// # When to Use
+///
+/// Use `TimeSeriesDbReader` when you need read-only access to production data
+/// without risking writer fencing:
+///
+/// - **Benchmarking**: Run queries against production data from a separate process.
+/// - **Ad hoc analysis**: Investigate metrics without affecting the running service.
+/// - **Testing**: Verify data written by a production writer.
+///
+/// # Example
+///
+/// ```ignore
+/// use common::StorageConfig;
+/// use slatedb::config::DbReaderOptions;
+/// use timeseries::TimeSeriesDbReader;
+///
+/// let storage = StorageConfig::default();
+/// let reader_options = DbReaderOptions::default();
+/// let reader = TimeSeriesDbReader::open(storage, reader_options, 50).await?;
+///
+/// let result = reader.query("rate(http_requests_total[5m])", None).await?;
+/// ```
+pub struct TimeSeriesDbReader {
+    namespace: Namespace,
+    storage: StorageReader,
+    /// LRU cache for read-only query buckets.
+    query_cache: Cache<TimeBucket, Arc<MiniQueryReader<StorageReader>>>,
+}
+
+impl TimeSeriesDbReader {
+    /// Opens a read-only view of the time series database.
+    ///
+    /// Uses SlateDB's `DbReader` which polls the manifest based on `reader_options`
+    /// to discover new data. Does **not** fence the existing writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend cannot be initialized.
+    pub async fn open(
+        namespace: Namespace,
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+    ) -> Result<Self> {
+        Self::open_inner(
+            namespace,
+            storage_config,
+            reader_options,
+            cache_capacity,
+            None,
+        )
+        .await
+    }
+
+    /// Opens a read-only view pinned to a specific checkpoint.
+    ///
+    /// Unlike [`open`](Self::open), the returned reader serves a frozen view
+    /// of the database as of the checkpoint and does not advance with newer
+    /// writes. The checkpoint must already exist (typically created via
+    /// `TimeSeriesDb::create_checkpoint`).
+    pub async fn open_at_checkpoint(
+        namespace: Namespace,
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Uuid,
+    ) -> Result<Self> {
+        Self::open_inner(
+            namespace,
+            storage_config,
+            reader_options,
+            cache_capacity,
+            Some(checkpoint_id),
+        )
+        .await
+    }
+
+    async fn open_inner(
+        namespace: Namespace,
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Option<Uuid>,
+    ) -> Result<Self> {
+        let reader = StorageReader::try_new(
+            &storage_config,
+            namespace.clone(),
+            reader_options,
+            checkpoint_id,
+        )
+        .await?;
+        Ok(Self::from_storage_with_capacity_scoped(
+            namespace,
+            reader,
+            cache_capacity,
+        ))
+    }
+
+    /// Creates a TimeSeriesDbReader from an existing storage implementation.
+    pub(crate) fn from_storage(storage: StorageReader) -> Self {
+        Self::from_storage_with_capacity(storage, DEFAULT_CACHE_CAPACITY)
+    }
+
+    fn from_storage_with_capacity(storage: StorageReader, cache_capacity: u64) -> Self {
+        Self::from_storage_with_capacity_scoped(Namespace::default(), storage, cache_capacity)
+    }
+
+    fn from_storage_with_capacity_scoped(
+        namespace: Namespace,
+        storage: StorageReader,
+        cache_capacity: u64,
+    ) -> Self {
+        let query_cache = Cache::builder().max_capacity(cache_capacity).build();
+        Self {
+            namespace,
+            storage,
+            query_cache,
+        }
+    }
+
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> StorageReader {
+        self.storage.clone()
+    }
+
+    /// Get a cached bucket reader, loading from storage if needed.
+    async fn get_or_load_bucket(&self, bucket: TimeBucket) -> Arc<MiniQueryReader<StorageReader>> {
+        let storage = self.storage.clone();
+        self.query_cache
+            .get_with(bucket, async move {
+                Arc::new(MiniQueryReader::new(
+                    self.namespace.clone(),
+                    bucket,
+                    storage,
+                ))
+            })
+            .await
+    }
+
+    // ── Public inherent methods ───────────────────────────────────────
+
+    /// Evaluates an instant PromQL query at a single point in time.
+    ///
+    /// If `time` is `None`, the current wall-clock time is used.
+    pub async fn query(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+    ) -> std::result::Result<QueryValue, QueryError> {
+        <Self as TsdbReadEngine>::eval_query(self, query, time, &QueryOptions::default()).await
+    }
+
+    /// Evaluates a range PromQL query over a time interval.
+    pub async fn query_range(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Send,
+        step: Duration,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        <Self as TsdbReadEngine>::eval_query_range(
+            self,
+            query,
+            range,
+            step,
+            &QueryOptions::default(),
+        )
+        .await
+    }
+
+    /// Returns the set of label-sets matching the given series matchers.
+    pub async fn series(
+        &self,
+        matchers: &[&str],
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        find_series_in_range(self, matchers, range).await
+    }
+
+    /// Returns the set of label names matching the given matchers.
+    pub async fn labels(
+        &self,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        find_labels_in_range(self, matchers, range).await
+    }
+
+    /// Closes the underlying storage reader, flushing any caches to disk.
+    pub async fn close(&self) -> Result<()> {
+        self.storage.close().await?;
+        Ok(())
+    }
+
+    /// Returns the set of values for a given label name.
+    pub async fn label_values(
+        &self,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        find_label_values_in_range(self, label_name, matchers, range).await
+    }
+
+    /// Returns metric metadata reconstructed from durable forward indexes.
+    ///
+    /// Metadata is namespace-scoped by the reader's storage handle. Descriptions
+    /// are not part of the forward-index format, so read-only results preserve
+    /// metric type and unit while leaving descriptions unset.
+    pub async fn metadata(
+        &self,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        let buckets = self
+            .storage
+            .get_buckets_in_range(None, None)
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let mut entries = Vec::new();
+        for bucket in buckets {
+            let index = self
+                .storage
+                .get_forward_index(bucket)
+                .await
+                .map_err(|error| QueryError::Execution(error.to_string()))?;
+            for (_, spec) in index.all_series() {
+                let Some(metric_name) = spec
+                    .labels
+                    .iter()
+                    .find(|label| label.name == "__name__")
+                    .map(|label| label.value.clone())
+                else {
+                    continue;
+                };
+                if metric.is_some_and(|filter| filter != metric_name) {
+                    continue;
+                }
+                let entry = MetricMetadata {
+                    metric_name,
+                    metric_type: spec.metric_type,
+                    description: None,
+                    unit: spec.unit,
+                };
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
+        Ok(entries)
+    }
+}
+
+// ── TsdbReadEngine for TimeSeriesDbReader ────────────────────────────
+
+/// Maximum number of buckets to load concurrently.
+const BUCKET_LOAD_CONCURRENCY: usize = 8;
+
+#[async_trait]
+impl TsdbReadEngine for TimeSeriesDbReader {
+    type QR = ReaderQueryReader;
+
+    async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
+        let buckets = self
+            .storage
+            .get_buckets_in_range(Some(start), Some(end))
+            .await?;
+
+        let readers: Vec<_> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let mini = self.get_or_load_bucket(bucket).await;
+                (bucket, mini)
+            })
+            .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
+
+        Ok(ReaderQueryReader::new(readers))
+    }
+
+    async fn make_query_reader_for_ranges(
+        &self,
+        ranges: &[(i64, i64)],
+    ) -> Result<ReaderQueryReader> {
+        let buckets = {
+            let _g = crate::promql::trace::Scope::enter("list_buckets");
+            self.storage.get_buckets_for_ranges(ranges).await?
+        };
+
+        let readers: Vec<_> = stream::iter(buckets)
+            .map(|bucket| async move {
+                let _g = crate::promql::trace::Scope::enter("bucket_load");
+                let mini = self.get_or_load_bucket(bucket).await;
+                (bucket, mini)
+            })
+            .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
+            .collect()
+            .await;
+
+        Ok(ReaderQueryReader::new(readers))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Series;
+    use crate::storage::{SharedInMemoryStorage, in_memory_shared_storage};
+
+    /// Writer storage plus the shared object store, so the tests can open
+    /// real (non-fencing) `DbReader`-backed readers over the same data.
+    async fn create_shared_storage() -> SharedInMemoryStorage {
+        in_memory_shared_storage().await
+    }
+
+    #[tokio::test]
+    async fn reader_sees_written_data() {
+        // Write data through internal Tsdb, then verify reader sees it.
+        let shared = create_shared_storage().await;
+
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+        let series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .label("status", "200")
+                .sample(1700000000000, 100.0)
+                .sample(1700000001000, 101.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Open reader on the same storage
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        // Query should find the data
+        let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
+        let result = reader
+            .query("http_requests_total", Some(query_time))
+            .await
+            .unwrap();
+
+        match result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 101.0);
+            }
+            _ => panic!("expected Vector result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_series_discovery() {
+        let shared = create_shared_storage().await;
+
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+        let series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .sample(1700000000000, 100.0)
+                .build(),
+            Series::builder("http_requests_total")
+                .label("method", "POST")
+                .sample(1700000000000, 50.0)
+                .build(),
+            Series::builder("cpu_usage")
+                .label("host", "server1")
+                .sample(1700000000000, 0.75)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        // Series discovery
+        let series = reader
+            .series(
+                &["{__name__=~\"http_requests_total|cpu_usage\"}"],
+                (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
+                    ..=(SystemTime::UNIX_EPOCH + Duration::from_secs(1700001000)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 3);
+
+        // Label names
+        let labels = reader
+            .labels(
+                None,
+                (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
+                    ..=(SystemTime::UNIX_EPOCH + Duration::from_secs(1700001000)),
+            )
+            .await
+            .unwrap();
+        assert!(labels.contains(&"__name__".to_string()));
+        assert!(labels.contains(&"method".to_string()));
+        assert!(labels.contains(&"host".to_string()));
+
+        // Label values
+        let values = reader
+            .label_values(
+                "method",
+                None,
+                (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
+                    ..=(SystemTime::UNIX_EPOCH + Duration::from_secs(1700001000)),
+            )
+            .await
+            .unwrap();
+        assert!(values.contains(&"GET".to_string()));
+        assert!(values.contains(&"POST".to_string()));
+    }
+
+    #[tokio::test]
+    async fn writer_and_reader_coexist_on_shared_storage() {
+        // Verify that a writer and a non-fencing reader can both operate on
+        // the same shared object store without interfering with each other.
+        let shared = create_shared_storage().await;
+
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+
+        // Write initial data
+        let series = vec![
+            Series::builder("metric_a")
+                .label("env", "prod")
+                .sample(1700000000000, 1.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // Open reader
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        // Reader sees initial data
+        let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000);
+        let result = reader.query("metric_a", Some(query_time)).await.unwrap();
+        match &result {
+            QueryValue::Vector(samples) => assert_eq!(samples.len(), 1),
+            _ => panic!("expected Vector"),
+        }
+
+        // Writer can still write more data (the DbReader does not fence it)
+        let more_series = vec![
+            Series::builder("metric_a")
+                .label("env", "prod")
+                .sample(1700000002000, 2.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(more_series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        // A reader opened after the new flush sees the new data. (The first
+        // reader's view advances only on manifest polls, so a fresh reader is
+        // used to assert visibility deterministically.)
+        let late_reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+        let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
+        let result2 = late_reader
+            .query("metric_a", Some(query_time2))
+            .await
+            .unwrap();
+        match &result2 {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 2.0);
+            }
+            _ => panic!("expected Vector"),
+        }
+
+        // The first reader still serves its original view.
+        let result3 = reader.query("metric_a", Some(query_time)).await.unwrap();
+        match &result3 {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.0);
+            }
+            _ => panic!("expected Vector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_query_range() {
+        let shared = create_shared_storage().await;
+
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+        let series = vec![
+            Series::builder("counter")
+                .label("job", "test")
+                .sample(1700000000000, 100.0)
+                .sample(1700000015000, 115.0)
+                .sample(1700000030000, 130.0)
+                .sample(1700000045000, 145.0)
+                .sample(1700000060000, 160.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
+        let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
+
+        let result = reader
+            .query_range("counter", start..=end, Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(!result.is_empty());
+        // Each RangeSample should have multiple data points
+        for rs in &result {
+            assert!(!rs.samples.is_empty());
+        }
+    }
+
+    /// Integration test using real SlateDB storage via TimeSeriesDb::open and
+    /// TimeSeriesDbReader::open on the same local path. This exercises the
+    /// actual DbReader open path and verifies writer + reader coexistence
+    /// without fencing.
+    ///
+    #[tokio::test]
+    async fn slatedb_writer_and_reader_coexist_no_fencing() {
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        };
+
+        // 1. Open writer and write data
+        let writer = TimeSeriesDb::open(
+            crate::Namespace::default(),
+            Config {
+                storage: storage_config.clone(),
+                flush_interval: Duration::from_secs(60),
+                retention: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .label("status", "200")
+                .sample(1700000000000, 100.0)
+                .sample(1700000001000, 101.0)
+                .build(),
+        ];
+        writer.write(series).await.unwrap();
+        writer.flush().await.unwrap();
+
+        // 2. Open reader via the public API (exercises create_storage_read + DbReader)
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(100),
+            skip_wal_replay: false,
+            ..Default::default()
+        };
+        let reader = TimeSeriesDbReader::open(
+            crate::Namespace::default(),
+            storage_config.clone(),
+            reader_options,
+            50,
+        )
+        .await
+        .unwrap();
+
+        // 3. Reader sees written data
+        let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
+        let result = reader
+            .query("http_requests_total", Some(query_time))
+            .await
+            .unwrap();
+        match &result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 101.0);
+            }
+            _ => panic!("expected Vector, got {:?}", result),
+        }
+
+        // 4. Writer can still write after reader opened (no fencing)
+        let more_series = vec![
+            Series::builder("http_requests_total")
+                .label("method", "GET")
+                .label("status", "200")
+                .sample(1700000002000, 102.0)
+                .build(),
+        ];
+        writer.write(more_series).await.unwrap();
+        writer.flush().await.unwrap();
+
+        // 5. Verify writer is still functional by querying through the writer
+        let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
+        let writer_result = writer
+            .query("http_requests_total", Some(query_time2))
+            .await
+            .unwrap();
+        match &writer_result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 102.0);
+            }
+            _ => panic!("expected Vector from writer, got {:?}", writer_result),
+        }
+
+        // 6. Verify reader can still query its original snapshot (not fenced).
+        //
+        // NOTE: Ideally we'd also verify that the reader sees the *new* data
+        // (value=102.0 at t=1700000002000) after its manifest_poll_interval
+        // elapses.  However, SlateDB's DbReader currently hits a
+        // "invalid sequence number ordering during merge" error when it
+        // encounters SSTs written after it opened, due to the merge operator
+        // seeing ascending sequence numbers.  Once that is resolved upstream
+        // this test should be extended to assert refresh visibility.
+        let reader_result = reader
+            .query("http_requests_total", Some(query_time))
+            .await
+            .unwrap();
+        match &reader_result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(
+                    samples.len(),
+                    1,
+                    "reader should still work after writer writes more data"
+                );
+                assert_eq!(samples[0].value, 101.0);
+            }
+            _ => panic!("expected Vector from reader, got {:?}", reader_result),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_persist_data_after_flush_and_writer_reopen() {
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        // given
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        };
+
+        let writer = TimeSeriesDb::open(
+            crate::Namespace::default(),
+            Config {
+                storage: storage_config.clone(),
+                flush_interval: Duration::from_secs(60),
+                retention: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let series = vec![
+            Series::builder("flush_durability_metric")
+                .label("env", "test")
+                .sample(1700000001000, 7.0)
+                .build(),
+        ];
+        writer.write(series).await.unwrap();
+
+        // when
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let reopened = TimeSeriesDb::open(
+            crate::Namespace::default(),
+            Config {
+                storage: storage_config,
+                flush_interval: Duration::from_secs(60),
+                retention: None,
+            },
+        )
+        .await
+        .unwrap();
+        let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
+        let result = reopened
+            .query("flush_durability_metric", Some(query_time))
+            .await
+            .unwrap();
+
+        // then
+        match result {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 7.0);
+            }
+            _ => panic!("expected Vector result after reopen"),
+        }
+    }
+
+    /// Writer and reader must return identical timestamps for query_range
+    /// with an inclusive end (`..=end`) where end is step-aligned. This
+    /// guards against the regression where double-converting through
+    /// `range_bounds_to_system_time` shifted the inclusive end by 1ms.
+    #[tokio::test]
+    async fn writer_and_reader_query_range_parity_at_boundary() {
+        use crate::model::QueryOptions;
+
+        let shared = create_shared_storage().await;
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+
+        // 5 samples at 15s intervals: t+0, t+15, t+30, t+45, t+60
+        let series = vec![
+            Series::builder("gauge")
+                .label("job", "test")
+                .sample(1700000000000, 1.0)
+                .sample(1700000015000, 2.0)
+                .sample(1700000030000, 3.0)
+                .sample(1700000045000, 4.0)
+                .sample(1700000060000, 5.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        // Use Tsdb directly for the writer side (same data, same storage)
+        let writer_tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
+        let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
+        let step = Duration::from_secs(15);
+
+        let reader_result = reader
+            .query_range("gauge", start..=end, step)
+            .await
+            .unwrap();
+        let writer_result = writer_tsdb
+            .eval_query_range("gauge", start..=end, step, &QueryOptions::default())
+            .await
+            .unwrap();
+
+        // Extract sorted (timestamp_ms, value) pairs for comparison
+        let extract_timestamps = |samples: &[RangeSample]| -> Vec<Vec<i64>> {
+            let mut result: Vec<Vec<i64>> = samples
+                .iter()
+                .map(|rs| rs.samples.iter().map(|(ts, _)| *ts).collect())
+                .collect();
+            result.sort();
+            result
+        };
+
+        let reader_ts = extract_timestamps(&reader_result);
+        let writer_ts = extract_timestamps(&writer_result);
+
+        assert_eq!(
+            reader_ts, writer_ts,
+            "reader and writer must produce identical timestamps for the same range query"
+        );
+        // The final step at t+60s must be present (inclusive end).
+        let all_ts: Vec<i64> = reader_result
+            .iter()
+            .flat_map(|rs| rs.samples.iter().map(|(ts, _)| *ts))
+            .collect();
+        assert!(
+            all_ts.contains(&1700000060000),
+            "inclusive end (t+60s) must be included; got timestamps: {:?}",
+            all_ts,
+        );
+    }
+
+    #[tokio::test]
+    async fn query_range_rejects_zero_step() {
+        let shared = create_shared_storage().await;
+
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+        let series = vec![
+            Series::builder("counter")
+                .label("job", "test")
+                .sample(1700000000000, 100.0)
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
+        let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
+
+        let result = reader
+            .query_range("counter", start..=end, Duration::ZERO)
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "expected InvalidQuery, got {:?}",
+            err
+        );
+    }
+
+    /// Writes data, creates a checkpoint, writes more data, then opens a
+    /// reader pinned to the checkpoint and verifies it sees only the data
+    /// that was durable at checkpoint time (not later writes).
+    #[tokio::test]
+    async fn should_open_reader_pinned_to_checkpoint() {
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        // given
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        };
+
+        let writer = TimeSeriesDb::open(
+            crate::Namespace::default(),
+            Config {
+                storage: storage_config.clone(),
+                flush_interval: Duration::from_secs(60),
+                retention: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        writer
+            .write(vec![
+                Series::builder("checkpointed")
+                    .label("env", "test")
+                    .sample(1700000001000, 1.0)
+                    .build(),
+            ])
+            .await
+            .unwrap();
+
+        // when — capture a checkpoint, then write a sample that must NOT be visible.
+        let checkpoint = writer.create_checkpoint().await.unwrap();
+
+        writer
+            .write(vec![
+                Series::builder("checkpointed")
+                    .label("env", "test")
+                    .sample(1700000002000, 2.0)
+                    .build(),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(100),
+            skip_wal_replay: true,
+            ..Default::default()
+        };
+        let reader = TimeSeriesDbReader::open_at_checkpoint(
+            crate::Namespace::default(),
+            storage_config,
+            reader_options,
+            50,
+            checkpoint.id,
+        )
+        .await
+        .unwrap();
+
+        // then — the pre-checkpoint sample is visible
+        let pre = reader
+            .query(
+                "checkpointed",
+                Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000)),
+            )
+            .await
+            .unwrap();
+        match &pre {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.0);
+            }
+            _ => panic!("expected Vector, got {:?}", pre),
+        }
+
+        // and — the post-checkpoint sample is NOT visible. PromQL lookback
+        // will surface the earlier (checkpointed) sample, so we assert the
+        // value is the pre-checkpoint one rather than the new write.
+        let post = reader
+            .query(
+                "checkpointed",
+                Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000)),
+            )
+            .await
+            .unwrap();
+        match &post {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(
+                    samples[0].value, 1.0,
+                    "reader pinned to checkpoint must not see writes made after the checkpoint",
+                );
+                assert_eq!(samples[0].timestamp_ms, 1700000002000);
+            }
+            _ => panic!("expected Vector, got {:?}", post),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_storage_uses_default_cache_capacity() {
+        let shared = create_shared_storage().await;
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+        assert_eq!(
+            reader.query_cache.policy().max_capacity(),
+            Some(DEFAULT_CACHE_CAPACITY)
+        );
+    }
+
+    #[tokio::test]
+    async fn from_storage_with_capacity_honors_custom_value() {
+        let shared = create_shared_storage().await;
+        let reader = TimeSeriesDbReader::from_storage_with_capacity(shared.reader().await, 123);
+        assert_eq!(reader.query_cache.policy().max_capacity(), Some(123));
+    }
+}
