@@ -1,0 +1,26 @@
+mode: standalone
+listeners: { http: "0.0.0.0:3200", grpc: "0.0.0.0:9092", otlp_grpc: "0.0.0.0:4317", jaeger_grpc: "0.0.0.0:14250" }
+storage:
+  type: SlateDb
+  path: retention
+  object_store: { type: Local, path: /data }
+  block_cache: { type: FoyerMemory, capacity: 33554432 }
+  meta_cache: { type: FoyerMemory, capacity: 8388608 }
+segment_duration_seconds: 1
+retention_seconds: 3
+page: { target_size_bytes: 4096, max_size_bytes: 1048576, max_traces: 1 }
+write: { durability: durable, remote_concurrency: 2, remote_retries: 1 }
+sharding: { virtual_shards: 2, io_concurrency_multiplier: 2, backend: standalone }
+auth:
+  unauthenticated: false
+  jwt:
+    jwks: { source: file, path: /app/regression/jwks.json }
+    refresh_interval_seconds: 300
+    request_timeout_seconds: 5
+  global: { read: [], write: [] }
+namespaces:
+  - name: regression
+    auth:
+      read:
+        - { type: basic, username: regression-reader, password: { source: literal, value: regression-read } }
+      write: []

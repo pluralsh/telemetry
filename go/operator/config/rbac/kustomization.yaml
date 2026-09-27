@@ -31,4 +31,7 @@ resources:
 - line_admin_role.yaml
 - line_editor_role.yaml
 - line_viewer_role.yaml
+- track_admin_role.yaml
+- track_editor_role.yaml
+- track_viewer_role.yaml
 

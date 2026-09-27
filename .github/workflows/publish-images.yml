@@ -51,6 +51,10 @@ jobs:
             image: ghcr.io/pluralsh/line
             context: .
             file: crates/line-server/Dockerfile
+          - name: track
+            image: ghcr.io/pluralsh/track
+            context: .
+            file: crates/track-server/Dockerfile
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
             context: go/operator
@@ -112,6 +116,8 @@ jobs:
             image: ghcr.io/pluralsh/meter
           - name: line
             image: ghcr.io/pluralsh/line
+          - name: track
+            image: ghcr.io/pluralsh/track
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
     steps:

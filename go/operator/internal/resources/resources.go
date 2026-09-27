@@ -29,6 +29,7 @@ const (
 	ConfigHashAnnotation = "telemetry.plural.sh/config-hash"
 	MeterNameAnnotation  = "telemetry.plural.sh/meter-name"
 	LineNameAnnotation   = "telemetry.plural.sh/line-name"
+	TrackNameAnnotation  = "telemetry.plural.sh/track-name"
 	TokenKey             = "internal-token"
 	InternalTokenPath    = "/var/run/secrets/meter/internal-token"
 
@@ -78,6 +79,7 @@ func (e *VolumeError) Error() string {
 type StatefulSetInput struct {
 	Meter                   *telemetryv1alpha1.Meter
 	Line                    *telemetryv1alpha1.Line
+	Track                   *telemetryv1alpha1.Track
 	Component               Component
 	ConfigSecretName        string
 	InternalTokenSecretName string
@@ -107,6 +109,13 @@ var (
 		DataPath: "/var/lib/line", CachePath: "/var/cache/line",
 		InternalTokenPath: "/var/run/secrets/line/internal-token", HTTPPort: 3100, GRPCPort: 9091,
 		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: LineNameAnnotation,
+	}
+	TrackDescriptor = Descriptor{
+		Kind: "Track", Name: "track", Image: "ghcr.io/pluralsh/track", ConfigKey: "track.yaml",
+		ConfigPath: "/etc/track/track.yaml", SecretsPath: "/etc/track/secrets",
+		DataPath: "/var/lib/track", CachePath: "/var/cache/track",
+		InternalTokenPath: "/var/run/secrets/track/internal-token", HTTPPort: 3200, GRPCPort: 9092,
+		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: TrackNameAnnotation,
 	}
 )
 
@@ -143,6 +152,15 @@ func ForLine(line *telemetryv1alpha1.Line) *Product {
 	}
 }
 
+func ForTrack(track *telemetryv1alpha1.Track) *Product {
+	return &Product{
+		ObjectMeta: track.ObjectMeta, Descriptor: TrackDescriptor, Mode: track.Spec.Mode,
+		Version: track.Spec.Version, Image: track.Spec.Image, Storage: track.Spec.Config.Storage, Writer: track.Spec.Writer,
+		Reader: track.Spec.Reader, Service: track.Spec.Service, Ingress: track.Spec.Ingress,
+		ServiceAccountSpec: track.Spec.ServiceAccount, ConfigHash: track.Status.ConfigHash,
+	}
+}
+
 func product(value any) *Product {
 	switch value := value.(type) {
 	case *Product:
@@ -151,6 +169,8 @@ func product(value any) *Product {
 		return ForMeter(value)
 	case *telemetryv1alpha1.Line:
 		return ForLine(value)
+	case *telemetryv1alpha1.Track:
+		return ForTrack(value)
 	default:
 		panic(fmt.Sprintf("unsupported telemetry product %T", value))
 	}
@@ -330,6 +350,8 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	var meter *Product
 	if input.Line != nil {
 		meter = ForLine(input.Line)
+	} else if input.Track != nil {
+		meter = ForTrack(input.Track)
 	} else {
 		meter = ForMeter(input.Meter)
 	}

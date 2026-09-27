@@ -1,0 +1,732 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
+
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use meter_server::auth::{Permission, authorize};
+use opentelemetry_proto::tonic::{
+    collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
+    common::v1::{AnyValue, KeyValue, any_value},
+    resource::v1::Resource,
+    trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData, span},
+};
+use prost::Message;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use track::{Namespace, QueryOptions, Trace, TraceId, trace_batches};
+
+use crate::{
+    AppState,
+    config::{NamespaceConfig, ServerMode},
+};
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route("/-/ready", get(readiness))
+        .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
+        .route("/write/ns/{namespace}/api/v2/spans", post(zipkin))
+        .route(
+            "/read/ns/{namespace}/api/traces/{trace_id}",
+            get(trace_by_id),
+        )
+        .route(
+            "/read/ns/{namespace}/api/v2/traces/{trace_id}",
+            get(trace_by_id),
+        )
+        .route("/read/ns/{namespace}/api/search", get(search))
+        .route("/read/ns/{namespace}/api/search/tags", get(tag_names))
+        .route("/read/ns/{namespace}/api/v1/tags", get(tag_names))
+        .route("/read/ns/{namespace}/api/v2/search/tags", get(tag_names_v2))
+        .route(
+            "/read/ns/{namespace}/api/search/tag/{name}/values",
+            get(tag_values),
+        )
+        .route(
+            "/read/ns/{namespace}/api/v1/tag/{name}/values",
+            get(tag_values),
+        )
+        .route(
+            "/read/ns/{namespace}/api/v2/search/tag/{name}/values",
+            get(tag_values_v2),
+        )
+        .route("/read/ns/{namespace}/api/echo", get(echo))
+        .route(
+            "/read/ns/{namespace}/api/metrics/query_range",
+            get(metrics_unsupported),
+        )
+        .with_state(state)
+}
+
+async fn readiness(State(state): State<AppState>) -> StatusCode {
+    if state.is_ready().await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn otlp_http(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    require_write_mode(&state)?;
+    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
+    check_size(&state, body.len())?;
+    let _permit = state
+        .request_limit
+        .acquire()
+        .await
+        .map_err(|_| ApiError::unavailable("server is shutting down"))?;
+    let is_json = content_type(&headers) == Some("application/json");
+    let request = if is_json {
+        serde_json::from_slice::<ExportTraceServiceRequest>(&body).map_err(ApiError::bad_request)?
+    } else if matches!(
+        content_type(&headers),
+        Some(
+            "application/x-protobuf"
+                | "application/protobuf"
+                | "application/octet-stream"
+                | "application/vnd.google.protobuf"
+        )
+    ) {
+        ExportTraceServiceRequest::decode(body).map_err(ApiError::bad_request)?
+    } else {
+        return Err(ApiError::unsupported_media());
+    };
+    let batches = trace_batches(request).map_err(ApiError::bad_request)?;
+    write_batches(&state, namespace, batches).await?;
+    if is_json {
+        Ok(Json(json!({})).into_response())
+    } else {
+        let response = ExportTraceServiceResponse {
+            partial_success: None,
+        };
+        Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-protobuf")],
+            response.encode_to_vec(),
+        )
+            .into_response())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZipkinSpan {
+    trace_id: String,
+    id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    timestamp: u64,
+    #[serde(default)]
+    duration: u64,
+    #[serde(default)]
+    local_endpoint: Option<ZipkinEndpoint>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    annotations: Vec<ZipkinAnnotation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZipkinEndpoint {
+    #[serde(default)]
+    service_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZipkinAnnotation {
+    timestamp: u64,
+    value: String,
+}
+
+async fn zipkin(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    require_write_mode(&state)?;
+    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
+    check_size(&state, body.len())?;
+    if content_type(&headers) != Some("application/json") {
+        return Err(ApiError::unsupported_media());
+    }
+    let spans: Vec<ZipkinSpan> = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    if spans.is_empty() {
+        return Err(ApiError::bad_request(
+            "Zipkin request must contain at least one span",
+        ));
+    }
+    let mut resources = Vec::new();
+    for value in spans {
+        let trace_id = parse_zipkin_trace_id(&value.trace_id)?;
+        let span_id = parse_hex_exact(&value.id, 8, "Zipkin span ID")?;
+        let parent_span_id = value
+            .parent_id
+            .as_deref()
+            .map(|value| parse_hex_exact(value, 8, "Zipkin parent span ID"))
+            .transpose()?
+            .unwrap_or_default();
+        let service_name = value
+            .local_endpoint
+            .and_then(|endpoint| endpoint.service_name);
+        let status = value.tags.get("error").map(|message| Status {
+            message: message.clone(),
+            code: 2,
+        });
+        let attributes = value
+            .tags
+            .into_iter()
+            .map(|(key, value)| string_attribute(key, value))
+            .collect();
+        let events = value
+            .annotations
+            .into_iter()
+            .map(|annotation| span::Event {
+                time_unix_nano: annotation.timestamp.saturating_mul(1_000),
+                name: annotation.value,
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+            })
+            .collect();
+        let resource = service_name.map(|service| Resource {
+            attributes: vec![string_attribute("service.name", service)],
+            dropped_attributes_count: 0,
+        });
+        resources.push(ResourceSpans {
+            resource,
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: trace_id.as_bytes().to_vec(),
+                    span_id,
+                    parent_span_id,
+                    name: value.name,
+                    kind: zipkin_kind(value.kind.as_deref()),
+                    start_time_unix_nano: value.timestamp.saturating_mul(1_000),
+                    end_time_unix_nano: value
+                        .timestamp
+                        .saturating_add(value.duration)
+                        .saturating_mul(1_000),
+                    attributes,
+                    events,
+                    status,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+    let batches =
+        track::trace_batches_from_resource_spans(resources).map_err(ApiError::bad_request)?;
+    write_batches(&state, namespace, batches).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn trace_by_id(
+    State(state): State<AppState>,
+    Path((namespace, trace_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_read_mode(&state)?;
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let _permit = state
+        .query_limit
+        .acquire()
+        .await
+        .map_err(|_| ApiError::unavailable("server is shutting down"))?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let trace_id = TraceId::from_str(&trace_id).map_err(ApiError::bad_request)?;
+    let trace = state
+        .db
+        .get_trace(&namespace, trace_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("trace not found"))?;
+    let data = TracesData {
+        resource_spans: trace.resource_spans,
+    };
+    if accepts_protobuf(&headers) {
+        Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-protobuf")],
+            data.encode_to_vec(),
+        )
+            .into_response())
+    } else {
+        Ok(Json(data).into_response())
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    end: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Value>, ApiError> {
+    require_read_mode(&state)?;
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let _permit = state
+        .query_limit
+        .acquire()
+        .await
+        .map_err(|_| ApiError::unavailable("server is shutting down"))?;
+    let limit = params.limit.unwrap_or(20);
+    if limit == 0 || limit > state.config.request.max_query_limit {
+        return Err(ApiError::bad_request("limit is outside configured range"));
+    }
+    let query = params
+        .q
+        .or_else(|| params.tags.map(|tags| legacy_tags_query(&tags)))
+        .unwrap_or_else(|| "{}".into());
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let results = state
+        .db
+        .query_traceql(
+            &namespace,
+            params.start.unwrap_or(0).saturating_mul(1_000_000_000),
+            params
+                .end
+                .unwrap_or(u64::MAX / 1_000_000_000)
+                .saturating_mul(1_000_000_000),
+            &query,
+            QueryOptions {
+                limit,
+                max_candidate_traces: state.config.request.max_candidates,
+                max_spans_per_trace: state.config.request.max_spans_per_trace,
+                max_concurrency: state.config.request.query_concurrency,
+            },
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
+    let traces = results
+        .into_iter()
+        .map(|result| {
+            json!({
+                "traceID": result.trace_id.to_string(),
+                "rootServiceName": result.root_service_name.unwrap_or_default(),
+                "rootTraceName": result.root_span_name.unwrap_or_default(),
+                "startTimeUnixNano": result.start_ns.to_string(),
+                "durationMs": result.end_ns.saturating_sub(result.start_ns) as f64 / 1_000_000.0,
+                "spanSet": {"matched": result.matched_spans.len()},
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(
+        json!({"traces": traces, "metrics": {"inspectedTraces": traces.len()}}),
+    ))
+}
+
+async fn tag_names(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<TagParams>,
+) -> Result<Json<Value>, ApiError> {
+    let (resource, span) = scoped_tag_names(
+        scan_traces(&state, &namespace, &headers).await?,
+        params.scope.as_deref(),
+    );
+    let names = resource.union(&span).collect::<BTreeSet<_>>();
+    Ok(Json(json!({"tagNames": names})))
+}
+
+async fn tag_names_v2(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<TagParams>,
+) -> Result<Json<Value>, ApiError> {
+    let (resource, span) = scoped_tag_names(
+        scan_traces(&state, &namespace, &headers).await?,
+        params.scope.as_deref(),
+    );
+    let mut scopes = Vec::new();
+    if params
+        .scope
+        .as_deref()
+        .is_none_or(|scope| scope == "resource")
+    {
+        scopes.push(json!({"name": "resource", "tags": resource}));
+    }
+    if params.scope.as_deref().is_none_or(|scope| scope == "span") {
+        scopes.push(json!({"name": "span", "tags": span}));
+    }
+    Ok(Json(json!({"scopes": scopes})))
+}
+
+async fn tag_values(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let values = tag_value_set(scan_traces(&state, &namespace, &headers).await?, &name);
+    Ok(Json(
+        json!({"tagValues": values.into_iter().map(|(_, value)| value).collect::<BTreeSet<_>>()}),
+    ))
+}
+
+async fn tag_values_v2(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let values = tag_value_set(scan_traces(&state, &namespace, &headers).await?, &name)
+        .into_iter()
+        .map(|(kind, value)| json!({"type": kind, "value": value}))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"tagValues": values})))
+}
+
+#[derive(Default, Deserialize)]
+struct TagParams {
+    scope: Option<String>,
+}
+
+async fn scan_traces(
+    state: &AppState,
+    namespace: &str,
+    headers: &HeaderMap,
+) -> Result<Vec<Trace>, ApiError> {
+    require_read_mode(state)?;
+    authorize_namespace(state, namespace, headers, Permission::Read).await?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    state
+        .db
+        .scan_traces(&namespace, state.config.request.max_candidates)
+        .await
+        .map_err(ApiError::internal)
+}
+
+fn scoped_tag_names(
+    traces: Vec<Trace>,
+    requested_scope: Option<&str>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut resource_names = BTreeSet::new();
+    let mut span_names = BTreeSet::new();
+    for trace in traces {
+        for resource in trace.resource_spans {
+            if requested_scope.is_none_or(|scope| scope == "resource")
+                && let Some(resource) = resource.resource
+            {
+                resource_names.extend(resource.attributes.into_iter().map(|value| value.key));
+            }
+            if requested_scope.is_none_or(|scope| scope == "span") {
+                for scope in resource.scope_spans {
+                    for span in scope.spans {
+                        span_names.extend(span.attributes.into_iter().map(|value| value.key));
+                    }
+                }
+            }
+        }
+    }
+    (resource_names, span_names)
+}
+
+fn tag_value_set(traces: Vec<Trace>, name: &str) -> BTreeSet<(String, String)> {
+    let (scope, name) = if let Some(name) = name.strip_prefix("resource.") {
+        (Some("resource"), name)
+    } else if let Some(name) = name.strip_prefix("span.") {
+        (Some("span"), name)
+    } else {
+        (None, name)
+    };
+    let mut values = BTreeSet::new();
+    for trace in traces {
+        for resource in trace.resource_spans {
+            if scope != Some("span")
+                && let Some(resource) = resource.resource
+            {
+                collect_values(&resource.attributes, name, &mut values);
+            }
+            if scope != Some("resource") {
+                for scope in resource.scope_spans {
+                    for span in scope.spans {
+                        collect_values(&span.attributes, name, &mut values);
+                    }
+                }
+            }
+        }
+    }
+    values
+}
+
+async fn echo(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_read_mode(&state)?;
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+async fn metrics_unsupported() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "TraceQL metrics execution is not implemented",
+    )
+        .into_response()
+}
+
+async fn write_batches(
+    state: &AppState,
+    namespace: String,
+    batches: Vec<track::TraceBatch>,
+) -> Result<(), ApiError> {
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    state
+        .route_write(&namespace, batches, ulid::Ulid::new().to_string())
+        .await
+        .map_err(ApiError::unavailable)
+}
+
+async fn authorize_namespace(
+    state: &AppState,
+    namespace: &str,
+    headers: &HeaderMap,
+    permission: Permission,
+) -> Result<NamespaceConfig, ApiError> {
+    let config = state
+        .namespaces
+        .get(namespace)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("unknown namespace"))?;
+    if authorize(
+        headers,
+        state.config.auth.unauthenticated,
+        &state.config.auth.global,
+        &config.auth,
+        state.jwt.as_ref(),
+        namespace,
+        permission,
+    )
+    .await
+    {
+        Ok(config)
+    } else {
+        Err(ApiError::unauthorized())
+    }
+}
+
+fn require_write_mode(state: &AppState) -> Result<(), ApiError> {
+    if state.config.mode == ServerMode::Reader {
+        Err(ApiError::not_found("write routes are disabled"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_read_mode(state: &AppState) -> Result<(), ApiError> {
+    if state.config.mode == ServerMode::Writer {
+        Err(ApiError::not_found("read routes are disabled"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_size(state: &AppState, size: usize) -> Result<(), ApiError> {
+    if size > state.config.request.max_request_bytes {
+        Err(ApiError::too_large())
+    } else {
+        Ok(())
+    }
+}
+
+fn content_type(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+}
+
+fn accepts_protobuf(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("protobuf") || value.contains("octet-stream"))
+}
+
+fn parse_zipkin_trace_id(value: &str) -> Result<TraceId, ApiError> {
+    let normalized = if value.len() == 16 {
+        format!("{value:0>32}")
+    } else {
+        value.to_owned()
+    };
+    TraceId::from_str(&normalized).map_err(ApiError::bad_request)
+}
+
+fn parse_hex_exact(value: &str, bytes: usize, name: &str) -> Result<Vec<u8>, ApiError> {
+    if value.len() != bytes * 2 {
+        return Err(ApiError::bad_request(format!(
+            "{name} must contain exactly {} hex characters",
+            bytes * 2
+        )));
+    }
+    (0..bytes)
+        .map(|index| {
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(ApiError::bad_request)
+        })
+        .collect()
+}
+
+fn zipkin_kind(value: Option<&str>) -> i32 {
+    match value.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "SERVER" => span::SpanKind::Server as i32,
+        "CLIENT" => span::SpanKind::Client as i32,
+        "PRODUCER" => span::SpanKind::Producer as i32,
+        "CONSUMER" => span::SpanKind::Consumer as i32,
+        _ => span::SpanKind::Internal as i32,
+    }
+}
+
+fn string_attribute(key: impl Into<String>, value: impl Into<String>) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.into())),
+        }),
+    }
+}
+
+fn legacy_tags_query(tags: &str) -> String {
+    let expressions = tags
+        .split_whitespace()
+        .filter_map(|tag| tag.split_once('='))
+        .map(|(name, value)| {
+            format!(
+                r#"resource."{}" = {}"#,
+                name.replace('"', r#"\""#),
+                serde_json::to_string(value).unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    if expressions.is_empty() {
+        "{}".into()
+    } else {
+        format!("{{ {} }}", expressions.join(" && "))
+    }
+}
+
+fn collect_values(attributes: &[KeyValue], name: &str, output: &mut BTreeSet<(String, String)>) {
+    for attribute in attributes.iter().filter(|attribute| attribute.key == name) {
+        let value = match attribute
+            .value
+            .as_ref()
+            .and_then(|value| value.value.as_ref())
+        {
+            Some(any_value::Value::StringValue(value)) => ("string", value.clone()),
+            Some(any_value::Value::BoolValue(value)) => ("bool", value.to_string()),
+            Some(any_value::Value::IntValue(value)) => ("int", value.to_string()),
+            Some(any_value::Value::DoubleValue(value)) => ("float", value.to_string()),
+            Some(any_value::Value::BytesValue(value)) => {
+                use base64::Engine;
+                (
+                    "string",
+                    base64::engine::general_purpose::STANDARD.encode(value),
+                )
+            }
+            _ => continue,
+        };
+        output.insert((value.0.to_owned(), value.1));
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: error.to_string(),
+        }
+    }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        }
+    }
+
+    fn not_found(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: error.to_string(),
+        }
+    }
+
+    fn unavailable(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: error.to_string(),
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "authentication required".into(),
+        }
+    }
+
+    fn unsupported_media() -> Self {
+        Self {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "unsupported content type".into(),
+        }
+    }
+
+    fn too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "request body exceeds configured limit".into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({"status":"error","error":self.message})),
+        )
+            .into_response()
+    }
+}

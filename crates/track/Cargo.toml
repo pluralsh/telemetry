@@ -1,11 +1,37 @@
 [package]
 name = "track"
-description = "Placeholder for the future Track traces product"
+description = "Namespace-aware OTLP trace storage built on immutable pages and SlateDB"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+common = { version = "0.1.0", path = "../common" }
+futures.workspace = true
+lalrpop-util = "0.23.1"
+logos = "0.16.1"
+opentelemetry-proto.workspace = true
+prost.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sharding = { path = "../sharding" }
+slatedb.workspace = true
+snap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+lalrpop = "0.23.1"

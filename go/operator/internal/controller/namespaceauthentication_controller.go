@@ -71,13 +71,14 @@ func (r *NamespaceAuthenticationReconciler) SetupWithManager(mgr ctrl.Manager) e
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForSecret)).
 		Watches(&telemetryv1alpha1.Meter{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForMeter)).
 		Watches(&telemetryv1alpha1.Line{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForLine)).
+		Watches(&telemetryv1alpha1.Track{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForTrack)).
 		Named("namespaceauthentication").
 		Complete(r)
 }
 
 func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *telemetryv1alpha1.NamespaceAuthentication) error {
-	if auth.Spec.DataStoreRef.Kind != dataStoreMeter && auth.Spec.DataStoreRef.Kind != dataStoreLine {
-		return fmt.Errorf("dataStoreRef.kind must be Meter or Line")
+	if auth.Spec.DataStoreRef.Kind != dataStoreMeter && auth.Spec.DataStoreRef.Kind != dataStoreLine && auth.Spec.DataStoreRef.Kind != dataStoreTrack {
+		return fmt.Errorf("dataStoreRef.kind must be Meter, Line, or Track")
 	}
 	if auth.Spec.DataStoreRef.Name == "" || auth.Spec.Namespace == "" || auth.Spec.Username == "" {
 		return fmt.Errorf("dataStoreRef.name, namespace, and username are required")
@@ -93,8 +94,12 @@ func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *
 		if err := r.Get(ctx, key, &telemetryv1alpha1.Meter{}); err != nil {
 			return fmt.Errorf("referenced Meter is unavailable: %w", err)
 		}
-	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Line{}); err != nil {
-		return fmt.Errorf("referenced Line is unavailable: %w", err)
+	} else if auth.Spec.DataStoreRef.Kind == dataStoreLine {
+		if err := r.Get(ctx, key, &telemetryv1alpha1.Line{}); err != nil {
+			return fmt.Errorf("referenced Line is unavailable: %w", err)
+		}
+	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Track{}); err != nil {
+		return fmt.Errorf("referenced Track is unavailable: %w", err)
 	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.SecretKeyRef.Name}, secret); err != nil {
@@ -124,6 +129,10 @@ func (r *NamespaceAuthenticationReconciler) authenticationsForMeter(ctx context.
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForLine(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.authenticationsForDataStore(ctx, obj, dataStoreLine)
+}
+
+func (r *NamespaceAuthenticationReconciler) authenticationsForTrack(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreTrack)
 }
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForDataStore(ctx context.Context, obj client.Object, kind string) []reconcile.Request {

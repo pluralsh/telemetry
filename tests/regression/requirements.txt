@@ -1,6 +1,7 @@
 pytest==8.4.2
 ruff==0.13.2
 blake3==1.0.9
+grpcio==1.75.1
 opentelemetry-proto==1.45.0
 protobuf==7.36.2
 PyJWT==2.15.0

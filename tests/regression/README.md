@@ -53,8 +53,27 @@ run with `--extended`. Line stores a logical expiry deadline in page metadata,
 so reads stop returning expired pages independently of SlateDB compaction;
 physical TTL remains enabled for eventual reclamation.
 
+## Track
+
+`products/track/` runs Tempo 2.8.2 as the semantic oracle and a two-writer,
+one-reader Track deployment over deterministic local MinIO storage. The Python
+modules in `harness/track/` build typed, deterministic OTLP fixtures, encode
+OTLP protobuf and Zipkin JSON, exercise OTLP HTTP and gRPC, and normalize only
+ordering and API-envelope differences before comparing traces.
+
+The live suite compares trace-by-ID, search, typed TraceQL predicates, tag
+names and values, and aggregate non-metrics TraceQL behavior. It also covers
+static-shard forwarding, Basic/JWT authorization, namespace isolation, reader
+mode, and Zipkin ingestion. Reader restart and short-retention persistence
+checks run with `--extended`. Track exposes Jaeger collector gRPC on host ports
+`14251` and `14252`; the topology keeps those routes available for collector
+compatibility even though the host harness currently exercises OTLP and Zipkin.
+
 Host ports are Loki `13100`, Line `13101`, retention Line `13102`, Prometheus
-`19090`, Meter writers `18080`/`18081`, Meter reader `18082`, and MinIO `19000`.
+`19090`, Meter writers `18080`/`18081`, Meter reader `18082`, and Meter MinIO
+`19000`. Track uses Tempo `13200`, writers `13201`/`13202`, reader `13203`,
+retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
+Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`.
 
 The optional Kubernetes scenario is not part of normal Cargo tests:
 

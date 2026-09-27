@@ -27,4 +27,13 @@ resources:
   kind: NamespaceAuthentication
   path: github.com/pluralsh/telemetry/go/operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: plural.sh
+  group: telemetry
+  kind: Track
+  path: github.com/pluralsh/telemetry/go/operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

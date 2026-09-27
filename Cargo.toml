@@ -28,7 +28,7 @@ kube = { version = "4.2", default-features = false, features = ["client", "runti
 metrics = "0.24"
 mixtrics = "0.2"
 moka = { version = "0.12", features = ["future"] }
-opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "gen-tonic-messages"] }
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "trace", "gen-tonic-messages"] }
 prost = "0.13"
 prost-build = "0.13"
 promql-parser = "0.8"

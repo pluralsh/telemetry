@@ -11,6 +11,24 @@ and namespace conventions for Loki-compatible logs. Start from
 `/app/config/line.example.yaml`. Line listens on HTTP port `3100` and internal gRPC port `9091` in
 the example configuration.
 
+`track-server --config <path>` serves Tempo-compatible trace reads and OTLP/Zipkin writes. Start
+from [`track.example.yaml`](track.example.yaml). It listens on HTTP `3200`, internal writer gRPC
+`9092`, and OTLP TraceService gRPC `4317`. OTLP HTTP is available at
+`/write/ns/{namespace}/v1/traces`; OTLP gRPC takes the namespace from `x-scope-orgid`. Zipkin v2
+JSON is accepted at `/write/ns/{namespace}/api/v2/spans`. Jaeger collector and Thrift transports
+are not currently implemented; `/write/ns/{namespace}/api/traces` returns `501` and does not
+pretend that JSON is Jaeger Thrift.
+
+Track reads are rooted at `/read/ns/{namespace}`: trace-by-ID v1/v2, TraceQL `/api/search`,
+v1/v2 tag names and values, and `/api/echo`. TraceQL metrics routes return `501` because metrics
+execution is deliberately outside Track's current scope. JSON is the default trace response;
+request a protobuf media type in `Accept` for protobuf. Reader mode disables writes, writer mode
+disables reads, and standalone mode enables both.
+
+Track supports standalone and static shard ownership. The checked-in server reports Kubernetes
+Track sharding as unsupported at startup rather than silently running with incorrect ownership;
+use static ownership for split deployments until the Track Kubernetes lifecycle is added.
+
 Defaults apply when a field or section is omitted. Fields described as required must be present
 when their containing section or tagged variant is present.
 

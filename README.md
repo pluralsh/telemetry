@@ -8,7 +8,13 @@ The project breakdown is, following a musical theme:
 
 1. Meter - Prometheus compatible datastore with built-in OTLP ingest as well as remote write
 2. Line - Loki-compatible log store
-3. Track - Tempo-compatible metrics store
+3. Track - Tempo-compatible trace store
+
+Track accepts OTLP over HTTP (`4318`-style namespace routes) and gRPC (`4317`),
+Zipkin JSON, and Jaeger collector gRPC (`14250`). Its Tempo-compatible read API
+includes trace lookup, TraceQL search, and canonical v1/v2 tag discovery. In
+sharded Kubernetes deployments, readers fan out across all virtual shards while
+writers acquire stable shard ranges using StatefulSet membership and leases.
 
 We might add other interesting slatedb + rust projects in here as well, but they'll all be datastore focused as a core guiding principle.  Many of these are also inspired or utilize implementations from the [Opendata](https://www.opendata.dev/) project to bootstrap the implementation.
 

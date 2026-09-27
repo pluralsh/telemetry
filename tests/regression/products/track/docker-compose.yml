@@ -1,0 +1,98 @@
+name: track-regression
+
+x-track-environment: &track-environment
+  AWS_ACCESS_KEY_ID: track
+  AWS_SECRET_ACCESS_KEY: track-regression-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+  TRACK_INTERNAL_TOKEN: internal-regression-token
+
+x-track: &track
+  build:
+    context: ../../../..
+    dockerfile: crates/track-server/Dockerfile
+  environment: *track-environment
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/regression.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/regression.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "13200:3200"
+      - "14319:4317"
+      - "14320:4318"
+      - "19411:9411"
+      - "14253:14250"
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: track
+      MINIO_ROOT_PASSWORD: track-regression-secret
+    volumes: ["minio-data:/data"]
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+    environment:
+      MC_HOST_local: http://track:track-regression-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_started
+    command: ["mb", "--ignore-existing", "local/track-regression"]
+    restart: on-failure
+
+  track-writer-0:
+    <<: *track
+    command: ["--config", "/app/regression/writer-0.yaml"]
+    volumes:
+      - ./writer-0.yaml:/app/regression/writer-0.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports:
+      - "13201:3200"
+      - "14317:4317"
+      - "14251:14250"
+
+  track-writer-1:
+    <<: *track
+    command: ["--config", "/app/regression/writer-1.yaml"]
+    volumes:
+      - ./writer-1.yaml:/app/regression/writer-1.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports:
+      - "13202:3200"
+      - "14318:4317"
+      - "14252:14250"
+
+  track-reader:
+    <<: *track
+    command: ["--config", "/app/regression/reader.yaml"]
+    volumes:
+      - ./reader.yaml:/app/regression/reader.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["13203:3200"]
+
+  track-retention:
+    profiles: ["extended"]
+    build:
+      context: ../../../..
+      dockerfile: crates/track-server/Dockerfile
+    user: "0:0"
+    command: ["--config", "/app/regression/retention.yaml"]
+    volumes:
+      - ./retention.yaml:/app/regression/retention.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+      - track-retention-data:/data
+    ports: ["13204:3200"]
+
+volumes:
+  tempo-data:
+  minio-data:
+  track-retention-data:

@@ -15,3 +15,11 @@ pub mod line {
         }
     }
 }
+
+pub mod track {
+    pub mod internal {
+        pub mod v1 {
+            tonic::include_proto!("track.internal.v1");
+        }
+    }
+}

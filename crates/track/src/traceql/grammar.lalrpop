@@ -1,0 +1,89 @@
+use super::ast::{BinaryOp, FieldExpr, SourceSpan, UnaryOp};
+use super::parser::{ExprToken, combine_binary, combine_unary};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = ();
+
+    enum ExprToken {
+        "operand" => ExprToken::Operand(<FieldExpr>),
+        "||" => ExprToken::Or(<SourceSpan>),
+        "&&" => ExprToken::And(<SourceSpan>),
+        "=" => ExprToken::Equal(<SourceSpan>),
+        "!=" => ExprToken::NotEqual(<SourceSpan>),
+        "=~" => ExprToken::Regex(<SourceSpan>),
+        "!~" => ExprToken::NotRegex(<SourceSpan>),
+        "<" => ExprToken::Less(<SourceSpan>),
+        "<=" => ExprToken::LessEqual(<SourceSpan>),
+        ">" => ExprToken::Greater(<SourceSpan>),
+        ">=" => ExprToken::GreaterEqual(<SourceSpan>),
+        "+" => ExprToken::Plus(<SourceSpan>),
+        "-" => ExprToken::Minus(<SourceSpan>),
+        "*" => ExprToken::Star(<SourceSpan>),
+        "/" => ExprToken::Slash(<SourceSpan>),
+        "%" => ExprToken::Percent(<SourceSpan>),
+        "^" => ExprToken::Caret(<SourceSpan>),
+        "!" => ExprToken::Not(<SourceSpan>),
+        "neg" => ExprToken::Neg(<SourceSpan>),
+        "(" => ExprToken::LeftParen(<SourceSpan>),
+        ")" => ExprToken::RightParen(<SourceSpan>),
+    }
+}
+
+pub Expr: FieldExpr = Or;
+
+Or: FieldExpr = {
+    <lhs:Or> <span:"||"> <rhs:And> => combine_binary(lhs, BinaryOp::Or, span, rhs),
+    And,
+};
+
+And: FieldExpr = {
+    <lhs:And> <span:"&&"> <rhs:Compare> => combine_binary(lhs, BinaryOp::And, span, rhs),
+    Compare,
+};
+
+Compare: FieldExpr = {
+    <lhs:Add> <span:"="> <rhs:Add> => combine_binary(lhs, BinaryOp::Equal, span, rhs),
+    <lhs:Add> <span:"!="> <rhs:Add> => combine_binary(lhs, BinaryOp::NotEqual, span, rhs),
+    <lhs:Add> <span:"=~"> <rhs:Add> => combine_binary(lhs, BinaryOp::Regex, span, rhs),
+    <lhs:Add> <span:"!~"> <rhs:Add> => combine_binary(lhs, BinaryOp::NotRegex, span, rhs),
+    <lhs:Add> <span:"<"> <rhs:Add> => combine_binary(lhs, BinaryOp::Less, span, rhs),
+    <lhs:Add> <span:"<="> <rhs:Add> => combine_binary(lhs, BinaryOp::LessEqual, span, rhs),
+    <lhs:Add> <span:">"> <rhs:Add> => combine_binary(lhs, BinaryOp::Greater, span, rhs),
+    <lhs:Add> <span:">="> <rhs:Add> => combine_binary(lhs, BinaryOp::GreaterEqual, span, rhs),
+    Add,
+};
+
+Add: FieldExpr = {
+    <lhs:Add> <span:"+"> <rhs:Multiply> => combine_binary(lhs, BinaryOp::Add, span, rhs),
+    <lhs:Add> <span:"-"> <rhs:Multiply> => combine_binary(lhs, BinaryOp::Sub, span, rhs),
+    Multiply,
+};
+
+Multiply: FieldExpr = {
+    <lhs:Multiply> <span:"*"> <rhs:Power> => combine_binary(lhs, BinaryOp::Mul, span, rhs),
+    <lhs:Multiply> <span:"/"> <rhs:Power> => combine_binary(lhs, BinaryOp::Div, span, rhs),
+    <lhs:Multiply> <span:"%"> <rhs:Power> => combine_binary(lhs, BinaryOp::Mod, span, rhs),
+    Power,
+};
+
+Power: FieldExpr = {
+    <lhs:Unary> <span:"^"> <rhs:Power> => combine_binary(lhs, BinaryOp::Pow, span, rhs),
+    Unary,
+};
+
+Unary: FieldExpr = {
+    <span:"!"> <expr:Unary> => combine_unary(UnaryOp::Not, span, expr),
+    <span:"neg"> <expr:Unary> => combine_unary(UnaryOp::Neg, span, expr),
+    Primary,
+};
+
+Primary: FieldExpr = {
+    <value:"operand"> => value,
+    <left:"("> <mut value:Expr> <right:")"> => {
+        value.span = left.join(right);
+        value
+    },
+};

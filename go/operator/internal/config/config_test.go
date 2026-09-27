@@ -109,6 +109,37 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 	}
 }
 
+func TestRenderTrackShardedConfig(t *testing.T) {
+	track := &telemetryv1alpha1.Track{
+		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: "observability"},
+		Spec: telemetryv1alpha1.TrackSpec{
+			Mode: telemetryv1alpha1.TrackModeSharded,
+		},
+	}
+	result, err := Render(Input{Track: track, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := string(result.Data[TrackKey])
+	reader := string(result.Data[ReaderKey])
+	for _, expected := range []string{
+		"mode: writer",
+		"otlp_grpc: 0.0.0.0:4317",
+		"jaeger_grpc: 0.0.0.0:14250",
+		"backend: kubernetes",
+		"stateful_set: traces-writer",
+		"headless_service: traces-writer-headless",
+		"max_candidates: 10000",
+	} {
+		if !strings.Contains(writer, expected) {
+			t.Errorf("Track writer config missing %q:\n%s", expected, writer)
+		}
+	}
+	if !strings.Contains(reader, "mode: reader") {
+		t.Fatalf("Track reader config missing reader mode:\n%s", reader)
+	}
+}
+
 func TestRenderShardedRoles(t *testing.T) {
 	ioConcurrencyMultiplier := int32(7)
 	meter := &telemetryv1alpha1.Meter{

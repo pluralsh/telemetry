@@ -18,6 +18,7 @@ import (
 const (
 	MeterKey  = "meter.yaml"
 	LineKey   = "line.yaml"
+	TrackKey  = "track.yaml"
 	ReaderKey = "reader.yaml"
 
 	sourceFile     = "file"
@@ -54,6 +55,7 @@ type JWT struct {
 type Input struct {
 	Meter             *telemetryv1alpha1.Meter
 	Line              *telemetryv1alpha1.Line
+	Track             *telemetryv1alpha1.Track
 	Global            Access
 	Namespaces        []NamespaceAccess
 	JWT               *JWT
@@ -68,11 +70,14 @@ type Result struct {
 }
 
 func Render(input Input) (Result, error) {
+	if input.Track != nil {
+		return renderTrack(input)
+	}
 	if input.Line != nil {
 		return renderLine(input)
 	}
 	if input.Meter == nil {
-		return Result{}, fmt.Errorf("meter or line is required")
+		return Result{}, fmt.Errorf("meter, line, or track is required")
 	}
 	descriptor := resources.MeterDescriptor
 	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
@@ -249,6 +254,89 @@ func renderLine(input Input) (Result, error) {
 		data[ReaderKey], err = makeConfig("reader")
 		if err != nil {
 			return Result{}, fmt.Errorf("render Line reader config: %w", err)
+		}
+	}
+	sum := sha256.New()
+	keys := lo.Keys(data)
+	slices.Sort(keys)
+	for _, key := range keys {
+		_, _ = sum.Write([]byte(key))
+		_, _ = sum.Write(data[key])
+	}
+	_, _ = sum.Write(input.InternalToken)
+	return Result{Data: data, Hash: hex.EncodeToString(sum.Sum(nil))}, nil
+}
+
+func renderTrack(input Input) (Result, error) {
+	track := input.Track
+	descriptor := resources.TrackDescriptor
+	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
+	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
+	data := map[string][]byte{}
+	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
+	namespaceAccess := map[string]renderAccess{}
+	for _, namespace := range input.Namespaces {
+		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
+		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
+		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
+		current.Read, current.Write = append(current.Read, rendered.Read...), append(current.Write, rendered.Write...)
+		namespaceAccess[namespace.Name] = current
+	}
+	var jwt *renderJWT
+	if input.JWT != nil {
+		jwt = &renderJWT{Issuer: input.JWT.Issuer, Audience: input.JWT.Audience, RefreshIntervalSeconds: int64Value(input.JWT.RefreshIntervalSeconds, 300), RequestTimeoutSeconds: int64Value(input.JWT.RequestTimeoutSeconds, 5)}
+		switch {
+		case len(input.JWT.JWKS) > 0:
+			data["jwks.json"] = append([]byte(nil), input.JWT.JWKS...)
+			jwt.JWKS = renderJWKS{Source: sourceFile, Path: secretsPath + "/jwks.json"}
+		case input.JWT.URL != "":
+			jwt.JWKS = renderJWKS{Source: "url", URL: input.JWT.URL}
+		default:
+			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
+		}
+	}
+	names := lo.Uniq(track.Spec.Config.Namespaces)
+	if len(names) == 0 {
+		names = []string{"default"}
+	}
+	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
+	sort.Strings(names)
+	namespaces := lo.Map(names, func(name string, _ int) renderNamespace {
+		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess())}
+	})
+	makeConfig := func(component string) ([]byte, error) {
+		spec := track.Spec.Config
+		return yaml.Marshal(renderTrackConfig{
+			Mode: component,
+			Listeners: renderListeners{
+				HTTP:     fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(track)),
+				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(track)),
+				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
+			},
+			Storage:                renderStorageConfig(spec.Storage, descriptor),
+			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
+			RetentionSeconds:       spec.RetentionSeconds,
+			Page:                   renderTrackPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
+			Write:                  renderLineWrite{Durability: lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityWritten)), RemoteConcurrency: int32Value(spec.Write.RemoteConcurrency, 16), RemoteRetries: int32Value(spec.Write.RemoteRetries, 2)},
+			Sharding:               renderShardingConfig(track.Name, track.Namespace, spec.Sharding, resources.GRPCPort(track), component),
+			Request:                renderTrackRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
+			Auth:                   renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces:             namespaces,
+		})
+	}
+	writerMode := modeStandalone
+	if resources.Mode(track) == telemetryv1alpha1.ProductModeSharded {
+		writerMode = modeWriter
+	}
+	var err error
+	data[TrackKey], err = makeConfig(writerMode)
+	if err != nil {
+		return Result{}, fmt.Errorf("render Track config: %w", err)
+	}
+	if writerMode == modeWriter {
+		data[ReaderKey], err = makeConfig("reader")
+		if err != nil {
+			return Result{}, fmt.Errorf("render Track reader config: %w", err)
 		}
 	}
 	sum := sha256.New()
@@ -442,6 +530,32 @@ type renderLineConfig struct {
 	Auth                      renderAuth           `json:"auth"`
 	Namespaces                []renderNamespace    `json:"namespaces"`
 }
+type renderTrackConfig struct {
+	Mode                   string             `json:"mode"`
+	Listeners              renderListeners    `json:"listeners"`
+	Storage                renderStorage      `json:"storage"`
+	SegmentDurationSeconds int64              `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64             `json:"retention_seconds,omitempty"`
+	Page                   renderTrackPage    `json:"page"`
+	Write                  renderLineWrite    `json:"write"`
+	Sharding               renderSharding     `json:"sharding"`
+	Request                renderTrackRequest `json:"request"`
+	Auth                   renderAuth         `json:"auth"`
+	Namespaces             []renderNamespace  `json:"namespaces"`
+}
+type renderTrackPage struct {
+	TargetSizeBytes int64 `json:"target_size_bytes"`
+	MaxSizeBytes    int64 `json:"max_size_bytes"`
+	MaxTraces       int64 `json:"max_traces"`
+}
+type renderTrackRequest struct {
+	MaxRequestBytes    int64 `json:"max_request_bytes"`
+	RequestConcurrency int32 `json:"request_concurrency"`
+	QueryConcurrency   int32 `json:"query_concurrency"`
+	MaxCandidates      int64 `json:"max_candidates"`
+	MaxSpansPerTrace   int64 `json:"max_spans_per_trace"`
+	MaxQueryLimit      int64 `json:"max_query_limit"`
+}
 type renderLinePage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`
 	MaxRows         int64 `json:"max_rows"`
@@ -465,8 +579,10 @@ type renderLineQueryCache struct {
 	QueryEntries int64 `json:"query_entries"`
 }
 type renderListeners struct {
-	HTTP string `json:"http"`
-	GRPC string `json:"grpc"`
+	HTTP       string `json:"http"`
+	GRPC       string `json:"grpc"`
+	OTLPGRPC   string `json:"otlp_grpc,omitempty"`
+	JaegerGRPC string `json:"jaeger_grpc,omitempty"`
 }
 type renderStorage struct {
 	Type         string            `json:"type"`

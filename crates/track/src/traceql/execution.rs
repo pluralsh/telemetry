@@ -1,0 +1,718 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use opentelemetry_proto::tonic::{
+    common::v1::{AnyValue, KeyValue, any_value},
+    trace::v1::Span,
+};
+use regex::Regex;
+
+use crate::{Trace, TraceId};
+
+use super::ast::{
+    AggregateOp, AttributeScope, BinaryOp, Expr, FieldExpr, Intrinsic, KindValue, PipelineStage,
+    Query, ScalarExpr, SpansetExpr, StaticValue, StatusValue, StructuralOp, UnaryOp,
+};
+use super::error::QueryError;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchedSpan {
+    pub span_id: Vec<u8>,
+    pub parent_span_id: Vec<u8>,
+    pub name: String,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub selected: Vec<(String, StaticValue)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceQlResult {
+    pub trace_id: TraceId,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub root_service_name: Option<String>,
+    pub root_span_name: Option<String>,
+    pub spanset_count: usize,
+    pub matched_spans: Vec<MatchedSpan>,
+}
+
+struct SpanContext<'a> {
+    span: &'a Span,
+    resource_attributes: &'a [KeyValue],
+}
+
+struct TraceContext<'a> {
+    trace: &'a Trace,
+    spans: Vec<SpanContext<'a>>,
+    by_id: HashMap<Vec<u8>, usize>,
+    children: HashMap<Vec<u8>, Vec<usize>>,
+    root: Option<usize>,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+pub(crate) fn execute(
+    trace: &Trace,
+    query: &Query,
+    max_spans: usize,
+) -> Result<Option<TraceQlResult>, QueryError> {
+    let context = TraceContext::new(trace, max_spans)?;
+    for stage in &query.stages {
+        if let PipelineStage::Metric { name, .. } = stage {
+            return Err(QueryError::Unsupported(format!(
+                "metric stage `{name}` is parsed but not executable"
+            )));
+        }
+    }
+    let mut spansets = eval_spanset(&query.spanset.value, &context)?;
+    let mut selected = Vec::new();
+    for stage in &query.stages {
+        match stage {
+            PipelineStage::By(field) => spansets = group_by(spansets, field, &context)?,
+            PipelineStage::Coalesce => {
+                let merged = spansets.into_iter().flatten().collect::<BTreeSet<_>>();
+                spansets = (!merged.is_empty())
+                    .then(|| merged.into_iter().collect())
+                    .into_iter()
+                    .collect();
+            }
+            PipelineStage::Select(fields) => selected = fields.clone(),
+            PipelineStage::ScalarFilter { lhs, op, rhs, .. } => {
+                spansets.retain(|spanset| {
+                    let left = eval_scalar(lhs, spanset, &context);
+                    let right = eval_scalar(rhs, spanset, &context);
+                    match (left, right) {
+                        (Ok(left), Ok(right)) => compare(*op, &left, &right).unwrap_or(false),
+                        _ => false,
+                    }
+                });
+            }
+            PipelineStage::Metric { .. } => unreachable!("metrics rejected before execution"),
+        }
+    }
+    if spansets.is_empty() {
+        return Ok(None);
+    }
+    let matched = spansets.iter().flatten().copied().collect::<BTreeSet<_>>();
+    let mut matched_spans = matched
+        .into_iter()
+        .map(|index| {
+            let item = &context.spans[index];
+            let selected = selected
+                .iter()
+                .filter_map(|field| {
+                    let value = eval_expr(field, index, &context).ok()?;
+                    value.into_static().map(|value| (field_name(field), value))
+                })
+                .collect();
+            MatchedSpan {
+                span_id: item.span.span_id.clone(),
+                parent_span_id: item.span.parent_span_id.clone(),
+                name: item.span.name.clone(),
+                start_ns: item.span.start_time_unix_nano,
+                end_ns: item.span.end_time_unix_nano,
+                selected,
+            }
+        })
+        .collect::<Vec<_>>();
+    matched_spans.sort_by(|left, right| {
+        (left.start_ns, &left.span_id).cmp(&(right.start_ns, &right.span_id))
+    });
+    let root = context.root.map(|index| &context.spans[index]);
+    Ok(Some(TraceQlResult {
+        trace_id: trace.trace_id,
+        start_ns: context.start_ns,
+        end_ns: context.end_ns,
+        root_service_name: root.and_then(|root| {
+            lookup_attribute(root.resource_attributes, "service.name")
+                .and_then(EvalValue::into_string)
+        }),
+        root_span_name: root.map(|root| root.span.name.clone()),
+        spanset_count: spansets.len(),
+        matched_spans,
+    }))
+}
+
+impl<'a> TraceContext<'a> {
+    fn new(trace: &'a Trace, max_spans: usize) -> Result<Self, QueryError> {
+        let mut spans = Vec::new();
+        for resource_spans in &trace.resource_spans {
+            let attributes = resource_spans
+                .resource
+                .as_ref()
+                .map_or(&[][..], |resource| resource.attributes.as_slice());
+            for scope in &resource_spans.scope_spans {
+                for span in &scope.spans {
+                    spans.push(SpanContext {
+                        span,
+                        resource_attributes: attributes,
+                    });
+                    if spans.len() > max_spans {
+                        return Err(QueryError::Limit(format!(
+                            "trace {} has more than {max_spans} spans",
+                            trace.trace_id
+                        )));
+                    }
+                }
+            }
+        }
+        let by_id = spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| (span.span.span_id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut children: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (index, span) in spans.iter().enumerate() {
+            children
+                .entry(span.span.parent_span_id.clone())
+                .or_default()
+                .push(index);
+        }
+        let root = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| {
+                span.span.parent_span_id.is_empty()
+                    || !by_id.contains_key(&span.span.parent_span_id)
+            })
+            .min_by_key(|(_, span)| (span.span.start_time_unix_nano, &span.span.span_id))
+            .map(|(index, _)| index);
+        let (start_ns, end_ns) = trace.timestamp_range();
+        Ok(Self {
+            trace,
+            spans,
+            by_id,
+            children,
+            root,
+            start_ns,
+            end_ns,
+        })
+    }
+}
+
+fn eval_spanset(
+    expression: &SpansetExpr,
+    context: &TraceContext<'_>,
+) -> Result<Vec<Vec<usize>>, QueryError> {
+    match expression {
+        SpansetExpr::Filter(expression) => {
+            let matches = (0..context.spans.len())
+                .filter_map(|index| {
+                    eval_expr(expression, index, context)
+                        .ok()
+                        .and_then(|value| value.as_bool())
+                        .filter(|value| *value)
+                        .map(|_| index)
+                })
+                .collect::<Vec<_>>();
+            Ok((!matches.is_empty())
+                .then_some(matches)
+                .into_iter()
+                .collect())
+        }
+        SpansetExpr::Binary { lhs, op, rhs } => {
+            let left = eval_spanset(&lhs.value, context)?
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            let right = eval_spanset(&rhs.value, context)?
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            let matched = structural(*op, &left, &right, context);
+            Ok((!matched.is_empty())
+                .then(|| matched.into_iter().collect())
+                .into_iter()
+                .collect())
+        }
+    }
+}
+
+fn structural(
+    op: StructuralOp,
+    left: &BTreeSet<usize>,
+    right: &BTreeSet<usize>,
+    context: &TraceContext<'_>,
+) -> BTreeSet<usize> {
+    if op == StructuralOp::Union {
+        return left.union(right).copied().collect();
+    }
+    if op == StructuralOp::And {
+        return if left.is_empty() || right.is_empty() {
+            BTreeSet::new()
+        } else {
+            left.union(right).copied().collect()
+        };
+    }
+    let (base, relation, negate, include_right) = match op {
+        StructuralOp::Child => (left, StructuralOp::Child, false, true),
+        StructuralOp::Parent => (left, StructuralOp::Parent, false, true),
+        StructuralOp::Descendant => (left, StructuralOp::Descendant, false, true),
+        StructuralOp::Ancestor => (left, StructuralOp::Ancestor, false, true),
+        StructuralOp::Sibling => (left, StructuralOp::Sibling, false, true),
+        StructuralOp::NotChild => (left, StructuralOp::Child, true, false),
+        StructuralOp::NotParent => (left, StructuralOp::Parent, true, false),
+        StructuralOp::NotDescendant => (left, StructuralOp::Descendant, true, false),
+        StructuralOp::NotAncestor => (left, StructuralOp::Ancestor, true, false),
+        StructuralOp::NotSibling => (left, StructuralOp::Sibling, true, false),
+        StructuralOp::UnionChild => (left, StructuralOp::Child, false, true),
+        StructuralOp::UnionParent => (left, StructuralOp::Parent, false, true),
+        StructuralOp::UnionDescendant => (left, StructuralOp::Descendant, false, true),
+        StructuralOp::UnionAncestor => (left, StructuralOp::Ancestor, false, true),
+        StructuralOp::UnionSibling => (left, StructuralOp::Sibling, false, true),
+        StructuralOp::And | StructuralOp::Union => unreachable!(),
+    };
+    let union_variant = matches!(
+        op,
+        StructuralOp::UnionChild
+            | StructuralOp::UnionParent
+            | StructuralOp::UnionDescendant
+            | StructuralOp::UnionAncestor
+            | StructuralOp::UnionSibling
+    );
+    let mut output = if union_variant {
+        left.union(right).copied().collect()
+    } else {
+        BTreeSet::new()
+    };
+    for &left_index in base {
+        let related = right
+            .iter()
+            .copied()
+            .filter(|&right_index| relation_matches(relation, left_index, right_index, context))
+            .collect::<Vec<_>>();
+        if negate {
+            if related.is_empty() {
+                output.insert(left_index);
+            }
+        } else {
+            if !related.is_empty() {
+                output.insert(left_index);
+            }
+            if include_right {
+                output.extend(related);
+            }
+        }
+    }
+    output
+}
+
+fn relation_matches(
+    relation: StructuralOp,
+    left: usize,
+    right: usize,
+    context: &TraceContext<'_>,
+) -> bool {
+    let left_span = context.spans[left].span;
+    let right_span = context.spans[right].span;
+    match relation {
+        StructuralOp::Child => left_span.parent_span_id == right_span.span_id,
+        StructuralOp::Parent => right_span.parent_span_id == left_span.span_id,
+        StructuralOp::Descendant => is_descendant(left, right, context),
+        StructuralOp::Ancestor => is_descendant(right, left, context),
+        StructuralOp::Sibling => {
+            left != right
+                && !left_span.parent_span_id.is_empty()
+                && left_span.parent_span_id == right_span.parent_span_id
+        }
+        _ => false,
+    }
+}
+
+fn is_descendant(mut child: usize, ancestor: usize, context: &TraceContext<'_>) -> bool {
+    let mut visited = BTreeSet::new();
+    while visited.insert(child) {
+        let parent_id = &context.spans[child].span.parent_span_id;
+        let Some(&parent) = context.by_id.get(parent_id) else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
+        child = parent;
+    }
+    false
+}
+
+fn group_by(
+    spansets: Vec<Vec<usize>>,
+    field: &FieldExpr,
+    context: &TraceContext<'_>,
+) -> Result<Vec<Vec<usize>>, QueryError> {
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for index in spansets.into_iter().flatten() {
+        let value = eval_expr(field, index, context)?;
+        groups.entry(value.key()).or_default().push(index);
+    }
+    Ok(groups.into_values().collect())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EvalValue {
+    Missing,
+    Static(StaticValue),
+}
+
+impl EvalValue {
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Static(StaticValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn into_static(self) -> Option<StaticValue> {
+        match self {
+            Self::Missing => None,
+            Self::Static(value) => Some(value),
+        }
+    }
+
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::Static(StaticValue::String(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn key(&self) -> String {
+        match self {
+            Self::Missing => "missing".to_owned(),
+            Self::Static(value) => format!("{value:?}"),
+        }
+    }
+}
+
+fn eval_expr(
+    expression: &FieldExpr,
+    index: usize,
+    context: &TraceContext<'_>,
+) -> Result<EvalValue, QueryError> {
+    match &expression.value {
+        Expr::Static(value) => Ok(EvalValue::Static(value.clone())),
+        Expr::Attribute(attribute) => {
+            let span = &context.spans[index];
+            let value = match attribute.scope {
+                AttributeScope::Resource => {
+                    lookup_attribute(span.resource_attributes, &attribute.name)
+                }
+                AttributeScope::Span => lookup_attribute(&span.span.attributes, &attribute.name),
+                AttributeScope::Unscoped => {
+                    lookup_attribute(&span.span.attributes, &attribute.name)
+                        .or_else(|| lookup_attribute(span.resource_attributes, &attribute.name))
+                }
+            };
+            Ok(value.unwrap_or(EvalValue::Missing))
+        }
+        Expr::Intrinsic(intrinsic) => Ok(eval_intrinsic(*intrinsic, index, context)),
+        Expr::Unary { op, expr } => {
+            let value = eval_expr(expr, index, context)?;
+            match (op, value) {
+                (UnaryOp::Not, EvalValue::Static(StaticValue::Bool(value))) => {
+                    Ok(EvalValue::Static(StaticValue::Bool(!value)))
+                }
+                (UnaryOp::Neg, EvalValue::Static(StaticValue::Int(value))) => {
+                    Ok(EvalValue::Static(StaticValue::Int(value.saturating_neg())))
+                }
+                (UnaryOp::Neg, EvalValue::Static(StaticValue::Float(value))) => {
+                    Ok(EvalValue::Static(StaticValue::Float(-value)))
+                }
+                (UnaryOp::Neg, EvalValue::Static(StaticValue::Duration(value))) => Ok(
+                    EvalValue::Static(StaticValue::Duration(value.saturating_neg())),
+                ),
+                _ => Ok(EvalValue::Missing),
+            }
+        }
+        Expr::Binary { lhs, op, rhs } => {
+            let left = eval_expr(lhs, index, context)?;
+            if *op == BinaryOp::And && left.as_bool() == Some(false) {
+                return Ok(EvalValue::Static(StaticValue::Bool(false)));
+            }
+            if *op == BinaryOp::Or && left.as_bool() == Some(true) {
+                return Ok(EvalValue::Static(StaticValue::Bool(true)));
+            }
+            let right = eval_expr(rhs, index, context)?;
+            if matches!(
+                op,
+                BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::Regex
+                    | BinaryOp::NotRegex
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+            ) {
+                return Ok(EvalValue::Static(StaticValue::Bool(
+                    compare(*op, &left, &right).unwrap_or(false),
+                )));
+            }
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                let result = match op {
+                    BinaryOp::And => left.as_bool() == Some(true) && right.as_bool() == Some(true),
+                    BinaryOp::Or => left.as_bool() == Some(true) || right.as_bool() == Some(true),
+                    _ => unreachable!(),
+                };
+                return Ok(EvalValue::Static(StaticValue::Bool(result)));
+            }
+            arithmetic(*op, left, right)
+        }
+    }
+}
+
+fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>) -> EvalValue {
+    let span = context.spans[index].span;
+    let value = match intrinsic {
+        Intrinsic::TraceId => StaticValue::String(context.trace.trace_id.to_string()),
+        Intrinsic::SpanId => StaticValue::String(hex(&span.span_id)),
+        Intrinsic::ParentId => StaticValue::String(hex(&span.parent_span_id)),
+        Intrinsic::Name => StaticValue::String(span.name.clone()),
+        Intrinsic::Duration => StaticValue::Duration(
+            i64::try_from(
+                span.end_time_unix_nano
+                    .saturating_sub(span.start_time_unix_nano),
+            )
+            .unwrap_or(i64::MAX),
+        ),
+        Intrinsic::Status => {
+            StaticValue::Status(match span.status.as_ref().map_or(0, |s| s.code) {
+                1 => StatusValue::Ok,
+                2 => StatusValue::Error,
+                _ => StatusValue::Unset,
+            })
+        }
+        Intrinsic::StatusMessage => StaticValue::String(
+            span.status
+                .as_ref()
+                .map_or_else(String::new, |s| s.message.clone()),
+        ),
+        Intrinsic::Kind => StaticValue::Kind(match span.kind {
+            1 => KindValue::Internal,
+            2 => KindValue::Server,
+            3 => KindValue::Client,
+            4 => KindValue::Producer,
+            5 => KindValue::Consumer,
+            _ => KindValue::Unspecified,
+        }),
+        Intrinsic::RootName => StaticValue::String(
+            context
+                .root
+                .map_or_else(String::new, |root| context.spans[root].span.name.clone()),
+        ),
+        Intrinsic::RootServiceName => StaticValue::String(
+            context
+                .root
+                .and_then(|root| {
+                    lookup_attribute(context.spans[root].resource_attributes, "service.name")
+                        .and_then(EvalValue::into_string)
+                })
+                .unwrap_or_default(),
+        ),
+        Intrinsic::ChildCount => StaticValue::Int(
+            context
+                .children
+                .get(&span.span_id)
+                .map_or(0, Vec::len)
+                .try_into()
+                .unwrap_or(i64::MAX),
+        ),
+        Intrinsic::TraceDuration => StaticValue::Duration(
+            i64::try_from(context.end_ns.saturating_sub(context.start_ns)).unwrap_or(i64::MAX),
+        ),
+    };
+    EvalValue::Static(value)
+}
+
+fn lookup_attribute(attributes: &[KeyValue], name: &str) -> Option<EvalValue> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key == name)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(any_value)
+        .map(EvalValue::Static)
+}
+
+fn any_value(value: &AnyValue) -> Option<StaticValue> {
+    match value.value.as_ref()? {
+        any_value::Value::StringValue(value) => Some(StaticValue::String(value.clone())),
+        any_value::Value::BoolValue(value) => Some(StaticValue::Bool(*value)),
+        any_value::Value::IntValue(value) => Some(StaticValue::Int(*value)),
+        any_value::Value::DoubleValue(value) => Some(StaticValue::Float(*value)),
+        any_value::Value::ArrayValue(_)
+        | any_value::Value::KvlistValue(_)
+        | any_value::Value::BytesValue(_) => None,
+    }
+}
+
+fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
+    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+        && (matches!(left, EvalValue::Missing)
+            || matches!(left, EvalValue::Static(StaticValue::Nil))
+            || matches!(right, EvalValue::Missing)
+            || matches!(right, EvalValue::Static(StaticValue::Nil)))
+    {
+        let equal = matches!(
+            (left, right),
+            (EvalValue::Missing, EvalValue::Static(StaticValue::Nil))
+                | (EvalValue::Static(StaticValue::Nil), EvalValue::Missing)
+        );
+        return Some(if op == BinaryOp::Equal { equal } else { !equal });
+    }
+    let (EvalValue::Static(left), EvalValue::Static(right)) = (left, right) else {
+        return None;
+    };
+    let ordering = static_cmp(left, right);
+    match op {
+        BinaryOp::Equal => Some(static_equal(left, right)),
+        BinaryOp::NotEqual => Some(!static_equal(left, right)),
+        BinaryOp::Less => ordering.map(|value| value.is_lt()),
+        BinaryOp::LessEqual => ordering.map(|value| value.is_le()),
+        BinaryOp::Greater => ordering.map(|value| value.is_gt()),
+        BinaryOp::GreaterEqual => ordering.map(|value| value.is_ge()),
+        BinaryOp::Regex | BinaryOp::NotRegex => {
+            let (StaticValue::String(value), StaticValue::String(pattern)) = (left, right) else {
+                return None;
+            };
+            let matched = Regex::new(pattern).ok()?.is_match(value);
+            Some(if op == BinaryOp::Regex {
+                matched
+            } else {
+                !matched
+            })
+        }
+        _ => None,
+    }
+}
+
+fn static_equal(left: &StaticValue, right: &StaticValue) -> bool {
+    match (left, right) {
+        (StaticValue::Float(left), StaticValue::Float(right)) => left.to_bits() == right.to_bits(),
+        (StaticValue::Int(left), StaticValue::Float(right)) => *left as f64 == *right,
+        (StaticValue::Float(left), StaticValue::Int(right)) => *left == *right as f64,
+        _ => left == right,
+    }
+}
+
+fn static_cmp(left: &StaticValue, right: &StaticValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (StaticValue::String(left), StaticValue::String(right)) => Some(left.cmp(right)),
+        (StaticValue::Int(left), StaticValue::Int(right)) => Some(left.cmp(right)),
+        (StaticValue::Float(left), StaticValue::Float(right)) => left.partial_cmp(right),
+        (StaticValue::Int(left), StaticValue::Float(right)) => (*left as f64).partial_cmp(right),
+        (StaticValue::Float(left), StaticValue::Int(right)) => left.partial_cmp(&(*right as f64)),
+        (StaticValue::Duration(left), StaticValue::Duration(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
+}
+
+fn arithmetic(op: BinaryOp, left: EvalValue, right: EvalValue) -> Result<EvalValue, QueryError> {
+    let (EvalValue::Static(left), EvalValue::Static(right)) = (left, right) else {
+        return Ok(EvalValue::Missing);
+    };
+    let result = match (left, right) {
+        (StaticValue::Int(left), StaticValue::Int(right)) => StaticValue::Int(match op {
+            BinaryOp::Add => left.saturating_add(right),
+            BinaryOp::Sub => left.saturating_sub(right),
+            BinaryOp::Mul => left.saturating_mul(right),
+            BinaryOp::Div if right != 0 => left / right,
+            BinaryOp::Mod if right != 0 => left % right,
+            BinaryOp::Pow if right >= 0 => {
+                left.saturating_pow(right.try_into().unwrap_or(u32::MAX))
+            }
+            _ => return Ok(EvalValue::Missing),
+        }),
+        (StaticValue::Duration(left), StaticValue::Duration(right)) => {
+            StaticValue::Duration(match op {
+                BinaryOp::Add => left.saturating_add(right),
+                BinaryOp::Sub => left.saturating_sub(right),
+                _ => return Ok(EvalValue::Missing),
+            })
+        }
+        (left, right) => {
+            let Some(left) = as_float(&left) else {
+                return Ok(EvalValue::Missing);
+            };
+            let Some(right) = as_float(&right) else {
+                return Ok(EvalValue::Missing);
+            };
+            StaticValue::Float(match op {
+                BinaryOp::Add => left + right,
+                BinaryOp::Sub => left - right,
+                BinaryOp::Mul => left * right,
+                BinaryOp::Div => left / right,
+                BinaryOp::Mod => left % right,
+                BinaryOp::Pow => left.powf(right),
+                _ => return Ok(EvalValue::Missing),
+            })
+        }
+    };
+    Ok(EvalValue::Static(result))
+}
+
+fn as_float(value: &StaticValue) -> Option<f64> {
+    match value {
+        StaticValue::Int(value) => Some(*value as f64),
+        StaticValue::Float(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn eval_scalar(
+    expression: &ScalarExpr,
+    spanset: &[usize],
+    context: &TraceContext<'_>,
+) -> Result<EvalValue, QueryError> {
+    match expression {
+        ScalarExpr::Static(value) => Ok(EvalValue::Static(value.clone())),
+        ScalarExpr::Aggregate { op, field } => {
+            if *op == AggregateOp::Count {
+                return Ok(EvalValue::Static(StaticValue::Int(
+                    spanset.len().try_into().unwrap_or(i64::MAX),
+                )));
+            }
+            let field = field.as_ref().expect("validated numeric aggregate field");
+            let values = spanset
+                .iter()
+                .filter_map(|&index| eval_expr(field, index, context).ok())
+                .filter_map(|value| match value {
+                    EvalValue::Static(StaticValue::Int(value)) => Some(value as f64),
+                    EvalValue::Static(StaticValue::Float(value)) => Some(value),
+                    EvalValue::Static(StaticValue::Duration(value)) => Some(value as f64),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                return Ok(EvalValue::Missing);
+            }
+            let value = match op {
+                AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+                AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
+                AggregateOp::Sum => values.iter().sum(),
+                AggregateOp::Count => unreachable!(),
+            };
+            Ok(EvalValue::Static(StaticValue::Float(value)))
+        }
+        ScalarExpr::Binary { lhs, op, rhs } => arithmetic(
+            *op,
+            eval_scalar(lhs, spanset, context)?,
+            eval_scalar(rhs, spanset, context)?,
+        ),
+    }
+}
+
+fn field_name(field: &FieldExpr) -> String {
+    match &field.value {
+        Expr::Attribute(attribute) => attribute.name.clone(),
+        Expr::Intrinsic(intrinsic) => format!("{intrinsic:?}"),
+        _ => "expression".to_owned(),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
