@@ -1,0 +1,106 @@
+use crate::logql::ast::{BinaryModifier, BinaryOp, Query, Span};
+use crate::logql::error::ParseError;
+use crate::logql::parser::{combine_binary, ExprToken};
+
+grammar;
+
+pub Expr: Query = Or;
+
+Or: Query = {
+    <left:And> <rest:(<OrOp> <And>)*> => rest.into_iter().fold(
+        left,
+        |lhs, (operator, rhs)| combine_binary(lhs, operator, rhs),
+    ),
+};
+
+And: Query = {
+    <left:Comparison> <rest:(<SetOp> <Comparison>)*> => rest.into_iter().fold(
+        left,
+        |lhs, (operator, rhs)| combine_binary(lhs, operator, rhs),
+    ),
+};
+
+Comparison: Query = {
+    <left:Additive> <rest:(<ComparisonOp> <Additive>)*> => rest.into_iter().fold(
+        left,
+        |lhs, (operator, rhs)| combine_binary(lhs, operator, rhs),
+    ),
+};
+
+Additive: Query = {
+    <left:Multiplicative> <rest:(<AddOp> <Multiplicative>)*> => rest.into_iter().fold(
+        left,
+        |lhs, (operator, rhs)| combine_binary(lhs, operator, rhs),
+    ),
+};
+
+Multiplicative: Query = {
+    <left:Power> <rest:(<MulOp> <Power>)*> => rest.into_iter().fold(
+        left,
+        |lhs, (operator, rhs)| combine_binary(lhs, operator, rhs),
+    ),
+};
+
+Power: Query = {
+    <left:Primary> <right:(<PowOp> <Power>)?> => match right {
+        Some((operator, rhs)) => combine_binary(left, operator, rhs),
+        None => left,
+    },
+};
+
+Primary: Query = <value:"operand"> => value;
+
+OrOp: (BinaryOp, Option<BinaryModifier>, Span) =
+    <value:"or"> => (BinaryOp::Or, value.0, value.1);
+
+SetOp: (BinaryOp, Option<BinaryModifier>, Span) = {
+    <value:"and"> => (BinaryOp::And, value.0, value.1),
+    <value:"unless"> => (BinaryOp::Unless, value.0, value.1),
+};
+
+ComparisonOp: (BinaryOp, Option<BinaryModifier>, Span) = {
+    <value:"=="> => (BinaryOp::Equal, value.0, value.1),
+    <value:"!="> => (BinaryOp::NotEqual, value.0, value.1),
+    <value:">"> => (BinaryOp::Greater, value.0, value.1),
+    <value:">="> => (BinaryOp::GreaterOrEqual, value.0, value.1),
+    <value:"<"> => (BinaryOp::Less, value.0, value.1),
+    <value:"<="> => (BinaryOp::LessOrEqual, value.0, value.1),
+};
+
+AddOp: (BinaryOp, Option<BinaryModifier>, Span) = {
+    <value:"+"> => (BinaryOp::Add, value.0, value.1),
+    <value:"-"> => (BinaryOp::Sub, value.0, value.1),
+};
+
+MulOp: (BinaryOp, Option<BinaryModifier>, Span) = {
+    <value:"*"> => (BinaryOp::Mul, value.0, value.1),
+    <value:"/"> => (BinaryOp::Div, value.0, value.1),
+    <value:"%"> => (BinaryOp::Mod, value.0, value.1),
+};
+
+PowOp: (BinaryOp, Option<BinaryModifier>, Span) =
+    <value:"^"> => (BinaryOp::Pow, value.0, value.1);
+
+extern {
+    type Location = usize;
+    type Error = ParseError;
+
+    enum ExprToken {
+        "operand" => ExprToken::Operand(<Query>),
+        "or" => ExprToken::Or(<(Option<BinaryModifier>, Span)>),
+        "and" => ExprToken::And(<(Option<BinaryModifier>, Span)>),
+        "unless" => ExprToken::Unless(<(Option<BinaryModifier>, Span)>),
+        "==" => ExprToken::Equal(<(Option<BinaryModifier>, Span)>),
+        "!=" => ExprToken::NotEqual(<(Option<BinaryModifier>, Span)>),
+        ">" => ExprToken::Greater(<(Option<BinaryModifier>, Span)>),
+        ">=" => ExprToken::GreaterEqual(<(Option<BinaryModifier>, Span)>),
+        "<" => ExprToken::Less(<(Option<BinaryModifier>, Span)>),
+        "<=" => ExprToken::LessEqual(<(Option<BinaryModifier>, Span)>),
+        "+" => ExprToken::Plus(<(Option<BinaryModifier>, Span)>),
+        "-" => ExprToken::Minus(<(Option<BinaryModifier>, Span)>),
+        "*" => ExprToken::Star(<(Option<BinaryModifier>, Span)>),
+        "/" => ExprToken::Slash(<(Option<BinaryModifier>, Span)>),
+        "%" => ExprToken::Percent(<(Option<BinaryModifier>, Span)>),
+        "^" => ExprToken::Caret(<(Option<BinaryModifier>, Span)>),
+    }
+}

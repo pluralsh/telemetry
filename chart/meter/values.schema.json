@@ -71,7 +71,9 @@
         "auth": {
           "type": "object",
           "additionalProperties": false,
+          "required": ["unauthenticated", "global"],
           "properties": {
+            "unauthenticated": {"type": "boolean", "default": false},
             "jwt": {"$ref": "#/definitions/jwt"},
             "global": {"type": "object"}
           }

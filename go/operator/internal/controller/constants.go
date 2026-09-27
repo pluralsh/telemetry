@@ -17,6 +17,7 @@ const (
 	permissionRead  = "read"
 	permissionWrite = "write"
 	dataStoreMeter  = "Meter"
+	dataStoreLine   = "Line"
 
 	namespaceAuthMeterIndex  = "telemetry.plural.sh/namespace-auth-meter"
 	meterSecretIndex         = "telemetry.plural.sh/meter-secret"

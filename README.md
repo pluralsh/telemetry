@@ -1,8 +1,7 @@
 # Telemetry
 
-Telemetry is a Rust workspace for observability products. Meter, the metrics product, is
-implemented and deployable. Loom and Thread are currently minimal placeholders reserved for logs
-and traces.
+Telemetry is a Rust workspace for observability products. Meter provides metrics, Line provides
+logs, and Track is reserved for traces. Meter and Line are implemented and deployable.
 
 ## Meter status and architecture
 
@@ -28,8 +27,9 @@ Workspace crates:
 - `sharding`: virtual-shard planning, assignment, Kubernetes coordination, leasing, and ownership.
 - `meter`: namespace-aware TSDB, ingestion conversion, and sharded query engine.
 - `meter-server`: Axum/tonic server and `meter-server` binary.
-- `regression`: black-box Prometheus comparison and deployment regression runner.
-- `loom` / `thread`: future logs/traces placeholders.
+- `line`: namespace-aware log storage and Loki-compatible query engine.
+- `line-server`: Axum/tonic server and `line-server` binary.
+- `track`: future traces product placeholder.
 
 Meter targets the API surface listed below; it does not claim complete Prometheus server or PromQL
 compatibility.
@@ -54,17 +54,25 @@ installs only read routes; standalone installs both.
 ## Run and configure
 
 The complete field-by-field YAML reference, defaults, units, variants, mode constraints, and
-authentication behavior is in [config/README.md](config/README.md). Start from the fully commented
-[config/meter.example.yaml](config/meter.example.yaml):
+authentication behavior is in [config/README.md](config/README.md). Start Meter from the fully
+commented [config/meter.example.yaml](config/meter.example.yaml):
 
 ```sh
 cp config/meter.example.yaml config/meter.yaml
 mise exec -- cargo run --package meter-server -- --config config/meter.yaml
 ```
 
-Use environment variables or mounted files for production secrets. The
+For Line, start from [config/line.example.yaml](config/line.example.yaml):
+
+```sh
+cp config/line.example.yaml config/line.yaml
+mise exec -- cargo run --package line-server -- --config config/line.yaml
+```
+
+Use environment variables or mounted files for production secrets. The Meter
 `crates/meter-server/Dockerfile` runtime runs `meter-server`; mount configuration at
-`/app/config/meter.yaml`.
+`/app/config/meter.yaml`. The Line `crates/line-server/Dockerfile` runtime runs `line-server` and
+defaults to `/app/config/line.example.yaml`.
 
 Deployment roles:
 
@@ -116,6 +124,10 @@ mounting.
 
 ## Authentication
 
+Meter and Line deny anonymous namespace HTTP reads and writes by default. Health and readiness
+endpoints remain public. Set `auth.unauthenticated: true` only for deployments that intentionally
+allow anonymous namespace access; empty credential lists do not open access.
+
 HTTP Basic credentials can be global or namespace-specific and separately scoped to reads and
 writes. Bearer credentials are JWTs verified against a configured JWKS file or URL; tokens require
 expiration, namespace-regex, and `read`/`write` permission claims. Optional issuer and audience
@@ -151,12 +163,13 @@ The sample [Meter](go/operator/config/samples/telemetry_v1alpha1_meter.yaml) and
 [NamespaceAuthentication](go/operator/config/samples/telemetry_v1alpha1_namespaceauthentication.yaml)
 resources are useful starting points.
 
-CI runs formatting, workspace checks, Clippy, all-feature unit/integration tests, and the Docker
-regression suite, plus operator generation, manifests, formatting, vet, envtest, and Helm chart
-checks. `tests/regression/test.sh` compares deterministic results with pinned Prometheus across
-tested instant/range selectors, regex matching, aggregation, rate, offsets, binary joins,
-discovery, metadata, boundary/empty behavior, OTLP conversion, namespace isolation, Basic/JWT
-authorization, forwarded-write idempotency, read-only route rejection, and reader freshness.
+CI runs formatting, workspace checks, Clippy, all-feature unit/integration tests, and the Python
+Docker regression harness, plus operator generation, manifests, formatting, vet, envtest, and Helm
+chart checks. Run it with `mise exec -- python -m pytest tests/regression`; the harness preserves
+Meter's Prometheus differential, sharding, auth, OTLP, and isolation coverage alongside pinned
+single-node Loki-versus-Line log and metric differential coverage. Lifecycle/config assets live
+beneath `tests/regression/products/`, while product-specific wire fixtures, normalization, and
+orchestration are shared from `tests/regression/harness/`.
 See [tests/regression/README.md](tests/regression/README.md).
 
 `tests/kind/test.sh` is an optional, manually dispatched kind scenario covering lease-backed

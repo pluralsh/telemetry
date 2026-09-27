@@ -2,7 +2,8 @@
 
 ## OpenData
 
-Portions of `crates/common` and `crates/meter` are adapted from the OpenData project:
+Portions of `crates/common`, `crates/meter`, and Line's BM25 scoring and
+BlockMax design in `crates/line` are adapted from the OpenData project:
 https://github.com/opendata-oss/opendata
 
 MIT License

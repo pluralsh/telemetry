@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -151,6 +152,17 @@ var _ = Describe("Meter Controller", func() {
 	It("reconciles sharded resources and rolls the config hash after credential rotation", func() {
 		meter, auth, password := createMeterFixture(ctx, "sharded-envtest", telemetryv1alpha1.MeterModeSharded)
 		created = append(created, meter, auth, password)
+		meter.Spec.Version = "1.2.3"
+		meter.Spec.Image = telemetryv1alpha1.ImageSpec{
+			Repository: "registry.example.com/telemetry/meter",
+			PullPolicy: corev1.PullAlways,
+		}
+		meter.Spec.Writer.Replicas = lo.ToPtr(int32(4))
+		meter.Spec.Writer.NodeSelector = map[string]string{"kubernetes.io/arch": "arm64"}
+		meter.Spec.Writer.Tolerations = []corev1.Toleration{{
+			Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "telemetry", Effect: corev1.TaintEffectNoSchedule,
+		}}
+		Expect(k8sClient.Update(ctx, meter)).To(Succeed())
 		key := client.ObjectKeyFromObject(meter)
 
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
@@ -181,6 +193,19 @@ var _ = Describe("Meter Controller", func() {
 			assertService(ctx, name, false)
 			assertService(ctx, name+"-headless", true)
 			sts := assertStatefulSet(ctx, name, kind, config)
+			Expect(sts.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
+				HaveField("Image", "registry.example.com/telemetry/meter:1.2.3"),
+				HaveField("ImagePullPolicy", corev1.PullAlways),
+			))
+			if kind == componentWriter {
+				Expect(sts.Spec.Replicas).NotTo(BeNil())
+				Expect(*sts.Spec.Replicas).To(Equal(int32(4)))
+				Expect(sts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("kubernetes.io/arch", "arm64"))
+				Expect(sts.Spec.Template.Spec.Tolerations).To(ContainElement(HaveField("Key", "dedicated")))
+			} else {
+				Expect(sts.Spec.Replicas).NotTo(BeNil())
+				Expect(*sts.Spec.Replicas).To(Equal(int32(2)))
+			}
 			created = append(created,
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name + "-headless", Namespace: namespace}},
@@ -304,6 +329,80 @@ var _ = Describe("Meter Controller", func() {
 		Expect(k8sClient.Get(ctx, key, recreated)).To(Succeed())
 		templateSize := recreated.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
 		Expect(templateSize.Cmp(resource.MustParse("20Gi"))).To(Equal(0))
+	})
+
+	It("validates canonical versions and conflicting legacy tags for Meter and Line", func() {
+		invalidVersionMeter := &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-version-meter", Namespace: namespace},
+			Spec:       telemetryv1alpha1.MeterSpec{Version: "v1.2.3"},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, invalidVersionMeter))).To(BeTrue())
+
+		invalidVersionLine := &telemetryv1alpha1.Line{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-version-line", Namespace: namespace},
+			Spec:       telemetryv1alpha1.LineSpec{Version: "1.2"},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, invalidVersionLine))).To(BeTrue())
+
+		invalidLegacyTagMeter := &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-legacy-tag-meter", Namespace: namespace},
+			Spec:       telemetryv1alpha1.MeterSpec{Image: telemetryv1alpha1.ImageSpec{Tag: "latest"}},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, invalidLegacyTagMeter))).To(BeTrue())
+
+		invalidLegacyTagLine := &telemetryv1alpha1.Line{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-legacy-tag-line", Namespace: namespace},
+			Spec:       telemetryv1alpha1.LineSpec{Image: telemetryv1alpha1.ImageSpec{Tag: "v2.3.4"}},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, invalidLegacyTagLine))).To(BeTrue())
+
+		conflictingMeter := &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: "conflicting-version-meter", Namespace: namespace},
+			Spec: telemetryv1alpha1.MeterSpec{
+				Version: "1.2.3",
+				Image:   telemetryv1alpha1.ImageSpec{Tag: "1.2.4"},
+			},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, conflictingMeter))).To(BeTrue())
+
+		conflictingLine := &telemetryv1alpha1.Line{
+			ObjectMeta: metav1.ObjectMeta{Name: "conflicting-version-line", Namespace: namespace},
+			Spec: telemetryv1alpha1.LineSpec{
+				Version: "2.3.4",
+				Image:   telemetryv1alpha1.ImageSpec{Tag: "2.3.5"},
+			},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, conflictingLine))).To(BeTrue())
+
+		valid := &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-version-meter", Namespace: namespace},
+			Spec: telemetryv1alpha1.MeterSpec{
+				Version: "1.2.3-rc.1+build.7",
+				Image:   telemetryv1alpha1.ImageSpec{Tag: "1.2.3-rc.1+build.7"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, valid)).To(Succeed())
+		created = append(created, valid)
+	})
+
+	It("rejects replica settings that violate standalone architecture", func() {
+		meter := &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-standalone-meter", Namespace: namespace},
+			Spec: telemetryv1alpha1.MeterSpec{
+				Mode:   telemetryv1alpha1.MeterModeStandalone,
+				Writer: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(2))},
+			},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, meter))).To(BeTrue())
+
+		line := &telemetryv1alpha1.Line{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-standalone-line", Namespace: namespace},
+			Spec: telemetryv1alpha1.LineSpec{
+				Mode:   telemetryv1alpha1.LineModeStandalone,
+				Reader: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(1))},
+			},
+		}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, line))).To(BeTrue())
 	})
 })
 

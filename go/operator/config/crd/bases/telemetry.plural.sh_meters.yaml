@@ -206,6 +206,11 @@ spec:
                         required:
                         - jwks
                         type: object
+                      unauthenticated:
+                        default: false
+                        description: Unauthenticated permits anonymous access to namespace
+                          HTTP APIs.
+                        type: boolean
                     type: object
                   namespaces:
                     default:
@@ -246,6 +251,8 @@ spec:
                       rule: '!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds)
                         || self.renewIntervalSeconds < self.leaseDurationSeconds'
                   storage:
+                    default:
+                      path: meter
                     properties:
                       blockCache:
                         properties:
@@ -320,12 +327,8 @@ spec:
                       objectStore:
                         properties:
                           aws:
-                            description: |-
-                              AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.
-
-                              Credentials are optional so workloads can use ambient credentials such as
-                              IAM roles for service accounts. When static credentials are used, both the
-                              access key ID and secret access key must be supplied.
+                            description: AWSObjectStoreSpec configures an Amazon S3
+                              or S3-compatible object store.
                             properties:
                               accessKeyIDSecretRef:
                                 description: SecretKeySelector selects a key of a
@@ -353,15 +356,11 @@ spec:
                                 type: object
                                 x-kubernetes-map-type: atomic
                               allowHTTP:
-                                description: AllowHTTP permits unencrypted HTTP connections
-                                  to the custom endpoint.
                                 type: boolean
                               bucket:
                                 minLength: 1
                                 type: string
                               endpoint:
-                                description: Endpoint overrides the AWS endpoint for
-                                  S3-compatible stores.
                                 type: string
                               region:
                                 minLength: 1
@@ -417,8 +416,6 @@ spec:
                                 type: object
                                 x-kubernetes-map-type: atomic
                               virtualHostedStyle:
-                                description: VirtualHostedStyle sends requests to
-                                  bucket.endpoint instead of endpoint/bucket.
                                 type: boolean
                             required:
                             - bucket
@@ -429,11 +426,6 @@ spec:
                                 must be configured together
                               rule: has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)
                           azure:
-                            description: |-
-                              AzureObjectStoreSpec configures Azure Blob Storage.
-
-                              Authentication is optional to support managed identity. At most one explicit
-                              authentication method may be configured.
                             properties:
                               accessKeySecretRef:
                                 description: SecretKeySelector selects a key of a
@@ -464,8 +456,6 @@ spec:
                                 minLength: 1
                                 type: string
                               allowHTTP:
-                                description: AllowHTTP permits unencrypted HTTP connections
-                                  to the custom endpoint.
                                 type: boolean
                               bearerTokenSecretRef:
                                 description: SecretKeySelector selects a key of a
@@ -493,8 +483,6 @@ spec:
                                 type: object
                                 x-kubernetes-map-type: atomic
                               clientSecret:
-                                description: AzureClientSecretAuthSpec configures
-                                  Azure service-principal authentication.
                                 properties:
                                   clientID:
                                     minLength: 1
@@ -536,8 +524,6 @@ spec:
                                 minLength: 1
                                 type: string
                               endpoint:
-                                description: Endpoint overrides the Azure Blob Storage
-                                  endpoint.
                                 type: string
                               sasTokenSecretRef:
                                 description: SecretKeySelector selects a key of a
@@ -565,9 +551,6 @@ spec:
                                 type: object
                                 x-kubernetes-map-type: atomic
                               workloadIdentity:
-                                description: |-
-                                  AzureWorkloadIdentityAuthSpec configures Azure workload identity federation.
-                                  The pod template must mount the projected service-account token at TokenFile.
                                 properties:
                                   clientID:
                                     minLength: 1
@@ -595,14 +578,8 @@ spec:
                                 has(self.workloadIdentity)].filter(x, x).size() <=
                                 1'
                           gcp:
-                            description: |-
-                              GCPObjectStoreSpec configures Google Cloud Storage.
-
-                              Authentication is optional to support application default credentials.
                             properties:
                               baseURL:
-                                description: BaseURL overrides the Google Cloud Storage
-                                  API URL.
                                 type: string
                               bearerTokenSecretRef:
                                 description: SecretKeySelector selects a key of a
@@ -694,7 +671,6 @@ spec:
                             stores
                           rule: self.type == 'Gcp' || !has(self.gcp)
                       path:
-                        default: meter
                         type: string
                       settingsPath:
                         type: string
@@ -726,20 +702,29 @@ spec:
                     type: object
                 type: object
               image:
+                default:
+                  pullPolicy: IfNotPresent
+                  repository: ghcr.io/pluralsh/meter
                 properties:
                   pullPolicy:
                     default: IfNotPresent
-                    description: PullPolicy describes a policy for if/when to pull
-                      a container image
+                    description: PullPolicy is the Kubernetes image pull policy.
                     enum:
                     - Always
                     - IfNotPresent
                     - Never
                     type: string
                   repository:
-                    default: ghcr.io/pluralsh/meter
+                    description: |-
+                      Repository is the container image repository. It defaults to the product's
+                      official GHCR repository.
                     type: string
                   tag:
+                    description: |-
+                      Tag is a deprecated alias for the enclosing resource's spec.version.
+                      When both are set they must match, and spec.version takes precedence.
+                      Deprecated: use spec.version.
+                    pattern: ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$
                     type: string
                 type: object
               ingress:
@@ -762,15 +747,12 @@ spec:
                         type: object
                     type: object
                   pathPrefix:
-                    description: PathPrefix optionally scopes Meter's public read
-                      and write APIs, for example /meter.
                     type: string
                   tls:
                     properties:
                       enabled:
                         type: boolean
                       secretName:
-                        description: SecretName defaults to <meter-name>-tls.
                         type: string
                     type: object
                 type: object
@@ -791,8 +773,6 @@ spec:
               reader:
                 properties:
                   cacheVolume:
-                    description: VolumeSpec configures one of the fixed data or cache
-                      workload volumes.
                     properties:
                       emptyDir:
                         description: |-
@@ -1025,8 +1005,6 @@ spec:
                         required
                       rule: has(self.emptyDir) != has(self.persistentVolumeClaim)
                   dataVolume:
-                    description: VolumeSpec configures one of the fixed data or cache
-                      workload volumes.
                     properties:
                       emptyDir:
                         description: |-
@@ -1258,9 +1236,17 @@ spec:
                     - message: exactly one of emptyDir or persistentVolumeClaim is
                         required
                       rule: has(self.emptyDir) != has(self.persistentVolumeClaim)
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      NodeSelector is merged with podTemplate.spec.nodeSelector. Values here
+                      take precedence when the same key is configured in both places.
+                    type: object
                   podTemplate:
-                    description: PodTemplateSpec describes the data a pod should have
-                      when created from a template
+                    description: |-
+                      PodTemplate is the full Kubernetes pod template escape hatch. Operator
+                      required fields and the first-class scheduling fields are merged into it.
                     properties:
                       metadata:
                         description: |-
@@ -9357,19 +9343,63 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  tolerations:
+                    description: |-
+                      Tolerations are merged with podTemplate.spec.tolerations. A first-class
+                      toleration replaces a podTemplate toleration with the same key, operator,
+                      and effect; otherwise it is appended.
+                    items:
+                      description: |-
+                        The pod this Toleration is attached to tolerates any taint that matches
+                        the triple <key,value,effect> using the matching operator <operator>.
+                      properties:
+                        effect:
+                          description: |-
+                            Effect indicates the taint effect to match. Empty means match all taint effects.
+                            When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: |-
+                            Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                            If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                          type: string
+                        operator:
+                          description: |-
+                            Operator represents a key's relationship to the value.
+                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Exists is equivalent to wildcard for value, so that a pod can
+                            tolerate all taints of a particular category.
+                          type: string
+                        tolerationSeconds:
+                          description: |-
+                            TolerationSeconds represents the period of time the toleration (which must be
+                            of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                            it is not set, which means tolerate the taint forever (do not evict). Zero and
+                            negative values will be treated as 0 (evict immediately) by the system.
+                          format: int64
+                          type: integer
+                        value:
+                          description: |-
+                            Value is the taint value the toleration matches to.
+                            If the operator is Exists, the value should be empty, otherwise just a regular string.
+                          type: string
+                      type: object
+                    type: array
                 type: object
               service:
+                default:
+                  grpcPort: 9090
+                  httpPort: 8080
+                  type: ClusterIP
                 properties:
                   annotations:
                     additionalProperties:
                       type: string
                     type: object
                   grpcPort:
-                    default: 9090
                     format: int32
                     type: integer
                   httpPort:
-                    default: 8080
                     format: int32
                     type: integer
                   type:
@@ -9383,19 +9413,22 @@ spec:
                     type: string
                 type: object
               serviceAccount:
-                description: ServiceAccountSpec configures the ServiceAccount created
-                  for Meter workloads.
                 properties:
                   annotations:
                     additionalProperties:
                       type: string
                     type: object
                 type: object
+              version:
+                description: |-
+                  Version is the canonical Meter container image tag. It must be SemVer
+                  without a leading "v". When omitted, deprecated image.tag is used, then
+                  the operator's default version.
+                pattern: ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$
+                type: string
               writer:
                 properties:
                   cacheVolume:
-                    description: VolumeSpec configures one of the fixed data or cache
-                      workload volumes.
                     properties:
                       emptyDir:
                         description: |-
@@ -9628,8 +9661,6 @@ spec:
                         required
                       rule: has(self.emptyDir) != has(self.persistentVolumeClaim)
                   dataVolume:
-                    description: VolumeSpec configures one of the fixed data or cache
-                      workload volumes.
                     properties:
                       emptyDir:
                         description: |-
@@ -9861,9 +9892,17 @@ spec:
                     - message: exactly one of emptyDir or persistentVolumeClaim is
                         required
                       rule: has(self.emptyDir) != has(self.persistentVolumeClaim)
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      NodeSelector is merged with podTemplate.spec.nodeSelector. Values here
+                      take precedence when the same key is configured in both places.
+                    type: object
                   podTemplate:
-                    description: PodTemplateSpec describes the data a pod should have
-                      when created from a template
+                    description: |-
+                      PodTemplate is the full Kubernetes pod template escape hatch. Operator
+                      required fields and the first-class scheduling fields are merged into it.
                     properties:
                       metadata:
                         description: |-
@@ -17960,12 +17999,61 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  tolerations:
+                    description: |-
+                      Tolerations are merged with podTemplate.spec.tolerations. A first-class
+                      toleration replaces a podTemplate toleration with the same key, operator,
+                      and effect; otherwise it is appended.
+                    items:
+                      description: |-
+                        The pod this Toleration is attached to tolerates any taint that matches
+                        the triple <key,value,effect> using the matching operator <operator>.
+                      properties:
+                        effect:
+                          description: |-
+                            Effect indicates the taint effect to match. Empty means match all taint effects.
+                            When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: |-
+                            Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                            If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                          type: string
+                        operator:
+                          description: |-
+                            Operator represents a key's relationship to the value.
+                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Exists is equivalent to wildcard for value, so that a pod can
+                            tolerate all taints of a particular category.
+                          type: string
+                        tolerationSeconds:
+                          description: |-
+                            TolerationSeconds represents the period of time the toleration (which must be
+                            of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                            it is not set, which means tolerate the taint forever (do not evict). Zero and
+                            negative values will be treated as 0 (evict immediately) by the system.
+                          format: int64
+                          type: integer
+                        value:
+                          description: |-
+                            Value is the taint value the toleration matches to.
+                            If the operator is Exists, the value should be empty, otherwise just a regular string.
+                          type: string
+                      type: object
+                    type: array
                 type: object
             type: object
             x-kubernetes-validations:
             - message: reader replicas must be zero in Standalone mode
               rule: self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas)
                 || self.reader.replicas == 0
+            - message: writer replicas must be one in Standalone mode
+              rule: self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas)
+                || self.writer.replicas == 1
+            - message: spec.version and deprecated spec.image.tag must match when
+                both are set
+              rule: '!has(self.version) || !has(self.image) || !has(self.image.tag)
+                || self.version == self.image.tag'
           status:
             description: MeterStatus defines the observed state of Meter.
             properties:

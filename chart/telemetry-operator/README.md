@@ -1,7 +1,7 @@
 # Telemetry Operator Helm chart
 
-This chart installs the Kubebuilder-based Telemetry Operator and its `Meter`
-and `NamespaceAuthentication` CRDs. The operator watches all namespaces and
+This chart installs the Kubebuilder-based Telemetry Operator and its `Meter`,
+`Line`, and `NamespaceAuthentication` CRDs. The operator watches all namespaces and
 manages the workloads and credentials declared by those resources.
 
 ## Install
@@ -51,9 +51,30 @@ The current manager implementation only supports cluster-wide watches, so
 `watchClusterWide` must remain `true`. If `rbac.create=false`, provide an
 equivalent ClusterRole/ClusterRoleBinding and leader-election Role/RoleBinding.
 
-## Meter workload storage
+## Meter and Line images and scheduling
+For managed `Meter` and `Line` resources, `spec.version` is the canonical
+product image tag. It accepts SemVer 2.0 without a leading `v`, including
+prerelease and build metadata. Deprecated `spec.image.tag` remains an alias
+with the same validation; `spec.version` takes precedence and admission
+rejects conflicting values. Omitting both uses `0.1.0`.
+`spec.image.repository` defaults to the product's `ghcr.io/pluralsh/...`
+repository, and `spec.image.pullPolicy` defaults to `IfNotPresent`.
 
-Each Meter writer and reader receives per-replica `ReadWriteOnce` claims by
+Sharded resources default to three writer replicas and two reader replicas.
+`spec.writer.replicas` and `spec.reader.replicas` override those defaults.
+Standalone resources safely run exactly one writer and no reader; other
+standalone replica values are rejected.
+
+Each writer and reader supports first-class `nodeSelector` and Kubernetes
+`tolerations`, plus the full `podTemplate` escape hatch. First-class node
+selector keys override matching `podTemplate.spec.nodeSelector` keys.
+Tolerations are merged, with first-class entries replacing template entries
+that have the same key, operator, and effect, so duplicates are not emitted.
+Nodes own taints; workloads configure tolerations for those taints.
+
+## Workload storage
+
+Each Meter or Line writer and reader receives per-replica `ReadWriteOnce` claims by
 default: 10Gi for `dataVolume` and 20Gi for `cacheVolume`, using the cluster's
 default StorageClass. Override either claim with a Kubernetes-native PVC spec,
 or explicitly opt into ephemeral storage:
@@ -78,6 +99,16 @@ Persistent claims can be expanded by increasing their requested storage. The
 operator patches existing claims and orphan-recreates the StatefulSet so future
 replicas use the new template. Shrinks and other immutable claim changes are
 rejected.
+
+Line defaults to `ghcr.io/pluralsh/line`, HTTP port 3100, and gRPC port 9091.
+Its ingress routes `/write/ns` to writers and `/read/ns` to readers so the
+remaining path segment is the Line namespace required by its Loki-compatible
+API. Line rejects `spec.ingress.pathPrefix` because its server routes are fixed.
+
+Managed Meter and Line namespace HTTP APIs deny anonymous access by default.
+Omitting `spec.config.auth.unauthenticated` renders `false`; explicitly set it
+to `true` only for workloads that intentionally allow anonymous reads and
+writes. Health and readiness endpoints remain public.
 
 ## Object-store authentication
 

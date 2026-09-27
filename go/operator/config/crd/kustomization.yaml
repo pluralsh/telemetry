@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/telemetry.plural.sh_meters.yaml
+- bases/telemetry.plural.sh_lines.yaml
 - bases/telemetry.plural.sh_namespaceauthentications.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 

@@ -103,6 +103,188 @@ func TestIngressRoutesShardedWritesAndReads(t *testing.T) {
 	assertIngressPath(t, paths, "/read", testMeterName+"-reader")
 }
 
+func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
+	line := &telemetryv1alpha1.Line{
+		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testNamespace},
+		Spec: telemetryv1alpha1.LineSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "logs.example.com",
+		}},
+	}
+	statefulSet, err := StatefulSet(StatefulSetInput{
+		Line: line, Component: ComponentStandalone, ConfigSecretName: "config",
+		InternalTokenSecretName: "token", InternalTokenSecretKey: TokenKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := statefulSet.Spec.Template.Spec.Containers[0]
+	if container.Name != "line" || container.Image != "ghcr.io/pluralsh/line:0.1.0" {
+		t.Fatalf("unexpected Line container: %#v", container)
+	}
+	if container.Ports[0].ContainerPort != 3100 || container.Ports[1].ContainerPort != 9091 {
+		t.Fatalf("unexpected Line ports: %#v", container.Ports)
+	}
+	if !lo.ContainsBy(container.VolumeMounts, func(mount corev1.VolumeMount) bool {
+		return mount.Name == "config" && mount.MountPath == "/etc/line/line.yaml" && mount.SubPath == "line.yaml"
+	}) {
+		t.Fatalf("Line config mount is missing: %#v", container.VolumeMounts)
+	}
+	paths := Ingress(line).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/write/ns", line.Name)
+	assertIngressPath(t, paths, "/read/ns", line.Name)
+
+	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
+	paths = Ingress(line).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/write/ns", line.Name+"-writer")
+	assertIngressPath(t, paths, "/read/ns", line.Name+"-reader")
+}
+
+func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     StatefulSetInput
+		container string
+	}{
+		{
+			name: "Meter",
+			input: StatefulSetInput{Meter: &telemetryv1alpha1.Meter{
+				ObjectMeta: metav1.ObjectMeta{Name: "metrics", Namespace: testNamespace},
+				Spec: telemetryv1alpha1.MeterSpec{
+					Version: "1.2.3-rc.1",
+					Image: telemetryv1alpha1.ImageSpec{
+						Repository: "registry.example.com/observability/meter",
+						Tag:        "0.9.0",
+						PullPolicy: corev1.PullAlways,
+					},
+					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "meter", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+					}}},
+				},
+			}},
+			container: "meter",
+		},
+		{
+			name: "Line",
+			input: StatefulSetInput{Line: &telemetryv1alpha1.Line{
+				ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testNamespace},
+				Spec: telemetryv1alpha1.LineSpec{
+					Version: "2.3.4+build.5",
+					Image: telemetryv1alpha1.ImageSpec{
+						Repository: "registry.example.com/observability/line",
+						Tag:        "0.8.0",
+						PullPolicy: corev1.PullAlways,
+					},
+					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "line", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+					}}},
+				},
+			}},
+			container: "line",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.input.Component = ComponentStandalone
+			test.input.ConfigSecretName = "config"
+			test.input.InternalTokenSecretName = "token"
+			test.input.InternalTokenSecretKey = TokenKey
+			statefulSet, err := StatefulSet(test.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			container := statefulSet.Spec.Template.Spec.Containers[0]
+			product := product(lo.Ternary(test.input.Meter != nil, any(test.input.Meter), any(test.input.Line)))
+			expected := product.Image.Repository + ":" + product.Version
+			if container.Name != test.container || container.Image != expected || container.ImagePullPolicy != corev1.PullAlways {
+				t.Fatalf("container image settings = %#v, want %s with Always", container, expected)
+			}
+		})
+	}
+}
+
+func TestStatefulSetUsesDeprecatedImageTagAlias(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{Image: telemetryv1alpha1.ImageSpec{
+			Repository: "registry.example.com/observability/meter",
+			Tag:        "3.2.1",
+		}},
+	}
+	container := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0]
+	if container.Image != "registry.example.com/observability/meter:3.2.1" {
+		t.Fatalf("container image = %q, want deprecated tag alias", container.Image)
+	}
+}
+
+func TestReplicaDefaultsOverridesAndStandaloneSafety(t *testing.T) {
+	for _, value := range []any{
+		&telemetryv1alpha1.Meter{Spec: telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeSharded}},
+		&telemetryv1alpha1.Line{Spec: telemetryv1alpha1.LineSpec{Mode: telemetryv1alpha1.LineModeSharded}},
+	} {
+		if got := *Replicas(value, ComponentWriter); got != 3 {
+			t.Fatalf("%T default writer replicas = %d, want 3", value, got)
+		}
+		if got := *Replicas(value, ComponentReader); got != 2 {
+			t.Fatalf("%T default reader replicas = %d, want 2", value, got)
+		}
+	}
+
+	meter := &telemetryv1alpha1.Meter{Spec: telemetryv1alpha1.MeterSpec{
+		Mode:   telemetryv1alpha1.MeterModeSharded,
+		Writer: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(4))},
+		Reader: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(5))},
+	}}
+	if got := *Replicas(meter, ComponentWriter); got != 4 {
+		t.Fatalf("writer replica override = %d, want 4", got)
+	}
+	if got := *Replicas(meter, ComponentReader); got != 5 {
+		t.Fatalf("reader replica override = %d, want 5", got)
+	}
+	meter.Spec.Mode = telemetryv1alpha1.MeterModeStandalone
+	meter.Spec.Writer.Replicas = lo.ToPtr(int32(9))
+	if got := *Replicas(meter, ComponentStandalone); got != 1 {
+		t.Fatalf("standalone replicas = %d, want safe fixed value 1", got)
+	}
+}
+
+func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
+	templateToleration := corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "old", Effect: corev1.TaintEffectNoSchedule}
+	duplicateTemplateToleration := corev1.Toleration{Key: "dedicated", Value: "newer-template", Effect: corev1.TaintEffectNoSchedule}
+	firstClassToleration := corev1.Toleration{Key: "dedicated", Value: "telemetry", Effect: corev1.TaintEffectNoSchedule}
+	retainedToleration := corev1.Toleration{Key: "spot", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}
+	workload := telemetryv1alpha1.WorkloadSpec{
+		NodeSelector: map[string]string{"topology.kubernetes.io/zone": "first-class", "kubernetes.io/arch": "arm64"},
+		Tolerations:  []corev1.Toleration{firstClassToleration},
+		PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			NodeSelector: map[string]string{"topology.kubernetes.io/zone": "template", "node.example.com/pool": "observability"},
+			Tolerations:  []corev1.Toleration{templateToleration, retainedToleration, duplicateTemplateToleration},
+		}},
+	}
+	inputs := []StatefulSetInput{
+		{Meter: &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: "metrics"}, Spec: telemetryv1alpha1.MeterSpec{Writer: workload}}},
+		{Line: &telemetryv1alpha1.Line{ObjectMeta: metav1.ObjectMeta{Name: "logs"}, Spec: telemetryv1alpha1.LineSpec{Writer: workload}}},
+	}
+	for _, input := range inputs {
+		input.Component = ComponentStandalone
+		input.ConfigSecretName = "config"
+		input.InternalTokenSecretName = "token"
+		input.InternalTokenSecretKey = TokenKey
+		statefulSet, err := StatefulSet(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := statefulSet.Spec.Template.Spec
+		if spec.NodeSelector["topology.kubernetes.io/zone"] != "first-class" ||
+			spec.NodeSelector["node.example.com/pool"] != "observability" ||
+			spec.NodeSelector["kubernetes.io/arch"] != "arm64" {
+			t.Fatalf("merged node selector = %#v", spec.NodeSelector)
+		}
+		if len(spec.Tolerations) != 2 || !lo.Contains(spec.Tolerations, firstClassToleration) || !lo.Contains(spec.Tolerations, retainedToleration) {
+			t.Fatalf("merged tolerations = %#v, want replacement without duplicates", spec.Tolerations)
+		}
+	}
+}
+
 func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
 	dataSize, cacheSize := resource.MustParse("1Gi"), resource.MustParse("2Gi")
 	meter := &telemetryv1alpha1.Meter{

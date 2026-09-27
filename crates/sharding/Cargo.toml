@@ -1,6 +1,6 @@
 [package]
 name = "sharding"
-description = "Reusable virtual-shard assignment and ownership for Meter, Loom, and Thread"
+description = "Reusable virtual-shard assignment and ownership for Meter, Line, and Track"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

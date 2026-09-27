@@ -127,6 +127,9 @@ sharding:
   # watch_poll_interval_seconds: 2
 
 auth:
+  # HTTP namespace APIs deny anonymous requests by default. Set this to true
+  # only when anonymous read/write access is intentional.
+  unauthenticated: false
   # Optional writer-to-writer Bearer token. It does not authorize HTTP APIs.
   # Every participating process must resolve the same value.
   internal: { source: env, name: METER_INTERNAL_TOKEN }
@@ -156,7 +159,7 @@ auth:
   # iss/aud become required when issuer/audience above are configured.
 
   # Global Basic credentials are alternatives accepted for every namespace.
-  # Empty lists plus no jwt mean anonymous access for that permission.
+  # Empty lists do not enable anonymous access.
   global:
     read: []
     write: []

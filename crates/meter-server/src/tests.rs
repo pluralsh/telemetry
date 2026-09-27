@@ -12,6 +12,7 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
 };
+use base64::Engine;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use http_body_util::BodyExt;
 use proto::meter::internal::v1::internal_writer_server::InternalWriter;
@@ -27,7 +28,7 @@ use tower::ServiceExt;
 use super::*;
 
 fn test_config(mode: ServerMode) -> Config {
-    Config {
+    let mut config = Config {
         mode,
         storage: SlateDbStorageConfig {
             path: "meter-tests".to_owned(),
@@ -47,7 +48,9 @@ fn test_config(mode: ServerMode) -> Config {
             },
         ],
         ..Config::default()
-    }
+    };
+    config.auth.unauthenticated = true;
+    config
 }
 
 fn state(mode: ServerMode) -> AppState {
@@ -243,6 +246,7 @@ async fn query_range_and_series_accept_form_posts() {
 async fn form_posts_preserve_read_auth() {
     let mut config = test_config(ServerMode::Standalone);
     config.sharding.virtual_shards = 1;
+    config.auth.unauthenticated = false;
     config.namespaces[0].auth.read = vec![crate::config::Credential::Basic {
         username: "reader".to_owned(),
         password: crate::config::Secret::Literal {
@@ -260,7 +264,45 @@ async fn form_posts_preserve_read_auth() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = router(state.clone())
+        .oneshot(
+            HttpRequest::post("/read/ns/alpha/api/v1/query")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(
+                    AUTHORIZATION,
+                    format!(
+                        "Basic {}",
+                        base64::prelude::BASE64_STANDARD.encode("reader:read-password")
+                    ),
+                )
+                .body(Body::from("query=1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn namespace_http_auth_is_secure_by_default_and_explicitly_bypassable() {
+    for (unauthenticated, expected) in [(false, StatusCode::UNAUTHORIZED), (true, StatusCode::OK)] {
+        let mut config = test_config(ServerMode::Standalone);
+        config.sharding.virtual_shards = 1;
+        config.auth.unauthenticated = unauthenticated;
+        let state = AppState::open(config).await.unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                HttpRequest::get("/read/ns/alpha/api/v1/query?query=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        state.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -274,6 +316,7 @@ async fn malformed_bearer_returns_generic_unauthorized_response() {
     .unwrap();
     let mut config = test_config(ServerMode::Standalone);
     config.sharding.virtual_shards = 1;
+    config.auth.unauthenticated = false;
     config.auth.jwt = Some(crate::config::JwtConfig {
         jwks: crate::config::JwksSource::File {
             path: path.display().to_string(),

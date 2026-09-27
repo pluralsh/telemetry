@@ -1,0 +1,84 @@
+name: meter-regression
+
+x-meter-environment: &meter-environment
+  AWS_ACCESS_KEY_ID: meter
+  AWS_SECRET_ACCESS_KEY: meter-regression-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+  METER_INTERNAL_TOKEN: internal-regression-token
+
+x-meter: &meter
+  build:
+    context: ../../../..
+    dockerfile: crates/meter-server/Dockerfile
+  environment: *meter-environment
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --web.enable-otlp-receiver
+      - --enable-feature=metadata-wal-records
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["19090:9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: meter
+      MINIO_ROOT_PASSWORD: meter-regression-secret
+    volumes: ["minio-data:/data"]
+    ports: ["19000:9000"]
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+    environment:
+      MC_HOST_local: http://meter:meter-regression-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_started
+    command: ["mb", "--ignore-existing", "local/meter-regression"]
+    restart: on-failure
+
+  meter-writer-0:
+    <<: *meter
+    command: ["--config", "/app/regression/writer-0.yaml"]
+    volumes:
+      - ./writer-0.yaml:/app/regression/writer-0.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18080:8080"]
+
+  meter-writer-1:
+    <<: *meter
+    command: ["--config", "/app/regression/writer-1.yaml"]
+    volumes:
+      - ./writer-1.yaml:/app/regression/writer-1.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18081:8080"]
+
+  meter-reader:
+    <<: *meter
+    command: ["--config", "/app/regression/reader.yaml"]
+    volumes:
+      - ./reader.yaml:/app/regression/reader.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18082:8080"]
+
+volumes:
+  prometheus-data:
+  minio-data:

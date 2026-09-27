@@ -46,6 +46,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 		"path: /etc/meter/secrets/global-read-0-password",
 		"path: /etc/meter/secrets/namespace-tenant-auth-password",
 		"path: /var/run/secrets/meter/internal-token",
+		"unauthenticated: false",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Errorf("rendered config missing %q:\n%s", expected, rendered)
@@ -70,6 +71,43 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	}
 }
 
+func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
+	for _, product := range []struct {
+		name  string
+		input Input
+		key   string
+	}{
+		{
+			name: "meter",
+			input: Input{Meter: &telemetryv1alpha1.Meter{
+				Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
+				}},
+			}},
+			key: MeterKey,
+		},
+		{
+			name: "line",
+			input: Input{Line: &telemetryv1alpha1.Line{
+				Spec: telemetryv1alpha1.LineSpec{Config: telemetryv1alpha1.LineConfigSpec{
+					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
+				}},
+			}},
+			key: LineKey,
+		},
+	} {
+		t.Run(product.name, func(t *testing.T) {
+			result, err := Render(product.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(result.Data[product.key]), "unauthenticated: true") {
+				t.Fatalf("rendered config did not enable anonymous access:\n%s", result.Data[product.key])
+			}
+		})
+	}
+}
+
 func TestRenderShardedRoles(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
@@ -83,6 +121,52 @@ func TestRenderShardedRoles(t *testing.T) {
 		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
+	}
+}
+
+func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
+	line := &telemetryv1alpha1.Line{
+		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testMeterNamespace},
+		Spec: telemetryv1alpha1.LineSpec{
+			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/logs"},
+			Config:  telemetryv1alpha1.LineConfigSpec{Namespaces: []string{"tenant-a"}},
+		},
+	}
+	result, err := Render(Input{Line: line, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(result.Data[LineKey])
+	for _, expected := range []string{
+		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
+		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
+		"segment_duration_seconds: 3600", "visibility_interval_seconds: 1",
+		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
+		"path: /var/run/secrets/line/internal-token", "name: tenant-a",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("rendered Line config missing %q:\n%s", expected, rendered)
+		}
+	}
+	for _, invalid := range []string{"path_prefix:", "reader_cache_capacity:", "flush_interval_seconds:"} {
+		if strings.Contains(rendered, invalid) {
+			t.Errorf("rendered Line config contains unsupported field %q:\n%s", invalid, rendered)
+		}
+	}
+
+	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
+	sharded, err := Render(Input{Line: line, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, reader := string(sharded.Data[LineKey]), string(sharded.Data[ReaderKey])
+	for _, expected := range []string{"mode: writer", "backend: kubernetes", "owner_port: 9091", "stateful_set: logs-writer"} {
+		if !strings.Contains(writer, expected) {
+			t.Errorf("writer config missing %q:\n%s", expected, writer)
+		}
+	}
+	if !strings.Contains(reader, "mode: reader") || !strings.Contains(reader, "backend: kubernetes") {
+		t.Fatalf("unexpected Line reader config:\n%s", reader)
 	}
 }
 

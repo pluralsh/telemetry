@@ -48,6 +48,11 @@ jobs:
             context: .
             file: crates/meter-server/Dockerfile
             target: ""
+          - name: line
+            image: ghcr.io/pluralsh/line
+            context: .
+            file: crates/line-server/Dockerfile
+            target: ""
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
             context: go/operator

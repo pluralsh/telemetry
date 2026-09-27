@@ -209,6 +209,13 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Meter")
 		os.Exit(1)
 	}
+	if err := (&controller.LineReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Line")
+		os.Exit(1)
+	}
 	if err := (&controller.NamespaceAuthenticationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

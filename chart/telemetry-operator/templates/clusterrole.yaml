@@ -7,13 +7,13 @@ metadata:
     {{- include "telemetry-operator.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters", "namespaceauthentications"]
+    resources: ["meters", "lines", "namespaceauthentications"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters/status", "namespaceauthentications/status"]
+    resources: ["meters/status", "lines/status", "namespaceauthentications/status"]
     verbs: ["get", "update", "patch"]
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters/finalizers", "namespaceauthentications/finalizers"]
+    resources: ["meters/finalizers", "lines/finalizers", "namespaceauthentications/finalizers"]
     verbs: ["update"]
   - apiGroups: [""]
     resources: ["secrets", "services", "serviceaccounts"]

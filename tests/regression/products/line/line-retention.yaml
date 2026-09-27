@@ -1,0 +1,19 @@
+mode: standalone
+listeners: { http: "0.0.0.0:3100", grpc: "0.0.0.0:9091" }
+storage:
+  type: SlateDb
+  path: retention
+  object_store: { type: Local, path: /data }
+segment_duration_seconds: 2
+retention_seconds: 4
+page:
+  target_size_bytes: 4096
+  max_rows: 32
+  max_age_seconds: 1
+  rows_per_block: 16
+visibility_interval_seconds: 1
+cache: { query_entries: 0 }
+auth: { unauthenticated: true }
+namespaces:
+  - name: regression
+    auth: { read: [], write: [] }

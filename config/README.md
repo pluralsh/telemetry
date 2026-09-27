@@ -1,9 +1,15 @@
-# Meter server configuration
+# Server configuration
 
 `meter-server --config <path>` reads YAML into the configuration below. The default path is
 `config/meter.yaml`. Unknown fields are rejected in the server, listener, write, authentication,
 JWT, and namespace sections. The checked-in [`meter.example.yaml`](meter.example.yaml) is a valid,
 commented standalone configuration with alternatives for every tagged variant.
+
+`line-server --config <path>` uses the same shared server, storage, write, sharding, authentication,
+and namespace conventions for Loki-compatible logs. Start from
+[`line.example.yaml`](line.example.yaml); the container image defaults to
+`/app/config/line.example.yaml`. Line listens on HTTP port `3100` and internal gRPC port `9091` in
+the example configuration.
 
 Defaults apply when a field or section is omitted. Fields described as required must be present
 when their containing section or tagged variant is present.
@@ -142,6 +148,10 @@ A secret value supports exactly one source:
 CR/LF characters are removed; an empty result is rejected. Secret values are redacted from debug
 output. Prefer environment or read-only mounted files in production.
 
+`auth.unauthenticated` defaults to `false`. Therefore every namespace read/write HTTP request
+requires an applicable Basic credential or valid JWT unless anonymous access is explicitly enabled
+with `auth.unauthenticated: true`. Empty credential lists never imply anonymous access.
+
 `auth.global.read` and `auth.global.write` are credential lists accepted for every namespace.
 Each `namespaces[].auth.read` and `.write` list adds credentials for that namespace and permission.
 The only configured credential type is HTTP Basic:
@@ -152,9 +162,10 @@ The only configured credential type is HTTP Basic:
   password: { source: file, path: /var/run/secrets/meter/password }
 ```
 
-Global and namespace Basic credentials are alternatives, not cumulative requirements. If a
-permission has no Basic credentials and JWT is disabled, that operation is anonymous. Once JWT is
-enabled, a request must present either an applicable Basic credential or a valid Bearer JWT.
+Global and namespace Basic credentials are alternatives, not cumulative requirements. When
+`auth.unauthenticated` is `false`, a request must present either an applicable Basic credential or
+a valid Bearer JWT. When it is explicitly `true`, anonymous namespace access is allowed even if
+Basic or JWT credentials are also configured.
 
 `auth.internal` is an optional secret used only for writer-to-writer gRPC. When set, callers send
 and owners require `authorization: Bearer <token>`. Configure the same value on every writer and
@@ -195,7 +206,8 @@ JWT claims:
 
 ## `namespaces`
 
-`namespaces` defaults to one unauthenticated namespace named `default` and must not be empty.
+`namespaces` defaults to one namespace named `default` and must not be empty. That namespace is
+protected by the default `auth.unauthenticated: false` HTTP policy.
 Entries require a unique `name`; names must be 1–255 bytes and cannot contain NUL or ASCII control
 characters. Only listed namespaces are opened. Requests for any other name return `404`.
 

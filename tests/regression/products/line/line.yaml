@@ -1,0 +1,21 @@
+mode: standalone
+listeners: { http: "0.0.0.0:3100", grpc: "0.0.0.0:9091" }
+storage:
+  type: SlateDb
+  path: regression
+  object_store: { type: Local, path: /data }
+  block_cache: { type: FoyerMemory, capacity: 67108864 }
+  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+segment_duration_seconds: 60
+retention_seconds: 3600
+page:
+  target_size_bytes: 16384
+  max_rows: 128
+  max_age_seconds: 1
+  rows_per_block: 32
+visibility_interval_seconds: 1
+cache: { query_entries: 0 }
+auth: { unauthenticated: true }
+namespaces:
+  - name: regression
+    auth: { read: [], write: [] }

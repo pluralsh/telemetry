@@ -1,0 +1,93 @@
+"""Docker Compose lifecycle with failure diagnostics and unconditional cleanup."""
+
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .process import CommandFailed, run, wait_http
+
+
+def docker_available() -> tuple[bool, str]:
+    if shutil.which("docker") is None:
+        return False, "docker executable is unavailable"
+    try:
+        run(("docker", "info"), timeout=10)
+        run(("docker", "compose", "version"), timeout=10)
+    except (CommandFailed, OSError) as error:
+        return False, f"Docker is unavailable: {error}"
+    return True, ""
+
+
+@dataclass
+class ComposeProject:
+    file: Path
+    name: str
+    readiness_urls: tuple[str, ...] = ()
+    services: tuple[str, ...] = ()
+    profiles: tuple[str, ...] = ()
+    _started: bool = field(default=False, init=False)
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        command = [
+            "docker",
+            "compose",
+            "--project-name",
+            self.name,
+            "--file",
+            str(self.file),
+        ]
+        for profile in self.profiles:
+            command.extend(("--profile", profile))
+        return tuple(command)
+
+    def execute(self, *args: str, timeout: float | None = None) -> str:
+        return run((*self.command, *args), cwd=self.file.parent, timeout=timeout).stdout
+
+    def start(self, *, build: bool = True) -> None:
+        args = ["up", "--detach", "--remove-orphans"]
+        if build:
+            args.append("--build")
+        args.extend(self.services)
+        try:
+            self.execute(*args, timeout=900)
+            self._started = True
+            for url in self.readiness_urls:
+                wait_http(url)
+        except Exception:
+            self.print_diagnostics()
+            self.stop()
+            raise
+
+    def restart(self, service: str) -> None:
+        self.execute("restart", service, timeout=180)
+        for url in self.readiness_urls:
+            wait_http(url)
+
+    def print_diagnostics(self) -> None:
+        for args in (("ps",), ("logs", "--no-color")):
+            try:
+                output = self.execute(*args, timeout=60)
+            except Exception as error:
+                print(f"could not collect {' '.join(args)}: {error}")
+            else:
+                print(output)
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        try:
+            self.execute("down", "--volumes", "--remove-orphans", timeout=180)
+        finally:
+            self._started = False
+
+    def __enter__(self) -> ComposeProject:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if exc is not None:
+            self.print_diagnostics()
+        self.stop()

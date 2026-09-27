@@ -12,17 +12,16 @@ import (
 	"sigs.k8s.io/yaml"
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
+	"github.com/pluralsh/telemetry/go/operator/internal/resources"
 )
 
 const (
 	MeterKey  = "meter.yaml"
+	LineKey   = "line.yaml"
 	ReaderKey = "reader.yaml"
 
-	defaultSecretsPath = "/etc/meter/secrets"
-	defaultDataPath    = "/var/lib/meter"
-	defaultCachePath   = "/var/cache/meter"
-	sourceFile         = "file"
-	modeStandalone     = "standalone"
+	sourceFile     = "file"
+	modeStandalone = "standalone"
 )
 
 type Credential struct {
@@ -53,6 +52,7 @@ type JWT struct {
 
 type Input struct {
 	Meter             *telemetryv1alpha1.Meter
+	Line              *telemetryv1alpha1.Line
 	Global            Access
 	Namespaces        []NamespaceAccess
 	JWT               *JWT
@@ -67,11 +67,15 @@ type Result struct {
 }
 
 func Render(input Input) (Result, error) {
-	if input.Meter == nil {
-		return Result{}, fmt.Errorf("meter is required")
+	if input.Line != nil {
+		return renderLine(input)
 	}
-	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, defaultSecretsPath)
-	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, "/var/run/secrets/meter/internal-token")
+	if input.Meter == nil {
+		return Result{}, fmt.Errorf("Meter or Line is required")
+	}
+	descriptor := resources.MeterDescriptor
+	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
+	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
 	data := map[string][]byte{}
 	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
 	namespaceAccess := map[string]renderAccess{}
@@ -118,11 +122,11 @@ func Render(input Input) (Result, error) {
 			Mode:                mode,
 			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Meter)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Meter))},
 			PathPrefix:          input.Meter.Spec.Ingress.PathPrefix,
-			Storage:             renderStorageConfig(input.Meter.Spec.Config.Storage),
+			Storage:             renderStorageConfig(input.Meter.Spec.Config.Storage, descriptor),
 			ReaderCacheCapacity: int64Value(input.Meter.Spec.Config.ReaderCacheCapacity, 268435456),
 			Write:               renderWriteConfig(input.Meter.Spec.Config.Write),
-			Sharding:            renderShardingConfig(input.Meter, mode),
-			Auth:                renderAuth{JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Sharding:            renderShardingConfig(input.Meter.Name, input.Meter.Namespace, input.Meter.Spec.Config.Sharding, grpcPort(input.Meter), mode),
+			Auth:                renderAuth{Unauthenticated: input.Meter.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:          namespaces,
 		})
 	}
@@ -139,6 +143,111 @@ func Render(input Input) (Result, error) {
 		data[ReaderKey], err = makeConfig("reader")
 		if err != nil {
 			return Result{}, fmt.Errorf("render reader config: %w", err)
+		}
+	}
+	sum := sha256.New()
+	keys := lo.Keys(data)
+	slices.Sort(keys)
+	for _, key := range keys {
+		_, _ = sum.Write([]byte(key))
+		_, _ = sum.Write(data[key])
+	}
+	_, _ = sum.Write(input.InternalToken)
+	return Result{Data: data, Hash: hex.EncodeToString(sum.Sum(nil))}, nil
+}
+
+func renderLine(input Input) (Result, error) {
+	line := input.Line
+	descriptor := resources.LineDescriptor
+	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
+	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
+	data := map[string][]byte{}
+	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
+	namespaceAccess := map[string]renderAccess{}
+	for _, namespace := range input.Namespaces {
+		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
+		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
+		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
+		current.Read = append(current.Read, rendered.Read...)
+		current.Write = append(current.Write, rendered.Write...)
+		namespaceAccess[namespace.Name] = current
+	}
+	var jwt *renderJWT
+	if input.JWT != nil {
+		jwt = &renderJWT{
+			Issuer: input.JWT.Issuer, Audience: input.JWT.Audience,
+			RefreshIntervalSeconds: int64Value(input.JWT.RefreshIntervalSeconds, 300),
+			RequestTimeoutSeconds:  int64Value(input.JWT.RequestTimeoutSeconds, 5),
+		}
+		switch {
+		case len(input.JWT.JWKS) > 0:
+			data["jwks.json"] = append([]byte(nil), input.JWT.JWKS...)
+			jwt.JWKS = renderJWKS{Source: sourceFile, Path: secretsPath + "/jwks.json"}
+		case input.JWT.URL != "":
+			jwt.JWKS = renderJWKS{Source: "url", URL: input.JWT.URL}
+		default:
+			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
+		}
+	}
+	names := lo.Uniq(line.Spec.Config.Namespaces)
+	if len(names) == 0 {
+		names = []string{"default"}
+	}
+	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
+	sort.Strings(names)
+	namespaces := lo.Map(names, func(name string, _ int) renderNamespace {
+		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess())}
+	})
+	makeConfig := func(component string) ([]byte, error) {
+		spec := line.Spec.Config
+		return yaml.Marshal(renderLineConfig{
+			Mode: component,
+			Listeners: renderListeners{
+				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(line)),
+				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(line)),
+			},
+			Storage:                renderStorageConfig(spec.Storage, descriptor),
+			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
+			RetentionSeconds:       spec.RetentionSeconds,
+			Page: renderLinePage{
+				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
+				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
+				MaxAgeSeconds:   int64Value(spec.Page.MaxAgeSeconds, 5),
+				RowsPerBlock:    int64Value(spec.Page.RowsPerBlock, 256),
+			},
+			VisibilityIntervalSeconds: int64Value(spec.VisibilityIntervalSeconds, 1),
+			Write: renderLineWrite{
+				Durability:        lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityWritten)),
+				RemoteConcurrency: int32Value(spec.Write.RemoteConcurrency, 16),
+				RemoteRetries:     int32Value(spec.Write.RemoteRetries, 2),
+			},
+			Sharding: renderShardingConfig(line.Name, line.Namespace, spec.Sharding, resources.GRPCPort(line), component),
+			Request: renderLineRequest{
+				MaxRequestBytes:             int64Value(spec.Request.MaxRequestBytes, 10485760),
+				MaxQueryEntries:             int64Value(spec.Request.MaxQueryEntries, 5000),
+				MaxQueryPages:               int64Value(spec.Request.MaxQueryPages, 10000),
+				MaxStructuredMetadataFields: int64Value(spec.Request.MaxStructuredMetadataFields, 128),
+				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 8),
+				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 67108864),
+			},
+			Cache:      renderLineQueryCache{QueryEntries: int64Value(spec.Cache.QueryEntries, 256)},
+			Auth:       renderAuth{Unauthenticated: line.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces: namespaces,
+		})
+	}
+	writerMode := modeStandalone
+	if resources.Mode(line) == telemetryv1alpha1.ProductModeSharded {
+		writerMode = "writer"
+	}
+	var err error
+	data[LineKey], err = makeConfig(writerMode)
+	if err != nil {
+		return Result{}, fmt.Errorf("render Line config: %w", err)
+	}
+	if writerMode == "writer" {
+		data[ReaderKey], err = makeConfig("reader")
+		if err != nil {
+			return Result{}, fmt.Errorf("render Line reader config: %w", err)
 		}
 	}
 	sum := sha256.New()
@@ -177,26 +286,27 @@ func emptyAccess() renderAccess {
 	return renderAccess{Read: []renderCredential{}, Write: []renderCredential{}}
 }
 
-func renderStorageConfig(spec telemetryv1alpha1.StorageSpec) renderStorage {
+func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor) renderStorage {
 	objectType := lo.CoalesceOrEmpty(string(spec.ObjectStore.Type), string(telemetryv1alpha1.ObjectStoreLocal))
 	objectPath := spec.ObjectStore.Path
 	if objectType == string(telemetryv1alpha1.ObjectStoreLocal) {
-		objectPath = lo.CoalesceOrEmpty(objectPath, defaultDataPath+"/data")
+		objectPath = lo.CoalesceOrEmpty(objectPath, descriptor.DataPath+"/data")
 	}
 	result := renderStorage{
-		Path:         lo.CoalesceOrEmpty(spec.Path, "meter"),
+		Type:         "SlateDb",
+		Path:         lo.CoalesceOrEmpty(spec.Path, descriptor.Name),
 		SettingsPath: spec.SettingsPath,
 		ObjectStore:  renderObjectStoreConfig(spec.ObjectStore, objectType, objectPath),
 	}
 	if spec.BlockCache == nil {
-		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(int64(10737418240)), DiskPath: defaultCachePath}
+		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(int64(10737418240)), DiskPath: descriptor.CachePath}
 	} else {
-		result.BlockCache = renderCacheConfig(spec.BlockCache)
+		result.BlockCache = renderCacheConfig(spec.BlockCache, descriptor.CachePath)
 	}
 	if spec.MetaCache == nil {
 		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(int64(134217728))}
 	} else {
-		result.MetaCache = renderCacheConfig(spec.MetaCache)
+		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath)
 	}
 	return result
 }
@@ -222,7 +332,7 @@ func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType,
 	return result
 }
 
-func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec) *renderCache {
+func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath string) *renderCache {
 	result := &renderCache{Type: string(spec.Type), MemoryCapacity: spec.MemoryCapacity, DiskCapacity: spec.DiskCapacity, DiskPath: spec.DiskPath, Capacity: spec.Capacity, Shards: spec.Shards, WritePolicy: spec.WritePolicy, Flushers: spec.Flushers, BufferPoolSize: spec.BufferPoolSize, SubmitQueueSizeThreshold: spec.SubmitQueueSizeThreshold}
 	if spec.Type == telemetryv1alpha1.CacheFoyerHybrid {
 		result.MemoryCapacity = lo.CoalesceOrEmpty(result.MemoryCapacity, lo.ToPtr(int64(536870912)))
@@ -244,20 +354,20 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	}
 }
 
-func renderShardingConfig(meter *telemetryv1alpha1.Meter, component string) renderSharding {
-	virtual := int32Value(meter.Spec.Config.Sharding.VirtualShards, 64)
+func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
+	virtual := int32Value(spec.VirtualShards, 64)
 	if component == modeStandalone {
 		return renderSharding{VirtualShards: virtual, Backend: modeStandalone}
 	}
-	writer := resourceName(meter.Name, "writer")
+	writer := resourceName(name, "writer")
 	return renderSharding{
-		VirtualShards: virtual, Backend: "kubernetes", Namespace: meter.Namespace,
+		VirtualShards: virtual, Backend: "kubernetes", Namespace: namespace,
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
-		OwnerPort: grpcPort(meter), AssignmentConfigMap: resourceName(meter.Name, "writer-shard-assignments"),
-		CoordinatorLease: resourceName(meter.Name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(meter.Name, "writer-shard"),
-		LeaseDurationSeconds:     int64Value(meter.Spec.Config.Sharding.LeaseDurationSeconds, 15),
-		RenewIntervalSeconds:     int64Value(meter.Spec.Config.Sharding.RenewIntervalSeconds, 5),
-		WatchPollIntervalSeconds: int64Value(meter.Spec.Config.Sharding.WatchPollIntervalSeconds, 2),
+		OwnerPort: grpcPort, AssignmentConfigMap: resourceName(name, "writer-shard-assignments"),
+		CoordinatorLease: resourceName(name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(name, "writer-shard"),
+		LeaseDurationSeconds:     int64Value(spec.LeaseDurationSeconds, 15),
+		RenewIntervalSeconds:     int64Value(spec.RenewIntervalSeconds, 5),
+		WatchPollIntervalSeconds: int64Value(spec.WatchPollIntervalSeconds, 2),
 	}
 }
 
@@ -312,11 +422,49 @@ type renderConfig struct {
 	Auth                renderAuth        `json:"auth"`
 	Namespaces          []renderNamespace `json:"namespaces"`
 }
+type renderLineConfig struct {
+	Mode                      string               `json:"mode"`
+	Listeners                 renderListeners      `json:"listeners"`
+	Storage                   renderStorage        `json:"storage"`
+	SegmentDurationSeconds    int64                `json:"segment_duration_seconds"`
+	RetentionSeconds          *int64               `json:"retention_seconds,omitempty"`
+	Page                      renderLinePage       `json:"page"`
+	VisibilityIntervalSeconds int64                `json:"visibility_interval_seconds"`
+	Write                     renderLineWrite      `json:"write"`
+	Sharding                  renderSharding       `json:"sharding"`
+	Request                   renderLineRequest    `json:"request"`
+	Cache                     renderLineQueryCache `json:"cache"`
+	Auth                      renderAuth           `json:"auth"`
+	Namespaces                []renderNamespace    `json:"namespaces"`
+}
+type renderLinePage struct {
+	TargetSizeBytes int64 `json:"target_size_bytes"`
+	MaxRows         int64 `json:"max_rows"`
+	MaxAgeSeconds   int64 `json:"max_age_seconds"`
+	RowsPerBlock    int64 `json:"rows_per_block"`
+}
+type renderLineWrite struct {
+	Durability        string `json:"durability"`
+	RemoteConcurrency int32  `json:"remote_concurrency"`
+	RemoteRetries     int32  `json:"remote_retries"`
+}
+type renderLineRequest struct {
+	MaxRequestBytes             int64 `json:"max_request_bytes"`
+	MaxQueryEntries             int64 `json:"max_query_entries"`
+	MaxQueryPages               int64 `json:"max_query_pages"`
+	MaxStructuredMetadataFields int64 `json:"max_structured_metadata_fields"`
+	QueryConcurrency            int32 `json:"query_concurrency"`
+	MaxInFlightQueryBytes       int64 `json:"max_in_flight_query_bytes"`
+}
+type renderLineQueryCache struct {
+	QueryEntries int64 `json:"query_entries"`
+}
 type renderListeners struct {
 	HTTP string `json:"http"`
 	GRPC string `json:"grpc"`
 }
 type renderStorage struct {
+	Type         string            `json:"type"`
 	Path         string            `json:"path"`
 	ObjectStore  renderObjectStore `json:"object_store"`
 	SettingsPath string            `json:"settings_path,omitempty"`
@@ -393,9 +541,10 @@ type renderAccess struct {
 	Write []renderCredential `json:"write"`
 }
 type renderAuth struct {
-	JWT      *renderJWT        `json:"jwt,omitempty"`
-	Global   renderAccess      `json:"global"`
-	Internal *renderFileSecret `json:"internal,omitempty"`
+	Unauthenticated bool              `json:"unauthenticated"`
+	JWT             *renderJWT        `json:"jwt,omitempty"`
+	Global          renderAccess      `json:"global"`
+	Internal        *renderFileSecret `json:"internal,omitempty"`
 }
 type renderNamespace struct {
 	Name string       `json:"name"`

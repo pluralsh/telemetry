@@ -1,29 +1,60 @@
-# Meter regression suite
+# Regression harness
 
-This black-box suite sends the same deterministic Prometheus remote-write
-Snappy/protobuf fixture to stock Prometheus and a two-writer Meter cluster. The
-fixture is deliberately posted only to `meter-writer-0`; series mapped to the
-second contiguous shard range therefore exercise authenticated internal gRPC
-forwarding. A separate reader opens every shard `DbReader` from shared MinIO
-storage.
+Pytest owns lifecycle, readiness, diagnostics, and cleanup for each product.
+Docker state is isolated by Compose project and removed after every suite. Tests
+skip with a clear reason when Docker or Compose is unavailable.
 
-Run the complete Docker suite:
+Install and run:
 
 ```sh
-tests/regression/test.sh
+mise install
+mise exec -- python -m pip install -r tests/regression/requirements.txt
+mise exec -- python -m pytest tests/regression/test_unit
+mise exec -- python -m pytest tests/regression/test_live
 ```
 
-`start.sh`, `wait.sh`, and `down.sh` are also usable independently. The test
-script always tears down volumes and prints service logs on failure. Host ports
-are Prometheus `19090`, writers `18080`/`18081`, reader `18082`, and MinIO
-`19000`.
+Use `--extended` to include restart and time-based retention checks. The core
+suite keeps those slower checks out of pull-request latency:
 
-The Rust runner compares normalized/sorted Prometheus results. Numeric values
-use relative tolerance `1e-9` with absolute floor `1e-12`. It covers instant
-and range queries, selectors, regex, aggregation, counter rate, offsets, binary
-joins, discovery and metadata APIs, empty/boundary behavior, OTLP equivalence,
-namespace isolation, authorization, idempotency, read-only rejection, and
-reader freshness.
+```sh
+mise exec -- python -m pytest tests/regression/test_live --extended
+```
+
+## Meter
+
+`products/meter/` owns Prometheus, MinIO, Meter compose/config assets. The
+host-side Python suite uses product-specific modules in `harness/meter/` for
+deterministic fixtures, Prometheus remote-write protobuf and Snappy encoding,
+OTLP protobuf, authentication, HTTP calls, and response normalization. The live
+tests compare PromQL and discovery results against Prometheus using relative
+tolerance `1e-9` with absolute floor `1e-12`, and cover sharding, forwarding,
+the Basic/JWT authorization matrix, OTLP metadata, idempotency, namespace
+isolation, and reader freshness.
+
+The optional Meter-only entrypoint used by the kind handoff scenario is:
+
+```sh
+PYTHONPATH=tests/regression python -m harness.meter
+```
+
+## Line
+
+`products/line/` pins Loki 3.5.5 by multi-architecture digest and builds a local
+single-node Line image. Identical current-time Loki JSON, raw Snappy protobuf,
+and OTLP JSON fixtures are sent to both products. The suite canonicalizes and
+compares Loki log and metric endpoint envelopes, while keeping Line's
+`| match` BM25 extension in Line-only assertions.
+
+Coverage includes out-of-order entries, sparse streams, cold/warm BM25,
+periodic visibility, durable restart, and retention expiry. Line's checked-in
+configuration publishes accepted writes every one second; the live test polls
+at 100 ms and fails if visibility exceeds three seconds. Restart and retention
+run with `--extended`. Line stores a logical expiry deadline in page metadata,
+so reads stop returning expired pages independently of SlateDB compaction;
+physical TTL remains enabled for eventual reclamation.
+
+Host ports are Loki `13100`, Line `13101`, retention Line `13102`, Prometheus
+`19090`, Meter writers `18080`/`18081`, Meter reader `18082`, and MinIO `19000`.
 
 The optional Kubernetes scenario is not part of normal Cargo tests:
 

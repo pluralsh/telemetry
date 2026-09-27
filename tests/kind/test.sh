@@ -92,7 +92,8 @@ run_meter_check() {
       REGRESSION_BASE_MS="$((BASE_MS + offset_ms))" \
       METER_WRITE_URL=http://127.0.0.1:28080/write/ns/regression \
       METER_READ_URL=http://127.0.0.1:28082/read/ns/regression \
-      cargo run --locked --package regression
+      PYTHONPATH="$ROOT/tests/regression" \
+      python -m harness.meter
   )
 }
 

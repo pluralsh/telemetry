@@ -9,6 +9,7 @@
 Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API group.
 
 ### Resource Types
+- [Line](#line)
 - [Meter](#meter)
 - [NamespaceAuthentication](#namespaceauthentication)
 
@@ -20,10 +21,6 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 
 AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.
 
-Credentials are optional so workloads can use ambient credentials such as
-IAM roles for service accounts. When static credentials are used, both the
-access key ID and secret access key must be supplied.
-
 
 
 _Appears in:_
@@ -33,9 +30,9 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `region` _string_ |  |  | MinLength: 1 <br /> |
 | `bucket` _string_ |  |  | MinLength: 1 <br /> |
-| `endpoint` _string_ | Endpoint overrides the AWS endpoint for S3-compatible stores. |  |  |
-| `allowHTTP` _boolean_ | AllowHTTP permits unencrypted HTTP connections to the custom endpoint. |  |  |
-| `virtualHostedStyle` _boolean_ | VirtualHostedStyle sends requests to bucket.endpoint instead of endpoint/bucket. |  |  |
+| `endpoint` _string_ |  |  |  |
+| `allowHTTP` _boolean_ |  |  |  |
+| `virtualHostedStyle` _boolean_ |  |  |  |
 | `accessKeyIDSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `secretAccessKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `sessionTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
@@ -67,10 +64,12 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
+| `unauthenticated` _boolean_ | Unauthenticated permits anonymous access to namespace HTTP APIs. | false |  |
 | `global` _[AccessSpec](#accessspec)_ |  |  |  |
 | `jwt` _[JWTSpec](#jwtspec)_ |  |  |  |
 | `internalTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
@@ -80,7 +79,7 @@ _Appears in:_
 
 
 
-AzureClientSecretAuthSpec configures Azure service-principal authentication.
+
 
 
 
@@ -98,10 +97,7 @@ _Appears in:_
 
 
 
-AzureObjectStoreSpec configures Azure Blob Storage.
 
-Authentication is optional to support managed identity. At most one explicit
-authentication method may be configured.
 
 
 
@@ -112,8 +108,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `account` _string_ |  |  | MinLength: 1 <br /> |
 | `container` _string_ |  |  | MinLength: 1 <br /> |
-| `endpoint` _string_ | Endpoint overrides the Azure Blob Storage endpoint. |  |  |
-| `allowHTTP` _boolean_ | AllowHTTP permits unencrypted HTTP connections to the custom endpoint. |  |  |
+| `endpoint` _string_ |  |  |  |
+| `allowHTTP` _boolean_ |  |  |  |
 | `accessKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `sasTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `bearerTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
@@ -125,8 +121,7 @@ _Appears in:_
 
 
 
-AzureWorkloadIdentityAuthSpec configures Azure workload identity federation.
-The pod template must mount the projected service-account token at TokenFile.
+
 
 
 
@@ -212,7 +207,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `kind` _string_ |  |  | Enum: [Meter] <br /> |
+| `kind` _string_ |  |  | Enum: [Meter Line] <br /> |
 | `name` _string_ |  |  | MinLength: 1 <br /> |
 
 
@@ -238,9 +233,7 @@ _Appears in:_
 
 
 
-GCPObjectStoreSpec configures Google Cloud Storage.
 
-Authentication is optional to support application default credentials.
 
 
 
@@ -250,7 +243,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `bucket` _string_ |  |  | MinLength: 1 <br /> |
-| `baseURL` _string_ | BaseURL overrides the Google Cloud Storage API URL. |  |  |
+| `baseURL` _string_ |  |  |  |
 | `serviceAccountKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `bearerTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 
@@ -264,13 +257,14 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `repository` _string_ |  | ghcr.io/pluralsh/meter |  |
-| `tag` _string_ |  |  |  |
-| `pullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#pullpolicy-v1-core)_ |  | IfNotPresent | Enum: [Always IfNotPresent Never] <br /> |
+| `repository` _string_ | Repository is the container image repository. It defaults to the product's<br />official GHCR repository. |  |  |
+| `tag` _string_ | Tag is a deprecated alias for the enclosing resource's spec.version.<br />When both are set they must match, and spec.version takes precedence.<br />Deprecated: use spec.version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `pullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#pullpolicy-v1-core)_ | PullPolicy is the Kubernetes image pull policy. | IfNotPresent | Enum: [Always IfNotPresent Never] <br /> |
 
 
 #### IngressMetadataSpec
@@ -299,6 +293,7 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
 
 | Field | Description | Default | Validation |
@@ -306,7 +301,7 @@ _Appears in:_
 | `enabled` _boolean_ |  |  |  |
 | `hostname` _string_ |  |  |  |
 | `ingressClass` _string_ |  |  |  |
-| `pathPrefix` _string_ | PathPrefix optionally scopes Meter's public read and write APIs, for example /meter. |  |  |
+| `pathPrefix` _string_ |  |  |  |
 | `metadata` _[IngressMetadataSpec](#ingressmetadataspec)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 | `tls` _[IngressTLSSpec](#ingresstlsspec)_ |  |  |  |
 
@@ -325,7 +320,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `enabled` _boolean_ |  |  |  |
-| `secretName` _string_ | SecretName defaults to <meter-name>-tls. |  |  |
+| `secretName` _string_ |  |  |  |
 
 
 #### JWKSSpec
@@ -365,6 +360,134 @@ _Appears in:_
 | `requestTimeoutSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 
 
+#### Line
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `Line` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[LineSpec](#linespec)_ |  |  |  |
+
+
+#### LineCacheSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [LineConfigSpec](#lineconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `queryEntries` _integer_ |  | 256 | Minimum: 0 <br /> |
+
+
+#### LineConfigSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [LineSpec](#linespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:line \} |  |
+| `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
+| `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
+| `page` _[LinePageSpec](#linepagespec)_ |  |  |  |
+| `visibilityIntervalSeconds` _integer_ |  | 1 | Minimum: 1 <br /> |
+| `write` _[WriteSpec](#writespec)_ |  |  |  |
+| `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
+| `request` _[LineRequestSpec](#linerequestspec)_ |  |  |  |
+| `cache` _[LineCacheSpec](#linecachespec)_ |  |  |  |
+| `auth` _[AuthSpec](#authspec)_ |  |  |  |
+| `namespaces` _string array_ |  | [default] |  |
+
+
+
+
+#### LinePageSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [LineConfigSpec](#lineconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `targetSizeBytes` _integer_ |  | 1048576 | Minimum: 1 <br /> |
+| `maxRows` _integer_ |  | 8192 | Minimum: 1 <br /> |
+| `maxAgeSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
+| `rowsPerBlock` _integer_ |  | 256 | Minimum: 1 <br /> |
+
+
+#### LineRequestSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [LineConfigSpec](#lineconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxRequestBytes` _integer_ |  | 10485760 | Minimum: 1 <br /> |
+| `maxQueryEntries` _integer_ |  | 5000 | Minimum: 1 <br /> |
+| `maxQueryPages` _integer_ |  | 10000 | Minimum: 1 <br /> |
+| `maxStructuredMetadataFields` _integer_ |  | 128 | Minimum: 1 <br /> |
+| `queryConcurrency` _integer_ |  | 8 | Minimum: 1 <br /> |
+| `maxInFlightQueryBytes` _integer_ |  | 67108864 | Minimum: 1 <br /> |
+
+
+#### LineSpec
+
+
+
+LineSpec defines the desired state of Line.
+
+
+
+_Appears in:_
+- [Line](#line)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[LineMode](#linemode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the canonical Line container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/line \} |  |
+| `config` _[LineConfigSpec](#lineconfigspec)_ |  |  |  |
+| `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9091 httpPort:3100 type:ClusterIP \} |  |
+| `ingress` _[IngressSpec](#ingressspec)_ |  |  |  |
+| `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
+
+
+
+
 #### Meter
 
 
@@ -396,7 +519,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `storage` _[StorageSpec](#storagespec)_ |  |  |  |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:meter \} |  |
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
@@ -404,21 +527,6 @@ _Appears in:_
 | `namespaces` _string array_ |  | [default] |  |
 
 
-#### MeterMode
-
-_Underlying type:_ _string_
-
-
-
-
-
-_Appears in:_
-- [MeterSpec](#meterspec)
-
-| Field | Description |
-| --- | --- |
-| `Standalone` |  |
-| `Sharded` |  |
 
 
 #### MeterSpec
@@ -435,11 +543,12 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `mode` _[MeterMode](#metermode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
-| `image` _[ImageSpec](#imagespec)_ |  |  |  |
+| `version` _string_ | Version is the canonical Meter container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/meter \} |  |
 | `config` _[MeterConfigSpec](#meterconfigspec)_ |  |  |  |
 | `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
-| `service` _[ServiceSpec](#servicespec)_ |  |  |  |
+| `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9090 httpPort:8080 type:ClusterIP \} |  |
 | `ingress` _[IngressSpec](#ingressspec)_ |  |  |  |
 | `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
 
@@ -526,15 +635,18 @@ _Appears in:_
 | `Gcp` |  |
 
 
+
+
 #### ServiceAccountSpec
 
 
 
-ServiceAccountSpec configures the ServiceAccount created for Meter workloads.
+
 
 
 
 _Appears in:_
+- [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
 
 | Field | Description | Default | Validation |
@@ -551,12 +663,13 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `httpPort` _integer_ |  | 8080 |  |
-| `grpcPort` _integer_ |  | 9090 |  |
+| `httpPort` _integer_ |  |  |  |
+| `grpcPort` _integer_ |  |  |  |
 | `type` _[ServiceType](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#servicetype-v1-core)_ |  | ClusterIP | Enum: [ClusterIP NodePort LoadBalancer] <br /> |
 | `annotations` _object (keys:string, values:string)_ |  |  |  |
 
@@ -570,6 +683,7 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
 
 | Field | Description | Default | Validation |
@@ -589,11 +703,12 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `path` _string_ |  | meter |  |
+| `path` _string_ |  |  |  |
 | `settingsPath` _string_ |  |  |  |
 | `objectStore` _[ObjectStoreSpec](#objectstorespec)_ |  |  |  |
 | `blockCache` _[CacheSpec](#cachespec)_ |  |  |  |
@@ -604,7 +719,7 @@ _Appears in:_
 
 
 
-VolumeSpec configures one of the fixed data or cache workload volumes.
+
 
 
 
@@ -626,12 +741,15 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `replicas` _integer_ |  |  | Minimum: 0 <br /> |
-| `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ |  |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is merged with podTemplate.spec.nodeSelector. Values here<br />take precedence when the same key is configured in both places. |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations are merged with podTemplate.spec.tolerations. A first-class<br />toleration replaces a podTemplate toleration with the same key, operator,<br />and effect; otherwise it is appended. |  |  |
+| `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ | PodTemplate is the full Kubernetes pod template escape hatch. Operator<br />required fields and the first-class scheduling fields are merged into it. |  |  |
 | `dataVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `cacheVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 
@@ -645,6 +763,7 @@ _Appears in:_
 
 
 _Appears in:_
+- [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
 
 | Field | Description | Default | Validation |

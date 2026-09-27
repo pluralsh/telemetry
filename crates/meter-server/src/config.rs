@@ -184,6 +184,7 @@ impl Default for ShardingConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
+    pub unauthenticated: bool,
     pub jwt: Option<JwtConfig>,
     pub global: Access,
     pub internal: Option<Secret>,
@@ -383,6 +384,7 @@ mod tests {
     fn defaults_and_validation() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         assert_eq!(config.sharding.virtual_shards, 64);
+        assert!(!config.auth.unauthenticated);
         config.validate().unwrap();
         let invalid: Config =
             serde_yaml::from_str("sharding:\n  virtual_shards: 0\n  backend: standalone\n")
@@ -440,5 +442,15 @@ auth:
         token: { source: literal, value: stale-token }
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn unauthenticated_must_be_an_explicit_boolean() {
+        let omitted: Config = serde_yaml::from_str("auth: {}").unwrap();
+        assert!(!omitted.auth.unauthenticated);
+        let disabled: Config = serde_yaml::from_str("auth:\n  unauthenticated: false\n").unwrap();
+        assert!(!disabled.auth.unauthenticated);
+        let enabled: Config = serde_yaml::from_str("auth:\n  unauthenticated: true\n").unwrap();
+        assert!(enabled.auth.unauthenticated);
     }
 }

@@ -176,17 +176,18 @@ impl JwtAuthenticator {
 
 pub async fn authorize(
     headers: &HeaderMap,
+    unauthenticated: bool,
     global: &Access,
     namespace_access: &Access,
     jwt: Option<&JwtAuthenticator>,
     namespace: &str,
     permission: Permission,
 ) -> bool {
-    let global = credentials(global, permission);
-    let namespace_credentials = credentials(namespace_access, permission);
-    if global.is_empty() && namespace_credentials.is_empty() && jwt.is_none() {
+    if unauthenticated {
         return true;
     }
+    let global = credentials(global, permission);
+    let namespace_credentials = credentials(namespace_access, permission);
     let Some(header) = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -430,6 +431,7 @@ mod tests {
         assert!(
             authorize(
                 &bearer(&read),
+                false,
                 &Access::default(),
                 &Access::default(),
                 Some(&jwt),
@@ -441,6 +443,7 @@ mod tests {
         assert!(
             !authorize(
                 &bearer(&read),
+                false,
                 &Access::default(),
                 &Access::default(),
                 Some(&jwt),
@@ -452,6 +455,7 @@ mod tests {
         assert!(
             !authorize(
                 &bearer(&read),
+                false,
                 &Access::default(),
                 &Access::default(),
                 Some(&jwt),
@@ -464,6 +468,7 @@ mod tests {
         assert!(
             !authorize(
                 &bearer(&write),
+                false,
                 &Access::default(),
                 &Access::default(),
                 Some(&jwt),
@@ -492,6 +497,7 @@ mod tests {
             assert!(
                 !authorize(
                     &bearer(&token),
+                    false,
                     &Access::default(),
                     &Access::default(),
                     Some(&jwt),
@@ -516,6 +522,7 @@ mod tests {
             assert_eq!(
                 authorize(
                     &bearer(&value),
+                    false,
                     &Access::default(),
                     &Access::default(),
                     Some(&jwt),
@@ -552,6 +559,7 @@ mod tests {
         assert!(
             authorize(
                 &basic("global-reader", "global-password"),
+                false,
                 &global,
                 &namespace,
                 Some(&jwt),
@@ -563,6 +571,7 @@ mod tests {
         assert!(
             authorize(
                 &basic("tenant-writer", "tenant-password"),
+                false,
                 &global,
                 &namespace,
                 Some(&jwt),
@@ -574,9 +583,39 @@ mod tests {
         assert!(
             !authorize(
                 &basic("tenant-writer", "tenant-password"),
+                false,
                 &global,
                 &namespace,
                 Some(&jwt),
+                "tenant",
+                Permission::Read,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_access_requires_explicit_opt_in() {
+        let headers = HeaderMap::new();
+        assert!(
+            !authorize(
+                &headers,
+                false,
+                &Access::default(),
+                &Access::default(),
+                None,
+                "tenant",
+                Permission::Read,
+            )
+            .await
+        );
+        assert!(
+            authorize(
+                &headers,
+                true,
+                &Access::default(),
+                &Access::default(),
+                None,
                 "tenant",
                 Permission::Read,
             )

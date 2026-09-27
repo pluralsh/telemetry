@@ -64,6 +64,7 @@ spec:
                   kind:
                     enum:
                     - Meter
+                    - Line
                     type: string
                   name:
                     minLength: 1

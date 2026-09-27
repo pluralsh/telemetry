@@ -1,13 +1,45 @@
 # Telemetry Operator
 
 ## Description
-The Telemetry Operator manages `Meter` datastores and their
+The Telemetry Operator manages `Meter` metric stores, `Line` log stores, and their
 `NamespaceAuthentication` credentials. It renders Meter configuration, creates
 internal credentials, and reconciles the Services, StatefulSets, and
 namespace-scoped RBAC required by standalone or sharded deployments.
 
-Each writer or reader workload accepts `replicas`, `podTemplate`, `dataVolume`,
-and `cacheVolume`. A volume selects exactly one of `emptyDir` or
+The canonical product image tag is `spec.version`. It accepts SemVer 2.0 values
+such as `1.2.3` or `1.2.3-rc.1+build.7`; a leading `v` is rejected to match the
+repository's published image tags. The deprecated `spec.image.tag` remains an
+alias for existing resources and accepts the same SemVer syntax.
+`spec.version` takes precedence, and admission rejects resources that set both
+fields to different values. When neither is set, the operator uses `0.1.0`.
+`spec.image.repository` defaults to
+`ghcr.io/pluralsh/meter` or `ghcr.io/pluralsh/line`, and
+`spec.image.pullPolicy` defaults to `IfNotPresent`. These first-class image
+settings override image values in the product container inside `podTemplate`.
+
+Line uses fixed Loki-compatible namespace paths. Its Ingress routes
+`/write/ns/{namespace}` to writers and `/read/ns/{namespace}` to readers.
+`spec.ingress.pathPrefix` is intentionally rejected for Line because the
+server does not strip or configure a prefix. Line defaults to HTTP port 3100,
+gRPC port 9091, image `ghcr.io/pluralsh/line`, and product-specific config,
+data, cache, and secret paths.
+
+Each writer or reader workload accepts `replicas`, `nodeSelector`,
+`tolerations`, `podTemplate`, `dataVolume`, and `cacheVolume`. Sharded
+workloads default to three writer replicas and two reader replicas; explicit
+non-negative replica counts override those defaults. Standalone mode always
+uses one writer replica and no reader workload. Admission rejects any other
+standalone replica configuration.
+
+`nodeSelector` is merged over `podTemplate.spec.nodeSelector`, so first-class
+keys win. `tolerations` are merged with `podTemplate.spec.tolerations`; a
+first-class entry replaces a template entry with the same key, operator, and
+effect, preventing duplicates, while unrelated entries are retained. Pod
+taints are not configurable because taints belong to nodes; use tolerations to
+schedule onto tainted nodes. The full `podTemplate` remains available for
+other Kubernetes pod settings.
+
+A volume selects exactly one of `emptyDir` or
 `persistentVolumeClaim`. When omitted, data and cache use per-replica
 `ReadWriteOnce` persistent claims of 10Gi and 20Gi respectively, with the
 cluster's default StorageClass. Explicit `emptyDir` volumes remain supported,
@@ -16,7 +48,7 @@ including optional `sizeLimit`. Persistent claims are mounted through fixed
 shrinking or changing immutable claim properties is rejected without deleting
 existing PVCs.
 
-The operator creates one ServiceAccount per Meter and assigns it to every
+The operator creates one ServiceAccount per Meter or Line and assigns it to every
 managed workload. Use `spec.serviceAccount.annotations` for cloud identity
 integrations such as AWS IRSA, Azure workload identity, or GKE workload
 identity.
@@ -108,6 +140,10 @@ managed/workload identity, or Google application default credentials. See the
 [CRD API reference](docs/api.md) for each provider's endpoint and authentication
 fields and the [object-store authentication guide](docs/object-store-authentication.md)
 for complete examples.
+
+Meter and Line namespace HTTP APIs are authenticated by default. Omitted
+`spec.config.auth.unauthenticated` renders `false`; set it to `true` only when
+anonymous reads and writes are intentional. Health and readiness remain public.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**

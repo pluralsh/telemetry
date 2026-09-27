@@ -21,6 +21,7 @@ data:
       virtual_shards: {{ .Values.sharding.virtualShards }}
       backend: standalone
     auth:
+      unauthenticated: {{ .Values.config.auth.unauthenticated }}
       {{- if .Values.internalToken.enabled }}
       internal:
         source: file
@@ -67,6 +68,7 @@ data:
       renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
       watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
     auth:
+      unauthenticated: {{ .Values.config.auth.unauthenticated }}
       {{- if .Values.internalToken.enabled }}
       internal:
         source: file
@@ -113,6 +115,7 @@ data:
       renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
       watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
     auth:
+      unauthenticated: {{ .Values.config.auth.unauthenticated }}
       {{- if .Values.internalToken.enabled }}
       internal:
         source: file

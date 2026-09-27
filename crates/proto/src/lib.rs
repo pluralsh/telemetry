@@ -7,3 +7,11 @@ pub mod meter {
         }
     }
 }
+
+pub mod line {
+    pub mod internal {
+        pub mod v1 {
+            tonic::include_proto!("line.internal.v1");
+        }
+    }
+}

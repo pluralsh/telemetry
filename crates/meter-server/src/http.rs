@@ -450,6 +450,7 @@ async fn authorize_namespace(
         .ok_or_else(|| ApiError::not_found("unknown namespace"))?;
     if authorize(
         headers,
+        state.config.auth.unauthenticated,
         &state.config.auth.global,
         &config.auth,
         state.jwt.as_ref(),

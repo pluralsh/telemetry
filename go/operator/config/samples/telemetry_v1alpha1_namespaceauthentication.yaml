@@ -12,3 +12,18 @@ spec:
   secretKeyRef:
     name: prometheus-basic-auth
     key: password
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: loki-reader
+spec:
+  dataStoreRef:
+    kind: Line
+    name: line-sample
+  namespace: default
+  username: loki
+  permission: read
+  secretKeyRef:
+    name: loki-basic-auth
+    key: password

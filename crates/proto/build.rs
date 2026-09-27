@@ -8,9 +8,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos_with_config(
             prost_config,
-            &["proto/meter/internal/v1/writer.proto"],
+            &[
+                "proto/meter/internal/v1/writer.proto",
+                "proto/line/internal/v1/writer.proto",
+            ],
             &["proto"],
         )?;
     println!("cargo:rerun-if-changed=proto/meter/internal/v1/writer.proto");
+    println!("cargo:rerun-if-changed=proto/line/internal/v1/writer.proto");
     Ok(())
 }

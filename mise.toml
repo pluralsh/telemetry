@@ -1,6 +1,7 @@
 [tools]
 go = "1.27.0"
 kubebuilder = "4.6.0"
+python = "3.13.7"
 rust = { version = "1.91.0", components = "clippy,rustfmt" }
 
 [env]

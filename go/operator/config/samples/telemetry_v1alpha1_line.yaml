@@ -1,0 +1,25 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Line
+metadata:
+  name: line-sample
+spec:
+  mode: Standalone
+  version: 0.1.0
+  image:
+    repository: ghcr.io/pluralsh/line
+    pullPolicy: IfNotPresent
+  config:
+    auth:
+      unauthenticated: false
+    namespaces:
+      - default
+    storage:
+      objectStore:
+        type: Local
+  ingress:
+    enabled: false
+  writer:
+    # Standalone mode always runs exactly one replica.
+    replicas: 1
+    nodeSelector:
+      kubernetes.io/os: linux

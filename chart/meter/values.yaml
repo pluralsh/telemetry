@@ -75,6 +75,8 @@ config:
     remote_concurrency: 16
     remote_retries: 2
   auth:
+    # Namespace HTTP APIs require credentials unless explicitly enabled.
+    unauthenticated: false
     # Optional external JWT verification. For a file source, mount an existing
     # Secret containing a public JWKS with extraVolumes/extraVolumeMounts.
     # jwt:

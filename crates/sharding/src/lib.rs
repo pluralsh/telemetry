@@ -1,7 +1,7 @@
 //! Virtual-shard planning and runtime ownership shared by Telemetry products.
 //!
-//! The crate is product-neutral: Meter is the first consumer, while Loom and
-//! Thread can reuse the same assignment and lifecycle contracts later.
+//! The crate is product-neutral: Meter is the first consumer, while Line and
+//! Track can reuse the same assignment and lifecycle contracts later.
 
 mod backend;
 mod model;

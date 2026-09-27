@@ -1,0 +1,54 @@
+name: Regression
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness-unit:
+    name: Harness unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise exec -- python -m pip install -r tests/regression/requirements.txt
+      - run: mise exec -- ruff check tests/regression
+      - run: mise exec -- ruff format --check tests/regression
+      - run: mise exec -- python -m pytest tests/regression/test_unit
+
+  compatibility:
+    name: Live compatibility tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise exec -- python -m pip install -r tests/regression/requirements.txt
+      - name: Run Docker compatibility regression
+        run: mise exec -- python -m pytest tests/regression/test_live
+
+  kind:
+    name: Kubernetes handoff regression
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: mise exec -- python -m pip install -r tests/regression/requirements.txt
+      - name: Run optional Kubernetes handoff regression
+        run: mise exec -- tests/kind/test.sh

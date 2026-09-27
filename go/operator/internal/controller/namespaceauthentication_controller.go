@@ -44,6 +44,7 @@ type NamespaceAuthenticationReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications/finalizers,verbs=update
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=meters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=lines,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *NamespaceAuthenticationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -69,13 +70,14 @@ func (r *NamespaceAuthenticationReconciler) SetupWithManager(mgr ctrl.Manager) e
 		For(&telemetryv1alpha1.NamespaceAuthentication{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForSecret)).
 		Watches(&telemetryv1alpha1.Meter{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForMeter)).
+		Watches(&telemetryv1alpha1.Line{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForLine)).
 		Named("namespaceauthentication").
 		Complete(r)
 }
 
 func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *telemetryv1alpha1.NamespaceAuthentication) error {
-	if auth.Spec.DataStoreRef.Kind != "Meter" {
-		return fmt.Errorf("dataStoreRef.kind must be Meter")
+	if auth.Spec.DataStoreRef.Kind != dataStoreMeter && auth.Spec.DataStoreRef.Kind != dataStoreLine {
+		return fmt.Errorf("dataStoreRef.kind must be Meter or Line")
 	}
 	if auth.Spec.DataStoreRef.Name == "" || auth.Spec.Namespace == "" || auth.Spec.Username == "" {
 		return fmt.Errorf("dataStoreRef.name, namespace, and username are required")
@@ -86,8 +88,13 @@ func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *
 	if auth.Spec.SecretKeyRef.Name == "" || auth.Spec.SecretKeyRef.Key == "" {
 		return fmt.Errorf("secretKeyRef.name and secretKeyRef.key are required")
 	}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.DataStoreRef.Name}, &telemetryv1alpha1.Meter{}); err != nil {
-		return fmt.Errorf("referenced Meter is unavailable: %w", err)
+	key := types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.DataStoreRef.Name}
+	if auth.Spec.DataStoreRef.Kind == dataStoreMeter {
+		if err := r.Get(ctx, key, &telemetryv1alpha1.Meter{}); err != nil {
+			return fmt.Errorf("referenced Meter is unavailable: %w", err)
+		}
+	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Line{}); err != nil {
+		return fmt.Errorf("referenced Line is unavailable: %w", err)
 	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.SecretKeyRef.Name}, secret); err != nil {
@@ -112,13 +119,23 @@ func (r *NamespaceAuthenticationReconciler) authenticationsForSecret(ctx context
 }
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForMeter(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreMeter)
+}
+
+func (r *NamespaceAuthenticationReconciler) authenticationsForLine(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreLine)
+}
+
+func (r *NamespaceAuthenticationReconciler) authenticationsForDataStore(ctx context.Context, obj client.Object, kind string) []reconcile.Request {
 	items := &telemetryv1alpha1.NamespaceAuthenticationList{}
-	if err := r.List(ctx, items, client.InNamespace(obj.GetNamespace()), client.MatchingFields{namespaceAuthMeterIndex: obj.GetName()}); err != nil {
+	if err := r.List(ctx, items, client.InNamespace(obj.GetNamespace())); err != nil {
 		return nil
 	}
-	requests := make([]reconcile.Request, 0, len(items.Items))
+	requests := make([]reconcile.Request, 0)
 	for i := range items.Items {
-		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&items.Items[i])})
+		if items.Items[i].Spec.DataStoreRef.Kind == kind && items.Items[i].Spec.DataStoreRef.Name == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&items.Items[i])})
+		}
 	}
 	return requests
 }
