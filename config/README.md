@@ -38,8 +38,16 @@ Meter always uses SlateDB. If the whole section is omitted, it defaults to `path
 - `storage.object_store`: required object-store variant:
   - `type: InMemory`: process-local, nonpersistent storage; no additional fields.
   - `type: Local`: local filesystem storage; requires `path`.
-  - `type: Aws`: S3 storage; requires `region` and `bucket`. Credentials and optional endpoint
-    settings are resolved by the underlying AWS object-store builder from its environment.
+  - `type: Aws`: S3 storage; requires `region` and `bucket`. Optional fields are `endpoint`,
+    `allow_http`, and `virtual_hosted_style`. Credentials are resolved from standard AWS
+    environment variables and ambient providers such as web identity, ECS, and EC2 metadata.
+  - `type: Azure`: Azure Blob Storage; requires `account` and `container`. Optional fields are
+    `endpoint` and `allow_http`. Account keys, SAS tokens, bearer tokens, service principals,
+    workload identity, managed identity, and the Azure CLI are supported through the standard
+    `AZURE_*` object-store environment variables.
+  - `type: Gcp`: Google Cloud Storage; requires `bucket` and optionally accepts `base_url`.
+    Service-account JSON, bearer tokens, and application default credentials are supported
+    through the standard `GOOGLE_*` object-store environment variables.
 - `storage.block_cache`: optional SlateDB SST data-block cache.
 - `storage.meta_cache`: optional SlateDB index/filter/stats cache. Either cache may use either
   cache variant; leaving one side absent disables caching for that block class.

@@ -55,12 +55,26 @@ make deploy IMG=<some-registry>/operator:tag
 privileges or be logged in as admin.
 
 **Create instances of your solution**
-Create the password Secret referenced by the sample, then apply the resources:
+Create the password and S3 credential Secrets referenced by the sample, then
+apply the resources:
 
 ```sh
 kubectl create secret generic prometheus-basic-auth --from-literal=password=change-me
+kubectl create secret generic meter-s3 \
+  --from-literal=access-key-id=change-me \
+  --from-literal=secret-access-key=change-me
 kubectl apply -k config/samples/
 ```
+
+Meter object stores support AWS S3 (including custom S3-compatible endpoints),
+Azure Blob Storage, and Google Cloud Storage. Static credentials are always
+referenced from Kubernetes Secrets and injected directly into Meter containers;
+they are not copied into the generated Meter configuration. Credential
+references can be omitted to use ambient cloud identity such as AWS IRSA, Azure
+managed/workload identity, or Google application default credentials. See the
+[CRD API reference](docs/api.md) for each provider's endpoint and authentication
+fields and the [object-store authentication guide](docs/object-store-authentication.md)
+for complete examples.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**

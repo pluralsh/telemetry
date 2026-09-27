@@ -331,13 +331,44 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
     match config {
         ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
         ObjectStoreConfig::Aws(aws_config) => {
-            let store = object_store::aws::AmazonS3Builder::from_env()
+            let mut builder = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&aws_config.region)
                 .with_bucket_name(&aws_config.bucket)
-                .build()
-                .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
-                })?;
+                .with_allow_http(aws_config.allow_http)
+                .with_virtual_hosted_style_request(aws_config.virtual_hosted_style);
+            if let Some(endpoint) = &aws_config.endpoint {
+                builder = builder.with_endpoint(endpoint);
+            }
+            let store = builder.build().map_err(|e| {
+                StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
+            })?;
+            Ok(Arc::new(store))
+        }
+        ObjectStoreConfig::Azure(azure_config) => {
+            let mut builder = object_store::azure::MicrosoftAzureBuilder::from_env()
+                .with_account(&azure_config.account)
+                .with_container_name(&azure_config.container)
+                .with_allow_http(azure_config.allow_http);
+            if let Some(endpoint) = &azure_config.endpoint {
+                builder = builder.with_endpoint(endpoint.clone());
+            }
+            let store = builder.build().map_err(|e| {
+                StorageError::Storage(format!("Failed to create Azure Blob Storage store: {}", e))
+            })?;
+            Ok(Arc::new(store))
+        }
+        ObjectStoreConfig::Gcp(gcp_config) => {
+            let mut builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(&gcp_config.bucket);
+            if let Some(base_url) = &gcp_config.base_url {
+                builder = builder.with_base_url(base_url);
+            }
+            let store = builder.build().map_err(|e| {
+                StorageError::Storage(format!(
+                    "Failed to create Google Cloud Storage store: {}",
+                    e
+                ))
+            })?;
             Ok(Arc::new(store))
         }
         ObjectStoreConfig::Local(local_config) => {

@@ -44,6 +44,22 @@ const (
 	verbGet                   = "get"
 	defaultMeterImage         = "ghcr.io/pluralsh/meter"
 	meterUserID         int64 = 10001
+
+	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
+	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+	envAWSSessionToken    = "AWS_SESSION_TOKEN"
+
+	envAzureCredentialType = "AZURE_CREDENTIAL_TYPE"
+	envAzureAccessKey      = "AZURE_STORAGE_ACCOUNT_KEY"
+	envAzureSASToken       = "AZURE_STORAGE_SAS_TOKEN"
+	envAzureBearerToken    = "AZURE_STORAGE_TOKEN"
+	envAzureClientID       = "AZURE_STORAGE_CLIENT_ID"
+	envAzureClientSecret   = "AZURE_STORAGE_CLIENT_SECRET"
+	envAzureTenantID       = "AZURE_STORAGE_TENANT_ID"
+	envAzureFederatedToken = "AZURE_FEDERATED_TOKEN_FILE"
+
+	envGoogleServiceAccountKey = "GOOGLE_SERVICE_ACCOUNT_KEY"
+	envGoogleBearerToken       = "GOOGLE_BEARER_TOKEN"
 )
 
 var (
@@ -296,6 +312,7 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name },
 		corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
+	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(meter)...)
 	meterContainer.VolumeMounts = mergeNamed(meterContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name },
 		corev1.VolumeMount{Name: volumeConfig, MountPath: configPath, SubPath: ConfigKey(component), ReadOnly: true},
 		corev1.VolumeMount{Name: volumeSecrets, MountPath: secretsPath, ReadOnly: true},
@@ -332,6 +349,70 @@ func podTemplate(input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume
 	}
 	spec.Volumes = mergeNamed(spec.Volumes, func(item corev1.Volume) string { return item.Name }, required...)
 	return template
+}
+
+func objectStoreEnv(meter *telemetryv1alpha1.Meter) []corev1.EnvVar {
+	objectStore := meter.Spec.Config.Storage.ObjectStore
+	switch {
+	case objectStore.AWS != nil:
+		return lo.Compact([]corev1.EnvVar{
+			secretEnv(envAWSAccessKeyID, objectStore.AWS.AccessKeyIDSecretRef),
+			secretEnv(envAWSSecretAccessKey, objectStore.AWS.SecretAccessKeySecretRef),
+			secretEnv(envAWSSessionToken, objectStore.AWS.SessionTokenSecretRef),
+		})
+	case objectStore.Azure != nil:
+		return azureObjectStoreEnv(objectStore.Azure)
+	case objectStore.GCP != nil:
+		return lo.Compact([]corev1.EnvVar{
+			secretEnv(envGoogleServiceAccountKey, objectStore.GCP.ServiceAccountKeySecretRef),
+			secretEnv(envGoogleBearerToken, objectStore.GCP.BearerTokenSecretRef),
+		})
+	default:
+		return nil
+	}
+}
+
+func azureObjectStoreEnv(spec *telemetryv1alpha1.AzureObjectStoreSpec) []corev1.EnvVar {
+	switch {
+	case spec.AccessKeySecretRef != nil:
+		return []corev1.EnvVar{
+			{Name: envAzureCredentialType, Value: "access_key"},
+			secretEnv(envAzureAccessKey, spec.AccessKeySecretRef),
+		}
+	case spec.SASTokenSecretRef != nil:
+		return []corev1.EnvVar{
+			{Name: envAzureCredentialType, Value: "sas_token"},
+			secretEnv(envAzureSASToken, spec.SASTokenSecretRef),
+		}
+	case spec.BearerTokenSecretRef != nil:
+		return []corev1.EnvVar{
+			{Name: envAzureCredentialType, Value: "bearer_token"},
+			secretEnv(envAzureBearerToken, spec.BearerTokenSecretRef),
+		}
+	case spec.ClientSecret != nil:
+		return []corev1.EnvVar{
+			{Name: envAzureCredentialType, Value: "client_secret"},
+			{Name: envAzureClientID, Value: spec.ClientSecret.ClientID},
+			{Name: envAzureTenantID, Value: spec.ClientSecret.TenantID},
+			secretEnv(envAzureClientSecret, &spec.ClientSecret.ClientSecretKeyRef),
+		}
+	case spec.WorkloadIdentity != nil:
+		return []corev1.EnvVar{
+			{Name: envAzureCredentialType, Value: "workload_identity"},
+			{Name: envAzureClientID, Value: spec.WorkloadIdentity.ClientID},
+			{Name: envAzureTenantID, Value: spec.WorkloadIdentity.TenantID},
+			{Name: envAzureFederatedToken, Value: spec.WorkloadIdentity.TokenFile},
+		}
+	default:
+		return nil
+	}
+}
+
+func secretEnv(name string, selector *corev1.SecretKeySelector) corev1.EnvVar {
+	if selector == nil {
+		return corev1.EnvVar{}
+	}
+	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: selector.DeepCopy()}}
 }
 
 func secureContainerContext(context *corev1.SecurityContext) *corev1.SecurityContext {

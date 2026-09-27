@@ -12,8 +12,15 @@ spec:
       path: meter
       objectStore:
         type: Aws
-        region: us-east-1
-        bucket: meter
+        aws:
+          region: us-east-1
+          bucket: meter
+          accessKeyIDSecretRef:
+            name: meter-s3
+            key: access-key-id
+          secretAccessKeySecretRef:
+            name: meter-s3
+            key: secret-access-key
       blockCache:
         type: FoyerHybrid
         memoryCapacity: 536870912

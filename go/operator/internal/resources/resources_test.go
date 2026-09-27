@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	testMeterName = "example"
-	testNamespace = "test"
+	testMeterName       = "example"
+	testNamespace       = "test"
+	testObjectStoreName = "meter"
 )
 
 func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
@@ -64,7 +65,7 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 		Status:     telemetryv1alpha1.MeterStatus{ConfigHash: "hash"},
 		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
-				Containers:     []corev1.Container{{Name: "meter", Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
+				Containers:     []corev1.Container{{Name: containerMeter, Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
 				InitContainers: []corev1.Container{{Name: "init"}},
 			},
 		}}},
@@ -100,6 +101,69 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "POD_NAME" }) {
 		t.Fatal("pod template merge lost annotations or environment")
 	}
+}
+
+func TestStatefulSetInjectsObjectStoreCredentialsFromSecrets(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreAWS,
+				AWS: &telemetryv1alpha1.AWSObjectStoreSpec{
+					Region: "us-east-1", Bucket: testObjectStoreName,
+					AccessKeyIDSecretRef:     &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s3"}, Key: "access-key"},
+					SecretAccessKeySecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s3"}, Key: "secret-key"},
+					SessionTokenSecretRef:    &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s3"}, Key: "session-token"},
+				},
+			}},
+		}},
+	}
+	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	assertSecretEnv(t, env, envAWSAccessKeyID, "s3", "access-key")
+	assertSecretEnv(t, env, envAWSSecretAccessKey, "s3", "secret-key")
+	assertSecretEnv(t, env, envAWSSessionToken, "s3", "session-token")
+}
+
+func TestStatefulSetInjectsAzureClientSecretAuthentication(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreAzure,
+				Azure: &telemetryv1alpha1.AzureObjectStoreSpec{
+					Account: "telemetry", Container: testObjectStoreName,
+					ClientSecret: &telemetryv1alpha1.AzureClientSecretAuthSpec{
+						ClientID: "client", TenantID: "tenant",
+						ClientSecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "azure"}, Key: "client-secret"},
+					},
+				},
+			}},
+		}},
+	}
+	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	assertLiteralEnv(t, env, envAzureCredentialType, "client_secret")
+	assertLiteralEnv(t, env, envAzureClientID, "client")
+	assertLiteralEnv(t, env, envAzureTenantID, "tenant")
+	assertSecretEnv(t, env, envAzureClientSecret, "azure", "client-secret")
+}
+
+func TestStatefulSetInjectsGCPServiceAccount(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreGCP,
+				GCP: &telemetryv1alpha1.GCPObjectStoreSpec{
+					Bucket: testObjectStoreName,
+					ServiceAccountKeySecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "gcp"}, Key: "service-account.json",
+					},
+				},
+			}},
+		}},
+	}
+	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	assertSecretEnv(t, env, envGoogleServiceAccountKey, "gcp", "service-account.json")
 }
 
 func mustStatefulSet(t *testing.T, meter *telemetryv1alpha1.Meter) *appsv1.StatefulSet {
@@ -139,6 +203,25 @@ func assertEmptyDir(t *testing.T, volumes []corev1.Volume, name string, size res
 		}
 	}
 	t.Fatalf("%s emptyDir is missing", name)
+}
+
+func assertSecretEnv(t *testing.T, env []corev1.EnvVar, name, secret, key string) {
+	t.Helper()
+	value, found := lo.Find(env, func(item corev1.EnvVar) bool { return item.Name == name })
+	if !found || value.ValueFrom == nil || value.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("secret environment variable %q is missing: %#v", name, env)
+	}
+	if value.ValueFrom.SecretKeyRef.Name != secret || value.ValueFrom.SecretKeyRef.Key != key {
+		t.Fatalf("%s references %s/%s, want %s/%s", name, value.ValueFrom.SecretKeyRef.Name, value.ValueFrom.SecretKeyRef.Key, secret, key)
+	}
+}
+
+func assertLiteralEnv(t *testing.T, env []corev1.EnvVar, name, expected string) {
+	t.Helper()
+	value, found := lo.Find(env, func(item corev1.EnvVar) bool { return item.Name == name })
+	if !found || value.Value != expected {
+		t.Fatalf("%s = %q, want %q", name, value.Value, expected)
+	}
 }
 
 func hasVolume(volumes []corev1.Volume, name string) bool {

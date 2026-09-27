@@ -17,7 +17,7 @@ storage:
   # its standard local settings files and SLATEDB_ environment overrides.
   # settings_path: /etc/meter/SlateDb.toml
 
-  # Object-store variants are case-sensitive: Local, Aws, or InMemory.
+  # Object-store variants are case-sensitive: Local, Aws, Azure, Gcp, or InMemory.
   object_store:
     type: Local
     path: .data
@@ -25,6 +25,23 @@ storage:
   #   type: Aws
   #   region: us-east-1
   #   bucket: meter
+  #   endpoint: http://minio:9000 # Optional S3-compatible endpoint.
+  #   allow_http: true
+  #   virtual_hosted_style: false
+  #   # Credentials use standard AWS environment variables or ambient identity.
+  # object_store:
+  #   type: Azure
+  #   account: telemetry
+  #   container: meter
+  #   endpoint: http://azurite:10000/telemetry # Optional.
+  #   allow_http: true
+  #   # Supports account key, SAS, bearer token, service principal, workload
+  #   # identity, and managed identity through AZURE_* environment variables.
+  # object_store:
+  #   type: Gcp
+  #   bucket: meter
+  #   base_url: http://gcs-emulator:4443 # Optional.
+  #   # Uses GOOGLE_* credentials or application default credentials.
   # object_store:
   #   type: InMemory # Development/testing only; data is process-local.
 

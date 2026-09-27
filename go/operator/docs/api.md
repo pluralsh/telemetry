@@ -14,6 +14,33 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 
 
 
+#### AWSObjectStoreSpec
+
+
+
+AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.
+
+Credentials are optional so workloads can use ambient credentials such as
+IAM roles for service accounts. When static credentials are used, both the
+access key ID and secret access key must be supplied.
+
+
+
+_Appears in:_
+- [ObjectStoreSpec](#objectstorespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `region` _string_ |  |  | MinLength: 1 <br /> |
+| `bucket` _string_ |  |  | MinLength: 1 <br /> |
+| `endpoint` _string_ | Endpoint overrides the AWS endpoint for S3-compatible stores. |  |  |
+| `allowHTTP` _boolean_ | AllowHTTP permits unencrypted HTTP connections to the custom endpoint. |  |  |
+| `virtualHostedStyle` _boolean_ | VirtualHostedStyle sends requests to bucket.endpoint instead of endpoint/bucket. |  |  |
+| `accessKeyIDSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `secretAccessKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `sessionTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+
+
 #### AccessSpec
 
 
@@ -47,6 +74,70 @@ _Appears in:_
 | `global` _[AccessSpec](#accessspec)_ |  |  |  |
 | `jwt` _[JWTSpec](#jwtspec)_ |  |  |  |
 | `internalTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+
+
+#### AzureClientSecretAuthSpec
+
+
+
+AzureClientSecretAuthSpec configures Azure service-principal authentication.
+
+
+
+_Appears in:_
+- [AzureObjectStoreSpec](#azureobjectstorespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `clientID` _string_ |  |  | MinLength: 1 <br /> |
+| `tenantID` _string_ |  |  | MinLength: 1 <br /> |
+| `clientSecretKeyRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+
+
+#### AzureObjectStoreSpec
+
+
+
+AzureObjectStoreSpec configures Azure Blob Storage.
+
+Authentication is optional to support managed identity. At most one explicit
+authentication method may be configured.
+
+
+
+_Appears in:_
+- [ObjectStoreSpec](#objectstorespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `account` _string_ |  |  | MinLength: 1 <br /> |
+| `container` _string_ |  |  | MinLength: 1 <br /> |
+| `endpoint` _string_ | Endpoint overrides the Azure Blob Storage endpoint. |  |  |
+| `allowHTTP` _boolean_ | AllowHTTP permits unencrypted HTTP connections to the custom endpoint. |  |  |
+| `accessKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `sasTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `bearerTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `clientSecret` _[AzureClientSecretAuthSpec](#azureclientsecretauthspec)_ |  |  |  |
+| `workloadIdentity` _[AzureWorkloadIdentityAuthSpec](#azureworkloadidentityauthspec)_ |  |  |  |
+
+
+#### AzureWorkloadIdentityAuthSpec
+
+
+
+AzureWorkloadIdentityAuthSpec configures Azure workload identity federation.
+The pod template must mount the projected service-account token at TokenFile.
+
+
+
+_Appears in:_
+- [AzureObjectStoreSpec](#azureobjectstorespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `clientID` _string_ |  |  | MinLength: 1 <br /> |
+| `tenantID` _string_ |  |  | MinLength: 1 <br /> |
+| `tokenFile` _string_ |  |  | MinLength: 1 <br /> |
 
 
 #### BasicCredentialSpec
@@ -141,6 +232,27 @@ _Appears in:_
 | `applied` |  |
 | `written` |  |
 | `durable` |  |
+
+
+#### GCPObjectStoreSpec
+
+
+
+GCPObjectStoreSpec configures Google Cloud Storage.
+
+Authentication is optional to support application default credentials.
+
+
+
+_Appears in:_
+- [ObjectStoreSpec](#objectstorespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `bucket` _string_ |  |  | MinLength: 1 <br /> |
+| `baseURL` _string_ | BaseURL overrides the Google Cloud Storage API URL. |  |  |
+| `serviceAccountKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `bearerTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 
 
 #### ImageSpec
@@ -330,10 +442,11 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `type` _[ObjectStoreType](#objectstoretype)_ |  | Local | Enum: [InMemory Local Aws] <br /> |
+| `type` _[ObjectStoreType](#objectstoretype)_ |  | Local | Enum: [InMemory Local Aws Azure Gcp] <br /> |
 | `path` _string_ |  |  |  |
-| `region` _string_ |  |  |  |
-| `bucket` _string_ |  |  |  |
+| `aws` _[AWSObjectStoreSpec](#awsobjectstorespec)_ |  |  |  |
+| `azure` _[AzureObjectStoreSpec](#azureobjectstorespec)_ |  |  |  |
+| `gcp` _[GCPObjectStoreSpec](#gcpobjectstorespec)_ |  |  |  |
 
 
 #### ObjectStoreType
@@ -352,6 +465,8 @@ _Appears in:_
 | `InMemory` |  |
 | `Local` |  |
 | `Aws` |  |
+| `Azure` |  |
+| `Gcp` |  |
 
 
 #### ServiceSpec

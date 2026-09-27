@@ -319,11 +319,353 @@ spec:
                         type: object
                       objectStore:
                         properties:
-                          bucket:
-                            type: string
+                          aws:
+                            description: |-
+                              AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.
+
+                              Credentials are optional so workloads can use ambient credentials such as
+                              IAM roles for service accounts. When static credentials are used, both the
+                              access key ID and secret access key must be supplied.
+                            properties:
+                              accessKeyIDSecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              allowHTTP:
+                                description: AllowHTTP permits unencrypted HTTP connections
+                                  to the custom endpoint.
+                                type: boolean
+                              bucket:
+                                minLength: 1
+                                type: string
+                              endpoint:
+                                description: Endpoint overrides the AWS endpoint for
+                                  S3-compatible stores.
+                                type: string
+                              region:
+                                minLength: 1
+                                type: string
+                              secretAccessKeySecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              sessionTokenSecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              virtualHostedStyle:
+                                description: VirtualHostedStyle sends requests to
+                                  bucket.endpoint instead of endpoint/bucket.
+                                type: boolean
+                            required:
+                            - bucket
+                            - region
+                            type: object
+                            x-kubernetes-validations:
+                            - message: accessKeyIDSecretRef and secretAccessKeySecretRef
+                                must be configured together
+                              rule: has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)
+                          azure:
+                            description: |-
+                              AzureObjectStoreSpec configures Azure Blob Storage.
+
+                              Authentication is optional to support managed identity. At most one explicit
+                              authentication method may be configured.
+                            properties:
+                              accessKeySecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              account:
+                                minLength: 1
+                                type: string
+                              allowHTTP:
+                                description: AllowHTTP permits unencrypted HTTP connections
+                                  to the custom endpoint.
+                                type: boolean
+                              bearerTokenSecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              clientSecret:
+                                description: AzureClientSecretAuthSpec configures
+                                  Azure service-principal authentication.
+                                properties:
+                                  clientID:
+                                    minLength: 1
+                                    type: string
+                                  clientSecretKeyRef:
+                                    description: SecretKeySelector selects a key of
+                                      a Secret.
+                                    properties:
+                                      key:
+                                        description: The key of the secret to select
+                                          from.  Must be a valid secret key.
+                                        type: string
+                                      name:
+                                        default: ""
+                                        description: |-
+                                          Name of the referent.
+                                          This field is effectively required, but due to backwards compatibility is
+                                          allowed to be empty. Instances of this type with an empty value here are
+                                          almost certainly wrong.
+                                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                        type: string
+                                      optional:
+                                        description: Specify whether the Secret or
+                                          its key must be defined
+                                        type: boolean
+                                    required:
+                                    - key
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                  tenantID:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - clientID
+                                - clientSecretKeyRef
+                                - tenantID
+                                type: object
+                              container:
+                                minLength: 1
+                                type: string
+                              endpoint:
+                                description: Endpoint overrides the Azure Blob Storage
+                                  endpoint.
+                                type: string
+                              sasTokenSecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              workloadIdentity:
+                                description: |-
+                                  AzureWorkloadIdentityAuthSpec configures Azure workload identity federation.
+                                  The pod template must mount the projected service-account token at TokenFile.
+                                properties:
+                                  clientID:
+                                    minLength: 1
+                                    type: string
+                                  tenantID:
+                                    minLength: 1
+                                    type: string
+                                  tokenFile:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - clientID
+                                - tenantID
+                                - tokenFile
+                                type: object
+                            required:
+                            - account
+                            - container
+                            type: object
+                            x-kubernetes-validations:
+                            - message: at most one Azure authentication method may
+                                be configured
+                              rule: '[has(self.accessKeySecretRef), has(self.sasTokenSecretRef),
+                                has(self.bearerTokenSecretRef), has(self.clientSecret),
+                                has(self.workloadIdentity)].filter(x, x).size() <=
+                                1'
+                          gcp:
+                            description: |-
+                              GCPObjectStoreSpec configures Google Cloud Storage.
+
+                              Authentication is optional to support application default credentials.
+                            properties:
+                              baseURL:
+                                description: BaseURL overrides the Google Cloud Storage
+                                  API URL.
+                                type: string
+                              bearerTokenSecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              bucket:
+                                minLength: 1
+                                type: string
+                              serviceAccountKeySecretRef:
+                                description: SecretKeySelector selects a key of a
+                                  Secret.
+                                properties:
+                                  key:
+                                    description: The key of the secret to select from.  Must
+                                      be a valid secret key.
+                                    type: string
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                  optional:
+                                    description: Specify whether the Secret or its
+                                      key must be defined
+                                    type: boolean
+                                required:
+                                - key
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            required:
+                            - bucket
+                            type: object
+                            x-kubernetes-validations:
+                            - message: serviceAccountKeySecretRef and bearerTokenSecretRef
+                                are mutually exclusive
+                              rule: '![has(self.serviceAccountKeySecretRef), has(self.bearerTokenSecretRef)].all(x,
+                                x)'
                           path:
-                            type: string
-                          region:
                             type: string
                           type:
                             default: Local
@@ -331,12 +673,26 @@ spec:
                             - InMemory
                             - Local
                             - Aws
+                            - Azure
+                            - Gcp
                             type: string
                         type: object
                         x-kubernetes-validations:
-                        - message: Aws object stores require region and bucket
-                          rule: self.type != 'Aws' || (has(self.region) && self.region.size()
-                            > 0 && has(self.bucket) && self.bucket.size() > 0)
+                        - message: Aws object stores require aws configuration
+                          rule: self.type != 'Aws' || has(self.aws)
+                        - message: aws configuration is only valid for Aws object
+                            stores
+                          rule: self.type == 'Aws' || !has(self.aws)
+                        - message: Azure object stores require azure configuration
+                          rule: self.type != 'Azure' || has(self.azure)
+                        - message: azure configuration is only valid for Azure object
+                            stores
+                          rule: self.type == 'Azure' || !has(self.azure)
+                        - message: Gcp object stores require gcp configuration
+                          rule: self.type != 'Gcp' || has(self.gcp)
+                        - message: gcp configuration is only valid for Gcp object
+                            stores
+                          rule: self.type == 'Gcp' || !has(self.gcp)
                       path:
                         default: meter
                         type: string

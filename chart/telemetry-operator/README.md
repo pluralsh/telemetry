@@ -78,3 +78,12 @@ Persistent claims can be expanded by increasing their requested storage. The
 operator patches existing claims and orphan-recreates the StatefulSet so future
 replicas use the new template. Shrinks and other immutable claim changes are
 rejected.
+
+## Object-store authentication
+
+Meter supports AWS S3 and S3-compatible endpoints, Azure Blob Storage, and
+Google Cloud Storage. Provider credentials in a `Meter` resource use
+`SecretKeySelector` fields and are injected directly into the managed
+containers, rather than copied into generated configuration. Omit explicit
+credentials to use ambient identity such as AWS IRSA, Azure managed/workload
+identity, or Google application default credentials.

@@ -9,9 +9,15 @@ import (
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
 )
 
+const (
+	testMeterName      = "example"
+	testMeterNamespace = "test"
+	testBucket         = "meter"
+)
+
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "test"},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
 		Spec:       telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{Namespaces: []string{"default", "default"}}},
 	}
 	input := Input{
@@ -62,7 +68,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 
 func TestRenderShardedRoles(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "test"},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
 		Spec:       telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeSharded},
 	}
 	result, err := Render(Input{Meter: meter, InternalToken: []byte("token")})
@@ -73,5 +79,67 @@ func TestRenderShardedRoles(t *testing.T) {
 		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
+	}
+}
+
+func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
+	tests := []struct {
+		name        string
+		objectStore telemetryv1alpha1.ObjectStoreSpec
+		expected    []string
+	}{
+		{
+			name: "aws",
+			objectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreAWS,
+				AWS: &telemetryv1alpha1.AWSObjectStoreSpec{
+					Region: "us-east-1", Bucket: testBucket, Endpoint: "http://minio:9000",
+					AllowHTTP: true, VirtualHostedStyle: true,
+				},
+			},
+			expected: []string{"type: Aws", "region: us-east-1", "bucket: meter", "endpoint: http://minio:9000", "allow_http: true", "virtual_hosted_style: true"},
+		},
+		{
+			name: "azure",
+			objectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreAzure,
+				Azure: &telemetryv1alpha1.AzureObjectStoreSpec{
+					Account: "telemetry", Container: testBucket, Endpoint: "http://azurite:10000/telemetry", AllowHTTP: true,
+				},
+			},
+			expected: []string{"type: Azure", "account: telemetry", "container: meter", "endpoint: http://azurite:10000/telemetry", "allow_http: true"},
+		},
+		{
+			name: "gcp",
+			objectStore: telemetryv1alpha1.ObjectStoreSpec{
+				Type: telemetryv1alpha1.ObjectStoreGCP,
+				GCP:  &telemetryv1alpha1.GCPObjectStoreSpec{Bucket: testBucket, BaseURL: "http://gcs:4443"},
+			},
+			expected: []string{"type: Gcp", "bucket: meter", "base_url: http://gcs:4443"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			meter := &telemetryv1alpha1.Meter{
+				ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
+				Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+					Storage: telemetryv1alpha1.StorageSpec{ObjectStore: test.objectStore},
+				}},
+			}
+			result, err := Render(Input{Meter: meter, InternalToken: []byte("token")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered := string(result.Data[MeterKey])
+			for _, expected := range test.expected {
+				if !strings.Contains(rendered, expected) {
+					t.Errorf("rendered config missing %q:\n%s", expected, rendered)
+				}
+			}
+			if strings.Contains(rendered, "secretRef") {
+				t.Fatalf("rendered config exposed a secret reference:\n%s", rendered)
+			}
+		})
 	}
 }

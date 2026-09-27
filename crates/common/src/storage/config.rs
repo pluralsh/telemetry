@@ -199,6 +199,12 @@ pub enum ObjectStoreConfig {
     /// AWS S3 object store.
     Aws(AwsObjectStoreConfig),
 
+    /// Azure Blob Storage object store.
+    Azure(AzureObjectStoreConfig),
+
+    /// Google Cloud Storage object store.
+    Gcp(GcpObjectStoreConfig),
+
     /// Local filesystem object store.
     Local(LocalObjectStoreConfig),
 }
@@ -211,6 +217,47 @@ pub struct AwsObjectStoreConfig {
 
     /// S3 bucket name.
     pub bucket: String,
+
+    /// Optional endpoint for S3-compatible object stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Permit unencrypted HTTP connections to a custom endpoint.
+    #[serde(default)]
+    pub allow_http: bool,
+
+    /// Use virtual-hosted-style requests instead of path-style requests.
+    #[serde(default)]
+    pub virtual_hosted_style: bool,
+}
+
+/// Azure Blob Storage object store configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AzureObjectStoreConfig {
+    /// Azure storage account name.
+    pub account: String,
+
+    /// Azure Blob Storage container name.
+    pub container: String,
+
+    /// Optional custom Blob Storage endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Permit unencrypted HTTP connections to a custom endpoint.
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
+/// Google Cloud Storage object store configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GcpObjectStoreConfig {
+    /// Google Cloud Storage bucket name.
+    pub bucket: String,
+
+    /// Optional custom Google Cloud Storage API base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// Local filesystem object store configuration.
@@ -310,13 +357,55 @@ settings_path: slatedb.toml
                     slate_config.object_store,
                     ObjectStoreConfig::Aws(AwsObjectStoreConfig {
                         region: "us-west-2".to_string(),
-                        bucket: "my-bucket".to_string()
+                        bucket: "my-bucket".to_string(),
+                        endpoint: None,
+                        allow_http: false,
+                        virtual_hosted_style: false,
                     })
                 );
                 assert_eq!(slate_config.settings_path, Some("slatedb.toml".to_string()));
             }
             _ => panic!("Expected SlateDb config"),
         }
+    }
+
+    #[test]
+    fn should_deserialize_cloud_object_store_options() {
+        let azure: ObjectStoreConfig = serde_yaml::from_str(
+            r#"
+type: Azure
+account: telemetry
+container: meter
+endpoint: http://azurite:10000/telemetry
+allow_http: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            azure,
+            ObjectStoreConfig::Azure(AzureObjectStoreConfig {
+                account: "telemetry".to_string(),
+                container: "meter".to_string(),
+                endpoint: Some("http://azurite:10000/telemetry".to_string()),
+                allow_http: true,
+            })
+        );
+
+        let gcp: ObjectStoreConfig = serde_yaml::from_str(
+            r#"
+type: Gcp
+bucket: meter
+base_url: http://gcs-emulator:4443
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gcp,
+            ObjectStoreConfig::Gcp(GcpObjectStoreConfig {
+                bucket: "meter".to_string(),
+                base_url: Some("http://gcs-emulator:4443".to_string()),
+            })
+        );
     }
 
     #[test]

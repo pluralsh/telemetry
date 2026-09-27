@@ -34,6 +34,8 @@ const (
 	ObjectStoreInMemory ObjectStoreType = "InMemory"
 	ObjectStoreLocal    ObjectStoreType = "Local"
 	ObjectStoreAWS      ObjectStoreType = "Aws"
+	ObjectStoreAzure    ObjectStoreType = "Azure"
+	ObjectStoreGCP      ObjectStoreType = "Gcp"
 )
 
 type CacheType string
@@ -60,14 +62,96 @@ type ImageSpec struct {
 	PullPolicy corev1.PullPolicy `json:"pullPolicy,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.type != 'Aws' || (has(self.region) && self.region.size() > 0 && has(self.bucket) && self.bucket.size() > 0)",message="Aws object stores require region and bucket"
+// AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.
+//
+// Credentials are optional so workloads can use ambient credentials such as
+// IAM roles for service accounts. When static credentials are used, both the
+// access key ID and secret access key must be supplied.
+// +kubebuilder:validation:XValidation:rule="has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)",message="accessKeyIDSecretRef and secretAccessKeySecretRef must be configured together"
+type AWSObjectStoreSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Region string `json:"region"`
+	// +kubebuilder:validation:MinLength=1
+	Bucket string `json:"bucket"`
+	// Endpoint overrides the AWS endpoint for S3-compatible stores.
+	Endpoint string `json:"endpoint,omitempty"`
+	// AllowHTTP permits unencrypted HTTP connections to the custom endpoint.
+	AllowHTTP bool `json:"allowHTTP,omitempty"`
+	// VirtualHostedStyle sends requests to bucket.endpoint instead of endpoint/bucket.
+	VirtualHostedStyle       bool                      `json:"virtualHostedStyle,omitempty"`
+	AccessKeyIDSecretRef     *corev1.SecretKeySelector `json:"accessKeyIDSecretRef,omitempty"`
+	SecretAccessKeySecretRef *corev1.SecretKeySelector `json:"secretAccessKeySecretRef,omitempty"`
+	SessionTokenSecretRef    *corev1.SecretKeySelector `json:"sessionTokenSecretRef,omitempty"`
+}
+
+// AzureClientSecretAuthSpec configures Azure service-principal authentication.
+type AzureClientSecretAuthSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	ClientID string `json:"clientID"`
+	// +kubebuilder:validation:MinLength=1
+	TenantID           string                   `json:"tenantID"`
+	ClientSecretKeyRef corev1.SecretKeySelector `json:"clientSecretKeyRef"`
+}
+
+// AzureWorkloadIdentityAuthSpec configures Azure workload identity federation.
+// The pod template must mount the projected service-account token at TokenFile.
+type AzureWorkloadIdentityAuthSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	ClientID string `json:"clientID"`
+	// +kubebuilder:validation:MinLength=1
+	TenantID string `json:"tenantID"`
+	// +kubebuilder:validation:MinLength=1
+	TokenFile string `json:"tokenFile"`
+}
+
+// AzureObjectStoreSpec configures Azure Blob Storage.
+//
+// Authentication is optional to support managed identity. At most one explicit
+// authentication method may be configured.
+// +kubebuilder:validation:XValidation:rule="[has(self.accessKeySecretRef), has(self.sasTokenSecretRef), has(self.bearerTokenSecretRef), has(self.clientSecret), has(self.workloadIdentity)].filter(x, x).size() <= 1",message="at most one Azure authentication method may be configured"
+type AzureObjectStoreSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Account string `json:"account"`
+	// +kubebuilder:validation:MinLength=1
+	Container string `json:"container"`
+	// Endpoint overrides the Azure Blob Storage endpoint.
+	Endpoint string `json:"endpoint,omitempty"`
+	// AllowHTTP permits unencrypted HTTP connections to the custom endpoint.
+	AllowHTTP            bool                           `json:"allowHTTP,omitempty"`
+	AccessKeySecretRef   *corev1.SecretKeySelector      `json:"accessKeySecretRef,omitempty"`
+	SASTokenSecretRef    *corev1.SecretKeySelector      `json:"sasTokenSecretRef,omitempty"`
+	BearerTokenSecretRef *corev1.SecretKeySelector      `json:"bearerTokenSecretRef,omitempty"`
+	ClientSecret         *AzureClientSecretAuthSpec     `json:"clientSecret,omitempty"`
+	WorkloadIdentity     *AzureWorkloadIdentityAuthSpec `json:"workloadIdentity,omitempty"`
+}
+
+// GCPObjectStoreSpec configures Google Cloud Storage.
+//
+// Authentication is optional to support application default credentials.
+// +kubebuilder:validation:XValidation:rule="![has(self.serviceAccountKeySecretRef), has(self.bearerTokenSecretRef)].all(x, x)",message="serviceAccountKeySecretRef and bearerTokenSecretRef are mutually exclusive"
+type GCPObjectStoreSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Bucket string `json:"bucket"`
+	// BaseURL overrides the Google Cloud Storage API URL.
+	BaseURL                    string                    `json:"baseURL,omitempty"`
+	ServiceAccountKeySecretRef *corev1.SecretKeySelector `json:"serviceAccountKeySecretRef,omitempty"`
+	BearerTokenSecretRef       *corev1.SecretKeySelector `json:"bearerTokenSecretRef,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="self.type != 'Aws' || has(self.aws)",message="Aws object stores require aws configuration"
+// +kubebuilder:validation:XValidation:rule="self.type == 'Aws' || !has(self.aws)",message="aws configuration is only valid for Aws object stores"
+// +kubebuilder:validation:XValidation:rule="self.type != 'Azure' || has(self.azure)",message="Azure object stores require azure configuration"
+// +kubebuilder:validation:XValidation:rule="self.type == 'Azure' || !has(self.azure)",message="azure configuration is only valid for Azure object stores"
+// +kubebuilder:validation:XValidation:rule="self.type != 'Gcp' || has(self.gcp)",message="Gcp object stores require gcp configuration"
+// +kubebuilder:validation:XValidation:rule="self.type == 'Gcp' || !has(self.gcp)",message="gcp configuration is only valid for Gcp object stores"
 type ObjectStoreSpec struct {
-	// +kubebuilder:validation:Enum=InMemory;Local;Aws
+	// +kubebuilder:validation:Enum=InMemory;Local;Aws;Azure;Gcp
 	// +kubebuilder:default=Local
-	Type   ObjectStoreType `json:"type,omitempty"`
-	Path   string          `json:"path,omitempty"`
-	Region string          `json:"region,omitempty"`
-	Bucket string          `json:"bucket,omitempty"`
+	Type  ObjectStoreType       `json:"type,omitempty"`
+	Path  string                `json:"path,omitempty"`
+	AWS   *AWSObjectStoreSpec   `json:"aws,omitempty"`
+	Azure *AzureObjectStoreSpec `json:"azure,omitempty"`
+	GCP   *GCPObjectStoreSpec   `json:"gcp,omitempty"`
 }
 
 type CacheSpec struct {

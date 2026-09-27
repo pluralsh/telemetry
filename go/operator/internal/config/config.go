@@ -185,7 +185,7 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec) renderStorage {
 	result := renderStorage{
 		Path:         lo.CoalesceOrEmpty(spec.Path, "meter"),
 		SettingsPath: spec.SettingsPath,
-		ObjectStore:  renderObjectStore{Type: objectType, Path: objectPath, Region: spec.ObjectStore.Region, Bucket: spec.ObjectStore.Bucket},
+		ObjectStore:  renderObjectStoreConfig(spec.ObjectStore, objectType, objectPath),
 	}
 	if spec.BlockCache == nil {
 		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(int64(10737418240)), DiskPath: defaultCachePath}
@@ -196,6 +196,27 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec) renderStorage {
 		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(int64(134217728))}
 	} else {
 		result.MetaCache = renderCacheConfig(spec.MetaCache)
+	}
+	return result
+}
+
+func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType, objectPath string) renderObjectStore {
+	result := renderObjectStore{Type: objectType, Path: objectPath}
+	switch {
+	case spec.AWS != nil:
+		result.Region = spec.AWS.Region
+		result.Bucket = spec.AWS.Bucket
+		result.Endpoint = spec.AWS.Endpoint
+		result.AllowHTTP = spec.AWS.AllowHTTP
+		result.VirtualHostedStyle = spec.AWS.VirtualHostedStyle
+	case spec.Azure != nil:
+		result.Account = spec.Azure.Account
+		result.Container = spec.Azure.Container
+		result.Endpoint = spec.Azure.Endpoint
+		result.AllowHTTP = spec.Azure.AllowHTTP
+	case spec.GCP != nil:
+		result.Bucket = spec.GCP.Bucket
+		result.BaseURL = spec.GCP.BaseURL
 	}
 	return result
 }
@@ -301,10 +322,16 @@ type renderStorage struct {
 	MetaCache    *renderCache      `json:"meta_cache,omitempty"`
 }
 type renderObjectStore struct {
-	Type   string `json:"type"`
-	Path   string `json:"path,omitempty"`
-	Region string `json:"region,omitempty"`
-	Bucket string `json:"bucket,omitempty"`
+	Type               string `json:"type"`
+	Path               string `json:"path,omitempty"`
+	Region             string `json:"region,omitempty"`
+	Bucket             string `json:"bucket,omitempty"`
+	Endpoint           string `json:"endpoint,omitempty"`
+	AllowHTTP          bool   `json:"allow_http,omitempty"`
+	VirtualHostedStyle bool   `json:"virtual_hosted_style,omitempty"`
+	Account            string `json:"account,omitempty"`
+	Container          string `json:"container,omitempty"`
+	BaseURL            string `json:"base_url,omitempty"`
 }
 type renderCache struct {
 	Type                     string `json:"type"`
