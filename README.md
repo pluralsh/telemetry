@@ -37,15 +37,19 @@ compatibility.
 ## Namespaces and routes
 
 Only namespaces declared in configuration are opened, with separate storage and query state.
-Tenant routes are rooted at `/ns/{namespace}`:
+Read routes are rooted at `/read/ns/{namespace}` and write routes at
+`/write/ns/{namespace}`:
 
-- Writes: `/api/v1/write` and `/v1/metrics`.
-- Queries: `/api/v1/query` and `/api/v1/query_range`.
-- Discovery/metadata: `/api/v1/series`, `/api/v1/labels`,
+- Writes: `/write/ns/{namespace}/api/v1/write` and
+  `/write/ns/{namespace}/v1/metrics`.
+- Queries: `/read/ns/{namespace}/api/v1/query` and
+  `/read/ns/{namespace}/api/v1/query_range`.
+- Discovery/metadata: below `/read/ns/{namespace}` at `/api/v1/series`, `/api/v1/labels`,
   `/api/v1/label/{name}/values`, `/api/v1/metadata`, and `/federate`.
 
-`/-/healthy`, `/-/ready`, and `/metrics` are unprefixed. Writer mode installs only write routes;
-reader mode installs only read routes; standalone installs both.
+An optional `path_prefix`, such as `/meter`, can scope both public route trees. `/-/healthy`,
+`/-/ready`, and `/metrics` remain unprefixed. Writer mode installs only write routes; reader mode
+installs only read routes; standalone installs both.
 
 ## Run and configure
 

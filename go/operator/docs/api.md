@@ -273,6 +273,61 @@ _Appears in:_
 | `pullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#pullpolicy-v1-core)_ |  | IfNotPresent | Enum: [Always IfNotPresent Never] <br /> |
 
 
+#### IngressMetadataSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [IngressSpec](#ingressspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `annotations` _object (keys:string, values:string)_ |  |  |  |
+| `labels` _object (keys:string, values:string)_ |  |  |  |
+
+
+#### IngressSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [MeterSpec](#meterspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ |  |  |  |
+| `hostname` _string_ |  |  |  |
+| `ingressClass` _string_ |  |  |  |
+| `pathPrefix` _string_ | PathPrefix optionally scopes Meter's public read and write APIs, for example /meter. |  |  |
+| `metadata` _[IngressMetadataSpec](#ingressmetadataspec)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `tls` _[IngressTLSSpec](#ingresstlsspec)_ |  |  |  |
+
+
+#### IngressTLSSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [IngressSpec](#ingressspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ |  |  |  |
+| `secretName` _string_ | SecretName defaults to <meter-name>-tls. |  |  |
+
+
 #### JWKSSpec
 
 
@@ -385,6 +440,8 @@ _Appears in:_
 | `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `service` _[ServiceSpec](#servicespec)_ |  |  |  |
+| `ingress` _[IngressSpec](#ingressspec)_ |  |  |  |
+| `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
 
 
 
@@ -467,6 +524,22 @@ _Appears in:_
 | `Aws` |  |
 | `Azure` |  |
 | `Gcp` |  |
+
+
+#### ServiceAccountSpec
+
+
+
+ServiceAccountSpec configures the ServiceAccount created for Meter workloads.
+
+
+
+_Appears in:_
+- [MeterSpec](#meterspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `annotations` _object (keys:string, values:string)_ |  |  |  |
 
 
 #### ServiceSpec

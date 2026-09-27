@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,9 +39,12 @@ import (
 )
 
 const (
-	testNamespace       = "default"
-	testPasswordKey     = "password"
-	testTenantNamespace = "tenant-a"
+	testNamespace                = "default"
+	testPasswordKey              = "password"
+	testTenantNamespace          = "tenant-a"
+	testServiceAccountAnnotation = "eks.amazonaws.com/role-arn"
+	testServiceAccountRole       = "arn:aws:iam::123456789012:role/meter"
+	testIngressHostname          = "meter.example.com"
 )
 
 var _ = Describe("Meter Controller", func() {
@@ -78,6 +82,7 @@ var _ = Describe("Meter Controller", func() {
 		Expect(rendered).To(ContainSubstring("name: tenant-a"))
 		Expect(rendered).To(ContainSubstring("username: alice"))
 		Expect(rendered).To(ContainSubstring("source: file"))
+		Expect(rendered).To(ContainSubstring("path_prefix: /meter"))
 		Expect(rendered).To(ContainSubstring("/etc/meter/secrets/namespace-" + auth.Name + "-password"))
 		Expect(config.Data["namespace-"+auth.Name+"-password"]).To(Equal([]byte("initial-password")))
 
@@ -89,11 +94,24 @@ var _ = Describe("Meter Controller", func() {
 		assertServiceAccount(ctx, meter.Name)
 		assertService(ctx, meter.Name, false)
 		assertService(ctx, meter.Name+"-headless", true)
+		ingress := assertIngress(ctx, meter.Name)
+		Expect(ingress.Spec.Rules[0].HTTP.Paths).To(ContainElements(
+			SatisfyAll(
+				HaveField("Path", "/meter/read"),
+				HaveField("Backend.Service.Name", meter.Name),
+			),
+			SatisfyAll(
+				HaveField("Path", "/meter/write"),
+				HaveField("Backend.Service.Name", meter.Name),
+			),
+		))
+		Expect(ingress.Spec.TLS[0].SecretName).To(Equal(meter.Name + "-tls"))
 		sts := assertStatefulSet(ctx, meter.Name, componentStandalone, config)
 		created = append(created,
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: namespace}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: namespace}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-headless", Namespace: namespace}},
+			ingress,
 			sts,
 		)
 
@@ -121,6 +139,13 @@ var _ = Describe("Meter Controller", func() {
 			HaveField("Status", metav1.ConditionTrue),
 			HaveField("Reason", "Ready"),
 		))
+
+		current.Spec.Ingress.Enabled = false
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: meter.Name}, &networkingv1.Ingress{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
 	It("reconciles sharded resources and rolls the config hash after credential rotation", func() {
@@ -137,6 +162,7 @@ var _ = Describe("Meter Controller", func() {
 		Expect(string(config.Data["meter.yaml"])).To(SatisfyAll(
 			ContainSubstring("mode: writer"),
 			ContainSubstring("backend: kubernetes"),
+			ContainSubstring("path_prefix: /meter"),
 			ContainSubstring("source: file"),
 			ContainSubstring("/etc/meter/secrets/namespace-"+auth.Name+"-password"),
 		))
@@ -161,6 +187,12 @@ var _ = Describe("Meter Controller", func() {
 				sts,
 			)
 		}
+		ingress := assertIngress(ctx, meter.Name)
+		Expect(ingress.Spec.Rules[0].HTTP.Paths).To(ContainElements(
+			SatisfyAll(HaveField("Path", "/meter/write"), HaveField("Backend.Service.Name", meter.Name+"-writer")),
+			SatisfyAll(HaveField("Path", "/meter/read"), HaveField("Backend.Service.Name", meter.Name+"-reader")),
+		))
+		created = append(created, ingress)
 
 		roleName := meter.Name + "-sharding"
 		role := &rbacv1.Role{}
@@ -283,7 +315,14 @@ func createMeterFixture(ctx context.Context, name string, mode telemetryv1alpha1
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.MeterSpec{
-			Mode:   mode,
+			Mode: mode,
+			Ingress: telemetryv1alpha1.IngressSpec{
+				Enabled: true, Hostname: testIngressHostname, IngressClass: "nginx", PathPrefix: "/meter",
+				TLS: telemetryv1alpha1.IngressTLSSpec{Enabled: true},
+			},
+			ServiceAccount: telemetryv1alpha1.ServiceAccountSpec{
+				Annotations: map[string]string{testServiceAccountAnnotation: testServiceAccountRole},
+			},
 			Config: telemetryv1alpha1.MeterConfigSpec{Namespaces: []string{testTenantNamespace}},
 		},
 	}
@@ -310,6 +349,16 @@ func assertServiceAccount(ctx context.Context, name string) {
 	serviceAccount := &corev1.ServiceAccount{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, serviceAccount)).To(Succeed())
 	Expect(serviceAccount.OwnerReferences).To(ContainElement(HaveField("Name", name)))
+	Expect(serviceAccount.Annotations).To(HaveKeyWithValue(testServiceAccountAnnotation, testServiceAccountRole))
+}
+
+func assertIngress(ctx context.Context, name string) *networkingv1.Ingress {
+	ingress := &networkingv1.Ingress{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, ingress)).To(Succeed())
+	Expect(ingress.OwnerReferences).To(ContainElement(HaveField("Name", name)))
+	Expect(ingress.Spec.Rules).To(HaveLen(1))
+	Expect(ingress.Spec.Rules[0].Host).To(Equal(testIngressHostname))
+	return ingress
 }
 
 func assertService(ctx context.Context, name string, headless bool) {

@@ -107,12 +107,15 @@ impl Runner {
             writer: Target {
                 base: env_or(
                     "METER_WRITE_URL",
-                    "http://meter-writer-0:8080/ns/regression",
+                    "http://meter-writer-0:8080/write/ns/regression",
                 ),
                 auth: Some(bearer("regression-write")),
             },
             reader: Target {
-                base: env_or("METER_READ_URL", "http://meter-reader:8080/ns/regression"),
+                base: env_or(
+                    "METER_READ_URL",
+                    "http://meter-reader:8080/read/ns/regression",
+                ),
                 auth: Some(basic("regression-reader", "regression-read")),
             },
             base_ms: env::var("REGRESSION_BASE_MS")

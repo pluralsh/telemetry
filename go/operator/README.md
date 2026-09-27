@@ -16,6 +16,39 @@ including optional `sizeLimit`. Persistent claims are mounted through fixed
 shrinking or changing immutable claim properties is rejected without deleting
 existing PVCs.
 
+The operator creates one ServiceAccount per Meter and assigns it to every
+managed workload. Use `spec.serviceAccount.annotations` for cloud identity
+integrations such as AWS IRSA, Azure workload identity, or GKE workload
+identity.
+
+`spec.ingress` can expose Meter through a standard Kubernetes Ingress:
+
+```yaml
+spec:
+  ingress:
+    enabled: true
+    hostname: meter.example.com
+    ingressClass: nginx
+    # Optional when sharing a hostname with another application.
+    pathPrefix: /meter
+    metadata:
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      labels:
+        app.kubernetes.io/part-of: telemetry
+    tls:
+      enabled: true
+      # Defaults to <meter-name>-tls when omitted.
+      secretName: meter-tls
+```
+
+The operator routes `{pathPrefix}/write` to the writer Service and
+`{pathPrefix}/read` to the reader Service. Both routes target the same Service
+for standalone instances. Meter serves the prefix directly, so the Ingress
+must not strip or rewrite it. Health, readiness, and metrics endpoints remain
+unprefixed and are not exposed by these routes. Disabling ingress deletes the
+operator-owned Ingress.
+
 This module is part of the repository's `go/` workspace. The supported
 installation method is the published OCI Helm chart. The generated
 [CRD API reference](docs/api.md) documents the supported resources.

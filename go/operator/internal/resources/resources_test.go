@@ -6,6 +6,7 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -40,6 +41,66 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	if hasVolume(statefulSet.Spec.Template.Spec.Volumes, "data") || hasVolume(statefulSet.Spec.Template.Spec.Volumes, "cache") {
 		t.Fatal("pod volumes shadow default claim templates")
 	}
+}
+
+func TestServiceAccountIncludesConfiguredAnnotations(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{ServiceAccount: telemetryv1alpha1.ServiceAccountSpec{
+			Annotations: map[string]string{"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/meter"},
+		}},
+	}
+	serviceAccount := ServiceAccount(meter)
+	if serviceAccount.Annotations["eks.amazonaws.com/role-arn"] != "arn:aws:iam::123456789012:role/meter" {
+		t.Fatalf("service account annotations = %#v", serviceAccount.Annotations)
+	}
+}
+
+func TestIngressUsesStandaloneServiceAndTLSDefaults(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "meter.example.com", IngressClass: "nginx", PathPrefix: "/meter",
+			Metadata: telemetryv1alpha1.IngressMetadataSpec{
+				Annotations: map[string]string{"cert-manager.io/cluster-issuer": "letsencrypt"},
+				Labels:      map[string]string{"example.com/exposure": "external"},
+			},
+			TLS: telemetryv1alpha1.IngressTLSSpec{Enabled: true},
+		}},
+	}
+	ingress := Ingress(meter)
+	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "nginx" {
+		t.Fatalf("ingress class = %#v", ingress.Spec.IngressClassName)
+	}
+	if ingress.Annotations["cert-manager.io/cluster-issuer"] != "letsencrypt" ||
+		ingress.Labels["example.com/exposure"] != "external" {
+		t.Fatalf("ingress metadata = %#v/%#v", ingress.Labels, ingress.Annotations)
+	}
+	if len(ingress.Spec.TLS) != 1 || ingress.Spec.TLS[0].SecretName != testMeterName+"-tls" {
+		t.Fatalf("ingress TLS = %#v", ingress.Spec.TLS)
+	}
+	paths := ingress.Spec.Rules[0].HTTP.Paths
+	if len(paths) != 2 {
+		t.Fatalf("standalone ingress paths = %#v", paths)
+	}
+	assertIngressPath(t, paths, "/meter/write", testMeterName)
+	assertIngressPath(t, paths, "/meter/read", testMeterName)
+}
+
+func TestIngressRoutesShardedWritesAndReads(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{
+			Mode:    telemetryv1alpha1.MeterModeSharded,
+			Ingress: telemetryv1alpha1.IngressSpec{Enabled: true, Hostname: "meter.example.com"},
+		},
+	}
+	paths := Ingress(meter).Spec.Rules[0].HTTP.Paths
+	if len(paths) != 2 {
+		t.Fatalf("sharded ingress paths = %#v", paths)
+	}
+	assertIngressPath(t, paths, "/write", testMeterName+"-writer")
+	assertIngressPath(t, paths, "/read", testMeterName+"-reader")
 }
 
 func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
@@ -221,6 +282,16 @@ func assertLiteralEnv(t *testing.T, env []corev1.EnvVar, name, expected string) 
 	value, found := lo.Find(env, func(item corev1.EnvVar) bool { return item.Name == name })
 	if !found || value.Value != expected {
 		t.Fatalf("%s = %q, want %q", name, value.Value, expected)
+	}
+}
+
+func assertIngressPath(t *testing.T, paths []networkingv1.HTTPIngressPath, path, service string) {
+	t.Helper()
+	value, found := lo.Find(paths, func(item networkingv1.HTTPIngressPath) bool { return item.Path == path })
+	if !found || value.PathType == nil || *value.PathType != networkingv1.PathTypePrefix ||
+		value.Backend.Service == nil || value.Backend.Service.Name != service ||
+		value.Backend.Service.Port.Name != portHTTP {
+		t.Fatalf("ingress path %q to %q is missing: %#v", path, service, paths)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -129,7 +130,12 @@ func Replicas(meter *telemetryv1alpha1.Meter, component Component) *int32 {
 }
 
 func ServiceAccount(meter *telemetryv1alpha1.Meter) *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: meter.Namespace, Labels: Labels(meter, ComponentNone)}}
+	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name:        meter.Name,
+		Namespace:   meter.Namespace,
+		Labels:      Labels(meter, ComponentNone),
+		Annotations: copyMap(meter.Spec.ServiceAccount.Annotations),
+	}}
 }
 
 func Role(meter *telemetryv1alpha1.Meter) *rbacv1.Role {
@@ -177,6 +183,59 @@ func Service(meter *telemetryv1alpha1.Meter, component Component, headless bool)
 		service.Annotations = copyMap(meter.Spec.Service.Annotations)
 	}
 	return service
+}
+
+func Ingress(meter *telemetryv1alpha1.Meter) *networkingv1.Ingress {
+	labels := Labels(meter, ComponentNone)
+	maps.Copy(labels, meter.Spec.Ingress.Metadata.Labels)
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        meter.Name,
+			Namespace:   meter.Namespace,
+			Labels:      labels,
+			Annotations: copyMap(meter.Spec.Ingress.Metadata.Annotations),
+		},
+		Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{
+			Host: meter.Spec.Ingress.Hostname,
+			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: ingressPaths(meter),
+			}},
+		}}},
+	}
+	if meter.Spec.Ingress.IngressClass != "" {
+		ingress.Spec.IngressClassName = lo.ToPtr(meter.Spec.Ingress.IngressClass)
+	}
+	if meter.Spec.Ingress.TLS.Enabled {
+		ingress.Spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{meter.Spec.Ingress.Hostname},
+			SecretName: lo.CoalesceOrEmpty(meter.Spec.Ingress.TLS.SecretName, Name(meter.Name, "tls")),
+		}}
+	}
+	return ingress
+}
+
+func ingressPaths(meter *telemetryv1alpha1.Meter) []networkingv1.HTTPIngressPath {
+	prefix := meter.Spec.Ingress.PathPrefix
+	writerService := ComponentName(meter, ComponentWriter)
+	readerService := ComponentName(meter, ComponentReader)
+	if Mode(meter) == telemetryv1alpha1.MeterModeStandalone {
+		writerService, readerService = meter.Name, meter.Name
+	}
+	return []networkingv1.HTTPIngressPath{
+		ingressPath(prefix+"/write", networkingv1.PathTypePrefix, writerService),
+		ingressPath(prefix+"/read", networkingv1.PathTypePrefix, readerService),
+	}
+}
+
+func ingressPath(path string, pathType networkingv1.PathType, serviceName string) networkingv1.HTTPIngressPath {
+	return networkingv1.HTTPIngressPath{
+		Path:     path,
+		PathType: lo.ToPtr(pathType),
+		Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
+			Name: serviceName,
+			Port: networkingv1.ServiceBackendPort{Name: portHTTP},
+		}},
+	}
 }
 
 func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {

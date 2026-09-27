@@ -28,6 +28,7 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,6 +59,7 @@ type MeterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 func (r *MeterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -104,6 +106,7 @@ func (r *MeterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&networkingv1.Ingress{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.metersForPVC)).
@@ -172,6 +175,9 @@ func (r *MeterReconciler) reconcile(ctx context.Context, meter *telemetryv1alpha
 			return result, err
 		}
 	}
+	if err := r.reconcileIngress(ctx, meter); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -180,6 +186,7 @@ func (r *MeterReconciler) reconcileServiceAccount(ctx context.Context, meter *te
 	current := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, current, func() error {
 		current.Labels = desired.Labels
+		current.Annotations = desired.Annotations
 		return controllerutil.SetControllerReference(meter, current, r.Scheme)
 	})
 	return err
@@ -213,6 +220,28 @@ func (r *MeterReconciler) reconcileService(ctx context.Context, meter *telemetry
 			service.Spec.ClusterIP = desired.Spec.ClusterIP
 		}
 		return controllerutil.SetControllerReference(meter, service, r.Scheme)
+	})
+	return err
+}
+
+func (r *MeterReconciler) reconcileIngress(ctx context.Context, meter *telemetryv1alpha1.Meter) error {
+	current := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: meter.Namespace}}
+	if !meter.Spec.Ingress.Enabled {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(current), current); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if metav1.IsControlledBy(current, meter) {
+			return client.IgnoreNotFound(r.Delete(ctx, current))
+		}
+		return nil
+	}
+
+	desired := resources.Ingress(meter)
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, current, func() error {
+		current.Labels = desired.Labels
+		current.Annotations = desired.Annotations
+		current.Spec = desired.Spec
+		return controllerutil.SetControllerReference(meter, current, r.Scheme)
 	})
 	return err
 }

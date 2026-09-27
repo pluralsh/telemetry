@@ -4,6 +4,16 @@ Object-store credentials are referenced from Secrets in the Meter namespace and
 injected directly into managed Meter containers. They are not written to the
 generated Meter configuration Secret.
 
+The operator creates a ServiceAccount named after each Meter. Cloud identity
+annotations can be configured declaratively:
+
+```yaml
+spec:
+  serviceAccount:
+    annotations:
+      cloud-provider.example/identity: meter
+```
+
 ## AWS S3
 
 Omit credential references to use the standard AWS credential chain, including
@@ -34,6 +44,18 @@ spec:
 
 Set `allowHTTP: true` only when a trusted S3-compatible endpoint does not
 support TLS.
+
+For EKS IRSA, annotate the managed ServiceAccount and omit static credentials:
+
+```yaml
+spec:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/meter
+```
+
+EKS Pod Identity uses an external association with the Meter ServiceAccount and
+does not require this annotation.
 
 ## Azure Blob Storage
 
@@ -85,6 +107,11 @@ workloadIdentity:
 
 `endpoint` and `allowHTTP` support Azurite and other custom endpoints.
 
+Azure workload identity commonly uses
+`serviceAccount.annotations.azure.workload.identity/client-id` together with
+the workload identity webhook's required pod labels or an explicitly projected
+token in `podTemplate`.
+
 ## Google Cloud Storage
 
 Omit explicit authentication to use application default credentials, including
@@ -105,3 +132,15 @@ spec:
 
 For a static OAuth token, replace `serviceAccountKeySecretRef` with
 `bearerTokenSecretRef`. `baseURL` can override the API URL for an emulator.
+
+For the GKE service-account linking flow, set:
+
+```yaml
+spec:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: meter@my-project.iam.gserviceaccount.com
+```
+
+The underlying Google object-store client obtains GKE workload identity
+credentials from the metadata server when explicit credentials are omitted.

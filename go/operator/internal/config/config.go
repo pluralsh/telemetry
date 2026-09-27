@@ -117,6 +117,7 @@ func Render(input Input) (Result, error) {
 		return yaml.Marshal(renderConfig{
 			Mode:                mode,
 			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Meter)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Meter))},
+			PathPrefix:          input.Meter.Spec.Ingress.PathPrefix,
 			Storage:             renderStorageConfig(input.Meter.Spec.Config.Storage),
 			ReaderCacheCapacity: int64Value(input.Meter.Spec.Config.ReaderCacheCapacity, 268435456),
 			Write:               renderWriteConfig(input.Meter.Spec.Config.Write),
@@ -303,6 +304,7 @@ func int32Value(value *int32, fallback int32) int32 { return lo.FromPtrOr(value,
 type renderConfig struct {
 	Mode                string            `json:"mode"`
 	Listeners           renderListeners   `json:"listeners"`
+	PathPrefix          string            `json:"path_prefix,omitempty"`
 	Storage             renderStorage     `json:"storage"`
 	ReaderCacheCapacity int64             `json:"reader_cache_capacity"`
 	Write               renderWrite       `json:"write"`

@@ -93,8 +93,8 @@ services:
     profiles: ["test"]
     environment:
       PROMETHEUS_URL: http://prometheus:9090
-      METER_WRITE_URL: http://meter-writer-0:8080/ns/regression
-      METER_READ_URL: http://meter-reader:8080/ns/regression
+      METER_WRITE_URL: http://meter-writer-0:8080/write/ns/regression
+      METER_READ_URL: http://meter-reader:8080/read/ns/regression
     depends_on:
       prometheus:
         condition: service_healthy

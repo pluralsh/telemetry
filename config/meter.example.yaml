@@ -5,6 +5,10 @@
 # Standalone serves reads and writes and requires sharding.backend: standalone.
 mode: standalone
 
+# Optional prefix for public read and write APIs. Health, readiness, and metrics
+# endpoints remain unprefixed. Default: empty.
+# path_prefix: /meter
+
 listeners:
   http: 0.0.0.0:8080 # HTTP bind address (default 0.0.0.0:8080).
   grpc: 0.0.0.0:9090 # Internal writer gRPC bind address (default 0.0.0.0:9090).

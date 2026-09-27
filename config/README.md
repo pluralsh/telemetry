@@ -16,11 +16,14 @@ when their containing section or tagged variant is present.
   routes. Split writer/reader deployments normally use `static` or `kubernetes` sharding.
 - `listeners.http`: HTTP bind socket. Default `0.0.0.0:8080`.
 - `listeners.grpc`: internal writer gRPC bind socket. Default `0.0.0.0:9090`.
+- `path_prefix`: optional prefix for public read and write APIs, such as `/meter`. It must start
+  with `/` and must not end with `/`. The default is empty.
 
-All tenant APIs are under `/ns/{namespace}`. Read routes are `/api/v1/query`,
-`/api/v1/query_range`, `/api/v1/series`, `/api/v1/labels`,
-`/api/v1/label/{name}/values`, `/api/v1/metadata`, and `/federate`. Write routes are
-`/api/v1/write` (Prometheus remote write) and `/v1/metrics` (OTLP/HTTP protobuf).
+Read APIs are under `{path_prefix}/read/ns/{namespace}` and write APIs are under
+`{path_prefix}/write/ns/{namespace}`. Read routes are `/api/v1/query`, `/api/v1/query_range`,
+`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/{name}/values`, `/api/v1/metadata`, and
+`/federate`. Write routes are `/api/v1/write` (Prometheus remote write) and `/v1/metrics`
+(OTLP/HTTP protobuf).
 `/-/healthy`, `/-/ready`, and `/metrics` are not namespace-prefixed.
 
 ## `storage`
@@ -197,5 +200,6 @@ Entries require a unique `name`; names must be 1–255 bytes and cannot contain 
 characters. Only listed namespaces are opened. Requests for any other name return `404`.
 
 Each namespace has isolated storage and query state. Its APIs use the literal configured name in
-`/ns/{namespace}`, while its storage prefix uses the deterministic namespace hash described above.
-Authentication is evaluated separately for read and write access.
+`/read/ns/{namespace}` and `/write/ns/{namespace}`, optionally below `path_prefix`, while its
+storage prefix uses the deterministic namespace hash described above. Authentication is evaluated
+separately for read and write access.

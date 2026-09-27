@@ -83,7 +83,7 @@ async fn routes_are_namespaced_and_health_is_not() {
     assert_eq!(
         app.clone()
             .oneshot(
-                HttpRequest::get("/ns/alpha/api/v1/query?query=up")
+                HttpRequest::get("/read/ns/alpha/api/v1/query?query=up")
                     .body(Body::empty())
                     .unwrap()
             )
@@ -106,10 +106,47 @@ async fn routes_are_namespaced_and_health_is_not() {
 }
 
 #[tokio::test]
+async fn path_prefix_scopes_public_apis_but_not_health() {
+    let mut state = state(ServerMode::Standalone);
+    let mut config = (*state.config).clone();
+    config.path_prefix = "/meter".to_owned();
+    state.config = Arc::new(config);
+    let app = router(state);
+
+    let prefixed = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/meter/write/ns/alpha/api/v1/write")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(prefixed.status(), StatusCode::NOT_FOUND);
+
+    let unprefixed = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/write/ns/alpha/api/v1/write")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unprefixed.status(), StatusCode::NOT_FOUND);
+
+    let health = app
+        .oneshot(HttpRequest::get("/-/healthy").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn unknown_namespace_cannot_cross_tenant_boundary() {
     let response = router(state(ServerMode::Standalone))
         .oneshot(
-            HttpRequest::get("/ns/gamma/api/v1/query?query=up")
+            HttpRequest::get("/read/ns/gamma/api/v1/query?query=up")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -122,7 +159,7 @@ async fn unknown_namespace_cannot_cross_tenant_boundary() {
 async fn reader_mode_omits_write_routes() {
     let response = router(state(ServerMode::Reader))
         .oneshot(
-            HttpRequest::post("/ns/alpha/api/v1/write")
+            HttpRequest::post("/write/ns/alpha/api/v1/write")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -135,7 +172,7 @@ async fn reader_mode_omits_write_routes() {
 async fn writer_mode_omits_query_routes() {
     let response = router(state(ServerMode::Writer))
         .oneshot(
-            HttpRequest::get("/ns/alpha/api/v1/query?query=up")
+            HttpRequest::get("/read/ns/alpha/api/v1/query?query=up")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -177,13 +214,13 @@ async fn query_range_and_series_accept_form_posts() {
     let state = live_standalone_state().await;
     let app = router(state.clone());
     for (path, form) in [
-        ("/ns/alpha/api/v1/query", "query=1"),
+        ("/read/ns/alpha/api/v1/query", "query=1"),
         (
-            "/ns/alpha/api/v1/query_range",
+            "/read/ns/alpha/api/v1/query_range",
             "query=1&start=1&end=2&step=1",
         ),
         (
-            "/ns/alpha/api/v1/series",
+            "/read/ns/alpha/api/v1/series",
             "match%5B%5D=up&match%5B%5D=process_start_time_seconds",
         ),
     ] {
@@ -215,7 +252,7 @@ async fn form_posts_preserve_read_auth() {
     let state = AppState::open(config).await.unwrap();
     let response = router(state.clone())
         .oneshot(
-            HttpRequest::post("/ns/alpha/api/v1/query")
+            HttpRequest::post("/read/ns/alpha/api/v1/query")
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from("query=1"))
                 .unwrap(),
@@ -246,7 +283,7 @@ async fn malformed_bearer_returns_generic_unauthorized_response() {
     let state = AppState::open(config).await.unwrap();
     let response = router(state.clone())
         .oneshot(
-            HttpRequest::get("/ns/alpha/api/v1/query?query=1")
+            HttpRequest::get("/read/ns/alpha/api/v1/query?query=1")
                 .header(AUTHORIZATION, "Bearer malformed")
                 .body(Body::empty())
                 .unwrap(),
@@ -295,7 +332,7 @@ async fn metadata_filters_and_federate_renders_complete_labels() {
         .clone()
         .oneshot(
             HttpRequest::get(
-                "/ns/alpha/api/v1/metadata?metric=federated_metric&limit=1&limit_per_metric=1",
+                "/read/ns/alpha/api/v1/metadata?metric=federated_metric&limit=1&limit_per_metric=1",
             )
             .body(Body::empty())
             .unwrap(),
@@ -316,7 +353,7 @@ async fn metadata_filters_and_federate_renders_complete_labels() {
     let isolated = app
         .clone()
         .oneshot(
-            HttpRequest::get("/ns/beta/api/v1/metadata?metric=federated_metric")
+            HttpRequest::get("/read/ns/beta/api/v1/metadata?metric=federated_metric")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -328,7 +365,7 @@ async fn metadata_filters_and_federate_renders_complete_labels() {
 
     let federate = app
         .oneshot(
-            HttpRequest::get("/ns/alpha/federate?match%5B%5D=federated_metric")
+            HttpRequest::get("/read/ns/alpha/federate?match%5B%5D=federated_metric")
                 .body(Body::empty())
                 .unwrap(),
         )

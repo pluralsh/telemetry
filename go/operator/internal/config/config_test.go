@@ -18,7 +18,10 @@ const (
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
-		Spec:       telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{Namespaces: []string{"default", "default"}}},
+		Spec: telemetryv1alpha1.MeterSpec{
+			Config:  telemetryv1alpha1.MeterConfigSpec{Namespaces: []string{"default", "default"}},
+			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/meter"},
+		},
 	}
 	input := Input{
 		Meter:  meter,
@@ -39,6 +42,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", "flush_interval_seconds: 60",
 		"virtual_shards: 64", "type: Local", "path: /var/lib/meter/data",
+		"path_prefix: /meter",
 		"path: /etc/meter/secrets/global-read-0-password",
 		"path: /etc/meter/secrets/namespace-tenant-auth-password",
 		"path: /var/run/secrets/meter/internal-token",

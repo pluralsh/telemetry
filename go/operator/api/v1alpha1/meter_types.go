@@ -281,17 +281,47 @@ type ServiceSpec struct {
 	Annotations map[string]string  `json:"annotations,omitempty"`
 }
 
+type IngressMetadataSpec struct {
+	Annotations map[string]string `json:"annotations,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+}
+
+type IngressTLSSpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// SecretName defaults to <meter-name>-tls.
+	SecretName string `json:"secretName,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.hostname) && self.hostname.size() > 0)",message="hostname is required when ingress is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() > 1 && self.pathPrefix.startsWith('/') && !self.pathPrefix.endsWith('/'))",message="pathPrefix must be empty or start with '/' and must not end with '/'"
+type IngressSpec struct {
+	Enabled      bool   `json:"enabled,omitempty"`
+	Hostname     string `json:"hostname,omitempty"`
+	IngressClass string `json:"ingressClass,omitempty"`
+	// PathPrefix optionally scopes Meter's public read and write APIs, for example /meter.
+	PathPrefix string              `json:"pathPrefix,omitempty"`
+	Metadata   IngressMetadataSpec `json:"metadata,omitempty"`
+	TLS        IngressTLSSpec      `json:"tls,omitempty"`
+}
+
+// ServiceAccountSpec configures the ServiceAccount created for Meter workloads.
+type ServiceAccountSpec struct {
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
 // MeterSpec defines the desired state of Meter.
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0",message="reader replicas must be zero in Standalone mode"
 type MeterSpec struct {
 	// +kubebuilder:validation:Enum=Standalone;Sharded
 	// +kubebuilder:default=Standalone
-	Mode    MeterMode       `json:"mode,omitempty"`
-	Image   ImageSpec       `json:"image,omitempty"`
-	Config  MeterConfigSpec `json:"config,omitempty"`
-	Writer  WorkloadSpec    `json:"writer,omitempty"`
-	Reader  WorkloadSpec    `json:"reader,omitempty"`
-	Service ServiceSpec     `json:"service,omitempty"`
+	Mode           MeterMode          `json:"mode,omitempty"`
+	Image          ImageSpec          `json:"image,omitempty"`
+	Config         MeterConfigSpec    `json:"config,omitempty"`
+	Writer         WorkloadSpec       `json:"writer,omitempty"`
+	Reader         WorkloadSpec       `json:"reader,omitempty"`
+	Service        ServiceSpec        `json:"service,omitempty"`
+	Ingress        IngressSpec        `json:"ingress,omitempty"`
+	ServiceAccount ServiceAccountSpec `json:"serviceAccount,omitempty"`
 }
 
 // MeterStatus defines the observed state of Meter.

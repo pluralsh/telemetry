@@ -28,26 +28,7 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router {
-    let mut namespace_routes = Router::new();
-    if state.config.mode != ServerMode::Writer {
-        namespace_routes = namespace_routes
-            .route("/api/v1/query", get(query).post(query_form))
-            .route(
-                "/api/v1/query_range",
-                get(query_range).post(query_range_form),
-            )
-            .route("/api/v1/series", get(series).post(series_form))
-            .route("/api/v1/labels", get(labels))
-            .route("/api/v1/label/{name}/values", get(label_values))
-            .route("/api/v1/metadata", get(metadata))
-            .route("/federate", get(federate));
-    }
-    if state.config.mode != ServerMode::Reader {
-        namespace_routes = namespace_routes
-            .route("/api/v1/write", post(remote_write))
-            .route("/v1/metrics", post(otlp_http));
-    }
-    Router::new()
+    let mut app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route(
             "/-/ready",
@@ -59,9 +40,35 @@ pub fn router(state: AppState) -> Router {
                 }
             }),
         )
-        .route("/metrics", get(|| async { "# meter_server_up 1\n" }))
-        .nest("/ns/{namespace}", namespace_routes)
-        .with_state(state)
+        .route("/metrics", get(|| async { "# meter_server_up 1\n" }));
+
+    if state.config.mode != ServerMode::Writer {
+        let read_routes = Router::new()
+            .route("/api/v1/query", get(query).post(query_form))
+            .route(
+                "/api/v1/query_range",
+                get(query_range).post(query_range_form),
+            )
+            .route("/api/v1/series", get(series).post(series_form))
+            .route("/api/v1/labels", get(labels))
+            .route("/api/v1/label/{name}/values", get(label_values))
+            .route("/api/v1/metadata", get(metadata))
+            .route("/federate", get(federate));
+        app = app.nest(
+            &format!("{}/read/ns/{{namespace}}", state.config.path_prefix),
+            read_routes,
+        );
+    }
+    if state.config.mode != ServerMode::Reader {
+        let write_routes = Router::new()
+            .route("/api/v1/write", post(remote_write))
+            .route("/v1/metrics", post(otlp_http));
+        app = app.nest(
+            &format!("{}/write/ns/{{namespace}}", state.config.path_prefix),
+            write_routes,
+        );
+    }
+    app.with_state(state)
 }
 
 async fn remote_write(

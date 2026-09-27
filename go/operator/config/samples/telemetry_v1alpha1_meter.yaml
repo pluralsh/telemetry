@@ -35,6 +35,19 @@ spec:
       remoteConcurrency: 16
     namespaces:
       - default
+  ingress:
+    enabled: true
+    hostname: meter.example.com
+    ingressClass: nginx
+    pathPrefix: /meter
+    metadata:
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      labels:
+        app.kubernetes.io/part-of: telemetry
+    tls:
+      enabled: true
+      secretName: meter-sample-tls
   writer:
     replicas: 3
     cacheVolume:

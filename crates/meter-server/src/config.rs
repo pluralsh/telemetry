@@ -225,6 +225,8 @@ pub enum JwksSource {
 pub struct Config {
     pub mode: ServerMode,
     pub listeners: ListenerConfig,
+    /// Optional prefix for public read and write HTTP APIs, such as `/meter`.
+    pub path_prefix: String,
     pub storage: SlateDbStorageConfig,
     pub reader_cache_capacity: u64,
     pub write: WriteConfig,
@@ -238,6 +240,7 @@ impl Default for Config {
         Self {
             mode: ServerMode::Standalone,
             listeners: ListenerConfig::default(),
+            path_prefix: String::new(),
             storage: SlateDbStorageConfig::default(),
             reader_cache_capacity: 256 * 1024 * 1024,
             write: WriteConfig::default(),
@@ -260,6 +263,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.path_prefix.is_empty()
+            && (!self.path_prefix.starts_with('/')
+                || self.path_prefix.len() == 1
+                || self.path_prefix.ends_with('/'))
+        {
+            return Err(ConfigError::Validation(
+                "path_prefix must be empty or start with '/' and must not end with '/'".to_owned(),
+            ));
+        }
         if self.sharding.virtual_shards == 0 {
             return Err(ConfigError::Validation(
                 "sharding.virtual_shards must be greater than zero".to_owned(),
@@ -376,6 +388,22 @@ mod tests {
             serde_yaml::from_str("sharding:\n  virtual_shards: 0\n  backend: standalone\n")
                 .unwrap();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn path_prefix_must_be_canonical() {
+        for prefix in ["meter", "/", "/meter/"] {
+            let config = Config {
+                path_prefix: prefix.to_owned(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_err(), "{prefix} should be rejected");
+        }
+        let config = Config {
+            path_prefix: "/meter".to_owned(),
+            ..Config::default()
+        };
+        config.validate().unwrap();
     }
 
     #[test]

@@ -742,6 +742,46 @@ spec:
                   tag:
                     type: string
                 type: object
+              ingress:
+                properties:
+                  enabled:
+                    type: boolean
+                  hostname:
+                    type: string
+                  ingressClass:
+                    type: string
+                  metadata:
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        type: object
+                    type: object
+                  pathPrefix:
+                    description: PathPrefix optionally scopes Meter's public read
+                      and write APIs, for example /meter.
+                    type: string
+                  tls:
+                    properties:
+                      enabled:
+                        type: boolean
+                      secretName:
+                        description: SecretName defaults to <meter-name>-tls.
+                        type: string
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: hostname is required when ingress is enabled
+                  rule: '!has(self.enabled) || !self.enabled || (has(self.hostname)
+                    && self.hostname.size() > 0)'
+                - message: pathPrefix must be empty or start with '/' and must not
+                    end with '/'
+                  rule: '!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size()
+                    > 1 && self.pathPrefix.startsWith(''/'') && !self.pathPrefix.endsWith(''/''))'
               mode:
                 default: Standalone
                 enum:
@@ -9341,6 +9381,15 @@ spec:
                     - NodePort
                     - LoadBalancer
                     type: string
+                type: object
+              serviceAccount:
+                description: ServiceAccountSpec configures the ServiceAccount created
+                  for Meter workloads.
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    type: object
                 type: object
               writer:
                 properties:

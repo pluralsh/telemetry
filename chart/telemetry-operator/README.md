@@ -86,4 +86,16 @@ Google Cloud Storage. Provider credentials in a `Meter` resource use
 `SecretKeySelector` fields and are injected directly into the managed
 containers, rather than copied into generated configuration. Omit explicit
 credentials to use ambient identity such as AWS IRSA, Azure managed/workload
-identity, or Google application default credentials.
+identity, or Google application default credentials. Configure cloud identity
+annotations on the Meter-managed ServiceAccount with
+`spec.serviceAccount.annotations`.
+
+## Meter ingress
+
+Set `spec.ingress.enabled`, `hostname`, and optionally `ingressClass`, metadata,
+and TLS settings to create an Ingress for a Meter. TLS defaults to the
+`<meter-name>-tls` Secret. Set the optional `pathPrefix`, such as `/meter`, when
+sharing a hostname. The operator routes `{pathPrefix}/write` to writers and
+`{pathPrefix}/read` to readers; both routes target the same Service for a
+standalone Meter. The server handles the prefix directly, so no Ingress rewrite
+is required. Health, readiness, and metrics endpoints remain unprefixed.
