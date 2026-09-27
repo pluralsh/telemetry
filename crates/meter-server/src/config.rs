@@ -144,7 +144,6 @@ pub struct KubernetesShardingConfig {
     pub shard_lease_prefix: String,
     pub lease_duration_seconds: u64,
     pub renew_interval_seconds: u64,
-    pub watch_poll_interval_seconds: u64,
 }
 
 impl Default for KubernetesShardingConfig {
@@ -159,7 +158,6 @@ impl Default for KubernetesShardingConfig {
             shard_lease_prefix: "meter-shard".to_owned(),
             lease_duration_seconds: 15,
             renew_interval_seconds: 5,
-            watch_poll_interval_seconds: 2,
         }
     }
 }

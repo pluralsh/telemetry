@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::query::query_databases;
 use crate::{
@@ -90,8 +90,9 @@ impl ShardingOptions {
 
 /// A facade over independently opened fixed virtual-shard databases.
 pub struct ShardedLine {
+    config: Config,
     options: ShardingOptions,
-    shards: BTreeMap<ShardId, Arc<LogDb>>,
+    shards: RwLock<BTreeMap<ShardId, Arc<LogDb>>>,
     io_permits: Arc<Semaphore>,
 }
 
@@ -107,9 +108,13 @@ impl ShardedLine {
             databases.insert(shard, Arc::new(database));
         }
         Ok(Self {
+            config,
             options,
-            io_permits: shard_io_semaphore(databases.len(), options.io_concurrency_multiplier()),
-            shards: databases,
+            io_permits: shard_io_semaphore(
+                options.virtual_shards() as usize,
+                options.io_concurrency_multiplier(),
+            ),
+            shards: RwLock::new(databases),
         })
     }
 
@@ -117,12 +122,60 @@ impl ShardedLine {
         self.options.route(namespace, labels)
     }
 
-    pub fn contains_shard(&self, shard: ShardId) -> bool {
-        self.shards.contains_key(&shard)
+    pub async fn contains_shard(&self, shard: ShardId) -> bool {
+        self.shards.read().await.contains_key(&shard)
     }
 
-    pub fn shard(&self, shard: ShardId) -> Option<Arc<LogDb>> {
-        self.shards.get(&shard).cloned()
+    pub async fn shard(&self, shard: ShardId) -> Option<Arc<LogDb>> {
+        self.shards.read().await.get(&shard).cloned()
+    }
+
+    pub async fn open_shard(&self, shard: ShardId) -> Result<()> {
+        if self.contains_shard(shard).await {
+            return Ok(());
+        }
+        let database = LogDb::open(self.options.shard_storage(&self.config, shard)?).await?;
+        let mut shards = self.shards.write().await;
+        if shards.contains_key(&shard) {
+            drop(shards);
+            database.close().await?;
+            return Ok(());
+        }
+        shards.insert(shard, Arc::new(database));
+        Ok(())
+    }
+
+    pub async fn flush_shard(&self, shard: ShardId) -> Result<()> {
+        if let Some(database) = self.shard(shard).await {
+            database.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn close_shard(&self, shard: ShardId) -> Result<()> {
+        let mut shards = self.shards.write().await;
+        let Some(database) = shards.remove(&shard) else {
+            return Ok(());
+        };
+        let database = match Arc::try_unwrap(database) {
+            Ok(database) => database,
+            Err(database) => {
+                shards.insert(shard, database);
+                return Err(Error::Invalid(
+                    "shard database still has in-flight references".into(),
+                ));
+            }
+        };
+        drop(shards);
+        database.close().await
+    }
+
+    pub async fn open_shard_count(&self) -> usize {
+        self.shards.read().await.len()
+    }
+
+    pub async fn open_shards(&self) -> Vec<ShardId> {
+        self.shards.read().await.keys().copied().collect()
     }
 
     pub async fn write(
@@ -140,7 +193,7 @@ impl ShardedLine {
         }
         let mut report = WriteReport::default();
         for (shard, batches) in grouped {
-            let database = self.shards.get(&shard).ok_or_else(|| {
+            let database = self.shard(shard).await.ok_or_else(|| {
                 Error::Invalid(format!("shard {} is not open on this node", shard.get()))
             })?;
             let written = database
@@ -159,8 +212,9 @@ impl ShardedLine {
         request: &QueryRequest,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        let databases = self.shards.read().await.values().cloned().collect();
         query_databases(
-            self.shards.values().cloned().collect(),
+            databases,
             namespace,
             request,
             options,
@@ -170,14 +224,24 @@ impl ShardedLine {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        for database in self.shards.values() {
+        let databases = self
+            .shards
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for database in databases {
             database.flush().await?;
         }
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
-        for database in self.shards.values() {
+        let databases = std::mem::take(&mut *self.shards.write().await)
+            .into_values()
+            .collect::<Vec<_>>();
+        for database in databases {
             database.close().await?;
         }
         Ok(())
@@ -283,5 +347,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("max_pages"));
+    }
+
+    #[tokio::test]
+    async fn opens_and_closes_shards_dynamically_without_losing_failed_close() {
+        let database = ShardedLine::open(
+            Config {
+                storage: StorageConfig::InMemory,
+                ..Config::default()
+            },
+            ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap(),
+            [],
+        )
+        .await
+        .unwrap();
+        let shard = ShardId::new(1);
+
+        database.open_shard(shard).await.unwrap();
+        database.open_shard(shard).await.unwrap();
+        assert_eq!(database.open_shard_count().await, 1);
+
+        let reference = database.shard(shard).await.unwrap();
+        let error = database.close_shard(shard).await.unwrap_err();
+        assert!(error.to_string().contains("in-flight references"));
+        assert!(database.contains_shard(shard).await);
+
+        drop(reference);
+        database.flush_shard(shard).await.unwrap();
+        database.close_shard(shard).await.unwrap();
+        assert!(!database.contains_shard(shard).await);
     }
 }

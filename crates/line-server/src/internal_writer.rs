@@ -183,6 +183,9 @@ impl InternalWriter for AppState {
             }));
         }
         drop(assignment);
+        if self.draining_shards.read().await.contains(&shard) {
+            return Err(Status::unavailable("local shard is draining"));
+        }
         // The wire durability is authoritative for forwarded requests.
         let durability = match ProtoDurability::try_from(request.durability)
             .unwrap_or(ProtoDurability::Applied)
@@ -194,6 +197,7 @@ impl InternalWriter for AppState {
         let database = self
             .db
             .shard(shard)
+            .await
             .ok_or_else(|| Status::unavailable("local shard is not open"))?;
         if let Err(error) = database
             .write_with_durability(&namespace, std::mem::take(&mut batches), durability)

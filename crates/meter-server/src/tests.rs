@@ -657,24 +657,24 @@ struct RecordingLifecycle(Mutex<Vec<&'static str>>);
 impl ShardLifecycle for RecordingLifecycle {
     async fn open(
         &self,
-        _range: ShardRange,
+        _shard: ShardId,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
         self.0.lock().unwrap().push("open");
         Ok(())
     }
 
-    async fn drain(&self, _range: ShardRange) -> Result<(), BoxError> {
+    async fn drain(&self, _shard: ShardId) -> Result<(), BoxError> {
         self.0.lock().unwrap().push("drain");
         Ok(())
     }
 
-    async fn flush(&self, _range: ShardRange) -> Result<(), BoxError> {
+    async fn flush(&self, _shard: ShardId) -> Result<(), BoxError> {
         self.0.lock().unwrap().push("flush");
         Ok(())
     }
 
-    async fn close(&self, _range: ShardRange) -> Result<(), BoxError> {
+    async fn close(&self, _shard: ShardId) -> Result<(), BoxError> {
         self.0.lock().unwrap().push("close");
         Ok(())
     }
@@ -682,7 +682,9 @@ impl ShardLifecycle for RecordingLifecycle {
 
 #[tokio::test]
 async fn graceful_drain_flushes_before_close_and_release() {
-    let (_, map) = assignment_for(&test_config(ServerMode::Standalone)).unwrap();
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.virtual_shards = 1;
+    let (_, map) = assignment_for(&config).unwrap();
     let lifecycle = Arc::new(RecordingLifecycle::default());
     let manager = OwnershipManager::new(
         "standalone",

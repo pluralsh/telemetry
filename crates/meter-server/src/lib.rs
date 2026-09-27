@@ -18,12 +18,10 @@ use proto::meter::internal::v1::{
     Durability as ProtoDurability, Label as ProtoLabel, Namespace as ProtoNamespace,
     Sample as ProtoSample, Series as ProtoSeries, WriteBatchRequest,
 };
-#[cfg(all(test, feature = "kubernetes"))]
-use sharding::balanced_contiguous;
 #[cfg(test)]
 use sharding::{Assignment, Owner, ShardId, ShardMap, ShardRange};
 #[cfg(all(test, feature = "kubernetes"))]
-use state::membership_changed;
+use sharding::{balanced_contiguous, kubernetes::membership_changed};
 #[cfg(test)]
 use state::{assignment_for, meter_config_for_namespace};
 #[cfg(test)]

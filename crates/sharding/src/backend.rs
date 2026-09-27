@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use crate::{
     AssignmentGeneration, AssignmentStore, BoxError, LeaseBackend, Owner, OwnerResolver,
-    ResolvedOwner, ShardMap, ShardRange,
+    ResolvedOwner, ShardId, ShardMap,
 };
 
 pub struct FakeAssignmentStore {
@@ -64,45 +64,62 @@ pub type StandaloneAssignmentStore = FakeAssignmentStore;
 pub enum LeaseEvent {
     Acquired {
         owner: String,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     },
     Renewed {
         owner: String,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     },
     Released {
         owner: String,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     },
 }
 
-#[derive(Default)]
 pub struct FakeLeaseBackend {
-    leases: Mutex<HashMap<ShardRange, (String, AssignmentGeneration)>>,
-    forced_loss: Mutex<HashSet<ShardRange>>,
+    leases: Mutex<HashMap<ShardId, (String, AssignmentGeneration)>>,
+    forced_loss: Mutex<HashSet<ShardId>>,
     events: Mutex<Vec<LeaseEvent>>,
+    release_tx: watch::Sender<u64>,
+}
+
+impl Default for FakeLeaseBackend {
+    fn default() -> Self {
+        let (release_tx, _) = watch::channel(0);
+        Self {
+            leases: Mutex::new(HashMap::new()),
+            forced_loss: Mutex::new(HashSet::new()),
+            events: Mutex::new(Vec::new()),
+            release_tx,
+        }
+    }
 }
 
 impl FakeLeaseBackend {
-    pub fn lose(&self, range: ShardRange) {
+    pub fn lose(&self, shard: ShardId) {
         self.forced_loss
             .lock()
             .expect("forced-loss lock poisoned")
-            .insert(range);
-        self.leases
+            .insert(shard);
+        let removed = self
+            .leases
             .lock()
             .expect("lease lock poisoned")
-            .remove(&range);
+            .remove(&shard)
+            .is_some();
+        if removed {
+            self.notify_release();
+        }
     }
 
-    pub fn holder(&self, range: ShardRange) -> Option<(String, AssignmentGeneration)> {
+    pub fn holder(&self, shard: ShardId) -> Option<(String, AssignmentGeneration)> {
         self.leases
             .lock()
             .expect("lease lock poisoned")
-            .get(&range)
+            .get(&shard)
             .cloned()
     }
 
@@ -112,37 +129,46 @@ impl FakeLeaseBackend {
             .expect("lease event lock poisoned")
             .clone()
     }
+
+    fn notify_release(&self) {
+        let next = self.release_tx.borrow().wrapping_add(1);
+        self.release_tx.send_replace(next);
+    }
 }
 
 #[async_trait]
 impl LeaseBackend for FakeLeaseBackend {
+    fn watch_releases(&self) -> watch::Receiver<u64> {
+        self.release_tx.subscribe()
+    }
+
     async fn acquire(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError> {
         if self
             .forced_loss
             .lock()
             .expect("forced-loss lock poisoned")
-            .contains(&range)
+            .contains(&shard)
         {
             return Ok(false);
         }
         let mut leases = self.leases.lock().expect("lease lock poisoned");
-        if let Some((holder, held_generation)) = leases.get(&range)
+        if let Some((holder, held_generation)) = leases.get(&shard)
             && (holder != owner_id || *held_generation > generation)
         {
             return Ok(false);
         }
-        leases.insert(range, (owner_id.to_owned(), generation));
+        leases.insert(shard, (owner_id.to_owned(), generation));
         self.events
             .lock()
             .expect("lease event lock poisoned")
             .push(LeaseEvent::Acquired {
                 owner: owner_id.to_owned(),
-                range,
+                shard,
                 generation,
             });
         Ok(true)
@@ -151,19 +177,19 @@ impl LeaseBackend for FakeLeaseBackend {
     async fn renew(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError> {
         if self
             .forced_loss
             .lock()
             .expect("forced-loss lock poisoned")
-            .contains(&range)
+            .contains(&shard)
         {
             return Ok(false);
         }
         let leases = self.leases.lock().expect("lease lock poisoned");
-        let owned = leases.get(&range).is_some_and(|(holder, held_generation)| {
+        let owned = leases.get(&shard).is_some_and(|(holder, held_generation)| {
             holder == owner_id && *held_generation == generation
         });
         drop(leases);
@@ -173,7 +199,7 @@ impl LeaseBackend for FakeLeaseBackend {
                 .expect("lease event lock poisoned")
                 .push(LeaseEvent::Renewed {
                     owner: owner_id.to_owned(),
-                    range,
+                    shard,
                     generation,
                 });
         }
@@ -183,22 +209,26 @@ impl LeaseBackend for FakeLeaseBackend {
     async fn release(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
         let mut leases = self.leases.lock().expect("lease lock poisoned");
-        if leases.get(&range).is_some_and(|(holder, held_generation)| {
+        let released = leases.get(&shard).is_some_and(|(holder, held_generation)| {
             holder == owner_id && *held_generation == generation
-        }) {
-            leases.remove(&range);
+        });
+        if released {
+            leases.remove(&shard);
         }
         drop(leases);
+        if released {
+            self.notify_release();
+        }
         self.events
             .lock()
             .expect("lease event lock poisoned")
             .push(LeaseEvent::Released {
                 owner: owner_id.to_owned(),
-                range,
+                shard,
                 generation,
             });
         Ok(())
@@ -240,7 +270,7 @@ impl OwnerResolver for StaticOwnerResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Assignment, AssignmentState, ShardMap};
+    use crate::{Assignment, AssignmentState, ShardMap, ShardRange};
 
     fn map(generation: u64) -> ShardMap {
         ShardMap::new(

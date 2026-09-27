@@ -130,11 +130,12 @@ and uses Leases for coordinator and shard ownership. The server must be built wi
 - `shard_lease_prefix`: prefix for per-shard Lease names. Default `meter-shard`.
 - `lease_duration_seconds`: shard/coordinator lease duration in seconds. Default `15`.
 - `renew_interval_seconds`: shard ownership renewal interval in seconds. Default `5`.
-- `watch_poll_interval_seconds`: assignment-watch fallback poll interval in seconds. Default `2`.
 
 The local Kubernetes owner ID is `POD_NAME` when set, otherwise
 `<stateful_set>-${POD_ORDINAL:-0}`. The coordinator balances contiguous shard ranges as StatefulSet
-membership changes. Readers open all virtual shards; writers open only currently owned shards.
+membership changes. Writers watch the assignment ConfigMap, acquire a stable Lease for each
+assigned shard, and watch Lease releases for immediate handoff. Coordinator candidates also watch
+the coordinator Lease for prompt failover. Readers open all virtual shards.
 
 ## Secrets and authentication
 

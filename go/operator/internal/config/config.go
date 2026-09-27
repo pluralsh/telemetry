@@ -370,9 +370,8 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
 		OwnerPort: grpcPort, AssignmentConfigMap: resourceName(name, "writer-shard-assignments"),
 		CoordinatorLease: resourceName(name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(name, "writer-shard"),
-		LeaseDurationSeconds:     int64Value(spec.LeaseDurationSeconds, 15),
-		RenewIntervalSeconds:     int64Value(spec.RenewIntervalSeconds, 5),
-		WatchPollIntervalSeconds: int64Value(spec.WatchPollIntervalSeconds, 2),
+		LeaseDurationSeconds: int64Value(spec.LeaseDurationSeconds, 15),
+		RenewIntervalSeconds: int64Value(spec.RenewIntervalSeconds, 5),
 	}
 }
 
@@ -507,19 +506,18 @@ type renderWrite struct {
 	RemoteRetries        int32  `json:"remote_retries"`
 }
 type renderSharding struct {
-	VirtualShards            int32  `json:"virtual_shards"`
-	IOConcurrencyMultiplier  int32  `json:"io_concurrency_multiplier"`
-	Backend                  string `json:"backend"`
-	Namespace                string `json:"namespace,omitempty"`
-	StatefulSet              string `json:"stateful_set,omitempty"`
-	HeadlessService          string `json:"headless_service,omitempty"`
-	OwnerPort                int32  `json:"owner_port,omitempty"`
-	AssignmentConfigMap      string `json:"assignment_config_map,omitempty"`
-	CoordinatorLease         string `json:"coordinator_lease,omitempty"`
-	ShardLeasePrefix         string `json:"shard_lease_prefix,omitempty"`
-	LeaseDurationSeconds     int64  `json:"lease_duration_seconds,omitempty"`
-	RenewIntervalSeconds     int64  `json:"renew_interval_seconds,omitempty"`
-	WatchPollIntervalSeconds int64  `json:"watch_poll_interval_seconds,omitempty"`
+	VirtualShards           int32  `json:"virtual_shards"`
+	IOConcurrencyMultiplier int32  `json:"io_concurrency_multiplier"`
+	Backend                 string `json:"backend"`
+	Namespace               string `json:"namespace,omitempty"`
+	StatefulSet             string `json:"stateful_set,omitempty"`
+	HeadlessService         string `json:"headless_service,omitempty"`
+	OwnerPort               int32  `json:"owner_port,omitempty"`
+	AssignmentConfigMap     string `json:"assignment_config_map,omitempty"`
+	CoordinatorLease        string `json:"coordinator_lease,omitempty"`
+	ShardLeasePrefix        string `json:"shard_lease_prefix,omitempty"`
+	LeaseDurationSeconds    int64  `json:"lease_duration_seconds,omitempty"`
+	RenewIntervalSeconds    int64  `json:"renew_interval_seconds,omitempty"`
 }
 type renderFileSecret struct {
 	Source string `json:"source"`

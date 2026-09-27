@@ -7,8 +7,8 @@ This chart deploys Meter in exactly one of two topologies:
   the same store.
 - `sharded`: a writer StatefulSet with stable pod identities and a reader
   StatefulSet. Meter uses the Kubernetes API to derive writer membership,
-  coordinate assignments through a ConfigMap, and protect shard ownership with
-  Leases.
+  publishes contiguous range assignments through a watched ConfigMap, and
+  protects each independently writable shard with a stable, watched Lease.
 
 ## Install
 

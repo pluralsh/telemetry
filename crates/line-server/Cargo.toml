@@ -15,11 +15,16 @@ path = "src/lib.rs"
 name = "line-server"
 path = "src/main.rs"
 
+[features]
+default = ["kubernetes"]
+kubernetes = ["sharding/kubernetes", "dep:kube"]
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum = "0.8.9"
 bytes.workspace = true
 chrono.workspace = true
@@ -28,6 +33,7 @@ common = { path = "../common" }
 flate2 = "1"
 futures.workspace = true
 line = { path = "../line" }
+kube = { workspace = true, optional = true }
 meter-server = { path = "../meter-server", default-features = false }
 opentelemetry-proto = { workspace = true, features = ["logs", "with-serde"] }
 prost.workspace = true

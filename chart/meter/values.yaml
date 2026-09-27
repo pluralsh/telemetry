@@ -101,7 +101,6 @@ sharding:
   ioConcurrencyMultiplier: 4
   leaseDurationSeconds: 15
   renewIntervalSeconds: 5
-  watchPollIntervalSeconds: 2
 
 # Internal writer-to-writer authentication. When enabled, the token is mounted
 # as a file and is never written to the generated ConfigMap.

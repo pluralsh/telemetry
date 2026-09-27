@@ -125,7 +125,6 @@ sharding:
   # shard_lease_prefix: meter-shard
   # lease_duration_seconds: 15
   # renew_interval_seconds: 5
-  # watch_poll_interval_seconds: 2
 
 auth:
   # HTTP namespace APIs deny anonymous requests by default. Set this to true

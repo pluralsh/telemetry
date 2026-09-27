@@ -312,11 +312,6 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
-                      watchPollIntervalSeconds:
-                        default: 2
-                        format: int64
-                        minimum: 1
-                        type: integer
                     type: object
                     x-kubernetes-validations:
                     - message: renewIntervalSeconds must be less than leaseDurationSeconds
@@ -9417,6 +9412,9 @@ spec:
                         type: object
                     type: object
                   replicas:
+                    description: |-
+                      Replicas defaults to three for sharded writers and two for sharded
+                      readers. Standalone mode uses exactly one writer and no reader.
                     format: int32
                     minimum: 0
                     type: integer
@@ -18073,6 +18071,9 @@ spec:
                         type: object
                     type: object
                   replicas:
+                    description: |-
+                      Replicas defaults to three for sharded writers and two for sharded
+                      readers. Standalone mode uses exactly one writer and no reader.
                     format: int32
                     minimum: 0
                     type: integer

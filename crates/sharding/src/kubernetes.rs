@@ -5,13 +5,14 @@
 //! backend structs in this module.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use k8s_openapi::{
     api::{
         apps::v1::StatefulSet,
@@ -20,13 +21,20 @@ use k8s_openapi::{
     },
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
-use kube::{Api, Client, Error as KubeError, api::PostParams};
+use kube::{
+    Api, Client, Error as KubeError,
+    api::PostParams,
+    runtime::{
+        WatchStreamExt,
+        watcher::{self, Event},
+    },
+};
 use tokio::{sync::watch, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AssignmentGeneration, AssignmentStore, BoxError, LeaseBackend, Owner, OwnerResolver,
-    ResolvedOwner, ShardMap, ShardRange,
+    ResolvedOwner, ShardId, ShardMap, balanced_contiguous,
 };
 
 const ASSIGNMENT_KEY: &str = "assignment.json";
@@ -44,7 +52,6 @@ pub struct KubernetesConfig {
     pub coordinator_lease: String,
     pub shard_lease_prefix: String,
     pub lease_duration: Duration,
-    pub watch_poll_interval: Duration,
 }
 
 impl Default for KubernetesConfig {
@@ -58,7 +65,6 @@ impl Default for KubernetesConfig {
             coordinator_lease: "meter-shard-coordinator".to_owned(),
             shard_lease_prefix: "meter-shard".to_owned(),
             lease_duration: Duration::from_secs(15),
-            watch_poll_interval: Duration::from_secs(2),
         }
     }
 }
@@ -326,63 +332,115 @@ impl KubernetesCoordinatorElection {
 pub struct KubernetesLeaseBackend {
     prefix: String,
     leases: KubernetesLeaseSet,
+    release_tx: watch::Sender<u64>,
 }
 
 impl KubernetesLeaseBackend {
-    pub fn new(client: Client, config: &KubernetesConfig) -> Self {
+    pub fn new(client: Client, config: &KubernetesConfig, cancel: CancellationToken) -> Self {
+        let leases =
+            KubernetesLeaseSet::new(client, config.namespace.clone(), config.lease_duration);
+        let prefix = config.shard_lease_prefix.clone();
+        let (release_tx, _) = watch::channel(0);
+        let watch_api = leases.api.clone();
+        let watch_prefix = format!("{prefix}-");
+        let watch_tx = release_tx.clone();
+        tokio::spawn(async move {
+            let mut events = watcher::watcher(watch_api, watcher::Config::default())
+                .default_backoff()
+                .boxed();
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    event = events.next() => match event {
+                        Some(Ok(Event::Apply(lease) | Event::InitApply(lease)))
+                            if is_released_shard_lease(&lease, &watch_prefix) =>
+                        {
+                            notify_lease_release(&watch_tx);
+                        }
+                        Some(Ok(Event::Delete(lease)))
+                            if is_shard_lease(&lease, &watch_prefix) =>
+                        {
+                            notify_lease_release(&watch_tx);
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "Kubernetes shard lease watch failed; reconnecting");
+                        }
+                        None => return,
+                    }
+                }
+            }
+        });
         Self {
-            prefix: config.shard_lease_prefix.clone(),
-            leases: KubernetesLeaseSet::new(
-                client,
-                config.namespace.clone(),
-                config.lease_duration,
-            ),
+            prefix,
+            leases,
+            release_tx,
         }
     }
 
-    pub fn lease_name(&self, range: ShardRange) -> String {
-        range_lease_name(&self.prefix, range)
+    pub fn lease_name(&self, shard: ShardId) -> String {
+        shard_lease_name(&self.prefix, shard)
     }
 }
 
-pub fn range_lease_name(prefix: &str, range: ShardRange) -> String {
-    format!("{prefix}-{}-{}", range.start(), range.end())
+fn is_shard_lease(lease: &Lease, prefix: &str) -> bool {
+    lease.metadata.name.as_deref().is_some_and(|name| {
+        name.strip_prefix(prefix)
+            .is_some_and(|id| id.parse::<u32>().is_ok())
+    })
+}
+
+fn is_released_shard_lease(lease: &Lease, prefix: &str) -> bool {
+    is_shard_lease(lease, prefix) && lease_record(lease).is_none()
+}
+
+fn notify_lease_release(tx: &watch::Sender<u64>) {
+    let next = tx.borrow().wrapping_add(1);
+    tx.send_replace(next);
+}
+
+pub fn shard_lease_name(prefix: &str, shard: ShardId) -> String {
+    format!("{prefix}-{:04}", shard.get())
 }
 
 #[async_trait]
 impl LeaseBackend for KubernetesLeaseBackend {
+    fn watch_releases(&self) -> watch::Receiver<u64> {
+        self.release_tx.subscribe()
+    }
+
     async fn acquire(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError> {
         Ok(self
             .leases
-            .acquire(&self.lease_name(range), owner_id, generation)
+            .acquire(&self.lease_name(shard), owner_id, generation)
             .await?)
     }
 
     async fn renew(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError> {
         Ok(self
             .leases
-            .renew(&self.lease_name(range), owner_id, generation)
+            .renew(&self.lease_name(shard), owner_id, generation)
             .await?)
     }
 
     async fn release(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
         self.leases
-            .release(&self.lease_name(range), owner_id, generation)
+            .release(&self.lease_name(shard), owner_id, generation)
             .await?;
         Ok(())
     }
@@ -414,27 +472,42 @@ impl KubernetesAssignmentStore {
             tx,
         });
         let watcher = store.clone();
-        let interval = config.watch_poll_interval;
         tokio::spawn(async move {
-            let mut poll = time::interval(interval);
-            poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let selector = format!("metadata.name={}", watcher.name);
+            let mut events = watcher::watcher(
+                watcher.api.clone(),
+                watcher::Config::default().fields(&selector),
+            )
+            .default_backoff()
+            .boxed();
+            let mut relisted = None;
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
-                    _ = poll.tick() => {
-                        match watcher.api.get_opt(&watcher.name).await {
-                            Ok(Some(config_map)) => match decode_assignment(&config_map) {
-                                Ok(Some(next)) => {
-                                    let current = watcher.tx.borrow().as_ref().map(|map| map.generation);
-                                    if current.is_none_or(|generation| next.generation > generation) {
-                                        watcher.tx.send_replace(Some(next));
-                                    }
+                    event = events.next() => {
+                        match event {
+                            Some(Ok(Event::Apply(config_map))) => {
+                                apply_watched_assignment(&watcher.tx, &config_map);
+                            }
+                            Some(Ok(Event::Delete(_))) => {
+                                tracing::warn!("Kubernetes shard assignment was deleted; retaining last known generation");
+                            }
+                            Some(Ok(Event::Init)) => relisted = None,
+                            Some(Ok(Event::InitApply(config_map))) => {
+                                match decode_assignment(&config_map) {
+                                    Ok(next) => relisted = next,
+                                    Err(error) => tracing::warn!(%error, "invalid relisted Kubernetes shard assignment"),
                                 }
-                                Ok(None) => {}
-                                Err(error) => tracing::warn!(%error, "invalid Kubernetes shard assignment"),
-                            },
-                            Ok(None) => {}
-                            Err(error) => tracing::warn!(%error, "failed to watch Kubernetes shard assignment"),
+                            }
+                            Some(Ok(Event::InitDone)) => {
+                                if let Some(next) = relisted.take() {
+                                    apply_assignment_update(&watcher.tx, next);
+                                }
+                            }
+                            Some(Err(error)) => {
+                                tracing::warn!(%error, "Kubernetes shard assignment watch failed; reconnecting");
+                            }
+                            None => return,
                         }
                     }
                 }
@@ -444,12 +517,27 @@ impl KubernetesAssignmentStore {
     }
 }
 
+fn apply_watched_assignment(tx: &watch::Sender<Option<ShardMap>>, config_map: &ConfigMap) {
+    match decode_assignment(config_map) {
+        Ok(Some(next)) => apply_assignment_update(tx, next),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "invalid Kubernetes shard assignment"),
+    }
+}
+
+fn apply_assignment_update(tx: &watch::Sender<Option<ShardMap>>, next: ShardMap) {
+    let current = tx.borrow().as_ref().map(|map| map.generation);
+    if current.is_none_or(|generation| next.generation > generation) {
+        tx.send_replace(Some(next));
+    }
+}
+
 #[async_trait]
 impl AssignmentStore for KubernetesAssignmentStore {
     async fn load(&self) -> Result<Option<ShardMap>, BoxError> {
         match self.api.get_opt(&self.name).await? {
             Some(config_map) => decode_assignment(&config_map),
-            None => Ok(None),
+            None => Ok(self.tx.borrow().clone()),
         }
     }
 
@@ -609,6 +697,151 @@ impl OwnerResolver for KubernetesOwnerResolver {
     }
 }
 
+pub async fn run_kubernetes_coordinator(
+    store: Arc<KubernetesAssignmentStore>,
+    config: KubernetesConfig,
+    identity: String,
+    virtual_shards: u32,
+    cancel: CancellationToken,
+) {
+    let client = match Client::try_default().await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(%error, "cannot start Kubernetes shard coordinator");
+            return;
+        }
+    };
+    let election = KubernetesCoordinatorElection::new(client.clone(), &config);
+    let coordinator_api: Api<Lease> = Api::namespaced(client.clone(), &config.namespace);
+    let coordinator_selector = format!("metadata.name={}", config.coordinator_lease);
+    let mut coordinator_events = watcher::watcher(
+        coordinator_api,
+        watcher::Config::default().fields(&coordinator_selector),
+    )
+    .default_backoff()
+    .boxed();
+    let membership = StatefulSetMembership::new(client, &config);
+    let renew_interval = (config.lease_duration / 3).max(Duration::from_secs(1));
+    let mut ticker = time::interval(renew_interval);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut leader = false;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                if leader
+                    && let Err(error) = election.release(&identity).await
+                {
+                    tracing::warn!(%error, "failed to release coordinator leadership");
+                }
+                return;
+            }
+            event = coordinator_events.next() => {
+                match event {
+                    Some(Ok(Event::Apply(lease) | Event::InitApply(lease)))
+                        if lease_record(&lease).is_none() =>
+                    {
+                        leader = false;
+                        ticker.reset_immediately();
+                    }
+                    Some(Ok(Event::Delete(_))) => {
+                        leader = false;
+                        ticker.reset_immediately();
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "Kubernetes coordinator lease watch failed; reconnecting");
+                    }
+                    None => {
+                        tracing::error!("Kubernetes coordinator lease watch ended");
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                leader = if leader {
+                    match election.renew(&identity).await {
+                        Ok(held) => held,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to renew coordinator leadership");
+                            false
+                        }
+                    }
+                } else {
+                    match election.try_acquire(&identity).await {
+                        Ok(acquired) => acquired,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to acquire coordinator leadership");
+                            false
+                        }
+                    }
+                };
+                if !leader {
+                    continue;
+                }
+                let owners = match membership.owners().await {
+                    Ok(owners) => owners,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to observe StatefulSet membership");
+                        continue;
+                    }
+                };
+                let current = match store.load().await {
+                    Ok(current) => current,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to load current shard assignment");
+                        continue;
+                    }
+                };
+                if !membership_changed(current.as_ref(), &owners, virtual_shards) {
+                    continue;
+                }
+                let generation = current
+                    .as_ref()
+                    .map_or(AssignmentGeneration::new(1), |map| map.generation.next());
+                let next = match balanced_contiguous(
+                    generation,
+                    virtual_shards,
+                    &owners,
+                    current.as_ref(),
+                ) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to plan shard assignment");
+                        continue;
+                    }
+                };
+                if let Err(error) = store.publish(next).await {
+                    tracing::warn!(%error, "failed to publish shard assignment");
+                    leader = false;
+                }
+            }
+        }
+    }
+}
+
+pub fn membership_changed(
+    current: Option<&ShardMap>,
+    owners: &[Owner],
+    virtual_shards: u32,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    if current.virtual_shards != virtual_shards {
+        return true;
+    }
+    let current_owners = current
+        .assignments
+        .iter()
+        .map(|assignment| (&assignment.owner.id, assignment.owner.ordinal))
+        .collect::<HashSet<_>>();
+    let desired_owners = owners
+        .iter()
+        .map(|owner| (&owner.id, owner.ordinal))
+        .collect::<HashSet<_>>();
+    current_owners != desired_owners
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Assignment, AssignmentState, ShardRange};
@@ -682,10 +915,54 @@ mod tests {
     }
 
     #[test]
-    fn range_leases_are_small_and_stably_named() {
+    fn shard_leases_are_small_and_stably_named() {
         assert_eq!(
-            range_lease_name("meter-shard", ShardRange::within(16, 32, 64).unwrap()),
-            "meter-shard-16-32"
+            shard_lease_name("meter-shard", ShardId::new(16)),
+            "meter-shard-0016"
         );
+    }
+
+    #[test]
+    fn lease_watch_only_notifies_for_released_shard_leases() {
+        let active = lease_resource(
+            "meter-shard-0016",
+            "default",
+            None,
+            "meter-0",
+            AssignmentGeneration::new(1),
+            Duration::from_secs(15),
+            1_000,
+        );
+        assert!(is_shard_lease(&active, "meter-shard-"));
+        assert!(!is_released_shard_lease(&active, "meter-shard-"));
+
+        let released = released_lease_resource(&active);
+        assert!(is_released_shard_lease(&released, "meter-shard-"));
+
+        let coordinator = lease_resource(
+            "meter-shard-coordinator",
+            "default",
+            None,
+            "meter-0",
+            AssignmentGeneration::default(),
+            Duration::from_secs(15),
+            1_000,
+        );
+        assert!(!is_shard_lease(&coordinator, "meter-shard-"));
+    }
+
+    #[test]
+    fn watched_assignments_only_advance_generations() {
+        let (tx, mut rx) = watch::channel(Some(assignment()));
+        let mut stale = assignment();
+        stale.generation = AssignmentGeneration::new(6);
+        apply_assignment_update(&tx, stale);
+        assert!(!rx.has_changed().unwrap());
+
+        let mut next = assignment();
+        next.generation = AssignmentGeneration::new(8);
+        apply_assignment_update(&tx, next.clone());
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref(), Some(&next));
     }
 }

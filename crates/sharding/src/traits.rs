@@ -3,7 +3,7 @@ use std::{error::Error, net::SocketAddr};
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use crate::{AssignmentGeneration, Owner, ShardMap, ShardRange};
+use crate::{AssignmentGeneration, Owner, ShardId, ShardMap};
 
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -28,36 +28,34 @@ pub trait AssignmentStore: Send + Sync {
 
 #[async_trait]
 pub trait LeaseBackend: Send + Sync {
+    fn watch_releases(&self) -> watch::Receiver<u64>;
+
     async fn acquire(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError>;
 
     async fn renew(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<bool, BoxError>;
 
     async fn release(
         &self,
         owner_id: &str,
-        range: ShardRange,
+        shard: ShardId,
         generation: AssignmentGeneration,
     ) -> Result<(), BoxError>;
 }
 
 #[async_trait]
 pub trait ShardLifecycle: Send + Sync {
-    async fn open(
-        &self,
-        range: ShardRange,
-        generation: AssignmentGeneration,
-    ) -> Result<(), BoxError>;
-    async fn drain(&self, range: ShardRange) -> Result<(), BoxError>;
-    async fn flush(&self, range: ShardRange) -> Result<(), BoxError>;
-    async fn close(&self, range: ShardRange) -> Result<(), BoxError>;
+    async fn open(&self, shard: ShardId, generation: AssignmentGeneration) -> Result<(), BoxError>;
+    async fn drain(&self, shard: ShardId) -> Result<(), BoxError>;
+    async fn flush(&self, shard: ShardId) -> Result<(), BoxError>;
+    async fn close(&self, shard: ShardId) -> Result<(), BoxError>;
 }

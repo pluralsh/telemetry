@@ -692,7 +692,6 @@ _Appears in:_
 | `ioConcurrencyMultiplier` _integer_ |  | 4 | Minimum: 1 <br /> |
 | `leaseDurationSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
 | `renewIntervalSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
-| `watchPollIntervalSeconds` _integer_ |  | 2 | Minimum: 1 <br /> |
 
 
 #### StorageSpec
@@ -747,7 +746,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `replicas` _integer_ |  |  | Minimum: 0 <br /> |
+| `replicas` _integer_ | Replicas defaults to three for sharded writers and two for sharded<br />readers. Standalone mode uses exactly one writer and no reader. |  | Minimum: 0 <br /> |
 | `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is merged with podTemplate.spec.nodeSelector. Values here<br />take precedence when the same key is configured in both places. |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations are merged with podTemplate.spec.tolerations. A first-class<br />toleration replaces a podTemplate toleration with the same key, operator,<br />and effect; otherwise it is appended. |  |  |
 | `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ | PodTemplate is the full Kubernetes pod template escape hatch. Operator<br />required fields and the first-class scheduling fields are merged into it. |  |  |

@@ -188,9 +188,6 @@ type ShardingSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=5
 	RenewIntervalSeconds *int64 `json:"renewIntervalSeconds,omitempty"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=2
-	WatchPollIntervalSeconds *int64 `json:"watchPollIntervalSeconds,omitempty"`
 }
 
 type BasicCredentialSpec struct {
@@ -232,6 +229,8 @@ type AuthSpec struct {
 }
 
 type WorkloadSpec struct {
+	// Replicas defaults to three for sharded writers and two for sharded
+	// readers. Standalone mode uses exactly one writer and no reader.
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
 	// NodeSelector is merged with podTemplate.spec.nodeSelector. Values here

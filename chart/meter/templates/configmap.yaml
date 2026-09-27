@@ -68,7 +68,6 @@ data:
       shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
       lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}
       renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
-      watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
     auth:
       unauthenticated: {{ .Values.config.auth.unauthenticated }}
       {{- if .Values.internalToken.enabled }}
@@ -116,7 +115,6 @@ data:
       shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
       lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}
       renew_interval_seconds: {{ .Values.sharding.renewIntervalSeconds }}
-      watch_poll_interval_seconds: {{ .Values.sharding.watchPollIntervalSeconds }}
     auth:
       unauthenticated: {{ .Values.config.auth.unauthenticated }}
       {{- if .Values.internalToken.enabled }}

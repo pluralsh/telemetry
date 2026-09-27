@@ -1,22 +1,29 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use futures::{StreamExt, stream};
 use tokio::{sync::watch, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AssignmentGeneration, AssignmentState, AssignmentStore, LeaseBackend, ShardLifecycle, ShardMap,
-    ShardRange,
+    AssignmentGeneration, AssignmentState, AssignmentStore, LeaseBackend, ShardId, ShardLifecycle,
+    ShardMap,
 };
 
 #[derive(Debug, Clone)]
 pub struct OwnershipManagerConfig {
     pub renew_interval: Duration,
+    pub lease_duration: Duration,
 }
 
 impl Default for OwnershipManagerConfig {
     fn default() -> Self {
         Self {
             renew_interval: Duration::from_secs(5),
+            lease_duration: Duration::from_secs(15),
         }
     }
 }
@@ -24,7 +31,7 @@ impl Default for OwnershipManagerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OwnershipState {
     pub generation: Option<AssignmentGeneration>,
-    pub ranges: Vec<(ShardRange, AssignmentState)>,
+    pub shards: Vec<(ShardId, AssignmentState)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,7 +55,7 @@ pub struct OwnershipManager<S, L, R> {
     store: Arc<S>,
     leases: Arc<L>,
     lifecycle: Arc<R>,
-    held: HashMap<ShardRange, AssignmentGeneration>,
+    held: HashMap<ShardId, (AssignmentGeneration, Instant)>,
     generation: Option<AssignmentGeneration>,
     latest: Option<ShardMap>,
     state_tx: watch::Sender<OwnershipState>,
@@ -87,6 +94,7 @@ where
 
     pub async fn run(mut self, cancel: CancellationToken) -> Result<(), ManagerError> {
         let mut assignments = self.store.watch();
+        let mut lease_releases = self.leases.watch_releases();
         if let Some(initial) = self.store.load().await.map_err(ManagerError::Store)? {
             self.apply_assignment(initial).await?;
         }
@@ -117,6 +125,12 @@ where
                     }
                 }
                 _ = renew.tick() => self.renew().await?,
+                changed = lease_releases.changed() => {
+                    if changed.is_ok() {
+                        lease_releases.borrow_and_update();
+                        self.acquire_missing().await?;
+                    }
+                }
             }
         }
     }
@@ -140,54 +154,74 @@ where
                     AssignmentState::Pending | AssignmentState::Active
                 )
             })
-            .map(|assignment| assignment.range)
+            .flat_map(|assignment| assignment.range.start().get()..assignment.range.end().get())
+            .map(ShardId::new)
             .collect::<Vec<_>>();
 
         let to_release = self
             .held
             .keys()
             .copied()
-            .filter(|range| !desired.contains(range))
+            .filter(|shard| !desired.contains(shard))
             .collect::<Vec<_>>();
-        for range in to_release {
-            self.stop_range(range).await?;
+        for shard in to_release {
+            self.stop_shard(shard).await?;
         }
 
-        for range in desired {
-            if let Some(old_generation) = self.held.get(&range).copied() {
+        for shard in desired {
+            if let Some((old_generation, _)) = self.held.get(&shard).copied() {
                 if old_generation != map.generation {
-                    let acquired = self
+                    match self
                         .leases
-                        .acquire(&self.owner_id, range, map.generation)
+                        .acquire(&self.owner_id, shard, map.generation)
                         .await
-                        .map_err(ManagerError::Lease)?;
-                    if acquired {
-                        self.held.insert(range, map.generation);
-                    } else {
-                        self.stop_range(range).await?;
+                    {
+                        Ok(true) => {
+                            self.held.insert(shard, (map.generation, Instant::now()));
+                        }
+                        Ok(false) => self.stop_shard(shard).await?,
+                        Err(error) => {
+                            tracing::warn!(
+                                %shard,
+                                generation = %map.generation,
+                                %error,
+                                "shard lease generation upgrade failed; retrying before expiry"
+                            );
+                        }
                     }
                 }
                 continue;
             }
 
-            self.publish_state(map.generation, range, AssignmentState::Pending);
-            let acquired = self
+            self.publish_state(map.generation, shard, AssignmentState::Pending);
+            let acquired = match self
                 .leases
-                .acquire(&self.owner_id, range, map.generation)
+                .acquire(&self.owner_id, shard, map.generation)
                 .await
-                .map_err(ManagerError::Lease)?;
+            {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    tracing::warn!(
+                        %shard,
+                        generation = %map.generation,
+                        %error,
+                        "shard lease acquisition failed; retrying"
+                    );
+                    continue;
+                }
+            };
             if !acquired {
                 continue;
             }
-            if let Err(error) = self.lifecycle.open(range, map.generation).await {
+            if let Err(error) = self.lifecycle.open(shard, map.generation).await {
                 self.leases
-                    .release(&self.owner_id, range, map.generation)
+                    .release(&self.owner_id, shard, map.generation)
                     .await
                     .map_err(ManagerError::Lease)?;
                 return Err(ManagerError::Lifecycle(error));
             }
-            self.held.insert(range, map.generation);
-            self.publish_state(map.generation, range, AssignmentState::Active);
+            self.held.insert(shard, (map.generation, Instant::now()));
+            self.publish_state(map.generation, shard, AssignmentState::Active);
         }
 
         self.generation = Some(map.generation);
@@ -196,91 +230,123 @@ where
     }
 
     async fn renew(&mut self) -> Result<(), ManagerError> {
+        let latest_generation = self.latest.as_ref().map(|map| map.generation);
         let held = self
             .held
             .iter()
-            .map(|(range, generation)| (*range, *generation))
+            .map(|(shard, (generation, confirmed))| (*shard, *generation, *confirmed))
             .collect::<Vec<_>>();
-        for (range, generation) in held {
-            let owned = self
-                .leases
-                .renew(&self.owner_id, range, generation)
-                .await
-                .map_err(ManagerError::Lease)?;
-            if !owned {
-                tracing::warn!(%range, %generation, "shard lease lost; draining local resources");
-                self.stop_range(range).await?;
+        let renewals = stream::iter(held.into_iter().map(|(shard, generation, confirmed)| {
+            let leases = Arc::clone(&self.leases);
+            let owner_id = self.owner_id.clone();
+            let target_generation = latest_generation
+                .filter(|latest| *latest > generation)
+                .unwrap_or(generation);
+            async move {
+                let result = if target_generation == generation {
+                    leases.renew(&owner_id, shard, generation).await
+                } else {
+                    leases.acquire(&owner_id, shard, target_generation).await
+                };
+                (shard, target_generation, confirmed, result)
+            }
+        }))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+        for (shard, generation, confirmed, result) in renewals {
+            match result {
+                Ok(true) => {
+                    self.held.insert(shard, (generation, Instant::now()));
+                }
+                Ok(false) => {
+                    tracing::warn!(%shard, %generation, "shard lease lost; draining local resources");
+                    self.stop_shard(shard).await?;
+                }
+                Err(error) if confirmed.elapsed() < self.config.lease_duration => {
+                    tracing::warn!(%shard, %generation, %error, "shard lease renewal failed; retrying before expiry");
+                }
+                Err(error) => {
+                    tracing::error!(%shard, %generation, %error, "shard lease could not be confirmed before expiry; draining");
+                    self.stop_shard(shard).await?;
+                }
             }
         }
+        self.acquire_missing().await
+    }
+
+    async fn acquire_missing(&mut self) -> Result<(), ManagerError> {
         let missing = self
             .latest
             .as_ref()
             .into_iter()
             .flat_map(|map| {
-                map.assignments_for(&self.owner_id)
-                    .map(move |item| (map, item))
+                map.assignments_for(&self.owner_id).flat_map(move |item| {
+                    (item.range.start().get()..item.range.end().get())
+                        .map(move |shard| (map, item.state, ShardId::new(shard)))
+                })
             })
-            .filter(|(_, assignment)| {
-                matches!(
-                    assignment.state,
-                    AssignmentState::Pending | AssignmentState::Active
-                ) && !self.held.contains_key(&assignment.range)
+            .filter(|(_, state, shard)| {
+                matches!(state, AssignmentState::Pending | AssignmentState::Active)
+                    && !self.held.contains_key(shard)
             })
-            .map(|(map, assignment)| (map.generation, assignment.range))
+            .map(|(map, _, shard)| (map.generation, shard))
             .collect::<Vec<_>>();
-        for (generation, range) in missing {
-            self.publish_state(generation, range, AssignmentState::Pending);
-            let acquired = self
-                .leases
-                .acquire(&self.owner_id, range, generation)
-                .await
-                .map_err(ManagerError::Lease)?;
+        for (generation, shard) in missing {
+            self.publish_state(generation, shard, AssignmentState::Pending);
+            let acquired = match self.leases.acquire(&self.owner_id, shard, generation).await {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    tracing::warn!(%shard, %generation, %error, "shard lease acquisition failed; retrying");
+                    continue;
+                }
+            };
             if !acquired {
                 continue;
             }
-            if let Err(error) = self.lifecycle.open(range, generation).await {
+            if let Err(error) = self.lifecycle.open(shard, generation).await {
                 self.leases
-                    .release(&self.owner_id, range, generation)
+                    .release(&self.owner_id, shard, generation)
                     .await
                     .map_err(ManagerError::Lease)?;
                 return Err(ManagerError::Lifecycle(error));
             }
-            self.held.insert(range, generation);
-            self.publish_state(generation, range, AssignmentState::Active);
+            self.held.insert(shard, (generation, Instant::now()));
+            self.publish_state(generation, shard, AssignmentState::Active);
         }
         Ok(())
     }
 
-    async fn stop_range(&mut self, range: ShardRange) -> Result<(), ManagerError> {
-        let Some(generation) = self.held.get(&range).copied() else {
+    async fn stop_shard(&mut self, shard: ShardId) -> Result<(), ManagerError> {
+        let Some((generation, _)) = self.held.get(&shard).copied() else {
             return Ok(());
         };
-        self.publish_state(generation, range, AssignmentState::Draining);
+        self.publish_state(generation, shard, AssignmentState::Draining);
         self.lifecycle
-            .drain(range)
+            .drain(shard)
             .await
             .map_err(ManagerError::Lifecycle)?;
         self.lifecycle
-            .flush(range)
+            .flush(shard)
             .await
             .map_err(ManagerError::Lifecycle)?;
         self.lifecycle
-            .close(range)
+            .close(shard)
             .await
             .map_err(ManagerError::Lifecycle)?;
         self.leases
-            .release(&self.owner_id, range, generation)
+            .release(&self.owner_id, shard, generation)
             .await
             .map_err(ManagerError::Lease)?;
-        self.held.remove(&range);
-        self.publish_state(generation, range, AssignmentState::Released);
+        self.held.remove(&shard);
+        self.publish_state(generation, shard, AssignmentState::Released);
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), ManagerError> {
-        let ranges = self.held.keys().copied().collect::<Vec<_>>();
-        for range in ranges {
-            self.stop_range(range).await?;
+        let shards = self.held.keys().copied().collect::<Vec<_>>();
+        for shard in shards {
+            self.stop_shard(shard).await?;
         }
         Ok(())
     }
@@ -288,22 +354,22 @@ where
     fn publish_state(
         &self,
         generation: AssignmentGeneration,
-        range: ShardRange,
+        shard: ShardId,
         state: AssignmentState,
     ) {
         let mut snapshot = self.state_tx.borrow().clone();
         snapshot.generation = Some(generation);
-        snapshot.ranges.retain(|(current, _)| *current != range);
-        snapshot.ranges.push((range, state));
-        snapshot.ranges.sort_by_key(|(range, _)| range.start());
+        snapshot.shards.retain(|(current, _)| *current != shard);
+        snapshot.shards.push((shard, state));
+        snapshot.shards.sort_by_key(|(shard, _)| *shard);
         self.state_tx.send_replace(snapshot);
     }
 
     fn publish_snapshot(&self) {
         let mut snapshot = self.state_tx.borrow().clone();
         snapshot.generation = self.generation;
-        snapshot.ranges.retain(|(range, state)| {
-            self.held.contains_key(range) || *state == AssignmentState::Released
+        snapshot.shards.retain(|(shard, state)| {
+            self.held.contains_key(shard) || *state == AssignmentState::Released
         });
         self.state_tx.send_replace(snapshot);
     }
@@ -311,14 +377,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
 
     use super::*;
     use crate::{
         Assignment, AssignmentGeneration, AssignmentState, BoxError, FakeAssignmentStore,
-        FakeLeaseBackend, Owner, ShardMap,
+        FakeLeaseBackend, Owner, ShardMap, ShardRange,
     };
 
     #[derive(Default)]
@@ -336,36 +405,79 @@ mod tests {
     impl ShardLifecycle for RecordingLifecycle {
         async fn open(
             &self,
-            _range: ShardRange,
+            _shard: ShardId,
             _generation: AssignmentGeneration,
         ) -> Result<(), BoxError> {
             self.events.lock().unwrap().push("open");
             Ok(())
         }
 
-        async fn drain(&self, _range: ShardRange) -> Result<(), BoxError> {
+        async fn drain(&self, _shard: ShardId) -> Result<(), BoxError> {
             self.events.lock().unwrap().push("drain");
             Ok(())
         }
 
-        async fn flush(&self, _range: ShardRange) -> Result<(), BoxError> {
+        async fn flush(&self, _shard: ShardId) -> Result<(), BoxError> {
             self.events.lock().unwrap().push("flush");
             Ok(())
         }
 
-        async fn close(&self, _range: ShardRange) -> Result<(), BoxError> {
+        async fn close(&self, _shard: ShardId) -> Result<(), BoxError> {
             self.events.lock().unwrap().push("close");
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlakyLeaseBackend {
+        inner: FakeLeaseBackend,
+        fail_next_renewal: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LeaseBackend for FlakyLeaseBackend {
+        fn watch_releases(&self) -> watch::Receiver<u64> {
+            self.inner.watch_releases()
+        }
+
+        async fn acquire(
+            &self,
+            owner_id: &str,
+            shard: ShardId,
+            generation: AssignmentGeneration,
+        ) -> Result<bool, BoxError> {
+            self.inner.acquire(owner_id, shard, generation).await
+        }
+
+        async fn renew(
+            &self,
+            owner_id: &str,
+            shard: ShardId,
+            generation: AssignmentGeneration,
+        ) -> Result<bool, BoxError> {
+            if self.fail_next_renewal.swap(false, Ordering::AcqRel) {
+                return Err(std::io::Error::other("transient renewal failure").into());
+            }
+            self.inner.renew(owner_id, shard, generation).await
+        }
+
+        async fn release(
+            &self,
+            owner_id: &str,
+            shard: ShardId,
+            generation: AssignmentGeneration,
+        ) -> Result<(), BoxError> {
+            self.inner.release(owner_id, shard, generation).await
         }
     }
 
     fn map(generation: u64, owner: &str, state: AssignmentState) -> ShardMap {
         ShardMap::new(
             AssignmentGeneration::new(generation),
-            64,
+            1,
             vec![Assignment::new(
                 Owner::new(owner, 0),
-                ShardRange::within(0, 64, 64).unwrap(),
+                ShardRange::within(0, 1, 1).unwrap(),
                 state,
             )],
         )
@@ -387,6 +499,7 @@ mod tests {
                 "meter-0",
                 OwnershipManagerConfig {
                     renew_interval: Duration::from_millis(10),
+                    lease_duration: Duration::from_millis(30),
                 },
                 store,
                 leases.clone(),
@@ -400,12 +513,12 @@ mod tests {
     #[tokio::test]
     async fn opens_only_after_acquiring_and_closes_before_release() {
         let (mut manager, leases, lifecycle) = manager(None);
-        let range = ShardRange::within(0, 64, 64).unwrap();
+        let shard = ShardId::new(0);
         manager
             .apply_assignment(map(1, "meter-0", AssignmentState::Pending))
             .await
             .unwrap();
-        assert!(leases.holder(range).is_some());
+        assert!(leases.holder(shard).is_some());
         assert_eq!(lifecycle.events(), vec!["open"]);
 
         manager
@@ -413,7 +526,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lifecycle.events(), vec!["open", "drain", "flush", "close"]);
-        assert!(leases.holder(range).is_none());
+        assert!(leases.holder(shard).is_none());
     }
 
     #[tokio::test]
@@ -433,15 +546,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrades_retained_shard_leases_without_reopening_resources() {
+        let (mut manager, leases, lifecycle) = manager(None);
+        let shard = ShardId::new(0);
+        manager
+            .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+            .await
+            .unwrap();
+        manager
+            .apply_assignment(map(2, "meter-0", AssignmentState::Active))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            leases.holder(shard),
+            Some(("meter-0".to_owned(), AssignmentGeneration::new(2)))
+        );
+        assert_eq!(lifecycle.events(), vec!["open"]);
+    }
+
+    #[tokio::test]
+    async fn retries_transient_renewal_errors_before_the_lease_deadline() {
+        let store = Arc::new(FakeAssignmentStore::new(None));
+        let leases = Arc::new(FlakyLeaseBackend::default());
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let mut manager = OwnershipManager::new(
+            "meter-0",
+            OwnershipManagerConfig {
+                renew_interval: Duration::from_millis(10),
+                lease_duration: Duration::from_secs(1),
+            },
+            store,
+            Arc::clone(&leases),
+            Arc::clone(&lifecycle),
+        );
+        let shard = ShardId::new(0);
+        manager
+            .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+            .await
+            .unwrap();
+
+        leases.fail_next_renewal.store(true, Ordering::Release);
+        manager.renew().await.unwrap();
+        assert_eq!(lifecycle.events(), vec!["open"]);
+        assert!(manager.held.contains_key(&shard));
+
+        manager.renew().await.unwrap();
+        assert!(leases.inner.events().iter().any(|event| {
+            matches!(
+                event,
+                crate::LeaseEvent::Renewed {
+                    shard: renewed,
+                    ..
+                } if *renewed == shard
+            )
+        }));
+    }
+
+    #[tokio::test]
     async fn lease_loss_drains_and_closes_resources() {
         let initial = map(1, "meter-0", AssignmentState::Active);
-        let range = initial.assignments[0].range;
+        let shard = ShardId::new(0);
         let (manager, leases, lifecycle) = manager(Some(initial));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(manager.run(cancel.clone()));
 
         time::sleep(Duration::from_millis(5)).await;
-        leases.lose(range);
+        leases.lose(shard);
         time::sleep(Duration::from_millis(20)).await;
         cancel.cancel();
         task.await.unwrap().unwrap();
@@ -471,6 +642,7 @@ mod tests {
             "meter-0",
             OwnershipManagerConfig {
                 renew_interval: Duration::from_secs(60),
+                lease_duration: Duration::from_secs(180),
             },
             store.clone(),
             leases,
@@ -499,11 +671,11 @@ mod tests {
     #[tokio::test]
     async fn retries_handoff_acquisition_after_previous_owner_releases() {
         let (mut manager, leases, lifecycle) = manager(None);
-        let range = ShardRange::within(0, 64, 64).unwrap();
+        let shard = ShardId::new(0);
         let generation = AssignmentGeneration::new(1);
         assert!(
             leases
-                .acquire("previous-owner", range, generation)
+                .acquire("previous-owner", shard, generation)
                 .await
                 .unwrap()
         );
@@ -514,14 +686,63 @@ mod tests {
         assert!(lifecycle.events().is_empty());
 
         leases
-            .release("previous-owner", range, generation)
+            .release("previous-owner", shard, generation)
             .await
             .unwrap();
         manager.renew().await.unwrap();
         assert_eq!(lifecycle.events(), vec!["open"]);
         assert_eq!(
-            leases.holder(range),
+            leases.holder(shard),
             Some(("meter-0".to_owned(), generation))
         );
+    }
+
+    #[tokio::test]
+    async fn lease_release_watch_wakes_waiting_owner_immediately() {
+        let generation = AssignmentGeneration::new(1);
+        let shard = ShardId::new(0);
+        let store = Arc::new(FakeAssignmentStore::new(Some(map(
+            1,
+            "meter-0",
+            AssignmentState::Active,
+        ))));
+        let leases = Arc::new(FakeLeaseBackend::default());
+        assert!(
+            leases
+                .acquire("previous-owner", shard, generation)
+                .await
+                .unwrap()
+        );
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let manager = OwnershipManager::new(
+            "meter-0",
+            OwnershipManagerConfig {
+                renew_interval: Duration::from_secs(60),
+                lease_duration: Duration::from_secs(180),
+            },
+            store,
+            Arc::clone(&leases),
+            Arc::clone(&lifecycle),
+        );
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(manager.run(cancel.clone()));
+        tokio::task::yield_now().await;
+        assert!(lifecycle.events().is_empty());
+
+        leases
+            .release("previous-owner", shard, generation)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while lifecycle.events().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(lifecycle.events(), vec!["open"]);
+
+        cancel.cancel();
+        task.await.unwrap().unwrap();
     }
 }

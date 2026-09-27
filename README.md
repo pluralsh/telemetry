@@ -82,9 +82,9 @@ Deployment roles:
 - `reader`: serves query/read APIs and opens every shard read-only without fencing writers.
 
 Static sharding uses an identical fixed owner map on every process. Kubernetes sharding discovers
-writer StatefulSet members, publishes assignments through a ConfigMap, and protects coordinator
-and shard ownership with Leases. Split deployments require object storage shared by all writers
-and readers.
+writer StatefulSet members, publishes contiguous range assignments through a watched ConfigMap,
+and protects the coordinator and each independently writable shard with stable, watched Leases.
+Split deployments require object storage shared by all writers and readers.
 
 ## Helm
 

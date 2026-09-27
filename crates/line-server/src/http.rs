@@ -37,7 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/-/ready",
             get(|State(state): State<AppState>| async move {
-                if state.is_ready() {
+                if state.is_ready().await {
                     StatusCode::OK
                 } else {
                     StatusCode::SERVICE_UNAVAILABLE

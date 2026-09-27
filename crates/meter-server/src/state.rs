@@ -22,7 +22,7 @@ use sharding::{
     balanced_contiguous,
     kubernetes::{
         KubernetesAssignmentStore, KubernetesConfig, KubernetesCoordinatorElection,
-        KubernetesLeaseBackend, StatefulSetMembership,
+        KubernetesLeaseBackend, StatefulSetMembership, run_kubernetes_coordinator,
     },
 };
 
@@ -109,11 +109,15 @@ impl AppState {
                                 }
                             }
                         }
-                        tokio::time::sleep(kube_config.watch_poll_interval).await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 };
                 let local = kubernetes_owner_id(settings);
-                let leases = Arc::new(KubernetesLeaseBackend::new(client, &kube_config));
+                let leases = Arc::new(KubernetesLeaseBackend::new(
+                    client,
+                    &kube_config,
+                    cancellation.clone(),
+                ));
                 kubernetes_runtime = Some((
                     store,
                     leases,
@@ -215,6 +219,7 @@ impl AppState {
                 state.local_owner.clone(),
                 OwnershipManagerConfig {
                     renew_interval: Duration::from_secs(renew_interval_seconds),
+                    lease_duration: kube_config.lease_duration,
                 },
                 Arc::clone(&store),
                 leases,
@@ -338,18 +343,19 @@ impl AppState {
             ServerMode::Writer => {
                 let assignment = self.assignment.read().await;
                 let expected = (0..assignment.virtual_shards)
+                    .map(ShardId::new)
                     .filter(|shard| {
                         assignment
-                            .owner_of(ShardId::new(*shard))
+                            .owner_of(*shard)
                             .is_some_and(|owner| owner.id == self.local_owner)
                     })
-                    .count();
+                    .collect::<HashSet<_>>();
                 let writers = self.writers.read().await;
-                expected > 0
+                !expected.is_empty()
                     && self.config.namespaces.iter().all(|namespace| {
-                        writers
-                            .get(&namespace.name)
-                            .is_some_and(|shards| shards.len() == expected)
+                        writers.get(&namespace.name).is_some_and(|shards| {
+                            shards.keys().copied().collect::<HashSet<_>>() == expected
+                        })
                     })
             }
         }
@@ -541,7 +547,7 @@ struct MeterShardLifecycle {
 impl ShardLifecycle for MeterShardLifecycle {
     async fn open(
         &self,
-        range: ShardRange,
+        shard: ShardId,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
         let options = ShardingOptions::new(
@@ -550,56 +556,43 @@ impl ShardLifecycle for MeterShardLifecycle {
         )?;
         {
             let mut draining = self.draining_shards.write().await;
-            for shard in range.start().get()..range.end().get() {
-                draining.remove(&ShardId::new(shard));
-            }
+            draining.remove(&shard);
         }
         for namespace_config in &self.config.namespaces {
             let namespace = Namespace::new(&namespace_config.name)?;
-            for shard_id in range.start().get()..range.end().get() {
-                let shard = ShardId::new(shard_id);
-                if self
-                    .writers
-                    .read()
-                    .await
-                    .get(&namespace_config.name)
-                    .is_some_and(|shards| shards.contains_key(&shard))
-                {
-                    continue;
-                }
-                let mut config = meter_config_for_namespace(&self.config, &namespace);
-                config.storage.path = options.shard_path(&config.storage.path, shard)?;
-                let database = Arc::new(TimeSeriesDb::open(namespace.clone(), config).await?);
-                self.writers
-                    .write()
-                    .await
-                    .entry(namespace_config.name.clone())
-                    .or_default()
-                    .insert(shard, database);
+            if self
+                .writers
+                .read()
+                .await
+                .get(&namespace_config.name)
+                .is_some_and(|shards| shards.contains_key(&shard))
+            {
+                continue;
             }
+            let mut config = meter_config_for_namespace(&self.config, &namespace);
+            config.storage.path = options.shard_path(&config.storage.path, shard)?;
+            let database = Arc::new(TimeSeriesDb::open(namespace.clone(), config).await?);
+            self.writers
+                .write()
+                .await
+                .entry(namespace_config.name.clone())
+                .or_default()
+                .insert(shard, database);
         }
         Ok(())
     }
 
-    async fn drain(&self, range: ShardRange) -> Result<(), BoxError> {
-        let mut draining = self.draining_shards.write().await;
-        for shard in range.start().get()..range.end().get() {
-            draining.insert(ShardId::new(shard));
-        }
+    async fn drain(&self, shard: ShardId) -> Result<(), BoxError> {
+        self.draining_shards.write().await.insert(shard);
         Ok(())
     }
 
-    async fn flush(&self, range: ShardRange) -> Result<(), BoxError> {
+    async fn flush(&self, shard: ShardId) -> Result<(), BoxError> {
         let databases = {
             let writers = self.writers.read().await;
             writers
                 .values()
-                .flat_map(|shards| {
-                    shards
-                        .iter()
-                        .filter(|(shard, _)| range.contains(**shard))
-                        .map(|(_, database)| Arc::clone(database))
-                })
+                .filter_map(|shards| shards.get(&shard).cloned())
                 .collect::<Vec<_>>()
         };
         for database in databases {
@@ -608,20 +601,13 @@ impl ShardLifecycle for MeterShardLifecycle {
         Ok(())
     }
 
-    async fn close(&self, range: ShardRange) -> Result<(), BoxError> {
+    async fn close(&self, shard: ShardId) -> Result<(), BoxError> {
         let databases = {
             let mut writers = self.writers.write().await;
             let mut removed = Vec::new();
             for shards in writers.values_mut() {
-                let ids = shards
-                    .keys()
-                    .copied()
-                    .filter(|shard| range.contains(*shard))
-                    .collect::<Vec<_>>();
-                for shard in ids {
-                    if let Some(database) = shards.remove(&shard) {
-                        removed.push(database);
-                    }
+                if let Some(database) = shards.remove(&shard) {
+                    removed.push(database);
                 }
             }
             removed
@@ -655,125 +641,7 @@ fn kubernetes_config(config: &crate::config::KubernetesShardingConfig) -> Kubern
         coordinator_lease: config.coordinator_lease.clone(),
         shard_lease_prefix: config.shard_lease_prefix.clone(),
         lease_duration: Duration::from_secs(config.lease_duration_seconds),
-        watch_poll_interval: Duration::from_secs(config.watch_poll_interval_seconds),
     }
-}
-
-#[cfg(feature = "kubernetes")]
-async fn run_kubernetes_coordinator(
-    store: Arc<KubernetesAssignmentStore>,
-    config: KubernetesConfig,
-    identity: String,
-    virtual_shards: u32,
-    cancel: CancellationToken,
-) {
-    let client = match kube::Client::try_default().await {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::error!(%error, "cannot start Kubernetes shard coordinator");
-            return;
-        }
-    };
-    let election = KubernetesCoordinatorElection::new(client.clone(), &config);
-    let membership = StatefulSetMembership::new(client, &config);
-    let renew_interval = (config.lease_duration / 3).max(Duration::from_secs(1));
-    let mut ticker = tokio::time::interval(renew_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut leader = false;
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => {
-                if leader
-                    && let Err(error) = election.release(&identity).await
-                {
-                    tracing::warn!(%error, "failed to release coordinator leadership");
-                }
-                return;
-            }
-            _ = ticker.tick() => {
-                leader = if leader {
-                    match election.renew(&identity).await {
-                        Ok(held) => held,
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to renew coordinator leadership");
-                            false
-                        }
-                    }
-                } else {
-                    match election.try_acquire(&identity).await {
-                        Ok(acquired) => acquired,
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to acquire coordinator leadership");
-                            false
-                        }
-                    }
-                };
-                if !leader {
-                    continue;
-                }
-                let owners = match membership.owners().await {
-                    Ok(owners) => owners,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to observe StatefulSet membership");
-                        continue;
-                    }
-                };
-                let current = match store.load().await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to load current shard assignment");
-                        continue;
-                    }
-                };
-                if !membership_changed(current.as_ref(), &owners, virtual_shards) {
-                    continue;
-                }
-                let generation = current
-                    .as_ref()
-                    .map_or(AssignmentGeneration::new(1), |map| map.generation.next());
-                let next = match balanced_contiguous(
-                    generation,
-                    virtual_shards,
-                    &owners,
-                    current.as_ref(),
-                ) {
-                    Ok(next) => next,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to plan shard assignment");
-                        continue;
-                    }
-                };
-                if let Err(error) = store.publish(next).await {
-                    tracing::warn!(%error, "failed to publish shard assignment");
-                    leader = false;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "kubernetes")]
-pub(crate) fn membership_changed(
-    current: Option<&ShardMap>,
-    owners: &[Owner],
-    virtual_shards: u32,
-) -> bool {
-    let Some(current) = current else {
-        return true;
-    };
-    if current.virtual_shards != virtual_shards {
-        return true;
-    }
-    let current_owners = current
-        .assignments
-        .iter()
-        .map(|assignment| (&assignment.owner.id, assignment.owner.ordinal))
-        .collect::<HashSet<_>>();
-    let desired_owners = owners
-        .iter()
-        .map(|owner| (&owner.id, owner.ordinal))
-        .collect::<HashSet<_>>();
-    current_owners != desired_owners
 }
 
 fn meter_config(config: &Config) -> meter::Config {

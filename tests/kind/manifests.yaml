@@ -111,7 +111,6 @@ data:
       shard_lease_prefix: meter-shard
       lease_duration_seconds: 10
       renew_interval_seconds: 2
-      watch_poll_interval_seconds: 1
     auth:
       internal: { source: literal, value: kind-internal }
       jwt:
@@ -193,7 +192,6 @@ data:
       shard_lease_prefix: meter-shard
       lease_duration_seconds: 10
       renew_interval_seconds: 2
-      watch_poll_interval_seconds: 1
     auth:
       internal: { source: literal, value: kind-internal }
       jwt:

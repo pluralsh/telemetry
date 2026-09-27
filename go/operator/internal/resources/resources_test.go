@@ -25,6 +25,12 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:0.1.0" {
 		t.Fatalf("default image = %q, want GHCR Meter image", image)
 	}
+	if policy := statefulSet.Spec.Template.Spec.Containers[0].ImagePullPolicy; policy != corev1.PullIfNotPresent {
+		t.Fatalf("default image pull policy = %q, want IfNotPresent", policy)
+	}
+	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 {
+		t.Fatalf("default standalone replicas = %#v, want 1", statefulSet.Spec.Replicas)
+	}
 	if len(statefulSet.Spec.VolumeClaimTemplates) != 2 {
 		t.Fatalf("default workload has %d claims, want 2", len(statefulSet.Spec.VolumeClaimTemplates))
 	}
