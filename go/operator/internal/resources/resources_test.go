@@ -20,6 +20,7 @@ const (
 	testObjectStoreName = "meter"
 	testTokenSecretName = "token"
 	testDedicatedKey    = "dedicated"
+	testConfigHash      = "hash"
 )
 
 func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
@@ -186,7 +187,7 @@ func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
 	pseudofs := &telemetryv1alpha1.PseudoFS{
 		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testNamespace},
-		Status:     telemetryv1alpha1.PseudoFSStatus{ConfigHash: "hash"},
+		Status:     telemetryv1alpha1.PseudoFSStatus{ConfigHash: testConfigHash},
 	}
 	service := Service(pseudofs, ComponentStandalone, false)
 	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Name != portGRPC || service.Spec.Ports[0].Port != 9093 {
@@ -390,7 +391,7 @@ func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
 func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Status:     telemetryv1alpha1.MeterStatus{ConfigHash: "hash"},
+		Status:     telemetryv1alpha1.MeterStatus{ConfigHash: testConfigHash},
 		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
 				Containers:     []corev1.Container{{Name: containerMeter, Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
@@ -424,7 +425,7 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 			t.Fatalf("container %q did not receive secure defaults: %#v", secured.Name, context)
 		}
 	}
-	if template.Annotations[ConfigHashAnnotation] != "hash" ||
+	if template.Annotations[ConfigHashAnnotation] != testConfigHash ||
 		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "CUSTOM" }) ||
 		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "POD_NAME" }) {
 		t.Fatal("pod template merge lost annotations or environment")

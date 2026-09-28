@@ -461,39 +461,7 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 	}
 	template.Annotations[ConfigHashAnnotation] = meter.ConfigHash
 	spec := &template.Spec
-	if spec.NodeSelector == nil {
-		spec.NodeSelector = map[string]string{}
-	}
-	maps.Copy(spec.NodeSelector, workloadFor(meter, component).NodeSelector)
-	spec.Tolerations = mergeTolerations(spec.Tolerations, workloadFor(meter, component).Tolerations)
-	spec.ServiceAccountName = meter.Name
-	if spec.AutomountServiceAccountToken == nil {
-		spec.AutomountServiceAccountToken = lo.ToPtr(Mode(meter) == telemetryv1alpha1.ProductModeSharded)
-	}
-	if spec.TerminationGracePeriodSeconds == nil {
-		spec.TerminationGracePeriodSeconds = lo.ToPtr(int64(30))
-	}
-	if spec.SecurityContext == nil {
-		spec.SecurityContext = &corev1.PodSecurityContext{}
-	}
-	if spec.SecurityContext.RunAsNonRoot == nil {
-		spec.SecurityContext.RunAsNonRoot = lo.ToPtr(true)
-	}
-	if spec.SecurityContext.RunAsUser == nil {
-		spec.SecurityContext.RunAsUser = lo.ToPtr(productUserID)
-	}
-	if spec.SecurityContext.RunAsGroup == nil {
-		spec.SecurityContext.RunAsGroup = lo.ToPtr(productUserID)
-	}
-	if spec.SecurityContext.FSGroup == nil {
-		spec.SecurityContext.FSGroup = lo.ToPtr(productUserID)
-	}
-	if spec.SecurityContext.FSGroupChangePolicy == nil {
-		spec.SecurityContext.FSGroupChangePolicy = lo.ToPtr(corev1.FSGroupChangeOnRootMismatch)
-	}
-	if spec.SecurityContext.SeccompProfile == nil {
-		spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
-	}
+	applyPodDefaults(spec, meter, component)
 
 	meterContainer := corev1.Container{Name: meter.Descriptor.Name}
 	others := make([]corev1.Container, 0, len(spec.Containers))
@@ -522,9 +490,9 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
 	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(meter)...)
 	requiredMounts := []corev1.VolumeMount{
-		corev1.VolumeMount{Name: volumeConfig, MountPath: meter.Descriptor.ConfigPath, SubPath: ConfigKeyFor(meter, component), ReadOnly: true},
-		corev1.VolumeMount{Name: volumeData, MountPath: meter.Descriptor.DataPath},
-		corev1.VolumeMount{Name: volumeCache, MountPath: meter.Descriptor.CachePath},
+		{Name: volumeConfig, MountPath: meter.Descriptor.ConfigPath, SubPath: ConfigKeyFor(meter, component), ReadOnly: true},
+		{Name: volumeData, MountPath: meter.Descriptor.DataPath},
+		{Name: volumeCache, MountPath: meter.Descriptor.CachePath},
 	}
 	if !meter.Descriptor.GRPCOnly {
 		requiredMounts = append(requiredMounts,
@@ -573,6 +541,42 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 	}
 	spec.Volumes = mergeNamed(spec.Volumes, func(item corev1.Volume) string { return item.Name }, required...)
 	return template
+}
+
+func applyPodDefaults(spec *corev1.PodSpec, meter *Product, component Component) {
+	if spec.NodeSelector == nil {
+		spec.NodeSelector = map[string]string{}
+	}
+	maps.Copy(spec.NodeSelector, workloadFor(meter, component).NodeSelector)
+	spec.Tolerations = mergeTolerations(spec.Tolerations, workloadFor(meter, component).Tolerations)
+	spec.ServiceAccountName = meter.Name
+	if spec.AutomountServiceAccountToken == nil {
+		spec.AutomountServiceAccountToken = lo.ToPtr(Mode(meter) == telemetryv1alpha1.ProductModeSharded)
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		spec.TerminationGracePeriodSeconds = lo.ToPtr(int64(30))
+	}
+	if spec.SecurityContext == nil {
+		spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	if spec.SecurityContext.RunAsNonRoot == nil {
+		spec.SecurityContext.RunAsNonRoot = lo.ToPtr(true)
+	}
+	if spec.SecurityContext.RunAsUser == nil {
+		spec.SecurityContext.RunAsUser = lo.ToPtr(productUserID)
+	}
+	if spec.SecurityContext.RunAsGroup == nil {
+		spec.SecurityContext.RunAsGroup = lo.ToPtr(productUserID)
+	}
+	if spec.SecurityContext.FSGroup == nil {
+		spec.SecurityContext.FSGroup = lo.ToPtr(productUserID)
+	}
+	if spec.SecurityContext.FSGroupChangePolicy == nil {
+		spec.SecurityContext.FSGroupChangePolicy = lo.ToPtr(corev1.FSGroupChangeOnRootMismatch)
+	}
+	if spec.SecurityContext.SeccompProfile == nil {
+		spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	}
 }
 
 func objectStoreEnv(meter *Product) []corev1.EnvVar {
