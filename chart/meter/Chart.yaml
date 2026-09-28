@@ -1,14 +1,14 @@
 apiVersion: v2
 name: meter
 description: Production-oriented Helm chart for Meter
+appVersion: 0.1.0
+version: 0.1.1
+sources:
+  - https://github.com/pluralsh/telemetry
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
-kubeVersion: ">=1.25.0-0"
+kubeVersion: '>=1.25.0-0'
 keywords:
   - telemetry
   - prometheus
   - metrics
 home: https://github.com/pluralsh/telemetry
-sources:
-  - https://github.com/pluralsh/telemetry
