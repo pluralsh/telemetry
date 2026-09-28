@@ -34,4 +34,7 @@ resources:
 - track_admin_role.yaml
 - track_editor_role.yaml
 - track_viewer_role.yaml
+- pseudofs_admin_role.yaml
+- pseudofs_editor_role.yaml
+- pseudofs_viewer_role.yaml
 

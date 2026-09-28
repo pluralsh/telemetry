@@ -212,6 +212,52 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 	}
 }
 
+func TestRenderPseudoFSConfig(t *testing.T) {
+	chunkSize, maxFileSize := int64(2097152), int64(2147483648)
+	maxAppendGenerations, maxUnaryFileSize := int64(32), int64(4194304)
+	pseudofs := &telemetryv1alpha1.PseudoFS{
+		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testMeterNamespace},
+		Spec: telemetryv1alpha1.PseudoFSSpec{
+			Config: telemetryv1alpha1.PseudoFSConfigSpec{
+				ChunkSizeBytes: &chunkSize, MaxFileSizeBytes: &maxFileSize,
+				MaxAppendGenerations: &maxAppendGenerations, MaxUnaryFileSizeBytes: &maxUnaryFileSize,
+			},
+		},
+	}
+	result, err := Render(Input{PseudoFS: pseudofs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(result.Data[PseudoFSKey])
+	for _, expected := range []string{
+		"listener: 0.0.0.0:9093",
+		"filesystem:",
+		"storage:",
+		"type: SlateDb",
+		"path: pseudofs",
+		"path: /var/lib/pseudofs/data",
+		"disk_path: /var/cache/pseudofs",
+		"chunk_size_bytes: 2097152",
+		"max_file_size_bytes: 2147483648",
+		"max_append_generations: 32",
+		"max_unary_file_size_bytes: 4194304",
+		"max_decoding_message_bytes: 16777216",
+		"max_encoding_message_bytes: 16777216",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("rendered PseudoFS config missing %q:\n%s", expected, rendered)
+		}
+	}
+	for _, invalid := range []string{"mode:", "auth:", "namespaces:", "http:"} {
+		if strings.Contains(rendered, invalid) {
+			t.Errorf("rendered PseudoFS config contains unsupported field %q:\n%s", invalid, rendered)
+		}
+	}
+	if result.Hash == "" {
+		t.Fatal("hash was not generated")
+	}
+}
+
 func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
 	tests := []struct {
 		name        string

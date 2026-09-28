@@ -1,0 +1,23 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: PseudoFS
+metadata:
+  name: pseudofs-sample
+spec:
+  version: 0.1.0
+  image:
+    repository: ghcr.io/pluralsh/pseudofs
+    pullPolicy: IfNotPresent
+  config:
+    storage:
+      objectStore:
+        type: Local
+    chunkSizeBytes: 1048576
+    maxFileSizeBytes: 1073741824
+    maxDecodingMessageBytes: 16777216
+    maxEncodingMessageBytes: 16777216
+  workload:
+    replicas: 1
+    nodeSelector:
+      kubernetes.io/os: linux
+  service:
+    grpcPort: 9093

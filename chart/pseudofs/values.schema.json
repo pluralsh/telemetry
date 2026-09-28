@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "imagePullSecrets", "nameOverride", "fullnameOverride", "serviceAccount", "service", "config", "persistence", "cache", "resources", "podAnnotations", "podLabels", "podSecurityContext", "securityContext", "probes", "priorityClassName", "runtimeClassName", "terminationGracePeriodSeconds", "nodeSelector", "affinity", "tolerations", "topologySpreadConstraints", "extraEnv", "extraEnvFrom", "extraVolumes", "extraVolumeMounts"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array"},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations", "automountServiceAccountToken"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object"},
+        "automountServiceAccountToken": {"type": "boolean"}
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port", "annotations"],
+      "properties": {
+        "type": {"type": "string"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "annotations": {"type": "object"}
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filesystem", "maxUnaryFileSizeBytes", "maxDecodingMessageBytes", "maxEncodingMessageBytes"],
+      "properties": {
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["storage", "chunk_size_bytes", "max_file_size_bytes", "max_append_generations"],
+          "properties": {
+            "storage": {"type": "object"},
+            "chunk_size_bytes": {"type": "integer", "minimum": 1},
+            "max_file_size_bytes": {"type": "integer", "minimum": 1},
+            "max_append_generations": {"type": "integer", "minimum": 2}
+          }
+        },
+        "maxUnaryFileSizeBytes": {"type": "integer", "minimum": 1},
+        "maxDecodingMessageBytes": {"type": "integer", "minimum": 1},
+        "maxEncodingMessageBytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "persistence": {"$ref": "#/definitions/persistence"},
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mountPath", "persistence", "emptyDir"],
+      "properties": {
+        "mountPath": {"type": "string", "pattern": "^/"},
+        "persistence": {"$ref": "#/definitions/cachePersistence"},
+        "emptyDir": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["medium", "sizeLimit"],
+          "properties": {
+            "medium": {"type": "string", "enum": ["", "Memory"]},
+            "sizeLimit": {"type": "string"}
+          }
+        }
+      }
+    },
+    "resources": {"type": "object"},
+    "podAnnotations": {"type": "object"},
+    "podLabels": {"type": "object"},
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["liveness", "readiness"],
+      "properties": {
+        "liveness": {"$ref": "#/definitions/probe"},
+        "readiness": {"$ref": "#/definitions/probe"}
+      }
+    },
+    "priorityClassName": {"type": "string"},
+    "runtimeClassName": {"type": "string"},
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "nodeSelector": {"type": "object"},
+    "affinity": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "topologySpreadConstraints": {"type": "array"},
+    "extraEnv": {"type": "array"},
+    "extraEnvFrom": {"type": "array"},
+    "extraVolumes": {"type": "array"},
+    "extraVolumeMounts": {"type": "array"}
+  },
+  "definitions": {
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "existingClaim", "storageClass", "accessModes", "size", "annotations", "mountPath"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "existingClaim": {"type": "string"},
+        "storageClass": {"type": "string"},
+        "accessModes": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "size": {"type": "string", "minLength": 1},
+        "annotations": {"type": "object"},
+        "mountPath": {"type": "string", "pattern": "^/"}
+      }
+    },
+    "cachePersistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "existingClaim", "storageClass", "accessModes", "size", "annotations"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "existingClaim": {"type": "string"},
+        "storageClass": {"type": "string"},
+        "accessModes": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "size": {"type": "string", "minLength": 1},
+        "annotations": {"type": "object"}
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "initialDelaySeconds": {"type": "integer", "minimum": 0},
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

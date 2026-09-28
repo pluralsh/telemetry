@@ -19,6 +19,12 @@ JSON is accepted at `/write/ns/{namespace}/api/v2/spans`. Jaeger collector and T
 are not currently implemented; `/write/ns/{namespace}/api/traces` returns `501` and does not
 pretend that JSON is Jaeger Thrift.
 
+`pseudofs-server --config <path>` serves multiple tenant-isolated virtual filesystems from one
+SlateDB writer over public gRPC. Start from [`pseudofs.example.yaml`](pseudofs.example.yaml). It
+listens on `9093`, enables gRPC health and reflection, and requires a validated tenant identifier
+on every filesystem request. Tenants are selected dynamically rather than configured as an
+allowlist; PseudoFS intentionally has no sharding or application authentication.
+
 Track reads are rooted at `/read/ns/{namespace}`: trace-by-ID v1/v2, TraceQL `/api/search`,
 v1/v2 tag names and values, and `/api/echo`. TraceQL metrics routes return `501` because metrics
 execution is deliberately outside Track's current scope. JSON is the default trace response;

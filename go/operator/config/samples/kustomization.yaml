@@ -3,5 +3,6 @@ resources:
 - telemetry_v1alpha1_meter.yaml
 - telemetry_v1alpha1_line.yaml
 - telemetry_v1alpha1_track.yaml
+- telemetry_v1alpha1_pseudofs.yaml
 - telemetry_v1alpha1_namespaceauthentication.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

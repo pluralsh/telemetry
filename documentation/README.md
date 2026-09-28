@@ -1,10 +1,11 @@
 # Technical documentation
 
-Plural Telemetry provides three object-store-backed databases:
+Plural Telemetry provides object-store-backed databases and related services:
 
 - [Meter](meter/): Prometheus-compatible metrics.
 - [Line](line/): Loki-compatible logs.
 - [Track](track/): Tempo-compatible traces.
+- [PseudoFS](pseudofs/): a gRPC virtual filesystem for embedded runtimes.
 
 Each database section describes its storage format, index strategy, public APIs,
 and server configuration. Cross-cutting behavior lives under [common](common/):

@@ -1,0 +1,122 @@
+image:
+  repository: ghcr.io/pluralsh/pseudofs
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+service:
+  type: ClusterIP
+  port: 9093
+  annotations: {}
+
+config:
+  filesystem:
+    storage:
+      type: SlateDb
+      path: pseudofs
+      object_store:
+        type: Local
+        path: /var/lib/pseudofs/data
+      block_cache:
+        type: FoyerHybrid
+        memory_capacity: 536870912
+        disk_capacity: 10737418240
+        disk_path: /var/cache/pseudofs
+      meta_cache:
+        type: FoyerMemory
+        capacity: 134217728
+    chunk_size_bytes: 1048576
+    max_file_size_bytes: 1073741824
+    max_append_generations: 64
+  maxUnaryFileSizeBytes: 8388608
+  maxDecodingMessageBytes: 16777216
+  maxEncodingMessageBytes: 16777216
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  mountPath: /var/lib/pseudofs
+
+cache:
+  mountPath: /var/cache/pseudofs
+  persistence:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+    annotations: {}
+  emptyDir:
+    medium: ""
+    sizeLimit: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+
+priorityClassName: ""
+runtimeClassName: ""
+terminationGracePeriodSeconds: 30
+nodeSelector: {}
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []

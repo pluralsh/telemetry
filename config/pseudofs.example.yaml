@@ -1,0 +1,25 @@
+# PseudoFS server configuration. Copy to config/pseudofs.yaml and adjust.
+listener: 0.0.0.0:9093
+
+filesystem:
+  storage:
+    type: SlateDb
+    path: pseudofs
+    object_store:
+      type: Local
+      path: /var/lib/pseudofs/data
+    block_cache:
+      type: FoyerHybrid
+      memory_capacity: 536870912
+      disk_capacity: 10737418240
+      disk_path: /var/cache/pseudofs
+    meta_cache:
+      type: FoyerMemory
+      capacity: 134217728
+  chunk_size_bytes: 1048576
+  max_file_size_bytes: 1073741824
+  max_append_generations: 64
+
+max_unary_file_size_bytes: 8388608
+max_decoding_message_bytes: 16777216
+max_encoding_message_bytes: 16777216

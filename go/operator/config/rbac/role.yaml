@@ -71,6 +71,7 @@ rules:
   - lines
   - meters
   - namespaceauthentications
+  - pseudofs
   - tracks
   verbs:
   - create
@@ -86,6 +87,7 @@ rules:
   - lines/finalizers
   - meters/finalizers
   - namespaceauthentications/finalizers
+  - pseudofs/finalizers
   - tracks/finalizers
   verbs:
   - update
@@ -95,6 +97,7 @@ rules:
   - lines/status
   - meters/status
   - namespaceauthentications/status
+  - pseudofs/status
   - tracks/status
   verbs:
   - get

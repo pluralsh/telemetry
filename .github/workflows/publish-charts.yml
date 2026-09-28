@@ -33,6 +33,8 @@ jobs:
         include:
           - name: meter
             path: chart/meter
+          - name: pseudofs
+            path: chart/pseudofs
           - name: telemetry-operator
             path: chart/telemetry-operator
     steps:
@@ -112,6 +114,11 @@ jobs:
         with:
           path: ./chart/meter
           release: ${{ github.ref_name }}
+      - name: Bump PseudoFS chart
+        uses: pluralsh/chart-releaser@v0.1.3
+        with:
+          path: ./chart/pseudofs
+          release: ${{ github.ref_name }}
       - name: Bump telemetry operator chart
         uses: pluralsh/chart-releaser@v0.1.3
         with:
@@ -124,12 +131,16 @@ jobs:
           set -euo pipefail
           release="${GITHUB_REF_NAME#v}"
           meter_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/meter/Chart.yaml)
+          pseudofs_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/pseudofs/Chart.yaml)
           operator_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/telemetry-operator/Chart.yaml)
           meter_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/meter/Chart.yaml)
+          pseudofs_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/pseudofs/Chart.yaml)
           operator_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-operator/Chart.yaml)
           test "$meter_app_version" = "$release"
+          test "$pseudofs_app_version" = "$release"
           test "$operator_app_version" = "$release"
           echo "meter=$meter_version" >> "$GITHUB_OUTPUT"
+          echo "pseudofs=$pseudofs_version" >> "$GITHUB_OUTPUT"
           echo "operator=$operator_version" >> "$GITHUB_OUTPUT"
       - name: Push Meter release chart
         uses: appany/helm-oci-chart-releaser@v0.5.0
@@ -138,6 +149,16 @@ jobs:
           repository: pluralsh/charts
           tag: ${{ steps.versions.outputs.meter }}
           path: chart/meter
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push PseudoFS release chart
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: pseudofs
+          repository: pluralsh/charts
+          tag: ${{ steps.versions.outputs.pseudofs }}
+          path: chart/pseudofs
           registry: ghcr.io
           registry_username: ${{ github.actor }}
           registry_password: ${{ secrets.GITHUB_TOKEN }}

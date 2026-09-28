@@ -9,6 +9,7 @@ The project breakdown is, following a musical theme:
 1. Meter - Prometheus compatible datastore with built-in OTLP ingest as well as remote write
 2. Line - Loki-compatible log store
 3. Track - Tempo-compatible trace store
+4. PseudoFS - gRPC virtual filesystem for embedded language runtimes
 
 Storage formats, indexing, APIs, configuration, sharding, and authentication
 are documented in the [technical documentation](documentation/README.md).

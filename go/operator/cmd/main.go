@@ -230,6 +230,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Track")
 		os.Exit(1)
 	}
+	if err := (&controller.PseudoFSReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		DefaultProductVersion: defaultProductVersion,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "PseudoFS")
+		os.Exit(1)
+	}
 	if err := (&controller.NamespaceAuthenticationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

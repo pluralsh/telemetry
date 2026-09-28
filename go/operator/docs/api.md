@@ -12,6 +12,7 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 - [Line](#line)
 - [Meter](#meter)
 - [NamespaceAuthentication](#namespaceauthentication)
+- [PseudoFS](#pseudofs)
 - [Track](#track)
 
 
@@ -261,6 +262,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [PseudoFSSpec](#pseudofsspec)
 - [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
@@ -641,6 +643,87 @@ _Appears in:_
 
 
 
+#### PseudoFS
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `PseudoFS` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PseudoFSSpec](#pseudofsspec)_ |  |  |  |
+
+
+#### PseudoFSConfigSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PseudoFSSpec](#pseudofsspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:pseudofs \} |  |
+| `chunkSizeBytes` _integer_ |  | 1048576 | Minimum: 1 <br /> |
+| `maxFileSizeBytes` _integer_ |  | 1073741824 | Minimum: 1 <br /> |
+| `maxAppendGenerations` _integer_ |  | 64 | Minimum: 2 <br /> |
+| `maxUnaryFileSizeBytes` _integer_ |  | 8388608 | Minimum: 1 <br /> |
+| `maxDecodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
+| `maxEncodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
+
+
+#### PseudoFSServiceSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PseudoFSSpec](#pseudofsspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `grpcPort` _integer_ |  | 9093 | Maximum: 65535 <br />Minimum: 1 <br /> |
+| `type` _[ServiceType](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#servicetype-v1-core)_ |  | ClusterIP | Enum: [ClusterIP NodePort LoadBalancer] <br /> |
+| `annotations` _object (keys:string, values:string)_ |  |  |  |
+
+
+#### PseudoFSSpec
+
+
+
+PseudoFSSpec defines the desired state of PseudoFS.
+
+
+
+_Appears in:_
+- [PseudoFS](#pseudofs)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `version` _string_ | Version is the canonical PseudoFS container image tag. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/pseudofs \} |  |
+| `config` _[PseudoFSConfigSpec](#pseudofsconfigspec)_ |  |  |  |
+| `workload` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `service` _[PseudoFSServiceSpec](#pseudofsservicespec)_ |  |  |  |
+| `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
+
+
+
+
 #### ServiceAccountSpec
 
 
@@ -652,6 +735,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [PseudoFSSpec](#pseudofsspec)
 - [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
@@ -712,6 +796,7 @@ _Appears in:_
 _Appears in:_
 - [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
+- [PseudoFSConfigSpec](#pseudofsconfigspec)
 - [TrackConfigSpec](#trackconfigspec)
 
 | Field | Description | Default | Validation |
@@ -860,6 +945,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [PseudoFSSpec](#pseudofsspec)
 - [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |

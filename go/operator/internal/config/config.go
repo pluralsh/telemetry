@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	MeterKey  = "meter.yaml"
-	LineKey   = "line.yaml"
-	TrackKey  = "track.yaml"
-	ReaderKey = "reader.yaml"
+	MeterKey    = "meter.yaml"
+	LineKey     = "line.yaml"
+	TrackKey    = "track.yaml"
+	PseudoFSKey = "pseudofs.yaml"
+	ReaderKey   = "reader.yaml"
 
 	sourceFile       = "file"
 	sourceURL        = "url"
@@ -58,6 +59,7 @@ type Input struct {
 	Meter             *telemetryv1alpha1.Meter
 	Line              *telemetryv1alpha1.Line
 	Track             *telemetryv1alpha1.Track
+	PseudoFS          *telemetryv1alpha1.PseudoFS
 	Global            Access
 	Namespaces        []NamespaceAccess
 	JWT               *JWT
@@ -72,6 +74,9 @@ type Result struct {
 }
 
 func Render(input Input) (Result, error) {
+	if input.PseudoFS != nil {
+		return renderPseudoFS(input.PseudoFS)
+	}
 	if input.Track != nil {
 		return renderTrack(input)
 	}
@@ -79,7 +84,7 @@ func Render(input Input) (Result, error) {
 		return renderLine(input)
 	}
 	if input.Meter == nil {
-		return Result{}, fmt.Errorf("meter, line, or track is required")
+		return Result{}, fmt.Errorf("meter, line, track, or pseudofs is required")
 	}
 	descriptor := resources.MeterDescriptor
 	secretsPath := lo.CoalesceOrEmpty(input.SecretsPath, descriptor.SecretsPath)
@@ -162,6 +167,27 @@ func Render(input Input) (Result, error) {
 	}
 	_, _ = sum.Write(input.InternalToken)
 	return Result{Data: data, Hash: hex.EncodeToString(sum.Sum(nil))}, nil
+}
+
+func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
+	spec := pseudofs.Spec.Config
+	rendered, err := yaml.Marshal(renderPseudoFSConfig{
+		Listener: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(pseudofs)),
+		Filesystem: renderPseudoFSFilesystem{
+			Storage:              renderStorageConfig(spec.Storage, resources.PseudoFSDescriptor),
+			ChunkSizeBytes:       int64Value(spec.ChunkSizeBytes, 1048576),
+			MaxFileSizeBytes:     int64Value(spec.MaxFileSizeBytes, 1073741824),
+			MaxAppendGenerations: int64Value(spec.MaxAppendGenerations, 64),
+		},
+		MaxUnaryFileSizeBytes:   int64Value(spec.MaxUnaryFileSizeBytes, 8388608),
+		MaxDecodingMessageBytes: int64Value(spec.MaxDecodingMessageBytes, 16777216),
+		MaxEncodingMessageBytes: int64Value(spec.MaxEncodingMessageBytes, 16777216),
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("render PseudoFS config: %w", err)
+	}
+	sum := sha256.Sum256(rendered)
+	return Result{Data: map[string][]byte{PseudoFSKey: rendered}, Hash: hex.EncodeToString(sum[:])}, nil
 }
 
 func renderLine(input Input) (Result, error) {
@@ -544,6 +570,19 @@ type renderTrackConfig struct {
 	Request                renderTrackRequest `json:"request"`
 	Auth                   renderAuth         `json:"auth"`
 	Namespaces             []renderNamespace  `json:"namespaces"`
+}
+type renderPseudoFSConfig struct {
+	Listener                string                   `json:"listener"`
+	Filesystem              renderPseudoFSFilesystem `json:"filesystem"`
+	MaxUnaryFileSizeBytes   int64                    `json:"max_unary_file_size_bytes"`
+	MaxDecodingMessageBytes int64                    `json:"max_decoding_message_bytes"`
+	MaxEncodingMessageBytes int64                    `json:"max_encoding_message_bytes"`
+}
+type renderPseudoFSFilesystem struct {
+	Storage              renderStorage `json:"storage"`
+	ChunkSizeBytes       int64         `json:"chunk_size_bytes"`
+	MaxFileSizeBytes     int64         `json:"max_file_size_bytes"`
+	MaxAppendGenerations int64         `json:"max_append_generations"`
 }
 type renderTrackPage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`

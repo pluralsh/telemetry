@@ -183,6 +183,47 @@ func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 	assertIngressPath(t, paths, "/read/ns", line.Name+"-reader")
 }
 
+func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
+	pseudofs := &telemetryv1alpha1.PseudoFS{
+		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testNamespace},
+		Status:     telemetryv1alpha1.PseudoFSStatus{ConfigHash: "hash"},
+	}
+	service := Service(pseudofs, ComponentStandalone, false)
+	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Name != portGRPC || service.Spec.Ports[0].Port != 9093 {
+		t.Fatalf("unexpected PseudoFS service ports: %#v", service.Spec.Ports)
+	}
+	statefulSet, err := StatefulSet(StatefulSetInput{
+		PseudoFS: pseudofs, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != 1 {
+		t.Fatalf("PseudoFS replicas = %#v, want 1", statefulSet.Spec.Replicas)
+	}
+	if statefulSet.Spec.ServiceName != pseudofs.Name {
+		t.Fatalf("PseudoFS governing service = %q, want %q", statefulSet.Spec.ServiceName, pseudofs.Name)
+	}
+	assertClaim(t, statefulSet.Spec.VolumeClaimTemplates, "data", "10Gi")
+	assertClaim(t, statefulSet.Spec.VolumeClaimTemplates, "cache", "20Gi")
+	container := statefulSet.Spec.Template.Spec.Containers[0]
+	if container.Name != "pseudofs" || container.Image != "ghcr.io/pluralsh/pseudofs:0.1.0" {
+		t.Fatalf("unexpected PseudoFS container: %#v", container)
+	}
+	if len(container.Ports) != 1 || container.Ports[0].Name != portGRPC || container.Ports[0].ContainerPort != 9093 {
+		t.Fatalf("unexpected PseudoFS container ports: %#v", container.Ports)
+	}
+	if container.LivenessProbe == nil || container.LivenessProbe.GRPC == nil ||
+		container.ReadinessProbe == nil || container.ReadinessProbe.GRPC == nil {
+		t.Fatal("PseudoFS does not use gRPC health probes")
+	}
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == volumeSecrets || mount.Name == volumeInternalToken {
+			t.Fatalf("PseudoFS contains unsupported secret mount: %#v", mount)
+		}
+	}
+}
+
 func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 	tests := []struct {
 		name      string

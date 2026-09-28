@@ -1,0 +1,14 @@
+apiVersion: v2
+name: pseudofs
+description: Standalone Helm chart for PseudoFS
+appVersion: 0.1.0
+version: 0.1.0
+type: application
+kubeVersion: '>=1.25.0-0'
+home: https://github.com/pluralsh/telemetry
+sources:
+  - https://github.com/pluralsh/telemetry
+keywords:
+  - telemetry
+  - filesystem
+  - grpc

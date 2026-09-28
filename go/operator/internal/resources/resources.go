@@ -26,12 +26,13 @@ const (
 	ComponentWriter     Component = "writer"
 	ComponentReader     Component = "reader"
 
-	ConfigHashAnnotation = "telemetry.plural.sh/config-hash"
-	MeterNameAnnotation  = "telemetry.plural.sh/meter-name"
-	LineNameAnnotation   = "telemetry.plural.sh/line-name"
-	TrackNameAnnotation  = "telemetry.plural.sh/track-name"
-	TokenKey             = "internal-token"
-	InternalTokenPath    = "/var/run/secrets/meter/internal-token"
+	ConfigHashAnnotation   = "telemetry.plural.sh/config-hash"
+	MeterNameAnnotation    = "telemetry.plural.sh/meter-name"
+	LineNameAnnotation     = "telemetry.plural.sh/line-name"
+	TrackNameAnnotation    = "telemetry.plural.sh/track-name"
+	PseudoFSNameAnnotation = "telemetry.plural.sh/pseudofs-name"
+	TokenKey               = "internal-token"
+	InternalTokenPath      = "/var/run/secrets/meter/internal-token"
 
 	volumeConfig              = "config"
 	volumeSecrets             = "secrets"
@@ -82,6 +83,7 @@ type StatefulSetInput struct {
 	Meter                   *telemetryv1alpha1.Meter
 	Line                    *telemetryv1alpha1.Line
 	Track                   *telemetryv1alpha1.Track
+	PseudoFS                *telemetryv1alpha1.PseudoFS
 	Component               Component
 	ConfigSecretName        string
 	InternalTokenSecretName string
@@ -95,6 +97,7 @@ type Descriptor struct {
 	ReadRoute, WriteRoute                                                                         string
 	NameAnnotation                                                                                string
 	SupportsPathPrefix                                                                            bool
+	GRPCOnly                                                                                      bool
 }
 
 var (
@@ -118,6 +121,11 @@ var (
 		DataPath: "/var/lib/track", CachePath: "/var/cache/track",
 		InternalTokenPath: "/var/run/secrets/track/internal-token", HTTPPort: 3200, GRPCPort: 9092,
 		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: TrackNameAnnotation,
+	}
+	PseudoFSDescriptor = Descriptor{
+		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",
+		ConfigPath: "/etc/pseudofs/pseudofs.yaml", DataPath: "/var/lib/pseudofs", CachePath: "/var/cache/pseudofs",
+		GRPCPort: 9093, NameAnnotation: PseudoFSNameAnnotation, GRPCOnly: true,
 	}
 )
 
@@ -163,6 +171,19 @@ func ForTrack(track *telemetryv1alpha1.Track) *Product {
 	}
 }
 
+func ForPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) *Product {
+	return &Product{
+		ObjectMeta: pseudofs.ObjectMeta, Descriptor: PseudoFSDescriptor, Mode: telemetryv1alpha1.ProductModeStandalone,
+		Version: pseudofs.Spec.Version, Image: pseudofs.Spec.Image, Storage: pseudofs.Spec.Config.Storage,
+		Writer: pseudofs.Spec.Workload,
+		Service: telemetryv1alpha1.ServiceSpec{
+			GRPCPort: pseudofs.Spec.Service.GRPCPort,
+			Type:     pseudofs.Spec.Service.Type, Annotations: pseudofs.Spec.Service.Annotations,
+		},
+		ServiceAccountSpec: pseudofs.Spec.ServiceAccount, ConfigHash: pseudofs.Status.ConfigHash,
+	}
+}
+
 func product(value any) *Product {
 	switch value := value.(type) {
 	case *Product:
@@ -173,6 +194,8 @@ func product(value any) *Product {
 		return ForLine(value)
 	case *telemetryv1alpha1.Track:
 		return ForTrack(value)
+	case *telemetryv1alpha1.PseudoFS:
+		return ForPseudoFS(value)
 	default:
 		panic(fmt.Sprintf("unsupported telemetry product %T", value))
 	}
@@ -274,11 +297,11 @@ func Service(value any, component Component, headless bool) *corev1.Service {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, component)},
 		Spec: corev1.ServiceSpec{
 			Selector: SelectorLabels(meter, component),
-			Ports: []corev1.ServicePort{
-				{Name: portHTTP, Port: HTTPPort(meter), TargetPort: intstr.FromString(portHTTP), Protocol: corev1.ProtocolTCP},
-				{Name: portGRPC, Port: GRPCPort(meter), TargetPort: intstr.FromString(portGRPC), Protocol: corev1.ProtocolTCP},
-			},
+			Ports:    []corev1.ServicePort{{Name: portGRPC, Port: GRPCPort(meter), TargetPort: intstr.FromString(portGRPC), Protocol: corev1.ProtocolTCP}},
 		},
+	}
+	if !meter.Descriptor.GRPCOnly {
+		service.Spec.Ports = append([]corev1.ServicePort{{Name: portHTTP, Port: HTTPPort(meter), TargetPort: intstr.FromString(portHTTP), Protocol: corev1.ProtocolTCP}}, service.Spec.Ports...)
 	}
 	if headless {
 		service.Spec.Type = corev1.ServiceTypeClusterIP
@@ -350,7 +373,9 @@ func ingressPath(path string, pathType networkingv1.PathType, serviceName string
 
 func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	var meter *Product
-	if input.Line != nil {
+	if input.PseudoFS != nil {
+		meter = ForPseudoFS(input.PseudoFS)
+	} else if input.Line != nil {
 		meter = ForLine(input.Line)
 	} else if input.Track != nil {
 		meter = ForTrack(input.Track)
@@ -384,7 +409,7 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, component)},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName: Name(name, "headless"), Replicas: Replicas(meter, component),
+			ServiceName: lo.Ternary(meter.Descriptor.GRPCOnly, name, Name(name, "headless")), Replicas: Replicas(meter, component),
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
 			Selector:            &metav1.LabelSelector{MatchLabels: SelectorLabels(meter, component)},
@@ -487,23 +512,34 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 		meterContainer.ImagePullPolicy = corev1.PullIfNotPresent
 	}
 	meterContainer.Args = []string{"--config", meter.Descriptor.ConfigPath}
-	meterContainer.Ports = mergeNamed(meterContainer.Ports, func(item corev1.ContainerPort) string { return item.Name },
-		corev1.ContainerPort{Name: portHTTP, ContainerPort: HTTPPort(meter), Protocol: corev1.ProtocolTCP},
-		corev1.ContainerPort{Name: portGRPC, ContainerPort: GRPCPort(meter), Protocol: corev1.ProtocolTCP})
+	requiredPorts := []corev1.ContainerPort{{Name: portGRPC, ContainerPort: GRPCPort(meter), Protocol: corev1.ProtocolTCP}}
+	if !meter.Descriptor.GRPCOnly {
+		requiredPorts = append([]corev1.ContainerPort{{Name: portHTTP, ContainerPort: HTTPPort(meter), Protocol: corev1.ProtocolTCP}}, requiredPorts...)
+	}
+	meterContainer.Ports = mergeNamed(meterContainer.Ports, func(item corev1.ContainerPort) string { return item.Name }, requiredPorts...)
 	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name },
 		corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
 	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(meter)...)
-	meterContainer.VolumeMounts = mergeNamed(meterContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name },
+	requiredMounts := []corev1.VolumeMount{
 		corev1.VolumeMount{Name: volumeConfig, MountPath: meter.Descriptor.ConfigPath, SubPath: ConfigKeyFor(meter, component), ReadOnly: true},
-		corev1.VolumeMount{Name: volumeSecrets, MountPath: meter.Descriptor.SecretsPath, ReadOnly: true},
-		corev1.VolumeMount{Name: volumeInternalToken, MountPath: meter.Descriptor.InternalTokenPath, SubPath: TokenKey, ReadOnly: true},
 		corev1.VolumeMount{Name: volumeData, MountPath: meter.Descriptor.DataPath},
-		corev1.VolumeMount{Name: volumeCache, MountPath: meter.Descriptor.CachePath})
-	if meterContainer.LivenessProbe == nil {
+		corev1.VolumeMount{Name: volumeCache, MountPath: meter.Descriptor.CachePath},
+	}
+	if !meter.Descriptor.GRPCOnly {
+		requiredMounts = append(requiredMounts,
+			corev1.VolumeMount{Name: volumeSecrets, MountPath: meter.Descriptor.SecretsPath, ReadOnly: true},
+			corev1.VolumeMount{Name: volumeInternalToken, MountPath: meter.Descriptor.InternalTokenPath, SubPath: TokenKey, ReadOnly: true})
+	}
+	meterContainer.VolumeMounts = mergeNamed(meterContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name }, requiredMounts...)
+	if meter.Descriptor.GRPCOnly && meterContainer.LivenessProbe == nil {
+		meterContainer.LivenessProbe = grpcProbe(GRPCPort(meter), 10, 10, 2, 3)
+	} else if meterContainer.LivenessProbe == nil {
 		meterContainer.LivenessProbe = httpProbe("/-/healthy", 10, 10, 2, 3)
 	}
-	if meterContainer.ReadinessProbe == nil {
+	if meter.Descriptor.GRPCOnly && meterContainer.ReadinessProbe == nil {
+		meterContainer.ReadinessProbe = grpcProbe(GRPCPort(meter), 2, 5, 2, 6)
+	} else if meterContainer.ReadinessProbe == nil {
 		meterContainer.ReadinessProbe = httpProbe("/-/ready", 2, 5, 2, 6)
 	}
 	spec.Containers = append([]corev1.Container{meterContainer}, others...)
@@ -517,10 +553,17 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 		spec.EphemeralContainers[i].SecurityContext = secureContainerContext(spec.EphemeralContainers[i].SecurityContext)
 	}
 
-	required := []corev1.Volume{
-		{Name: volumeConfig, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}},
-		{Name: volumeSecrets, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}},
-		{Name: volumeInternalToken, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.InternalTokenSecretName, Items: []corev1.KeyToPath{{Key: input.InternalTokenSecretKey, Path: TokenKey}}}}},
+	required := []corev1.Volume{{Name: volumeConfig, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}}}
+	if !meter.Descriptor.GRPCOnly {
+		required = append(required,
+			corev1.Volume{Name: volumeSecrets, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}},
+			corev1.Volume{
+				Name: volumeInternalToken,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: input.InternalTokenSecretName,
+					Items:      []corev1.KeyToPath{{Key: input.InternalTokenSecretKey, Path: TokenKey}},
+				}},
+			})
 	}
 	if dataVolume.EmptyDir != nil {
 		required = append(required, corev1.Volume{Name: volumeData, VolumeSource: corev1.VolumeSource{EmptyDir: dataVolume.EmptyDir.DeepCopy()}})
@@ -632,6 +675,13 @@ func secureContainerContext(context *corev1.SecurityContext) *corev1.SecurityCon
 
 func httpProbe(path string, initial, period, timeout, failures int32) *corev1.Probe {
 	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstr.FromString(portHTTP)}}, InitialDelaySeconds: initial, PeriodSeconds: period, TimeoutSeconds: timeout, FailureThreshold: failures}
+}
+
+func grpcProbe(port, initial, period, timeout, failures int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:        corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: port}},
+		InitialDelaySeconds: initial, PeriodSeconds: period, TimeoutSeconds: timeout, FailureThreshold: failures,
+	}
 }
 
 func mergeNamed[T any](existing []T, name func(T) string, required ...T) []T {

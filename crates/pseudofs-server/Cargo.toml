@@ -1,0 +1,43 @@
+[package]
+name = "pseudofs-server"
+description = "Standalone gRPC server for PseudoFS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pseudofs_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pseudofs-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+futures.workspace = true
+prost.workspace = true
+proto = { path = "../proto" }
+pseudofs = { path = "../pseudofs" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util.workspace = true
+tonic.workspace = true
+tonic-health = "0.13"
+tonic-reflection = "0.13"
+tracing.workspace = true
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+common = { path = "../common" }
+tempfile.workspace = true

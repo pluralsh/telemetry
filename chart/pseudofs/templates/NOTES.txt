@@ -1,0 +1,10 @@
+PseudoFS was installed as a single-replica StatefulSet.
+
+gRPC service:
+  {{ include "pseudofs.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Check the rollout:
+  kubectl --namespace {{ .Release.Namespace }} rollout status statefulset/{{ include "pseudofs.fullname" . }}
+
+The data volume is {{ ternary "durable" "ephemeral" .Values.persistence.enabled }}.
+The cache volume is {{ ternary "persistent" "ephemeral" .Values.cache.persistence.enabled }}.
