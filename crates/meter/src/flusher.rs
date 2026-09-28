@@ -98,6 +98,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 insert_series_id(
                     &frozen.namespace,
                     frozen.bucket,
+                    frozen.routing_slot,
                     *fingerprint,
                     *series_id,
                     ttl,
@@ -113,6 +114,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 insert_forward_index(
                     &frozen.namespace,
                     frozen.bucket,
+                    frozen.routing_slot,
                     *entry.key(),
                     entry.value().clone(),
                     ttl,
@@ -128,6 +130,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 merge_inverted_index(
                     &frozen.namespace,
                     frozen.bucket,
+                    frozen.routing_slot,
                     entry.key().clone(),
                     entry.value().clone(),
                     ttl,
@@ -143,6 +146,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 merge_samples(
                     &frozen.namespace,
                     frozen.bucket,
+                    frozen.routing_slot,
                     series_id,
                     &series_samples.metric_name,
                     series_samples.points,
@@ -284,6 +288,7 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -298,7 +303,10 @@ mod tests {
         let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = snapshot
+            .get_buckets_in_range(&crate::Namespace::default(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0], create_test_bucket());
     }
@@ -315,6 +323,7 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -328,7 +337,10 @@ mod tests {
         // then
         assert!(result.is_ok());
         let snapshot = result.unwrap();
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = snapshot
+            .get_buckets_in_range(&crate::Namespace::default(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets.len(), 0);
     }
 
@@ -336,6 +348,7 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -429,6 +442,7 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -447,7 +461,10 @@ mod tests {
         let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = snapshot
+            .get_buckets_in_range(&crate::Namespace::default(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets, vec![create_test_bucket()]);
     }
 
@@ -466,6 +483,7 @@ mod tests {
             let ctx = TsdbContext {
                 namespace: crate::Namespace::default(),
                 bucket,
+                routing_slot: 0,
                 series_dict: Arc::new(HashMap::new()),
                 next_series_id: i as u32,
                 active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -489,7 +507,10 @@ mod tests {
 
         // then: bucket appears exactly once
         let snapshot = storage.snapshot().await.unwrap();
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = snapshot
+            .get_buckets_in_range(&crate::Namespace::default(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets, vec![bucket]);
     }
 
@@ -505,6 +526,7 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -529,9 +551,14 @@ mod tests {
         let bucket = create_test_bucket();
         let mut count = 0;
         let _max_id = snapshot
-            .load_series_dictionary(&bucket, |_fingerprint, _series_id| {
-                count += 1;
-            })
+            .load_series_dictionary(
+                &crate::Namespace::default(),
+                &bucket,
+                0,
+                |_fingerprint, _series_id| {
+                    count += 1;
+                },
+            )
             .await
             .unwrap();
         assert_eq!(count, 2);

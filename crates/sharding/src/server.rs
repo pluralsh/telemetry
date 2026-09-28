@@ -12,7 +12,7 @@ use crate::{
 
 /// Product-specific defaults for the Kubernetes sharding resources.
 pub trait Product: fmt::Debug + Clone + Default + Send + Sync + 'static {
-    /// Base name of the product's StatefulSet, Service, ConfigMap, and Leases.
+    /// Base name of the product's StatefulSet, Service, ShardMap, and Leases.
     const NAME: &'static str;
     const OWNER_PORT: u16;
 }
@@ -76,7 +76,7 @@ pub struct KubernetesShardingConfig<P: Product> {
     pub stateful_set: String,
     pub headless_service: String,
     pub owner_port: u16,
-    pub assignment_config_map: String,
+    pub shard_map: String,
     pub coordinator_lease: String,
     pub shard_lease_prefix: String,
     pub lease_duration_seconds: u64,
@@ -93,7 +93,7 @@ impl<P: Product> Default for KubernetesShardingConfig<P> {
             stateful_set: P::NAME.to_owned(),
             headless_service: format!("{}-headless", P::NAME),
             owner_port: P::OWNER_PORT,
-            assignment_config_map: format!("{}-shard-assignments", P::NAME),
+            shard_map: format!("{}-shard-map", P::NAME),
             coordinator_lease: format!("{}-shard-coordinator", P::NAME),
             shard_lease_prefix: format!("{}-shard", P::NAME),
             lease_duration_seconds: 15,
@@ -129,7 +129,7 @@ impl<P: Product> KubernetesShardingConfig<P> {
             stateful_set: self.stateful_set.clone(),
             headless_service: self.headless_service.clone(),
             owner_port: self.owner_port,
-            assignment_config_map: self.assignment_config_map.clone(),
+            shard_map: self.shard_map.clone(),
             coordinator_lease: self.coordinator_lease.clone(),
             shard_lease_prefix: self.shard_lease_prefix.clone(),
             lease_duration: std::time::Duration::from_secs(self.lease_duration_seconds),
@@ -282,7 +282,7 @@ impl<P: Product> ShardingConfig<P> {
     ) -> Vec<ShardId> {
         match mode {
             ServerMode::Standalone | ServerMode::Reader => {
-                (0..self.virtual_shards).map(ShardId::new).collect()
+                (0..assignment.virtual_shards).map(ShardId::new).collect()
             }
             ServerMode::Writer if matches!(self.kind, ShardingBackend::Kubernetes(_)) => Vec::new(),
             ServerMode::Writer => owned_shards(assignment, local_owner).collect(),
@@ -317,11 +317,13 @@ mod runtime {
     use super::{KubernetesShardingConfig, Product};
     use crate::{
         AssignmentGeneration, AssignmentStore, BoxError, OwnershipManager, OwnershipManagerConfig,
-        ShardLifecycle, ShardMap, balanced_contiguous,
+        ReaderShardLifecycle, ShardLifecycle, ShardMap, ShardMigrationExecutor,
+        balanced_contiguous,
         kubernetes::{
             KubernetesAssignmentStore, KubernetesConfig, KubernetesCoordinatorElection,
             KubernetesLeaseBackend, StatefulSetMembership, run_kubernetes_coordinator,
         },
+        run_migration_worker,
     };
 
     /// Cluster handles a Kubernetes-sharded server keeps after startup.
@@ -331,7 +333,6 @@ mod runtime {
         config: KubernetesConfig,
         identity: String,
         renew_interval: Duration,
-        virtual_shards: u32,
         product: &'static str,
     }
 
@@ -340,7 +341,6 @@ mod runtime {
         /// the coordinator lease and publishes a balanced initial assignment.
         pub async fn bootstrap<P: Product>(
             settings: &KubernetesShardingConfig<P>,
-            virtual_shards: u32,
             cancellation: CancellationToken,
         ) -> Result<(Self, ShardMap), BoxError> {
             let client = kube::Client::try_default().await?;
@@ -358,9 +358,15 @@ mod runtime {
                     let owners = StatefulSetMembership::new(client.clone(), &config)
                         .owners()
                         .await?;
+                    let desired_shards = u32::try_from(owners.len()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "writer replica count exceeds supported shard count",
+                        )
+                    })?;
                     let initial = balanced_contiguous(
                         AssignmentGeneration::new(1),
-                        virtual_shards,
+                        desired_shards,
                         &owners,
                         None,
                     )?;
@@ -381,7 +387,6 @@ mod runtime {
                     config,
                     identity,
                     renew_interval: Duration::from_secs(settings.renew_interval_seconds),
-                    virtual_shards,
                     product: P::NAME,
                 },
                 assignment,
@@ -392,14 +397,72 @@ mod runtime {
             &self.identity
         }
 
-        /// Spawns the shard ownership manager, the assignment watcher that
-        /// keeps `assignment` current, and the coordinator loop.
-        pub fn spawn<R: ShardLifecycle + 'static>(
+        /// Watches the coherent ownership+routing snapshot without
+        /// participating in shard leases. Used by read-only servers.
+        pub fn spawn_reader<R>(
             self,
             lifecycle: Arc<R>,
             assignment: Arc<RwLock<ShardMap>>,
             cancellation: &CancellationToken,
-        ) -> [JoinHandle<()>; 3] {
+        ) -> JoinHandle<()>
+        where
+            R: ReaderShardLifecycle + 'static,
+        {
+            let mut updates = self.store.watch();
+            let watcher_cancel = cancellation.clone();
+            tokio::spawn(async move {
+                let mut pending = None;
+                let mut retry = tokio::time::interval(Duration::from_secs(1));
+                retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                retry.tick().await;
+                loop {
+                    let attempt = tokio::select! {
+                        () = watcher_cancel.cancelled() => return,
+                        changed = updates.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            pending = updates.borrow_and_update().clone();
+                            true
+                        }
+                        _ = retry.tick(), if pending.is_some() => true,
+                    };
+                    if !attempt {
+                        continue;
+                    }
+                    let Some(next) = pending.as_ref() else {
+                        continue;
+                    };
+                    match lifecycle.reconcile_readers(next).await {
+                        Ok(()) => {
+                            *assignment.write().await = next.clone();
+                            pending = None;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                generation = %next.generation,
+                                "reader shard reconciliation failed; retrying"
+                            );
+                        }
+                    }
+                }
+            })
+        }
+
+        /// Spawns the shard ownership manager, the assignment watcher that
+        /// keeps `assignment` current, and the coordinator loop.
+        pub fn spawn<R, E>(
+            self,
+            lifecycle: Arc<R>,
+            migration_executor: Arc<E>,
+            assignment: Arc<RwLock<ShardMap>>,
+            cancellation: &CancellationToken,
+        ) -> [JoinHandle<()>; 4]
+        where
+            R: ShardLifecycle + 'static,
+            E: ShardMigrationExecutor + 'static,
+        {
             let product = self.product;
             let manager = OwnershipManager::new(
                 self.identity.clone(),
@@ -435,14 +498,19 @@ mod runtime {
                     }
                 }
             });
+            let migration_task = tokio::spawn(run_migration_worker(
+                Arc::clone(&self.store),
+                migration_executor,
+                self.identity.clone(),
+                cancellation.clone(),
+            ));
             let coordinator_task = tokio::spawn(run_kubernetes_coordinator(
                 self.store,
                 self.config,
                 self.identity,
-                self.virtual_shards,
                 cancellation.clone(),
             ));
-            [manager_task, watcher_task, coordinator_task]
+            [manager_task, watcher_task, migration_task, coordinator_task]
         }
     }
 }
@@ -514,7 +582,7 @@ mod tests {
         assert_eq!(config.database, "demo");
         assert_eq!(config.stateful_set, "demo");
         assert_eq!(config.headless_service, "demo-headless");
-        assert_eq!(config.assignment_config_map, "demo-shard-assignments");
+        assert_eq!(config.shard_map, "demo-shard-map");
         assert_eq!(config.coordinator_lease, "demo-shard-coordinator");
         assert_eq!(config.shard_lease_prefix, "demo-shard");
         assert_eq!(config.owner_port, 9000);

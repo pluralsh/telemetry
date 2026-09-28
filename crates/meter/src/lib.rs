@@ -18,6 +18,7 @@ mod query;
 mod reader;
 #[cfg(feature = "remote-write")]
 pub mod remote_write;
+mod routing;
 mod serde;
 mod sharded;
 mod storage;
@@ -45,3 +46,6 @@ pub use otel::{OtelConfig, OtelConverter};
 pub use reader::TimeSeriesDbReader;
 pub use sharded::{ShardedMeter, ShardedTimeseries, ShardingOptions};
 pub use timeseries::{TimeSeriesDb, Visibility};
+
+/// Persisted SlateDB segment extractor identifier used by migration preflight.
+pub const SEGMENT_EXTRACTOR_NAME: &str = storage::segment_extractor::EXTRACTOR_NAME;

@@ -93,7 +93,8 @@ write:
   remote_retries: 2 # Retries after a stale-ownership response.
 
 sharding:
-  virtual_shards: 8 # Must match every process sharing this dataset.
+  # Storage-shard count fixed when the dataset is created.
+  virtual_shards: 8
   io_concurrency_multiplier: 8
   backend: standalone
 
@@ -120,7 +121,7 @@ sharding:
   # stateful_set: line
   # headless_service: line-headless
   # owner_port: 9091
-  # assignment_config_map: line-shard-assignments
+  # shard_map: line-shard-map
   # coordinator_lease: line-shard-coordinator
   # shard_lease_prefix: line-shard
   # lease_duration_seconds: 15

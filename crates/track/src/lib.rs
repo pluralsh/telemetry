@@ -11,6 +11,7 @@ mod error;
 mod model;
 mod otlp;
 mod page;
+mod routing;
 mod sharded;
 pub mod traceql;
 
@@ -27,3 +28,6 @@ pub use sharded::{ShardedTrack, ShardingOptions};
 pub use traceql::{
     MatchedSpan, QueryOptions, QueryPlan, StaticValue as TraceQlValue, TraceQlResult,
 };
+
+/// Persisted SlateDB segment extractor identifier used by migration preflight.
+pub const SEGMENT_EXTRACTOR_NAME: &str = "track-trace/v2";

@@ -15,6 +15,7 @@
 //! only the storage *handles* are native here.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -81,6 +82,7 @@ pub(crate) trait StorageRead: Send + Sync {
     /// start time.
     async fn get_buckets_in_range(
         &self,
+        namespace: &Namespace,
         start_secs: Option<i64>,
         end_secs: Option<i64>,
     ) -> crate::util::Result<Vec<TimeBucket>>;
@@ -88,40 +90,59 @@ pub(crate) trait StorageRead: Send + Sync {
     /// Returns the buckets overlapping any of the given disjoint ranges.
     async fn get_buckets_for_ranges(
         &self,
+        namespace: &Namespace,
         ranges: &[(i64, i64)],
     ) -> crate::util::Result<Vec<TimeBucket>>;
 
     /// Loads the full forward index of `bucket`.
-    async fn get_forward_index(&self, bucket: TimeBucket) -> crate::util::Result<ForwardIndex>;
+    async fn get_forward_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<ForwardIndex>;
 
     /// Loads the full inverted index of `bucket`.
-    async fn get_inverted_index(&self, bucket: TimeBucket) -> crate::util::Result<InvertedIndex>;
+    async fn get_inverted_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<InvertedIndex>;
 
     /// Loads only the given terms from the inverted index (legacy batch path).
     async fn get_inverted_index_terms(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         terms: &[Label],
     ) -> crate::util::Result<InvertedIndex>;
 
     /// Fetches a single inverted-index posting for `(bucket, term)`.
     async fn get_inverted_index_term(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         term: &Label,
     ) -> crate::util::Result<Option<RoaringBitmap>>;
 
     /// Loads only the given series from the forward index (legacy batch path).
     async fn get_forward_index_series(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_ids: &[SeriesId],
     ) -> crate::util::Result<ForwardIndex>;
 
     /// Fetches a single forward-index entry for `(bucket, series_id)`.
     async fn get_forward_index_one(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_id: SeriesId,
     ) -> crate::util::Result<Option<SeriesSpec>>;
 
@@ -132,7 +153,9 @@ pub(crate) trait StorageRead: Send + Sync {
     /// on a concrete handle.
     async fn load_series_dictionary<F>(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        routing_slot: u16,
         insert: F,
     ) -> crate::util::Result<u32>
     where
@@ -142,7 +165,9 @@ pub(crate) trait StorageRead: Send + Sync {
     /// Returns all values of `label_name` within `bucket`.
     async fn get_label_values(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         label_name: &str,
     ) -> crate::util::Result<Vec<String>>;
 }
@@ -159,80 +184,120 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
 
     async fn get_buckets_in_range(
         &self,
+        namespace: &Namespace,
         start_secs: Option<i64>,
         end_secs: Option<i64>,
     ) -> crate::util::Result<Vec<TimeBucket>> {
         self.reader()
-            .get_buckets_in_range(start_secs, end_secs)
+            .get_buckets_in_range(namespace, start_secs, end_secs)
             .await
     }
 
     async fn get_buckets_for_ranges(
         &self,
+        namespace: &Namespace,
         ranges: &[(i64, i64)],
     ) -> crate::util::Result<Vec<TimeBucket>> {
-        self.reader().get_buckets_for_ranges(ranges).await
+        self.reader()
+            .get_buckets_for_ranges(namespace, ranges)
+            .await
     }
 
-    async fn get_forward_index(&self, bucket: TimeBucket) -> crate::util::Result<ForwardIndex> {
-        self.reader().get_forward_index(bucket).await
+    async fn get_forward_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<ForwardIndex> {
+        self.reader()
+            .get_forward_index(namespace, bucket, slots)
+            .await
     }
 
-    async fn get_inverted_index(&self, bucket: TimeBucket) -> crate::util::Result<InvertedIndex> {
-        self.reader().get_inverted_index(bucket).await
+    async fn get_inverted_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<InvertedIndex> {
+        self.reader()
+            .get_inverted_index(namespace, bucket, slots)
+            .await
     }
 
     async fn get_inverted_index_terms(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         terms: &[Label],
     ) -> crate::util::Result<InvertedIndex> {
-        self.reader().get_inverted_index_terms(bucket, terms).await
+        self.reader()
+            .get_inverted_index_terms(namespace, bucket, slots, terms)
+            .await
     }
 
     async fn get_inverted_index_term(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         term: &Label,
     ) -> crate::util::Result<Option<RoaringBitmap>> {
-        self.reader().get_inverted_index_term(bucket, term).await
+        self.reader()
+            .get_inverted_index_term(namespace, bucket, slots, term)
+            .await
     }
 
     async fn get_forward_index_series(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_ids: &[SeriesId],
     ) -> crate::util::Result<ForwardIndex> {
         self.reader()
-            .get_forward_index_series(bucket, series_ids)
+            .get_forward_index_series(namespace, bucket, slots, series_ids)
             .await
     }
 
     async fn get_forward_index_one(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_id: SeriesId,
     ) -> crate::util::Result<Option<SeriesSpec>> {
-        self.reader().get_forward_index_one(bucket, series_id).await
+        self.reader()
+            .get_forward_index_one(namespace, bucket, slots, series_id)
+            .await
     }
 
     async fn load_series_dictionary<F>(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        routing_slot: u16,
         insert: F,
     ) -> crate::util::Result<u32>
     where
         F: FnMut(SeriesFingerprint, SeriesId) + Send,
     {
-        self.reader().load_series_dictionary(bucket, insert).await
+        self.reader()
+            .load_series_dictionary(namespace, bucket, routing_slot, insert)
+            .await
     }
 
     async fn get_label_values(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         label_name: &str,
     ) -> crate::util::Result<Vec<String>> {
-        self.reader().get_label_values(bucket, label_name).await
+        self.reader()
+            .get_label_values(namespace, bucket, slots, label_name)
+            .await
     }
 }
 
@@ -250,6 +315,7 @@ pub(crate) trait WarmStorage: StorageRead {
     /// promptly if `cancel` fires. See [`StorageReaderInner::warm`].
     async fn warm(
         &self,
+        namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
         cancel: &CancellationToken,
@@ -264,11 +330,14 @@ where
 {
     async fn warm(
         &self,
+        namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
-        self.reader().warm(buckets, include_samples, cancel).await
+        self.reader()
+            .warm(namespace, buckets, include_samples, cancel)
+            .await
     }
 }
 
@@ -309,7 +378,7 @@ type SegmentLister = Arc<dyn Fn() -> Vec<slatedb::SegmentPrefix> + Send + Sync>;
 struct StorageReaderInner<T: DbReadOps + Send + Sync> {
     db: Arc<T>,
     segments: SegmentLister,
-    namespace: Namespace,
+    owned_slots: Range<u16>,
 }
 
 impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
@@ -317,7 +386,7 @@ impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
         Self {
             db: Arc::clone(&self.db),
             segments: Arc::clone(&self.segments),
-            namespace: self.namespace.clone(),
+            owned_slots: self.owned_slots.clone(),
         }
     }
 }
@@ -359,6 +428,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_buckets_in_range(
         &self,
+        namespace: &Namespace,
         start_secs: Option<i64>,
         end_secs: Option<i64>,
     ) -> crate::util::Result<Vec<TimeBucket>> {
@@ -373,7 +443,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         let end_min = end_secs.map(|e| (e / 60) as u32);
 
         let mut filtered_buckets: Vec<TimeBucket> = self
-            .list_buckets()
+            .list_buckets(namespace)
             .into_iter()
             .filter(|bucket| match (start_min, end_min) {
                 (None, None) => true,
@@ -402,6 +472,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_buckets_for_ranges(
         &self,
+        namespace: &Namespace,
         ranges: &[(i64, i64)],
     ) -> crate::util::Result<Vec<TimeBucket>> {
         if ranges.is_empty() {
@@ -409,7 +480,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         }
 
         let mut filtered_buckets: Vec<TimeBucket> = self
-            .list_buckets()
+            .list_buckets(namespace)
             .into_iter()
             .filter(|bucket| {
                 let bucket_start_min = bucket.start as i64;
@@ -431,13 +502,20 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn get_forward_index(&self, bucket: TimeBucket) -> crate::util::Result<ForwardIndex> {
-        let range = ForwardIndexKey::bucket_range(&self.namespace, &bucket);
+    async fn get_forward_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<ForwardIndex> {
+        let range = crate::serde::bucket_slots_range(namespace, &bucket, slots);
         let mut iter = self.scan(range).await?;
 
         let forward_index = ForwardIndex::default();
         while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
-            let key = ForwardIndexKey::decode(record.key.as_ref())?;
+            let Ok(key) = ForwardIndexKey::decode(record.key.as_ref()) else {
+                continue;
+            };
             let value = ForwardIndexValue::decode(record.value.as_ref())?;
             forward_index.series.insert(key.series_id, value.into());
         }
@@ -445,21 +523,29 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn get_inverted_index(&self, bucket: TimeBucket) -> crate::util::Result<InvertedIndex> {
-        let range = InvertedIndexKey::bucket_range(&self.namespace, &bucket);
+    async fn get_inverted_index(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        slots: Range<u16>,
+    ) -> crate::util::Result<InvertedIndex> {
+        let range = crate::serde::bucket_slots_range(namespace, &bucket, slots);
         let mut iter = self.scan(range).await?;
 
         let inverted_index = InvertedIndex::default();
         while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
-            let key = InvertedIndexKey::decode(record.key.as_ref())?;
+            let Ok(key) = InvertedIndexKey::decode(record.key.as_ref()) else {
+                continue;
+            };
             let value = InvertedIndexValue::decode(record.value.as_ref())?;
-            inverted_index.postings.insert(
-                Label {
+            let mut entry = inverted_index
+                .postings
+                .entry(Label {
                     name: key.attribute,
                     value: key.value,
-                },
-                value.postings,
-            );
+                })
+                .or_default();
+            *entry.value_mut() |= value.postings;
         }
 
         Ok(inverted_index)
@@ -473,7 +559,9 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_inverted_index_terms(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         terms: &[Label],
     ) -> crate::util::Result<InvertedIndex> {
         let result = InvertedIndex::default();
@@ -481,10 +569,13 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         // a closure over `&Label` trips async_trait's `Send` inference.
         let fetches: Vec<_> = terms
             .iter()
-            .map(|term| async move {
-                self.get_inverted_index_term(bucket, term)
-                    .await
-                    .map(|postings| (term, postings))
+            .map(|term| {
+                let slots = slots.clone();
+                async move {
+                    self.get_inverted_index_term(namespace, bucket, slots, term)
+                        .await
+                        .map(|postings| (term, postings))
+                }
             })
             .collect();
         let mut fetches =
@@ -507,28 +598,31 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_inverted_index_term(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         term: &Label,
     ) -> crate::util::Result<Option<RoaringBitmap>> {
-        let key = InvertedIndexKey {
-            namespace: self.namespace.clone(),
-            bucket: *bucket,
-            attribute: term.name.clone(),
-            value: term.value.clone(),
-        }
-        .encode();
-
-        match self.get(key).await? {
-            Some(value) => {
+        let mut postings = RoaringBitmap::new();
+        for routing_slot in slots {
+            let key = InvertedIndexKey {
+                namespace: namespace.clone(),
+                bucket: *bucket,
+                routing_slot,
+                attribute: term.name.clone(),
+                value: term.value.clone(),
+            }
+            .encode();
+            if let Some(value) = self.get(key).await? {
                 crate::promql::trace::record_bytes(
                     crate::promql::trace::IoKind::InvertedIndexFetch,
                     value.len() as u64,
                 );
                 let inverted_index_value = InvertedIndexValue::decode(value.as_ref())?;
-                Ok(Some(inverted_index_value.postings))
+                postings |= inverted_index_value.postings;
             }
-            None => Ok(None),
         }
+        Ok((!postings.is_empty()).then_some(postings))
     }
 
     /// Load only the specified series from the forward index. Legacy
@@ -537,16 +631,21 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index_series(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_ids: &[SeriesId],
     ) -> crate::util::Result<ForwardIndex> {
         let result = ForwardIndex::default();
         let fetches: Vec<_> = series_ids
             .iter()
-            .map(|&series_id| async move {
-                self.get_forward_index_one(bucket, series_id)
-                    .await
-                    .map(|spec| (series_id, spec))
+            .map(|&series_id| {
+                let slots = slots.clone();
+                async move {
+                    self.get_forward_index_one(namespace, bucket, slots, series_id)
+                        .await
+                        .map(|spec| (series_id, spec))
+                }
             })
             .collect();
         let mut fetches =
@@ -565,12 +664,19 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index_one(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         series_id: SeriesId,
     ) -> crate::util::Result<Option<SeriesSpec>> {
+        let routing_slot = (series_id % u32::from(sharding::ROUTING_SLOT_COUNT)) as u16;
+        if !slots.contains(&routing_slot) {
+            return Ok(None);
+        }
         let key = ForwardIndexKey {
-            namespace: self.namespace.clone(),
+            namespace: namespace.clone(),
             bucket: *bucket,
+            routing_slot,
             series_id,
         }
         .encode();
@@ -593,21 +699,27 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip(self, bucket, insert))]
     async fn load_series_dictionary<F>(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        routing_slot: u16,
         mut insert: F,
     ) -> crate::util::Result<u32>
     where
         F: FnMut(SeriesFingerprint, SeriesId) + Send,
     {
-        let range = SeriesDictionaryKey::bucket_range(&self.namespace, bucket);
+        let range = SeriesDictionaryKey::bucket_range(namespace, bucket, routing_slot);
         let mut iter = self.scan(range).await?;
 
-        let mut next_series_id = 0;
+        let mut next_series_id = u32::from(routing_slot);
         while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
             let key = SeriesDictionaryKey::decode(record.key.as_ref())?;
             let value = SeriesDictionaryValue::decode(record.value.as_ref())?;
             insert(key.series_fingerprint, value.series_id);
-            next_series_id = next_series_id.max(value.series_id.saturating_add(1));
+            next_series_id = next_series_id.max(
+                value
+                    .series_id
+                    .saturating_add(u32::from(sharding::ROUTING_SLOT_COUNT)),
+            );
         }
 
         Ok(next_series_id)
@@ -616,11 +728,11 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     /// Lists the timeseries buckets currently visible to this handle, by
     /// projecting the segment prefixes reported by SlateDB (manifest plus
     /// unflushed memtable segments) through the timeseries extractor.
-    fn list_buckets(&self) -> Vec<TimeBucket> {
+    fn list_buckets(&self, namespace: &Namespace) -> Vec<TimeBucket> {
         (self.segments)()
             .iter()
             .filter_map(|seg| parse_bucket(&seg.prefix))
-            .filter_map(|(namespace, bucket)| (namespace == self.namespace).then_some(bucket))
+            .filter_map(|(key_namespace, bucket)| (key_namespace == *namespace).then_some(bucket))
             .collect()
     }
 
@@ -640,19 +752,22 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_label_values(
         &self,
+        namespace: &Namespace,
         bucket: &TimeBucket,
+        slots: Range<u16>,
         label_name: &str,
     ) -> crate::util::Result<Vec<String>> {
-        let range = InvertedIndexKey::attribute_range(&self.namespace, bucket, label_name);
-        let mut iter = self.scan(range).await?;
-
-        let mut values = Vec::new();
-        while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
-            let key = InvertedIndexKey::decode(record.key.as_ref())?;
-            values.push(key.value);
+        let mut values = HashSet::new();
+        for routing_slot in slots {
+            let range =
+                InvertedIndexKey::attribute_range(namespace, bucket, routing_slot, label_name);
+            let mut iter = self.scan(range).await?;
+            while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
+                let key = InvertedIndexKey::decode(record.key.as_ref())?;
+                values.insert(key.value);
+            }
         }
-
-        Ok(values)
+        Ok(values.into_iter().collect())
     }
 }
 
@@ -690,6 +805,7 @@ where
     #[tracing::instrument(level = "trace", skip_all)]
     async fn warm(
         &self,
+        namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
         cancel: &CancellationToken,
@@ -701,15 +817,20 @@ where
             .segments()
             .iter()
             .filter_map(|segment| {
-                let (namespace, bucket) = parse_bucket(segment.prefix())?;
-                if namespace != self.namespace {
+                let (segment_namespace, bucket) = parse_bucket(segment.prefix())?;
+                if &segment_namespace != namespace {
                     return None;
                 }
                 if !wanted.contains(&bucket) {
                     return None;
                 }
-                let targets: Arc<[CacheTarget]> =
-                    bucket_cache_targets(&self.namespace, &bucket, include_samples).into();
+                let targets: Arc<[CacheTarget]> = bucket_cache_targets(
+                    namespace,
+                    &bucket,
+                    self.owned_slots.clone(),
+                    include_samples,
+                )
+                .into();
                 let ids = segment
                     .l0()
                     .iter()
@@ -746,19 +867,31 @@ where
 fn bucket_cache_targets(
     namespace: &Namespace,
     bucket: &TimeBucket,
+    owned_slots: Range<u16>,
     include_samples: bool,
 ) -> Vec<CacheTarget> {
-    let mut targets = vec![
-        CacheTarget::Filters,
-        CacheTarget::Index,
-        CacheTarget::data::<Bytes, _>(SeriesDictionaryKey::bucket_range(namespace, bucket)),
-        CacheTarget::data::<Bytes, _>(ForwardIndexKey::bucket_range(namespace, bucket)),
-        CacheTarget::data::<Bytes, _>(InvertedIndexKey::bucket_range(namespace, bucket)),
-    ];
-    if include_samples {
-        targets.push(CacheTarget::data::<Bytes, _>(TimeSeriesKey::bucket_range(
-            namespace, bucket,
-        )));
+    let records_per_slot = if include_samples { 4 } else { 3 };
+    let mut targets =
+        Vec::with_capacity(2 + usize::from(owned_slots.end - owned_slots.start) * records_per_slot);
+    targets.push(CacheTarget::Filters);
+    targets.push(CacheTarget::Index);
+    for routing_slot in owned_slots {
+        targets.push(CacheTarget::data::<Bytes, _>(
+            SeriesDictionaryKey::bucket_range(namespace, bucket, routing_slot),
+        ));
+        targets.push(CacheTarget::data::<Bytes, _>(
+            ForwardIndexKey::bucket_range(namespace, bucket, routing_slot),
+        ));
+        targets.push(CacheTarget::data::<Bytes, _>(
+            InvertedIndexKey::bucket_range(namespace, bucket, routing_slot),
+        ));
+        if include_samples {
+            targets.push(CacheTarget::data::<Bytes, _>(TimeSeriesKey::bucket_range(
+                namespace,
+                bucket,
+                routing_slot,
+            )));
+        }
     }
     targets
 }
@@ -779,17 +912,31 @@ impl StorageReader {
     /// checkpoint and does not advance with newer writes.
     pub(crate) async fn try_new(
         slate_config: &SlateDbStorageConfig,
-        namespace: Namespace,
         reader_options: DbReaderOptions,
         checkpoint_id: Option<Uuid>,
     ) -> crate::util::Result<Self> {
-        let object_store = create_object_store(&slate_config.object_store)?;
-        Self::try_new_with_object_store(
+        Self::try_new_with_slots(
             slate_config,
-            namespace,
+            reader_options,
+            checkpoint_id,
+            0..sharding::ROUTING_SLOT_COUNT,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_slots(
+        slate_config: &SlateDbStorageConfig,
+        reader_options: DbReaderOptions,
+        checkpoint_id: Option<Uuid>,
+        owned_slots: Range<u16>,
+    ) -> crate::util::Result<Self> {
+        let object_store = create_object_store(&slate_config.object_store)?;
+        Self::try_new_with_object_store_and_slots(
+            slate_config,
             reader_options,
             checkpoint_id,
             object_store,
+            owned_slots,
         )
         .await
     }
@@ -798,10 +945,26 @@ impl StorageReader {
     /// share an in-memory store between a writer and a reader.
     pub(crate) async fn try_new_with_object_store(
         slate_config: &SlateDbStorageConfig,
-        namespace: Namespace,
         reader_options: DbReaderOptions,
         checkpoint_id: Option<Uuid>,
         object_store: Arc<dyn ObjectStore>,
+    ) -> crate::util::Result<Self> {
+        Self::try_new_with_object_store_and_slots(
+            slate_config,
+            reader_options,
+            checkpoint_id,
+            object_store,
+            0..sharding::ROUTING_SLOT_COUNT,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_object_store_and_slots(
+        slate_config: &SlateDbStorageConfig,
+        reader_options: DbReaderOptions,
+        checkpoint_id: Option<Uuid>,
+        object_store: Arc<dyn ObjectStore>,
+        owned_slots: Range<u16>,
     ) -> crate::util::Result<Self> {
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
         let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
@@ -829,7 +992,7 @@ impl StorageReader {
             reader: StorageReaderInner {
                 db: reader.clone(),
                 segments: Arc::new(move || reader.status().list_segments()),
-                namespace,
+                owned_slots,
             },
         })
     }
@@ -842,6 +1005,10 @@ impl StorageReader {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    pub(crate) fn owned_slots(&self) -> Range<u16> {
+        self.reader.owned_slots.clone()
     }
 }
 
@@ -888,20 +1055,34 @@ impl Storage {
     /// Opens the storage from configuration, wired with the OpenTSDB merge
     /// operator, the timeseries segment extractor, the metrics recorder, and
     /// (when configured) the foyer block cache.
-    pub(crate) async fn try_new(
-        slate_config: &SlateDbStorageConfig,
-        namespace: Namespace,
-    ) -> crate::util::Result<Self> {
+    pub(crate) async fn try_new(slate_config: &SlateDbStorageConfig) -> crate::util::Result<Self> {
         let object_store = create_object_store(&slate_config.object_store)?;
-        Self::try_new_with_object_store(slate_config, namespace, object_store).await
+        Self::try_new_with_object_store_and_slots(
+            slate_config,
+            object_store,
+            0..sharding::ROUTING_SLOT_COUNT,
+        )
+        .await
     }
 
     /// Like [`Self::try_new`] but over an explicit object store, so tests can
     /// share an in-memory store between a writer and a reader.
     pub(crate) async fn try_new_with_object_store(
         slate_config: &SlateDbStorageConfig,
-        namespace: Namespace,
         object_store: Arc<dyn ObjectStore>,
+    ) -> crate::util::Result<Self> {
+        Self::try_new_with_object_store_and_slots(
+            slate_config,
+            object_store,
+            0..sharding::ROUTING_SLOT_COUNT,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_object_store_and_slots(
+        slate_config: &SlateDbStorageConfig,
+        object_store: Arc<dyn ObjectStore>,
+        owned_slots: Range<u16>,
     ) -> crate::util::Result<Self> {
         let settings = load_settings(slate_config)?;
         info!(
@@ -929,16 +1110,20 @@ impl Storage {
                 .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?,
         );
 
-        Ok(Self::from_db(db, namespace))
+        Ok(Self::from_db_with_slots(db, owned_slots))
     }
 
-    fn from_db(db: Arc<Db>, namespace: Namespace) -> Self {
+    fn from_db(db: Arc<Db>) -> Self {
+        Self::from_db_with_slots(db, 0..sharding::ROUTING_SLOT_COUNT)
+    }
+
+    fn from_db_with_slots(db: Arc<Db>, owned_slots: Range<u16>) -> Self {
         Self {
             db: db.clone(),
             reader: StorageReaderInner {
                 db: db.clone(),
                 segments: Arc::new(move || db.status().list_segments()),
-                namespace,
+                owned_slots,
             },
         }
     }
@@ -1036,9 +1221,13 @@ impl Storage {
             reader: StorageReaderInner {
                 db: snapshot,
                 segments: Arc::new(move || segments.clone()),
-                namespace: self.reader.namespace.clone(),
+                owned_slots: self.reader.owned_slots.clone(),
             },
         })
+    }
+
+    pub(crate) fn owned_slots(&self) -> Range<u16> {
+        self.reader.owned_slots.clone()
     }
 
     /// Flushes pending writes to durable storage.
@@ -1090,6 +1279,7 @@ impl Store for Storage {
 pub(crate) fn insert_series_id(
     namespace: &Namespace,
     bucket: TimeBucket,
+    routing_slot: u16,
     fingerprint: SeriesFingerprint,
     id: SeriesId,
     ttl: Ttl,
@@ -1097,6 +1287,7 @@ pub(crate) fn insert_series_id(
     let key = SeriesDictionaryKey {
         namespace: namespace.clone(),
         bucket,
+        routing_slot,
         series_fingerprint: fingerprint,
     }
     .encode();
@@ -1110,6 +1301,7 @@ pub(crate) fn insert_series_id(
 pub(crate) fn insert_forward_index(
     namespace: &Namespace,
     bucket: TimeBucket,
+    routing_slot: u16,
     series_id: SeriesId,
     series_spec: SeriesSpec,
     ttl: Ttl,
@@ -1117,6 +1309,7 @@ pub(crate) fn insert_forward_index(
     let key = ForwardIndexKey {
         namespace: namespace.clone(),
         bucket,
+        routing_slot,
         series_id,
     }
     .encode();
@@ -1136,6 +1329,7 @@ pub(crate) fn insert_forward_index(
 pub(crate) fn merge_inverted_index(
     namespace: &Namespace,
     bucket: TimeBucket,
+    routing_slot: u16,
     label: Label,
     postings: RoaringBitmap,
     ttl: Ttl,
@@ -1143,6 +1337,7 @@ pub(crate) fn merge_inverted_index(
     let key = InvertedIndexKey {
         namespace: namespace.clone(),
         bucket,
+        routing_slot,
         attribute: label.name,
         value: label.value,
     }
@@ -1157,6 +1352,7 @@ pub(crate) fn merge_inverted_index(
 pub(crate) fn merge_samples(
     namespace: &Namespace,
     bucket: TimeBucket,
+    routing_slot: u16,
     series_id: SeriesId,
     metric_name: &str,
     samples: Vec<Sample>,
@@ -1165,6 +1361,7 @@ pub(crate) fn merge_samples(
     let key = TimeSeriesKey {
         namespace: namespace.clone(),
         bucket,
+        routing_slot,
         metric_name: metric_name.to_string(),
         series_id,
     }
@@ -1196,7 +1393,7 @@ mod tests {
     use slatedb_common::clock::MockSystemClock;
 
     fn storage_from_db(db: Db) -> Storage {
-        Storage::from_db(Arc::new(db), crate::Namespace::default())
+        Storage::from_db(Arc::new(db))
     }
 
     fn reader_from_db_reader(reader: DbReader) -> StorageReader {
@@ -1206,7 +1403,7 @@ mod tests {
             reader: StorageReaderInner {
                 db: reader,
                 segments: Arc::new(move || status_reader.status().list_segments()),
-                namespace: crate::Namespace::default(),
+                owned_slots: 0..sharding::ROUTING_SLOT_COUNT,
             },
         }
     }
@@ -1523,6 +1720,7 @@ mod tests {
         let key = ForwardIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 0,
             series_id: 1,
         }
         .encode();
@@ -1545,7 +1743,11 @@ mod tests {
         );
 
         // the bucket is discoverable from the segment list.
-        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
+        let namespace = crate::Namespace::default();
+        let buckets = storage
+            .get_buckets_in_range(&namespace, None, None)
+            .await
+            .unwrap();
         assert!(buckets.contains(&bucket));
 
         // when / then: warming the live bucket (with and without samples), an
@@ -1553,11 +1755,21 @@ mod tests {
         // per-SST fanout run; `warm_sst` itself no-ops because the in-memory
         // config has no block cache.
         let cancel = CancellationToken::new();
-        storage.warm(buckets.clone(), true, &cancel).await.unwrap();
-        storage.warm(buckets, false, &cancel).await.unwrap();
-        storage.warm(vec![], true, &cancel).await.unwrap();
+        storage
+            .warm(&namespace, buckets.clone(), true, &cancel)
+            .await
+            .unwrap();
+        storage
+            .warm(&namespace, buckets, false, &cancel)
+            .await
+            .unwrap();
+        storage
+            .warm(&namespace, vec![], true, &cancel)
+            .await
+            .unwrap();
         storage
             .warm(
+                &namespace,
                 vec![TimeBucket {
                     start: 999_999,
                     size: 1,
@@ -1572,8 +1784,14 @@ mod tests {
         // returns Ok.
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
-        storage.warm(buckets, true, &cancelled).await.unwrap();
+        let buckets = storage
+            .get_buckets_in_range(&namespace, None, None)
+            .await
+            .unwrap();
+        storage
+            .warm(&namespace, buckets, true, &cancelled)
+            .await
+            .unwrap();
 
         storage.close().await.unwrap();
     }

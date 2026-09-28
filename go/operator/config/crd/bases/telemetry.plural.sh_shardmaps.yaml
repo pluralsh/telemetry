@@ -1,0 +1,266 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: shardmaps.telemetry.plural.sh
+spec:
+  group: telemetry.plural.sh
+  names:
+    kind: ShardMap
+    listKind: ShardMapList
+    plural: shardmaps
+    shortNames:
+    - sm
+    singular: shardmap
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.generation
+      name: Generation
+      type: integer
+    - jsonPath: .spec.shard_count
+      name: Shards
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ShardMap is the Schema for authoritative telemetry shard routing.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ShardMapSpec is the authoritative routing and writer-ownership snapshot.
+              The elected Rust shard coordinator writes it with resourceVersion-based
+              compare-and-swap updates; all writer and reader replicas consume it by watch.
+            properties:
+              assignments:
+                items:
+                  properties:
+                    owner:
+                      properties:
+                        id:
+                          type: string
+                        ordinal:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                      - id
+                      - ordinal
+                      type: object
+                    range:
+                      properties:
+                        end:
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        start:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                      - end
+                      - start
+                      type: object
+                    state:
+                      enum:
+                      - pending
+                      - active
+                      - draining
+                      - released
+                      type: string
+                  required:
+                  - owner
+                  - range
+                  - state
+                  type: object
+                type: array
+              generation:
+                format: int64
+                minimum: 1
+                type: integer
+              migration:
+                properties:
+                  desired_shard_count:
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  error:
+                    type: string
+                  phase:
+                    enum:
+                    - preparing
+                    - prepared
+                    - draining
+                    - cloning
+                    - ready
+                    - completing
+                    - failed
+                    type: string
+                  split:
+                    properties:
+                      moved_range:
+                        properties:
+                          end:
+                            pattern: ^[0-9a-f]{32}$
+                            type: string
+                          start:
+                            pattern: ^[0-9a-f]{32}$
+                            type: string
+                        required:
+                        - end
+                        - start
+                        type: object
+                      source_owner:
+                        properties:
+                          id:
+                            type: string
+                          ordinal:
+                            format: int32
+                            minimum: 0
+                            type: integer
+                        required:
+                        - id
+                        - ordinal
+                        type: object
+                      source_shard:
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      target_owner:
+                        properties:
+                          id:
+                            type: string
+                          ordinal:
+                            format: int32
+                            minimum: 0
+                            type: integer
+                        required:
+                        - id
+                        - ordinal
+                        type: object
+                      target_shard:
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    required:
+                    - moved_range
+                    - source_owner
+                    - source_shard
+                    - target_owner
+                    - target_shard
+                    type: object
+                  target_routing:
+                    properties:
+                      assignments:
+                        items:
+                          properties:
+                            range:
+                              properties:
+                                end:
+                                  pattern: ^[0-9a-f]{32}$
+                                  type: string
+                                start:
+                                  pattern: ^[0-9a-f]{32}$
+                                  type: string
+                              required:
+                              - end
+                              - start
+                              type: object
+                            shard:
+                              format: int32
+                              minimum: 0
+                              type: integer
+                          required:
+                          - range
+                          - shard
+                          type: object
+                        type: array
+                      generation:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    required:
+                    - assignments
+                    - generation
+                    type: object
+                required:
+                - desired_shard_count
+                - phase
+                - split
+                - target_routing
+                type: object
+              routing:
+                properties:
+                  assignments:
+                    items:
+                      properties:
+                        range:
+                          properties:
+                            end:
+                              pattern: ^[0-9a-f]{32}$
+                              type: string
+                            start:
+                              pattern: ^[0-9a-f]{32}$
+                              type: string
+                          required:
+                          - end
+                          - start
+                          type: object
+                        shard:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                      - range
+                      - shard
+                      type: object
+                    type: array
+                  generation:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                required:
+                - assignments
+                - generation
+                type: object
+              shard_count:
+                description: |-
+                  ShardCount is the current number of physical SlateDB storage shards.
+                  Desired count comes from writer StatefulSet replicas.
+                format: int32
+                minimum: 1
+                type: integer
+            required:
+            - assignments
+            - generation
+            - routing
+            - shard_count
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

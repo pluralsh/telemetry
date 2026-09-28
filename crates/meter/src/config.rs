@@ -27,7 +27,7 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDb
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
 /// };
-/// let ts = meter::TimeSeriesDb::open(Namespace::default(), config).await?;
+/// let ts = meter::TimeSeriesDb::open(config).await?;
 /// # Ok(())
 /// # }
 /// ```

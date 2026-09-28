@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
+use async_trait::async_trait;
+use sharding::{
+    DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
+    ShardId, ShardMap,
+};
+use slatedb::config::DbReaderOptions;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::query::query_databases;
@@ -57,29 +62,13 @@ impl ShardingOptions {
         self.io_concurrency_multiplier
     }
 
-    pub fn route(self, namespace: &Namespace, labels: &Labels) -> ShardId {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&(namespace.as_bytes().len() as u32).to_be_bytes());
-        hasher.update(namespace.as_bytes());
-        for label in labels.iter() {
-            hasher.update(&(label.name.len() as u32).to_be_bytes());
-            hasher.update(label.name.as_bytes());
-            hasher.update(&(label.value.len() as u32).to_be_bytes());
-            hasher.update(label.value.as_bytes());
-        }
-        let hash = hasher.finalize();
-        let value = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("eight bytes"));
-        ShardId::new((value % u64::from(self.virtual_shards)) as u32)
+    pub fn route(self, routing: &HashRangeMap, namespace: &Namespace, labels: &Labels) -> ShardId {
+        routing.route(sharding::hash_routing_key(
+            &crate::routing::canonical_routing_key(namespace, labels),
+        ))
     }
 
     pub fn shard_storage(self, config: &Config, shard: ShardId) -> Result<Config> {
-        if shard.get() >= self.virtual_shards {
-            return Err(Error::Invalid(format!(
-                "shard {} is outside configured virtual shard count {}",
-                shard.get(),
-                self.virtual_shards
-            )));
-        }
         let mut config = config.clone();
         config.storage = config
             .storage
@@ -93,6 +82,8 @@ pub struct ShardedLine {
     config: Config,
     options: ShardingOptions,
     shards: RwLock<BTreeMap<ShardId, Arc<LogDb>>>,
+    shard_slots: RwLock<BTreeMap<ShardId, std::ops::Range<u16>>>,
+    reader_options: Option<DbReaderOptions>,
     io_permits: Arc<Semaphore>,
 }
 
@@ -102,10 +93,26 @@ impl ShardedLine {
         options: ShardingOptions,
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
+        let routing = HashRangeMap::bootstrap(options.virtual_shards())
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        Self::open_with_routing(config, options, shards, &routing).await
+    }
+
+    pub async fn open_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+    ) -> Result<Self> {
         let mut databases = BTreeMap::new();
+        let mut shard_slots = BTreeMap::new();
         for shard in shards {
-            let database = LogDb::open(options.shard_storage(&config, shard)?).await?;
+            let slots = slot_range(routing, shard)?;
+            let database =
+                LogDb::open_with_slots(options.shard_storage(&config, shard)?, slots.clone())
+                    .await?;
             databases.insert(shard, Arc::new(database));
+            shard_slots.insert(shard, slots);
         }
         Ok(Self {
             config,
@@ -115,11 +122,46 @@ impl ShardedLine {
                 options.io_concurrency_multiplier(),
             ),
             shards: RwLock::new(databases),
+            shard_slots: RwLock::new(shard_slots),
+            reader_options: None,
         })
     }
 
-    pub fn route(&self, namespace: &Namespace, labels: &Labels) -> ShardId {
-        self.options.route(namespace, labels)
+    pub async fn open_readers_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+        reader_options: DbReaderOptions,
+    ) -> Result<Self> {
+        let mut databases = BTreeMap::new();
+        let mut shard_slots = BTreeMap::new();
+        for shard in shards {
+            let slots = slot_range(routing, shard)?;
+            let database = LogDb::open_reader_with_slots(
+                options.shard_storage(&config, shard)?,
+                slots.clone(),
+                reader_options.clone(),
+            )
+            .await?;
+            databases.insert(shard, Arc::new(database));
+            shard_slots.insert(shard, slots);
+        }
+        Ok(Self {
+            config,
+            options,
+            io_permits: shard_io_semaphore(
+                options.virtual_shards() as usize,
+                options.io_concurrency_multiplier(),
+            ),
+            shards: RwLock::new(databases),
+            shard_slots: RwLock::new(shard_slots),
+            reader_options: Some(reader_options),
+        })
+    }
+
+    pub fn route(&self, routing: &HashRangeMap, namespace: &Namespace, labels: &Labels) -> ShardId {
+        self.options.route(routing, namespace, labels)
     }
 
     pub async fn contains_shard(&self, shard: ShardId) -> bool {
@@ -131,10 +173,25 @@ impl ShardedLine {
     }
 
     pub async fn open_shard(&self, shard: ShardId) -> Result<()> {
+        let routing = HashRangeMap::bootstrap(self.options.virtual_shards())
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        self.open_shard_with_slots(shard, slot_range(&routing, shard)?)
+            .await
+    }
+
+    pub async fn open_shard_with_slots(
+        &self,
+        shard: ShardId,
+        owned_slots: std::ops::Range<u16>,
+    ) -> Result<()> {
         if self.contains_shard(shard).await {
             return Ok(());
         }
-        let database = LogDb::open(self.options.shard_storage(&self.config, shard)?).await?;
+        let database = LogDb::open_with_slots(
+            self.options.shard_storage(&self.config, shard)?,
+            owned_slots.clone(),
+        )
+        .await?;
         let mut shards = self.shards.write().await;
         if shards.contains_key(&shard) {
             drop(shards);
@@ -142,6 +199,7 @@ impl ShardedLine {
             return Ok(());
         }
         shards.insert(shard, Arc::new(database));
+        self.shard_slots.write().await.insert(shard, owned_slots);
         Ok(())
     }
 
@@ -157,10 +215,14 @@ impl ShardedLine {
         let Some(database) = shards.remove(&shard) else {
             return Ok(());
         };
+        let owned_slots = self.shard_slots.write().await.remove(&shard);
         let database = match Arc::try_unwrap(database) {
             Ok(database) => database,
             Err(database) => {
                 shards.insert(shard, database);
+                if let Some(owned_slots) = owned_slots {
+                    self.shard_slots.write().await.insert(shard, owned_slots);
+                }
                 return Err(Error::Invalid(
                     "shard database still has in-flight references".into(),
                 ));
@@ -178,8 +240,89 @@ impl ShardedLine {
         self.shards.read().await.keys().copied().collect()
     }
 
+    pub async fn reconcile_shards(&self, routing: &HashRangeMap) -> Result<()> {
+        let desired = routing
+            .assignments
+            .iter()
+            .map(|assignment| {
+                assignment
+                    .range
+                    .slots()
+                    .map(|slots| (assignment.shard, slots))
+                    .map_err(|error| Error::Invalid(error.to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let current_slots = self.shard_slots.read().await.clone();
+        let mut opened = BTreeMap::new();
+        for (&shard, slots) in &desired {
+            if current_slots.get(&shard) == Some(slots) {
+                continue;
+            }
+            let reader_options = self.reader_options.as_ref().ok_or_else(|| {
+                Error::Invalid("reader reconciliation requires a reader facade".into())
+            })?;
+            opened.insert(
+                shard,
+                Arc::new(
+                    LogDb::open_reader_with_slots(
+                        self.options.shard_storage(&self.config, shard)?,
+                        slots.clone(),
+                        reader_options.clone(),
+                    )
+                    .await?,
+                ),
+            );
+        }
+
+        let mut shards = self.shards.write().await;
+        let mut shard_slots = self.shard_slots.write().await;
+        let retiring = shards
+            .iter()
+            .filter(|(shard, _)| desired.get(shard) != shard_slots.get(shard))
+            .map(|(shard, database)| (*shard, Arc::strong_count(database)))
+            .collect::<Vec<_>>();
+        if let Some((shard, references)) = retiring
+            .iter()
+            .find(|(_, references)| *references != 1)
+            .copied()
+        {
+            drop(shard_slots);
+            drop(shards);
+            for (_, database) in opened {
+                Arc::try_unwrap(database)
+                    .unwrap_or_else(|_| unreachable!("new shard has no external references"))
+                    .close()
+                    .await?;
+            }
+            return Err(Error::Invalid(format!(
+                "shard {shard} still has {} in-flight references",
+                references - 1
+            )));
+        }
+        let retiring = retiring
+            .into_iter()
+            .filter_map(|(shard, _)| shards.remove(&shard))
+            .collect::<Vec<_>>();
+        for (shard, database) in opened {
+            shards.insert(shard, database);
+        }
+        *shard_slots = desired;
+        drop(shard_slots);
+        drop(shards);
+        for database in retiring {
+            Arc::try_unwrap(database)
+                .unwrap_or_else(|_| {
+                    unreachable!("retired shard was checked for external references")
+                })
+                .close()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn write(
         &self,
+        routing: &HashRangeMap,
         namespace: &Namespace,
         batches: Vec<LogBatch>,
         durability: Durability,
@@ -187,7 +330,7 @@ impl ShardedLine {
         let mut grouped: BTreeMap<ShardId, Vec<LogBatch>> = BTreeMap::new();
         for batch in batches {
             grouped
-                .entry(self.route(namespace, &batch.labels))
+                .entry(self.route(routing, namespace, &batch.labels))
                 .or_default()
                 .push(batch);
         }
@@ -241,11 +384,35 @@ impl ShardedLine {
         let databases = std::mem::take(&mut *self.shards.write().await)
             .into_values()
             .collect::<Vec<_>>();
+        self.shard_slots.write().await.clear();
         for database in databases {
             database.close().await?;
         }
         Ok(())
     }
+}
+
+#[async_trait]
+impl ReaderShardLifecycle for ShardedLine {
+    async fn reconcile_readers(
+        &self,
+        assignment: &ShardMap,
+    ) -> std::result::Result<(), sharding::BoxError> {
+        self.reconcile_shards(&assignment.routing)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+fn slot_range(routing: &HashRangeMap, shard: ShardId) -> Result<std::ops::Range<u16>> {
+    routing
+        .assignments
+        .iter()
+        .find(|assignment| assignment.shard == shard)
+        .ok_or_else(|| Error::Invalid(format!("unknown shard {}", shard.get())))?
+        .range
+        .slots()
+        .map_err(|error| Error::Invalid(error.to_string()))
 }
 
 #[cfg(test)]
@@ -268,13 +435,19 @@ mod tests {
     #[test]
     fn routing_is_canonical_stable_and_namespace_scoped() {
         let options = ShardingOptions::new(64, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let routing = HashRangeMap::bootstrap(options.virtual_shards()).unwrap();
         let a = Namespace::new("a").unwrap();
         let b = Namespace::new("b").unwrap();
         let canonical = labels(&[("a", "2"), ("z", "1")]);
         let reordered = Labels::new(vec![Label::new("z", "1"), Label::new("a", "2")]).unwrap();
-        assert_eq!(options.route(&a, &canonical), options.route(&a, &reordered));
-        assert_ne!(options.route(&a, &canonical), options.route(&b, &canonical));
-        assert_eq!(options.route(&a, &canonical).get(), 39);
+        assert_eq!(
+            options.route(&routing, &a, &canonical),
+            options.route(&routing, &a, &reordered)
+        );
+        assert_ne!(
+            options.route(&routing, &a, &canonical),
+            options.route(&routing, &b, &canonical)
+        );
     }
 
     #[test]
@@ -287,6 +460,7 @@ mod tests {
     #[tokio::test]
     async fn writes_and_queries_across_shards_with_global_limits() {
         let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let routing = HashRangeMap::bootstrap(options.virtual_shards()).unwrap();
         let database = ShardedLine::open(
             Config {
                 storage: StorageConfig::InMemory,
@@ -302,7 +476,7 @@ mod tests {
         for shard in 0..2 {
             let labels = (0..10_000)
                 .map(|candidate| labels(&[("app", &format!("{shard}-{candidate}"))]))
-                .find(|labels| options.route(&namespace, labels).get() == shard)
+                .find(|labels| options.route(&routing, &namespace, labels).get() == shard)
                 .unwrap();
             batches.push(LogBatch::new(
                 labels,
@@ -310,7 +484,7 @@ mod tests {
             ));
         }
         database
-            .write(&namespace, batches, Durability::Written)
+            .write(&routing, &namespace, batches, Durability::Written)
             .await
             .unwrap();
         let result = database
@@ -376,5 +550,40 @@ mod tests {
         database.flush_shard(shard).await.unwrap();
         database.close_shard(shard).await.unwrap();
         assert!(!database.contains_shard(shard).await);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_adds_resizes_and_safely_removes_reader_shards() {
+        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let one = HashRangeMap::bootstrap(1).unwrap();
+        let two = one.grow_to(2).unwrap();
+        let database = ShardedLine::open_readers_with_routing(
+            Config {
+                storage: StorageConfig::InMemory,
+                ..Config::default()
+            },
+            options,
+            [ShardId::new(0)],
+            &one,
+            DbReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        database.reconcile_shards(&two).await.unwrap();
+        assert_eq!(
+            database.open_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        let active = database.shard(ShardId::new(1)).await.unwrap();
+        assert!(database.reconcile_shards(&one).await.is_err());
+        assert_eq!(
+            database.open_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        drop(active);
+        database.reconcile_shards(&one).await.unwrap();
+        assert_eq!(database.open_shards().await, vec![ShardId::new(0)]);
+        database.close().await.unwrap();
     }
 }

@@ -10,8 +10,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: { name: meter-sharding, namespace: meter-regression }
 rules:
-  - apiGroups: [""]
-    resources: [configmaps]
+  - apiGroups: [telemetry.plural.sh]
+    resources: [shardmaps]
     verbs: [get, list, watch, create, update, patch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
@@ -94,19 +94,19 @@ data:
     listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
     storage:
       path: kind
-      object_store: { type: Aws, region: us-east-1, bucket: meter-kind }
+      object_store:
+        { type: Aws, region: us-east-1, bucket: meter-kind, endpoint: "http://minio:9000", allow_http: true }
       block_cache: { type: FoyerMemory, capacity: 33554432 }
       meta_cache: { type: FoyerMemory, capacity: 8388608 }
     reader_cache_capacity: 33554432
     write: { durability: durable, flush_interval_seconds: 1, remote_concurrency: 8, remote_retries: 3 }
     sharding:
-      virtual_shards: 16
       backend: kubernetes
       namespace: meter-regression
       stateful_set: meter
       headless_service: meter-headless
       owner_port: 9090
-      assignment_config_map: meter-shard-assignments
+      shard_map: meter-shard-map
       coordinator_lease: meter-shard-coordinator
       shard_lease_prefix: meter-shard
       lease_duration_seconds: 10
@@ -176,18 +176,18 @@ data:
     listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
     storage:
       path: kind
-      object_store: { type: Aws, region: us-east-1, bucket: meter-kind }
+      object_store:
+        { type: Aws, region: us-east-1, bucket: meter-kind, endpoint: "http://minio:9000", allow_http: true }
       block_cache: { type: FoyerMemory, capacity: 33554432 }
       meta_cache: { type: FoyerMemory, capacity: 8388608 }
     reader_cache_capacity: 33554432
     sharding:
-      virtual_shards: 16
       backend: kubernetes
       namespace: meter-regression
       stateful_set: meter
       headless_service: meter-headless
       owner_port: 9090
-      assignment_config_map: meter-shard-assignments
+      shard_map: meter-shard-map
       coordinator_lease: meter-shard-coordinator
       shard_lease_prefix: meter-shard
       lease_duration_seconds: 10

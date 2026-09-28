@@ -58,6 +58,7 @@ type MeterReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=meters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=meters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=shardmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -113,6 +114,9 @@ func (r *MeterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.RoleBinding{}).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.metersForPVC)).
 		Watches(&telemetryv1alpha1.NamespaceAuthentication{}, handler.EnqueueRequestsFromMapFunc(r.metersForNamespaceAuth)).
+		Watches(&telemetryv1alpha1.ShardMap{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+			return requestsForShardMap(obj.(*telemetryv1alpha1.ShardMap), dataStoreMeter)
+		})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.metersForSecret)).
 		Named("meter").
 		Complete(r)
@@ -425,7 +429,7 @@ func (r *MeterReconciler) workloadsReady(ctx context.Context, meter *telemetryv1
 		if err := r.Get(ctx, types.NamespacedName{Namespace: meter.Namespace, Name: resources.ComponentName(meter, component)}, sts); err != nil {
 			return false, "", err
 		}
-		desired := lo.FromPtrOr(resources.Replicas(meter, component), int32(1))
+		desired := lo.FromPtrOr(sts.Spec.Replicas, int32(1))
 		if sts.Status.ReadyReplicas < desired || sts.Status.ObservedGeneration < sts.Generation {
 			return false, fmt.Sprintf("%s has %d/%d ready replicas", component, sts.Status.ReadyReplicas, desired), nil
 		}
@@ -444,9 +448,19 @@ func (r *MeterReconciler) setStatus(ctx context.Context, meter *telemetryv1alpha
 	if resources.Mode(current) == telemetryv1alpha1.MeterModeSharded {
 		current.Status.WriterEndpoint = fmt.Sprintf("http://%s:%d", resources.ComponentName(current, resources.ComponentWriter), resources.HTTPPort(current))
 		current.Status.ReaderEndpoint = fmt.Sprintf("http://%s:%d", resources.ComponentName(current, resources.ComponentReader), resources.HTTPPort(current))
+		scaling, err := loadWriterScalingState(ctx, r.Client, current, dataStoreMeter, resources.Mode(current), writerReplicaIntent(current))
+		if err != nil {
+			return err
+		}
+		current.Status.WriterScalingStatus = scaling.status
+		setWriterScalingConditions(&current.Status.Conditions, current.Generation, scaling)
+		if converged, scalingMessage := shardedReady(scaling); !converged && (reason == reasonReady || reason == reasonProgressing) {
+			status, reason, message = metav1.ConditionFalse, reasonProgressing, scalingMessage
+		}
 	} else {
 		current.Status.WriterEndpoint = fmt.Sprintf("http://%s:%d", current.Name, resources.HTTPPort(current))
 		current.Status.ReaderEndpoint = current.Status.WriterEndpoint
+		current.Status.WriterScalingStatus = telemetryv1alpha1.WriterScalingStatus{EffectiveWriterReplicas: 1}
 	}
 	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: conditionReady, Status: status, Reason: reason, Message: message, ObservedGeneration: current.Generation, LastTransitionTime: metav1.NewTime(time.Now())})
 	if equality.Semantic.DeepEqual(base.Status, current.Status) {

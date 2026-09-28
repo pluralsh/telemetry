@@ -6,8 +6,8 @@ metadata:
   labels:
     {{- include "meter.labels" . | nindent 4 }}
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
+  - apiGroups: ["telemetry.plural.sh"]
+    resources: ["shardmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

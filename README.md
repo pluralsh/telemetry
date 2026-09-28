@@ -17,8 +17,9 @@ are documented in the [technical documentation](documentation/README.md).
 Track accepts OTLP over HTTP (`4318`-style namespace routes) and gRPC (`4317`),
 Zipkin JSON, and Jaeger collector gRPC (`14250`). Its Tempo-compatible read API
 includes trace lookup, TraceQL search, and canonical v1/v2 tag discovery. In
-sharded Kubernetes deployments, readers fan out across all virtual shards while
-writers acquire stable shard ranges using StatefulSet membership and leases.
+sharded Kubernetes deployments, readers fan out across all storage shards while
+writers acquire stable shard ownership using StatefulSet membership and leases.
+Routing uses versioned explicit 128-bit hash ranges independent of writer count.
 
 We might add other interesting slatedb + rust projects in here as well, but they'll all be datastore focused as a core guiding principle.  Many of these are also inspired or utilize implementations from the [Opendata](https://www.opendata.dev/) project to bootstrap the implementation.
 
@@ -43,7 +44,10 @@ See [Operator Docs](go/operator/docs/api.md) for full API documentation.
 
 ## Sharding
 
-Sharding is implemented on top of kubernetes for coordination, and supports shard assignment via a virtual shard -> physical shard mapping, with configurable shard ranges assigned to active writers.
+Sharding is implemented on top of Kubernetes coordination. A single versioned
+assignment snapshot carries explicit 128-bit hash-range routing plus storage
+shard ownership. Writer scaling only reassigns ownership; changing the storage
+shard count requires an explicit split/backfill/cutover migration.
 
 We utilize a few k8s api primitives to do this:
 

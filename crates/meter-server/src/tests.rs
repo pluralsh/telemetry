@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     sync::{Arc, Mutex},
 };
@@ -60,8 +60,8 @@ fn state(mode: ServerMode) -> AppState {
         remote_limit: Arc::new(Semaphore::new(4)),
         config: Arc::new(config),
         jwt: None,
-        writers: Arc::new(RwLock::new(HashMap::new())),
-        readers: Arc::new(RwLock::new(HashMap::new())),
+        writers: None,
+        readers: None,
         assignment: Arc::new(RwLock::new(assignment)),
         local_owner: "standalone".to_owned(),
         completed_requests: Arc::new(Mutex::new(HashSet::new())),
@@ -472,13 +472,12 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     assert!(state.flush_runs.load(Ordering::Relaxed) > 0);
 
     let namespace = Namespace::new("alpha").unwrap();
-    let mut storage = meter_config_for_namespace(&config, &namespace).storage;
+    let mut storage = meter_config(&config).storage;
     storage.path = ShardingOptions::new(1, 4)
         .unwrap()
         .shard_path(&storage.path, ShardId::new(0))
         .unwrap();
     let reader = meter::TimeSeriesDbReader::open(
-        namespace,
         storage,
         slatedb::config::DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(100),
@@ -491,6 +490,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     .unwrap();
     let query = reader
         .query(
+            &namespace,
             "durably_visible",
             Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
         )
@@ -499,7 +499,10 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     assert!(!query.into_matrix().is_empty());
     let metadata = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let metadata = reader.metadata(Some("durably_visible")).await.unwrap();
+            let metadata = reader
+                .metadata(&namespace, Some("durably_visible"))
+                .await
+                .unwrap();
             if !metadata.is_empty() {
                 return metadata;
             }
@@ -546,16 +549,16 @@ fn static_assignment_groups_local_and_remote_owners() {
 
 #[cfg(feature = "kubernetes")]
 #[test]
-fn coordinator_detects_scale_out_and_scale_in_membership() {
+fn coordinator_uses_replica_count_as_desired_shard_count() {
     let one = vec![Owner::new("meter-0", 0)];
     let two = vec![Owner::new("meter-0", 0), Owner::new("meter-1", 1)];
-    let initial = balanced_contiguous(AssignmentGeneration::new(1), 64, &one, None).unwrap();
-    assert!(!membership_changed(Some(&initial), &one, 64));
-    assert!(membership_changed(Some(&initial), &two, 64));
-    let scaled = balanced_contiguous(initial.generation.next(), 64, &two, Some(&initial)).unwrap();
-    assert_eq!(scaled.generation.get(), 2);
-    assert_eq!(scaled.assignments.len(), 2);
-    assert!(membership_changed(Some(&scaled), &one, 64));
+    let initial = balanced_contiguous(AssignmentGeneration::new(1), 1, &one, None).unwrap();
+    assert!(!membership_changed(Some(&initial), &one, 1));
+    assert!(membership_changed(Some(&initial), &two, 2));
+
+    let scaled = balanced_contiguous(AssignmentGeneration::new(2), 2, &two, None).unwrap();
+    assert!(!membership_changed(Some(&scaled), &two, 2));
+    assert!(membership_changed(Some(&scaled), &one, 1));
 }
 
 fn proto_request(generation: u64, shard: u64) -> WriteBatchRequest {
@@ -607,12 +610,13 @@ async fn grpc_retries_are_idempotent() {
         .unwrap();
     let namespace = Namespace::new("alpha").unwrap();
     let options = ShardingOptions::new(DEFAULT_VIRTUAL_SHARDS, 4).unwrap();
+    let routing = state.assignment.read().await.routing.clone();
     let mut item = Series::new(
         "idempotent_total",
         vec![Label::new("instance", "a")],
         vec![Sample::new(1_700_000_000_000, 1.0)],
     );
-    let shard = options.route(&namespace, &item.labels);
+    let shard = options.route(&routing, &namespace, &item.labels);
     let request = WriteBatchRequest {
         namespace: Some(ProtoNamespace {
             name: "alpha".to_owned(),
@@ -647,6 +651,25 @@ async fn grpc_retries_are_idempotent() {
         .into_inner();
     assert_eq!(first.accepted_series, second.accepted_series);
     assert_eq!(first.accepted_samples, second.accepted_samples);
+    let beta_request = WriteBatchRequest {
+        namespace: Some(ProtoNamespace {
+            name: "beta".to_owned(),
+        }),
+        assignment_generation: 1,
+        shard_id: 0,
+        series: vec![],
+        metadata: vec![],
+        durability: ProtoDurability::Applied as i32,
+        request_id: "same-request".to_owned(),
+    };
+    InternalWriter::write(&state, Request::new(beta_request))
+        .await
+        .unwrap();
+    {
+        let completed = state.completed_requests.lock().unwrap();
+        assert!(completed.contains(&("alpha".to_owned(), "same-request".to_owned())));
+        assert!(completed.contains(&("beta".to_owned(), "same-request".to_owned())));
+    }
     state.shutdown().await.unwrap();
 }
 

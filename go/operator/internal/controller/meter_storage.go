@@ -42,6 +42,11 @@ func (r *MeterReconciler) reconcileStatefulSet(ctx context.Context, meter *telem
 	if err := controllerutil.SetControllerReference(meter, desired, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
+	if component == resources.ComponentWriter {
+		if err := synchronizeWriterReplicas(ctx, r.Client, meter, dataStoreMeter, resources.Mode(meter), desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	current := &appsv1.StatefulSet{}
 	key := client.ObjectKeyFromObject(desired)

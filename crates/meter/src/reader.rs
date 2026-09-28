@@ -6,6 +6,7 @@
 //! which always fences the previous writer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -164,10 +165,9 @@ impl QueryReader for ReaderQueryReader {
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    namespace: Namespace,
     storage: StorageReader,
     /// LRU cache for read-only query buckets.
-    query_cache: Cache<TimeBucket, Arc<MiniQueryReader<StorageReader>>>,
+    query_cache: Cache<(Namespace, TimeBucket), Arc<MiniQueryReader<StorageReader>>>,
 }
 
 impl TimeSeriesDbReader {
@@ -180,17 +180,16 @@ impl TimeSeriesDbReader {
     ///
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(
-        namespace: Namespace,
         storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
         Self::open_inner(
-            namespace,
             storage_config,
             reader_options,
             cache_capacity,
             None,
+            0..sharding::ROUTING_SLOT_COUNT,
         )
         .await
     }
@@ -202,41 +201,52 @@ impl TimeSeriesDbReader {
     /// writes. The checkpoint must already exist (typically created via
     /// `TimeSeriesDb::create_checkpoint`).
     pub async fn open_at_checkpoint(
-        namespace: Namespace,
         storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
         checkpoint_id: Uuid,
     ) -> Result<Self> {
         Self::open_inner(
-            namespace,
             storage_config,
             reader_options,
             cache_capacity,
             Some(checkpoint_id),
+            0..sharding::ROUTING_SLOT_COUNT,
         )
         .await
     }
 
     async fn open_inner(
-        namespace: Namespace,
         storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
         checkpoint_id: Option<Uuid>,
+        owned_slots: Range<u16>,
     ) -> Result<Self> {
-        let reader = StorageReader::try_new(
+        let reader = StorageReader::try_new_with_slots(
             &storage_config,
-            namespace.clone(),
             reader_options,
             checkpoint_id,
+            owned_slots,
         )
         .await?;
-        Ok(Self::from_storage_with_capacity_scoped(
-            namespace,
-            reader,
+        Ok(Self::from_storage_with_capacity(reader, cache_capacity))
+    }
+
+    pub(crate) async fn open_with_slots(
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        owned_slots: Range<u16>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            storage_config,
+            reader_options,
             cache_capacity,
-        ))
+            None,
+            owned_slots,
+        )
+        .await
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
@@ -245,17 +255,8 @@ impl TimeSeriesDbReader {
     }
 
     fn from_storage_with_capacity(storage: StorageReader, cache_capacity: u64) -> Self {
-        Self::from_storage_with_capacity_scoped(Namespace::default(), storage, cache_capacity)
-    }
-
-    fn from_storage_with_capacity_scoped(
-        namespace: Namespace,
-        storage: StorageReader,
-        cache_capacity: u64,
-    ) -> Self {
         let query_cache = Cache::builder().max_capacity(cache_capacity).build();
         Self {
-            namespace,
             storage,
             query_cache,
         }
@@ -267,14 +268,33 @@ impl TimeSeriesDbReader {
         self.storage.clone()
     }
 
+    pub(crate) async fn make_query_reader_for_ranges(
+        &self,
+        namespace: &Namespace,
+        ranges: &[(i64, i64)],
+    ) -> Result<ReaderQueryReader> {
+        ScopedReader {
+            namespace,
+            reader: self,
+        }
+        .make_query_reader_for_ranges(ranges)
+        .await
+    }
+
     /// Get a cached bucket reader, loading from storage if needed.
-    async fn get_or_load_bucket(&self, bucket: TimeBucket) -> Arc<MiniQueryReader<StorageReader>> {
+    async fn get_or_load_bucket(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+    ) -> Arc<MiniQueryReader<StorageReader>> {
         let storage = self.storage.clone();
+        let namespace = namespace.clone();
         self.query_cache
-            .get_with(bucket, async move {
+            .get_with((namespace.clone(), bucket), async move {
                 Arc::new(MiniQueryReader::new(
-                    self.namespace.clone(),
+                    namespace,
                     bucket,
+                    storage.owned_slots(),
                     storage,
                 ))
             })
@@ -288,21 +308,31 @@ impl TimeSeriesDbReader {
     /// If `time` is `None`, the current wall-clock time is used.
     pub async fn query(
         &self,
+        namespace: &Namespace,
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
-        <Self as TsdbReadEngine>::eval_query(self, query, time, &QueryOptions::default()).await
+        ScopedReader {
+            namespace,
+            reader: self,
+        }
+        .eval_query(query, time, &QueryOptions::default())
+        .await
     }
 
     /// Evaluates a range PromQL query over a time interval.
     pub async fn query_range(
         &self,
+        namespace: &Namespace,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        <Self as TsdbReadEngine>::eval_query_range(
-            self,
+        <ScopedReader<'_> as TsdbReadEngine>::eval_query_range(
+            &ScopedReader {
+                namespace,
+                reader: self,
+            },
             query,
             range,
             step,
@@ -314,19 +344,37 @@ impl TimeSeriesDbReader {
     /// Returns the set of label-sets matching the given series matchers.
     pub async fn series(
         &self,
+        namespace: &Namespace,
         matchers: &[&str],
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        find_series_in_range(self, matchers, range).await
+        find_series_in_range(
+            &ScopedReader {
+                namespace,
+                reader: self,
+            },
+            matchers,
+            range,
+        )
+        .await
     }
 
     /// Returns the set of label names matching the given matchers.
     pub async fn labels(
         &self,
+        namespace: &Namespace,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_labels_in_range(self, matchers, range).await
+        find_labels_in_range(
+            &ScopedReader {
+                namespace,
+                reader: self,
+            },
+            matchers,
+            range,
+        )
+        .await
     }
 
     /// Closes the underlying storage reader, flushing any caches to disk.
@@ -338,11 +386,21 @@ impl TimeSeriesDbReader {
     /// Returns the set of values for a given label name.
     pub async fn label_values(
         &self,
+        namespace: &Namespace,
         label_name: &str,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_label_values_in_range(self, label_name, matchers, range).await
+        find_label_values_in_range(
+            &ScopedReader {
+                namespace,
+                reader: self,
+            },
+            label_name,
+            matchers,
+            range,
+        )
+        .await
     }
 
     /// Returns metric metadata reconstructed from durable forward indexes.
@@ -352,18 +410,19 @@ impl TimeSeriesDbReader {
     /// metric type and unit while leaving descriptions unset.
     pub async fn metadata(
         &self,
+        namespace: &Namespace,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
         let buckets = self
             .storage
-            .get_buckets_in_range(None, None)
+            .get_buckets_in_range(namespace, None, None)
             .await
             .map_err(|error| QueryError::Execution(error.to_string()))?;
         let mut by_metric: BTreeMap<String, Vec<MetricMetadata>> = BTreeMap::new();
         for bucket in buckets {
             let index = self
                 .storage
-                .get_forward_index(bucket)
+                .get_forward_index(namespace, bucket, self.storage.owned_slots())
                 .await
                 .map_err(|error| QueryError::Execution(error.to_string()))?;
             for (_, spec) in index.all_series() {
@@ -399,19 +458,25 @@ impl TimeSeriesDbReader {
 /// Maximum number of buckets to load concurrently.
 const BUCKET_LOAD_CONCURRENCY: usize = 16;
 
+struct ScopedReader<'a> {
+    namespace: &'a Namespace,
+    reader: &'a TimeSeriesDbReader,
+}
+
 #[async_trait]
-impl TsdbReadEngine for TimeSeriesDbReader {
+impl TsdbReadEngine for ScopedReader<'_> {
     type QR = ReaderQueryReader;
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
         let buckets = self
+            .reader
             .storage
-            .get_buckets_in_range(Some(start), Some(end))
+            .get_buckets_in_range(self.namespace, Some(start), Some(end))
             .await?;
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
-                let mini = self.get_or_load_bucket(bucket).await;
+                let mini = self.reader.get_or_load_bucket(self.namespace, bucket).await;
                 (bucket, mini)
             })
             .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
@@ -427,13 +492,16 @@ impl TsdbReadEngine for TimeSeriesDbReader {
     ) -> Result<ReaderQueryReader> {
         let buckets = {
             let _g = crate::promql::trace::Scope::enter("list_buckets");
-            self.storage.get_buckets_for_ranges(ranges).await?
+            self.reader
+                .storage
+                .get_buckets_for_ranges(self.namespace, ranges)
+                .await?
         };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
                 let _g = crate::promql::trace::Scope::enter("bucket_load");
-                let mini = self.get_or_load_bucket(bucket).await;
+                let mini = self.reader.get_or_load_bucket(self.namespace, bucket).await;
                 (bucket, mini)
             })
             .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
@@ -441,6 +509,31 @@ impl TsdbReadEngine for TimeSeriesDbReader {
             .await;
 
         Ok(ReaderQueryReader::new(readers))
+    }
+}
+
+#[async_trait]
+impl TsdbReadEngine for TimeSeriesDbReader {
+    type QR = ReaderQueryReader;
+
+    async fn make_query_reader(&self, start: i64, end: i64) -> Result<Self::QR> {
+        let namespace = Namespace::default();
+        ScopedReader {
+            namespace: &namespace,
+            reader: self,
+        }
+        .make_query_reader(start, end)
+        .await
+    }
+
+    async fn make_query_reader_for_ranges(&self, ranges: &[(i64, i64)]) -> Result<Self::QR> {
+        let namespace = Namespace::default();
+        ScopedReader {
+            namespace: &namespace,
+            reader: self,
+        }
+        .make_query_reader_for_ranges(ranges)
+        .await
     }
 }
 
@@ -479,7 +572,11 @@ mod tests {
         // Query should find the data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
         let result = reader
-            .query("http_requests_total", Some(query_time))
+            .query(
+                &crate::Namespace::default(),
+                "http_requests_total",
+                Some(query_time),
+            )
             .await
             .unwrap();
 
@@ -519,6 +616,7 @@ mod tests {
         // Series discovery
         let series = reader
             .series(
+                &crate::Namespace::default(),
                 &["{__name__=~\"http_requests_total|cpu_usage\"}"],
                 (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
                     ..=(SystemTime::UNIX_EPOCH + Duration::from_secs(1700001000)),
@@ -530,6 +628,7 @@ mod tests {
         // Label names
         let labels = reader
             .labels(
+                &crate::Namespace::default(),
                 None,
                 (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
                     ..=(SystemTime::UNIX_EPOCH + Duration::from_secs(1700001000)),
@@ -543,6 +642,7 @@ mod tests {
         // Label values
         let values = reader
             .label_values(
+                &crate::Namespace::default(),
                 "method",
                 None,
                 (SystemTime::UNIX_EPOCH + Duration::from_secs(1699999000))
@@ -577,7 +677,10 @@ mod tests {
 
         // Reader sees initial data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000);
-        let result = reader.query("metric_a", Some(query_time)).await.unwrap();
+        let result = reader
+            .query(&crate::Namespace::default(), "metric_a", Some(query_time))
+            .await
+            .unwrap();
         match &result {
             QueryValue::Vector(samples) => assert_eq!(samples.len(), 1),
             _ => panic!("expected Vector"),
@@ -599,7 +702,7 @@ mod tests {
         let late_reader = TimeSeriesDbReader::from_storage(shared.reader().await);
         let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
         let result2 = late_reader
-            .query("metric_a", Some(query_time2))
+            .query(&crate::Namespace::default(), "metric_a", Some(query_time2))
             .await
             .unwrap();
         match &result2 {
@@ -611,7 +714,10 @@ mod tests {
         }
 
         // The first reader still serves its original view.
-        let result3 = reader.query("metric_a", Some(query_time)).await.unwrap();
+        let result3 = reader
+            .query(&crate::Namespace::default(), "metric_a", Some(query_time))
+            .await
+            .unwrap();
         match &result3 {
             QueryValue::Vector(samples) => {
                 assert_eq!(samples.len(), 1);
@@ -645,7 +751,12 @@ mod tests {
         let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
 
         let result = reader
-            .query_range("counter", start..=end, Duration::from_secs(15))
+            .query_range(
+                &crate::Namespace::default(),
+                "counter",
+                start..=end,
+                Duration::from_secs(15),
+            )
             .await
             .unwrap();
 
@@ -681,14 +792,11 @@ mod tests {
         };
 
         // 1. Open writer and write data
-        let writer = TimeSeriesDb::open(
-            crate::Namespace::default(),
-            Config {
-                storage: storage_config.clone(),
-                flush_interval: Duration::from_secs(60),
-                retention: None,
-            },
-        )
+        let writer = TimeSeriesDb::open(Config {
+            storage: storage_config.clone(),
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
         .await
         .unwrap();
 
@@ -700,7 +808,10 @@ mod tests {
                 .sample(1700000001000, 101.0)
                 .build(),
         ];
-        writer.write(series).await.unwrap();
+        writer
+            .write(&crate::Namespace::default(), series)
+            .await
+            .unwrap();
         writer.flush().await.unwrap();
 
         // 2. Open reader via the public API (exercises create_storage_read + DbReader)
@@ -709,19 +820,18 @@ mod tests {
             skip_wal_replay: false,
             ..Default::default()
         };
-        let reader = TimeSeriesDbReader::open(
-            crate::Namespace::default(),
-            storage_config.clone(),
-            reader_options,
-            50,
-        )
-        .await
-        .unwrap();
+        let reader = TimeSeriesDbReader::open(storage_config.clone(), reader_options, 50)
+            .await
+            .unwrap();
 
         // 3. Reader sees written data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
         let result = reader
-            .query("http_requests_total", Some(query_time))
+            .query(
+                &crate::Namespace::default(),
+                "http_requests_total",
+                Some(query_time),
+            )
             .await
             .unwrap();
         match &result {
@@ -740,13 +850,20 @@ mod tests {
                 .sample(1700000002000, 102.0)
                 .build(),
         ];
-        writer.write(more_series).await.unwrap();
+        writer
+            .write(&crate::Namespace::default(), more_series)
+            .await
+            .unwrap();
         writer.flush().await.unwrap();
 
         // 5. Verify writer is still functional by querying through the writer
         let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
         let writer_result = writer
-            .query("http_requests_total", Some(query_time2))
+            .query(
+                &crate::Namespace::default(),
+                "http_requests_total",
+                Some(query_time2),
+            )
             .await
             .unwrap();
         match &writer_result {
@@ -767,7 +884,11 @@ mod tests {
         // seeing ascending sequence numbers.  Once that is resolved upstream
         // this test should be extended to assert refresh visibility.
         let reader_result = reader
-            .query("http_requests_total", Some(query_time))
+            .query(
+                &crate::Namespace::default(),
+                "http_requests_total",
+                Some(query_time),
+            )
             .await
             .unwrap();
         match &reader_result {
@@ -803,14 +924,11 @@ mod tests {
             meta_cache: None,
         };
 
-        let writer = TimeSeriesDb::open(
-            crate::Namespace::default(),
-            Config {
-                storage: storage_config.clone(),
-                flush_interval: Duration::from_secs(60),
-                retention: None,
-            },
-        )
+        let writer = TimeSeriesDb::open(Config {
+            storage: storage_config.clone(),
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
         .await
         .unwrap();
 
@@ -820,25 +938,29 @@ mod tests {
                 .sample(1700000001000, 7.0)
                 .build(),
         ];
-        writer.write(series).await.unwrap();
+        writer
+            .write(&crate::Namespace::default(), series)
+            .await
+            .unwrap();
 
         // when
         writer.flush().await.unwrap();
         drop(writer);
 
-        let reopened = TimeSeriesDb::open(
-            crate::Namespace::default(),
-            Config {
-                storage: storage_config,
-                flush_interval: Duration::from_secs(60),
-                retention: None,
-            },
-        )
+        let reopened = TimeSeriesDb::open(Config {
+            storage: storage_config,
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
         .await
         .unwrap();
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
         let result = reopened
-            .query("flush_durability_metric", Some(query_time))
+            .query(
+                &crate::Namespace::default(),
+                "flush_durability_metric",
+                Some(query_time),
+            )
             .await
             .unwrap();
 
@@ -887,7 +1009,7 @@ mod tests {
         let step = Duration::from_secs(15);
 
         let reader_result = reader
-            .query_range("gauge", start..=end, step)
+            .query_range(&crate::Namespace::default(), "gauge", start..=end, step)
             .await
             .unwrap();
         let writer_result = writer_tsdb
@@ -944,7 +1066,12 @@ mod tests {
         let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
 
         let result = reader
-            .query_range("counter", start..=end, Duration::ZERO)
+            .query_range(
+                &crate::Namespace::default(),
+                "counter",
+                start..=end,
+                Duration::ZERO,
+            )
             .await;
 
         assert!(result.is_err());
@@ -979,24 +1106,24 @@ mod tests {
             meta_cache: None,
         };
 
-        let writer = TimeSeriesDb::open(
-            crate::Namespace::default(),
-            Config {
-                storage: storage_config.clone(),
-                flush_interval: Duration::from_secs(60),
-                retention: None,
-            },
-        )
+        let writer = TimeSeriesDb::open(Config {
+            storage: storage_config.clone(),
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
         .await
         .unwrap();
 
         writer
-            .write(vec![
-                Series::builder("checkpointed")
-                    .label("env", "test")
-                    .sample(1700000001000, 1.0)
-                    .build(),
-            ])
+            .write(
+                &crate::Namespace::default(),
+                vec![
+                    Series::builder("checkpointed")
+                        .label("env", "test")
+                        .sample(1700000001000, 1.0)
+                        .build(),
+                ],
+            )
             .await
             .unwrap();
 
@@ -1004,12 +1131,15 @@ mod tests {
         let checkpoint = writer.create_checkpoint().await.unwrap();
 
         writer
-            .write(vec![
-                Series::builder("checkpointed")
-                    .label("env", "test")
-                    .sample(1700000002000, 2.0)
-                    .build(),
-            ])
+            .write(
+                &crate::Namespace::default(),
+                vec![
+                    Series::builder("checkpointed")
+                        .label("env", "test")
+                        .sample(1700000002000, 2.0)
+                        .build(),
+                ],
+            )
             .await
             .unwrap();
         writer.flush().await.unwrap();
@@ -1020,7 +1150,6 @@ mod tests {
             ..Default::default()
         };
         let reader = TimeSeriesDbReader::open_at_checkpoint(
-            crate::Namespace::default(),
             storage_config,
             reader_options,
             50,
@@ -1032,6 +1161,7 @@ mod tests {
         // then — the pre-checkpoint sample is visible
         let pre = reader
             .query(
+                &crate::Namespace::default(),
                 "checkpointed",
                 Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000)),
             )
@@ -1050,6 +1180,7 @@ mod tests {
         // value is the pre-checkpoint one rather than the new write.
         let post = reader
             .query(
+                &crate::Namespace::default(),
                 "checkpointed",
                 Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000)),
             )

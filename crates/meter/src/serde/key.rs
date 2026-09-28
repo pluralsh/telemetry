@@ -12,6 +12,7 @@ use common::serde::terminated_bytes;
 pub struct SeriesDictionaryKey {
     pub namespace: Namespace,
     pub bucket: TimeBucket,
+    pub routing_slot: u16,
     pub series_fingerprint: SeriesFingerprint,
 }
 
@@ -22,6 +23,7 @@ impl SeriesDictionaryKey {
             &mut buf,
             &self.namespace,
             &self.bucket,
+            self.routing_slot,
             RecordType::SeriesDictionary,
         );
         buf.extend_from_slice(&self.series_fingerprint.to_be_bytes());
@@ -29,7 +31,7 @@ impl SeriesDictionaryKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        let (namespace, bucket, routing_slot, record_type, offset) = parse_record_prefix(buf)?;
         if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
                 message: format!(
@@ -49,6 +51,7 @@ impl SeriesDictionaryKey {
         Ok(SeriesDictionaryKey {
             namespace,
             bucket,
+            routing_slot,
             series_fingerprint,
         })
     }
@@ -65,6 +68,9 @@ impl TimeBucketScoped for SeriesDictionaryKey {
     fn bucket(&self) -> TimeBucket {
         self.bucket
     }
+    fn routing_slot(&self) -> u16 {
+        self.routing_slot
+    }
 }
 
 /// ForwardIndex key
@@ -72,6 +78,7 @@ impl TimeBucketScoped for SeriesDictionaryKey {
 pub struct ForwardIndexKey {
     pub namespace: Namespace,
     pub bucket: TimeBucket,
+    pub routing_slot: u16,
     pub series_id: SeriesId,
 }
 
@@ -82,6 +89,7 @@ impl ForwardIndexKey {
             &mut buf,
             &self.namespace,
             &self.bucket,
+            self.routing_slot,
             RecordType::ForwardIndex,
         );
         buf.extend_from_slice(&self.series_id.to_be_bytes());
@@ -89,7 +97,7 @@ impl ForwardIndexKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        let (namespace, bucket, routing_slot, record_type, offset) = parse_record_prefix(buf)?;
         if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
                 message: format!(
@@ -109,6 +117,7 @@ impl ForwardIndexKey {
         Ok(ForwardIndexKey {
             namespace,
             bucket,
+            routing_slot,
             series_id,
         })
     }
@@ -125,6 +134,9 @@ impl TimeBucketScoped for ForwardIndexKey {
     fn bucket(&self) -> TimeBucket {
         self.bucket
     }
+    fn routing_slot(&self) -> u16 {
+        self.routing_slot
+    }
 }
 
 /// InvertedIndex key
@@ -132,6 +144,7 @@ impl TimeBucketScoped for ForwardIndexKey {
 pub struct InvertedIndexKey {
     pub namespace: Namespace,
     pub bucket: TimeBucket,
+    pub routing_slot: u16,
     pub attribute: String,
     pub value: String,
 }
@@ -143,6 +156,7 @@ impl InvertedIndexKey {
             &mut buf,
             &self.namespace,
             &self.bucket,
+            self.routing_slot,
             RecordType::InvertedIndex,
         );
         // Attribute uses terminated encoding to delimit from value
@@ -157,16 +171,23 @@ impl InvertedIndexKey {
     pub fn attribute_range(
         namespace: &Namespace,
         bucket: &TimeBucket,
+        routing_slot: u16,
         attribute: &str,
     ) -> BytesRange {
         let mut buf = BytesMut::new();
-        write_record_prefix(&mut buf, namespace, bucket, RecordType::InvertedIndex);
+        write_record_prefix(
+            &mut buf,
+            namespace,
+            bucket,
+            routing_slot,
+            RecordType::InvertedIndex,
+        );
         terminated_bytes::serialize(attribute.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        let (namespace, bucket, routing_slot, record_type, offset) = parse_record_prefix(buf)?;
         if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
                 message: format!(
@@ -191,6 +212,7 @@ impl InvertedIndexKey {
         Ok(InvertedIndexKey {
             namespace,
             bucket,
+            routing_slot,
             attribute,
             value,
         })
@@ -208,6 +230,9 @@ impl TimeBucketScoped for InvertedIndexKey {
     fn bucket(&self) -> TimeBucket {
         self.bucket
     }
+    fn routing_slot(&self) -> u16 {
+        self.routing_slot
+    }
 }
 
 /// TimeSeries key — metric-name-prefixed layout.
@@ -222,6 +247,7 @@ impl TimeBucketScoped for InvertedIndexKey {
 pub struct TimeSeriesKey {
     pub namespace: Namespace,
     pub bucket: TimeBucket,
+    pub routing_slot: u16,
     pub metric_name: String,
     pub series_id: SeriesId,
 }
@@ -233,6 +259,7 @@ impl TimeSeriesKey {
             &mut buf,
             &self.namespace,
             &self.bucket,
+            self.routing_slot,
             RecordType::TimeSeries,
         );
         terminated_bytes::serialize(self.metric_name.as_bytes(), &mut buf);
@@ -241,7 +268,7 @@ impl TimeSeriesKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        let (namespace, bucket, routing_slot, record_type, offset) = parse_record_prefix(buf)?;
         if record_type != RecordType::TimeSeries {
             return Err(EncodingError {
                 message: format!(
@@ -268,6 +295,7 @@ impl TimeSeriesKey {
         Ok(TimeSeriesKey {
             namespace,
             bucket,
+            routing_slot,
             metric_name,
             series_id,
         })
@@ -285,6 +313,9 @@ impl TimeBucketScoped for TimeSeriesKey {
     fn bucket(&self) -> TimeBucket {
         self.bucket
     }
+    fn routing_slot(&self) -> u16 {
+        self.routing_slot
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +331,7 @@ mod tests {
                 start: 12345,
                 size: 2,
             },
+            routing_slot: 17,
             series_fingerprint: 67890,
         };
 
@@ -312,6 +344,51 @@ mod tests {
     }
 
     #[test]
+    fn should_encode_slot_between_segment_prefix_and_record_type() {
+        let key = ForwardIndexKey {
+            namespace: Namespace::new("tenant").unwrap(),
+            bucket: TimeBucket {
+                start: 12345,
+                size: 1,
+            },
+            routing_slot: 0x0abc,
+            series_id: 7,
+        };
+
+        let encoded = key.encode();
+        let namespace_end = encoded[2..].iter().position(|byte| *byte == 0).unwrap() + 2;
+        let slot_offset = namespace_end + 1 + 4 + 1;
+
+        assert_eq!(&encoded[slot_offset..slot_offset + 2], &[0x0a, 0xbc]);
+        assert_eq!(encoded[slot_offset + 2], RecordType::ForwardIndex.id());
+        assert_eq!(ForwardIndexKey::decode(&encoded).unwrap(), key);
+    }
+
+    #[test]
+    fn bucket_slot_range_excludes_unowned_slots() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let bucket = TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        let key = |routing_slot| {
+            ForwardIndexKey {
+                namespace: namespace.clone(),
+                bucket,
+                routing_slot,
+                series_id: u32::from(routing_slot),
+            }
+            .encode()
+        };
+        let range = crate::serde::bucket_slots_range(&namespace, &bucket, 100..200);
+
+        assert!(!range.contains(&key(99)));
+        assert!(range.contains(&key(100)));
+        assert!(range.contains(&key(199)));
+        assert!(!range.contains(&key(200)));
+    }
+
+    #[test]
     fn should_encode_and_decode_forward_index_key() {
         // given
         let key = ForwardIndexKey {
@@ -320,6 +397,7 @@ mod tests {
                 start: 12345,
                 size: 3,
             },
+            routing_slot: 17,
             series_id: 42,
         };
 
@@ -340,6 +418,7 @@ mod tests {
                 start: 12345,
                 size: 1,
             },
+            routing_slot: 17,
             attribute: "host".to_string(),
             value: "server1".to_string(),
         };
@@ -361,6 +440,7 @@ mod tests {
                 start: 12345,
                 size: 4,
             },
+            routing_slot: 17,
             metric_name: "http_requests_total".to_string(),
             series_id: 99,
         };
@@ -381,6 +461,7 @@ mod tests {
                 start: 12345,
                 size: 1,
             },
+            routing_slot: 17,
             metric_name: "".to_string(),
             series_id: 7,
         };
@@ -405,24 +486,28 @@ mod tests {
         let key_a = TimeSeriesKey {
             namespace: crate::Namespace::default(),
             bucket: bucket_a,
+            routing_slot: 17,
             metric_name: "cpu_usage".to_string(),
             series_id: 2,
         };
         let key_b = TimeSeriesKey {
             namespace: crate::Namespace::default(),
             bucket: bucket_a,
+            routing_slot: 17,
             metric_name: "cpu_usage".to_string(),
             series_id: 10,
         };
         let key_c = TimeSeriesKey {
             namespace: crate::Namespace::default(),
             bucket: bucket_a,
+            routing_slot: 17,
             metric_name: "memory_usage".to_string(),
             series_id: 1,
         };
         let key_d = TimeSeriesKey {
             namespace: crate::Namespace::default(),
             bucket: bucket_d,
+            routing_slot: 17,
             metric_name: "cpu_usage".to_string(),
             series_id: 1,
         };
@@ -450,25 +535,28 @@ mod tests {
         let key1 = InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 17,
             attribute: "host".to_string(),
             value: "server1".to_string(),
         };
         let key2 = InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 17,
             attribute: "host".to_string(),
             value: "server2".to_string(),
         };
         let key3 = InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 17,
             attribute: "env".to_string(),
             value: "prod".to_string(),
         };
 
         // when
         let range =
-            InvertedIndexKey::attribute_range(&crate::Namespace::default(), &bucket, "host");
+            InvertedIndexKey::attribute_range(&crate::Namespace::default(), &bucket, 17, "host");
 
         // then
         assert!(range.contains(&key1.encode()));
@@ -488,13 +576,18 @@ mod tests {
         let host_name_key = InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 17,
             attribute: "host".to_string(),
             value: "name".to_string(),
         };
 
         // when - search for "hostname"
-        let range =
-            InvertedIndexKey::attribute_range(&crate::Namespace::default(), &bucket, "hostname");
+        let range = InvertedIndexKey::attribute_range(
+            &crate::Namespace::default(),
+            &bucket,
+            17,
+            "hostname",
+        );
 
         // then - should NOT match the "host":"name" key
         assert!(
@@ -517,6 +610,7 @@ mod tests {
         let short_attr_key = InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket,
+            routing_slot: 17,
             attribute: "ab".to_string(),
             value: "cdef".to_string(),
         };
@@ -527,7 +621,7 @@ mod tests {
 
         // when
         let range =
-            InvertedIndexKey::attribute_range(&crate::Namespace::default(), &bucket, "abcdef");
+            InvertedIndexKey::attribute_range(&crate::Namespace::default(), &bucket, 17, "abcdef");
 
         // then
         assert!(
@@ -551,6 +645,7 @@ mod tests {
                 start: 12345,
                 size: 1,
             },
+            routing_slot: 17,
             attribute: "host".to_string(),
             value: "server1".to_string(),
         };

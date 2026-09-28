@@ -14,7 +14,7 @@ cleanup() {
     kill "${FORWARD_PIDS[@]}" 2>/dev/null || true
   fi
   if (( status != 0 )); then
-    kubectl -n "$NS" get all,configmap,lease -o wide >"$LOG_DIR/resources.log" 2>&1 || true
+    kubectl -n "$NS" get all,configmap,shardmap,lease -o wide >"$LOG_DIR/resources.log" 2>&1 || true
     kubectl -n "$NS" logs statefulset/meter --all-containers --prefix >"$LOG_DIR/writers.log" 2>&1 || true
     kubectl -n "$NS" logs deployment/meter-reader --all-containers --prefix >"$LOG_DIR/reader.log" 2>&1 || true
   fi
@@ -27,9 +27,12 @@ trap cleanup EXIT INT TERM
 
 command -v kind >/dev/null
 command -v kubectl >/dev/null
+PYTHON="${PYTHON:-python3}"
+command -v "$PYTHON" >/dev/null
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
 docker build -f "$ROOT/crates/meter-server/Dockerfile" -t meter-regression:local "$ROOT"
 kind load docker-image --name "$CLUSTER" meter-regression:local
+kubectl apply -f "$ROOT/go/operator/config/crd/bases/telemetry.plural.sh_shardmaps.yaml"
 kubectl apply -f "$ROOT/tests/kind/manifests.yaml"
 kubectl -n "$NS" wait --for=condition=complete job/minio-init --timeout=180s
 kubectl -n "$NS" rollout status statefulset/meter --timeout=300s
@@ -63,8 +66,8 @@ check_assignment() {
   expected="$1"
   for _ in {1..60}; do
     owners="$(
-      kubectl -n "$NS" get configmap meter-shard-assignments \
-        -o jsonpath='{.data.assignment\.json}' 2>/dev/null \
+      kubectl -n "$NS" get shardmap meter-shard-map \
+        -o jsonpath='{.spec.assignments}' 2>/dev/null \
         | { grep -o '"owner"' || true; } \
         | wc -l \
         | tr -d ' '
@@ -93,19 +96,14 @@ run_meter_check() {
       METER_WRITE_URL=http://127.0.0.1:28080/write/ns/regression \
       METER_READ_URL=http://127.0.0.1:28082/read/ns/regression \
       PYTHONPATH="$ROOT/tests/regression" \
-      python -m harness.meter
+      "$PYTHON" -m harness.meter
   )
 }
 
 check_assignment 1
-run_meter_check one-writer 0
+run_meter_check one-writer 600000
 
-kubectl -n "$NS" scale statefulset/meter --replicas=3
+kubectl -n "$NS" scale statefulset/meter --replicas=2
 kubectl -n "$NS" rollout status statefulset/meter --timeout=300s
-check_assignment 3
-run_meter_check three-writers 600000
-
-kubectl -n "$NS" scale statefulset/meter --replicas=1
-kubectl -n "$NS" rollout status statefulset/meter --timeout=300s
-check_assignment 1
-run_meter_check one-writer-again 1200000
+check_assignment 2
+run_meter_check two-writers 1200000

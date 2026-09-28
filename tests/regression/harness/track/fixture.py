@@ -134,7 +134,7 @@ def fixture_shard(trace_id: str, namespace: str = "regression") -> int:
         + namespace_bytes
         + bytes.fromhex(trace_id)
     ).digest()
-    return int.from_bytes(digest[:8], "big") % 16
+    return (int.from_bytes(digest[:16], "big") * 16) >> 128
 
 
 def assert_spans_writer_ranges(trace_ids: tuple[str, ...] = TRACE_IDS) -> None:

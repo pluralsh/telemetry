@@ -125,6 +125,9 @@ pub struct Config {
     pub segment_duration_seconds: u64,
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
+    /// Interval between L0 flushes. A successful flush makes accepted writes
+    /// visible to readers.
+    pub visibility_interval_seconds: u64,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -142,6 +145,7 @@ impl Default for Config {
             segment_duration_seconds: core.segment_duration.as_secs(),
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
+            visibility_interval_seconds: 1,
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),

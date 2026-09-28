@@ -12,7 +12,7 @@ pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let (_, _, record_type, _) =
+        let (_, _, _, record_type, _) =
             parse_record_prefix(key.as_ref()).expect("Failed to decode record type");
 
         match record_type {
@@ -74,6 +74,7 @@ mod tests {
         InvertedIndexKey {
             namespace: crate::Namespace::default(),
             bucket: test_bucket(),
+            routing_slot: 17,
             attribute: "env".to_string(),
             value: "prod".to_string(),
         }
@@ -85,6 +86,7 @@ mod tests {
         TimeSeriesKey {
             namespace: crate::Namespace::default(),
             bucket: test_bucket(),
+            routing_slot: 17,
             metric_name: "test_metric".to_string(),
             series_id: 42,
         }
@@ -97,6 +99,7 @@ mod tests {
         SeriesDictionaryKey {
             namespace: crate::Namespace::default(),
             bucket: test_bucket(),
+            routing_slot: 17,
             series_fingerprint: 123,
         }
         .encode()

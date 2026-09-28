@@ -1,24 +1,36 @@
 # Meter storage format
 
-Meter stores every namespace in an independent SlateDB database over the
-configured object store. Namespace paths are deterministic hashes beneath
-`storage.path`; sharded deployments add a shard suffix.
+Meter opens exactly one SlateDB database per owned storage shard. The database
+path is `storage.path/shard-NNNN`; namespaces do not add another path level.
+All tenant isolation is encoded in the keys described below, and every read,
+write, ingest cache, and metadata catalog lookup remains namespace-scoped.
 
 Records are grouped into time buckets (normally one hour). Every key begins
-with the following routing scope; the scope is also the SlateDB segment
-boundary.
+with the following layout. The SlateDB segment boundary remains immediately
+after `bucket size`; the routing slot and record type are outside that boundary.
 
 ```text
 Common key scope
-┌───────────┬─────────┬─────────────────┬──────────────┬─────────────┬─────────────┐
-│ subsystem │ version │    namespace    │ bucket start │ bucket size │ record type │
-│ 0x01      │ 0x01    │ TerminatedBytes │ u32 BE       │ u8          │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────┴─────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬──────────────┬─────────────┬──────────────┬─────────────┐
+│ subsystem │ version │    namespace    │ bucket start │ bucket size │ routing slot │ record type │
+│ 0x01      │ 0x02    │ TerminatedBytes │ u32 BE       │ u8          │ u16 BE       │ u8          │
+└───────────┴─────────┴─────────────────┴──────────────┴─────────────┴──────────────┴─────────────┘
+                                                               ▲
+                                                   SlateDB segment boundary
 ```
 
 Keys use big-endian numeric fields for lexical ordering. Values use their
 record-specific encoding. `TerminatedBytes` escapes embedded delimiters and
-ends with `0x00`; bucket size `0` is reserved.
+ends with `0x00`; bucket size `0` is reserved. Only the low 12 bits of the
+routing-slot field are valid (`0..4096`). The slot is the high 12 bits of
+BLAKE3 over the exact canonical Meter routing key used by `ShardedMeter`:
+namespace bytes followed by sorted `(label name, label value)` pairs separated
+with zero bytes.
+
+Series IDs are allocated independently per `(bucket, routing slot)`. The
+stored `u32` sequence starts at the slot and advances by 4096, preserving
+bucket-wide uniqueness when query indexes combine multiple owned slots while
+allowing the slot to be recovered as `series_id % 4096`.
 
 | ID | Record | Purpose |
 | --- | --- | --- |
@@ -31,7 +43,7 @@ ends with `0x00`; bucket size `0` is reserved.
 
 ### Series dictionary (`0x02`)
 
-Assigns a bucket-local compact ID to a canonical label-set fingerprint.
+Assigns a bucket-and-slot-local compact ID to a canonical label-set fingerprint.
 
 ```text
 KEY   common scope │ fingerprint: u128 BE

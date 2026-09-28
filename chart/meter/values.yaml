@@ -97,7 +97,6 @@ config:
         write: []
 
 sharding:
-  virtualShards: 8
   ioConcurrencyMultiplier: 8
   leaseDurationSeconds: 15
   renewIntervalSeconds: 5

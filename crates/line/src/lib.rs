@@ -12,6 +12,7 @@ pub mod logql;
 mod model;
 mod page;
 mod query;
+mod routing;
 mod search;
 mod sharded;
 
@@ -27,3 +28,6 @@ pub use query::{
     QueryRequest, QueryResult, Sample, VectorSample,
 };
 pub use sharded::{ShardedLine, ShardingOptions};
+
+/// Persisted SlateDB segment extractor identifier used by migration preflight.
+pub const SEGMENT_EXTRACTOR_NAME: &str = "line-log/v2";

@@ -28,6 +28,9 @@ page:
   max_size_bytes: 4194304
   max_traces: 1024
 
+# Successful periodic L0 flushes make accepted writes visible to readers.
+visibility_interval_seconds: 1
+
 write:
   durability: written
   remote_concurrency: 16

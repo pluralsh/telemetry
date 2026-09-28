@@ -17,13 +17,13 @@ use k8s_openapi::{
     api::{
         apps::v1::StatefulSet,
         coordination::v1::{Lease, LeaseSpec},
-        core::v1::ConfigMap,
     },
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
 };
 use kube::{
     Api, Client, Error as KubeError,
     api::PostParams,
+    core::{ApiResource, DynamicObject, GroupVersionKind},
     runtime::{
         WatchStreamExt,
         watcher::{self, Event},
@@ -33,12 +33,10 @@ use tokio::{sync::watch, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AssignmentGeneration, AssignmentStore, BoxError, LeaseBackend, Owner, OwnerResolver,
-    ResolvedOwner, ShardId, ShardMap, balanced_contiguous,
+    AssignmentGeneration, AssignmentStore, BoxError, LeaseBackend, MigrationPhase, Owner,
+    OwnerResolver, ResolvedOwner, ShardId, ShardMap, balanced_contiguous, coordinator_step,
 };
 
-const ASSIGNMENT_KEY: &str = "assignment.json";
-const GENERATION_ANNOTATION: &str = "telemetry.plural.sh/assignment-generation";
 const RENEWED_AT_ANNOTATION: &str = "telemetry.plural.sh/renewed-at-unix-ms";
 const LEASE_GENERATION_ANNOTATION: &str = "telemetry.plural.sh/assignment-generation";
 const LABEL_DOMAIN: &str = "telemetry.plural.sh";
@@ -53,7 +51,7 @@ pub struct KubernetesConfig {
     pub stateful_set: String,
     pub headless_service: String,
     pub owner_port: u16,
-    pub assignment_config_map: String,
+    pub shard_map: String,
     pub coordinator_lease: String,
     pub shard_lease_prefix: String,
     pub lease_duration: Duration,
@@ -68,7 +66,7 @@ impl Default for KubernetesConfig {
             stateful_set: "meter".to_owned(),
             headless_service: "meter-headless".to_owned(),
             owner_port: 9090,
-            assignment_config_map: "meter-shard-assignments".to_owned(),
+            shard_map: "meter-shard-map".to_owned(),
             coordinator_lease: "meter-shard-coordinator".to_owned(),
             shard_lease_prefix: "meter-shard".to_owned(),
             lease_duration: Duration::from_secs(15),
@@ -330,6 +328,15 @@ impl KubernetesLeaseSet {
         }
         Ok(())
     }
+
+    async fn is_released(&self, name: &str) -> Result<bool, KubeError> {
+        Ok(self
+            .api
+            .get_opt(name)
+            .await?
+            .as_ref()
+            .is_none_or(|lease| lease_record(lease).is_none()))
+    }
 }
 
 pub struct KubernetesCoordinatorElection {
@@ -484,9 +491,12 @@ impl LeaseBackend for KubernetesLeaseBackend {
 }
 
 pub struct KubernetesAssignmentStore {
-    api: Api<ConfigMap>,
+    api: Api<DynamicObject>,
+    api_resource: ApiResource,
     namespace: String,
     name: String,
+    labels: BTreeMap<String, String>,
+    owner_reference: Option<OwnerReference>,
     tx: watch::Sender<Option<ShardMap>>,
 }
 
@@ -496,16 +506,33 @@ impl KubernetesAssignmentStore {
         config: &KubernetesConfig,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BoxError> {
-        let api = Api::namespaced(client, &config.namespace);
-        let initial = match api.get_opt(&config.assignment_config_map).await? {
-            Some(config_map) => decode_assignment(&config_map)?,
+        let api_resource = shard_map_api_resource();
+        let api = Api::namespaced_with(client.clone(), &config.namespace, &api_resource);
+        let stateful_sets: Api<StatefulSet> = Api::namespaced(client, &config.namespace);
+        let owner_reference = stateful_sets
+            .get(&config.stateful_set)
+            .await?
+            .metadata
+            .uid
+            .map(|uid| OwnerReference {
+                api_version: "apps/v1".to_owned(),
+                kind: "StatefulSet".to_owned(),
+                name: config.stateful_set.clone(),
+                uid,
+                ..OwnerReference::default()
+            });
+        let initial = match api.get_opt(&config.shard_map).await? {
+            Some(resource) => decode_assignment(&resource)?,
             None => None,
         };
         let (tx, _) = watch::channel(initial);
         let store = Arc::new(Self {
             api,
+            api_resource,
             namespace: config.namespace.clone(),
-            name: config.assignment_config_map.clone(),
+            name: config.shard_map.clone(),
+            labels: BTreeMap::from([config.lease_label()]),
+            owner_reference,
             tx,
         });
         let watcher = store.clone();
@@ -523,15 +550,15 @@ impl KubernetesAssignmentStore {
                     () = cancel.cancelled() => return,
                     event = events.next() => {
                         match event {
-                            Some(Ok(Event::Apply(config_map))) => {
-                                apply_watched_assignment(&watcher.tx, &config_map);
+                            Some(Ok(Event::Apply(resource))) => {
+                                apply_watched_assignment(&watcher.tx, &resource);
                             }
                             Some(Ok(Event::Delete(_))) => {
                                 tracing::warn!("Kubernetes shard assignment was deleted; retaining last known generation");
                             }
                             Some(Ok(Event::Init)) => relisted = None,
-                            Some(Ok(Event::InitApply(config_map))) => {
-                                match decode_assignment(&config_map) {
+                            Some(Ok(Event::InitApply(resource))) => {
+                                match decode_assignment(&resource) {
                                     Ok(next) => relisted = next,
                                     Err(error) => tracing::warn!(%error, "invalid relisted Kubernetes shard assignment"),
                                 }
@@ -554,8 +581,18 @@ impl KubernetesAssignmentStore {
     }
 }
 
-fn apply_watched_assignment(tx: &watch::Sender<Option<ShardMap>>, config_map: &ConfigMap) {
-    match decode_assignment(config_map) {
+fn shard_map_api_resource() -> ApiResource {
+    let mut resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "telemetry.plural.sh",
+        "v1alpha1",
+        "ShardMap",
+    ));
+    resource.plural = "shardmaps".to_owned();
+    resource
+}
+
+fn apply_watched_assignment(tx: &watch::Sender<Option<ShardMap>>, resource: &DynamicObject) {
+    match decode_assignment(resource) {
         Ok(Some(next)) => apply_assignment_update(tx, next),
         Ok(None) => {}
         Err(error) => tracing::warn!(%error, "invalid Kubernetes shard assignment"),
@@ -565,6 +602,11 @@ fn apply_watched_assignment(tx: &watch::Sender<Option<ShardMap>>, config_map: &C
 fn apply_assignment_update(tx: &watch::Sender<Option<ShardMap>>, next: ShardMap) {
     let current = tx.borrow().as_ref().map(|map| map.generation);
     if current.is_none_or(|generation| next.generation > generation) {
+        tracing::info!(
+            generation = next.generation.get(),
+            shard_count = next.virtual_shards,
+            "applied Kubernetes ShardMap generation"
+        );
         tx.send_replace(Some(next));
     }
 }
@@ -573,34 +615,43 @@ fn apply_assignment_update(tx: &watch::Sender<Option<ShardMap>>, next: ShardMap)
 impl AssignmentStore for KubernetesAssignmentStore {
     async fn load(&self) -> Result<Option<ShardMap>, BoxError> {
         match self.api.get_opt(&self.name).await? {
-            Some(config_map) => decode_assignment(&config_map),
+            Some(resource) => decode_assignment(&resource),
             None => Ok(self.tx.borrow().clone()),
         }
     }
 
     async fn publish(&self, assignment: ShardMap) -> Result<(), BoxError> {
-        if self
-            .load()
-            .await?
-            .is_some_and(|current| current.generation >= assignment.generation)
-        {
+        let existing = self.api.get_opt(&self.name).await?;
+        let current = existing
+            .as_ref()
+            .map(decode_assignment)
+            .transpose()?
+            .flatten();
+        if current.is_some_and(|current| current.generation >= assignment.generation) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "assignment generation must increase",
             )
             .into());
         }
-        let config_map = encode_assignment(&self.name, &self.namespace, &assignment)?;
-        match self.api.get_opt(&self.name).await? {
+        let resource = encode_assignment(
+            &self.name,
+            &self.namespace,
+            &self.labels,
+            self.owner_reference.as_ref(),
+            &self.api_resource,
+            &assignment,
+        )?;
+        match existing {
             Some(existing) => {
-                let mut replacement = config_map;
+                let mut replacement = resource;
                 replacement.metadata.resource_version = existing.metadata.resource_version;
                 self.api
                     .replace(&self.name, &PostParams::default(), &replacement)
                     .await?;
             }
             None => {
-                self.api.create(&PostParams::default(), &config_map).await?;
+                self.api.create(&PostParams::default(), &resource).await?;
             }
         }
         self.tx.send_replace(Some(assignment));
@@ -615,50 +666,24 @@ impl AssignmentStore for KubernetesAssignmentStore {
 fn encode_assignment(
     name: &str,
     namespace: &str,
+    labels: &BTreeMap<String, String>,
+    owner_reference: Option<&OwnerReference>,
+    api_resource: &ApiResource,
     assignment: &ShardMap,
-) -> Result<ConfigMap, serde_json::Error> {
-    let mut annotations = BTreeMap::new();
-    annotations.insert(
-        GENERATION_ANNOTATION.to_owned(),
-        assignment.generation.to_string(),
-    );
-    let mut data = BTreeMap::new();
-    data.insert(
-        ASSIGNMENT_KEY.to_owned(),
-        serde_json::to_string(assignment)?,
-    );
-    Ok(ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(name.to_owned()),
-            namespace: Some(namespace.to_owned()),
-            annotations: Some(annotations),
-            ..ObjectMeta::default()
-        },
-        data: Some(data),
-        ..ConfigMap::default()
-    })
+) -> Result<DynamicObject, serde_json::Error> {
+    let mut resource = DynamicObject::new(name, api_resource);
+    resource.metadata.namespace = Some(namespace.to_owned());
+    resource.metadata.labels = Some(labels.clone());
+    resource.metadata.owner_references = owner_reference.map(|reference| vec![reference.clone()]);
+    resource.data = serde_json::json!({ "spec": assignment });
+    Ok(resource)
 }
 
-fn decode_assignment(config_map: &ConfigMap) -> Result<Option<ShardMap>, BoxError> {
-    let Some(serialized) = config_map
-        .data
-        .as_ref()
-        .and_then(|data| data.get(ASSIGNMENT_KEY))
-    else {
+fn decode_assignment(resource: &DynamicObject) -> Result<Option<ShardMap>, BoxError> {
+    let Some(spec) = resource.data.get("spec") else {
         return Ok(None);
     };
-    let assignment: ShardMap = serde_json::from_str(serialized)?;
-    let stamped_generation = config_map
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get(GENERATION_ANNOTATION))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing generation stamp"))?
-        .parse::<u64>()?;
-    if assignment.generation != AssignmentGeneration::new(stamped_generation) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "generation stamp mismatch").into());
-    }
-    Ok(Some(assignment))
+    Ok(Some(serde_json::from_value(spec.clone())?))
 }
 
 pub struct StatefulSetMembership {
@@ -743,7 +768,6 @@ pub async fn run_kubernetes_coordinator(
     store: Arc<KubernetesAssignmentStore>,
     config: KubernetesConfig,
     identity: String,
-    virtual_shards: u32,
     cancel: CancellationToken,
 ) {
     let client = match Client::try_default().await {
@@ -754,6 +778,7 @@ pub async fn run_kubernetes_coordinator(
         }
     };
     let election = KubernetesCoordinatorElection::new(client.clone(), &config);
+    let migration_leases = KubernetesLeaseSet::new(client.clone(), &config);
     let coordinator_api: Api<Lease> = Api::namespaced(client.clone(), &config.namespace);
     let coordinator_selector = format!("metadata.name={}", config.coordinator_lease);
     let mut coordinator_events = watcher::watcher(
@@ -860,6 +885,13 @@ pub async fn run_kubernetes_coordinator(
                     }
                 };
                 dirty |= leader && !was_leader;
+                // A draining migration can become eligible for cutover when
+                // the source Lease is released without changing ShardMap.
+                dirty |= leader
+                    && assignments
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|map| map.migration.is_some());
             }
         }
         if !leader || !dirty {
@@ -868,7 +900,14 @@ pub async fn run_kubernetes_coordinator(
         let Some(owners) = owners.as_deref() else {
             continue;
         };
-        match reconcile_assignment(store.as_ref(), owners, virtual_shards).await {
+        match reconcile_assignment(
+            store.as_ref(),
+            &migration_leases,
+            &config.shard_lease_prefix,
+            owners,
+        )
+        .await
+        {
             Reconcile::Done => dirty = false,
             Reconcile::Retry => {}
             Reconcile::LostLeadership => leader = false,
@@ -885,9 +924,20 @@ enum Reconcile {
 
 async fn reconcile_assignment(
     store: &KubernetesAssignmentStore,
+    leases: &KubernetesLeaseSet,
+    shard_lease_prefix: &str,
     owners: &[Owner],
-    virtual_shards: u32,
 ) -> Reconcile {
+    let desired_shards = match u32::try_from(owners.len()) {
+        Ok(0) | Err(_) => {
+            tracing::warn!(
+                owners = owners.len(),
+                "writer replica count cannot produce a shard assignment"
+            );
+            return Reconcile::Retry;
+        }
+        Ok(count) => count,
+    };
     let current = match store.load().await {
         Ok(current) => current,
         Err(error) => {
@@ -895,17 +945,61 @@ async fn reconcile_assignment(
             return Reconcile::Retry;
         }
     };
-    if !membership_changed(current.as_ref(), owners, virtual_shards) {
-        return Reconcile::Done;
-    }
-    let generation = current
-        .as_ref()
-        .map_or(AssignmentGeneration::new(1), |map| map.generation.next());
-    let next = match balanced_contiguous(generation, virtual_shards, owners, current.as_ref()) {
-        Ok(next) => next,
-        Err(error) => {
-            tracing::warn!(%error, "failed to plan shard assignment");
-            return Reconcile::Retry;
+    let next = if let Some(current) = current.as_ref() {
+        if desired_shards < current.virtual_shards {
+            tracing::warn!(
+                current = current.virtual_shards,
+                desired = desired_shards,
+                "writer scale-down is not supported"
+            );
+            return Reconcile::Done;
+        }
+        if current.migration.is_some() || desired_shards > current.virtual_shards {
+            let source_lease_released = if let Some(migration) = &current.migration
+                && migration.phase == MigrationPhase::Draining
+            {
+                let lease_name = shard_lease_name(shard_lease_prefix, migration.split.source_shard);
+                match leases.is_released(&lease_name).await {
+                    Ok(released) => released,
+                    Err(error) => {
+                        tracing::warn!(%error, %lease_name, "failed to inspect source shard lease");
+                        return Reconcile::Retry;
+                    }
+                }
+            } else {
+                false
+            };
+            match coordinator_step(current, desired_shards, owners, source_lease_released) {
+                Ok(Some(next)) => next,
+                Ok(None) => return Reconcile::Done,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to advance shard migration");
+                    return Reconcile::Retry;
+                }
+            }
+        } else if membership_changed(Some(current), owners, desired_shards) {
+            match balanced_contiguous(
+                current.generation.next(),
+                desired_shards,
+                owners,
+                Some(current),
+            ) {
+                Ok(next) => next,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to plan shard assignment");
+                    return Reconcile::Retry;
+                }
+            }
+        } else {
+            return Reconcile::Done;
+        }
+    } else {
+        match balanced_contiguous(AssignmentGeneration::new(1), desired_shards, owners, None) {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::warn!(%error, "failed to plan initial shard assignment");
+                return Reconcile::Retry;
+            }
         }
     };
     match store.publish(next).await {
@@ -967,21 +1061,26 @@ mod tests {
             resolver.endpoint(&Owner::new("meter-0", 0)).unwrap(),
             "meter-0.meter-headless.default.svc:9090"
         );
-        assert_eq!(config.assignment_config_map, "meter-shard-assignments");
+        assert_eq!(config.shard_map, "meter-shard-map");
     }
 
     #[test]
-    fn config_map_round_trip_requires_matching_generation_stamp() {
-        let map = assignment();
-        let mut config_map = encode_assignment("assignments", "testing", &map).unwrap();
-        assert_eq!(decode_assignment(&config_map).unwrap(), Some(map));
-        config_map
-            .metadata
-            .annotations
-            .as_mut()
-            .unwrap()
-            .insert(GENERATION_ANNOTATION.to_owned(), "8".to_owned());
-        assert!(decode_assignment(&config_map).is_err());
+    fn shard_map_resource_round_trips() {
+        let owners = (0..65)
+            .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
+            .collect::<Vec<_>>();
+        let map = crate::plan_next_split(&assignment(), 65, &owners).unwrap();
+        let resource = encode_assignment(
+            "assignments",
+            "testing",
+            &BTreeMap::new(),
+            None,
+            &shard_map_api_resource(),
+            &map,
+        )
+        .unwrap();
+        assert_eq!(decode_assignment(&resource).unwrap(), Some(map));
+        assert_eq!(resource.metadata.namespace.as_deref(), Some("testing"));
     }
 
     #[test]

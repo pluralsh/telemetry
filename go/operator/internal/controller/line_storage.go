@@ -32,6 +32,11 @@ func (r *LineReconciler) reconcileStatefulSet(ctx context.Context, line *telemet
 	if err := controllerutil.SetControllerReference(line, desired, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
+	if component == resources.ComponentWriter {
+		if err := synchronizeWriterReplicas(ctx, r.Client, line, dataStoreLine, resources.Mode(line), desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	current := &appsv1.StatefulSet{}
 	key := client.ObjectKeyFromObject(desired)
 	if err := r.Get(ctx, key, current); err != nil {

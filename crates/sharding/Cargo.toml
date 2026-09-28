@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
 futures.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }

@@ -51,6 +51,71 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	if hasVolume(statefulSet.Spec.Template.Spec.Volumes, "data") || hasVolume(statefulSet.Spec.Template.Spec.Volumes, "cache") {
 		t.Fatal("pod volumes shadow default claim templates")
 	}
+	resources := statefulSet.Spec.Template.Spec.Containers[0].Resources
+	assertResourceQuantity(t, resources.Requests, corev1.ResourceCPU, "250m")
+	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, "2Gi")
+	if _, exists := resources.Limits[corev1.ResourceCPU]; exists {
+		t.Fatal("default resources unexpectedly include a CPU limit")
+	}
+}
+
+func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
+	meter := &telemetryv1alpha1.Meter{
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MeterSpec{
+			Mode: telemetryv1alpha1.MeterModeSharded,
+			Writer: telemetryv1alpha1.WorkloadSpec{
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				},
+				PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: containerMeter,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:              resource.MustParse("500m"),
+							corev1.ResourceMemory:           resource.MustParse("768Mi"),
+							corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+						},
+						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+					},
+				}}}},
+			},
+			Reader: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("750m")},
+			}},
+		},
+	}
+
+	writer, err := StatefulSet(StatefulSetInput{
+		Meter: meter, Component: ComponentWriter, ConfigSecretName: volumeConfig,
+		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerResources := writer.Spec.Template.Spec.Containers[0].Resources
+	assertResourceQuantity(t, writerResources.Requests, corev1.ResourceCPU, "500m")
+	assertResourceQuantity(t, writerResources.Requests, corev1.ResourceMemory, "1Gi")
+	assertResourceQuantity(t, writerResources.Requests, corev1.ResourceEphemeralStorage, "1Gi")
+	assertResourceQuantity(t, writerResources.Limits, corev1.ResourceCPU, "2")
+	assertResourceQuantity(t, writerResources.Limits, corev1.ResourceMemory, "3Gi")
+
+	reader, err := StatefulSet(StatefulSetInput{
+		Meter: meter, Component: ComponentReader, ConfigSecretName: volumeConfig,
+		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerResources := reader.Spec.Template.Spec.Containers[0].Resources
+	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceCPU, "750m")
+	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, readerResources.Limits, corev1.ResourceMemory, "2Gi")
+	if _, exists := readerResources.Limits[corev1.ResourceCPU]; exists {
+		t.Fatal("reader resources unexpectedly include a CPU limit")
+	}
 }
 
 func TestStatefulSetProductVersionPrecedence(t *testing.T) {
@@ -218,6 +283,9 @@ func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
 		container.ReadinessProbe == nil || container.ReadinessProbe.GRPC == nil {
 		t.Fatal("PseudoFS does not use gRPC health probes")
 	}
+	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "250m")
+	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, container.Resources.Limits, corev1.ResourceMemory, "2Gi")
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == volumeSecrets || mount.Name == volumeInternalToken {
 			t.Fatalf("PseudoFS contains unsupported secret mount: %#v", mount)
@@ -519,6 +587,17 @@ func assertClaim(t *testing.T, claims []corev1.PersistentVolumeClaim, name, size
 		}
 	}
 	t.Fatalf("claim %s is missing", name)
+}
+
+func assertResourceQuantity(t *testing.T, resources corev1.ResourceList, name corev1.ResourceName, expected string) {
+	t.Helper()
+	actual, exists := resources[name]
+	if !exists {
+		t.Fatalf("resource %s is missing", name)
+	}
+	if actual.Cmp(resource.MustParse(expected)) != 0 {
+		t.Fatalf("resource %s = %s, want %s", name, actual.String(), expected)
+	}
 }
 
 func assertEmptyDir(t *testing.T, volumes []corev1.Volume, name string, size resource.Quantity) {

@@ -4,26 +4,30 @@
 // you may not use this file except in compliance with the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use common::storage::{PutOptions, PutRecordOp, Record, RecordOp, Storage, Ttl, WriteOptions};
-use common::{StorageBuilder, StorageSemantics};
+use common::storage::{
+    PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
+};
+use common::{StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read};
 use futures::{StreamExt, TryStreamExt, stream};
 use opentelemetry_proto::tonic::{
     common::v1::KeyValue,
     trace::v1::{ResourceSpans, ScopeSpans},
 };
 use prost::Message;
+use slatedb::config::DbReaderOptions;
 use tokio::sync::Mutex;
 
 use crate::codec::{
     PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices, decode_locator,
     decode_locator_trace_id, decode_metadata, decode_posting_sequence, decode_sequence,
-    encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key,
-    locator_namespace_range, locator_range, metadata_key, metadata_range, next_sequence_key,
-    payload_key, posting_key, posting_range, segment_for,
+    encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key, locator_range,
+    locator_slot_range, metadata_key, metadata_range, next_sequence_key, payload_key, posting_key,
+    posting_range, segment_for,
 };
 
 /// Concurrent storage reads per query stage.
@@ -58,15 +62,26 @@ struct Retention {
 
 /// Single-node OTLP trace database over the common SlateDB abstraction.
 pub struct TraceDb {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn StorageRead>,
+    writer: Option<Arc<dyn Storage>>,
     config: Config,
     segment_ns: u64,
+    owned_slots: Range<u16>,
     write_lock: Mutex<()>,
 }
 
 impl TraceDb {
     pub async fn open(config: Config) -> Result<Self> {
+        Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
+    }
+
+    pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
         config.validate()?;
+        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
+            return Err(Error::Invalid(format!(
+                "invalid owned routing slot range {owned_slots:?}"
+            )));
+        }
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
         let semantics = StorageSemantics::new()
@@ -76,12 +91,53 @@ impl TraceDb {
             .with_semantics(semantics)
             .build()
             .await?;
+        let storage_read = storage.clone();
         Ok(Self {
-            storage,
+            storage: storage_read,
+            writer: Some(storage),
             config,
             segment_ns,
+            owned_slots,
             write_lock: Mutex::new(()),
         })
+    }
+
+    pub(crate) async fn open_reader_with_slots(
+        config: Config,
+        owned_slots: Range<u16>,
+        reader_options: DbReaderOptions,
+    ) -> Result<Self> {
+        config.validate()?;
+        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
+            return Err(Error::Invalid(format!(
+                "invalid owned routing slot range {owned_slots:?}"
+            )));
+        }
+        let segment_ns = u64::try_from(config.segment_duration.as_nanos())
+            .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
+        let semantics = StorageSemantics::new()
+            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
+        let storage = create_storage_read(
+            &config.storage,
+            StorageReaderRuntime::new(),
+            semantics,
+            reader_options,
+        )
+        .await?;
+        Ok(Self {
+            storage,
+            writer: None,
+            config,
+            segment_ns,
+            owned_slots,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    fn writer(&self) -> Result<&dyn Storage> {
+        self.writer
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("writes are unavailable on a read-only database".into()))
     }
 
     pub async fn write(
@@ -101,15 +157,22 @@ impl TraceDb {
         batches: Vec<TraceBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
-        let mut groups: BTreeMap<SegmentId, Vec<Trace>> = BTreeMap::new();
+        let mut groups: BTreeMap<(SegmentId, u16), Vec<Trace>> = BTreeMap::new();
         let mut report = WriteReport::default();
         for batch in batches {
             for trace in batch.traces {
                 let (min_timestamp_ns, _) = trace.timestamp_range();
                 let segment = segment_for(min_timestamp_ns, self.segment_ns);
+                let slot = crate::routing::routing_slot(namespace, trace.trace_id);
+                if !self.owned_slots.contains(&slot) {
+                    return Err(Error::Invalid(format!(
+                        "routing slot {slot} is outside opened shard range {:?}",
+                        self.owned_slots
+                    )));
+                }
                 report.traces += 1;
                 report.spans += trace.spans().count();
-                groups.entry(segment).or_default().push(trace);
+                groups.entry((segment, slot)).or_default().push(trace);
             }
         }
         if groups.is_empty() {
@@ -125,8 +188,8 @@ impl TraceDb {
             expires_at_unix_ms: self.logical_expiry()?,
         };
         let mut ops = Vec::new();
-        for (segment, traces) in groups {
-            let sequence_key = next_sequence_key(namespace, segment);
+        for ((segment, slot), traces) in groups {
+            let sequence_key = next_sequence_key(namespace, segment, slot);
             let mut sequence = self
                 .storage
                 .get(sequence_key.clone())
@@ -137,7 +200,16 @@ impl TraceDb {
             let mut builder = PageBuilder::new(self.config.page.clone())?;
             let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
                 append_page_ops(
-                    &mut ops, namespace, segment, sequence, &page, &traces, retention,
+                    &mut ops,
+                    namespace,
+                    PageWriteId {
+                        segment,
+                        slot,
+                        sequence,
+                    },
+                    &page,
+                    &traces,
+                    retention,
                 )?;
                 sequence = sequence
                     .checked_add(1)
@@ -159,7 +231,7 @@ impl TraceDb {
                 retention.physical_ttl,
             ));
         }
-        self.storage
+        self.writer()?
             .apply_with_options(
                 ops,
                 WriteOptions {
@@ -167,9 +239,6 @@ impl TraceDb {
                 },
             )
             .await?;
-        if durability == Durability::Written {
-            self.storage.flush().await?;
-        }
         Ok(report)
     }
 
@@ -277,19 +346,22 @@ impl TraceDb {
         } else if matchers.is_empty() {
             let mut candidates = Candidates::default();
             for segment in first_segment..=last_segment {
-                let mut metadata = self
-                    .storage
-                    .scan_iter(metadata_range(namespace, segment))
-                    .await?;
-                while let Some(record) = metadata.next().await? {
-                    let page_metadata = decode_metadata(&record.value)?;
-                    if page_metadata.is_expired_at(now) || !page_metadata.overlaps(start_ns, end_ns)
-                    {
-                        continue;
-                    }
-                    for trace in &page_metadata.traces {
-                        if trace.overlaps(start_ns, end_ns) {
-                            candidates.insert(trace.trace_id);
+                for slot in self.owned_slots.clone() {
+                    let mut metadata = self
+                        .storage
+                        .scan_iter(metadata_range(namespace, segment, slot))
+                        .await?;
+                    while let Some(record) = metadata.next().await? {
+                        let page_metadata = decode_metadata(&record.value)?;
+                        if page_metadata.is_expired_at(now)
+                            || !page_metadata.overlaps(start_ns, end_ns)
+                        {
+                            continue;
+                        }
+                        for trace in &page_metadata.traces {
+                            if trace.overlaps(start_ns, end_ns) {
+                                candidates.insert(trace.trace_id);
+                            }
                         }
                     }
                 }
@@ -333,41 +405,45 @@ impl TraceDb {
     ) -> Result<Candidates> {
         let mut candidates = Candidates::default();
         for segment in segments {
-            let mut postings = self
-                .storage
-                .scan_iter(posting_range(namespace, segment, matcher))
-                .await?;
-            let mut pages = Vec::new();
-            while let Some(record) = postings.next().await? {
-                pages.push((
-                    decode_posting_sequence(&record.key)?,
-                    decode_indices(&record.value)?,
-                ));
-            }
-            let mut pages = stream::iter(pages)
-                .map(|(sequence, indices)| async move {
-                    let record = self
-                        .storage
-                        .get(metadata_key(namespace, segment, sequence))
-                        .await?
-                        .ok_or_else(|| {
+            for slot in self.owned_slots.clone() {
+                let mut postings = self
+                    .storage
+                    .scan_iter(posting_range(namespace, segment, slot, matcher))
+                    .await?;
+                let mut pages = Vec::new();
+                while let Some(record) = postings.next().await? {
+                    pages.push((
+                        decode_posting_sequence(&record.key)?,
+                        decode_indices(&record.value)?,
+                    ));
+                }
+                let mut pages = stream::iter(pages)
+                    .map(|(sequence, indices)| async move {
+                        let record = self
+                            .storage
+                            .get(metadata_key(namespace, segment, slot, sequence))
+                            .await?
+                            .ok_or_else(|| {
+                                Error::Corrupt(
+                                    "attribute posting references missing metadata".to_owned(),
+                                )
+                            })?;
+                        Ok::<_, Error>((decode_metadata(&record.value)?, indices))
+                    })
+                    .buffered(READ_CONCURRENCY);
+                while let Some((metadata, indices)) = pages.try_next().await? {
+                    if metadata.is_expired_at(now) || !metadata.overlaps(start_ns, end_ns) {
+                        continue;
+                    }
+                    for index in indices {
+                        let trace = metadata.traces.get(index as usize).ok_or_else(|| {
                             Error::Corrupt(
-                                "attribute posting references missing metadata".to_owned(),
+                                "attribute posting trace index is out of bounds".to_owned(),
                             )
                         })?;
-                    Ok::<_, Error>((decode_metadata(&record.value)?, indices))
-                })
-                .buffered(READ_CONCURRENCY);
-            while let Some((metadata, indices)) = pages.try_next().await? {
-                if metadata.is_expired_at(now) || !metadata.overlaps(start_ns, end_ns) {
-                    continue;
-                }
-                for index in indices {
-                    let trace = metadata.traces.get(index as usize).ok_or_else(|| {
-                        Error::Corrupt("attribute posting trace index is out of bounds".to_owned())
-                    })?;
-                    if trace.overlaps(start_ns, end_ns) {
-                        candidates.insert(trace.trace_id);
+                        if trace.overlaps(start_ns, end_ns) {
+                            candidates.insert(trace.trace_id);
+                        }
                     }
                 }
             }
@@ -384,20 +460,25 @@ impl TraceDb {
         last_segment: SegmentId,
         now: u64,
     ) -> Result<Vec<TraceId>> {
-        let mut records = self
-            .storage
-            .scan_iter(locator_namespace_range(namespace))
-            .await?;
         let mut first_pages = HashMap::new();
-        while let Some(record) = records.next().await? {
-            let locator = decode_locator(&record.value)?;
-            if !locator.is_expired_at(now)
-                && locator.segment >= first_segment
-                && locator.segment <= last_segment
-            {
-                first_pages
-                    .entry(decode_locator_trace_id(&record.key)?)
-                    .or_insert((locator.segment, locator.page_sequence));
+        for slot in self.owned_slots.clone() {
+            let mut records = self
+                .storage
+                .scan_iter(locator_slot_range(namespace, slot))
+                .await?;
+            while let Some(record) = records.next().await? {
+                let locator = decode_locator(&record.value)?;
+                if !locator.is_expired_at(now)
+                    && locator.segment >= first_segment
+                    && locator.segment <= last_segment
+                {
+                    let (key_slot, trace_id) = decode_locator_trace_id(&record.key)?;
+                    first_pages.entry(trace_id).or_insert((
+                        locator.segment,
+                        key_slot,
+                        locator.page_sequence,
+                    ));
+                }
             }
         }
         Ok(order_by_first_page(first_pages))
@@ -424,29 +505,34 @@ impl TraceDb {
             ));
         }
         let now = unix_time_ms()?;
-        let mut records = self
-            .storage
-            .scan_iter(locator_namespace_range(namespace))
-            .await?;
-        let mut scanned: Vec<ScannedTrace> = Vec::new();
-        // Locator keys sort by trace ID, so a trace's continuations are adjacent.
-        while let Some(record) = records.next().await? {
-            let locator = decode_locator(&record.value)?;
-            if locator.is_expired_at(now) {
-                continue;
+        let mut first_pages = HashMap::new();
+        for slot in self.owned_slots.clone() {
+            let mut records = self
+                .storage
+                .scan_iter(locator_slot_range(namespace, slot))
+                .await?;
+            while let Some(record) = records.next().await? {
+                let locator = decode_locator(&record.value)?;
+                if locator.is_expired_at(now) {
+                    continue;
+                }
+                let (key_slot, trace_id) = decode_locator_trace_id(&record.key)?;
+                first_pages.entry(trace_id).or_insert((
+                    locator.segment,
+                    key_slot,
+                    locator.page_sequence,
+                ));
             }
-            let trace_id = decode_locator_trace_id(&record.key)?;
-            if scanned.last().is_some_and(|last| last.trace_id == trace_id) {
-                continue;
-            }
-            if scanned.len() == limit {
-                break;
-            }
-            scanned.push(ScannedTrace {
-                trace_id,
-                first_page: (locator.segment, locator.page_sequence),
-            });
         }
+        let mut scanned = first_pages
+            .into_iter()
+            .map(|(trace_id, first_page)| ScannedTrace {
+                trace_id,
+                first_page,
+            })
+            .collect::<Vec<_>>();
+        scanned.sort_unstable_by_key(|trace| trace.trace_id);
+        scanned.truncate(limit);
         Ok(scanned)
     }
 
@@ -560,7 +646,9 @@ impl TraceDb {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        self.storage.flush().await?;
+        if let Some(storage) = &self.writer {
+            storage.flush().await?;
+        }
         Ok(())
     }
 
@@ -597,9 +685,16 @@ impl TraceDb {
     ) -> Result<Vec<(TraceId, Vec<TraceLocator>)>> {
         stream::iter(trace_ids.iter().copied())
             .map(|trace_id| async move {
+                let slot = crate::routing::routing_slot(namespace, trace_id);
+                if !self.owned_slots.contains(&slot) {
+                    return Err(Error::Invalid(format!(
+                        "routing slot {slot} is outside opened shard range {:?}",
+                        self.owned_slots
+                    )));
+                }
                 let mut records = self
                     .storage
-                    .scan_iter(locator_range(namespace, trace_id))
+                    .scan_iter(locator_range(namespace, slot, trace_id))
                     .await?;
                 let mut locators = Vec::new();
                 while let Some(record) = records.next().await? {
@@ -626,13 +721,16 @@ impl TraceDb {
     ) -> Result<Vec<Located>> {
         let wanted: BTreeSet<PageRef> = located
             .iter()
-            .flat_map(|(_, locators)| locators.iter().map(TraceLocator::page))
+            .flat_map(|(trace_id, locators)| {
+                let slot = crate::routing::routing_slot(namespace, *trace_id);
+                locators.iter().map(move |locator| locator.page(slot))
+            })
             .collect();
         let metadata: HashMap<PageRef, StoredPageMetadata> = stream::iter(wanted)
-            .map(|page @ (segment, sequence)| async move {
+            .map(|page @ (segment, slot, sequence)| async move {
                 let record = self
                     .storage
-                    .get(metadata_key(namespace, segment, sequence))
+                    .get(metadata_key(namespace, segment, slot, sequence))
                     .await?
                     .ok_or_else(|| {
                         Error::Corrupt("trace locator references missing metadata".to_owned())
@@ -646,10 +744,11 @@ impl TraceDb {
             .into_iter()
             .filter(|(_, locators)| !locators.is_empty())
             .map(|(trace_id, locators)| {
+                let slot = crate::routing::routing_slot(namespace, trace_id);
                 let mut start_ns = u64::MAX;
                 let mut end_ns = 0;
                 for locator in &locators {
-                    let trace = metadata[&locator.page()]
+                    let trace = metadata[&locator.page(slot)]
                         .traces
                         .get(locator.trace_index as usize)
                         .filter(|trace| trace.trace_id == trace_id)
@@ -678,13 +777,16 @@ impl TraceDb {
     ) -> Result<Vec<Trace>> {
         let wanted: BTreeSet<PageRef> = located
             .iter()
-            .flat_map(|(_, locators)| locators.iter().map(TraceLocator::page))
+            .flat_map(|(trace_id, locators)| {
+                let slot = crate::routing::routing_slot(namespace, *trace_id);
+                locators.iter().map(move |locator| locator.page(slot))
+            })
             .collect();
         let pages: HashMap<PageRef, Page> = stream::iter(wanted)
-            .map(|page @ (segment, sequence)| async move {
+            .map(|page @ (segment, slot, sequence)| async move {
                 let payload = self
                     .storage
-                    .get(payload_key(namespace, segment, sequence))
+                    .get(payload_key(namespace, segment, slot, sequence))
                     .await?
                     .ok_or_else(|| {
                         Error::Corrupt("trace locator references a missing page".to_owned())
@@ -699,11 +801,12 @@ impl TraceDb {
             if locators.is_empty() {
                 continue;
             }
+            let slot = crate::routing::routing_slot(namespace, trace_id);
             let continuations = locators
                 .iter()
                 .map(|locator| {
                     let trace =
-                        pages[&locator.page()].decode_trace(locator.trace_index as usize)?;
+                        pages[&locator.page(slot)].decode_trace(locator.trace_index as usize)?;
                     if trace.trace_id != trace_id {
                         return Err(Error::Corrupt(
                             "trace locator points to a different trace".to_owned(),
@@ -786,11 +889,17 @@ fn order_by_first_page(first_pages: HashMap<TraceId, PageRef>) -> Vec<TraceId> {
     ordered.into_iter().map(|(trace_id, _)| trace_id).collect()
 }
 
+#[derive(Clone, Copy)]
+struct PageWriteId {
+    segment: SegmentId,
+    slot: u16,
+    sequence: u64,
+}
+
 fn append_page_ops(
     ops: &mut Vec<RecordOp>,
     namespace: &Namespace,
-    segment: SegmentId,
-    sequence: u64,
+    id: PageWriteId,
     page: &Page,
     traces: &[Trace],
     retention: Retention,
@@ -818,12 +927,12 @@ fn append_page_ops(
             .collect(),
     };
     ops.push(put(
-        metadata_key(namespace, segment, sequence),
+        metadata_key(namespace, id.segment, id.slot, id.sequence),
         encode_metadata(&metadata)?,
         retention.physical_ttl,
     ));
     ops.push(put(
-        payload_key(namespace, segment, sequence),
+        payload_key(namespace, id.segment, id.slot, id.sequence),
         page.bytes(),
         retention.physical_ttl,
     ));
@@ -834,10 +943,10 @@ fn append_page_ops(
     for (index, (entry, trace)) in page.directory().iter().zip(traces).enumerate() {
         debug_assert_eq!(entry.trace_id, trace.trace_id);
         ops.push(put(
-            locator_key(namespace, trace.trace_id, segment, sequence),
+            locator_key(namespace, id.slot, trace.trace_id, id.segment, id.sequence),
             encode_locator(&TraceLocator {
-                segment,
-                page_sequence: sequence,
+                segment: id.segment,
+                page_sequence: id.sequence,
                 trace_index: u32::try_from(index)
                     .map_err(|_| Error::Invalid("trace index exceeds u32".to_owned()))?,
                 expires_at_unix_ms: retention.expires_at_unix_ms,
@@ -848,7 +957,13 @@ fn append_page_ops(
         collect_trace_attributes(trace, &mut seen);
         for matcher in seen {
             postings
-                .entry(posting_key(namespace, segment, &matcher, sequence))
+                .entry(posting_key(
+                    namespace,
+                    id.segment,
+                    id.slot,
+                    &matcher,
+                    id.sequence,
+                ))
                 .or_default()
                 .push(index as u32);
         }
@@ -1067,7 +1182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_multiple_traces_per_page_and_isolates_namespaces() {
+    async fn stores_traces_in_slot_local_pages_and_isolates_namespaces() {
         let db = TraceDb::open(test_config()).await.unwrap();
         let tenant_a = Namespace::new("tenant-a").unwrap();
         let tenant_b = Namespace::new("tenant-b").unwrap();
@@ -1080,7 +1195,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(report.pages, 1);
+        let expected_pages = [
+            crate::routing::routing_slot(&tenant_a, first.trace_id),
+            crate::routing::routing_slot(&tenant_a, second.trace_id),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .len();
+        assert_eq!(report.pages, expected_pages);
         assert_eq!(report.traces, 2);
         db.write(
             &tenant_b,
@@ -1104,6 +1226,77 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_sequences_are_local_to_each_segment_slot() {
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("slot-local").unwrap();
+        let first = trace(1, 1, "first", Vec::new(), Vec::new());
+        let first_slot = crate::routing::routing_slot(&namespace, first.trace_id);
+        let second = (2..=u8::MAX)
+            .map(|id| trace(id, 2, "second", Vec::new(), Vec::new()))
+            .find(|trace| crate::routing::routing_slot(&namespace, trace.trace_id) != first_slot)
+            .unwrap();
+        let second_slot = crate::routing::routing_slot(&namespace, second.trace_id);
+
+        db.write(
+            &namespace,
+            vec![TraceBatch::new(vec![first.clone(), second.clone()])],
+        )
+        .await
+        .unwrap();
+
+        for slot in [first_slot, second_slot] {
+            let mut records = db
+                .storage
+                .scan_iter(metadata_range(&namespace, 0, slot))
+                .await
+                .unwrap();
+            let record = records.next().await.unwrap().unwrap();
+            assert_eq!(
+                crate::codec::decode_metadata_sequence(&record.key).unwrap(),
+                0
+            );
+            assert!(records.next().await.unwrap().is_none());
+        }
+        assert_eq!(
+            db.get_trace(&namespace, first.trace_id).await.unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            db.get_trace(&namespace, second.trace_id).await.unwrap(),
+            Some(second)
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opened_slot_range_rejects_non_authoritative_access() {
+        let namespace = Namespace::new("owned-slots").unwrap();
+        let trace = trace(1, 1, "outside", Vec::new(), Vec::new());
+        let slot = crate::routing::routing_slot(&namespace, trace.trace_id);
+        let owned = if slot == 0 { 1..2 } else { 0..1 };
+        let db = TraceDb::open_with_slots(test_config(), owned)
+            .await
+            .unwrap();
+
+        let write_error = db
+            .write(&namespace, vec![TraceBatch::new(vec![trace.clone()])])
+            .await
+            .unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("outside opened shard range")
+        );
+        let read_error = db.get_trace(&namespace, trace.trace_id).await.unwrap_err();
+        assert!(
+            read_error
+                .to_string()
+                .contains("outside opened shard range")
         );
         db.close().await.unwrap();
     }

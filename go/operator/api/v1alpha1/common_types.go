@@ -25,6 +25,18 @@ const (
 	ProductModeSharded    ProductMode = "Sharded"
 )
 
+// WriterScalingStatus reports the operator-observed writer membership and the
+// authoritative Rust-managed ShardMap state. Nil shard fields mean the
+// ShardMap was absent or could not be trusted.
+type WriterScalingStatus struct {
+	EffectiveWriterReplicas int32  `json:"effectiveWriterReplicas,omitempty"`
+	ReadyWriterReplicas     int32  `json:"readyWriterReplicas,omitempty"`
+	ShardCount              *int32 `json:"shardCount,omitempty"`
+	ShardGeneration         *int64 `json:"shardGeneration,omitempty"`
+	MigrationPhase          string `json:"migrationPhase,omitempty"`
+	MigrationError          string `json:"migrationError,omitempty"`
+}
+
 type ObjectStoreType string
 
 const (
@@ -178,9 +190,6 @@ type WriteSpec struct {
 type ShardingSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=8
-	VirtualShards *int32 `json:"virtualShards,omitempty"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=8
 	IOConcurrencyMultiplier *int32 `json:"ioConcurrencyMultiplier,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=15
@@ -240,6 +249,10 @@ type WorkloadSpec struct {
 	// toleration replaces a podTemplate toleration with the same key, operator,
 	// and effect; otherwise it is appended.
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// Resources configures requests and limits for the datastore container.
+	// Values here take precedence over podTemplate container resources. Missing
+	// values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit.
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// PodTemplate is the full Kubernetes pod template escape hatch. Operator
 	// required fields and the first-class scheduling fields are merged into it.
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`

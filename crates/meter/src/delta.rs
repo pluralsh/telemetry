@@ -20,6 +20,7 @@ pub(crate) struct SeriesSamples {
 pub(crate) struct TsdbContext {
     pub(crate) namespace: Namespace,
     pub(crate) bucket: TimeBucket,
+    pub(crate) routing_slot: u16,
     pub(crate) series_dict: Arc<HashMap<SeriesFingerprint, SeriesId>>,
     pub(crate) next_series_id: u32,
     pub(crate) active_series: Arc<ActiveSeriesTracker>,
@@ -29,6 +30,7 @@ pub(crate) struct TsdbContext {
 pub(crate) struct FrozenTsdbDelta {
     pub(crate) namespace: Namespace,
     pub(crate) bucket: TimeBucket,
+    pub(crate) routing_slot: u16,
     pub(crate) forward_index: ForwardIndex,
     pub(crate) inverted_index: InvertedIndex,
     pub(crate) series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
@@ -50,6 +52,7 @@ impl FrozenTsdbDelta {
 pub(crate) struct TsdbWriteDelta {
     namespace: Namespace,
     bucket: TimeBucket,
+    routing_slot: u16,
     series_dict_base: Arc<HashMap<SeriesFingerprint, SeriesId>>,
     series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
     forward_index: ForwardIndex,
@@ -124,7 +127,10 @@ impl TsdbWriteDelta {
         } else {
             // New series: allocate ID and build indexes.
             let id = self.next_series_id;
-            self.next_series_id += 1;
+            self.next_series_id = self
+                .next_series_id
+                .checked_add(u32::from(sharding::ROUTING_SLOT_COUNT))
+                .expect("series ID space exhausted for routing slot");
 
             self.series_dict_delta.insert(fingerprint, id);
 
@@ -162,6 +168,7 @@ impl Delta for TsdbWriteDelta {
         Self {
             namespace: context.namespace,
             bucket: context.bucket,
+            routing_slot: context.routing_slot,
             series_dict_base: context.series_dict.clone(),
             series_dict_delta: HashMap::new(),
             forward_index: ForwardIndex::default(),
@@ -201,6 +208,7 @@ impl Delta for TsdbWriteDelta {
         let context = TsdbContext {
             namespace: self.namespace.clone(),
             bucket: self.bucket,
+            routing_slot: self.routing_slot,
             series_dict: merged_dict,
             next_series_id: self.next_series_id,
             active_series: self.active_series,
@@ -209,6 +217,7 @@ impl Delta for TsdbWriteDelta {
         let frozen = FrozenTsdbDelta {
             namespace: self.namespace,
             bucket: self.bucket,
+            routing_slot: self.routing_slot,
             forward_index: self.forward_index,
             inverted_index: self.inverted_index,
             series_dict_delta: self.series_dict_delta,
@@ -234,6 +243,7 @@ mod tests {
         TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: Arc::new(ActiveSeriesTracker::new(0)),
@@ -267,10 +277,43 @@ mod tests {
         delta.apply(vec![series]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 1);
+        assert_eq!(delta.next_series_id, 4096);
         assert_eq!(delta.series_dict_delta.len(), 1);
         assert_eq!(delta.samples.len(), 1);
         assert_eq!(delta.samples.get(&0).unwrap().points.len(), 1);
+    }
+
+    #[test]
+    fn should_allocate_series_ids_independently_in_slot_stride() {
+        let mut ctx = create_test_context();
+        ctx.routing_slot = 17;
+        ctx.next_series_id = 17;
+        let mut delta = TsdbWriteDelta::init(ctx);
+
+        delta
+            .apply(vec![
+                create_test_series("a", vec![("env", "prod")], create_test_sample()),
+                create_test_series(
+                    "b",
+                    vec![("env", "prod")],
+                    Sample {
+                        timestamp_ms: 60_000_002,
+                        value: 1.0,
+                    },
+                ),
+            ])
+            .unwrap();
+
+        assert!(delta.samples.contains_key(&17));
+        assert!(
+            delta
+                .samples
+                .contains_key(&(17 + u32::from(sharding::ROUTING_SLOT_COUNT)))
+        );
+        assert_eq!(
+            delta.next_series_id,
+            17 + 2 * u32::from(sharding::ROUTING_SLOT_COUNT)
+        );
     }
 
     #[test]
@@ -294,7 +337,7 @@ mod tests {
         delta.apply(vec![series2]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 1); // Only one series created
+        assert_eq!(delta.next_series_id, 4096); // Only one series created
         assert_eq!(delta.series_dict_delta.len(), 1);
         assert_eq!(delta.samples.get(&0).unwrap().points.len(), 2);
     }
@@ -321,7 +364,7 @@ mod tests {
         delta2.apply(vec![series2]).unwrap();
 
         // then: should reuse series_id from frozen context
-        assert_eq!(delta2.next_series_id, 1); // No new ID allocated
+        assert_eq!(delta2.next_series_id, 4096); // No new ID allocated
         assert_eq!(delta2.series_dict_delta.len(), 0); // Not in delta overlay
         assert_eq!(delta2.samples.get(&0).unwrap().points.len(), 1);
 
@@ -366,7 +409,7 @@ mod tests {
         }
 
         // then
-        assert_eq!(delta.next_series_id, 1);
+        assert_eq!(delta.next_series_id, 4096);
         assert_eq!(delta.samples.get(&0).unwrap().points.len(), 3);
     }
 
@@ -378,8 +421,9 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 0,
             series_dict: Arc::new(base),
-            next_series_id: 1,
+            next_series_id: 4096,
             active_series: Arc::new(ActiveSeriesTracker::new(0)),
         };
         let delta = TsdbWriteDelta::init(ctx);
@@ -413,11 +457,11 @@ mod tests {
         delta.apply(vec![series2]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 2);
+        assert_eq!(delta.next_series_id, 8192);
         assert_eq!(delta.series_dict_delta.len(), 2);
         assert_eq!(delta.samples.len(), 2);
         assert!(delta.samples.contains_key(&0));
-        assert!(delta.samples.contains_key(&1));
+        assert!(delta.samples.contains_key(&4096));
     }
 
     #[test]
@@ -444,7 +488,7 @@ mod tests {
         delta.apply(vec![series2]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 1); // Same series_id reused
+        assert_eq!(delta.next_series_id, 4096); // Same series_id reused
         assert_eq!(delta.series_dict_delta.len(), 1);
         assert_eq!(delta.samples.len(), 1);
     }
@@ -522,7 +566,7 @@ mod tests {
         delta.apply(vec![series]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 1);
+        assert_eq!(delta.next_series_id, 4096);
         assert_eq!(delta.series_dict_delta.len(), 1);
         assert_eq!(delta.samples.len(), 1);
         // Only __name__ label in inverted index
@@ -566,8 +610,9 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
+            routing_slot: 42,
             series_dict: Arc::new(base),
-            next_series_id: 43,
+            next_series_id: 4138,
             active_series: Arc::new(ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
@@ -578,7 +623,7 @@ mod tests {
         delta.apply(vec![series]).unwrap();
 
         // then
-        assert_eq!(delta.next_series_id, 43); // No new ID allocated
+        assert_eq!(delta.next_series_id, 4138); // No new ID allocated
         assert_eq!(delta.series_dict_delta.len(), 0); // Not added to delta
         assert!(delta.samples.contains_key(&42)); // Uses existing series_id
     }

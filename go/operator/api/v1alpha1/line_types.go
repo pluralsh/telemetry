@@ -114,11 +114,12 @@ type LineSpec struct {
 }
 
 type LineStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
-	WriterEndpoint     string             `json:"writerEndpoint,omitempty"`
-	ReaderEndpoint     string             `json:"readerEndpoint,omitempty"`
-	ConfigHash         string             `json:"configHash,omitempty"`
+	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
+	Conditions          []metav1.Condition `json:"conditions,omitempty"`
+	WriterEndpoint      string             `json:"writerEndpoint,omitempty"`
+	ReaderEndpoint      string             `json:"readerEndpoint,omitempty"`
+	ConfigHash          string             `json:"configHash,omitempty"`
+	WriterScalingStatus `json:",inline"`
 }
 
 // +kubebuilder:object:root=true

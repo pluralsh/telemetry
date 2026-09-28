@@ -28,7 +28,7 @@ fn in_memory_config() -> common::storage::config::SlateDbStorageConfig {
 /// object store, so storages do not share state.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) async fn in_memory_storage() -> Storage {
-    Storage::try_new(&in_memory_config(), crate::Namespace::default())
+    Storage::try_new(&in_memory_config())
         .await
         .expect("in-memory SlateDB storage build failed")
 }
@@ -53,7 +53,6 @@ impl SharedInMemoryStorage {
     pub(crate) async fn reader(&self) -> StorageReader {
         StorageReader::try_new_with_object_store(
             &self.config,
-            crate::Namespace::default(),
             slatedb::config::DbReaderOptions::default(),
             None,
             self.object_store.clone(),
@@ -71,13 +70,9 @@ pub(crate) async fn in_memory_shared_storage() -> SharedInMemoryStorage {
     let config = in_memory_config();
     let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
         Arc::new(slatedb::object_store::memory::InMemory::new());
-    let storage = Storage::try_new_with_object_store(
-        &config,
-        crate::Namespace::default(),
-        object_store.clone(),
-    )
-    .await
-    .expect("in-memory SlateDB storage build failed");
+    let storage = Storage::try_new_with_object_store(&config, object_store.clone())
+        .await
+        .expect("in-memory SlateDB storage build failed");
     SharedInMemoryStorage {
         storage: Arc::new(storage),
         config,
@@ -173,81 +168,116 @@ mod failing_storage {
 
         async fn get_buckets_in_range(
             &self,
+            namespace: &crate::Namespace,
             start_secs: Option<i64>,
             end_secs: Option<i64>,
         ) -> crate::util::Result<Vec<TimeBucket>> {
-            self.inner.get_buckets_in_range(start_secs, end_secs).await
+            self.inner
+                .get_buckets_in_range(namespace, start_secs, end_secs)
+                .await
         }
 
         async fn get_buckets_for_ranges(
             &self,
+            namespace: &crate::Namespace,
             ranges: &[(i64, i64)],
         ) -> crate::util::Result<Vec<TimeBucket>> {
-            self.inner.get_buckets_for_ranges(ranges).await
+            self.inner.get_buckets_for_ranges(namespace, ranges).await
         }
 
-        async fn get_forward_index(&self, bucket: TimeBucket) -> crate::util::Result<ForwardIndex> {
-            self.inner.get_forward_index(bucket).await
+        async fn get_forward_index(
+            &self,
+            namespace: &crate::Namespace,
+            bucket: TimeBucket,
+            slots: std::ops::Range<u16>,
+        ) -> crate::util::Result<ForwardIndex> {
+            self.inner.get_forward_index(namespace, bucket, slots).await
         }
 
         async fn get_inverted_index(
             &self,
+            namespace: &crate::Namespace,
             bucket: TimeBucket,
+            slots: std::ops::Range<u16>,
         ) -> crate::util::Result<InvertedIndex> {
-            self.inner.get_inverted_index(bucket).await
+            self.inner
+                .get_inverted_index(namespace, bucket, slots)
+                .await
         }
 
         async fn get_inverted_index_terms(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            slots: std::ops::Range<u16>,
             terms: &[Label],
         ) -> crate::util::Result<InvertedIndex> {
-            self.inner.get_inverted_index_terms(bucket, terms).await
+            self.inner
+                .get_inverted_index_terms(namespace, bucket, slots, terms)
+                .await
         }
 
         async fn get_inverted_index_term(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            slots: std::ops::Range<u16>,
             term: &Label,
         ) -> crate::util::Result<Option<RoaringBitmap>> {
-            self.inner.get_inverted_index_term(bucket, term).await
+            self.inner
+                .get_inverted_index_term(namespace, bucket, slots, term)
+                .await
         }
 
         async fn get_forward_index_series(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            slots: std::ops::Range<u16>,
             series_ids: &[SeriesId],
         ) -> crate::util::Result<ForwardIndex> {
             self.inner
-                .get_forward_index_series(bucket, series_ids)
+                .get_forward_index_series(namespace, bucket, slots, series_ids)
                 .await
         }
 
         async fn get_forward_index_one(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            slots: std::ops::Range<u16>,
             series_id: SeriesId,
         ) -> crate::util::Result<Option<SeriesSpec>> {
-            self.inner.get_forward_index_one(bucket, series_id).await
+            self.inner
+                .get_forward_index_one(namespace, bucket, slots, series_id)
+                .await
         }
 
         async fn load_series_dictionary<F>(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            routing_slot: u16,
             insert: F,
         ) -> crate::util::Result<u32>
         where
             F: FnMut(SeriesFingerprint, SeriesId) + Send,
         {
-            self.inner.load_series_dictionary(bucket, insert).await
+            self.inner
+                .load_series_dictionary(namespace, bucket, routing_slot, insert)
+                .await
         }
 
         async fn get_label_values(
             &self,
+            namespace: &crate::Namespace,
             bucket: &TimeBucket,
+            slots: std::ops::Range<u16>,
             label_name: &str,
         ) -> crate::util::Result<Vec<String>> {
-            self.inner.get_label_values(bucket, label_name).await
+            self.inner
+                .get_label_values(namespace, bucket, slots, label_name)
+                .await
         }
     }
 }
@@ -308,7 +338,7 @@ mod tests {
             meta_cache: None,
         };
 
-        let storage = Storage::try_new(&config, crate::Namespace::default()).await;
+        let storage = Storage::try_new(&config).await;
         assert!(
             storage.is_ok(),
             "expected config-driven block cache to work"
@@ -343,14 +373,11 @@ mod tests {
 
         // Open a writer first so the reader has a manifest to read, then drop it
         // (SlateDB fencing) before opening the reader.
-        let writer = Storage::try_new(&with_cache(&writer_cache), crate::Namespace::default())
-            .await
-            .unwrap();
+        let writer = Storage::try_new(&with_cache(&writer_cache)).await.unwrap();
         drop(writer);
 
         let reader = StorageReader::try_new(
             &with_cache(&reader_cache),
-            crate::Namespace::default(),
             slatedb::config::DbReaderOptions::default(),
             None,
         )
@@ -365,7 +392,7 @@ mod tests {
     async fn should_work_without_block_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let config = slatedb_config_with_local_dir(tmp.path());
-        let storage = Storage::try_new(&config, crate::Namespace::default()).await;
+        let storage = Storage::try_new(&config).await;
         assert!(storage.is_ok());
         storage.unwrap().close().await.unwrap();
     }
@@ -410,7 +437,7 @@ mod tests {
         );
 
         let handle = tokio::spawn(async move {
-            let _ = Storage::try_new(&config, crate::Namespace::default()).await;
+            let _ = Storage::try_new(&config).await;
         });
         let result = handle.await;
         assert!(

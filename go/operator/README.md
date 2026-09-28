@@ -33,6 +33,25 @@ non-negative replica counts override those defaults. Standalone mode always
 uses one writer replica and no reader workload. Admission rejects any other
 standalone replica configuration.
 
+In sharded mode, `spec.writer.replicas` remains user intent. Scale-up is applied
+to the writer StatefulSet immediately so the Rust shard coordinator can observe
+the new ordinal and advance the authoritative `<name>-writer-shard-map`.
+Scale-down is held at the ShardMap shard count and any active migration floor.
+If that ShardMap is missing or its ownership metadata is uncertain, the
+operator conservatively retains the current StatefulSet replica count. Product
+status exposes effective and ready writer replicas, ShardMap count/generation,
+migration phase/error, and `WriterScaling` / `WriterScalingBlocked`
+conditions. A sharded product is not `Ready` while migration is active or
+until writer intent equals the authoritative shard count.
+
+The operator intentionally does not inject a writer `preStop` drain command.
+The products currently expose health/readiness endpoints and coordinate
+per-shard drain through ShardMap and Lease transitions, but do not expose a
+stable, authenticated, bounded whole-process drain endpoint or CLI command.
+Calling an inferred endpoint during pod termination could bypass the Rust
+coordinator or hang termination. A hook can be added once such a protocol is
+explicitly supported with a bounded timeout and idempotent semantics.
+
 `nodeSelector` is merged over `podTemplate.spec.nodeSelector`, so first-class
 keys win. `tolerations` are merged with `podTemplate.spec.tolerations`; a
 first-class entry replaces a template entry with the same key, operator, and

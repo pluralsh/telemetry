@@ -13,12 +13,12 @@ use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
 };
 
-pub(crate) const KEY_VERSION: u8 = 1;
+pub(crate) const KEY_VERSION: u8 = 2;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
-    ScopedSegmentExtractor::new("track-trace/v1", KEY_SCOPE);
+    ScopedSegmentExtractor::new("track-trace/v2", KEY_SCOPE);
 /// Leading byte of page metadata and locator values.
 const VALUE_VERSION: u8 = 1;
 const HAS_EXPIRY: u8 = 1;
@@ -82,8 +82,8 @@ pub(crate) struct TraceLocator {
     pub expires_at_unix_ms: Option<u64>,
 }
 
-/// A page's `(segment, sequence)` address.
-pub(crate) type PageRef = (SegmentId, u64);
+/// A page's `(segment, routing slot, sequence)` address.
+pub(crate) type PageRef = (SegmentId, u16, u64);
 
 impl TraceLocator {
     pub(crate) fn is_expired_at(&self, unix_ms: u64) -> bool {
@@ -91,8 +91,8 @@ impl TraceLocator {
             .is_some_and(|expires_at| unix_ms >= expires_at)
     }
 
-    pub(crate) fn page(&self) -> PageRef {
-        (self.segment, self.page_sequence)
+    pub(crate) fn page(&self, slot: u16) -> PageRef {
+        (self.segment, slot, self.page_sequence)
     }
 }
 
@@ -107,25 +107,35 @@ pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes
     bytes.freeze()
 }
 
-pub(crate) fn next_sequence_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::NextPageSequence).freeze()
+pub(crate) fn next_sequence_key(namespace: &Namespace, segment: SegmentId, slot: u16) -> Bytes {
+    record_prefix(namespace, segment, slot, RecordType::NextPageSequence).freeze()
 }
 
-pub(crate) fn metadata_key(namespace: &Namespace, segment: SegmentId, sequence: u64) -> Bytes {
-    sequence_key(namespace, segment, RecordType::PageMetadata, sequence)
+pub(crate) fn metadata_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    sequence: u64,
+) -> Bytes {
+    sequence_key(namespace, segment, slot, RecordType::PageMetadata, sequence)
 }
 
-pub(crate) fn payload_key(namespace: &Namespace, segment: SegmentId, sequence: u64) -> Bytes {
-    sequence_key(namespace, segment, RecordType::PagePayload, sequence)
+pub(crate) fn payload_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    sequence: u64,
+) -> Bytes {
+    sequence_key(namespace, segment, slot, RecordType::PagePayload, sequence)
 }
 
-pub(crate) fn metadata_range(namespace: &Namespace, segment: SegmentId) -> BytesRange {
-    BytesRange::prefix(record_prefix(namespace, segment, RecordType::PageMetadata).freeze())
+pub(crate) fn metadata_range(namespace: &Namespace, segment: SegmentId, slot: u16) -> BytesRange {
+    BytesRange::prefix(record_prefix(namespace, segment, slot, RecordType::PageMetadata).freeze())
 }
 
 #[cfg(test)]
 pub(crate) fn decode_metadata_sequence(key: &[u8]) -> Result<u64> {
-    let (_, _, record_type, offset) = parse_record_prefix(key)?;
+    let (_, _, _, record_type, offset) = parse_record_prefix(key)?;
     if record_type != RecordType::PageMetadata || key.len() != offset + 8 {
         return Err(Error::Corrupt("invalid trace page metadata key".to_owned()));
     }
@@ -134,45 +144,52 @@ pub(crate) fn decode_metadata_sequence(key: &[u8]) -> Result<u64> {
 
 pub(crate) fn locator_key(
     namespace: &Namespace,
+    slot: u16,
     trace_id: TraceId,
     segment: SegmentId,
     sequence: u64,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator);
+    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, slot, RecordType::TraceLocator);
     bytes.extend_from_slice(trace_id.as_bytes());
     bytes.put_u64(encode_i64_sortable(segment));
     bytes.put_u64(sequence);
     bytes.freeze()
 }
 
-pub(crate) fn locator_range(namespace: &Namespace, trace_id: TraceId) -> BytesRange {
-    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator);
+pub(crate) fn locator_range(namespace: &Namespace, slot: u16, trace_id: TraceId) -> BytesRange {
+    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, slot, RecordType::TraceLocator);
     bytes.extend_from_slice(trace_id.as_bytes());
     BytesRange::prefix(bytes.freeze())
 }
 
-pub(crate) fn locator_namespace_range(namespace: &Namespace) -> BytesRange {
-    BytesRange::prefix(record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator).freeze())
+pub(crate) fn locator_slot_range(namespace: &Namespace, slot: u16) -> BytesRange {
+    BytesRange::prefix(
+        record_prefix(namespace, LOCATOR_SEGMENT, slot, RecordType::TraceLocator).freeze(),
+    )
 }
 
-pub(crate) fn decode_locator_trace_id(key: &[u8]) -> Result<TraceId> {
-    let (_, segment, record_type, offset) = parse_record_prefix(key)?;
+pub(crate) fn decode_locator_trace_id(key: &[u8]) -> Result<(u16, TraceId)> {
+    let (_, segment, slot, record_type, offset) = parse_record_prefix(key)?;
     if segment != LOCATOR_SEGMENT
         || record_type != RecordType::TraceLocator
         || key.len() != offset + 16 + 8 + 8
     {
         return Err(Error::Corrupt("invalid trace locator key".to_owned()));
     }
-    TraceId::new(key[offset..offset + 16].try_into().unwrap())
+    Ok((
+        slot,
+        TraceId::new(key[offset..offset + 16].try_into().unwrap())?,
+    ))
 }
 
 pub(crate) fn posting_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     matcher: &AttributeMatcher,
     sequence: u64,
 ) -> Bytes {
-    let mut bytes = posting_prefix(namespace, segment, matcher);
+    let mut bytes = posting_prefix(namespace, segment, slot, matcher);
     bytes.put_u64(sequence);
     bytes.freeze()
 }
@@ -180,9 +197,10 @@ pub(crate) fn posting_key(
 pub(crate) fn posting_range(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     matcher: &AttributeMatcher,
 ) -> BytesRange {
-    BytesRange::prefix(posting_prefix(namespace, segment, matcher).freeze())
+    BytesRange::prefix(posting_prefix(namespace, segment, slot, matcher).freeze())
 }
 
 pub(crate) fn decode_posting_sequence(key: &[u8]) -> Result<u64> {
@@ -396,9 +414,10 @@ pub(crate) fn decode_indices(value: &[u8]) -> Result<Vec<u32>> {
 fn posting_prefix(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     matcher: &AttributeMatcher,
 ) -> BytesMut {
-    let mut bytes = record_prefix(namespace, segment, RecordType::AttributePosting);
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::AttributePosting);
     bytes.put_u8(match matcher.scope {
         AttributeScope::Resource => 1,
         AttributeScope::Span => 2,
@@ -428,24 +447,41 @@ fn posting_prefix(
 fn sequence_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     record_type: RecordType,
     sequence: u64,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, record_type);
+    let mut bytes = record_prefix(namespace, segment, slot, record_type);
     bytes.put_u64(sequence);
     bytes.freeze()
 }
 
-fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
+fn record_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    record_type: RecordType,
+) -> BytesMut {
+    assert!(slot < sharding::ROUTING_SLOT_COUNT);
     let mut bytes = BytesMut::new();
     KEY_SCOPE.write(&mut bytes, namespace, segment);
+    bytes.put_u16(slot);
     bytes.put_u8(record_type as u8);
     bytes
 }
 
-fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType, usize)> {
+fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, u16, RecordType, usize)> {
     let (namespace, segment, scope_len) = KEY_SCOPE.parse(bytes)?;
-    let Some(&record_type) = bytes.get(scope_len) else {
+    let slot_bytes = bytes
+        .get(scope_len..scope_len + 2)
+        .ok_or_else(|| Error::Corrupt("key is missing its routing slot".to_owned()))?;
+    let slot = u16::from_be_bytes(slot_bytes.try_into().unwrap());
+    if slot >= sharding::ROUTING_SLOT_COUNT {
+        return Err(Error::Corrupt(format!(
+            "routing slot exceeds 12 bits: {slot}"
+        )));
+    }
+    let Some(&record_type) = bytes.get(scope_len + 2) else {
         return Err(Error::Corrupt("key is missing its record type".to_owned()));
     };
     let record_type = match record_type {
@@ -456,7 +492,7 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         5 => RecordType::AttributePosting,
         value => return Err(Error::Corrupt(format!("unknown Track record type {value}"))),
     };
-    Ok((namespace, segment, record_type, scope_len + 1))
+    Ok((namespace, segment, slot, record_type, scope_len + 3))
 }
 #[cfg(test)]
 mod tests {
@@ -466,15 +502,16 @@ mod tests {
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "track-trace/v1");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "track-trace/v2");
     }
 
     #[test]
-    fn keys_route_by_namespace_and_time_segment() {
+    fn keys_route_by_namespace_time_segment_and_slot() {
         let namespace = Namespace::new("tenant").unwrap();
-        let key = metadata_key(&namespace, -2, 7);
+        let key = metadata_key(&namespace, -2, 17, 7);
         assert!(key.starts_with(&segment_prefix(&namespace, -2)));
         assert_eq!(decode_metadata_sequence(&key).unwrap(), 7);
+        assert_eq!(parse_record_prefix(&key).unwrap().2, 17);
         assert_eq!(
             KEY_SCOPE.prefix_len(&key),
             Some(segment_prefix(&namespace, -2).len())
@@ -485,10 +522,12 @@ mod tests {
     fn locator_uses_fixed_segment_and_unique_fragments() {
         let namespace = Namespace::default();
         let id = TraceId::new([1; 16]).unwrap();
-        let first = locator_key(&namespace, id, 2, 3);
-        let second = locator_key(&namespace, id, 4, 5);
+        let slot = crate::routing::routing_slot(&namespace, id);
+        let first = locator_key(&namespace, slot, id, 2, 3);
+        let second = locator_key(&namespace, slot, id, 4, 5);
         assert_ne!(first, second);
         assert!(first.starts_with(&segment_prefix(&namespace, LOCATOR_SEGMENT)));
+        assert_eq!(decode_locator_trace_id(&first).unwrap(), (slot, id));
     }
 
     #[test]
@@ -586,8 +625,21 @@ mod tests {
             value: AttributeValue::Int(7),
         };
         assert_ne!(
-            posting_key(&namespace, 0, &string, 1),
-            posting_key(&namespace, 0, &integer, 1)
+            posting_key(&namespace, 0, 17, &string, 1),
+            posting_key(&namespace, 0, 17, &integer, 1)
         );
+    }
+
+    #[test]
+    fn routing_slot_follows_segment_prefix_and_precedes_record_type() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let prefix = segment_prefix(&namespace, 9);
+        let key = metadata_key(&namespace, 9, 0x0abc, 7);
+        assert_eq!(
+            &key[prefix.len()..prefix.len() + 2],
+            &0x0abcu16.to_be_bytes()
+        );
+        assert_eq!(key[prefix.len() + 2], RecordType::PageMetadata as u8);
+        assert_eq!(KEY_SCOPE.prefix_len(&key), Some(prefix.len()));
     }
 }

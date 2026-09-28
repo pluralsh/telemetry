@@ -3,6 +3,7 @@ pub mod factory;
 pub mod in_memory;
 pub mod loader;
 pub mod metrics_recorder;
+pub mod projected_clone;
 pub mod slate;
 pub mod sst_blocks;
 pub mod util;

@@ -93,7 +93,8 @@ write:
   remote_retries: 2
 
 sharding:
-  virtual_shards: 8 # Default 8; must be greater than zero.
+  # Initial/desired storage-shard count; online changes may only increase it.
+  virtual_shards: 8
   io_concurrency_multiplier: 8 # Default 8; global shard I/O permits per open shard.
   backend: standalone
 
@@ -121,7 +122,7 @@ sharding:
   # stateful_set: meter
   # headless_service: meter-headless
   # owner_port: 9090
-  # assignment_config_map: meter-shard-assignments
+  # shard_map: meter-shard-map
   # coordinator_lease: meter-shard-coordinator
   # shard_lease_prefix: meter-shard
   # lease_duration_seconds: 15

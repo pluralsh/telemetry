@@ -2634,6 +2634,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "line"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "blake3",
  "bytes",
@@ -2684,6 +2685,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sharding",
+ "slatedb",
  "snap",
  "tempfile",
  "thiserror 2.0.21",
@@ -4817,6 +4819,7 @@ name = "sharding"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "futures",
  "k8s-openapi",
  "kube",
@@ -5616,6 +5619,7 @@ dependencies = [
 name = "track"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "bytes",
  "common",
@@ -5662,6 +5666,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sharding",
+ "slatedb",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -84,6 +84,9 @@ page:
   max_size_bytes: 4194304 # Hard encoded page limit; 4 MiB.
   max_traces: 1024 # Maximum traces in one page.
 
+# Successful periodic L0 flushes make accepted writes visible to readers.
+visibility_interval_seconds: 1
+
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: written
@@ -91,7 +94,8 @@ write:
   remote_retries: 2 # Retries after a stale-ownership response.
 
 sharding:
-  virtual_shards: 8 # Must match every process sharing this dataset.
+  # Storage-shard count fixed when the dataset is created.
+  virtual_shards: 8
   io_concurrency_multiplier: 8
   backend: standalone
 
@@ -118,7 +122,7 @@ sharding:
   # stateful_set: track
   # headless_service: track-headless
   # owner_port: 9092
-  # assignment_config_map: track-shard-assignments
+  # shard_map: track-shard-map
   # coordinator_lease: track-shard-coordinator
   # shard_lease_prefix: track-shard
   # lease_duration_seconds: 15

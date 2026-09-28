@@ -255,6 +255,89 @@ var _ = Describe("Meter Controller", func() {
 		}
 	})
 
+	It("passes scale-up through and blocks unsafe writer scale-down from ShardMap state", func() {
+		meter, auth, password := createMeterFixture(ctx, "shard-scaling-envtest", telemetryv1alpha1.MeterModeSharded)
+		created = append(created, meter, auth, password)
+		key := client.ObjectKeyFromObject(meter)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		writer := &appsv1.StatefulSet{}
+		writerKey := types.NamespacedName{Namespace: namespace, Name: meter.Name + "-writer"}
+		Expect(k8sClient.Get(ctx, writerKey, writer)).To(Succeed())
+		created = append(created,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-config", Namespace: namespace}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-internal-token", Namespace: namespace}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-writer", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-writer-headless", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-reader", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-reader-headless", Namespace: namespace}},
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-reader", Namespace: namespace}},
+			&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: meter.Name, Namespace: namespace}},
+			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-sharding", Namespace: namespace}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: meter.Name + "-sharding", Namespace: namespace}},
+			writer,
+		)
+
+		shardMap := &telemetryv1alpha1.ShardMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: meter.Name + "-writer-shard-map", Namespace: namespace,
+				Labels: map[string]string{"telemetry.plural.sh/meter": meter.Name},
+			},
+			Spec: telemetryv1alpha1.ShardMapSpec{
+				Generation: 1, ShardCount: 3,
+				Routing:     telemetryv1alpha1.HashRangeMap{Generation: 1, Assignments: []telemetryv1alpha1.HashRangeAssignment{}},
+				Assignments: []telemetryv1alpha1.ShardAssignment{},
+			},
+		}
+		Expect(k8sClient.Create(ctx, shardMap)).To(Succeed())
+		created = append(created, shardMap)
+
+		current := &telemetryv1alpha1.Meter{}
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		current.Spec.Writer.Replicas = lo.ToPtr(int32(5))
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, writerKey, writer)).To(Succeed())
+		Expect(*writer.Spec.Replicas).To(Equal(int32(5)))
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		Expect(current.Status.EffectiveWriterReplicas).To(Equal(int32(5)))
+		Expect(current.Status.ShardCount).NotTo(BeNil())
+		Expect(*current.Status.ShardCount).To(Equal(int32(3)))
+		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionWriterScaling).Status).To(Equal(metav1.ConditionTrue))
+		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionReady).Status).To(Equal(metav1.ConditionFalse))
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(shardMap), shardMap)).To(Succeed())
+		shardMap.Spec.Generation = 2
+		shardMap.Spec.Migration = &telemetryv1alpha1.ShardMigration{
+			Phase: "cloning", DesiredShardCount: 5,
+			Split: telemetryv1alpha1.ShardSplit{
+				SourceOwner: telemetryv1alpha1.ShardOwner{Ordinal: 1},
+				TargetOwner: telemetryv1alpha1.ShardOwner{Ordinal: 4},
+				MovedRange: telemetryv1alpha1.HashRange{
+					Start: strings.Repeat("0", 32),
+					End:   strings.Repeat("f", 32),
+				},
+			},
+			TargetRouting: telemetryv1alpha1.HashRangeMap{Generation: 2, Assignments: []telemetryv1alpha1.HashRangeAssignment{}},
+		}
+		Expect(k8sClient.Update(ctx, shardMap)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		current.Spec.Writer.Replicas = lo.ToPtr(int32(2))
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, writerKey, writer)).To(Succeed())
+		Expect(*writer.Spec.Replicas).To(Equal(int32(5)))
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		Expect(current.Status.MigrationPhase).To(Equal("cloning"))
+		Expect(current.Status.EffectiveWriterReplicas).To(Equal(int32(5)))
+		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionWriterScalingBlocked).Status).To(Equal(metav1.ConditionTrue))
+		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionReady).Status).To(Equal(metav1.ConditionFalse))
+	})
+
 	It("expands an existing PVC and recreates its StatefulSet deterministically", func() {
 		className := "storage-envtest-expandable"
 		allowExpansion := true

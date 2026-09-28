@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+use crate::{HashRange, HashRangeMap, RoutingError, hash_routing_key};
+
 pub const DEFAULT_VIRTUAL_SHARDS: u32 = 8;
 pub const DEFAULT_IO_CONCURRENCY_MULTIPLIER: u32 = 8;
 
@@ -166,11 +168,46 @@ impl Assignment {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Preparing,
+    Prepared,
+    Draining,
+    Cloning,
+    Ready,
+    Completing,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardSplit {
+    pub source_shard: ShardId,
+    pub target_shard: ShardId,
+    pub moved_range: HashRange,
+    pub source_owner: Owner,
+    pub target_owner: Owner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardMigration {
+    pub phase: MigrationPhase,
+    pub desired_shard_count: u32,
+    pub split: ShardSplit,
+    pub target_routing: HashRangeMap,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShardMap {
     pub generation: AssignmentGeneration,
+    #[serde(rename = "shard_count")]
     pub virtual_shards: u32,
+    pub routing: HashRangeMap,
     pub assignments: Vec<Assignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<ShardMigration>,
 }
 
 impl<'de> Deserialize<'de> for ShardMap {
@@ -181,12 +218,23 @@ impl<'de> Deserialize<'de> for ShardMap {
         #[derive(Deserialize)]
         struct WireMap {
             generation: AssignmentGeneration,
+            #[serde(rename = "shard_count")]
             virtual_shards: u32,
+            routing: HashRangeMap,
             assignments: Vec<Assignment>,
+            #[serde(default)]
+            migration: Option<ShardMigration>,
         }
 
         let map = WireMap::deserialize(deserializer)?;
-        Self::new(map.generation, map.virtual_shards, map.assignments).map_err(de::Error::custom)
+        Self::with_routing_and_migration(
+            map.generation,
+            map.virtual_shards,
+            map.routing,
+            map.assignments,
+            map.migration,
+        )
+        .map_err(de::Error::custom)
     }
 }
 
@@ -194,10 +242,44 @@ impl ShardMap {
     pub fn new(
         generation: AssignmentGeneration,
         virtual_shards: u32,
+        assignments: Vec<Assignment>,
+    ) -> Result<Self, ModelError> {
+        let routing = HashRangeMap::bootstrap(virtual_shards)?;
+        Self::with_routing(generation, virtual_shards, routing, assignments)
+    }
+
+    pub fn with_routing(
+        generation: AssignmentGeneration,
+        virtual_shards: u32,
+        routing: HashRangeMap,
+        assignments: Vec<Assignment>,
+    ) -> Result<Self, ModelError> {
+        Self::with_routing_and_migration(generation, virtual_shards, routing, assignments, None)
+    }
+
+    pub fn with_routing_and_migration(
+        generation: AssignmentGeneration,
+        virtual_shards: u32,
+        routing: HashRangeMap,
         mut assignments: Vec<Assignment>,
+        migration: Option<ShardMigration>,
     ) -> Result<Self, ModelError> {
         if virtual_shards == 0 {
             return Err(ModelError::ZeroVirtualShards);
+        }
+        let mut routing_shards = routing
+            .assignments
+            .iter()
+            .map(|assignment| assignment.shard)
+            .collect::<Vec<_>>();
+        routing_shards.sort_unstable();
+        if routing_shards.len() != virtual_shards as usize
+            || routing_shards
+                .iter()
+                .enumerate()
+                .any(|(index, shard)| shard.get() != index as u32)
+        {
+            return Err(ModelError::RoutingShardSetMismatch { virtual_shards });
         }
         assignments.sort_by_key(|assignment| assignment.range.start());
         let mut expected = 0;
@@ -232,8 +314,14 @@ impl ShardMap {
         Ok(Self {
             generation,
             virtual_shards,
+            routing,
             assignments,
+            migration,
         })
+    }
+
+    pub fn route_key(&self, key: &[u8]) -> ShardId {
+        self.routing.route(hash_routing_key(key))
     }
 
     pub fn owner_of(&self, shard: ShardId) -> Option<&Owner> {
@@ -278,6 +366,10 @@ pub enum ModelError {
         covered_until: ShardId,
         virtual_shards: u32,
     },
+    #[error("routing map does not contain exactly shards [0, {virtual_shards})")]
+    RoutingShardSetMismatch { virtual_shards: u32 },
+    #[error(transparent)]
+    InvalidRouting(#[from] RoutingError),
 }
 
 #[cfg(test)]
@@ -328,7 +420,17 @@ mod tests {
         assert!(serde_json::from_str::<ShardRange>(invalid_range).is_err());
         let incomplete_map = r#"{
             "generation": 1,
-            "virtual_shards": 64,
+            "shard_count": 64,
+            "routing": {
+                "generation": 1,
+                "assignments": [{
+                    "shard": 0,
+                    "range": {
+                        "start": "00000000000000000000000000000000",
+                        "end": "ffffffffffffffffffffffffffffffff"
+                    }
+                }]
+            },
             "assignments": [{
                 "owner": {"id": "meter-0", "ordinal": 0},
                 "range": {"start": 1, "end": 64},
@@ -336,5 +438,25 @@ mod tests {
             }]
         }"#;
         assert!(serde_json::from_str::<ShardMap>(incomplete_map).is_err());
+    }
+
+    #[test]
+    fn assignment_snapshot_round_trips_with_routing_generation() {
+        let map = ShardMap::new(
+            AssignmentGeneration::new(7),
+            2,
+            vec![Assignment::new(
+                Owner::new("meter-0", 0),
+                ShardRange::within(0, 2, 2).unwrap(),
+                AssignmentState::Active,
+            )],
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&map).unwrap();
+        assert!(encoded.contains(r#""shard_count":2"#));
+        assert!(!encoded.contains("virtual_shards"));
+        let decoded = serde_json::from_str::<ShardMap>(&encoded).unwrap();
+        assert_eq!(decoded, map);
+        assert_eq!(decoded.routing.generation.get(), 1);
     }
 }

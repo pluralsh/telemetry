@@ -53,6 +53,7 @@ mod tests {
                 let key = SeriesDictionaryKey {
                     namespace: crate::Namespace::default(),
                     bucket: TimeBucket { start, size: 1 },
+                    routing_slot: 0,
                     series_fingerprint: 0,
                 }
                 .encode();
@@ -77,7 +78,10 @@ mod tests {
         // Buckets: [0, 3600s), [3600s, 7200s)  (hour buckets at min 0 and 60)
         let s = storage_with_buckets(&[0, 60]).await;
         // Point query exactly at second bucket start
-        let buckets = s.get_buckets_for_ranges(&[(3600, 3600)]).await.unwrap();
+        let buckets = s
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[(3600, 3600)])
+            .await
+            .unwrap();
         // Should match only the bucket starting at 3600s (min 60), not the one ending there
         assert_eq!(starts(&buckets), vec![60]);
     }
@@ -86,7 +90,10 @@ mod tests {
     async fn ranges_point_at_epoch() {
         let s = storage_with_buckets(&[0, 60]).await;
         // Point query at t=0
-        let buckets = s.get_buckets_for_ranges(&[(0, 0)]).await.unwrap();
+        let buckets = s
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[(0, 0)])
+            .await
+            .unwrap();
         assert_eq!(starts(&buckets), vec![0]);
     }
 
@@ -94,7 +101,10 @@ mod tests {
     async fn ranges_spanning_two_buckets() {
         let s = storage_with_buckets(&[0, 60, 120]).await;
         // Range [1800, 5400] spans bucket [0,3600) and [3600,7200)
-        let buckets = s.get_buckets_for_ranges(&[(1800, 5400)]).await.unwrap();
+        let buckets = s
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[(1800, 5400)])
+            .await
+            .unwrap();
         assert_eq!(starts(&buckets), vec![0, 60]);
     }
 
@@ -104,7 +114,7 @@ mod tests {
         let s = storage_with_buckets(&[0, 60, 120]).await;
         // Two disjoint ranges that skip the middle bucket
         let buckets = s
-            .get_buckets_for_ranges(&[(100, 200), (8000, 9000)])
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[(100, 200), (8000, 9000)])
             .await
             .unwrap();
         assert_eq!(starts(&buckets), vec![0, 120]);
@@ -113,7 +123,10 @@ mod tests {
     #[tokio::test]
     async fn ranges_empty_returns_nothing() {
         let s = storage_with_buckets(&[0, 60]).await;
-        let buckets = s.get_buckets_for_ranges(&[]).await.unwrap();
+        let buckets = s
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[])
+            .await
+            .unwrap();
         assert!(buckets.is_empty());
     }
 
@@ -122,7 +135,10 @@ mod tests {
         // Range starts exactly at boundary between two buckets.
         // Bucket [0, 3600s) should NOT match range [3600, 7200].
         let s = storage_with_buckets(&[0, 60]).await;
-        let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
+        let buckets = s
+            .get_buckets_for_ranges(&crate::Namespace::default(), &[(3600, 7200)])
+            .await
+            .unwrap();
         assert_eq!(starts(&buckets), vec![60]);
     }
 }

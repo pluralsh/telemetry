@@ -62,9 +62,9 @@ Meter always uses SlateDB. If the whole section is omitted, it defaults to `path
 `InMemory` object store, no settings file, and no caches. If `storage` is present, `path` and
 `object_store` are required.
 
-- `storage.path`: object-key prefix for Meter data. Each configured namespace is placed below a
-  deterministic `namespace-<blake3>` child, and sharded deployments add a shard-specific suffix.
-  Default `data`.
+- `storage.path`: object-key prefix for Meter data. Sharded deployments place one multi-namespace
+  SlateDB below each `shard-NNNN` child; namespace isolation is encoded in database keys. Default
+  `data`.
 - `storage.settings_path`: optional path to a SlateDB TOML, JSON, or YAML settings file. If
   omitted, SlateDB loads its normal `SlateDb.toml`, `SlateDb.json`, or `SlateDb.yaml` files and
   `SLATEDB_` environment overrides.
@@ -126,8 +126,9 @@ not bytes. Default `268435456`.
 
 ## `sharding`
 
-- `sharding.virtual_shards`: number of deterministic virtual shards. Default `8`; must be greater
-  than zero. Keep it identical across all processes sharing a dataset.
+- `sharding.virtual_shards`: storage-shard count for standalone and static backends. Default `8`;
+  must be greater than zero and remain identical across processes and restarts. Kubernetes derives
+  the desired storage-shard count from writer StatefulSet replicas instead.
 - `sharding.io_concurrency_multiplier`: global shard I/O permits per open shard. Default `8`;
   must be greater than zero. Increase it when I/O latency leaves shard operations idle.
 - `sharding.backend`: `standalone` (default), `static`, or `kubernetes`.
@@ -141,7 +142,7 @@ not bytes. Default `268435456`.
   `endpoint`, and the half-open range `[start_shard, end_shard)`. Ranges must be nonempty,
   contiguous, nonoverlapping, start at zero, and exactly cover `virtual_shards`.
 
-`kubernetes` discovers writer membership from a StatefulSet, stores assignments in a ConfigMap,
+`kubernetes` discovers writer membership from a StatefulSet, stores assignments in a ShardMap CR,
 and uses Leases for coordinator and shard ownership. The server must be built with the
 `kubernetes` feature (enabled by default) and have namespace-scoped RBAC. Fields are:
 
@@ -151,17 +152,19 @@ and uses Leases for coordinator and shard ownership. The server must be built wi
 - `stateful_set`: writer StatefulSet name. Default `meter`.
 - `headless_service`: writer headless Service used for owner DNS. Default `meter-headless`.
 - `owner_port`: internal gRPC port. Default `9090`.
-- `assignment_config_map`: assignment ConfigMap name. Default `meter-shard-assignments`.
+- `shard_map`: authoritative ShardMap resource name. Default `meter-shard-map`.
 - `coordinator_lease`: coordinator Lease name. Default `meter-shard-coordinator`.
 - `shard_lease_prefix`: prefix for per-shard Lease names. Default `meter-shard`.
 - `lease_duration_seconds`: shard/coordinator lease duration in seconds. Default `15`.
 - `renew_interval_seconds`: shard ownership renewal interval in seconds. Default `5`.
 
 The local Kubernetes owner ID is `POD_NAME` when set, otherwise
-`<stateful_set>-${POD_ORDINAL:-0}`. The coordinator balances contiguous shard ranges as StatefulSet
-membership changes. Writers watch the assignment ConfigMap, acquire a stable Lease for each
-assigned shard, and watch Lease releases for immediate handoff. Coordinator candidates also watch
-the coordinator Lease for prompt failover. Readers open all virtual shards.
+`<stateful_set>-${POD_ORDINAL:-0}`. The coordinator balances storage-shard ownership as StatefulSet
+membership changes. The desired storage-shard count is the StatefulSet replica count. The ShardMap
+snapshot contains both ownership and versioned 128-bit hash ranges and is updated with Kubernetes
+`resourceVersion` compare-and-swap. Writers and readers watch the ShardMap stream for coherent
+generation updates. Writers acquire a stable Lease for each assigned shard and watch Lease releases
+for immediate handoff. Coordinator candidates also watch the coordinator Lease for prompt failover.
 
 ## Secrets and authentication
 

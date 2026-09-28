@@ -148,7 +148,7 @@ impl InternalWriter for AppState {
             ));
         }
         let options = ShardingOptions::new(
-            self.config.sharding.virtual_shards,
+            assignment.virtual_shards,
             self.config.sharding.io_concurrency_multiplier,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -160,7 +160,7 @@ impl InternalWriter for AppState {
             .map_err(Status::invalid_argument)?;
         if batches
             .iter()
-            .any(|batch| options.route(&namespace, &batch.labels) != shard)
+            .any(|batch| options.route(&assignment.routing, &namespace, &batch.labels) != shard)
         {
             return Err(Status::invalid_argument(
                 "misrouted_batch: stream does not route to requested shard",
@@ -250,11 +250,12 @@ mod tests {
     fn request(generation: u64, request_id: &str) -> WriteBatchRequest {
         let namespace = Namespace::new("tenant").unwrap();
         let options = ShardingOptions::new(2, 4).unwrap();
+        let routing = sharding::HashRangeMap::bootstrap(2).unwrap();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()
             })
-            .find(|labels| options.route(&namespace, labels).get() == 1)
+            .find(|labels| options.route(&routing, &namespace, labels).get() == 1)
             .unwrap();
         to_proto_request(
             &namespace,

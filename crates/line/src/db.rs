@@ -6,15 +6,19 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use common::storage::{PutOptions, PutRecordOp, Record, RecordOp, Storage, Ttl, WriteOptions};
-use common::{StorageBuilder, StorageSemantics};
+use common::storage::{
+    PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
+};
+use common::{StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read};
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
+use slatedb::config::DbReaderOptions;
 use tokio::sync::Mutex;
 
 use crate::Namespace;
@@ -101,15 +105,26 @@ struct PageRetention {
 
 /// Single-writer/single-node log database over the common SlateDB abstraction.
 pub struct LogDb {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn StorageRead>,
+    writer: Option<Arc<dyn Storage>>,
     config: Config,
     segment_ns: i64,
+    owned_slots: Range<u16>,
     write_lock: Mutex<()>,
 }
 
 impl LogDb {
     pub async fn open(config: Config) -> Result<Self> {
+        Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
+    }
+
+    pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
         config.validate()?;
+        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
+            return Err(Error::Invalid(format!(
+                "invalid owned routing slot range {owned_slots:?}"
+            )));
+        }
         let segment_ns = duration_ns(config.segment_duration)?;
         let semantics = StorageSemantics::new()
             .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
@@ -118,12 +133,52 @@ impl LogDb {
             .with_semantics(semantics)
             .build()
             .await?;
+        let storage_read = storage.clone();
         Ok(Self {
-            storage,
+            storage: storage_read,
+            writer: Some(storage),
             config,
             segment_ns,
+            owned_slots,
             write_lock: Mutex::new(()),
         })
+    }
+
+    pub(crate) async fn open_reader_with_slots(
+        config: Config,
+        owned_slots: Range<u16>,
+        reader_options: DbReaderOptions,
+    ) -> Result<Self> {
+        config.validate()?;
+        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
+            return Err(Error::Invalid(format!(
+                "invalid owned routing slot range {owned_slots:?}"
+            )));
+        }
+        let segment_ns = duration_ns(config.segment_duration)?;
+        let semantics = StorageSemantics::new()
+            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
+        let storage = create_storage_read(
+            &config.storage,
+            StorageReaderRuntime::new(),
+            semantics,
+            reader_options,
+        )
+        .await?;
+        Ok(Self {
+            storage,
+            writer: None,
+            config,
+            segment_ns,
+            owned_slots,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    fn writer(&self) -> Result<&dyn Storage> {
+        self.writer
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("writes are unavailable on a read-only database".into()))
     }
 
     /// Atomically writes all generated index and page records.
@@ -142,7 +197,7 @@ impl LogDb {
         batches: Vec<LogBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
-        let groups = group_by_stream(batches, self.segment_ns)?;
+        let groups = group_by_stream(namespace, batches, self.segment_ns)?;
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
@@ -154,18 +209,24 @@ impl LogDb {
             expires_at_unix_ms: self.logical_expiry()?,
         };
         let mut write = PendingWrite::new(ttl, retention, groups.len());
-        for ((segment, fingerprint), (labels, entries)) in groups {
+        for ((segment, slot, fingerprint), (labels, entries)) in groups {
+            if !self.owned_slots.contains(&slot) {
+                return Err(Error::Invalid(format!(
+                    "routing slot {slot} is outside opened shard range {:?}",
+                    self.owned_slots
+                )));
+            }
             let stream_id = self
-                .resolve_stream_id(&mut write, namespace, segment, fingerprint, &labels)
+                .resolve_stream_id(&mut write, namespace, segment, slot, fingerprint, &labels)
                 .await?;
-            self.add_label_postings(&mut write, namespace, segment, &labels, stream_id)
+            self.add_label_postings(&mut write, namespace, segment, slot, &labels, stream_id)
                 .await?;
-            self.append_stream_pages(&mut write, namespace, segment, stream_id, entries)
+            self.append_stream_pages(&mut write, namespace, segment, slot, stream_id, entries)
                 .await?;
         }
         let (ops, report) = self.finish_write(write, namespace).await?;
 
-        self.storage
+        self.writer()?
             .apply_with_options(
                 ops,
                 WriteOptions {
@@ -173,9 +234,6 @@ impl LogDb {
                 },
             )
             .await?;
-        if durability == Durability::Written {
-            self.storage.flush().await?;
-        }
         Ok(report)
     }
 
@@ -186,16 +244,17 @@ impl LogDb {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
         fingerprint: StreamFingerprint,
         labels: &Labels,
     ) -> Result<StreamId> {
-        let dictionary = dictionary_key(namespace, segment, fingerprint);
+        let dictionary = dictionary_key(namespace, segment, slot, fingerprint);
         let stream_id = match self.storage.get(dictionary.clone()).await? {
             Some(record) => {
                 let stream_id = decode_stream_id(&record.value)?;
                 let existing = self
                     .storage
-                    .get(forward_key(namespace, segment, stream_id))
+                    .get(forward_key(namespace, segment, slot, stream_id))
                     .await?
                     .ok_or_else(|| Error::Corrupt("dictionary has no forward labels".to_owned()))?;
                 if decode_labels(&existing.value)? != *labels {
@@ -205,11 +264,14 @@ impl LogDb {
                 }
                 stream_id
             }
-            None => self.allocate_stream_id(write, namespace, segment).await?,
+            None => {
+                self.allocate_stream_id(write, namespace, segment, slot)
+                    .await?
+            }
         };
         write.put(dictionary, encode_stream_id(stream_id));
         write.put(
-            forward_key(namespace, segment, stream_id),
+            forward_key(namespace, segment, slot, stream_id),
             encode_labels(labels)?,
         );
         Ok(stream_id)
@@ -220,12 +282,13 @@ impl LogDb {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
     ) -> Result<StreamId> {
-        let next = match write.next_stream_ids.get(&segment) {
+        let next = match write.next_stream_ids.get(&(segment, slot)) {
             Some(next) => *next,
             None => self
                 .storage
-                .get(next_stream_id_key(namespace, segment))
+                .get(next_stream_id_key(namespace, segment, slot))
                 .await?
                 .map(|record| decode_stream_id(&record.value))
                 .transpose()?
@@ -234,7 +297,7 @@ impl LogDb {
         let following = next
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
-        write.next_stream_ids.insert(segment, following);
+        write.next_stream_ids.insert((segment, slot), following);
         Ok(next)
     }
 
@@ -243,16 +306,17 @@ impl LogDb {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
         labels: &Labels,
         stream_id: StreamId,
     ) -> Result<()> {
         for label in labels.iter() {
-            let bitmap = match write.postings.entry((segment, label.clone())) {
+            let bitmap = match write.postings.entry((segment, slot, label.clone())) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let bitmap = self
                         .storage
-                        .get(posting_key(namespace, segment, label))
+                        .get(posting_key(namespace, segment, slot, label))
                         .await?
                         .map(|record| decode_postings(&record.value))
                         .transpose()?
@@ -270,10 +334,11 @@ impl LogDb {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
         stream_id: StreamId,
         entries: Vec<LogEntry>,
     ) -> Result<()> {
-        let page_sequence_key = next_page_sequence_key(namespace, segment, stream_id);
+        let page_sequence_key = next_page_sequence_key(namespace, segment, slot, stream_id);
         let mut sequence = self
             .storage
             .get(page_sequence_key.clone())
@@ -285,11 +350,25 @@ impl LogDb {
         let mut builder = PageBuilder::new(self.config.page.clone(), Instant::now())?;
         for entry in entries {
             if let Some(completed) = builder.append_with_rows(entry, Instant::now())? {
-                write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
+                write.add_page(
+                    namespace,
+                    segment,
+                    slot,
+                    stream_id,
+                    &mut sequence,
+                    completed,
+                )?;
             }
         }
         if let Some(completed) = builder.finish_with_rows()? {
-            write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
+            write.add_page(
+                namespace,
+                segment,
+                slot,
+                stream_id,
+                &mut sequence,
+                completed,
+            )?;
         }
         write.report.rows += row_count;
         write.put(page_sequence_key, encode_page_sequence(sequence));
@@ -312,22 +391,22 @@ impl LogDb {
             report,
             ..
         } = write;
-        for (segment, next) in next_stream_ids {
+        for ((segment, slot), next) in next_stream_ids {
             ops.push(put(
-                next_stream_id_key(namespace, segment),
+                next_stream_id_key(namespace, segment, slot),
                 encode_stream_id(next),
                 ttl,
             ));
         }
-        for ((segment, label), bitmap) in postings {
+        for ((segment, slot, label), bitmap) in postings {
             ops.push(put(
-                posting_key(namespace, segment, &label),
+                posting_key(namespace, segment, slot, &label),
                 encode_postings(&bitmap)?,
                 ttl,
             ));
         }
-        for (segment, delta) in search_deltas {
-            self.append_search_index_ops(&mut ops, namespace, segment, delta, ttl)
+        for ((segment, slot), delta) in search_deltas {
+            self.append_search_index_ops(&mut ops, namespace, segment, slot, delta, ttl)
                 .await?;
         }
         Ok((ops, report))
@@ -338,12 +417,13 @@ impl LogDb {
         ops: &mut Vec<RecordOp>,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
         delta: IndexDelta,
         ttl: Ttl,
     ) -> Result<()> {
         let mut field = self
             .storage
-            .get(field_stats_key(namespace, segment))
+            .get(field_stats_key(namespace, segment, slot))
             .await?
             .map(|record| decode_field_stats(&record.value))
             .transpose()?
@@ -357,7 +437,7 @@ impl LogDb {
             .checked_add(delta.total_terms)
             .ok_or_else(|| Error::Invalid("segment token count overflow".into()))?;
         ops.push(put(
-            field_stats_key(namespace, segment),
+            field_stats_key(namespace, segment, slot),
             encode_field_stats(field),
             ttl,
         ));
@@ -366,7 +446,7 @@ impl LogDb {
         let mut writes = std::pin::pin!(
             futures::stream::iter(delta.postings)
                 .map(|(term, postings)| {
-                    term_index_writes(storage, namespace, segment, term, postings)
+                    term_index_writes(storage, namespace, segment, slot, term, postings)
                 })
                 .buffer_unordered(TERM_INDEX_CONCURRENCY)
         );
@@ -414,10 +494,10 @@ impl LogDb {
         let mut segment = first_segment;
         let mut estimate = QueryEstimate::default();
         loop {
-            for stream_id in self.stream_ids(namespace, segment, matchers).await? {
+            for (slot, stream_id) in self.stream_ids(namespace, segment, matchers).await? {
                 let mut metadata = self
                     .storage
-                    .scan_iter(metadata_range(namespace, segment, stream_id))
+                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
                     .await?;
                 while let Some(record) = metadata.next().await? {
                     let page = decode_metadata(&record.value)?;
@@ -499,10 +579,10 @@ impl LogDb {
 
         loop {
             let mut pages = Vec::new();
-            for stream_id in self.stream_ids(namespace, segment, matchers).await? {
+            for (slot, stream_id) in self.stream_ids(namespace, segment, matchers).await? {
                 let Some(labels_record) = self
                     .storage
-                    .get(forward_key(namespace, segment, stream_id))
+                    .get(forward_key(namespace, segment, slot, stream_id))
                     .await?
                 else {
                     return Err(Error::Corrupt(
@@ -513,10 +593,10 @@ impl LogDb {
                 let fingerprint = labels.fingerprint();
                 let mut metadata = self
                     .storage
-                    .scan_iter(metadata_range(namespace, segment, stream_id))
+                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
                     .await?;
                 while let Some(record) = metadata.next().await? {
-                    let (_, page_id) = decode_metadata_key(&record.key)?;
+                    let (_, _, page_id) = decode_metadata_key(&record.key)?;
                     let page_metadata = decode_metadata(&record.value)?;
                     if page_metadata.is_expired_at(now_unix_ms)
                         || page_metadata.max_timestamp_ns < start_ns
@@ -525,15 +605,15 @@ impl LogDb {
                         continue;
                     }
                     budget.take()?;
-                    pages.push((stream_id, labels.clone(), fingerprint, page_id));
+                    pages.push((slot, stream_id, labels.clone(), fingerprint, page_id));
                 }
             }
             let mut decoded = futures::stream::iter(pages)
                 .map(
-                    move |(stream_id, labels, fingerprint, page_id)| async move {
+                    move |(slot, stream_id, labels, fingerprint, page_id)| async move {
                         let payload = self
                             .storage
-                            .get(payload_key(namespace, segment, stream_id, page_id))
+                            .get(payload_key(namespace, segment, slot, stream_id, page_id))
                             .await?
                             .ok_or_else(|| {
                                 Error::Corrupt("page metadata has no payload".to_owned())
@@ -591,11 +671,11 @@ impl LogDb {
         loop {
             let stream_ids = self.stream_ids(namespace, segment, matchers).await?;
             let mut candidate_pages = Vec::new();
-            let mut allowed_pages = HashSet::new();
-            for stream_id in stream_ids {
+            let mut allowed_pages: HashMap<u16, HashSet<(StreamId, u64)>> = HashMap::new();
+            for (slot, stream_id) in stream_ids {
                 let labels_record = self
                     .storage
-                    .get(forward_key(namespace, segment, stream_id))
+                    .get(forward_key(namespace, segment, slot, stream_id))
                     .await?
                     .ok_or_else(|| {
                         Error::Corrupt("posting references missing forward labels".into())
@@ -603,10 +683,10 @@ impl LogDb {
                 let labels = Arc::new(decode_labels(&labels_record.value)?);
                 let mut metadata = self
                     .storage
-                    .scan_iter(metadata_range(namespace, segment, stream_id))
+                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
                     .await?;
                 while let Some(record) = metadata.next().await? {
-                    let (_, page_id) = decode_metadata_key(&record.key)?;
+                    let (_, _, page_id) = decode_metadata_key(&record.key)?;
                     let page_metadata = decode_metadata(&record.value)?;
                     if page_metadata.is_expired_at(now_unix_ms)
                         || page_metadata.max_timestamp_ns < start_ns
@@ -614,32 +694,38 @@ impl LogDb {
                     {
                         continue;
                     }
-                    allowed_pages.insert((stream_id, page_id.sequence));
-                    candidate_pages.push((stream_id, labels.clone(), page_id));
+                    allowed_pages
+                        .entry(slot)
+                        .or_default()
+                        .insert((stream_id, page_id.sequence));
+                    candidate_pages.push((slot, stream_id, labels.clone(), page_id));
                 }
             }
-            let Some(scores) = block_max_scores(
-                self.storage.as_ref(),
-                namespace,
-                segment,
-                terms,
-                &allowed_pages,
-                top_k,
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let mut by_page: HashMap<(StreamId, u64), HashMap<u32, f32>> = HashMap::new();
-            for (address, score) in scores {
-                by_page
-                    .entry((address.stream_id, address.page_sequence))
-                    .or_default()
-                    .insert(address.row_id, score);
+            let mut by_page: HashMap<(u16, StreamId, u64), HashMap<u32, f32>> = HashMap::new();
+            for (slot, allowed) in &allowed_pages {
+                let Some(scores) = block_max_scores(
+                    self.storage.as_ref(),
+                    namespace,
+                    segment,
+                    *slot,
+                    terms,
+                    allowed,
+                    top_k,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                for (address, score) in scores {
+                    by_page
+                        .entry((*slot, address.stream_id, address.page_sequence))
+                        .or_default()
+                        .insert(address.row_id, score);
+                }
             }
 
-            for (stream_id, labels, page_id) in candidate_pages {
-                let Some(page_scores) = by_page.get(&(stream_id, page_id.sequence)) else {
+            for (slot, stream_id, labels, page_id) in candidate_pages {
+                let Some(page_scores) = by_page.get(&(slot, stream_id, page_id.sequence)) else {
                     continue;
                 };
                 if pages_read == max_pages {
@@ -650,7 +736,7 @@ impl LogDb {
                 pages_read += 1;
                 let payload = self
                     .storage
-                    .get(payload_key(namespace, segment, stream_id, page_id))
+                    .get(payload_key(namespace, segment, slot, stream_id, page_id))
                     .await?
                     .ok_or_else(|| Error::Corrupt("page metadata has no payload".to_owned()))?;
                 let page = Page::decode(payload.value)?;
@@ -681,7 +767,9 @@ impl LogDb {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        self.storage.flush().await?;
+        if let Some(storage) = &self.writer {
+            storage.flush().await?;
+        }
         Ok(())
     }
 
@@ -695,35 +783,47 @@ impl LogDb {
         namespace: &Namespace,
         segment: SegmentId,
         matchers: &[Label],
-    ) -> Result<Vec<StreamId>> {
+    ) -> Result<Vec<(u16, StreamId)>> {
         if matchers.is_empty() {
-            let mut iterator = self
-                .storage
-                .scan_iter(forward_range(namespace, segment))
-                .await?;
             let mut result = Vec::new();
-            while let Some(record) = iterator.next().await? {
-                result.push(decode_forward_key(&record.key)?);
+            for slot in self.owned_slots.clone() {
+                let mut iterator = self
+                    .storage
+                    .scan_iter(forward_range(namespace, segment, slot))
+                    .await?;
+                while let Some(record) = iterator.next().await? {
+                    result.push(decode_forward_key(&record.key)?);
+                }
             }
             return Ok(result);
         }
 
-        let mut result: Option<RoaringBitmap> = None;
-        for matcher in matchers {
-            let Some(record) = self
-                .storage
-                .get(posting_key(namespace, segment, matcher))
-                .await?
-            else {
-                return Ok(Vec::new());
-            };
-            let bitmap = decode_postings(&record.value)?;
-            match &mut result {
-                Some(result) => *result &= bitmap,
-                None => result = Some(bitmap),
+        let mut streams = Vec::new();
+        for slot in self.owned_slots.clone() {
+            let mut result: Option<RoaringBitmap> = None;
+            for matcher in matchers {
+                let Some(record) = self
+                    .storage
+                    .get(posting_key(namespace, segment, slot, matcher))
+                    .await?
+                else {
+                    result = Some(RoaringBitmap::new());
+                    break;
+                };
+                let bitmap = decode_postings(&record.value)?;
+                match &mut result {
+                    Some(result) => *result &= bitmap,
+                    None => result = Some(bitmap),
+                }
             }
+            streams.extend(
+                result
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|stream_id| (slot, stream_id)),
+            );
         }
-        Ok(result.unwrap_or_default().iter().collect())
+        Ok(streams)
     }
 
     fn ttl(&self) -> Result<Ttl> {
@@ -752,17 +852,22 @@ impl LogDb {
     }
 }
 
-type StreamGroups = BTreeMap<(SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+type StreamGroups = BTreeMap<(SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
 
-/// Groups entries by `(segment, stream)`, each group sorted by timestamp.
-fn group_by_stream(batches: Vec<LogBatch>, segment_ns: i64) -> Result<StreamGroups> {
+/// Groups entries by `(segment, routing slot, stream)`, sorted by timestamp.
+fn group_by_stream(
+    namespace: &Namespace,
+    batches: Vec<LogBatch>,
+    segment_ns: i64,
+) -> Result<StreamGroups> {
     let mut groups = StreamGroups::new();
     for batch in batches {
         let fingerprint = batch.labels.fingerprint();
+        let slot = crate::routing::routing_slot(namespace, &batch.labels);
         for entry in batch.entries {
             let segment = segment_for(entry.timestamp_ns, segment_ns);
             let group = groups
-                .entry((segment, fingerprint))
+                .entry((segment, slot, fingerprint))
                 .or_insert_with(|| (batch.labels.clone(), Vec::new()));
             if group.0 != batch.labels {
                 return Err(Error::Invalid(
@@ -784,10 +889,10 @@ struct PendingWrite {
     ttl: Ttl,
     retention: PageRetention,
     ops: Vec<RecordOp>,
-    /// Next unallocated stream ID for each segment that allocated one.
-    next_stream_ids: HashMap<SegmentId, StreamId>,
-    postings: HashMap<(SegmentId, Label), RoaringBitmap>,
-    search_deltas: BTreeMap<SegmentId, IndexDelta>,
+    /// Next unallocated stream ID for each segment and slot that allocated one.
+    next_stream_ids: HashMap<(SegmentId, u16), StreamId>,
+    postings: HashMap<(SegmentId, u16, Label), RoaringBitmap>,
+    search_deltas: BTreeMap<(SegmentId, u16), IndexDelta>,
     report: WriteReport,
 }
 
@@ -815,22 +920,29 @@ impl PendingWrite {
         &mut self,
         namespace: &Namespace,
         segment: SegmentId,
+        slot: u16,
         stream_id: StreamId,
         sequence: &mut u64,
         (page, rows): (Page, Vec<LogEntry>),
     ) -> Result<()> {
-        self.search_deltas.entry(segment).or_default().add_page(
-            &DEFAULT_ANALYZER,
-            stream_id,
-            *sequence,
-            rows.iter().map(|row| row.line.as_str()),
-        )?;
+        self.search_deltas
+            .entry((segment, slot))
+            .or_default()
+            .add_page(
+                &DEFAULT_ANALYZER,
+                stream_id,
+                *sequence,
+                rows.iter().map(|row| row.line.as_str()),
+            )?;
         append_page_ops(
             &mut self.ops,
             namespace,
-            segment,
-            stream_id,
-            *sequence,
+            PageWriteId {
+                segment,
+                slot,
+                stream_id,
+                sequence: *sequence,
+            },
             page,
             self.retention,
         )?;
@@ -842,12 +954,18 @@ impl PendingWrite {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PageWriteId {
+    segment: SegmentId,
+    slot: u16,
+    stream_id: StreamId,
+    sequence: u64,
+}
+
 fn append_page_ops(
     ops: &mut Vec<RecordOp>,
     namespace: &Namespace,
-    segment: SegmentId,
-    stream_id: StreamId,
-    sequence: u64,
+    id: PageWriteId,
     page: Page,
     retention: PageRetention,
 ) -> Result<()> {
@@ -856,7 +974,7 @@ fn append_page_ops(
     let max_timestamp_ns = page.blocks().last().unwrap().max_timestamp_ns;
     let page_id = PageId {
         timestamp_ns: min_timestamp_ns,
-        sequence,
+        sequence: id.sequence,
     };
     let metadata = StoredPageMetadata {
         expires_at_unix_ms: retention.expires_at_unix_ms,
@@ -867,12 +985,12 @@ fn append_page_ops(
             .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
     };
     ops.push(put(
-        metadata_key(namespace, segment, stream_id, page_id),
+        metadata_key(namespace, id.segment, id.slot, id.stream_id, page_id),
         encode_metadata(&metadata)?,
         retention.physical_ttl,
     ));
     ops.push(put(
-        payload_key(namespace, segment, stream_id, page_id),
+        payload_key(namespace, id.segment, id.slot, id.stream_id, page_id),
         bytes,
         retention.physical_ttl,
     ));
@@ -1025,6 +1143,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_ids_are_local_to_each_segment_slot() {
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("slot-local").unwrap();
+        let first = labels("api", "prod");
+        let first_slot = crate::routing::routing_slot(&namespace, &first);
+        let second = (0..10_000)
+            .map(|candidate| labels(&format!("worker-{candidate}"), "prod"))
+            .find(|labels| crate::routing::routing_slot(&namespace, labels) != first_slot)
+            .unwrap();
+        let second_slot = crate::routing::routing_slot(&namespace, &second);
+
+        db.write(
+            &namespace,
+            vec![
+                LogBatch::new(first, vec![LogEntry::new(1, "first")]),
+                LogBatch::new(second, vec![LogEntry::new(2, "second")]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let ids = db.stream_ids(&namespace, 0, &[]).await.unwrap();
+        assert!(ids.contains(&(first_slot, 0)));
+        assert!(ids.contains(&(second_slot, 0)));
+        assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opened_slot_range_rejects_non_authoritative_writes() {
+        let namespace = Namespace::new("owned-slots").unwrap();
+        let labels = labels("api", "prod");
+        let slot = crate::routing::routing_slot(&namespace, &labels);
+        let owned = if slot == 0 { 1..2 } else { 0..1 };
+        let db = LogDb::open_with_slots(test_config(), owned).await.unwrap();
+
+        let error = db
+            .write(
+                &namespace,
+                vec![LogBatch::new(labels, vec![LogEntry::new(1, "outside")])],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("outside opened shard range"));
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn identical_writes_allocate_distinct_pages() {
         let db = LogDb::open(test_config()).await.unwrap();
         let namespace = Namespace::default();
@@ -1064,7 +1231,12 @@ mod tests {
         }
         let stats = db
             .storage
-            .get(crate::codec::term_stats_key(&namespace, 0, "needle"))
+            .get(crate::codec::term_stats_key(
+                &namespace,
+                0,
+                crate::routing::routing_slot(&namespace, &labels("search", "prod")),
+                "needle",
+            ))
             .await
             .unwrap()
             .unwrap();
@@ -1145,16 +1317,18 @@ mod tests {
         .await
         .unwrap();
 
-        let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+        let (slot, stream_id) = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
         let mut metadata_records = db
             .storage
-            .scan_iter(metadata_range(&namespace, 0, stream_id))
+            .scan_iter(metadata_range(&namespace, 0, slot, stream_id))
             .await
             .unwrap();
         let record = metadata_records.next().await.unwrap().unwrap();
         let mut metadata = decode_metadata(&record.value).unwrap();
         metadata.expires_at_unix_ms = Some(0);
-        db.storage
+        db.writer
+            .as_ref()
+            .unwrap()
             .apply(vec![put(
                 record.key,
                 encode_metadata(&metadata).unwrap(),

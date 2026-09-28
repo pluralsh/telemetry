@@ -82,7 +82,8 @@ def fixture_shard(value: Series) -> int:
         hasher.update(name.encode())
         hasher.update(b"\0")
         hasher.update(label_value.encode())
-    return int.from_bytes(hasher.digest(length=8), "big") % VIRTUAL_SHARDS
+    hash_value = int.from_bytes(hasher.digest(length=16), "big")
+    return (hash_value * VIRTUAL_SHARDS) >> 128
 
 
 def assert_spans_writer_ranges(value: tuple[Series, ...]) -> None:

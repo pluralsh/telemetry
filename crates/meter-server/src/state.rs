@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use futures::{StreamExt, stream};
-use meter::{Namespace, Series, ShardedMeter, ShardingOptions, TimeSeriesDb, Visibility};
+use meter::{Namespace, Series, ShardedMeter, ShardingOptions, Visibility};
 use proto::meter::internal::v1::internal_writer_client::InternalWriterClient;
 use sharding::{Owner, ShardId, ShardMap, server::owned_shards};
 use tokio::sync::{RwLock, Semaphore};
@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, metadata::MetadataValue};
 
 #[cfg(feature = "kubernetes")]
-use sharding::{AssignmentGeneration, BoxError, ShardLifecycle, server::KubernetesRuntime};
+use sharding::{
+    AssignmentGeneration, BoxError, MigrationExecutionError, ShardLifecycle,
+    ShardMigrationExecutor, ShardSplit, server::KubernetesRuntime,
+};
 
 use crate::{
     auth::JwtAuthenticator,
@@ -24,19 +27,16 @@ use crate::{
     internal_writer::to_proto_request,
 };
 
-type Writers = HashMap<String, BTreeMap<ShardId, Arc<TimeSeriesDb>>>;
-type Readers = HashMap<String, Arc<ShardedMeter>>;
-
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) jwt: Option<JwtAuthenticator>,
-    pub(crate) writers: Arc<RwLock<Writers>>,
-    pub(crate) readers: Arc<RwLock<Readers>>,
+    pub(crate) writers: Option<Arc<ShardedMeter>>,
+    pub(crate) readers: Option<Arc<ShardedMeter>>,
     pub(crate) assignment: Arc<RwLock<ShardMap>>,
     pub(crate) local_owner: String,
     pub(crate) remote_limit: Arc<Semaphore>,
-    pub(crate) completed_requests: Arc<Mutex<HashSet<String>>>,
+    pub(crate) completed_requests: Arc<Mutex<HashSet<(String, String)>>>,
     pub(crate) draining_shards: Arc<RwLock<HashSet<ShardId>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) background_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
@@ -56,13 +56,10 @@ impl AppState {
         let (local_owner, assignment) = match &config.sharding.kind {
             #[cfg(feature = "kubernetes")]
             ShardingBackend::Kubernetes(settings) => {
-                let (runtime, assignment) = KubernetesRuntime::bootstrap(
-                    settings,
-                    config.sharding.virtual_shards,
-                    cancellation.clone(),
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error))?;
+                let (runtime, assignment) =
+                    KubernetesRuntime::bootstrap(settings, cancellation.clone())
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error))?;
                 let local = runtime.identity().to_owned();
                 kubernetes = Some(runtime);
                 (local, assignment)
@@ -73,68 +70,55 @@ impl AppState {
             }
             _ => assignment_for(&config)?,
         };
-        let options = ShardingOptions::new(
-            config.sharding.virtual_shards,
-            config.sharding.io_concurrency_multiplier,
-        )?;
-        let mut writers = HashMap::new();
-        let mut readers = HashMap::new();
-        for namespace_config in &config.namespaces {
-            let namespace = Namespace::new(&namespace_config.name)?;
-            let namespace_config_base = meter_config_for_namespace(&config, &namespace);
-            if config.mode == ServerMode::Standalone {
-                let database = ShardedMeter::open_writers(
-                    namespace,
-                    namespace_config_base,
+        let shard_count = assignment.virtual_shards;
+        let options = ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?;
+        let meter_config = meter_config(&config);
+        let writer_shards = if config.mode == ServerMode::Standalone {
+            (0..shard_count).map(ShardId::new).collect::<Vec<_>>()
+        } else if matches!(config.sharding.kind, ShardingBackend::Kubernetes(_)) {
+            Vec::new()
+        } else {
+            owned_shards(&assignment, &local_owner).collect()
+        };
+        let writers = if config.mode != ServerMode::Reader {
+            Some(Arc::new(
+                ShardedMeter::open_writers_with_routing(
+                    meter_config.clone(),
                     options,
-                    (0..config.sharding.virtual_shards).map(ShardId::new),
+                    writer_shards,
+                    &assignment.routing,
                 )
-                .await?;
-                writers.insert(namespace_config.name.clone(), BTreeMap::new());
-                readers.insert(namespace_config.name.clone(), Arc::new(database));
-                continue;
-            }
-            if config.mode != ServerMode::Reader
-                && !matches!(config.sharding.kind, ShardingBackend::Kubernetes(_))
-            {
-                let mut shards = BTreeMap::new();
-                for shard in owned_shards(&assignment, &local_owner) {
-                    let mut meter_config = namespace_config_base.clone();
-                    meter_config.storage.path =
-                        options.shard_path(&meter_config.storage.path, shard)?;
-                    shards.insert(
-                        shard,
-                        Arc::new(TimeSeriesDb::open(namespace.clone(), meter_config).await?),
-                    );
-                }
-                writers.insert(namespace_config.name.clone(), shards);
-            }
-            if config.mode != ServerMode::Writer {
-                readers.insert(
-                    namespace_config.name.clone(),
-                    Arc::new(
-                        ShardedMeter::open_readers(
-                            namespace,
-                            namespace_config_base,
-                            options,
-                            (0..config.sharding.virtual_shards).map(ShardId::new),
-                            slatedb::config::DbReaderOptions {
-                                skip_wal_replay: false,
-                                ..slatedb::config::DbReaderOptions::default()
-                            },
-                            config.reader_cache_capacity,
-                        )
-                        .await?,
-                    ),
-                );
-            }
-        }
+                .await?,
+            ))
+        } else {
+            None
+        };
+        let readers = if config.mode == ServerMode::Standalone {
+            writers.clone()
+        } else if config.mode != ServerMode::Writer {
+            Some(Arc::new(
+                ShardedMeter::open_readers_with_routing(
+                    meter_config,
+                    options,
+                    (0..shard_count).map(ShardId::new),
+                    &assignment.routing,
+                    slatedb::config::DbReaderOptions {
+                        skip_wal_replay: false,
+                        ..slatedb::config::DbReaderOptions::default()
+                    },
+                    config.reader_cache_capacity,
+                )
+                .await?,
+            ))
+        } else {
+            None
+        };
         let state = Self {
             remote_limit: Arc::new(Semaphore::new(config.write.remote_concurrency)),
             config: Arc::new(config),
             jwt,
-            writers: Arc::new(RwLock::new(writers)),
-            readers: Arc::new(RwLock::new(readers)),
+            writers,
+            readers,
             assignment: Arc::new(RwLock::new(assignment)),
             local_owner,
             completed_requests: Arc::new(Mutex::new(HashSet::new())),
@@ -144,20 +128,39 @@ impl AppState {
             flush_runs: Arc::new(AtomicU64::new(0)),
         };
         #[cfg(feature = "kubernetes")]
-        if let Some(runtime) = kubernetes
-            && state.config.mode != ServerMode::Reader
-        {
-            let lifecycle = Arc::new(MeterShardLifecycle {
-                config: Arc::clone(&state.config),
-                writers: Arc::clone(&state.writers),
-                draining_shards: Arc::clone(&state.draining_shards),
-            });
-            let tasks = runtime.spawn(
-                lifecycle,
-                Arc::clone(&state.assignment),
-                &state.cancellation,
-            );
-            state.background_tasks.lock().await.extend(tasks);
+        if let Some(runtime) = kubernetes {
+            if state.config.mode == ServerMode::Reader {
+                let task = runtime.spawn_reader(
+                    state
+                        .readers
+                        .as_ref()
+                        .expect("reader mode must open sharded meter")
+                        .clone(),
+                    Arc::clone(&state.assignment),
+                    &state.cancellation,
+                );
+                state.background_tasks.lock().await.push(task);
+            } else {
+                let lifecycle = Arc::new(MeterShardLifecycle {
+                    writers: state
+                        .writers
+                        .as_ref()
+                        .expect("writer mode must open sharded meter")
+                        .clone(),
+                    draining_shards: Arc::clone(&state.draining_shards),
+                    assignment: Arc::clone(&state.assignment),
+                });
+                let tasks = runtime.spawn(
+                    lifecycle,
+                    Arc::new(MeterMigrationExecutor {
+                        storage: state.config.storage.clone(),
+                        options,
+                    }),
+                    Arc::clone(&state.assignment),
+                    &state.cancellation,
+                );
+                state.background_tasks.lock().await.extend(tasks);
+            }
         }
         if state.config.mode != ServerMode::Reader && state.config.write.flush_interval_seconds > 0
         {
@@ -194,26 +197,16 @@ impl AppState {
         for task in tasks {
             task.await?;
         }
-        let writers = {
-            let mut guard = self.writers.write().await;
-            std::mem::take(&mut *guard)
-        };
-        for (_, shards) in writers {
-            for (_, db) in shards {
-                db.flush().await?;
-                if let Ok(db) = Arc::try_unwrap(db) {
-                    db.close().await?;
-                }
-            }
+        if let Some(writers) = &self.writers {
+            writers.close().await?;
         }
-        let readers = {
-            let mut guard = self.readers.write().await;
-            std::mem::take(&mut *guard)
-        };
-        for (_, reader) in readers {
-            if let Ok(reader) = Arc::try_unwrap(reader) {
-                reader.close().await?;
-            }
+        if let Some(readers) = &self.readers
+            && self
+                .writers
+                .as_ref()
+                .is_none_or(|writers| !Arc::ptr_eq(writers, readers))
+        {
+            readers.close().await?;
         }
         Ok(())
     }
@@ -227,8 +220,21 @@ impl AppState {
 
     pub(crate) async fn is_ready(&self) -> bool {
         match self.config.mode {
-            ServerMode::Reader | ServerMode::Standalone => {
-                self.readers.read().await.len() == self.config.namespaces.len()
+            ServerMode::Standalone => self.readers.is_some(),
+            ServerMode::Reader => {
+                let expected = self
+                    .assignment
+                    .read()
+                    .await
+                    .routing
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.shard)
+                    .collect::<Vec<_>>();
+                match &self.readers {
+                    Some(readers) => readers.reader_shards().await == expected,
+                    None => false,
+                }
             }
             ServerMode::Writer => {
                 let assignment = self.assignment.read().await;
@@ -240,40 +246,24 @@ impl AppState {
                             .is_some_and(|owner| owner.id == self.local_owner)
                     })
                     .collect::<HashSet<_>>();
-                let writers = self.writers.read().await;
+                let Some(writers) = &self.writers else {
+                    return false;
+                };
                 !expected.is_empty()
-                    && self.config.namespaces.iter().all(|namespace| {
-                        writers.get(&namespace.name).is_some_and(|shards| {
-                            shards.keys().copied().collect::<HashSet<_>>() == expected
-                        })
-                    })
+                    && writers
+                        .writer_shards()
+                        .await
+                        .into_iter()
+                        .collect::<HashSet<_>>()
+                        == expected
             }
         }
     }
 
     async fn flush_active_writers(&self) -> anyhow::Result<()> {
         self.flush_runs.fetch_add(1, Ordering::Relaxed);
-        let databases = {
-            let writers = self.writers.read().await;
-            writers
-                .values()
-                .flat_map(|shards| shards.values().cloned())
-                .collect::<Vec<_>>()
-        };
-        for database in databases {
-            database.flush().await?;
-        }
-        if self.config.mode == ServerMode::Standalone {
-            let databases = self
-                .readers
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            for database in databases {
-                database.flush().await?;
-            }
+        if let Some(writers) = &self.writers {
+            writers.flush().await?;
         }
         Ok(())
     }
@@ -287,15 +277,15 @@ impl AppState {
     ) -> Result<(), ApiError> {
         let meter_namespace =
             Namespace::new(namespace).map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
-            self.config.sharding.virtual_shards,
+            assignment.virtual_shards,
             self.config.sharding.io_concurrency_multiplier,
         )
         .map_err(ApiError::internal)?;
-        let assignment = self.assignment.read().await.clone();
         let mut groups: HashMap<(Owner, ShardId), Vec<Series>> = HashMap::new();
         for item in series {
-            let shard = options.route(&meter_namespace, &item.labels);
+            let shard = options.route(&assignment.routing, &meter_namespace, &item.labels);
             let owner = assignment
                 .owner_of(shard)
                 .cloned()
@@ -353,29 +343,15 @@ impl AppState {
         if draining.contains(&shard) {
             return Err(ApiError::unavailable("local shard is draining"));
         }
-        let db = self
-            .writers
-            .read()
-            .await
-            .get(namespace)
-            .and_then(|shards| shards.get(&shard))
-            .cloned();
-        if let Some(db) = db {
-            return db
-                .write_with_visibility(series, visibility(durability))
-                .await
-                .map_err(ApiError::internal);
-        }
-        if self.config.mode == ServerMode::Standalone {
-            let reader = self
-                .readers
-                .read()
-                .await
-                .get(namespace)
-                .cloned()
-                .ok_or_else(|| ApiError::unavailable("standalone database is not open"))?;
-            return reader
-                .write(series, visibility(durability))
+        if let Some(writers) = &self.writers {
+            return writers
+                .write_shard(
+                    &Namespace::new(namespace)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                    shard,
+                    series,
+                    visibility(durability),
+                )
                 .await
                 .map_err(ApiError::internal);
         }
@@ -435,10 +411,86 @@ impl AppState {
 }
 
 #[cfg(feature = "kubernetes")]
+struct MeterMigrationExecutor {
+    storage: common::storage::config::SlateDbStorageConfig,
+    options: ShardingOptions,
+}
+
+#[cfg(feature = "kubernetes")]
+impl MeterMigrationExecutor {
+    fn spec(
+        &self,
+        split: &ShardSplit,
+    ) -> Result<common::storage::projected_clone::ProjectedCloneSpec, MigrationExecutionError> {
+        let slots = split
+            .moved_range
+            .slots()
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        Ok(common::storage::projected_clone::ProjectedCloneSpec {
+            source_path: self
+                .options
+                .shard_path(&self.storage.path, split.source_shard)
+                .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?,
+            target_path: self
+                .options
+                .shard_path(&self.storage.path, split.target_shard)
+                .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?,
+            checkpoint_name: format!(
+                "telemetry-migration-{}-{}-{}-{}",
+                split.source_shard.get(),
+                split.target_shard.get(),
+                slots.start,
+                slots.end
+            ),
+            slot_start: slots.start,
+            slot_end: slots.end,
+            segment_extractor_name: meter::SEGMENT_EXTRACTOR_NAME.to_owned(),
+        })
+    }
+
+    fn map_error(
+        error: common::storage::projected_clone::ProjectedCloneError,
+    ) -> MigrationExecutionError {
+        if error.is_fatal() {
+            MigrationExecutionError::fatal(error.to_string())
+        } else {
+            MigrationExecutionError::Retryable(Box::new(error))
+        }
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[tonic::async_trait]
+impl ShardMigrationExecutor for MeterMigrationExecutor {
+    async fn preflight_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
+        let object_store =
+            common::create_object_store(&self.storage.object_store).map_err(|error| {
+                MigrationExecutionError::fatal(format!("object store configuration: {error}"))
+            })?;
+        common::storage::projected_clone::preflight_projected_clone(
+            &self.spec(split)?,
+            object_store,
+        )
+        .await
+        .map_err(Self::map_error)
+    }
+
+    async fn clone_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
+        let object_store =
+            common::create_object_store(&self.storage.object_store).map_err(|error| {
+                MigrationExecutionError::fatal(format!("object store configuration: {error}"))
+            })?;
+        common::storage::projected_clone::execute_projected_clone(&self.spec(split)?, object_store)
+            .await
+            .map_err(Self::map_error)
+    }
+}
+
+#[cfg(feature = "kubernetes")]
 struct MeterShardLifecycle {
-    config: Arc<Config>,
-    writers: Arc<RwLock<Writers>>,
+    writers: Arc<ShardedMeter>,
     draining_shards: Arc<RwLock<HashSet<ShardId>>>,
+    assignment: Arc<RwLock<ShardMap>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -449,35 +501,24 @@ impl ShardLifecycle for MeterShardLifecycle {
         shard: ShardId,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
-        let options = ShardingOptions::new(
-            self.config.sharding.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
-        )?;
         {
             let mut draining = self.draining_shards.write().await;
             draining.remove(&shard);
         }
-        for namespace_config in &self.config.namespaces {
-            let namespace = Namespace::new(&namespace_config.name)?;
-            if self
-                .writers
-                .read()
-                .await
-                .get(&namespace_config.name)
-                .is_some_and(|shards| shards.contains_key(&shard))
-            {
-                continue;
-            }
-            let mut config = meter_config_for_namespace(&self.config, &namespace);
-            config.storage.path = options.shard_path(&config.storage.path, shard)?;
-            let database = Arc::new(TimeSeriesDb::open(namespace.clone(), config).await?);
-            self.writers
-                .write()
-                .await
-                .entry(namespace_config.name.clone())
-                .or_default()
-                .insert(shard, database);
-        }
+        let slots = self
+            .assignment
+            .read()
+            .await
+            .routing
+            .assignments
+            .iter()
+            .find(|assignment| assignment.shard == shard)
+            .ok_or_else(|| format!("missing routing range for shard {}", shard.get()))?
+            .range
+            .slots()?;
+        self.writers
+            .open_writer_shard_with_slots(shard, slots)
+            .await?;
         Ok(())
     }
 
@@ -487,56 +528,22 @@ impl ShardLifecycle for MeterShardLifecycle {
     }
 
     async fn flush(&self, shard: ShardId) -> Result<(), BoxError> {
-        let databases = {
-            let writers = self.writers.read().await;
-            writers
-                .values()
-                .filter_map(|shards| shards.get(&shard).cloned())
-                .collect::<Vec<_>>()
-        };
-        for database in databases {
-            database.flush().await?;
-        }
+        self.writers.flush_shard(shard).await?;
         Ok(())
     }
 
     async fn close(&self, shard: ShardId) -> Result<(), BoxError> {
-        let databases = {
-            let mut writers = self.writers.write().await;
-            let mut removed = Vec::new();
-            for shards in writers.values_mut() {
-                if let Some(database) = shards.remove(&shard) {
-                    removed.push(database);
-                }
-            }
-            removed
-        };
-        for database in databases {
-            let database = Arc::try_unwrap(database).map_err(|_| {
-                std::io::Error::other("shard database still has in-flight references")
-            })?;
-            database.close().await?;
-        }
+        self.writers.close_writer_shard(shard).await?;
         Ok(())
     }
 }
 
-fn meter_config(config: &Config) -> meter::Config {
+pub(crate) fn meter_config(config: &Config) -> meter::Config {
     meter::Config {
         storage: config.storage.clone(),
         flush_interval: Duration::from_secs(config.write.flush_interval_seconds),
         retention: None,
     }
-}
-
-pub(crate) fn meter_config_for_namespace(config: &Config, namespace: &Namespace) -> meter::Config {
-    let mut meter = meter_config(config);
-    let namespace_hash = blake3::hash(namespace.as_str().as_bytes()).to_hex();
-    meter.storage.path = format!(
-        "{}/namespace-{namespace_hash}",
-        meter.storage.path.trim_end_matches('/')
-    );
-    meter
 }
 
 pub(crate) fn assignment_for(config: &Config) -> anyhow::Result<(String, ShardMap)> {

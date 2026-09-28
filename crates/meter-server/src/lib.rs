@@ -24,7 +24,7 @@ use sharding::{Assignment, Owner, ShardId, ShardMap, ShardRange};
 #[cfg(all(test, feature = "kubernetes"))]
 use sharding::{balanced_contiguous, kubernetes::membership_changed};
 #[cfg(test)]
-use state::{assignment_for, meter_config_for_namespace};
+use state::{assignment_for, meter_config};
 #[cfg(test)]
 use std::{
     sync::atomic::{AtomicU64, Ordering},

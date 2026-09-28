@@ -32,6 +32,11 @@ func (r *TrackReconciler) reconcileStatefulSet(ctx context.Context, track *telem
 	if err := controllerutil.SetControllerReference(track, desired, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
+	if component == resources.ComponentWriter {
+		if err := synchronizeWriterReplicas(ctx, r.Client, track, dataStoreTrack, resources.Mode(track), desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	current := &appsv1.StatefulSet{}
 	key := client.ObjectKeyFromObject(desired)
 	if err := r.Get(ctx, key, current); err != nil {

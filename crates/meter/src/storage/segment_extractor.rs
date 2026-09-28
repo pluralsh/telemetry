@@ -2,13 +2,14 @@
 //!
 //! Implements [`slatedb::PrefixExtractor`] over the timeseries key layout,
 //! mapping every record to the routing prefix
-//! `[subsystem, version, namespace\0, time_bucket(4 BE), bucket_size]`. When configured on
+//! `[subsystem, version, namespace\0, time_bucket(4 BE), bucket_size]`. The routing slot
+//! follows this prefix and deliberately remains outside the segment boundary. When configured on
 //! the `slatedb::DbBuilder`, the extractor causes SlateDB to route writes for
 //! each `(namespace, time_bucket, bucket_size)` scope into its own SlateDB
 //! segment, so per-bucket LSM state can be compacted (and eventually drained)
 //! as a unit.
 //!
-//! The `record_type` byte that follows deliberately sits *outside* the
+//! The routing-slot and `record_type` bytes that follow deliberately sit *outside* the
 //! extracted prefix so all record types for a given bucket (series
 //! dictionary, forward index, inverted index, time series samples) share one
 //! routing prefix and land in the same SlateDB segment.
@@ -40,7 +41,7 @@ const MIN_ROUTING_PREFIX_LEN: usize = 8;
 /// Stable, persisted identifier for this extractor's routing rules. Bump
 /// whenever the routing logic changes in a way that would re-route existing
 /// keys (e.g. a new `KEY_VERSION` with a different prefix shape).
-const EXTRACTOR_NAME: &str = "meter-timeseries/v1";
+pub(crate) const EXTRACTOR_NAME: &str = "meter-timeseries/v2";
 
 fn routing_prefix_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < MIN_ROUTING_PREFIX_LEN || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
@@ -54,7 +55,7 @@ fn routing_prefix_len(bytes: &[u8]) -> Option<usize> {
 /// Prefix extractor routing timeseries records to per-bucket SlateDB segments.
 ///
 /// Every well-formed timeseries key has the shape `[SUBSYSTEM, KEY_VERSION,
-/// namespace\0, time_bucket(4 BE), bucket_size, record_type, ...]` by
+/// namespace\0, time_bucket(4 BE), bucket_size, routing_slot(2 BE), record_type, ...]` by
 /// construction, so this extractor returns the length through `bucket_size`
 /// for any well-formed `PrefixTarget::Point`, and for any `PrefixTarget::Prefix`
 /// that covers at least that much.
@@ -150,11 +151,22 @@ mod tests {
     }
 
     fn key(namespace: &Namespace, start: u32, size: u8, record_type: RecordType) -> Bytes {
+        key_with_slot(namespace, start, size, 0, record_type)
+    }
+
+    fn key_with_slot(
+        namespace: &Namespace,
+        start: u32,
+        size: u8,
+        routing_slot: u16,
+        record_type: RecordType,
+    ) -> Bytes {
         let mut buf = BytesMut::new();
         write_record_prefix(
             &mut buf,
             namespace,
             &TimeBucket { start, size },
+            routing_slot,
             record_type,
         );
         buf.extend_from_slice(b"tail");
@@ -186,7 +198,7 @@ mod tests {
 
     #[test]
     fn should_return_stable_name() {
-        assert_eq!(TimeseriesSegmentExtractor.name(), "meter-timeseries/v1");
+        assert_eq!(TimeseriesSegmentExtractor.name(), "meter-timeseries/v2");
     }
 
     #[test]
@@ -207,6 +219,16 @@ mod tests {
         assert_eq!(extracted(&dictionary), extracted(&samples));
         assert_eq!(extracted(&forward), extracted(&samples));
         assert_eq!(extracted(&inverted), extracted(&samples));
+    }
+
+    #[test]
+    fn should_preserve_segment_boundary_across_routing_slots() {
+        let tenant = namespace("tenant");
+        let low = key_with_slot(&tenant, 100, 1, 1, RecordType::ForwardIndex);
+        let high = key_with_slot(&tenant, 100, 1, 4095, RecordType::TimeSeries);
+
+        assert_eq!(extracted(&low), extracted(&high));
+        assert_eq!(extracted(&low), raw_prefix("tenant", 100, 1));
     }
 
     #[test]

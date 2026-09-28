@@ -3,8 +3,13 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
-use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
+use sharding::{
+    DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
+    ShardId, ShardMap,
+};
+use slatedb::config::DbReaderOptions;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
@@ -53,24 +58,18 @@ impl ShardingOptions {
         self.io_concurrency_multiplier
     }
 
-    pub fn route(self, namespace: &Namespace, trace_id: TraceId) -> ShardId {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&(namespace.as_bytes().len() as u32).to_be_bytes());
-        hasher.update(namespace.as_bytes());
-        hasher.update(trace_id.as_bytes());
-        let hash = hasher.finalize();
-        let value = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("eight bytes"));
-        ShardId::new((value % u64::from(self.virtual_shards)) as u32)
+    pub fn route(
+        self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        trace_id: TraceId,
+    ) -> ShardId {
+        routing.route(sharding::hash_routing_key(
+            &crate::routing::canonical_routing_key(namespace, trace_id),
+        ))
     }
 
     pub fn shard_storage(self, config: &Config, shard: ShardId) -> Result<Config> {
-        if shard.get() >= self.virtual_shards {
-            return Err(Error::Invalid(format!(
-                "shard {} is outside configured virtual shard count {}",
-                shard.get(),
-                self.virtual_shards
-            )));
-        }
         let mut config = config.clone();
         config.storage = config
             .storage
@@ -84,6 +83,8 @@ pub struct ShardedTrack {
     config: Config,
     options: ShardingOptions,
     shards: RwLock<BTreeMap<ShardId, Arc<TraceDb>>>,
+    shard_slots: RwLock<BTreeMap<ShardId, std::ops::Range<u16>>>,
+    reader_options: Option<DbReaderOptions>,
     io_permits: Arc<Semaphore>,
 }
 
@@ -93,12 +94,29 @@ impl ShardedTrack {
         options: ShardingOptions,
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
+        let routing = HashRangeMap::bootstrap(options.virtual_shards())
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        Self::open_with_routing(config, options, shards, &routing).await
+    }
+
+    pub async fn open_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+    ) -> Result<Self> {
         let mut databases = BTreeMap::new();
+        let mut shard_slots = BTreeMap::new();
         for shard in shards {
+            let slots = slot_range(routing, shard)?;
             databases.insert(
                 shard,
-                Arc::new(TraceDb::open(options.shard_storage(&config, shard)?).await?),
+                Arc::new(
+                    TraceDb::open_with_slots(options.shard_storage(&config, shard)?, slots.clone())
+                        .await?,
+                ),
             );
+            shard_slots.insert(shard, slots);
         }
         let permits = (options.virtual_shards() as usize)
             .max(1)
@@ -107,12 +125,56 @@ impl ShardedTrack {
             config,
             options,
             shards: RwLock::new(databases),
+            shard_slots: RwLock::new(shard_slots),
+            reader_options: None,
             io_permits: Arc::new(Semaphore::new(permits)),
         })
     }
 
-    pub fn route(&self, namespace: &Namespace, trace_id: TraceId) -> ShardId {
-        self.options.route(namespace, trace_id)
+    pub async fn open_readers_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+        reader_options: DbReaderOptions,
+    ) -> Result<Self> {
+        let mut databases = BTreeMap::new();
+        let mut shard_slots = BTreeMap::new();
+        for shard in shards {
+            let slots = slot_range(routing, shard)?;
+            databases.insert(
+                shard,
+                Arc::new(
+                    TraceDb::open_reader_with_slots(
+                        options.shard_storage(&config, shard)?,
+                        slots.clone(),
+                        reader_options.clone(),
+                    )
+                    .await?,
+                ),
+            );
+            shard_slots.insert(shard, slots);
+        }
+        let permits = (options.virtual_shards() as usize)
+            .max(1)
+            .saturating_mul(options.io_concurrency_multiplier() as usize);
+        Ok(Self {
+            config,
+            options,
+            shards: RwLock::new(databases),
+            shard_slots: RwLock::new(shard_slots),
+            reader_options: Some(reader_options),
+            io_permits: Arc::new(Semaphore::new(permits)),
+        })
+    }
+
+    pub fn route(
+        &self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        trace_id: TraceId,
+    ) -> ShardId {
+        self.options.route(routing, namespace, trace_id)
     }
 
     pub async fn contains_shard(&self, shard: ShardId) -> bool {
@@ -124,14 +186,30 @@ impl ShardedTrack {
     }
 
     pub async fn open_shard(&self, shard: ShardId) -> Result<()> {
+        let routing = HashRangeMap::bootstrap(self.options.virtual_shards())
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        self.open_shard_with_slots(shard, slot_range(&routing, shard)?)
+            .await
+    }
+
+    pub async fn open_shard_with_slots(
+        &self,
+        shard: ShardId,
+        owned_slots: std::ops::Range<u16>,
+    ) -> Result<()> {
         if self.contains_shard(shard).await {
             return Ok(());
         }
-        let database = TraceDb::open(self.options.shard_storage(&self.config, shard)?).await?;
+        let database = TraceDb::open_with_slots(
+            self.options.shard_storage(&self.config, shard)?,
+            owned_slots.clone(),
+        )
+        .await?;
         let mut shards = self.shards.write().await;
         match shards.entry(shard) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Arc::new(database));
+                self.shard_slots.write().await.insert(shard, owned_slots);
                 return Ok(());
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
@@ -153,10 +231,14 @@ impl ShardedTrack {
         let Some(database) = shards.remove(&shard) else {
             return Ok(());
         };
+        let owned_slots = self.shard_slots.write().await.remove(&shard);
         let database = match Arc::try_unwrap(database) {
             Ok(database) => database,
             Err(database) => {
                 shards.insert(shard, database);
+                if let Some(owned_slots) = owned_slots {
+                    self.shard_slots.write().await.insert(shard, owned_slots);
+                }
                 return Err(Error::Invalid(
                     "shard database still has in-flight references".into(),
                 ));
@@ -174,8 +256,89 @@ impl ShardedTrack {
         self.shards.read().await.keys().copied().collect()
     }
 
+    pub async fn reconcile_shards(&self, routing: &HashRangeMap) -> Result<()> {
+        let desired = routing
+            .assignments
+            .iter()
+            .map(|assignment| {
+                assignment
+                    .range
+                    .slots()
+                    .map(|slots| (assignment.shard, slots))
+                    .map_err(|error| Error::Invalid(error.to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let current_slots = self.shard_slots.read().await.clone();
+        let mut opened = BTreeMap::new();
+        for (&shard, slots) in &desired {
+            if current_slots.get(&shard) == Some(slots) {
+                continue;
+            }
+            let reader_options = self.reader_options.as_ref().ok_or_else(|| {
+                Error::Invalid("reader reconciliation requires a reader facade".into())
+            })?;
+            opened.insert(
+                shard,
+                Arc::new(
+                    TraceDb::open_reader_with_slots(
+                        self.options.shard_storage(&self.config, shard)?,
+                        slots.clone(),
+                        reader_options.clone(),
+                    )
+                    .await?,
+                ),
+            );
+        }
+
+        let mut shards = self.shards.write().await;
+        let mut shard_slots = self.shard_slots.write().await;
+        let retiring = shards
+            .iter()
+            .filter(|(shard, _)| desired.get(shard) != shard_slots.get(shard))
+            .map(|(shard, database)| (*shard, Arc::strong_count(database)))
+            .collect::<Vec<_>>();
+        if let Some((shard, references)) = retiring
+            .iter()
+            .find(|(_, references)| *references != 1)
+            .copied()
+        {
+            drop(shard_slots);
+            drop(shards);
+            for (_, database) in opened {
+                Arc::try_unwrap(database)
+                    .unwrap_or_else(|_| unreachable!("new shard has no external references"))
+                    .close()
+                    .await?;
+            }
+            return Err(Error::Invalid(format!(
+                "shard {shard} still has {} in-flight references",
+                references - 1
+            )));
+        }
+        let retiring = retiring
+            .into_iter()
+            .filter_map(|(shard, _)| shards.remove(&shard))
+            .collect::<Vec<_>>();
+        for (shard, database) in opened {
+            shards.insert(shard, database);
+        }
+        *shard_slots = desired;
+        drop(shard_slots);
+        drop(shards);
+        for database in retiring {
+            Arc::try_unwrap(database)
+                .unwrap_or_else(|_| {
+                    unreachable!("retired shard was checked for external references")
+                })
+                .close()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn write(
         &self,
+        routing: &HashRangeMap,
         namespace: &Namespace,
         batches: Vec<TraceBatch>,
         durability: Durability,
@@ -183,7 +346,7 @@ impl ShardedTrack {
         let mut grouped = BTreeMap::<ShardId, Vec<Trace>>::new();
         for trace in batches.into_iter().flat_map(|batch| batch.traces) {
             grouped
-                .entry(self.route(namespace, trace.trace_id))
+                .entry(self.route(routing, namespace, trace.trace_id))
                 .or_default()
                 .push(trace);
         }
@@ -204,10 +367,11 @@ impl ShardedTrack {
 
     pub async fn get_trace(
         &self,
+        routing: &HashRangeMap,
         namespace: &Namespace,
         trace_id: TraceId,
     ) -> Result<Option<Trace>> {
-        let shard = self.route(namespace, trace_id);
+        let shard = self.route(routing, namespace, trace_id);
         let database = self.shard(shard).await.ok_or_else(|| {
             Error::Invalid(format!("shard {} is not open on this node", shard.get()))
         })?;
@@ -359,6 +523,7 @@ impl ShardedTrack {
         let databases = std::mem::take(&mut *self.shards.write().await)
             .into_values()
             .collect::<Vec<_>>();
+        self.shard_slots.write().await.clear();
         for database in databases {
             database.close().await?;
         }
@@ -368,6 +533,29 @@ impl ShardedTrack {
     async fn databases(&self) -> Vec<Arc<TraceDb>> {
         self.shards.read().await.values().cloned().collect()
     }
+}
+
+#[async_trait]
+impl ReaderShardLifecycle for ShardedTrack {
+    async fn reconcile_readers(
+        &self,
+        assignment: &ShardMap,
+    ) -> std::result::Result<(), sharding::BoxError> {
+        self.reconcile_shards(&assignment.routing)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+fn slot_range(routing: &HashRangeMap, shard: ShardId) -> Result<std::ops::Range<u16>> {
+    routing
+        .assignments
+        .iter()
+        .find(|assignment| assignment.shard == shard)
+        .ok_or_else(|| Error::Invalid(format!("unknown shard {}", shard.get())))?
+        .range
+        .slots()
+        .map_err(|error| Error::Invalid(error.to_string()))
 }
 
 #[cfg(test)]
@@ -409,16 +597,24 @@ mod tests {
     #[test]
     fn routing_is_stable_and_namespace_scoped() {
         let options = ShardingOptions::new(64, 4).unwrap();
+        let routing = HashRangeMap::bootstrap(options.virtual_shards()).unwrap();
         let id = TraceId::new([3; 16]).unwrap();
         let a = Namespace::new("a").unwrap();
         let b = Namespace::new("b").unwrap();
-        assert_eq!(options.route(&a, id), options.route(&a, id));
-        assert_ne!(options.route(&a, id), options.route(&b, id));
+        assert_eq!(
+            options.route(&routing, &a, id),
+            options.route(&routing, &a, id)
+        );
+        assert_ne!(
+            options.route(&routing, &a, id),
+            options.route(&routing, &b, id)
+        );
     }
 
     #[tokio::test]
     async fn writes_reads_flushes_and_manages_shards() {
         let options = ShardingOptions::new(2, 2).unwrap();
+        let routing = HashRangeMap::bootstrap(options.virtual_shards()).unwrap();
         let namespace = Namespace::new("tenant").unwrap();
         let database = ShardedTrack::open(config(), options, [ShardId::new(0), ShardId::new(1)])
             .await
@@ -426,6 +622,7 @@ mod tests {
         let traces = vec![trace(1, 1), trace(2, 2)];
         database
             .write(
+                &routing,
                 &namespace,
                 vec![TraceBatch::new(traces.clone())],
                 Durability::Written,
@@ -435,7 +632,7 @@ mod tests {
         for trace in traces {
             assert_eq!(
                 database
-                    .get_trace(&namespace, trace.trace_id)
+                    .get_trace(&routing, &namespace, trace.trace_id)
                     .await
                     .unwrap(),
                 Some(trace)
@@ -452,6 +649,38 @@ mod tests {
         extra.close_shard(ShardId::new(1)).await.unwrap();
         database.close().await.unwrap();
         extra.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_adds_resizes_and_safely_removes_reader_shards() {
+        let options = ShardingOptions::new(1, 2).unwrap();
+        let one = HashRangeMap::bootstrap(1).unwrap();
+        let two = one.grow_to(2).unwrap();
+        let database = ShardedTrack::open_readers_with_routing(
+            config(),
+            options,
+            [ShardId::new(0)],
+            &one,
+            DbReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        database.reconcile_shards(&two).await.unwrap();
+        assert_eq!(
+            database.open_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        let active = database.shard(ShardId::new(1)).await.unwrap();
+        assert!(database.reconcile_shards(&one).await.is_err());
+        assert_eq!(
+            database.open_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        drop(active);
+        database.reconcile_shards(&one).await.unwrap();
+        assert_eq!(database.open_shards().await, vec![ShardId::new(0)]);
+        database.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -473,8 +702,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let routing = HashRangeMap::bootstrap(4).unwrap();
         sharded
             .write(
+                &routing,
                 &namespace,
                 vec![TraceBatch::new(traces)],
                 Durability::Written,
@@ -506,8 +737,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let routing = HashRangeMap::bootstrap(4).unwrap();
         sharded
             .write(
+                &routing,
                 &namespace,
                 vec![TraceBatch::new(traces)],
                 Durability::Written,

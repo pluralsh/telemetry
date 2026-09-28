@@ -73,7 +73,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "meter.assignmentName" -}}
-{{- printf "%s-writer-shard-assignments" (include "meter.fullname" . | trunc 38 | trimSuffix "-") -}}
+{{- printf "%s-writer-shard-map" (include "meter.fullname" . | trunc 46 | trimSuffix "-") -}}
 {{- end }}
 
 {{- define "meter.coordinatorLeaseName" -}}

@@ -1,17 +1,22 @@
 # Line storage format
 
 Line stores logs in SlateDB, partitioned by namespace and fixed-duration time
-segment. Each segment is a SlateDB routing/compaction boundary.
+segment. Each segment remains a SlateDB routing/compaction boundary. Inside a
+segment, records sort first by a 12-bit routing slot derived from the canonical
+`ShardedLine` routing key.
 
 ```text
 Common key scope
-┌───────────┬─────────┬─────────────────┬──────────────────┬─────────────┐
-│ subsystem │ version │    namespace    │   time segment   │ record type │
-│ 0x03      │ 0x01    │ TerminatedBytes │ sortable i64 BE  │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬──────────────────┬──────────────┬─────────────┐
+│ subsystem │ version │    namespace    │   time segment   │ routing slot │ record type │
+│ 0x03      │ 0x02    │ TerminatedBytes │ sortable i64 BE  │ u16 BE       │ u8          │
+└───────────┴─────────┴─────────────────┴──────────────────┴──────────────┴─────────────┘
 ```
 
-`TerminatedBytes` escapes embedded delimiters and ends with `0x00`.
+`TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Routing
+slots are in `0..4096`; the unused high four bits of their `u16` encoding are
+zero. Version 2 is a hard format switch: version-1 Line databases are not read
+by this format.
 
 | ID | Record | Purpose |
 | --- | --- | --- |
@@ -27,31 +32,32 @@ Common key scope
 
 ```text
 NextStreamId (0x01)
-KEY   common scope
+KEY   common scope │ routing slot
 VALUE stream_id: u32 BE
 
 StreamDictionary (0x02)
-KEY   common scope │ label fingerprint: 16 bytes
+KEY   common scope │ routing slot │ label fingerprint: 16 bytes
 VALUE stream_id: u32 BE
 
 ForwardLabels (0x03)
-KEY   common scope │ stream_id: u32 BE
+KEY   common scope │ routing slot │ stream_id: u32 BE
 VALUE 0x01 │ count: var_u32 │ (name len: var_u32 │ name │ value len: var_u32 │ value) × count
 
 LabelPostings (0x04)
-KEY   common scope │ label name: TerminatedBytes │ label value: raw UTF-8
+KEY   common scope │ routing slot │ label name: TerminatedBytes │ label value: raw UTF-8
 VALUE RoaringBitmap<stream_id: u32>
 ```
 
-IDs are local to one time segment. The dictionary deduplicates complete stream
-label sets; forward labels reconstruct results; postings intersect exact label
-matchers.
+IDs are local to one `(time segment, routing slot)` pair. The dictionary
+deduplicates complete stream label sets; forward labels reconstruct results;
+postings intersect exact label matchers. Physical shards open an authoritative
+half-open slot range and writes and scans are restricted to that range.
 
 ## Page records
 
 ```text
 PageMetadata (0x05)
-KEY   common scope │ stream_id: u32 │ first timestamp: sortable i64 │ sequence: u64
+KEY   common scope │ routing slot │ stream_id: u32 │ first timestamp: sortable i64 │ sequence: u64
 VALUE ┌─────────┬───────┬─────────────────────┬──────────────┬─────────────────┬──────────┬───────────────┐
       │ version │ flags │ expiry ms           │ min ts       │ max − min ts    │ rows     │ payload bytes │
       │ u8 = 1  │ u8    │ var_u64 if flags&1  │ i64 BE       │ var_u64         │ var_u32  │ var_u32       │
@@ -62,7 +68,7 @@ KEY   same page address as PageMetadata
 VALUE immutable LINE page (layout below)
 
 NextPageSequence (0x07)
-KEY   common scope │ stream_id: u32
+KEY   common scope │ routing slot │ stream_id: u32
 VALUE next sequence: u64 BE
 ```
 
@@ -95,20 +101,20 @@ structured metadata. Blocks decompress independently.
 
 ```text
 SearchFieldStats (0x08)
-KEY   common scope
+KEY   common scope │ routing slot
 VALUE 0x01 │ documents: var_u64 │ total tokens: var_u64
 
 SearchTermStats (0x09)
-KEY   common scope │ term: TerminatedBytes
+KEY   common scope │ routing slot │ term: TerminatedBytes
 VALUE 0x01 │ document frequency: var_u64 │ posting blocks: var_u32
 
 SearchTermDirectory (0x0a)
-KEY   common scope │ term: TerminatedBytes │ directory ordinal: u32
+KEY   common scope │ routing slot │ term: TerminatedBytes │ directory ordinal: u32
 VALUE 0x01 │ count: var_u32 │ entry × count
       entry: ordinal Δ │ postings │ max frequency │ min length   (var_u32 each)
 
 SearchPostingBlock (0x0b)
-KEY   common scope │ term: TerminatedBytes │ block ordinal: u32
+KEY   common scope │ routing slot │ term: TerminatedBytes │ block ordinal: u32
 VALUE 0x01 │ count: var_u32 │ posting × count, sorted by address
       posting: stream Δ: var_u32
                stream Δ ≠ 0 → page sequence: var_u64 │ row ID: var_u32
@@ -126,7 +132,8 @@ unbounded SlateDB value. Writes top up a term's partially filled trailing block
 before allocating new ones, so frequent small writes do not fragment postings
 into one block per write. Queries load directories first, fetch posting blocks
 concurrently, visit the rarest term first, and fetch only blocks whose impact
-bound can still enter a single-term top-k result.
+bound can still enter a single-term top-k result. Field statistics, term
+statistics, directories, posting blocks, and write deltas are all slot-local.
 
 Retention uses both SlateDB TTL and logical expiry in page metadata, so expired
 pages disappear from reads before compaction physically removes them.

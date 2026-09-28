@@ -83,9 +83,8 @@
     },
     "sharding": {
       "type": "object",
-      "required": ["virtualShards", "ioConcurrencyMultiplier", "leaseDurationSeconds", "renewIntervalSeconds"],
+      "required": ["ioConcurrencyMultiplier", "leaseDurationSeconds", "renewIntervalSeconds"],
       "properties": {
-        "virtualShards": {"type": "integer", "minimum": 1},
         "ioConcurrencyMultiplier": {"type": "integer", "minimum": 1},
         "leaseDurationSeconds": {"type": "integer", "minimum": 2},
         "renewIntervalSeconds": {"type": "integer", "minimum": 1}

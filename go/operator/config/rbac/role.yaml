@@ -103,3 +103,11 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - telemetry.plural.sh
+  resources:
+  - shardmaps
+  verbs:
+  - get
+  - list
+  - watch

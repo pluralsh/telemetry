@@ -18,7 +18,7 @@ data:
     write:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
-      virtual_shards: {{ .Values.sharding.virtualShards }}
+      virtual_shards: 1
       io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: standalone
     auth:
@@ -56,7 +56,6 @@ data:
     write:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
-      virtual_shards: {{ .Values.sharding.virtualShards }}
       io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
       database: {{ include "meter.fullname" . | quote }}
@@ -64,7 +63,7 @@ data:
       stateful_set: {{ include "meter.writerName" . | quote }}
       headless_service: {{ include "meter.headlessName" . | quote }}
       owner_port: {{ .Values.service.grpcPort }}
-      assignment_config_map: {{ include "meter.assignmentName" . | quote }}
+      shard_map: {{ include "meter.assignmentName" . | quote }}
       coordinator_lease: {{ include "meter.coordinatorLeaseName" . | quote }}
       shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
       lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}
@@ -104,7 +103,6 @@ data:
     write:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
-      virtual_shards: {{ .Values.sharding.virtualShards }}
       io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
       database: {{ include "meter.fullname" . | quote }}
@@ -112,7 +110,7 @@ data:
       stateful_set: {{ include "meter.writerName" . | quote }}
       headless_service: {{ include "meter.headlessName" . | quote }}
       owner_port: {{ .Values.service.grpcPort }}
-      assignment_config_map: {{ include "meter.assignmentName" . | quote }}
+      shard_map: {{ include "meter.assignmentName" . | quote }}
       coordinator_lease: {{ include "meter.coordinatorLeaseName" . | quote }}
       shard_lease_prefix: {{ include "meter.shardLeasePrefix" . | quote }}
       lease_duration_seconds: {{ .Values.sharding.leaseDurationSeconds }}

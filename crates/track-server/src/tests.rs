@@ -11,6 +11,7 @@ use opentelemetry_proto::tonic::{
     trace::v1::{ResourceSpans, ScopeSpans, Span},
 };
 use prost::Message;
+use std::time::Duration;
 use tower::ServiceExt;
 
 use crate::{
@@ -114,6 +115,36 @@ async fn protobuf_ingest_then_tempo_search_and_trace_lookup() {
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
         "application/x-protobuf"
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn periodic_visibility_flushes_accepted_writes() {
+    let state = state(ServerMode::Standalone, true).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/write/ns/tenant/v1/traces")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .body(Body::from(otlp_request().encode_to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(state.has_pending_visibility());
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        if !state.has_pending_visibility() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !state.has_pending_visibility(),
+        "visibility task did not flush the accepted write"
     );
     state.shutdown().await.unwrap();
 }
@@ -247,9 +278,11 @@ async fn jaeger_collector_converts_process_span_and_log_data() {
         .insert("x-scope-orgid", "tenant".parse().unwrap());
     CollectorService::post_spans(&state, request).await.unwrap();
 
+    let routing = state.assignment.read().await.routing.clone();
     let trace = state
         .db
         .get_trace(
+            &routing,
             &track::Namespace::new("tenant").unwrap(),
             track::TraceId::new([3; 16]).unwrap(),
         )

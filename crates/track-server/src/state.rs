@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use futures::{StreamExt, stream};
@@ -19,7 +20,10 @@ use tonic::{Request, metadata::MetadataValue};
 use track::{Namespace, ShardedTrack, ShardingOptions, Trace, TraceBatch};
 
 #[cfg(feature = "kubernetes")]
-use sharding::{AssignmentGeneration, BoxError, ShardLifecycle, server::KubernetesRuntime};
+use sharding::{
+    AssignmentGeneration, BoxError, MigrationExecutionError, ShardLifecycle,
+    ShardMigrationExecutor, ShardSplit, server::KubernetesRuntime,
+};
 
 use crate::{
     config::{Config, NamespaceConfig, ServerMode, ShardingBackend},
@@ -39,6 +43,7 @@ pub struct AppState {
     pub(crate) request_limit: Arc<Semaphore>,
     pub(crate) query_limit: Arc<Semaphore>,
     remote_limit: Arc<Semaphore>,
+    dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     cancellation: CancellationToken,
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
@@ -57,13 +62,10 @@ impl AppState {
         let (local_owner, assignment) = match &config.sharding.kind {
             #[cfg(feature = "kubernetes")]
             ShardingBackend::Kubernetes(settings) => {
-                let (runtime, assignment) = KubernetesRuntime::bootstrap(
-                    settings,
-                    config.sharding.virtual_shards,
-                    cancellation.clone(),
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error))?;
+                let (runtime, assignment) =
+                    KubernetesRuntime::bootstrap(settings, cancellation.clone())
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error))?;
                 let local = runtime.identity().to_owned();
                 kubernetes = Some(runtime);
                 (local, assignment)
@@ -74,20 +76,31 @@ impl AppState {
             }
             _ => assignment_for(&config)?,
         };
+        let shard_count = assignment.virtual_shards;
         let shards = config
             .sharding
             .startup_shards(config.mode, &assignment, &local_owner);
-        let db = Arc::new(
-            ShardedTrack::open(
+        let db = Arc::new(if config.mode == ServerMode::Reader {
+            ShardedTrack::open_readers_with_routing(
                 config.track_config(),
-                ShardingOptions::new(
-                    config.sharding.virtual_shards,
-                    config.sharding.io_concurrency_multiplier,
-                )?,
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
                 shards,
+                &assignment.routing,
+                slatedb::config::DbReaderOptions {
+                    skip_wal_replay: false,
+                    ..slatedb::config::DbReaderOptions::default()
+                },
             )
-            .await?,
-        );
+            .await?
+        } else {
+            ShardedTrack::open_with_routing(
+                config.track_config(),
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
+                shards,
+                &assignment.routing,
+            )
+            .await?
+        });
         let namespaces = config
             .namespaces
             .iter()
@@ -106,25 +119,42 @@ impl AppState {
             local_owner,
             completed_requests: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             draining_shards: Arc::new(RwLock::new(HashSet::new())),
+            dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
             cancellation,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         #[cfg(feature = "kubernetes")]
-        if let Some(runtime) = kubernetes
-            && state.config.mode != ServerMode::Reader
-        {
-            let lifecycle = Arc::new(TrackShardLifecycle {
-                db: Arc::clone(&state.db),
-                draining_shards: Arc::clone(&state.draining_shards),
-            });
-            let tasks = runtime.spawn(
-                lifecycle,
-                Arc::clone(&state.assignment),
-                &state.cancellation,
-            );
-            state.tasks.lock().await.extend(tasks);
+        if let Some(runtime) = kubernetes {
+            if state.config.mode == ServerMode::Reader {
+                let task = runtime.spawn_reader(
+                    Arc::clone(&state.db),
+                    Arc::clone(&state.assignment),
+                    &state.cancellation,
+                );
+                state.tasks.lock().await.push(task);
+            } else {
+                let lifecycle = Arc::new(TrackShardLifecycle {
+                    db: Arc::clone(&state.db),
+                    draining_shards: Arc::clone(&state.draining_shards),
+                    assignment: Arc::clone(&state.assignment),
+                });
+                let tasks = runtime.spawn(
+                    lifecycle,
+                    Arc::new(TrackMigrationExecutor {
+                        config: state.config.track_config(),
+                        options: ShardingOptions::new(
+                            state.assignment.read().await.virtual_shards,
+                            state.config.sharding.io_concurrency_multiplier,
+                        )?,
+                    }),
+                    Arc::clone(&state.assignment),
+                    &state.cancellation,
+                );
+                state.tasks.lock().await.extend(tasks);
+            }
         }
+        state.start_visibility_task().await;
         Ok(state)
     }
 
@@ -134,7 +164,16 @@ impl AppState {
         }
         match self.config.mode {
             ServerMode::Standalone | ServerMode::Reader => {
-                self.db.open_shard_count().await == self.config.sharding.virtual_shards as usize
+                let expected = self
+                    .assignment
+                    .read()
+                    .await
+                    .routing
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.shard)
+                    .collect::<Vec<_>>();
+                self.db.open_shards().await == expected
             }
             ServerMode::Writer => {
                 let assignment = self.assignment.read().await;
@@ -144,20 +183,25 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_visibility(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn route_write(
         &self,
         namespace: &Namespace,
         batches: Vec<TraceBatch>,
         request_id: String,
     ) -> anyhow::Result<()> {
+        let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
-            self.config.sharding.virtual_shards,
+            assignment.virtual_shards,
             self.config.sharding.io_concurrency_multiplier,
         )?;
-        let assignment = self.assignment.read().await.clone();
         let mut groups = HashMap::<(Owner, ShardId), Vec<Trace>>::new();
         for trace in batches.into_iter().flat_map(|batch| batch.traces) {
-            let shard = options.route(namespace, trace.trace_id);
+            let shard = options.route(&assignment.routing, namespace, trace.trace_id);
             let owner = assignment
                 .owner_of(shard)
                 .cloned()
@@ -213,6 +257,7 @@ impl AppState {
         database
             .write_with_durability(namespace, batches, durability(self.config.write.durability))
             .await?;
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -271,12 +316,135 @@ impl AppState {
         self.db.close().await?;
         Ok(())
     }
+
+    async fn start_visibility_task(&self) {
+        let seconds = self.config.visibility_interval_seconds;
+        if seconds == 0 {
+            return;
+        }
+        let state = self.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    () = state.cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if state.dirty.swap(false, Ordering::AcqRel)
+                            && let Err(error) = state.db.flush().await
+                        {
+                            state.ready.store(false, Ordering::Release);
+                            state.dirty.store(true, Ordering::Release);
+                            tracing::error!(%error, "Track visibility flush failed");
+                        }
+                    }
+                }
+            }
+        });
+        self.tasks.lock().await.push(task);
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+struct TrackMigrationExecutor {
+    config: track::Config,
+    options: ShardingOptions,
+}
+
+#[cfg(feature = "kubernetes")]
+impl TrackMigrationExecutor {
+    fn slate_config(
+        &self,
+    ) -> Result<&common::storage::config::SlateDbStorageConfig, MigrationExecutionError> {
+        match &self.config.storage {
+            common::StorageConfig::SlateDb(config) => Ok(config),
+            common::StorageConfig::InMemory => Err(MigrationExecutionError::fatal(
+                "projected shard migration requires SlateDB storage",
+            )),
+        }
+    }
+
+    fn spec(
+        &self,
+        split: &ShardSplit,
+    ) -> Result<common::storage::projected_clone::ProjectedCloneSpec, MigrationExecutionError> {
+        let slots = split
+            .moved_range
+            .slots()
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        let source = self
+            .options
+            .shard_storage(&self.config, split.source_shard)
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        let target = self
+            .options
+            .shard_storage(&self.config, split.target_shard)
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        let common::StorageConfig::SlateDb(source) = source.storage else {
+            return Err(MigrationExecutionError::fatal(
+                "projected shard migration requires SlateDB storage",
+            ));
+        };
+        let common::StorageConfig::SlateDb(target) = target.storage else {
+            return Err(MigrationExecutionError::fatal(
+                "projected shard migration requires SlateDB storage",
+            ));
+        };
+        Ok(common::storage::projected_clone::ProjectedCloneSpec {
+            source_path: source.path,
+            target_path: target.path,
+            checkpoint_name: format!(
+                "telemetry-migration-{}-{}-{}-{}",
+                split.source_shard.get(),
+                split.target_shard.get(),
+                slots.start,
+                slots.end
+            ),
+            slot_start: slots.start,
+            slot_end: slots.end,
+            segment_extractor_name: track::SEGMENT_EXTRACTOR_NAME.to_owned(),
+        })
+    }
+
+    fn map_error(
+        error: common::storage::projected_clone::ProjectedCloneError,
+    ) -> MigrationExecutionError {
+        if error.is_fatal() {
+            MigrationExecutionError::fatal(error.to_string())
+        } else {
+            MigrationExecutionError::Retryable(Box::new(error))
+        }
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[tonic::async_trait]
+impl ShardMigrationExecutor for TrackMigrationExecutor {
+    async fn preflight_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
+        let object_store = common::create_object_store(&self.slate_config()?.object_store)
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        common::storage::projected_clone::preflight_projected_clone(
+            &self.spec(split)?,
+            object_store,
+        )
+        .await
+        .map_err(Self::map_error)
+    }
+
+    async fn clone_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
+        let object_store = common::create_object_store(&self.slate_config()?.object_store)
+            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
+        common::storage::projected_clone::execute_projected_clone(&self.spec(split)?, object_store)
+            .await
+            .map_err(Self::map_error)
+    }
 }
 
 #[cfg(feature = "kubernetes")]
 struct TrackShardLifecycle {
     db: Arc<ShardedTrack>,
     draining_shards: Arc<RwLock<HashSet<ShardId>>>,
+    assignment: Arc<RwLock<ShardMap>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -287,7 +455,18 @@ impl ShardLifecycle for TrackShardLifecycle {
         shard: ShardId,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
-        self.db.open_shard(shard).await?;
+        let slots = self
+            .assignment
+            .read()
+            .await
+            .routing
+            .assignments
+            .iter()
+            .find(|assignment| assignment.shard == shard)
+            .ok_or_else(|| format!("missing routing range for shard {}", shard.get()))?
+            .range
+            .slots()?;
+        self.db.open_shard_with_slots(shard, slots).await?;
         self.draining_shards.write().await.remove(&shard);
         Ok(())
     }
@@ -378,6 +557,7 @@ mod tests {
         let lifecycle = TrackShardLifecycle {
             db: Arc::clone(&db),
             draining_shards: Arc::clone(&draining),
+            assignment: Arc::new(RwLock::new(assignment_for(&Config::default()).unwrap().1)),
         };
         let shard = ShardId::new(1);
         lifecycle

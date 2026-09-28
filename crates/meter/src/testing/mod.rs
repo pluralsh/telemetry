@@ -79,11 +79,7 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         block_cache: None,
         meta_cache: None,
     };
-    let storage = Arc::new(
-        Storage::try_new(&config, crate::Namespace::default())
-            .await
-            .unwrap(),
-    );
+    let storage = Arc::new(Storage::try_new(&config).await.unwrap());
     TestTsdb {
         inner: Arc::new(Tsdb::new(storage.clone())),
         storage,

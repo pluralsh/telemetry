@@ -12,7 +12,6 @@ spec:
         type: Local
         path: /var/lib/track/data
     sharding:
-      virtualShards: 8
       leaseDurationSeconds: 15
       renewIntervalSeconds: 5
     namespaces:

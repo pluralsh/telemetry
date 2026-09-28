@@ -13,6 +13,7 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 - [Meter](#meter)
 - [NamespaceAuthentication](#namespaceauthentication)
 - [PseudoFS](#pseudofs)
+- [ShardMap](#shardmap)
 - [Track](#track)
 
 
@@ -249,6 +250,59 @@ _Appears in:_
 | `baseURL` _string_ |  |  |  |
 | `serviceAccountKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `bearerTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+
+
+#### HashRange
+
+
+
+
+
+
+
+_Appears in:_
+- [HashRangeAssignment](#hashrangeassignment)
+- [ShardSplit](#shardsplit)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `start` _string_ |  |  | Pattern: `^[0-9a-f]\{32\}$` <br /> |
+| `end` _string_ |  |  | Pattern: `^[0-9a-f]\{32\}$` <br /> |
+
+
+#### HashRangeAssignment
+
+
+
+
+
+
+
+_Appears in:_
+- [HashRangeMap](#hashrangemap)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `shard` _integer_ |  |  | Minimum: 0 <br /> |
+| `range` _[HashRange](#hashrange)_ |  |  |  |
+
+
+#### HashRangeMap
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardMapSpec](#shardmapspec)
+- [ShardMigration](#shardmigration)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `generation` _integer_ |  |  | Minimum: 1 <br /> |
+| `assignments` _[HashRangeAssignment](#hashrangeassignment) array_ |  |  |  |
 
 
 #### ImageSpec
@@ -764,6 +818,139 @@ _Appears in:_
 | `annotations` _object (keys:string, values:string)_ |  |  |  |
 
 
+#### ShardAssignment
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardMapSpec](#shardmapspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `owner` _[ShardOwner](#shardowner)_ |  |  |  |
+| `range` _[ShardRange](#shardrange)_ |  |  |  |
+| `state` _string_ |  |  | Enum: [pending active draining released] <br /> |
+
+
+#### ShardMap
+
+
+
+ShardMap is the Schema for authoritative telemetry shard routing.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `ShardMap` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[ShardMapSpec](#shardmapspec)_ |  |  |  |
+
+
+#### ShardMapSpec
+
+
+
+ShardMapSpec is the authoritative routing and writer-ownership snapshot.
+The elected Rust shard coordinator writes it with resourceVersion-based
+compare-and-swap updates; all writer and reader replicas consume it by watch.
+
+
+
+_Appears in:_
+- [ShardMap](#shardmap)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `generation` _integer_ |  |  | Minimum: 1 <br /> |
+| `shard_count` _integer_ | ShardCount is the current number of physical SlateDB storage shards.<br />Desired count comes from writer StatefulSet replicas. |  | Minimum: 1 <br /> |
+| `routing` _[HashRangeMap](#hashrangemap)_ |  |  |  |
+| `assignments` _[ShardAssignment](#shardassignment) array_ |  |  |  |
+| `migration` _[ShardMigration](#shardmigration)_ |  |  |  |
+
+
+#### ShardMigration
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardMapSpec](#shardmapspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `phase` _string_ |  |  | Enum: [preparing prepared draining cloning ready completing failed] <br /> |
+| `desired_shard_count` _integer_ |  |  | Minimum: 1 <br /> |
+| `split` _[ShardSplit](#shardsplit)_ |  |  |  |
+| `target_routing` _[HashRangeMap](#hashrangemap)_ |  |  |  |
+| `error` _string_ |  |  |  |
+
+
+#### ShardOwner
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardAssignment](#shardassignment)
+- [ShardSplit](#shardsplit)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `id` _string_ |  |  |  |
+| `ordinal` _integer_ |  |  | Minimum: 0 <br /> |
+
+
+#### ShardRange
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardAssignment](#shardassignment)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `start` _integer_ |  |  | Minimum: 0 <br /> |
+| `end` _integer_ |  |  | Minimum: 1 <br /> |
+
+
+#### ShardSplit
+
+
+
+
+
+
+
+_Appears in:_
+- [ShardMigration](#shardmigration)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `source_shard` _integer_ |  |  | Minimum: 0 <br /> |
+| `target_shard` _integer_ |  |  | Minimum: 0 <br /> |
+| `moved_range` _[HashRange](#hashrange)_ |  |  |  |
+| `source_owner` _[ShardOwner](#shardowner)_ |  |  |  |
+| `target_owner` _[ShardOwner](#shardowner)_ |  |  |  |
+
+
 #### ShardingSpec
 
 
@@ -779,7 +966,6 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `virtualShards` _integer_ |  | 8 | Minimum: 1 <br /> |
 | `ioConcurrencyMultiplier` _integer_ |  | 8 | Minimum: 1 <br /> |
 | `leaseDurationSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
 | `renewIntervalSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
@@ -843,6 +1029,7 @@ _Appears in:_
 | `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
 | `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
 | `page` _[TrackPageSpec](#trackpagespec)_ |  |  |  |
+| `visibilityIntervalSeconds` _integer_ |  | 1 | Minimum: 0 <br /> |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `request` _[TrackRequestSpec](#trackrequestspec)_ |  |  |  |
@@ -953,6 +1140,7 @@ _Appears in:_
 | `replicas` _integer_ | Replicas defaults to three for sharded writers and two for sharded<br />readers. Standalone mode uses exactly one writer and no reader. |  | Minimum: 0 <br /> |
 | `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is merged with podTemplate.spec.nodeSelector. Values here<br />take precedence when the same key is configured in both places. |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations are merged with podTemplate.spec.tolerations. A first-class<br />toleration replaces a podTemplate toleration with the same key, operator,<br />and effect; otherwise it is appended. |  |  |
+| `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources configures requests and limits for the datastore container.<br />Values here take precedence over podTemplate container resources. Missing<br />values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit. |  |  |
 | `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ | PodTemplate is the full Kubernetes pod template escape hatch. Operator<br />required fields and the first-class scheduling fields are merged into it. |  |  |
 | `dataVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `cacheVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
@@ -977,5 +1165,30 @@ _Appears in:_
 | `flushIntervalSeconds` _integer_ |  | 60 | Minimum: 0 <br /> |
 | `remoteConcurrency` _integer_ |  | 16 | Minimum: 1 <br /> |
 | `remoteRetries` _integer_ |  | 2 | Minimum: 0 <br /> |
+
+
+#### WriterScalingStatus
+
+
+
+WriterScalingStatus reports the operator-observed writer membership and the
+authoritative Rust-managed ShardMap state. Nil shard fields mean the
+ShardMap was absent or could not be trusted.
+
+
+
+_Appears in:_
+- [LineStatus](#linestatus)
+- [MeterStatus](#meterstatus)
+- [TrackStatus](#trackstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `effectiveWriterReplicas` _integer_ |  |  |  |
+| `readyWriterReplicas` _integer_ |  |  |  |
+| `shardCount` _integer_ |  |  |  |
+| `shardGeneration` _integer_ |  |  |  |
+| `migrationPhase` _string_ |  |  |  |
+| `migrationError` _string_ |  |  |  |
 
 

@@ -41,7 +41,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", "flush_interval_seconds: 60",
-		"virtual_shards: 8", "io_concurrency_multiplier: 8",
+		"virtual_shards: 1", "io_concurrency_multiplier: 8",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
 		"path: /etc/meter/secrets/global-read-0-password",
@@ -130,6 +130,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"database: traces",
 		"stateful_set: traces-writer",
 		"headless_service: traces-writer-headless",
+		"visibility_interval_seconds: 1",
 		"max_candidates: 10000",
 	} {
 		if !strings.Contains(writer, expected) {
@@ -160,7 +161,9 @@ func TestRenderShardedRoles(t *testing.T) {
 	}
 	if !strings.Contains(string(result.Data[MeterKey]), "mode: writer") ||
 		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
+		!strings.Contains(string(result.Data[MeterKey]), "shard_map: example-writer-shard-map") ||
 		!strings.Contains(string(result.Data[MeterKey]), "io_concurrency_multiplier: 7") ||
+		strings.Contains(string(result.Data[MeterKey]), "virtual_shards:") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
 	}

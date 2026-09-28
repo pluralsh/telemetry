@@ -254,9 +254,10 @@ async fn trace_by_id(
         .map_err(|_| ApiError::unavailable("server is shutting down"))?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let trace_id = TraceId::from_str(&trace_id).map_err(ApiError::bad_request)?;
+    let assignment = state.assignment.read().await;
     let trace = state
         .db
-        .get_trace(&namespace, trace_id)
+        .get_trace(&assignment.routing, &namespace, trace_id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("trace not found"))?;

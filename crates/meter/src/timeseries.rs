@@ -4,9 +4,12 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
+use std::ops::Range;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use tokio::sync::RwLock;
 
 use crate::Namespace;
 use crate::config::Config;
@@ -43,7 +46,7 @@ pub enum Visibility {
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
-/// let ts = TimeSeriesDb::open(Namespace::default(), config).await?;
+/// let ts = TimeSeriesDb::open(config).await?;
 ///
 /// let series = Series::builder("http_requests_total")
 ///     .label("method", "GET")
@@ -51,14 +54,14 @@ pub enum Visibility {
 ///     .sample_now(1.0)
 ///     .build();
 ///
-/// ts.write(vec![series]).await?;
+/// ts.write(&Namespace::default(), vec![series]).await?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct TimeSeriesDb {
-    namespace: Namespace,
-    // Internal Tsdb - not exposed
-    tsdb: Tsdb,
+    storage: Arc<Storage>,
+    namespaces: RwLock<std::collections::HashMap<Namespace, Arc<Tsdb>>>,
+    retention: Option<Duration>,
 }
 
 impl TimeSeriesDb {
@@ -83,22 +86,49 @@ impl TimeSeriesDb {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
-    /// let ts = TimeSeriesDb::open(Namespace::default(), config).await?;
+    /// let ts = TimeSeriesDb::open(config).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn open(namespace: Namespace, config: Config) -> Result<Self> {
-        let storage = Arc::new(Storage::try_new(&config.storage, namespace.clone()).await?);
-        let tsdb = Tsdb::with_retention_scoped(namespace.clone(), storage, config.retention);
-        Ok(Self { namespace, tsdb })
+    pub async fn open(config: Config) -> Result<Self> {
+        Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
     }
 
-    pub fn namespace(&self) -> &Namespace {
-        &self.namespace
+    pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
+        let storage = Arc::new(
+            Storage::try_new_with_object_store_and_slots(
+                &config.storage,
+                common::create_object_store(&config.storage.object_store)?,
+                owned_slots,
+            )
+            .await?,
+        );
+        Ok(Self {
+            storage,
+            namespaces: RwLock::new(std::collections::HashMap::new()),
+            retention: config.retention,
+        })
     }
 
-    pub(crate) fn read_engine(&self) -> &Tsdb {
-        &self.tsdb
+    async fn tenant(&self, namespace: &Namespace) -> Arc<Tsdb> {
+        if let Some(tsdb) = self.namespaces.read().await.get(namespace).cloned() {
+            return tsdb;
+        }
+        let mut namespaces = self.namespaces.write().await;
+        namespaces
+            .entry(namespace.clone())
+            .or_insert_with(|| {
+                Arc::new(Tsdb::with_retention_scoped(
+                    namespace.clone(),
+                    Arc::clone(&self.storage),
+                    self.retention,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) async fn read_engine(&self, namespace: &Namespace) -> Arc<Tsdb> {
+        self.tenant(namespace).await
     }
 
     /// Writes one or more time series.
@@ -132,7 +162,7 @@ impl TimeSeriesDb {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
-    /// # let ts = TimeSeriesDb::open(Namespace::default(), config).await?;
+    /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
     ///         .label("host", "server1")
@@ -145,25 +175,27 @@ impl TimeSeriesDb {
     ///         .build(),
     /// ];
     ///
-    /// ts.write(series).await?;
+    /// ts.write(&Namespace::default(), series).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn write(&self, series: Vec<Series>) -> Result<()> {
-        self.write_with_visibility(series, Visibility::Applied)
+    pub async fn write(&self, namespace: &Namespace, series: Vec<Series>) -> Result<()> {
+        self.write_with_visibility(namespace, series, Visibility::Applied)
             .await
     }
 
     pub async fn write_with_visibility(
         &self,
+        namespace: &Namespace,
         series: Vec<Series>,
         visibility: Visibility,
     ) -> Result<()> {
-        self.tsdb.ingest_samples(series, None).await?;
+        let tsdb = self.tenant(namespace).await;
+        tsdb.ingest_samples(series, None).await?;
         match visibility {
             Visibility::Applied => Ok(()),
-            Visibility::Written => self.tsdb.flush_written().await,
-            Visibility::Durable => self.tsdb.flush().await,
+            Visibility::Written => tsdb.flush_written().await,
+            Visibility::Durable => tsdb.flush().await,
         }
     }
 
@@ -184,7 +216,7 @@ impl TimeSeriesDb {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
-    /// # let ts = TimeSeriesDb::open(Namespace::default(), config).await?;
+    /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
     ///         .label("host", "server1")
@@ -192,12 +224,20 @@ impl TimeSeriesDb {
     ///         .build(),
     /// ];
     ///
-    /// ts.write_timeout(series, Duration::from_secs(30)).await?;
+    /// ts.write_timeout(&Namespace::default(), series, Duration::from_secs(30)).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn write_timeout(&self, series: Vec<Series>, timeout: Duration) -> Result<()> {
-        self.tsdb.ingest_samples(series, Some(timeout)).await
+    pub async fn write_timeout(
+        &self,
+        namespace: &Namespace,
+        series: Vec<Series>,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.tenant(namespace)
+            .await
+            .ingest_samples(series, Some(timeout))
+            .await
     }
 
     // ── Read / Query API (RFC 0003) ──────────────────────────────────
@@ -207,10 +247,12 @@ impl TimeSeriesDb {
     /// If `time` is `None`, the current wall-clock time is used.
     pub async fn query(
         &self,
+        namespace: &Namespace,
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
-        self.tsdb
+        self.tenant(namespace)
+            .await
             .eval_query(query, time, &crate::model::QueryOptions::default())
             .await
     }
@@ -218,12 +260,13 @@ impl TimeSeriesDb {
     /// Evaluates a range PromQL query over a time interval.
     pub async fn query_range(
         &self,
+        namespace: &Namespace,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
         <Tsdb as TsdbReadEngine>::eval_query_range(
-            &self.tsdb,
+            self.tenant(namespace).await.as_ref(),
             query,
             range,
             step,
@@ -235,37 +278,47 @@ impl TimeSeriesDb {
     /// Returns the set of label-sets matching the given series matchers.
     pub async fn series(
         &self,
+        namespace: &Namespace,
         matchers: &[&str],
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        find_series_in_range(&self.tsdb, matchers, range).await
+        find_series_in_range(self.tenant(namespace).await.as_ref(), matchers, range).await
     }
 
     /// Returns the set of label names matching the given matchers.
     pub async fn labels(
         &self,
+        namespace: &Namespace,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_labels_in_range(&self.tsdb, matchers, range).await
+        find_labels_in_range(self.tenant(namespace).await.as_ref(), matchers, range).await
     }
 
     /// Returns the set of values for a given label name.
     pub async fn label_values(
         &self,
+        namespace: &Namespace,
         label_name: &str,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_label_values_in_range(&self.tsdb, label_name, matchers, range).await
+        find_label_values_in_range(
+            self.tenant(namespace).await.as_ref(),
+            label_name,
+            matchers,
+            range,
+        )
+        .await
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.
     pub async fn metadata(
         &self,
+        namespace: &Namespace,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        self.tsdb.find_metadata(metric).await
+        self.tenant(namespace).await.find_metadata(metric).await
     }
 
     /// Forces flush of all pending data to durable storage.
@@ -277,7 +330,18 @@ impl TimeSeriesDb {
     ///
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
-        self.tsdb.flush().await
+        let tenants = self
+            .namespaces
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for tsdb in tenants {
+            tsdb.flush_written().await?;
+        }
+        self.storage.flush().await?;
+        Ok(())
     }
 
     /// Flushes pending data and creates a durable checkpoint.
@@ -289,7 +353,8 @@ impl TimeSeriesDb {
     ///
     /// Only supported by SlateDB-backed storage.
     pub async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
-        self.tsdb.create_checkpoint().await
+        self.flush().await?;
+        Ok(self.storage.create_checkpoint().await?)
     }
 
     /// Closes the time series database, flushing any pending data and releasing
@@ -299,7 +364,9 @@ impl TimeSeriesDb {
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
     pub async fn close(self) -> Result<()> {
-        self.tsdb.close().await
+        self.flush().await?;
+        self.storage.close().await?;
+        Ok(())
     }
 }
 
@@ -323,9 +390,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let db = TimeSeriesDb::open(Namespace::new("visibility-test").unwrap(), config)
-            .await
-            .unwrap();
+        let namespace = Namespace::new("visibility-test").unwrap();
+        let db = TimeSeriesDb::open(config).await.unwrap();
 
         for (offset, visibility) in [
             (0, Visibility::Applied),
@@ -334,6 +400,7 @@ mod tests {
         ] {
             let timestamp = 1_700_000_000_000 + offset;
             db.write_with_visibility(
+                &namespace,
                 vec![
                     Series::builder("visibility_metric")
                         .label("level", format!("{visibility:?}"))
@@ -349,6 +416,7 @@ mod tests {
             }
             let result = db
                 .query(
+                    &namespace,
                     "visibility_metric",
                     Some(SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp as u64 + 1)),
                 )
@@ -376,21 +444,21 @@ mod tests {
 
         // Write a series and close without calling flush()
         {
-            let tsdb = TimeSeriesDb::open(
-                crate::Namespace::default(),
-                Config {
-                    storage: storage.clone(),
-                    ..Default::default()
-                },
-            )
+            let tsdb = TimeSeriesDb::open(Config {
+                storage: storage.clone(),
+                ..Default::default()
+            })
             .await
             .unwrap();
 
-            tsdb.write(vec![Series::new(
-                "cpu_usage",
-                vec![Label::new("host", "server1")],
-                vec![Sample::new(3_900_000, 0.42)],
-            )])
+            tsdb.write(
+                &crate::Namespace::default(),
+                vec![Series::new(
+                    "cpu_usage",
+                    vec![Label::new("host", "server1")],
+                    vec![Sample::new(3_900_000, 0.42)],
+                )],
+            )
             .await
             .unwrap();
 
@@ -398,24 +466,81 @@ mod tests {
         }
 
         // Reopen and verify the series survived
-        let tsdb = TimeSeriesDb::open(
-            crate::Namespace::default(),
-            Config {
-                storage: storage.clone(),
-                ..Default::default()
-            },
-        )
+        let tsdb = TimeSeriesDb::open(Config {
+            storage: storage.clone(),
+            ..Default::default()
+        })
         .await
         .unwrap();
 
         let series = tsdb
-            .series(&["{__name__=\"cpu_usage\"}"], ..)
+            .series(
+                &crate::Namespace::default(),
+                &["{__name__=\"cpu_usage\"}"],
+                ..,
+            )
             .await
             .unwrap();
 
         assert!(
             !series.is_empty(),
             "expected series to survive close without explicit flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_storage_isolates_namespace_ingest_and_metadata_state() {
+        let db = TimeSeriesDb::open(Config {
+            storage: SlateDbStorageConfig {
+                path: "tenant-isolation".to_string(),
+                object_store: ObjectStoreConfig::InMemory,
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let alpha = Namespace::new("alpha").unwrap();
+        let beta = Namespace::new("beta").unwrap();
+        let timestamp = 1_700_000_000_000;
+
+        let mut alpha_series = Series::new(
+            "shared_metric",
+            vec![Label::new("host", "same")],
+            vec![Sample::new(timestamp, 1.0)],
+        );
+        alpha_series.description = Some("alpha description".to_string());
+        let mut beta_series = Series::new(
+            "shared_metric",
+            vec![Label::new("host", "same")],
+            vec![Sample::new(timestamp, 2.0)],
+        );
+        beta_series.description = Some("beta description".to_string());
+
+        db.write_with_visibility(&alpha, vec![alpha_series], Visibility::Written)
+            .await
+            .unwrap();
+        db.write_with_visibility(&beta, vec![beta_series], Visibility::Written)
+            .await
+            .unwrap();
+
+        let at = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp as u64));
+        let alpha_value = db.query(&alpha, "shared_metric", at).await.unwrap();
+        let beta_value = db.query(&beta, "shared_metric", at).await.unwrap();
+        assert_eq!(alpha_value.into_matrix()[0].samples[0].1, 1.0);
+        assert_eq!(beta_value.into_matrix()[0].samples[0].1, 2.0);
+
+        let alpha_metadata = db.metadata(&alpha, Some("shared_metric")).await.unwrap();
+        let beta_metadata = db.metadata(&beta, Some("shared_metric")).await.unwrap();
+        assert_eq!(
+            alpha_metadata[0].description.as_deref(),
+            Some("alpha description")
+        );
+        assert_eq!(
+            beta_metadata[0].description.as_deref(),
+            Some("beta description")
         );
     }
 }

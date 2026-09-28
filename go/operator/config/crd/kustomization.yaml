@@ -7,6 +7,7 @@ resources:
 - bases/telemetry.plural.sh_tracks.yaml
 - bases/telemetry.plural.sh_pseudofs.yaml
 - bases/telemetry.plural.sh_namespaceauthentications.yaml
+- bases/telemetry.plural.sh_shardmaps.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

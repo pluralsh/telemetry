@@ -13,12 +13,12 @@ use crate::Namespace;
 use crate::error::{Error, Result};
 use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
 
-pub(crate) const KEY_VERSION: u8 = 1;
+pub(crate) const KEY_VERSION: u8 = 2;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
-    ScopedSegmentExtractor::new("line-log/v1", KEY_SCOPE);
+    ScopedSegmentExtractor::new("line-log/v2", KEY_SCOPE);
 const PAGE_METADATA_VERSION: u8 = 1;
 const PAGE_METADATA_HAS_EXPIRY: u8 = 1;
 /// Leading byte of forward-label values.
@@ -73,16 +73,17 @@ pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes
     bytes.freeze()
 }
 
-pub(crate) fn next_stream_id_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::NextStreamId).freeze()
+pub(crate) fn next_stream_id_key(namespace: &Namespace, segment: SegmentId, slot: u16) -> Bytes {
+    record_prefix(namespace, segment, slot, RecordType::NextStreamId).freeze()
 }
 
 pub(crate) fn next_page_sequence_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     stream_id: StreamId,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::NextPageSequence);
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::NextPageSequence);
     bytes.put_u32(stream_id);
     bytes.freeze()
 }
@@ -90,46 +91,63 @@ pub(crate) fn next_page_sequence_key(
 pub(crate) fn dictionary_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     fingerprint: StreamFingerprint,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::StreamDictionary);
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::StreamDictionary);
     bytes.extend_from_slice(&fingerprint);
     bytes.freeze()
 }
 
-pub(crate) fn forward_key(namespace: &Namespace, segment: SegmentId, stream_id: StreamId) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::ForwardLabels);
+pub(crate) fn forward_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    stream_id: StreamId,
+) -> Bytes {
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::ForwardLabels);
     bytes.put_u32(stream_id);
     bytes.freeze()
 }
 
-pub(crate) fn forward_range(namespace: &Namespace, segment: SegmentId) -> BytesRange {
-    BytesRange::prefix(record_prefix(namespace, segment, RecordType::ForwardLabels).freeze())
+pub(crate) fn forward_range(namespace: &Namespace, segment: SegmentId, slot: u16) -> BytesRange {
+    BytesRange::prefix(record_prefix(namespace, segment, slot, RecordType::ForwardLabels).freeze())
 }
 
-pub(crate) fn decode_forward_key(bytes: &[u8]) -> Result<StreamId> {
-    let (_, _, record_type, offset) = parse_record_prefix(bytes)?;
+pub(crate) fn decode_forward_key(bytes: &[u8]) -> Result<(u16, StreamId)> {
+    let (_, _, slot, record_type, offset) = parse_record_prefix(bytes)?;
     if record_type != RecordType::ForwardLabels || bytes.len() != offset + 4 {
         return Err(Error::Corrupt("invalid forward-label key".to_owned()));
     }
-    Ok(u32::from_be_bytes(
-        bytes[offset..offset + 4].try_into().unwrap(),
+    Ok((
+        slot,
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()),
     ))
 }
 
-pub(crate) fn posting_key(namespace: &Namespace, segment: SegmentId, label: &Label) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::LabelPostings);
+pub(crate) fn posting_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    label: &Label,
+) -> Bytes {
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::LabelPostings);
     common::serde::terminated_bytes::serialize(label.name.as_bytes(), &mut bytes);
     bytes.extend_from_slice(label.value.as_bytes());
     bytes.freeze()
 }
 
-pub(crate) fn field_stats_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::SearchFieldStats).freeze()
+pub(crate) fn field_stats_key(namespace: &Namespace, segment: SegmentId, slot: u16) -> Bytes {
+    record_prefix(namespace, segment, slot, RecordType::SearchFieldStats).freeze()
 }
 
-pub(crate) fn term_stats_key(namespace: &Namespace, segment: SegmentId, term: &str) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::SearchTermStats);
+pub(crate) fn term_stats_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    term: &str,
+) -> Bytes {
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::SearchTermStats);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
     bytes.freeze()
 }
@@ -137,10 +155,11 @@ pub(crate) fn term_stats_key(namespace: &Namespace, segment: SegmentId, term: &s
 pub(crate) fn term_directory_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     term: &str,
     ordinal: u32,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::SearchTermDirectory);
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::SearchTermDirectory);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
     bytes.put_u32(ordinal);
     bytes.freeze()
@@ -149,10 +168,11 @@ pub(crate) fn term_directory_key(
 pub(crate) fn term_posting_block_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     term: &str,
     ordinal: u32,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::SearchPostingBlock);
+    let mut bytes = record_prefix(namespace, segment, slot, RecordType::SearchPostingBlock);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
     bytes.put_u32(ordinal);
     bytes.freeze()
@@ -161,12 +181,14 @@ pub(crate) fn term_posting_block_key(
 pub(crate) fn metadata_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     stream_id: StreamId,
     page_id: PageId,
 ) -> Bytes {
     page_key(
         namespace,
         segment,
+        slot,
         RecordType::PageMetadata,
         stream_id,
         page_id,
@@ -176,12 +198,14 @@ pub(crate) fn metadata_key(
 pub(crate) fn payload_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     stream_id: StreamId,
     page_id: PageId,
 ) -> Bytes {
     page_key(
         namespace,
         segment,
+        slot,
         RecordType::PagePayload,
         stream_id,
         page_id,
@@ -191,15 +215,16 @@ pub(crate) fn payload_key(
 pub(crate) fn metadata_range(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     stream_id: StreamId,
 ) -> BytesRange {
-    let mut prefix = record_prefix(namespace, segment, RecordType::PageMetadata);
+    let mut prefix = record_prefix(namespace, segment, slot, RecordType::PageMetadata);
     prefix.put_u32(stream_id);
     BytesRange::prefix(prefix.freeze())
 }
 
-pub(crate) fn decode_metadata_key(bytes: &[u8]) -> Result<(StreamId, PageId)> {
-    let (_, _, record_type, offset) = parse_record_prefix(bytes)?;
+pub(crate) fn decode_metadata_key(bytes: &[u8]) -> Result<(u16, StreamId, PageId)> {
+    let (_, _, slot, record_type, offset) = parse_record_prefix(bytes)?;
     if record_type != RecordType::PageMetadata || bytes.len() != offset + 20 {
         return Err(Error::Corrupt("invalid page metadata key".to_owned()));
     }
@@ -207,6 +232,7 @@ pub(crate) fn decode_metadata_key(bytes: &[u8]) -> Result<(StreamId, PageId)> {
     let timestamp_ns = decode_sortable_i64(&bytes[offset + 4..offset + 12]);
     let sequence = u64::from_be_bytes(bytes[offset + 12..offset + 20].try_into().unwrap());
     Ok((
+        slot,
         stream_id,
         PageId {
             timestamp_ns,
@@ -386,27 +412,44 @@ pub(crate) fn decode_postings(bytes: &[u8]) -> Result<roaring::RoaringBitmap> {
 fn page_key(
     namespace: &Namespace,
     segment: SegmentId,
+    slot: u16,
     record_type: RecordType,
     stream_id: StreamId,
     page_id: PageId,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, record_type);
+    let mut bytes = record_prefix(namespace, segment, slot, record_type);
     bytes.put_u32(stream_id);
     bytes.put_u64(encode_i64_sortable(page_id.timestamp_ns));
     bytes.put_u64(page_id.sequence);
     bytes.freeze()
 }
 
-fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
+fn record_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    slot: u16,
+    record_type: RecordType,
+) -> BytesMut {
+    assert!(slot < sharding::ROUTING_SLOT_COUNT);
     let mut bytes = BytesMut::new();
     KEY_SCOPE.write(&mut bytes, namespace, segment);
+    bytes.put_u16(slot);
     bytes.put_u8(record_type as u8);
     bytes
 }
 
-fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType, usize)> {
+fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, u16, RecordType, usize)> {
     let (namespace, segment, scope_len) = KEY_SCOPE.parse(bytes)?;
-    let Some(&record_type) = bytes.get(scope_len) else {
+    let slot_bytes = bytes
+        .get(scope_len..scope_len + 2)
+        .ok_or_else(|| Error::Corrupt("key is missing its routing slot".to_owned()))?;
+    let slot = u16::from_be_bytes(slot_bytes.try_into().unwrap());
+    if slot >= sharding::ROUTING_SLOT_COUNT {
+        return Err(Error::Corrupt(format!(
+            "routing slot exceeds 12 bits: {slot}"
+        )));
+    }
+    let Some(&record_type) = bytes.get(scope_len + 2) else {
         return Err(Error::Corrupt("key is missing its record type".to_owned()));
     };
     let record_type = match record_type {
@@ -423,7 +466,7 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         11 => RecordType::SearchPostingBlock,
         value => return Err(Error::Corrupt(format!("unknown record type {value}"))),
     };
-    Ok((namespace, segment, record_type, scope_len + 1))
+    Ok((namespace, segment, slot, record_type, scope_len + 3))
 }
 
 fn decode_sortable_i64(bytes: &[u8]) -> i64 {
@@ -438,7 +481,7 @@ mod tests {
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "line-log/v1");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "line-log/v2");
     }
 
     #[test]
@@ -447,6 +490,7 @@ mod tests {
         let first = metadata_key(
             &namespace,
             -10,
+            17,
             2,
             PageId {
                 timestamp_ns: -4,
@@ -456,6 +500,7 @@ mod tests {
         let second = metadata_key(
             &namespace,
             10,
+            18,
             1,
             PageId {
                 timestamp_ns: 4,
@@ -467,6 +512,7 @@ mod tests {
         assert_eq!(
             decode_metadata_key(&first).unwrap(),
             (
+                17,
                 2,
                 PageId {
                     timestamp_ns: -4,
@@ -482,6 +528,7 @@ mod tests {
         let first = metadata_key(
             &namespace,
             0,
+            17,
             3,
             PageId {
                 timestamp_ns: 42,
@@ -491,6 +538,7 @@ mod tests {
         let second = metadata_key(
             &namespace,
             0,
+            17,
             3,
             PageId {
                 timestamp_ns: 42,
@@ -498,6 +546,16 @@ mod tests {
             },
         );
         assert!(first < second);
+    }
+
+    #[test]
+    fn slot_is_between_segment_prefix_and_record_type() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let key = forward_key(&namespace, 42, 0x0abc, 7);
+        let prefix = segment_prefix(&namespace, 42);
+        assert_eq!(&key[prefix.len()..prefix.len() + 2], &[0x0a, 0xbc]);
+        assert_eq!(key[prefix.len() + 2], RecordType::ForwardLabels as u8);
+        assert_eq!(decode_forward_key(&key).unwrap(), (0x0abc, 7));
     }
 
     #[test]

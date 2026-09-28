@@ -11,6 +11,7 @@ Each database section describes its storage format, index strategy, public APIs,
 and server configuration. Cross-cutting behavior lives under [common](common/):
 
 - [Sharding](common/sharding.md)
+- [Capacity planning and scaling](common/scaling.md)
 - [Authentication](common/authentication.md)
 
 These pages describe the implementation and operationally important limits.

@@ -129,7 +129,7 @@ impl InternalWriter for AppState {
         let meter_namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let options = ShardingOptions::new(
-            self.config.sharding.virtual_shards,
+            assignment.virtual_shards,
             self.config.sharding.io_concurrency_multiplier,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -137,7 +137,7 @@ impl InternalWriter for AppState {
         let mut samples = 0;
         for item in request.series {
             let item = from_proto_series(item);
-            if options.route(&meter_namespace, &item.labels) != shard {
+            if options.route(&assignment.routing, &meter_namespace, &item.labels) != shard {
                 return Err(Status::invalid_argument(
                     "misrouted_series: series does not route to requested shard",
                 ));
@@ -151,7 +151,7 @@ impl InternalWriter for AppState {
                 .completed_requests
                 .lock()
                 .map_err(|_| Status::internal("idempotency lock poisoned"))?
-                .contains(&request.request_id)
+                .contains(&(namespace.to_owned(), request.request_id.clone()))
         {
             return Ok(TonicResponse::new(WriteBatchResponse {
                 assignment_generation: assignment.generation.get(),
@@ -174,7 +174,7 @@ impl InternalWriter for AppState {
             self.completed_requests
                 .lock()
                 .map_err(|_| Status::internal("idempotency lock poisoned"))?
-                .insert(request.request_id);
+                .insert((namespace.to_owned(), request.request_id));
         }
         Ok(TonicResponse::new(WriteBatchResponse {
             assignment_generation: self.assignment.read().await.generation.get(),

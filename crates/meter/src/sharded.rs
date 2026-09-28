@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -6,9 +6,12 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
-use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
+use sharding::{
+    DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
+    ShardId, ShardMap, hash_routing_key,
+};
 use slatedb::config::DbReaderOptions;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{SeriesId, TimeBucket};
@@ -87,7 +90,6 @@ impl ShardingOptions {
     }
 
     pub fn shard_path(self, base: &str, shard: ShardId) -> Result<String> {
-        self.validate_shard(shard)?;
         Ok(format!(
             "{}/shard-{:04}",
             base.trim_end_matches('/'),
@@ -95,41 +97,39 @@ impl ShardingOptions {
         ))
     }
 
-    pub fn route(self, namespace: &Namespace, labels: &[crate::Label]) -> ShardId {
-        let mut labels: Vec<&crate::Label> = labels.iter().collect();
-        if !labels.is_sorted() {
-            labels.sort_unstable();
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(namespace.as_bytes());
-        for label in labels {
-            hasher.update(&[0]);
-            hasher.update(label.name.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(label.value.as_bytes());
-        }
-        let value = u64::from_be_bytes(hasher.finalize().as_bytes()[..8].try_into().unwrap());
-        ShardId::new((value % u64::from(self.virtual_shards)) as u32)
+    pub fn route(
+        self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        labels: &[crate::Label],
+    ) -> ShardId {
+        routing.route(hash_routing_key(&crate::routing::canonical_routing_key(
+            namespace, labels,
+        )))
     }
 
-    fn validate_shard(self, shard: ShardId) -> Result<()> {
-        if shard.get() >= self.virtual_shards {
-            return Err(Error::InvalidInput(format!(
-                "shard {} is outside configured virtual shard count {}",
-                shard.get(),
-                self.virtual_shards
-            )));
-        }
-        Ok(())
+    fn slot_range(self, shard: ShardId) -> Result<std::ops::Range<u16>> {
+        HashRangeMap::bootstrap(self.virtual_shards)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?
+            .assignments
+            .into_iter()
+            .find(|assignment| assignment.shard == shard)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown shard {}", shard.get())))?
+            .range
+            .slots()
+            .map_err(|error| Error::InvalidInput(error.to_string()))
     }
 }
 
-/// Namespace-scoped facade over locally owned immutable virtual shards.
+/// Namespace-aware facade over locally owned immutable virtual shards.
 pub struct ShardedMeter {
-    namespace: Namespace,
+    config: Config,
     options: ShardingOptions,
-    writers: BTreeMap<ShardId, TimeSeriesDb>,
-    readers: BTreeMap<ShardId, TimeSeriesDbReader>,
+    writers: RwLock<BTreeMap<ShardId, Arc<TimeSeriesDb>>>,
+    readers: RwLock<BTreeMap<ShardId, Arc<TimeSeriesDbReader>>>,
+    reader_slots: RwLock<BTreeMap<ShardId, std::ops::Range<u16>>>,
+    reader_options: Option<DbReaderOptions>,
+    reader_cache_capacity: u64,
     io_permits: Arc<Semaphore>,
 }
 
@@ -137,72 +137,305 @@ pub type ShardedTimeseries = ShardedMeter;
 
 impl ShardedMeter {
     pub async fn open_writers(
-        namespace: Namespace,
         config: Config,
         options: ShardingOptions,
         owned_shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
+        let routing = HashRangeMap::bootstrap(options.virtual_shards)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        Self::open_writers_with_routing(config, options, owned_shards, &routing).await
+    }
+
+    pub async fn open_writers_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        owned_shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+    ) -> Result<Self> {
         let mut writers = BTreeMap::new();
         for shard in owned_shards {
-            options.validate_shard(shard)?;
             let mut shard_config = config.clone();
             shard_config.storage.path = options.shard_path(&config.storage.path, shard)?;
+            let slots = routing
+                .assignments
+                .iter()
+                .find(|assignment| assignment.shard == shard)
+                .ok_or_else(|| Error::InvalidInput(format!("unknown shard {}", shard.get())))?
+                .range
+                .slots()
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
             writers.insert(
                 shard,
-                TimeSeriesDb::open(namespace.clone(), shard_config).await?,
+                Arc::new(TimeSeriesDb::open_with_slots(shard_config, slots).await?),
             );
         }
         Ok(Self {
-            namespace,
+            config,
             options,
             io_permits: shard_io_semaphore(writers.len(), options.io_concurrency_multiplier()),
-            writers,
-            readers: BTreeMap::new(),
+            writers: RwLock::new(writers),
+            readers: RwLock::new(BTreeMap::new()),
+            reader_slots: RwLock::new(BTreeMap::new()),
+            reader_options: None,
+            reader_cache_capacity: 0,
         })
     }
 
     pub async fn open_readers(
-        namespace: Namespace,
         config: Config,
         options: ShardingOptions,
         local_shards: impl IntoIterator<Item = ShardId>,
         reader_options: DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
+        let routing = HashRangeMap::bootstrap(options.virtual_shards)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        Self::open_readers_with_routing(
+            config,
+            options,
+            local_shards,
+            &routing,
+            reader_options,
+            cache_capacity,
+        )
+        .await
+    }
+
+    pub async fn open_readers_with_routing(
+        config: Config,
+        options: ShardingOptions,
+        local_shards: impl IntoIterator<Item = ShardId>,
+        routing: &HashRangeMap,
+        reader_options: DbReaderOptions,
+        cache_capacity: u64,
+    ) -> Result<Self> {
         let mut readers = BTreeMap::new();
+        let mut reader_slots = BTreeMap::new();
         for shard in local_shards {
-            options.validate_shard(shard)?;
             let mut storage = config.storage.clone();
             storage.path = options.shard_path(&config.storage.path, shard)?;
+            let slots = routing
+                .assignments
+                .iter()
+                .find(|assignment| assignment.shard == shard)
+                .ok_or_else(|| Error::InvalidInput(format!("unknown shard {}", shard.get())))?
+                .range
+                .slots()
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
             readers.insert(
                 shard,
-                TimeSeriesDbReader::open(
-                    namespace.clone(),
-                    storage,
-                    reader_options.clone(),
-                    cache_capacity,
-                )
-                .await?,
+                Arc::new(
+                    TimeSeriesDbReader::open_with_slots(
+                        storage,
+                        reader_options.clone(),
+                        cache_capacity,
+                        slots.clone(),
+                    )
+                    .await?,
+                ),
             );
+            reader_slots.insert(shard, slots);
         }
         Ok(Self {
-            namespace,
+            config,
             options,
-            writers: BTreeMap::new(),
+            writers: RwLock::new(BTreeMap::new()),
             io_permits: shard_io_semaphore(readers.len(), options.io_concurrency_multiplier()),
-            readers,
+            readers: RwLock::new(readers),
+            reader_slots: RwLock::new(reader_slots),
+            reader_options: Some(reader_options),
+            reader_cache_capacity: cache_capacity,
         })
     }
 
-    pub fn route(&self, labels: &[crate::Label]) -> ShardId {
-        self.options.route(&self.namespace, labels)
+    pub fn route(
+        &self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        labels: &[crate::Label],
+    ) -> ShardId {
+        self.options.route(routing, namespace, labels)
     }
 
-    pub fn group(&self, series: Vec<Series>) -> Result<BTreeMap<ShardId, Vec<Series>>> {
+    pub async fn contains_writer_shard(&self, shard: ShardId) -> bool {
+        self.writers.read().await.contains_key(&shard)
+    }
+
+    pub async fn writer_shards(&self) -> Vec<ShardId> {
+        self.writers.read().await.keys().copied().collect()
+    }
+
+    pub async fn reader_shard_count(&self) -> usize {
+        self.readers.read().await.len()
+    }
+
+    pub async fn reader_shards(&self) -> Vec<ShardId> {
+        self.readers.read().await.keys().copied().collect()
+    }
+
+    /// Opens new or resized readers before atomically publishing the new set.
+    /// Readers with in-flight query references remain installed and cause a
+    /// retry instead of being detached while active.
+    pub async fn reconcile_reader_shards(&self, routing: &HashRangeMap) -> Result<()> {
+        let reader_options = self.reader_options.as_ref().ok_or_else(|| {
+            Error::InvalidInput("reader reconciliation requires a reader facade".into())
+        })?;
+        let desired = routing
+            .assignments
+            .iter()
+            .map(|assignment| {
+                assignment
+                    .range
+                    .slots()
+                    .map(|slots| (assignment.shard, slots))
+                    .map_err(|error| Error::InvalidInput(error.to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let current_slots = self.reader_slots.read().await.clone();
+        let mut opened = BTreeMap::new();
+        for (&shard, slots) in &desired {
+            if current_slots.get(&shard) == Some(slots) {
+                continue;
+            }
+            let mut storage = self.config.storage.clone();
+            storage.path = self.options.shard_path(&self.config.storage.path, shard)?;
+            opened.insert(
+                shard,
+                Arc::new(
+                    TimeSeriesDbReader::open_with_slots(
+                        storage,
+                        reader_options.clone(),
+                        self.reader_cache_capacity,
+                        slots.clone(),
+                    )
+                    .await?,
+                ),
+            );
+        }
+
+        let mut readers = self.readers.write().await;
+        let mut slots = self.reader_slots.write().await;
+        let retiring = readers
+            .iter()
+            .filter(|(shard, _)| desired.get(shard) != slots.get(shard))
+            .map(|(shard, reader)| (*shard, Arc::strong_count(reader)))
+            .collect::<Vec<_>>();
+        if let Some((shard, references)) = retiring
+            .iter()
+            .find(|(_, references)| *references != 1)
+            .copied()
+        {
+            drop(slots);
+            drop(readers);
+            for (_, reader) in opened {
+                Arc::try_unwrap(reader)
+                    .unwrap_or_else(|_| unreachable!("new reader has no external references"))
+                    .close()
+                    .await?;
+            }
+            return Err(Error::InvalidInput(format!(
+                "shard reader {shard} still has {} in-flight references",
+                references - 1
+            )));
+        }
+
+        let retiring = retiring
+            .into_iter()
+            .filter_map(|(shard, _)| readers.remove(&shard))
+            .collect::<Vec<_>>();
+        for (shard, reader) in opened {
+            readers.insert(shard, reader);
+        }
+        *slots = desired;
+        drop(slots);
+        drop(readers);
+        for reader in retiring {
+            Arc::try_unwrap(reader)
+                .unwrap_or_else(|_| {
+                    unreachable!("retired reader was checked for external references")
+                })
+                .close()
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn open_writer_shard(&self, shard: ShardId) -> Result<()> {
+        self.open_writer_shard_with_slots(shard, self.options.slot_range(shard)?)
+            .await
+    }
+
+    pub async fn open_writer_shard_with_slots(
+        &self,
+        shard: ShardId,
+        owned_slots: std::ops::Range<u16>,
+    ) -> Result<()> {
+        if self.contains_writer_shard(shard).await {
+            return Ok(());
+        }
+        let mut config = self.config.clone();
+        config.storage.path = self.options.shard_path(&config.storage.path, shard)?;
+        let database = Arc::new(TimeSeriesDb::open_with_slots(config, owned_slots).await?);
+        let mut writers = self.writers.write().await;
+        if let Entry::Vacant(entry) = writers.entry(shard) {
+            entry.insert(database);
+            return Ok(());
+        }
+        drop(writers);
+        if let Ok(database) = Arc::try_unwrap(database) {
+            database.close().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn flush_shard(&self, shard: ShardId) -> Result<()> {
+        if let Some(database) = self.writers.read().await.get(&shard).cloned() {
+            database.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn close_writer_shard(&self, shard: ShardId) -> Result<()> {
+        if let Some(database) = self.writers.write().await.remove(&shard) {
+            let database = Arc::try_unwrap(database).map_err(|_| {
+                Error::InvalidInput("shard database still has in-flight references".into())
+            })?;
+            database.close().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn write_shard(
+        &self,
+        namespace: &Namespace,
+        shard: ShardId,
+        series: Vec<Series>,
+        visibility: Visibility,
+    ) -> Result<()> {
+        let database = self
+            .writers
+            .read()
+            .await
+            .get(&shard)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("shard {} is not owned by this writer", shard.get()))
+            })?;
+        database
+            .write_with_visibility(namespace, series, visibility)
+            .await
+    }
+
+    pub async fn group(
+        &self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        series: Vec<Series>,
+    ) -> Result<BTreeMap<ShardId, Vec<Series>>> {
         let mut grouped: BTreeMap<ShardId, Vec<Series>> = BTreeMap::new();
         for item in series {
-            let shard = self.route(&item.labels);
-            if !self.writers.contains_key(&shard) {
+            let shard = self.route(routing, namespace, &item.labels);
+            if !self.writers.read().await.contains_key(&shard) {
                 return Err(Error::InvalidInput(format!(
                     "shard {} is not owned by this writer",
                     shard.get()
@@ -213,25 +446,49 @@ impl ShardedMeter {
         Ok(grouped)
     }
 
-    pub async fn write(&self, series: Vec<Series>, visibility: Visibility) -> Result<()> {
+    pub async fn write(
+        &self,
+        routing: &HashRangeMap,
+        namespace: &Namespace,
+        series: Vec<Series>,
+        visibility: Visibility,
+    ) -> Result<()> {
         let writes = self
-            .group(series)?
+            .group(routing, namespace, series)
+            .await?
             .into_iter()
-            .map(|(shard, batch)| self.writers[&shard].write_with_visibility(batch, visibility));
+            .map(|(shard, batch)| async move {
+                self.write_shard(namespace, shard, batch, visibility).await
+            });
         futures::future::try_join_all(writes).await?;
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        futures::future::try_join_all(self.writers.values().map(|writer| writer.flush())).await?;
+        let writers = self
+            .writers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(writers.iter().map(|writer| writer.flush())).await?;
         Ok(())
     }
 
-    pub async fn close(self) -> Result<()> {
-        for (_, writer) in self.writers {
+    pub async fn close(&self) -> Result<()> {
+        let writers = std::mem::take(&mut *self.writers.write().await);
+        for (_, writer) in writers {
+            let writer = Arc::try_unwrap(writer).map_err(|_| {
+                Error::InvalidInput("shard database still has in-flight references".into())
+            })?;
             writer.close().await?;
         }
-        for (_, reader) in self.readers {
+        let readers = std::mem::take(&mut *self.readers.write().await);
+        for (_, reader) in readers {
+            let reader = Arc::try_unwrap(reader).map_err(|_| {
+                Error::InvalidInput("shard reader still has in-flight references".into())
+            })?;
             reader.close().await?;
         }
         Ok(())
@@ -239,6 +496,7 @@ impl ShardedMeter {
 
     pub async fn query(
         &self,
+        namespace: &Namespace,
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
@@ -250,7 +508,7 @@ impl ShardedMeter {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, at_ms, at_ms, options.lookback_delta)?;
-        let source = Arc::new(self.query_source(&ranges).await?);
+        let source = Arc::new(self.query_source(namespace, &ranges).await?);
         execute_query_source(query, source, plan, true)
             .await
             .map(|outcome| outcome.value)
@@ -258,6 +516,7 @@ impl ShardedMeter {
 
     pub async fn query_range(
         &self,
+        namespace: &Namespace,
         query: &str,
         range: impl RangeBounds<SystemTime> + Clone + Send,
         step: Duration,
@@ -279,7 +538,7 @@ impl ShardedMeter {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, start_ms, end_ms, options.lookback_delta)?;
-        let source = Arc::new(self.query_source(&ranges).await?);
+        let source = Arc::new(self.query_source(namespace, &ranges).await?);
         execute_query_source(query, source, plan, false)
             .await
             .and_then(|outcome| query_value_to_range_samples(outcome.value))
@@ -287,16 +546,17 @@ impl ShardedMeter {
 
     pub async fn series(
         &self,
+        namespace: &Namespace,
         matchers: &[&str],
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let handles = self.read_handles();
+        let handles = self.read_handles().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
             let permits = Arc::clone(&self.io_permits);
             let range = range.clone();
-            pending.push(async move { reader.series(matchers, range, permits).await });
+            pending.push(async move { reader.series(namespace, matchers, range, permits).await });
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -313,16 +573,17 @@ impl ShardedMeter {
 
     pub async fn labels(
         &self,
+        namespace: &Namespace,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let handles = self.read_handles();
+        let handles = self.read_handles().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
             let permits = Arc::clone(&self.io_permits);
             let range = range.clone();
-            pending.push(async move { reader.labels(matchers, range, permits).await });
+            pending.push(async move { reader.labels(namespace, matchers, range, permits).await });
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -339,11 +600,12 @@ impl ShardedMeter {
 
     pub async fn label_values(
         &self,
+        namespace: &Namespace,
         label_name: &str,
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let handles = self.read_handles();
+        let handles = self.read_handles().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
@@ -351,7 +613,7 @@ impl ShardedMeter {
             let range = range.clone();
             pending.push(async move {
                 reader
-                    .label_values(label_name, matchers, range, permits)
+                    .label_values(namespace, label_name, matchers, range, permits)
                     .await
             });
         }
@@ -370,16 +632,17 @@ impl ShardedMeter {
 
     pub async fn metadata(
         &self,
+        namespace: &Namespace,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let handles = self.read_handles();
+        let handles = self.read_handles().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
             let permits = Arc::clone(&self.io_permits);
             pending.push(async move {
                 let _permit = acquire_io_permit(&permits).await;
-                reader.metadata(metric).await
+                reader.metadata(namespace, metric).await
             });
         }
         let results = stream::iter(pending)
@@ -398,23 +661,53 @@ impl ShardedMeter {
         Ok(entries)
     }
 
-    fn read_handles(&self) -> Vec<ReaderHandle<'_>> {
-        if self.readers.is_empty() {
-            self.writers.values().map(ReaderHandle::Writer).collect()
+    async fn read_handles(&self) -> Vec<ReaderHandle> {
+        let readers = self.readers.read().await;
+        if readers.is_empty() {
+            self.writers
+                .read()
+                .await
+                .values()
+                .cloned()
+                .map(ReaderHandle::Writer)
+                .collect()
         } else {
-            self.readers.values().map(ReaderHandle::Reader).collect()
+            readers
+                .values()
+                .cloned()
+                .map(ReaderHandle::Reader)
+                .collect()
         }
     }
 
-    async fn query_source(&self, ranges: &[(i64, i64)]) -> Result<MultiShardSeriesSource> {
-        let readers = if self.readers.is_empty() {
-            let width = self.writers.len().max(1);
-            let mut pending = Vec::with_capacity(self.writers.len());
-            for db in self.writers.values() {
+    async fn query_source(
+        &self,
+        namespace: &Namespace,
+        ranges: &[(i64, i64)],
+    ) -> Result<MultiShardSeriesSource> {
+        let reader_handles = self
+            .readers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let readers = if reader_handles.is_empty() {
+            let writer_handles = self
+                .writers
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let width = writer_handles.len().max(1);
+            let mut pending = Vec::with_capacity(writer_handles.len());
+            for db in writer_handles {
                 let permits = Arc::clone(&self.io_permits);
                 pending.push(async move {
                     let _permit = acquire_io_permit(&permits).await;
-                    db.read_engine()
+                    db.read_engine(namespace)
+                        .await
                         .make_query_reader_for_ranges(ranges)
                         .await
                         .map(ShardQueryReader::Writer)
@@ -425,13 +718,13 @@ impl ShardedMeter {
                 .try_collect::<Vec<_>>()
                 .await?
         } else {
-            let width = self.readers.len().max(1);
-            let mut pending = Vec::with_capacity(self.readers.len());
-            for db in self.readers.values() {
+            let width = reader_handles.len().max(1);
+            let mut pending = Vec::with_capacity(reader_handles.len());
+            for db in reader_handles {
                 let permits = Arc::clone(&self.io_permits);
                 pending.push(async move {
                     let _permit = acquire_io_permit(&permits).await;
-                    db.make_query_reader_for_ranges(ranges)
+                    db.make_query_reader_for_ranges(namespace, ranges)
                         .await
                         .map(ShardQueryReader::Reader)
                 });
@@ -448,9 +741,21 @@ impl ShardedMeter {
     }
 }
 
-enum ReaderHandle<'a> {
-    Writer(&'a TimeSeriesDb),
-    Reader(&'a TimeSeriesDbReader),
+#[async_trait]
+impl ReaderShardLifecycle for ShardedMeter {
+    async fn reconcile_readers(
+        &self,
+        assignment: &ShardMap,
+    ) -> std::result::Result<(), sharding::BoxError> {
+        self.reconcile_reader_shards(&assignment.routing)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+enum ReaderHandle {
+    Writer(Arc<TimeSeriesDb>),
+    Reader(Arc<TimeSeriesDbReader>),
 }
 
 enum ShardQueryReader {
@@ -762,41 +1067,56 @@ impl SeriesSource for MultiShardSeriesSource {
     }
 }
 
-impl ReaderHandle<'_> {
+impl ReaderHandle {
     async fn series<R: RangeBounds<SystemTime>>(
         &self,
+        namespace: &Namespace,
         matchers: &[&str],
         range: R,
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
         let (start, end) = crate::util::range_bounds_to_secs(range)?;
         let reader = match self {
-            Self::Writer(db) => {
-                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
-            }
-            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+            Self::Writer(db) => ShardQueryReader::Writer(
+                db.read_engine(namespace)
+                    .await
+                    .make_query_reader(start, end)
+                    .await?,
+            ),
+            Self::Reader(db) => ShardQueryReader::Reader(
+                db.make_query_reader_for_ranges(namespace, &[(start, end)])
+                    .await?,
+            ),
         };
         crate::tsdb::discover_series(&IoLimitedQueryReader::new(reader, permits), matchers).await
     }
 
     async fn labels<R: RangeBounds<SystemTime>>(
         &self,
+        namespace: &Namespace,
         matchers: Option<&[&str]>,
         range: R,
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
         let (start, end) = crate::util::range_bounds_to_secs(range)?;
         let reader = match self {
-            Self::Writer(db) => {
-                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
-            }
-            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+            Self::Writer(db) => ShardQueryReader::Writer(
+                db.read_engine(namespace)
+                    .await
+                    .make_query_reader(start, end)
+                    .await?,
+            ),
+            Self::Reader(db) => ShardQueryReader::Reader(
+                db.make_query_reader_for_ranges(namespace, &[(start, end)])
+                    .await?,
+            ),
         };
         crate::tsdb::discover_labels(&IoLimitedQueryReader::new(reader, permits), matchers).await
     }
 
     async fn label_values<R: RangeBounds<SystemTime>>(
         &self,
+        namespace: &Namespace,
         label_name: &str,
         matchers: Option<&[&str]>,
         range: R,
@@ -804,10 +1124,16 @@ impl ReaderHandle<'_> {
     ) -> std::result::Result<Vec<String>, QueryError> {
         let (start, end) = crate::util::range_bounds_to_secs(range)?;
         let reader = match self {
-            Self::Writer(db) => {
-                ShardQueryReader::Writer(db.read_engine().make_query_reader(start, end).await?)
-            }
-            Self::Reader(db) => ShardQueryReader::Reader(db.make_query_reader(start, end).await?),
+            Self::Writer(db) => ShardQueryReader::Writer(
+                db.read_engine(namespace)
+                    .await
+                    .make_query_reader(start, end)
+                    .await?,
+            ),
+            Self::Reader(db) => ShardQueryReader::Reader(
+                db.make_query_reader_for_ranges(namespace, &[(start, end)])
+                    .await?,
+            ),
         };
         crate::tsdb::discover_label_values(
             &IoLimitedQueryReader::new(reader, permits),
@@ -819,11 +1145,12 @@ impl ReaderHandle<'_> {
 
     async fn metadata(
         &self,
+        namespace: &Namespace,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
         match self {
-            Self::Writer(db) => db.metadata(metric).await,
-            Self::Reader(db) => db.metadata(metric).await,
+            Self::Writer(db) => db.metadata(namespace, metric).await,
+            Self::Reader(db) => db.metadata(namespace, metric).await,
         }
     }
 }
@@ -832,12 +1159,13 @@ impl ReaderHandle<'_> {
 mod tests {
     use super::*;
     use crate::Label;
-    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    };
 
     const TEST_TIME_MS: i64 = 1_700_000_060_000;
 
     async fn test_databases() -> (ShardedMeter, TimeSeriesDb) {
-        let namespace = Namespace::new("global-query-regression").unwrap();
         let config = |path: &str| Config {
             storage: SlateDbStorageConfig {
                 path: path.to_string(),
@@ -849,17 +1177,82 @@ mod tests {
             ..Default::default()
         };
         let sharded = ShardedMeter::open_writers(
-            namespace.clone(),
             config("sharded"),
             ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap(),
             [ShardId::new(0), ShardId::new(1)],
         )
         .await
         .unwrap();
-        let unsharded = TimeSeriesDb::open(namespace, config("unsharded"))
-            .await
-            .unwrap();
+        let unsharded = TimeSeriesDb::open(config("unsharded")).await.unwrap();
         (sharded, unsharded)
+    }
+
+    #[tokio::test]
+    async fn reader_reconciliation_adds_resizes_and_safely_removes_shards() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage: SlateDbStorageConfig {
+                path: "reader-reconcile".to_owned(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: directory.path().to_string_lossy().into_owned(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            },
+            ..Default::default()
+        };
+        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let one = HashRangeMap::bootstrap(1).unwrap();
+        let two = one.grow_to(2).unwrap();
+
+        let source = ShardedMeter::open_writers_with_routing(
+            config.clone(),
+            options,
+            [ShardId::new(0)],
+            &one,
+        )
+        .await
+        .unwrap();
+        source.close().await.unwrap();
+        let target = ShardedMeter::open_writers_with_routing(
+            config.clone(),
+            options,
+            [ShardId::new(1)],
+            &two,
+        )
+        .await
+        .unwrap();
+        target.close().await.unwrap();
+
+        let readers = ShardedMeter::open_readers_with_routing(
+            config,
+            options,
+            [ShardId::new(0)],
+            &one,
+            DbReaderOptions::default(),
+            17,
+        )
+        .await
+        .unwrap();
+        readers.reconcile_reader_shards(&two).await.unwrap();
+        assert_eq!(
+            readers.reader_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        assert_eq!(readers.reader_cache_capacity, 17);
+
+        let active = readers.readers.read().await[&ShardId::new(1)].clone();
+        let error = readers.reconcile_reader_shards(&one).await.unwrap_err();
+        assert!(error.to_string().contains("in-flight references"));
+        assert_eq!(
+            readers.reader_shards().await,
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        drop(active);
+        readers.reconcile_reader_shards(&one).await.unwrap();
+        assert_eq!(readers.reader_shards().await, vec![ShardId::new(0)]);
+        readers.close().await.unwrap();
     }
 
     fn series_on_shard(
@@ -869,6 +1262,7 @@ mod tests {
         extra_labels: &[(&str, &str)],
         samples: Vec<Sample>,
     ) -> Series {
+        let routing = HashRangeMap::bootstrap(db.options.virtual_shards()).unwrap();
         for candidate in 0..10_000 {
             let mut labels = extra_labels
                 .iter()
@@ -876,7 +1270,15 @@ mod tests {
                 .collect::<Vec<_>>();
             labels.push(Label::new("instance", format!("instance-{candidate}")));
             let series = Series::new(metric, labels, samples.clone());
-            if db.route(&series.labels).get() == shard {
+            if db
+                .route(
+                    &routing,
+                    &Namespace::new("global-query-regression").unwrap(),
+                    &series.labels,
+                )
+                .get()
+                == shard
+            {
                 return series;
             }
         }
@@ -884,6 +1286,7 @@ mod tests {
     }
 
     fn binary_join_series(db: &ShardedMeter) -> (Series, Series) {
+        let routing = HashRangeMap::bootstrap(db.options.virtual_shards()).unwrap();
         for candidate in 0..10_000 {
             let instance = format!("join-{candidate}");
             let left = Series::new(
@@ -896,7 +1299,10 @@ mod tests {
                 vec![Label::new("instance", &instance)],
                 vec![Sample::new(TEST_TIME_MS, 3.0)],
             );
-            if db.route(&left.labels) != db.route(&right.labels) {
+            let namespace = Namespace::new("global-query-regression").unwrap();
+            if db.route(&routing, &namespace, &left.labels)
+                != db.route(&routing, &namespace, &right.labels)
+            {
                 return (left, right);
             }
         }
@@ -928,18 +1334,32 @@ mod tests {
         query: &str,
     ) {
         let time = SystemTime::UNIX_EPOCH + Duration::from_millis((TEST_TIME_MS + 1_000) as u64);
-        let actual = sharded.query(query, Some(time)).await.unwrap();
-        let expected = unsharded.query(query, Some(time)).await.unwrap();
+        let namespace = Namespace::new("global-query-regression").unwrap();
+        let actual = sharded.query(&namespace, query, Some(time)).await.unwrap();
+        let expected = unsharded
+            .query(&namespace, query, Some(time))
+            .await
+            .unwrap();
         assert_eq!(normalized(actual), normalized(expected), "query: {query}");
     }
 
     async fn write_both(sharded: &ShardedMeter, unsharded: &TimeSeriesDb, series: Vec<Series>) {
+        let routing = HashRangeMap::bootstrap(sharded.options.virtual_shards()).unwrap();
         sharded
-            .write(series.clone(), Visibility::Written)
+            .write(
+                &routing,
+                &Namespace::new("global-query-regression").unwrap(),
+                series.clone(),
+                Visibility::Written,
+            )
             .await
             .unwrap();
         unsharded
-            .write_with_visibility(series, Visibility::Written)
+            .write_with_visibility(
+                &Namespace::new("global-query-regression").unwrap(),
+                series,
+                Visibility::Written,
+            )
             .await
             .unwrap();
     }
@@ -947,12 +1367,19 @@ mod tests {
     #[test]
     fn routing_is_canonical_and_namespace_sensitive() {
         let options = ShardingOptions::default();
+        let routing = HashRangeMap::bootstrap(options.virtual_shards()).unwrap();
         let a = Namespace::new("a").unwrap();
         let b = Namespace::new("b").unwrap();
         let labels = vec![Label::new("z", "1"), Label::new("a", "2")];
         let reversed = labels.iter().cloned().rev().collect::<Vec<_>>();
-        assert_eq!(options.route(&a, &labels), options.route(&a, &reversed));
-        assert_ne!(options.route(&a, &labels), options.route(&b, &labels));
+        assert_eq!(
+            options.route(&routing, &a, &labels),
+            options.route(&routing, &a, &reversed)
+        );
+        assert_ne!(
+            options.route(&routing, &a, &labels),
+            options.route(&routing, &b, &labels)
+        );
     }
 
     #[test]
@@ -972,6 +1399,46 @@ mod tests {
         assert_eq!(shard_io_semaphore(8, 4).available_permits(), 32);
         assert_eq!(shard_io_semaphore(8, 2).available_permits(), 16);
         assert_eq!(shard_io_semaphore(0, 4).available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn custom_routing_range_rejects_writes_for_unowned_slots() {
+        let config = Config {
+            storage: SlateDbStorageConfig {
+                path: "custom-routing".to_string(),
+                object_store: ObjectStoreConfig::InMemory,
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            },
+            ..Default::default()
+        };
+        let routing = HashRangeMap::bootstrap(2).unwrap().grow_to(3).unwrap();
+        let options = ShardingOptions::new(3, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let db =
+            ShardedMeter::open_writers_with_routing(config, options, [ShardId::new(2)], &routing)
+                .await
+                .unwrap();
+        let namespace = Namespace::new("global-query-regression").unwrap();
+        let series = series_on_shard(
+            &db,
+            "requests_total",
+            0,
+            &[],
+            vec![Sample::new(TEST_TIME_MS, 1.0)],
+        );
+
+        let error = db
+            .write_shard(
+                &namespace,
+                ShardId::new(2),
+                vec![series],
+                Visibility::Applied,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("outside opened shard range"));
     }
 
     #[tokio::test]

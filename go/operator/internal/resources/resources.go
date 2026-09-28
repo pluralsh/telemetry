@@ -65,8 +65,11 @@ const (
 )
 
 var (
-	defaultDataSize  = resource.MustParse("10Gi")
-	defaultCacheSize = resource.MustParse("20Gi")
+	defaultDataSize      = resource.MustParse("10Gi")
+	defaultCacheSize     = resource.MustParse("20Gi")
+	defaultCPURequest    = resource.MustParse("250m")
+	defaultMemoryRequest = resource.MustParse("512Mi")
+	defaultMemoryLimit   = resource.MustParse("2Gi")
 )
 
 type VolumeError struct {
@@ -270,7 +273,7 @@ func Role(value any) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, ComponentNone)},
 		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
+			{APIGroups: []string{"telemetry.plural.sh"}, Resources: []string{"shardmaps"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
 			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch", "delete"}},
 			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
 		},
@@ -472,6 +475,7 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 			others = append(others, container)
 		}
 	}
+	meterContainer.Resources = containerResources(meterContainer.Resources, workloadFor(meter, component).Resources)
 	productVersion := lo.CoalesceOrEmpty(meter.Version, meter.Image.Tag, input.DefaultProductVersion, operatorversion.ProductVersion)
 	meterContainer.Image = lo.CoalesceOrEmpty(meter.Image.Repository, meter.Descriptor.Image) + ":" + productVersion
 	if meter.Image.PullPolicy != "" {
@@ -577,6 +581,28 @@ func applyPodDefaults(spec *corev1.PodSpec, meter *Product, component Component)
 	if spec.SecurityContext.SeccompProfile == nil {
 		spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	}
+}
+
+func containerResources(template, configured corev1.ResourceRequirements) corev1.ResourceRequirements {
+	result := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    defaultCPURequest.DeepCopy(),
+			corev1.ResourceMemory: defaultMemoryRequest.DeepCopy(),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: defaultMemoryLimit.DeepCopy(),
+		},
+	}
+	mergeResources := func(resources corev1.ResourceRequirements) {
+		maps.Copy(result.Requests, resources.Requests)
+		maps.Copy(result.Limits, resources.Limits)
+		if resources.Claims != nil {
+			result.Claims = append([]corev1.ResourceClaim(nil), resources.Claims...)
+		}
+	}
+	mergeResources(template)
+	mergeResources(configured)
+	return result
 }
 
 func objectStoreEnv(meter *Product) []corev1.EnvVar {

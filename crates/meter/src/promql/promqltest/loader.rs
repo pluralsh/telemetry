@@ -70,7 +70,12 @@ pub(super) async fn load_series(
                 samples: bucket_samples,
             };
 
-            let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+            let routing_slot =
+                crate::routing::routing_slot(&crate::Namespace::default(), &series.labels);
+            let mini = tsdb
+                .get_or_create_for_ingest_slot(bucket, routing_slot)
+                .await
+                .unwrap();
             mini.ingest(&series).await.unwrap();
         }
     }

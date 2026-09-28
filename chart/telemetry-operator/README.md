@@ -69,6 +69,19 @@ Sharded resources default to three writer replicas and two reader replicas.
 Standalone resources safely run exactly one writer and no reader; other
 standalone replica values are rejected.
 
+For sharded writers, `spec.writer.replicas` is user intent. Scale-up reaches
+the StatefulSet immediately, while scale-down is blocked below the
+Rust-managed ShardMap's shard count or active migration floor. A missing or
+untrusted ShardMap conservatively preserves the current StatefulSet count.
+Status reports effective/ready writer replicas, ShardMap and migration state,
+and scaling conditions. `Ready` also requires no active migration and writer
+intent equal to the authoritative shard count.
+
+No automatic `preStop` drain hook is injected: the current products do not
+offer a stable, authenticated, bounded whole-process drain endpoint. Shard
+drain is coordinated by Rust through ShardMap and Leases; an inferred hook
+could conflict with that protocol or delay pod termination.
+
 Each writer and reader supports first-class `nodeSelector` and Kubernetes
 `tolerations`, plus the full `podTemplate` escape hatch. First-class node
 selector keys override matching `podTemplate.spec.nodeSelector` keys.

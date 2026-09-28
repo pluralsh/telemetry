@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use meter::{OtelConfig, OtelConverter, QueryValue, ShardedMeter};
+use meter::{Namespace, OtelConfig, OtelConverter, QueryValue, ShardedMeter};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
@@ -153,9 +153,10 @@ async fn execute_query(
 ) -> Result<Json<Value>, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     let reader = reader(&state, &namespace).await?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let at = params.time.map(system_time);
     let expression = params.query;
-    let value = tokio::spawn(async move { reader.query(&expression, at).await })
+    let value = tokio::spawn(async move { reader.query(&namespace, &expression, at).await })
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad_request)?;
@@ -200,13 +201,18 @@ async fn execute_query_range(
         return Err(ApiError::bad_request("invalid range or step"));
     }
     let reader = reader(&state, &namespace).await?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let expression = params.query;
     let range = RangeInclusive::new(system_time(params.start), system_time(params.end));
     let step = Duration::from_secs_f64(params.step);
-    let values = tokio::spawn(async move { reader.query_range(&expression, range, step).await })
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::bad_request)?;
+    let values = tokio::spawn(async move {
+        reader
+            .query_range(&namespace, &expression, range, step)
+            .await
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::bad_request)?;
     Ok(Json(
         json!({"status":"success","data":{"resultType":"matrix","result":
             values.into_iter().map(|sample| json!({
@@ -258,9 +264,10 @@ async fn execute_series(
         .map(String::as_str)
         .collect::<Vec<_>>();
     let range = time_range(params.start, params.end);
+    let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
-        .series(&refs, range)
+        .series(&meter_namespace, &refs, range)
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({"status":"success","data":data})))
@@ -279,9 +286,11 @@ async fn labels(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
         .labels(
+            &meter_namespace,
             (!refs.is_empty()).then_some(refs.as_slice()),
             time_range(params.start, params.end),
         )
@@ -303,9 +312,11 @@ async fn label_values(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
         .label_values(
+            &meter_namespace,
             &name,
             (!refs.is_empty()).then_some(refs.as_slice()),
             time_range(params.start, params.end),
@@ -329,9 +340,10 @@ async fn metadata(
     Query(params): Query<MetadataQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let entries = reader(&state, &namespace)
         .await?
-        .metadata(params.metric.as_deref())
+        .metadata(&meter_namespace, params.metric.as_deref())
         .await
         .map_err(ApiError::bad_request)?;
     let mut data: BTreeMap<String, Vec<Value>> = BTreeMap::new();
@@ -363,11 +375,13 @@ async fn federate(
     let params = parse_match_query(raw.as_deref())?;
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     let reader = reader(&state, &namespace).await?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let mut output = String::new();
     for matcher in &params.matches {
         let reader = Arc::clone(&reader);
+        let namespace = namespace.clone();
         let matcher = matcher.clone();
-        let value = tokio::spawn(async move { reader.query(&matcher, None).await })
+        let value = tokio::spawn(async move { reader.query(&namespace, &matcher, None).await })
             .await
             .map_err(ApiError::internal)?
             .map_err(ApiError::bad_request)?;
@@ -430,11 +444,12 @@ fn prometheus_float(value: f64) -> String {
 }
 
 async fn reader(state: &AppState, namespace: &str) -> Result<Arc<ShardedMeter>, ApiError> {
+    if state.namespace(namespace).is_none() {
+        return Err(ApiError::not_found("namespace is not readable"));
+    }
     state
         .readers
-        .read()
-        .await
-        .get(namespace)
+        .as_ref()
         .cloned()
         .ok_or_else(|| ApiError::not_found("namespace is not readable"))
 }

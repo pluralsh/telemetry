@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    Assignment, AssignmentGeneration, AssignmentState, ModelError, Owner, ShardMap, ShardRange,
+    Assignment, AssignmentGeneration, AssignmentState, HashRangeMap, ModelError, Owner,
+    RoutingError, ShardMap, ShardRange,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -12,8 +13,14 @@ pub enum PlanError {
     TooManyOwners { owners: usize, virtual_shards: u32 },
     #[error("owner ids and ordinals must both be unique")]
     DuplicateOwner,
+    #[error(
+        "changing storage shard count from {current} to {desired} requires a split/backfill/cutover migration"
+    )]
+    ShardCountChangeRequiresMigration { current: u32, desired: u32 },
     #[error(transparent)]
     InvalidMap(#[from] ModelError),
+    #[error(transparent)]
+    InvalidRouting(#[from] RoutingError),
 }
 
 #[derive(Clone)]
@@ -43,6 +50,16 @@ pub fn balanced_contiguous(
             virtual_shards,
         });
     }
+    let routing = match previous {
+        Some(previous) if previous.virtual_shards != virtual_shards => {
+            return Err(PlanError::ShardCountChangeRequiresMigration {
+                current: previous.virtual_shards,
+                desired: virtual_shards,
+            });
+        }
+        Some(previous) => previous.routing.clone(),
+        None => HashRangeMap::bootstrap(virtual_shards)?,
+    };
     let mut owners = owners.to_vec();
     owners.sort_by(|left, right| {
         left.ordinal
@@ -112,7 +129,8 @@ pub fn balanced_contiguous(
             Assignment::new(owner, range, AssignmentState::Active)
         })
         .collect();
-    ShardMap::new(generation, virtual_shards, assignments).map_err(PlanError::from)
+    ShardMap::with_routing(generation, virtual_shards, routing, assignments)
+        .map_err(PlanError::from)
 }
 
 fn retained_shards(
@@ -233,5 +251,40 @@ mod tests {
             balanced_contiguous(AssignmentGeneration::new(1), 64, &unordered, None).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.assignments[0].owner.id, "meter-0");
+    }
+
+    #[test]
+    fn membership_only_rebalance_preserves_routing_and_shard_count_changes_are_rejected() {
+        let initial =
+            balanced_contiguous(AssignmentGeneration::new(1), 4, &owners(1), None).unwrap();
+        let rebalanced =
+            balanced_contiguous(AssignmentGeneration::new(2), 4, &owners(2), Some(&initial))
+                .unwrap();
+        assert_eq!(rebalanced.routing, initial.routing);
+
+        assert!(matches!(
+            balanced_contiguous(
+                AssignmentGeneration::new(3),
+                5,
+                &owners(2),
+                Some(&rebalanced)
+            ),
+            Err(PlanError::ShardCountChangeRequiresMigration {
+                current: 4,
+                desired: 5
+            })
+        ));
+        assert!(matches!(
+            balanced_contiguous(
+                AssignmentGeneration::new(3),
+                3,
+                &owners(2),
+                Some(&rebalanced)
+            ),
+            Err(PlanError::ShardCountChangeRequiresMigration {
+                current: 4,
+                desired: 3
+            })
+        ));
     }
 }
