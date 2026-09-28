@@ -3,6 +3,7 @@
 //! Line stores immutable compressed pages and namespace/time-segment-scoped
 //! indexes in SlateDB and evaluates LogQL locally over bounded page scans.
 
+mod analyzer;
 mod codec;
 mod config;
 mod db;
@@ -14,6 +15,7 @@ mod query;
 mod search;
 mod sharded;
 
+pub use analyzer::{Analyzer, LogAnalyzer};
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
 pub use config::{Config, PageConfig};
 pub use db::{Durability, LogDb, WriteReport};

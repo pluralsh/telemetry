@@ -18,6 +18,7 @@ chrono.workspace = true
 common = { version = "0.1.0", path = "../common" }
 futures.workspace = true
 lalrpop-util = "0.23.1"
+linkify = "0.11.0"
 logos = "0.16.1"
 regex.workspace = true
 roaring.workspace = true
@@ -28,6 +29,7 @@ slatedb.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 proptest.workspace = true

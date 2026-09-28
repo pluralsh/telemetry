@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::Mutex;
 
 use crate::Namespace;
+use crate::analyzer::DEFAULT_ANALYZER;
 use crate::codec::{
     PageId, StoredPageMetadata, decode_forward_key, decode_labels, decode_metadata,
     decode_metadata_key, decode_page_sequence, decode_postings, decode_stream_id, dictionary_key,
@@ -658,7 +659,7 @@ impl LogDb {
                 })? {
                     let score = &page_scores[&row_id];
                     // Stored postings are candidates, never authority.
-                    if source_matches(&entry.line, terms) {
+                    if source_matches(&DEFAULT_ANALYZER, &entry.line, terms) {
                         rows.push((
                             LogRow {
                                 labels: labels.clone(),
@@ -819,6 +820,7 @@ impl PendingWrite {
         (page, rows): (Page, Vec<LogEntry>),
     ) -> Result<()> {
         self.search_deltas.entry(segment).or_default().add_page(
+            &DEFAULT_ANALYZER,
             stream_id,
             *sequence,
             rows.iter().map(|row| row.line.as_str()),

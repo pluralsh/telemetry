@@ -16,6 +16,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+use crate::analyzer::DEFAULT_ANALYZER;
 use crate::db::PageBudget;
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
@@ -656,7 +657,7 @@ fn indexed_match_terms(query: &Query) -> Option<Vec<String>> {
         for stage in &log.stages {
             match &stage.value {
                 PipelineStage::Match(value) => {
-                    let terms = query_terms(value);
+                    let terms = query_terms(&DEFAULT_ANALYZER, value);
                     if terms.is_empty() {
                         return None;
                     }

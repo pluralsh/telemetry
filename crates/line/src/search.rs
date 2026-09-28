@@ -10,7 +10,6 @@
 //! layout: every postings block is an independently addressable SlateDB value,
 //! while fixed-size directory pages describe those blocks.
 
-use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
@@ -20,6 +19,7 @@ use common::storage::Storage;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::Namespace;
+use crate::analyzer::Analyzer;
 use crate::codec::{field_stats_key, term_directory_key, term_posting_block_key, term_stats_key};
 use crate::error::{Error, Result};
 use crate::model::{SegmentId, StreamId};
@@ -99,6 +99,7 @@ pub(crate) struct IndexDelta {
 impl IndexDelta {
     pub(crate) fn add_page<'a>(
         &mut self,
+        analyzer: &dyn Analyzer,
         stream_id: StreamId,
         page_sequence: u64,
         lines: impl IntoIterator<Item = &'a str>,
@@ -106,7 +107,7 @@ impl IndexDelta {
         for (row, line) in lines.into_iter().enumerate() {
             let row_id = u32::try_from(row)
                 .map_err(|_| Error::Invalid("page row id exceeds u32".to_owned()))?;
-            let frequencies = token_frequencies(line);
+            let frequencies = token_frequencies(analyzer, line);
             let length = frequencies
                 .values()
                 .try_fold(0u32, |sum, frequency| sum.checked_add(*frequency))
@@ -135,61 +136,43 @@ impl IndexDelta {
     }
 }
 
-fn tokens(value: &str) -> impl Iterator<Item = &str> {
-    value
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-}
-
-/// Equivalent to `str::to_lowercase`, borrowing when the term is already
-/// lowercase ASCII.
-fn normalize(term: &str) -> Cow<'_, str> {
-    if term.is_ascii() && !term.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Borrowed(term)
-    } else {
-        Cow::Owned(term.to_lowercase())
-    }
-}
-
-pub(crate) fn token_frequencies(value: &str) -> HashMap<String, u32> {
+pub(crate) fn token_frequencies(analyzer: &dyn Analyzer, value: &str) -> HashMap<String, u32> {
     let mut frequencies = HashMap::new();
-    for term in tokens(value) {
-        let frequency = frequencies
-            .entry(normalize(term).into_owned())
-            .or_insert(0u32);
+    analyzer.for_each_term(value, &mut |term| {
+        let frequency = frequencies.entry(term.to_owned()).or_insert(0u32);
         *frequency = frequency.saturating_add(1);
-    }
+    });
     frequencies
 }
 
-pub(crate) fn query_terms(value: &str) -> Vec<String> {
-    tokens(value)
-        .map(|term| normalize(term).into_owned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+pub(crate) fn query_terms(analyzer: &dyn Analyzer, value: &str) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    analyzer.for_each_term(value, &mut |term| {
+        terms.insert(term.to_owned());
+    });
+    terms.into_iter().collect()
 }
 
-/// `terms` must be normalized, as produced by [`query_terms`].
-pub(crate) fn source_matches(line: &str, terms: &[String]) -> bool {
+/// `terms` must be analyzed, as produced by [`query_terms`].
+pub(crate) fn source_matches(analyzer: &dyn Analyzer, line: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
         return false;
     }
     let mut found = vec![false; terms.len()];
     let mut remaining = terms.len();
-    for token in tokens(line) {
-        let token = normalize(token);
-        for (index, term) in terms.iter().enumerate() {
-            if !found[index] && *term == token {
+    analyzer.for_each_term(line, &mut |term| {
+        if remaining == 0 {
+            return;
+        }
+        for (index, expected) in terms.iter().enumerate() {
+            if !found[index] && expected == term {
                 found[index] = true;
                 remaining -= 1;
-                if remaining == 0 {
-                    return true;
-                }
+                break;
             }
         }
-    }
-    false
+    });
+    remaining == 0
 }
 
 pub(crate) fn encode_field_stats(stats: FieldStats) -> Bytes {
@@ -809,6 +792,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::analyzer::DEFAULT_ANALYZER;
 
     fn posting(document: u64, frequency: u32, length: u32) -> Posting {
         Posting {
@@ -927,10 +911,10 @@ mod tests {
             line in "[a-zA-Z0-9 =_ÄÖÜäöü-]{0,64}",
             query in "[a-zA-Z0-9 ÄÖÜäöü]{0,16}",
         ) {
-            let terms = query_terms(&query);
-            let tokens = token_frequencies(&line);
+            let terms = query_terms(&DEFAULT_ANALYZER, &query);
+            let tokens = token_frequencies(&DEFAULT_ANALYZER, &line);
             let expected = !terms.is_empty() && terms.iter().all(|term| tokens.contains_key(term));
-            prop_assert_eq!(source_matches(&line, &terms), expected);
+            prop_assert_eq!(source_matches(&DEFAULT_ANALYZER, &line, &terms), expected);
         }
     }
 
@@ -978,10 +962,36 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_and_source_verifier_agree() {
-        let terms = query_terms("Error status");
-        assert!(source_matches("level=ERROR status=500", &terms));
-        assert!(!source_matches("error without code", &terms));
+    fn analyzer_and_source_verifier_agree() {
+        let terms = query_terms(&DEFAULT_ANALYZER, "Error status");
+        assert!(source_matches(
+            &DEFAULT_ANALYZER,
+            "level=ERROR status=500",
+            &terms
+        ));
+        assert!(!source_matches(
+            &DEFAULT_ANALYZER,
+            "error without code",
+            &terms
+        ));
+    }
+
+    #[test]
+    fn analyzer_preserves_urls_and_email_addresses() {
+        let terms = query_terms(
+            &DEFAULT_ANALYZER,
+            "Visit https://Example.com/a?x=1, or email User@Example.com.",
+        );
+        assert_eq!(
+            terms,
+            [
+                "email",
+                "https://example.com/a?x=1",
+                "or",
+                "user@example.com",
+                "visit",
+            ]
+        );
     }
 
     #[test]

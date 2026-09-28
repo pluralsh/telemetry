@@ -56,7 +56,7 @@ pub(super) fn match_terms(query: &str) -> Rc<[String]> {
         if let Some(terms) = cache.borrow().get(query) {
             return Rc::clone(terms);
         }
-        let terms: Rc<[String]> = query_terms(query).into();
+        let terms: Rc<[String]> = query_terms(&DEFAULT_ANALYZER, query).into();
         let mut cache = cache.borrow_mut();
         if cache.len() >= REGEX_CACHE_CAPACITY {
             cache.clear();

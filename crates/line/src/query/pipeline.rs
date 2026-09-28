@@ -36,7 +36,11 @@ pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> 
         PipelineStage::Unwrap(unwrap) => apply_unwrap(row, unwrap),
         // The index only produces candidates; the source line remains the
         // authority so stale/colliding postings cannot create false matches.
-        PipelineStage::Match(query) => Ok(source_matches(&row.line, &match_terms(query))),
+        PipelineStage::Match(query) => Ok(source_matches(
+            &DEFAULT_ANALYZER,
+            &row.line,
+            &match_terms(query),
+        )),
     }
 }
 
