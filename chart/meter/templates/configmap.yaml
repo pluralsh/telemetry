@@ -59,6 +59,7 @@ data:
       virtual_shards: {{ .Values.sharding.virtualShards }}
       io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
+      database: {{ include "meter.fullname" . | quote }}
       namespace: {{ .Release.Namespace | quote }}
       stateful_set: {{ include "meter.writerName" . | quote }}
       headless_service: {{ include "meter.headlessName" . | quote }}
@@ -106,6 +107,7 @@ data:
       virtual_shards: {{ .Values.sharding.virtualShards }}
       io_concurrency_multiplier: {{ .Values.sharding.ioConcurrencyMultiplier }}
       backend: kubernetes
+      database: {{ include "meter.fullname" . | quote }}
       namespace: {{ .Release.Namespace | quote }}
       stateful_set: {{ include "meter.writerName" . | quote }}
       headless_service: {{ include "meter.headlessName" . | quote }}

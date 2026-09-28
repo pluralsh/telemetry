@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::model::{Field, Fields, LogEntry};
 
 const MAGIC: &[u8; 4] = b"LINE";
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 1;
 const HEADER_LEN: usize = 13;
 const BLOCK_DIRECTORY_ENTRY_LEN: usize = 32;
 
@@ -194,23 +194,40 @@ impl Page {
         start_ns: i64,
         end_ns: i64,
     ) -> Result<Vec<(u32, LogEntry)>> {
+        self.decode_rows_where(start_ns, end_ns, |_| true)
+    }
+
+    /// Like [`decode_range_with_ids`](Self::decode_range_with_ids), limited
+    /// to row IDs accepted by `wanted`. Blocks holding no wanted row are never
+    /// decompressed.
+    pub(crate) fn decode_rows_where(
+        &self,
+        start_ns: i64,
+        end_ns: i64,
+        wanted: impl Fn(u32) -> bool,
+    ) -> Result<Vec<(u32, LogEntry)>> {
         let mut result = Vec::new();
         let mut first_row = 0u32;
         for (index, block) in self.blocks.iter().enumerate() {
-            if block.max_timestamp_ns < start_ns || block.min_timestamp_ns > end_ns {
-                first_row = first_row.saturating_add(block.row_count);
+            let rows = first_row..first_row.saturating_add(block.row_count);
+            first_row = rows.end;
+            if block.max_timestamp_ns < start_ns
+                || block.min_timestamp_ns > end_ns
+                || !rows.clone().any(&wanted)
+            {
                 continue;
             }
             result.extend(
                 self.decode_block(index)?
                     .into_iter()
-                    .enumerate()
-                    .filter(|(_, entry)| {
-                        entry.timestamp_ns >= start_ns && entry.timestamp_ns <= end_ns
+                    .zip(rows)
+                    .filter(|(entry, row_id)| {
+                        entry.timestamp_ns >= start_ns
+                            && entry.timestamp_ns <= end_ns
+                            && wanted(*row_id)
                     })
-                    .map(|(offset, entry)| (first_row + offset as u32, entry)),
+                    .map(|(entry, row_id)| (row_id, entry)),
             );
-            first_row = first_row.saturating_add(block.row_count);
         }
         Ok(result)
     }
@@ -238,6 +255,19 @@ impl PageBuilder {
     }
 
     pub fn append(&mut self, entry: LogEntry, now: Instant) -> Result<Option<Page>> {
+        Ok(self.append_with_rows(entry, now)?.map(|(page, _)| page))
+    }
+
+    pub fn finish(&mut self) -> Result<Option<Page>> {
+        Ok(self.finish_with_rows()?.map(|(page, _)| page))
+    }
+
+    /// Like [`Self::append`], but also returns the rows of a completed page.
+    pub(crate) fn append_with_rows(
+        &mut self,
+        entry: LogEntry,
+        now: Instant,
+    ) -> Result<Option<(Page, Vec<LogEntry>)>> {
         if self
             .entries
             .last()
@@ -254,10 +284,11 @@ impl PageBuilder {
                 || now.duration_since(self.created_at) >= self.config.max_age);
         let completed = if should_cut {
             let page = Page::from_entries(&self.entries, self.config.rows_per_block)?;
-            self.entries.clear();
+            let capacity = self.entries.len();
+            let rows = std::mem::replace(&mut self.entries, Vec::with_capacity(capacity));
             self.estimated_bytes = 0;
             self.created_at = now;
-            Some(page)
+            Some((page, rows))
         } else {
             None
         };
@@ -266,14 +297,13 @@ impl PageBuilder {
         Ok(completed)
     }
 
-    pub fn finish(&mut self) -> Result<Option<Page>> {
+    pub(crate) fn finish_with_rows(&mut self) -> Result<Option<(Page, Vec<LogEntry>)>> {
         if self.entries.is_empty() {
             return Ok(None);
         }
         let page = Page::from_entries(&self.entries, self.config.rows_per_block)?;
-        self.entries.clear();
         self.estimated_bytes = 0;
-        Ok(Some(page))
+        Ok(Some((page, std::mem::take(&mut self.entries))))
     }
 }
 
@@ -416,6 +446,32 @@ mod tests {
         assert_eq!(page.blocks().len(), 4);
         assert_eq!(page.decode_block(1).unwrap(), entries[3..6]);
         assert_eq!(page.decode_range(4, 7).unwrap(), entries[4..=7]);
+    }
+
+    #[test]
+    fn selected_rows_match_a_full_decode() {
+        let entries: Vec<_> = (0..10)
+            .map(|timestamp| LogEntry::new(timestamp, format!("line-{timestamp}")))
+            .collect();
+        let page = Page::from_entries(&entries, 3).unwrap();
+        let wanted = [1u32, 7, 8, 9];
+        let expected: Vec<_> = page
+            .decode_range_with_ids(2, 8)
+            .unwrap()
+            .into_iter()
+            .filter(|(row_id, _)| wanted.contains(row_id))
+            .collect();
+        let selected = page
+            .decode_rows_where(2, 8, |row_id| wanted.contains(&row_id))
+            .unwrap();
+        assert_eq!(selected, expected);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            [7, 8]
+        );
     }
 
     #[test]

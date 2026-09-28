@@ -18,6 +18,13 @@ pub(crate) trait ForwardIndexLookup {
     /// Returns None if the series is not found.
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec>;
 
+    /// Whether the series exists and its spec satisfies `predicate`, without
+    /// cloning the spec. False for unknown series.
+    fn spec_matches(&self, series_id: &SeriesId, predicate: &dyn Fn(&SeriesSpec) -> bool) -> bool {
+        self.get_spec(series_id)
+            .is_some_and(|spec| predicate(&spec))
+    }
+
     /// Get all series specs in the forward index.
     /// Returns a vector of (series_id, spec) pairs.
     fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)>;
@@ -26,6 +33,10 @@ pub(crate) trait ForwardIndexLookup {
 impl<T: ForwardIndexLookup + ?Sized> ForwardIndexLookup for Box<T> {
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
         (**self).get_spec(series_id)
+    }
+
+    fn spec_matches(&self, series_id: &SeriesId, predicate: &dyn Fn(&SeriesSpec) -> bool) -> bool {
+        (**self).spec_matches(series_id, predicate)
     }
 
     fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {
@@ -72,6 +83,12 @@ impl ForwardIndex {
 impl ForwardIndexLookup for ForwardIndex {
     fn get_spec(&self, series_id: &SeriesId) -> Option<SeriesSpec> {
         self.series.get(series_id).map(|r| r.value().clone())
+    }
+
+    fn spec_matches(&self, series_id: &SeriesId, predicate: &dyn Fn(&SeriesSpec) -> bool) -> bool {
+        self.series
+            .get(series_id)
+            .is_some_and(|entry| predicate(entry.value()))
     }
 
     fn all_series(&self) -> Vec<(SeriesId, SeriesSpec)> {

@@ -218,18 +218,30 @@ impl SequenceAllocator {
     }
 }
 
-#[cfg(all(test, any()))]
+#[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::storage::Storage;
-    use opendata_macros::storage_test;
+    use crate::StorageBuilder;
+    use crate::storage::config::StorageConfig;
 
     fn test_key() -> Bytes {
         Bytes::from_static(&[0x01, 0x02])
     }
 
-    #[storage_test]
-    async fn should_load_none_when_no_block_allocated(storage: Arc<dyn Storage>) {
+    async fn in_memory_storage() -> Arc<dyn Storage> {
+        StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_load_none_when_no_block_allocated() {
+        let storage = in_memory_storage().await;
         // when
         let block = AllocatedSeqBlock::load(storage.as_ref(), &test_key())
             .await
@@ -240,8 +252,9 @@ mod tests {
         assert_eq!(block.current_block, None);
     }
 
-    #[storage_test]
-    async fn should_load_first_block(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_load_first_block() {
+        let storage = in_memory_storage().await;
         // given:
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -259,8 +272,9 @@ mod tests {
         assert_eq!(block.block_size, DEFAULT_BLOCK_SIZE);
     }
 
-    #[storage_test]
-    async fn should_allocate_larger_block_when_requested(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_larger_block_when_requested() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -281,8 +295,9 @@ mod tests {
         assert_eq!(seq, large_count);
     }
 
-    #[storage_test]
-    async fn should_allocate_sequential_blocks(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_sequential_blocks() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -306,8 +321,9 @@ mod tests {
         assert_eq!(blocks[2].base_sequence, DEFAULT_BLOCK_SIZE * 2);
     }
 
-    #[storage_test]
-    async fn should_recover_from_storage_on_initialize(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_recover_from_storage_on_initialize() {
+        let storage = in_memory_storage().await;
         // First instance allocates some blocks
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -333,8 +349,9 @@ mod tests {
         assert_eq!(seq, DEFAULT_BLOCK_SIZE * 2);
     }
 
-    #[storage_test]
-    async fn should_resume_from_next_block_on_initialize(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_resume_from_next_block_on_initialize() {
+        let storage = in_memory_storage().await;
         // First instance allocates some blocks
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -359,8 +376,9 @@ mod tests {
         assert_eq!(seq, DEFAULT_BLOCK_SIZE);
     }
 
-    #[storage_test]
-    async fn should_allocate_sequential_sequence_numbers(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_sequential_sequence_numbers() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -377,8 +395,9 @@ mod tests {
         assert_eq!(seq3, 2);
     }
 
-    #[storage_test]
-    async fn should_allocate_batch_of_sequences(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_batch_of_sequences() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -393,8 +412,9 @@ mod tests {
         assert_eq!(seq2, 10);
     }
 
-    #[storage_test]
-    async fn should_span_blocks_when_batch_exceeds_remaining(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_span_blocks_when_batch_exceeds_remaining() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -413,8 +433,9 @@ mod tests {
         assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE);
     }
 
-    #[storage_test]
-    async fn should_allocate_new_block_when_exhausted(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_new_block_when_exhausted() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -429,8 +450,9 @@ mod tests {
         assert!(put.is_some());
     }
 
-    #[storage_test]
-    async fn should_allocate_exactly_remaining(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_allocate_exactly_remaining() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -453,8 +475,9 @@ mod tests {
         assert!(put.is_some());
     }
 
-    #[storage_test]
-    async fn should_handle_large_batch_spanning_from_partial_block(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_handle_large_batch_spanning_from_partial_block() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -475,8 +498,9 @@ mod tests {
         assert_eq!(next_seq, DEFAULT_BLOCK_SIZE - 100 + large_request);
     }
 
-    #[storage_test]
-    async fn should_peek_next_sequence_without_consuming(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_peek_next_sequence_without_consuming() {
+        let storage = in_memory_storage().await;
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await

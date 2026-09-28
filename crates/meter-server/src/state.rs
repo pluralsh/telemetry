@@ -8,27 +8,18 @@ use std::{
 use futures::{StreamExt, stream};
 use meter::{Namespace, Series, ShardedMeter, ShardingOptions, TimeSeriesDb, Visibility};
 use proto::meter::internal::v1::internal_writer_client::InternalWriterClient;
-use sharding::{
-    Assignment, AssignmentGeneration, AssignmentState, Owner, ShardId, ShardMap, ShardRange,
-};
+use sharding::{Owner, ShardId, ShardMap, server::owned_shards};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, metadata::MetadataValue};
 
 #[cfg(feature = "kubernetes")]
-use sharding::{
-    AssignmentStore, BoxError, OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
-    balanced_contiguous,
-    kubernetes::{
-        KubernetesAssignmentStore, KubernetesConfig, KubernetesCoordinatorElection,
-        KubernetesLeaseBackend, StatefulSetMembership, run_kubernetes_coordinator,
-    },
-};
+use sharding::{AssignmentGeneration, BoxError, ShardLifecycle, server::KubernetesRuntime};
 
 use crate::{
     auth::JwtAuthenticator,
-    config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend, StaticOwner},
+    config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
     http::ApiError,
     internal_writer::to_proto_request,
 };
@@ -61,71 +52,24 @@ impl AppState {
         };
         let cancellation = CancellationToken::new();
         #[cfg(feature = "kubernetes")]
-        let mut kubernetes_runtime = None;
+        let mut kubernetes = None;
         let (local_owner, assignment) = match &config.sharding.kind {
             #[cfg(feature = "kubernetes")]
             ShardingBackend::Kubernetes(settings) => {
-                let client = kube::Client::try_default().await?;
-                let kube_config = kubernetes_config(settings);
-                let store = KubernetesAssignmentStore::new(
-                    client.clone(),
-                    &kube_config,
+                let (runtime, assignment) = KubernetesRuntime::bootstrap(
+                    settings,
+                    config.sharding.virtual_shards,
                     cancellation.clone(),
                 )
                 .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let assignment = if let Some(current) = store
-                    .load()
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                {
-                    current
-                } else {
-                    let identity = kubernetes_owner_id(settings);
-                    loop {
-                        if let Some(current) = store
-                            .load()
-                            .await
-                            .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                        {
-                            break current;
-                        }
-                        let election =
-                            KubernetesCoordinatorElection::new(client.clone(), &kube_config);
-                        if election.try_acquire(&identity).await? {
-                            let owners = StatefulSetMembership::new(client.clone(), &kube_config)
-                                .owners()
-                                .await?;
-                            let initial = balanced_contiguous(
-                                AssignmentGeneration::new(1),
-                                config.sharding.virtual_shards,
-                                &owners,
-                                None,
-                            )?;
-                            match store.publish(initial.clone()).await {
-                                Ok(()) => break initial,
-                                Err(error) => {
-                                    tracing::warn!(%error, "initial shard assignment raced; retrying");
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                };
-                let local = kubernetes_owner_id(settings);
-                let leases = Arc::new(KubernetesLeaseBackend::new(
-                    client,
-                    &kube_config,
-                    cancellation.clone(),
-                ));
-                kubernetes_runtime = Some((
-                    store,
-                    leases,
-                    settings.renew_interval_seconds,
-                    kube_config,
-                    local.clone(),
-                ));
+                .map_err(|error| anyhow::anyhow!(error))?;
+                let local = runtime.identity().to_owned();
+                kubernetes = Some(runtime);
                 (local, assignment)
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            ShardingBackend::Kubernetes(_) => {
+                anyhow::bail!("Kubernetes sharding requires the kubernetes feature")
             }
             _ => assignment_for(&config)?,
         };
@@ -154,20 +98,14 @@ impl AppState {
                 && !matches!(config.sharding.kind, ShardingBackend::Kubernetes(_))
             {
                 let mut shards = BTreeMap::new();
-                for shard in 0..config.sharding.virtual_shards {
-                    let shard = ShardId::new(shard);
-                    if assignment
-                        .owner_of(shard)
-                        .is_some_and(|owner| owner.id == local_owner)
-                    {
-                        let mut meter_config = namespace_config_base.clone();
-                        meter_config.storage.path =
-                            options.shard_path(&meter_config.storage.path, shard)?;
-                        shards.insert(
-                            shard,
-                            Arc::new(TimeSeriesDb::open(namespace.clone(), meter_config).await?),
-                        );
-                    }
+                for shard in owned_shards(&assignment, &local_owner) {
+                    let mut meter_config = namespace_config_base.clone();
+                    meter_config.storage.path =
+                        options.shard_path(&meter_config.storage.path, shard)?;
+                    shards.insert(
+                        shard,
+                        Arc::new(TimeSeriesDb::open(namespace.clone(), meter_config).await?),
+                    );
                 }
                 writers.insert(namespace_config.name.clone(), shards);
             }
@@ -206,8 +144,7 @@ impl AppState {
             flush_runs: Arc::new(AtomicU64::new(0)),
         };
         #[cfg(feature = "kubernetes")]
-        if let Some((store, leases, renew_interval_seconds, kube_config, identity)) =
-            kubernetes_runtime
+        if let Some(runtime) = kubernetes
             && state.config.mode != ServerMode::Reader
         {
             let lifecycle = Arc::new(MeterShardLifecycle {
@@ -215,59 +152,12 @@ impl AppState {
                 writers: Arc::clone(&state.writers),
                 draining_shards: Arc::clone(&state.draining_shards),
             });
-            let manager = OwnershipManager::new(
-                state.local_owner.clone(),
-                OwnershipManagerConfig {
-                    renew_interval: Duration::from_secs(renew_interval_seconds),
-                    lease_duration: kube_config.lease_duration,
-                },
-                Arc::clone(&store),
-                leases,
+            let tasks = runtime.spawn(
                 lifecycle,
+                Arc::clone(&state.assignment),
+                &state.cancellation,
             );
-            let manager_cancel = state.cancellation.clone();
-            let manager_task = tokio::spawn(async move {
-                if let Err(error) = manager.run(manager_cancel).await {
-                    tracing::error!(%error, "Kubernetes ownership manager stopped");
-                }
-            });
-            let assignment = Arc::clone(&state.assignment);
-            let watcher_cancel = state.cancellation.clone();
-            let mut updates = store.watch();
-            let watcher_task = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = watcher_cancel.cancelled() => return,
-                        changed = updates.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            let next = { updates.borrow_and_update().clone() };
-                            if let Some(next) = next {
-                                *assignment.write().await = next;
-                            }
-                        }
-                    }
-                }
-            });
-            let coordinator_store = Arc::clone(&store);
-            let coordinator_cancel = state.cancellation.clone();
-            let virtual_shards = state.config.sharding.virtual_shards;
-            let coordinator_task = tokio::spawn(async move {
-                run_kubernetes_coordinator(
-                    coordinator_store,
-                    kube_config,
-                    identity,
-                    virtual_shards,
-                    coordinator_cancel,
-                )
-                .await;
-            });
-            state.background_tasks.lock().await.extend([
-                manager_task,
-                watcher_task,
-                coordinator_task,
-            ]);
+            state.background_tasks.lock().await.extend(tasks);
         }
         if state.config.mode != ServerMode::Reader && state.config.write.flush_interval_seconds > 0
         {
@@ -457,25 +347,34 @@ impl AppState {
         series: Vec<Series>,
         durability: Durability,
     ) -> Result<(), ApiError> {
+        // Held across the write: `drain` takes this lock exclusively, so it
+        // waits for in-flight writes before the shard is flushed and handed off.
         let draining = self.draining_shards.read().await;
         if draining.contains(&shard) {
             return Err(ApiError::unavailable("local shard is draining"));
         }
-        let writers = self.writers.read().await;
-        if let Some(db) = writers.get(namespace).and_then(|shards| shards.get(&shard)) {
+        let db = self
+            .writers
+            .read()
+            .await
+            .get(namespace)
+            .and_then(|shards| shards.get(&shard))
+            .cloned();
+        if let Some(db) = db {
             return db
                 .write_with_visibility(series, visibility(durability))
                 .await
                 .map_err(ApiError::internal);
         }
-        drop(writers);
         if self.config.mode == ServerMode::Standalone {
-            return self
+            let reader = self
                 .readers
                 .read()
                 .await
                 .get(namespace)
-                .ok_or_else(|| ApiError::unavailable("standalone database is not open"))?
+                .cloned()
+                .ok_or_else(|| ApiError::unavailable("standalone database is not open"))?;
+            return reader
                 .write(series, visibility(durability))
                 .await
                 .map_err(ApiError::internal);
@@ -622,28 +521,6 @@ impl ShardLifecycle for MeterShardLifecycle {
     }
 }
 
-#[cfg(feature = "kubernetes")]
-fn kubernetes_owner_id(config: &crate::config::KubernetesShardingConfig) -> String {
-    std::env::var("POD_NAME").unwrap_or_else(|_| {
-        let ordinal = std::env::var("POD_ORDINAL").unwrap_or_else(|_| "0".to_owned());
-        format!("{}-{ordinal}", config.stateful_set)
-    })
-}
-
-#[cfg(feature = "kubernetes")]
-fn kubernetes_config(config: &crate::config::KubernetesShardingConfig) -> KubernetesConfig {
-    KubernetesConfig {
-        namespace: config.namespace.clone(),
-        stateful_set: config.stateful_set.clone(),
-        headless_service: config.headless_service.clone(),
-        owner_port: config.owner_port,
-        assignment_config_map: config.assignment_config_map.clone(),
-        coordinator_lease: config.coordinator_lease.clone(),
-        shard_lease_prefix: config.shard_lease_prefix.clone(),
-        lease_duration: Duration::from_secs(config.lease_duration_seconds),
-    }
-}
-
 fn meter_config(config: &Config) -> meter::Config {
     meter::Config {
         storage: config.storage.clone(),
@@ -663,79 +540,14 @@ pub(crate) fn meter_config_for_namespace(config: &Config, namespace: &Namespace)
 }
 
 pub(crate) fn assignment_for(config: &Config) -> anyhow::Result<(String, ShardMap)> {
-    let (local, owners) = match &config.sharding.kind {
-        ShardingBackend::Standalone => (
-            "standalone".to_owned(),
-            vec![StaticOwner {
-                id: "standalone".to_owned(),
-                ordinal: 0,
-                endpoint: config.listeners.grpc.to_string(),
-                start_shard: 0,
-                end_shard: config.sharding.virtual_shards,
-            }],
-        ),
-        ShardingBackend::Static { owner_id, owners } => (owner_id.clone(), owners.clone()),
-        ShardingBackend::Kubernetes(kubernetes) => {
-            let ordinal = std::env::var("POD_NAME")
-                .ok()
-                .and_then(|name| name.rsplit_once('-')?.1.parse::<u32>().ok())
-                .unwrap_or(0);
-            let id = format!("{}-{ordinal}", kubernetes.stateful_set);
-            (
-                id.clone(),
-                vec![StaticOwner {
-                    id,
-                    ordinal,
-                    endpoint: format!(
-                        "{}-{ordinal}.{}:{}",
-                        kubernetes.stateful_set, kubernetes.headless_service, kubernetes.owner_port
-                    ),
-                    start_shard: 0,
-                    end_shard: config.sharding.virtual_shards,
-                }],
-            )
-        }
-    };
-    let assignments = owners
-        .into_iter()
-        .map(|owner| {
-            Ok(Assignment::new(
-                Owner::new(owner.id, owner.ordinal),
-                ShardRange::within(
-                    owner.start_shard,
-                    owner.end_shard,
-                    config.sharding.virtual_shards,
-                )?,
-                AssignmentState::Active,
-            ))
-        })
-        .collect::<Result<Vec<_>, sharding::ModelError>>()?;
-    Ok((
-        local,
-        ShardMap::new(
-            AssignmentGeneration::new(1),
-            config.sharding.virtual_shards,
-            assignments,
-        )?,
-    ))
+    Ok(config.sharding.static_assignment(config.listeners.grpc)?)
 }
 
 fn owner_endpoint(config: &Config, owner: &Owner) -> Result<String, ApiError> {
-    match &config.sharding.kind {
-        ShardingBackend::Standalone => Ok(config.listeners.grpc.to_string()),
-        ShardingBackend::Static { owners, .. } => owners
-            .iter()
-            .find(|candidate| candidate.id == owner.id)
-            .map(|candidate| candidate.endpoint.clone())
-            .ok_or_else(|| ApiError::unavailable("owner endpoint is unknown")),
-        ShardingBackend::Kubernetes(kubernetes) => Ok(format!(
-            "{}-{}.{}:{}",
-            kubernetes.stateful_set,
-            owner.ordinal,
-            kubernetes.headless_service,
-            kubernetes.owner_port
-        )),
-    }
+    config
+        .sharding
+        .owner_endpoint(config.listeners.grpc, owner)
+        .ok_or_else(|| ApiError::unavailable("owner endpoint is unknown"))
 }
 
 fn visibility(durability: Durability) -> Visibility {

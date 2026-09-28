@@ -98,7 +98,7 @@ config:
 
 sharding:
   virtualShards: 8
-  ioConcurrencyMultiplier: 4
+  ioConcurrencyMultiplier: 8
   leaseDurationSeconds: 15
   renewIntervalSeconds: 5
 

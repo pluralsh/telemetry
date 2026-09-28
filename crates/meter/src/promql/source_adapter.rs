@@ -32,8 +32,9 @@ use super::source::{
 // Buckets are fully independent keyspaces in RFC 0001's layout (all record
 // keys are bucket-prefixed, series IDs are bucket-scoped), so cross-bucket
 // fan-out cannot affect correctness. RFC 0007 §"Execution Model" (line 256)
-// prohibits implicit spawn-per-series, so there is no intra-bucket sample
-// fan-out; the constants below act as both scheduler and I/O ceiling.
+// prohibits implicit spawn-per-series, so intra-bucket sample fan-out is
+// polled concurrency within the run's task; the constants below act as both
+// scheduler and I/O ceiling.
 
 /// Cross-bucket readahead for resolve.
 const METADATA_STAGE_READAHEAD: usize = 32;
@@ -41,9 +42,14 @@ const METADATA_STAGE_READAHEAD: usize = 32;
 /// Cross-bucket readahead for sample batching.
 const SAMPLE_STAGE_READAHEAD: usize = 32;
 
+/// Series sample reads in flight within one bucket run. Worst-case in-flight
+/// sample gets = `SAMPLE_STAGE_READAHEAD * SAMPLES_PER_RUN_CONCURRENCY`, still
+/// capped by the sharded reader's I/O permits.
+const SAMPLES_PER_RUN_CONCURRENCY: usize = 8;
+
 /// Per-key index-fetch fan-out inside one bucket's resolve path. Worst-case
 /// in-flight gets during build_physical = `METADATA_STAGE_READAHEAD * INDEX_PER_KEY`.
-const INDEX_PER_KEY_CONCURRENCY: usize = 32;
+const INDEX_PER_KEY_CONCURRENCY: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Bucket-id encoding
@@ -326,10 +332,11 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     Ok(out)
 }
 
-/// Per-series loop stays sequential — implicit spawn-per-series is prohibited.
-/// Concurrency is the per-run dispatch one layer up. Metric names ride on the
-/// `ResolvedSeriesRef`, populated by `resolve_one_bucket` — no forward-index
-/// lookup here.
+/// Sample reads within a run are polled concurrently inside this task (never
+/// spawned), up to [`SAMPLES_PER_RUN_CONCURRENCY`]; ordered buffering keeps
+/// at most that many series' samples in memory beyond the block itself.
+/// Metric names ride on the `ResolvedSeriesRef`, populated by
+/// `resolve_one_bucket` — no forward-index lookup here.
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
     run: BucketRun,
@@ -351,13 +358,24 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
     let start_ms = time_range.start_ms.saturating_sub(1);
     let end_ms = time_range.end_ms_exclusive.saturating_sub(1);
 
-    for (col_idx, series_ref) in series[run.range.clone()].iter().enumerate() {
-        let sid = series_ref.series_id as SeriesId;
-        let samples: Vec<Sample> = reader
-            .samples(&bucket, sid, &series_ref.metric_name, start_ms, end_ms)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-
+    let bucket = &bucket;
+    let mut fetched = stream::iter(series[run.range.clone()].to_vec())
+        .map(|series_ref| async move {
+            reader
+                .samples(
+                    bucket,
+                    series_ref.series_id as SeriesId,
+                    &series_ref.metric_name,
+                    start_ms,
+                    end_ms,
+                )
+                .await
+                .map_err(|e| internal_err(e.to_string()))
+        })
+        .buffered(SAMPLES_PER_RUN_CONCURRENCY)
+        .enumerate();
+    while let Some((col_idx, samples)) = fetched.next().await {
+        let samples: Vec<Sample> = samples?;
         let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
         ts_col.reserve(samples.len());
         val_col.reserve(samples.len());
@@ -726,18 +744,15 @@ pub(crate) mod selector_util {
                 MatchOp::NotEqual => {
                     out.retain(|id| {
                         forward
-                            .get_spec(id)
-                            .map(|spec| !has_label(&spec.labels, &m.name, &m.value))
-                            .unwrap_or(false)
+                            .spec_matches(id, &|spec| !has_label(&spec.labels, &m.name, &m.value))
                     });
                 }
                 MatchOp::NotRe(_) => {
                     let values = parse_limited_regex(&m.value).map_err(internal_err)?;
                     out.retain(|id| {
-                        forward
-                            .get_spec(id)
-                            .map(|spec| !values.iter().any(|v| has_label(&spec.labels, &m.name, v)))
-                            .unwrap_or(false)
+                        forward.spec_matches(id, &|spec| {
+                            !values.iter().any(|v| has_label(&spec.labels, &m.name, v))
+                        })
                     });
                 }
                 _ => {}
@@ -755,10 +770,9 @@ pub(crate) mod selector_util {
         for m in &selector.matchers.matchers {
             if matches!(m.op, MatchOp::Equal) && m.value.is_empty() {
                 out.retain(|id| {
-                    forward
-                        .get_spec(id)
-                        .map(|spec| !has_label_with_non_empty_value(&spec.labels, &m.name))
-                        .unwrap_or(false)
+                    forward.spec_matches(id, &|spec| {
+                        !has_label_with_non_empty_value(&spec.labels, &m.name)
+                    })
                 });
             }
         }

@@ -5,20 +5,24 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
-use serde::{Deserialize, Serialize};
+use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
+use common::serde::sortable::{decode_i64_sortable, encode_i64_sortable};
+use common::serde::varint::{var_u32, var_u64};
 
+use crate::Namespace;
 use crate::error::{Error, Result};
 use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
-use crate::namespace::Namespace;
-use crate::page::BlockMetadata;
 
-pub(crate) const KEY_VERSION: u8 = 2;
+pub(crate) const KEY_VERSION: u8 = 1;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
-pub(crate) const CURRENT_PAGE_METADATA_VERSION: u8 = 2;
-
-const fn legacy_page_metadata_version() -> u8 {
-    1
-}
+const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
+/// Persisted by SlateDB; renaming it makes existing databases unopenable.
+pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
+    ScopedSegmentExtractor::new("line-log/v1", KEY_SCOPE);
+const PAGE_METADATA_VERSION: u8 = 1;
+const PAGE_METADATA_HAS_EXPIRY: u8 = 1;
+/// Leading byte of forward-label values.
+const LABELS_FORMAT: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -36,23 +40,19 @@ pub(crate) enum RecordType {
     SearchPostingBlock = 11,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PageId {
     pub timestamp_ns: i64,
     pub sequence: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredPageMetadata {
-    #[serde(default = "legacy_page_metadata_version")]
-    pub version: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix_ms: Option<u64>,
     pub min_timestamp_ns: i64,
     pub max_timestamp_ns: i64,
     pub row_count: u32,
     pub payload_bytes: u32,
-    pub blocks: Vec<BlockMetadata>,
 }
 
 impl StoredPageMetadata {
@@ -69,7 +69,7 @@ pub(crate) fn segment_for(timestamp_ns: i64, segment_ns: i64) -> SegmentId {
 #[cfg(test)]
 pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
     let mut bytes = BytesMut::new();
-    write_scope(&mut bytes, namespace, segment);
+    KEY_SCOPE.write(&mut bytes, namespace, segment);
     bytes.freeze()
 }
 
@@ -238,27 +238,136 @@ pub(crate) fn decode_page_sequence(bytes: &[u8]) -> Result<u64> {
 }
 
 pub(crate) fn encode_labels(labels: &Labels) -> Result<Bytes> {
-    Ok(Bytes::from(serde_json::to_vec(labels)?))
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(LABELS_FORMAT);
+    var_u32::serialize(value_len(labels.iter().count())?, &mut bytes);
+    for label in labels.iter() {
+        put_str(&label.name, &mut bytes)?;
+        put_str(&label.value, &mut bytes)?;
+    }
+    Ok(bytes.freeze())
 }
 
 pub(crate) fn decode_labels(bytes: &[u8]) -> Result<Labels> {
-    let labels: Labels = serde_json::from_slice(bytes)?;
-    Labels::new(labels.iter().cloned().collect())
+    if bytes.first() != Some(&LABELS_FORMAT) {
+        return Err(Error::Corrupt("unknown forward-label format".to_owned()));
+    }
+    let mut buf = &bytes[1..];
+    let count = read_u32(&mut buf)? as usize;
+    let mut labels = Vec::with_capacity(count.min(buf.len() / 2));
+    for _ in 0..count {
+        let name = read_str(&mut buf)?;
+        let value = read_str(&mut buf)?;
+        labels.push(Label { name, value });
+    }
+    expect_consumed(buf, "forward labels")?;
+    Labels::new(labels)
 }
 
 pub(crate) fn encode_metadata(metadata: &StoredPageMetadata) -> Result<Bytes> {
-    Ok(Bytes::from(serde_json::to_vec(metadata)?))
+    if metadata.max_timestamp_ns < metadata.min_timestamp_ns {
+        return Err(Error::Invalid(
+            "page max timestamp precedes min timestamp".to_owned(),
+        ));
+    }
+    let mut bytes = BytesMut::with_capacity(32);
+    bytes.put_u8(PAGE_METADATA_VERSION);
+    match metadata.expires_at_unix_ms {
+        Some(expires_at) => {
+            bytes.put_u8(PAGE_METADATA_HAS_EXPIRY);
+            var_u64::serialize(expires_at, &mut bytes);
+        }
+        None => bytes.put_u8(0),
+    }
+    bytes.put_i64(metadata.min_timestamp_ns);
+    var_u64::serialize(
+        metadata
+            .max_timestamp_ns
+            .abs_diff(metadata.min_timestamp_ns),
+        &mut bytes,
+    );
+    var_u32::serialize(metadata.row_count, &mut bytes);
+    var_u32::serialize(metadata.payload_bytes, &mut bytes);
+    Ok(bytes.freeze())
 }
 
 pub(crate) fn decode_metadata(bytes: &[u8]) -> Result<StoredPageMetadata> {
-    let metadata: StoredPageMetadata = serde_json::from_slice(bytes)?;
-    if metadata.version == 0 || metadata.version > CURRENT_PAGE_METADATA_VERSION {
+    let Some(&version) = bytes.first() else {
+        return Err(Error::Corrupt("empty page metadata".to_owned()));
+    };
+    if version != PAGE_METADATA_VERSION {
         return Err(Error::Corrupt(format!(
-            "unsupported page metadata version {}",
-            metadata.version
+            "unsupported page metadata version {version}"
         )));
     }
+    let mut buf = &bytes[1..];
+    let (&flags, rest) = buf
+        .split_first()
+        .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
+    buf = rest;
+    let expires_at_unix_ms = match flags {
+        0 => None,
+        PAGE_METADATA_HAS_EXPIRY => Some(read_u64(&mut buf)?),
+        _ => {
+            return Err(Error::Corrupt(format!(
+                "unknown page metadata flags {flags}"
+            )));
+        }
+    };
+    let (min, rest) = buf
+        .split_first_chunk::<8>()
+        .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
+    buf = rest;
+    let min_timestamp_ns = i64::from_be_bytes(*min);
+    let max_timestamp_ns = min_timestamp_ns
+        .checked_add_unsigned(read_u64(&mut buf)?)
+        .ok_or_else(|| Error::Corrupt("page max timestamp overflows".to_owned()))?;
+    let metadata = StoredPageMetadata {
+        expires_at_unix_ms,
+        min_timestamp_ns,
+        max_timestamp_ns,
+        row_count: read_u32(&mut buf)?,
+        payload_bytes: read_u32(&mut buf)?,
+    };
+    expect_consumed(buf, "page metadata")?;
     Ok(metadata)
+}
+
+fn put_str(value: &str, bytes: &mut BytesMut) -> Result<()> {
+    var_u32::serialize(value_len(value.len())?, bytes);
+    bytes.put_slice(value.as_bytes());
+    Ok(())
+}
+
+fn read_str(buf: &mut &[u8]) -> Result<String> {
+    let len = read_u32(buf)? as usize;
+    if buf.len() < len {
+        return Err(Error::Corrupt("truncated string".to_owned()));
+    }
+    let (value, rest) = buf.split_at(len);
+    *buf = rest;
+    String::from_utf8(value.to_vec())
+        .map_err(|error| Error::Corrupt(format!("string is not UTF-8: {error}")))
+}
+
+fn read_u32(buf: &mut &[u8]) -> Result<u32> {
+    var_u32::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
+}
+
+fn read_u64(buf: &mut &[u8]) -> Result<u64> {
+    var_u64::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
+}
+
+fn value_len(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::Invalid("value length exceeds u32".to_owned()))
+}
+
+fn expect_consumed(buf: &[u8], what: &str) -> Result<()> {
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Corrupt(format!("trailing bytes in {what}")))
+    }
 }
 
 pub(crate) fn encode_postings(postings: &roaring::RoaringBitmap) -> Result<Bytes> {
@@ -283,42 +392,24 @@ fn page_key(
 ) -> Bytes {
     let mut bytes = record_prefix(namespace, segment, record_type);
     bytes.put_u32(stream_id);
-    bytes.put_u64(encode_sortable_i64(page_id.timestamp_ns));
+    bytes.put_u64(encode_i64_sortable(page_id.timestamp_ns));
     bytes.put_u64(page_id.sequence);
     bytes.freeze()
 }
 
 fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
     let mut bytes = BytesMut::new();
-    write_scope(&mut bytes, namespace, segment);
+    KEY_SCOPE.write(&mut bytes, namespace, segment);
     bytes.put_u8(record_type as u8);
     bytes
 }
 
-fn write_scope(bytes: &mut BytesMut, namespace: &Namespace, segment: SegmentId) {
-    bytes.put_u8(SUBSYSTEM);
-    bytes.put_u8(KEY_VERSION);
-    common::serde::terminated_bytes::serialize(namespace.as_bytes(), bytes);
-    bytes.put_u64(encode_sortable_i64(segment));
-}
-
 fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType, usize)> {
-    if bytes.len() < 12 || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
-        return Err(Error::Corrupt("invalid Line key prefix".to_owned()));
-    }
-    let mut suffix = &bytes[2..];
-    let namespace_bytes = common::serde::terminated_bytes::deserialize(&mut suffix)
-        .map_err(|error| Error::Corrupt(error.to_string()))?;
-    if suffix.len() < 9 {
-        return Err(Error::Corrupt("truncated Line key scope".to_owned()));
-    }
-    let namespace = Namespace::new(
-        String::from_utf8(namespace_bytes.to_vec())
-            .map_err(|error| Error::Corrupt(format!("namespace is not UTF-8: {error}")))?,
-    )
-    .map_err(|error| Error::Corrupt(error.to_string()))?;
-    let segment = decode_sortable_i64(&suffix[..8]);
-    let record_type = match suffix[8] {
+    let (namespace, segment, scope_len) = KEY_SCOPE.parse(bytes)?;
+    let Some(&record_type) = bytes.get(scope_len) else {
+        return Err(Error::Corrupt("key is missing its record type".to_owned()));
+    };
+    let record_type = match record_type {
         1 => RecordType::NextStreamId,
         2 => RecordType::StreamDictionary,
         3 => RecordType::ForwardLabels,
@@ -332,34 +423,23 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         11 => RecordType::SearchPostingBlock,
         value => return Err(Error::Corrupt(format!("unknown record type {value}"))),
     };
-    Ok((
-        namespace,
-        segment,
-        record_type,
-        bytes.len() - suffix.len() + 9,
-    ))
-}
-
-pub(crate) fn routing_prefix_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 12 || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
-        return None;
-    }
-    let namespace_end = bytes[2..].iter().position(|byte| *byte == 0)? + 2;
-    let length = namespace_end + 1 + 8;
-    (bytes.len() >= length).then_some(length)
-}
-
-fn encode_sortable_i64(value: i64) -> u64 {
-    (value as u64) ^ (1_u64 << 63)
+    Ok((namespace, segment, record_type, scope_len + 1))
 }
 
 fn decode_sortable_i64(bytes: &[u8]) -> i64 {
-    (u64::from_be_bytes(bytes.try_into().unwrap()) ^ (1_u64 << 63)) as i64
+    decode_i64_sortable(u64::from_be_bytes(bytes.try_into().unwrap()))
 }
 
 #[cfg(test)]
 mod tests {
+    use slatedb::PrefixExtractor;
+
     use super::*;
+
+    #[test]
+    fn segment_extractor_name_is_stable() {
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "line-log/v1");
+    }
 
     #[test]
     fn keys_group_by_namespace_then_segment() {
@@ -421,22 +501,49 @@ mod tests {
     }
 
     #[test]
-    fn page_metadata_decodes_legacy_records_without_logical_expiry() {
-        let metadata = decode_metadata(
-            br#"{"min_timestamp_ns":1,"max_timestamp_ns":2,"row_count":1,"payload_bytes":3,"blocks":[]}"#,
-        )
+    fn page_metadata_roundtrips_in_binary() {
+        for expires_at_unix_ms in [None, Some(0), Some(u64::MAX)] {
+            let metadata = StoredPageMetadata {
+                expires_at_unix_ms,
+                min_timestamp_ns: i64::MIN,
+                max_timestamp_ns: i64::MAX,
+                row_count: 7,
+                payload_bytes: 4096,
+            };
+            let encoded = encode_metadata(&metadata).unwrap();
+            assert_eq!(encoded[0], PAGE_METADATA_VERSION);
+            assert_eq!(decode_metadata(&encoded).unwrap(), metadata);
+        }
+        let mut unknown = encode_metadata(&StoredPageMetadata {
+            expires_at_unix_ms: None,
+            min_timestamp_ns: 1,
+            max_timestamp_ns: 2,
+            row_count: 1,
+            payload_bytes: 1,
+        })
+        .unwrap()
+        .to_vec();
+        unknown[0] = PAGE_METADATA_VERSION + 1;
+        assert!(decode_metadata(&unknown).is_err());
+    }
+
+    #[test]
+    fn labels_roundtrip() {
+        let labels = Labels::new(vec![
+            Label::new("service", "api"),
+            Label::new("environment", "prod ✓"),
+            Label::new("empty", ""),
+        ])
         .unwrap();
-        assert_eq!(metadata.version, 1);
-        assert_eq!(metadata.expires_at_unix_ms, None);
-        assert!(!metadata.is_expired_at(u64::MAX));
+        let encoded = encode_labels(&labels).unwrap();
+        assert_eq!(decode_labels(&encoded).unwrap(), labels);
+        assert!(decode_labels(&encoded[..encoded.len() - 1]).is_err());
+        assert!(decode_labels(&serde_json::to_vec(&labels).unwrap()).is_err());
     }
 
     #[test]
     fn page_metadata_rejects_unknown_versions() {
-        let error = decode_metadata(
-            br#"{"version":3,"min_timestamp_ns":1,"max_timestamp_ns":2,"row_count":1,"payload_bytes":3,"blocks":[]}"#,
-        )
-        .unwrap_err();
+        let error = decode_metadata(&[PAGE_METADATA_VERSION + 1, 0]).unwrap_err();
         assert!(
             error
                 .to_string()

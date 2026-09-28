@@ -64,7 +64,7 @@ fn default_scan_options() -> ScanOptions {
         dirty: false,
         read_ahead_bytes: 1024 * 1024,
         cache_blocks: true,
-        max_fetch_tasks: 4,
+        max_fetch_tasks: 8,
         order: IterationOrder::Ascending,
         filter_context: None,
     }

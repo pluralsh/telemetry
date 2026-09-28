@@ -9,13 +9,13 @@ repository.workspace = true
 
 [features]
 default = []
-test-utils = ["dep:arc-swap"]
+test-utils = []
 
 [lints]
 workspace = true
 
 [dependencies]
-arc-swap = { workspace = true, optional = true }
+arc-swap.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 foyer.workspace = true

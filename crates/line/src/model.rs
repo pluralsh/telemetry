@@ -3,6 +3,8 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -175,7 +177,8 @@ impl LogBatch {
 /// A decoded query result with stream identity attached.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogRow {
-    pub labels: Labels,
+    /// Shared by every row decoded from the same stream.
+    pub labels: Arc<Labels>,
     pub entry: LogEntry,
 }
 

@@ -233,8 +233,8 @@ func renderLine(input Input) (Result, error) {
 				MaxQueryEntries:             int64Value(spec.Request.MaxQueryEntries, 5000),
 				MaxQueryPages:               int64Value(spec.Request.MaxQueryPages, 10000),
 				MaxStructuredMetadataFields: int64Value(spec.Request.MaxStructuredMetadataFields, 128),
-				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 8),
-				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 67108864),
+				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
+				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 134217728),
 			},
 			Cache:      renderLineQueryCache{QueryEntries: int64Value(spec.Cache.QueryEntries, 256)},
 			Auth:       renderAuth{Unauthenticated: line.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
@@ -445,7 +445,7 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 
 func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
 	virtual := int32Value(spec.VirtualShards, 8)
-	ioConcurrencyMultiplier := int32Value(spec.IOConcurrencyMultiplier, 4)
+	ioConcurrencyMultiplier := int32Value(spec.IOConcurrencyMultiplier, 8)
 	if component == modeStandalone {
 		return renderSharding{
 			VirtualShards: virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
@@ -455,7 +455,7 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 	writer := resourceName(name, modeWriter)
 	return renderSharding{
 		VirtualShards: virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
-		Backend: "kubernetes", Namespace: namespace,
+		Backend: "kubernetes", Database: resourceName(name, ""), Namespace: namespace,
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
 		OwnerPort: grpcPort, AssignmentConfigMap: resourceName(name, "writer-shard-assignments"),
 		CoordinatorLease: resourceName(name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(name, "writer-shard"),
@@ -626,6 +626,7 @@ type renderSharding struct {
 	VirtualShards           int32  `json:"virtual_shards"`
 	IOConcurrencyMultiplier int32  `json:"io_concurrency_multiplier"`
 	Backend                 string `json:"backend"`
+	Database                string `json:"database,omitempty"`
 	Namespace               string `json:"namespace,omitempty"`
 	StatefulSet             string `json:"stateful_set,omitempty"`
 	HeadlessService         string `json:"headless_service,omitempty"`

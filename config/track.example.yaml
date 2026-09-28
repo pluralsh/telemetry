@@ -35,7 +35,7 @@ write:
 
 sharding:
   virtual_shards: 8
-  io_concurrency_multiplier: 4
+  io_concurrency_multiplier: 8
   backend: standalone
 
 request:

@@ -180,7 +180,7 @@ type ShardingSpec struct {
 	// +kubebuilder:default=8
 	VirtualShards *int32 `json:"virtualShards,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=4
+	// +kubebuilder:default=8
 	IOConcurrencyMultiplier *int32 `json:"ioConcurrencyMultiplier,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=15

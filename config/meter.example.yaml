@@ -94,7 +94,7 @@ write:
 
 sharding:
   virtual_shards: 8 # Default 8; must be greater than zero.
-  io_concurrency_multiplier: 4 # Default 4; global shard I/O permits per open shard.
+  io_concurrency_multiplier: 8 # Default 8; global shard I/O permits per open shard.
   backend: standalone
 
   # Static split-deployment alternative. Ranges are half-open and must exactly
@@ -116,6 +116,7 @@ sharding:
   # Kubernetes alternative and all defaults. Writers are discovered from the
   # StatefulSet; assignments use a ConfigMap and ownership uses Leases.
   # backend: kubernetes
+  # database: meter    # Leases are labeled telemetry.plural.sh/meter=<database>
   # namespace: default
   # stateful_set: meter
   # headless_service: meter-headless

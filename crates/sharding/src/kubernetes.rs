@@ -41,9 +41,14 @@ const ASSIGNMENT_KEY: &str = "assignment.json";
 const GENERATION_ANNOTATION: &str = "telemetry.plural.sh/assignment-generation";
 const RENEWED_AT_ANNOTATION: &str = "telemetry.plural.sh/renewed-at-unix-ms";
 const LEASE_GENERATION_ANNOTATION: &str = "telemetry.plural.sh/assignment-generation";
+const LABEL_DOMAIN: &str = "telemetry.plural.sh";
 
 #[derive(Debug, Clone)]
 pub struct KubernetesConfig {
+    /// Product name, e.g. `meter`.
+    pub database_type: String,
+    /// Database (custom resource) name.
+    pub database: String,
     pub namespace: String,
     pub stateful_set: String,
     pub headless_service: String,
@@ -57,6 +62,8 @@ pub struct KubernetesConfig {
 impl Default for KubernetesConfig {
     fn default() -> Self {
         Self {
+            database_type: "meter".to_owned(),
+            database: "meter".to_owned(),
             namespace: "default".to_owned(),
             stateful_set: "meter".to_owned(),
             headless_service: "meter-headless".to_owned(),
@@ -66,6 +73,22 @@ impl Default for KubernetesConfig {
             shard_lease_prefix: "meter-shard".to_owned(),
             lease_duration: Duration::from_secs(15),
         }
+    }
+}
+
+impl KubernetesConfig {
+    /// Label carried by every Lease of this database:
+    /// `telemetry.plural.sh/<database_type>=<database>`.
+    pub fn lease_label(&self) -> (String, String) {
+        (
+            format!("{LABEL_DOMAIN}/{}", self.database_type),
+            self.database.clone(),
+        )
+    }
+
+    fn lease_selector(&self) -> String {
+        let (key, value) = self.lease_label();
+        format!("{key}={value}")
     }
 }
 
@@ -117,10 +140,15 @@ fn can_acquire(
     })
 }
 
-fn lease_resource(
-    name: &str,
-    namespace: &str,
+struct LeaseMeta<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    labels: &'a BTreeMap<String, String>,
     resource_version: Option<String>,
+}
+
+fn lease_resource(
+    meta: LeaseMeta<'_>,
     owner: &str,
     generation: AssignmentGeneration,
     duration: Duration,
@@ -134,9 +162,10 @@ fn lease_resource(
     annotations.insert(RENEWED_AT_ANNOTATION.to_owned(), now_ms.to_string());
     Lease {
         metadata: ObjectMeta {
-            name: Some(name.to_owned()),
-            namespace: Some(namespace.to_owned()),
-            resource_version,
+            name: Some(meta.name.to_owned()),
+            namespace: Some(meta.namespace.to_owned()),
+            resource_version: meta.resource_version,
+            labels: Some(meta.labels.clone()),
             annotations: Some(annotations),
             ..ObjectMeta::default()
         },
@@ -154,6 +183,7 @@ fn released_lease_resource(existing: &Lease) -> Lease {
             name: existing.metadata.name.clone(),
             namespace: existing.metadata.namespace.clone(),
             resource_version: existing.metadata.resource_version.clone(),
+            labels: existing.metadata.labels.clone(),
             ..ObjectMeta::default()
         },
         spec: Some(LeaseSpec::default()),
@@ -177,16 +207,26 @@ fn conflict(error: &KubeError) -> bool {
 struct KubernetesLeaseSet {
     api: Api<Lease>,
     namespace: String,
+    labels: BTreeMap<String, String>,
     duration: Duration,
 }
 
 impl KubernetesLeaseSet {
-    fn new(client: Client, namespace: impl Into<String>, duration: Duration) -> Self {
-        let namespace = namespace.into();
+    fn new(client: Client, config: &KubernetesConfig) -> Self {
         Self {
-            api: Api::namespaced(client, &namespace),
-            namespace,
-            duration,
+            api: Api::namespaced(client, &config.namespace),
+            namespace: config.namespace.clone(),
+            labels: BTreeMap::from([config.lease_label()]),
+            duration: config.lease_duration,
+        }
+    }
+
+    fn meta<'a>(&'a self, name: &'a str, resource_version: Option<String>) -> LeaseMeta<'a> {
+        LeaseMeta {
+            name,
+            namespace: &self.namespace,
+            labels: &self.labels,
+            resource_version,
         }
     }
 
@@ -207,11 +247,12 @@ impl KubernetesLeaseSet {
             return Ok(false);
         }
         let resource = lease_resource(
-            name,
-            &self.namespace,
-            existing
-                .as_ref()
-                .and_then(|lease| lease.metadata.resource_version.clone()),
+            self.meta(
+                name,
+                existing
+                    .as_ref()
+                    .and_then(|lease| lease.metadata.resource_version.clone()),
+            ),
             owner,
             generation,
             self.duration,
@@ -247,9 +288,7 @@ impl KubernetesLeaseSet {
             return Ok(false);
         }
         let resource = lease_resource(
-            name,
-            &self.namespace,
-            existing.metadata.resource_version,
+            self.meta(name, existing.metadata.resource_version),
             owner,
             generation,
             self.duration,
@@ -302,11 +341,7 @@ impl KubernetesCoordinatorElection {
     pub fn new(client: Client, config: &KubernetesConfig) -> Self {
         Self {
             lease_name: config.coordinator_lease.clone(),
-            leases: KubernetesLeaseSet::new(
-                client,
-                config.namespace.clone(),
-                config.lease_duration,
-            ),
+            leases: KubernetesLeaseSet::new(client, config),
         }
     }
 
@@ -337,17 +372,19 @@ pub struct KubernetesLeaseBackend {
 
 impl KubernetesLeaseBackend {
     pub fn new(client: Client, config: &KubernetesConfig, cancel: CancellationToken) -> Self {
-        let leases =
-            KubernetesLeaseSet::new(client, config.namespace.clone(), config.lease_duration);
+        let leases = KubernetesLeaseSet::new(client, config);
         let prefix = config.shard_lease_prefix.clone();
         let (release_tx, _) = watch::channel(0);
         let watch_api = leases.api.clone();
         let watch_prefix = format!("{prefix}-");
         let watch_tx = release_tx.clone();
+        let selector = config.lease_selector();
         tokio::spawn(async move {
-            let mut events = watcher::watcher(watch_api, watcher::Config::default())
-                .default_backoff()
-                .boxed();
+            // The coordinator lease shares the label; the name check filters it out.
+            let mut events =
+                watcher::watcher(watch_api, watcher::Config::default().labels(&selector))
+                    .default_backoff()
+                    .boxed();
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => return,
@@ -639,15 +676,20 @@ impl StatefulSetMembership {
 
     pub async fn owners(&self) -> Result<Vec<Owner>, KubeError> {
         let stateful_set = self.api.get(&self.stateful_set).await?;
-        let replicas = stateful_set
-            .spec
-            .and_then(|spec| spec.replicas)
-            .unwrap_or(1)
-            .max(0) as u32;
-        Ok((0..replicas)
-            .map(|ordinal| Owner::new(format!("{}-{ordinal}", self.stateful_set), ordinal))
-            .collect())
+        Ok(stateful_set_owners(&stateful_set, &self.stateful_set))
     }
+}
+
+fn stateful_set_owners(stateful_set: &StatefulSet, name: &str) -> Vec<Owner> {
+    let replicas = stateful_set
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1)
+        .max(0) as u32;
+    (0..replicas)
+        .map(|ordinal| Owner::new(format!("{name}-{ordinal}"), ordinal))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -720,11 +762,23 @@ pub async fn run_kubernetes_coordinator(
     )
     .default_backoff()
     .boxed();
-    let membership = StatefulSetMembership::new(client, &config);
+    let stateful_set_api: Api<StatefulSet> = Api::namespaced(client, &config.namespace);
+    let stateful_set_selector = format!("metadata.name={}", config.stateful_set);
+    let mut stateful_set_events = watcher::watcher(
+        stateful_set_api,
+        watcher::Config::default().fields(&stateful_set_selector),
+    )
+    .default_backoff()
+    .boxed();
+    let mut assignments = store.watch();
     let renew_interval = (config.lease_duration / 3).max(Duration::from_secs(1));
     let mut ticker = time::interval(renew_interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut leader = false;
+    // Membership comes from the StatefulSet watch; the assignment is reloaded
+    // only when membership, the assignment, or leadership changes.
+    let mut owners: Option<Vec<Owner>> = None;
+    let mut dirty = true;
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -757,7 +811,37 @@ pub async fn run_kubernetes_coordinator(
                     }
                 }
             }
+            event = stateful_set_events.next() => {
+                match event {
+                    Some(Ok(Event::Apply(stateful_set) | Event::InitApply(stateful_set))) => {
+                        let observed = stateful_set_owners(&stateful_set, &config.stateful_set);
+                        if owners.as_ref() != Some(&observed) {
+                            owners = Some(observed);
+                            dirty = true;
+                        }
+                    }
+                    Some(Ok(Event::Delete(_))) => {
+                        tracing::warn!("writer StatefulSet was deleted; retaining last known membership");
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "Kubernetes StatefulSet watch failed; reconnecting");
+                    }
+                    None => {
+                        tracing::error!("Kubernetes StatefulSet watch ended");
+                        return;
+                    }
+                }
+            }
+            changed = assignments.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                assignments.borrow_and_update();
+                dirty = true;
+            }
             _ = ticker.tick() => {
+                let was_leader = leader;
                 leader = if leader {
                     match election.renew(&identity).await {
                         Ok(held) => held,
@@ -775,46 +859,60 @@ pub async fn run_kubernetes_coordinator(
                         }
                     }
                 };
-                if !leader {
-                    continue;
-                }
-                let owners = match membership.owners().await {
-                    Ok(owners) => owners,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to observe StatefulSet membership");
-                        continue;
-                    }
-                };
-                let current = match store.load().await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to load current shard assignment");
-                        continue;
-                    }
-                };
-                if !membership_changed(current.as_ref(), &owners, virtual_shards) {
-                    continue;
-                }
-                let generation = current
-                    .as_ref()
-                    .map_or(AssignmentGeneration::new(1), |map| map.generation.next());
-                let next = match balanced_contiguous(
-                    generation,
-                    virtual_shards,
-                    &owners,
-                    current.as_ref(),
-                ) {
-                    Ok(next) => next,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to plan shard assignment");
-                        continue;
-                    }
-                };
-                if let Err(error) = store.publish(next).await {
-                    tracing::warn!(%error, "failed to publish shard assignment");
-                    leader = false;
-                }
+                dirty |= leader && !was_leader;
             }
+        }
+        if !leader || !dirty {
+            continue;
+        }
+        let Some(owners) = owners.as_deref() else {
+            continue;
+        };
+        match reconcile_assignment(store.as_ref(), owners, virtual_shards).await {
+            Reconcile::Done => dirty = false,
+            Reconcile::Retry => {}
+            Reconcile::LostLeadership => leader = false,
+        }
+    }
+}
+
+enum Reconcile {
+    Done,
+    /// Retried on the next renew tick.
+    Retry,
+    LostLeadership,
+}
+
+async fn reconcile_assignment(
+    store: &KubernetesAssignmentStore,
+    owners: &[Owner],
+    virtual_shards: u32,
+) -> Reconcile {
+    let current = match store.load().await {
+        Ok(current) => current,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load current shard assignment");
+            return Reconcile::Retry;
+        }
+    };
+    if !membership_changed(current.as_ref(), owners, virtual_shards) {
+        return Reconcile::Done;
+    }
+    let generation = current
+        .as_ref()
+        .map_or(AssignmentGeneration::new(1), |map| map.generation.next());
+    let next = match balanced_contiguous(generation, virtual_shards, owners, current.as_ref()) {
+        Ok(next) => next,
+        Err(error) => {
+            tracing::warn!(%error, "failed to plan shard assignment");
+            return Reconcile::Retry;
+        }
+    };
+    match store.publish(next).await {
+        Ok(()) => Reconcile::Done,
+        Err(error) => {
+            tracing::warn!(%error, "failed to publish shard assignment");
+            Reconcile::LostLeadership
         }
     }
 }
@@ -922,12 +1020,46 @@ mod tests {
         );
     }
 
+    fn meta<'a>(name: &'a str, labels: &'a BTreeMap<String, String>) -> LeaseMeta<'a> {
+        LeaseMeta {
+            name,
+            namespace: "default",
+            labels,
+            resource_version: None,
+        }
+    }
+
+    #[test]
+    fn leases_are_labeled_by_database_type_and_name_through_release() {
+        let config = KubernetesConfig {
+            database_type: "line".to_owned(),
+            database: "logs".to_owned(),
+            ..KubernetesConfig::default()
+        };
+        assert_eq!(
+            config.lease_label(),
+            ("telemetry.plural.sh/line".to_owned(), "logs".to_owned())
+        );
+        assert_eq!(config.lease_selector(), "telemetry.plural.sh/line=logs");
+
+        let labels = BTreeMap::from([config.lease_label()]);
+        let active = lease_resource(
+            meta("line-shard-0001", &labels),
+            "line-0",
+            AssignmentGeneration::new(1),
+            Duration::from_secs(15),
+            1_000,
+        );
+        assert_eq!(active.metadata.labels.as_ref(), Some(&labels));
+        let released = released_lease_resource(&active);
+        assert_eq!(released.metadata.labels.as_ref(), Some(&labels));
+    }
+
     #[test]
     fn lease_watch_only_notifies_for_released_shard_leases() {
+        let labels = BTreeMap::new();
         let active = lease_resource(
-            "meter-shard-0016",
-            "default",
-            None,
+            meta("meter-shard-0016", &labels),
             "meter-0",
             AssignmentGeneration::new(1),
             Duration::from_secs(15),
@@ -940,9 +1072,7 @@ mod tests {
         assert!(is_released_shard_lease(&released, "meter-shard-"));
 
         let coordinator = lease_resource(
-            "meter-shard-coordinator",
-            "default",
-            None,
+            meta("meter-shard-coordinator", &labels),
             "meter-0",
             AssignmentGeneration::default(),
             Duration::from_secs(15),

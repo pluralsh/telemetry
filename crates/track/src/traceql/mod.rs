@@ -21,6 +21,9 @@ pub use plan::{QueryPlan, plan};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryOptions {
     pub limit: usize,
+    /// Cap on verified candidate traces loaded and executed. Candidates are
+    /// consumed in result order and loading stops at `limit` matches, so this
+    /// bounds work actually done rather than the size of the index hit set.
     pub max_candidate_traces: usize,
     pub max_spans_per_trace: usize,
     pub max_concurrency: usize,

@@ -34,11 +34,11 @@ pub(crate) const COORDINATOR_DELTA_ESTIMATED_BYTES: &str =
 pub(crate) const COORDINATOR_DELTA_FREEZE_DURATION_SECONDS: &str =
     "opendata_write_coordinator_delta_freeze_duration_seconds";
 
-/// Histogram of how long the coordinator waits when sending a flush event to
-/// the flush task. A high value means the flush task is the bottleneck and
-/// new writes will not be accepted until the event is dispatched.
-pub(crate) const COORDINATOR_FLUSH_EVENT_SEND_DURATION_SECONDS: &str =
-    "opendata_write_coordinator_flush_event_send_duration_seconds";
+/// Counter of flushes deferred because the flush queue was full. A rising
+/// value means the flush task is the bottleneck; writes keep landing in the
+/// live delta, which grows until the queue has room.
+pub(crate) const COORDINATOR_FLUSH_DEFERRED_TOTAL: &str =
+    "opendata_write_coordinator_flush_deferred_total";
 
 /// Approximate depth of the flush event channel, sampled on each send.
 pub(crate) const COORDINATOR_FLUSH_EVENT_QUEUE_DEPTH: &str =
@@ -85,9 +85,9 @@ pub fn describe_coordinator_metrics() {
         COORDINATOR_DELTA_FREEZE_DURATION_SECONDS,
         "Time spent freezing the current delta on the coordinator hot path (seconds)"
     );
-    metrics::describe_histogram!(
-        COORDINATOR_FLUSH_EVENT_SEND_DURATION_SECONDS,
-        "Time spent dispatching a flush event from the coordinator to the flush task (seconds)"
+    metrics::describe_counter!(
+        COORDINATOR_FLUSH_DEFERRED_TOTAL,
+        "Coordinator flushes deferred because the flush queue was full"
     );
     metrics::describe_gauge!(
         COORDINATOR_FLUSH_EVENT_QUEUE_DEPTH,

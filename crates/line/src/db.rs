@@ -3,34 +3,43 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::storage::{PutOptions, PutRecordOp, Record, RecordOp, Storage, Ttl, WriteOptions};
 use common::{StorageBuilder, StorageSemantics};
+use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use tokio::sync::Mutex;
 
+use crate::Namespace;
 use crate::codec::{
-    CURRENT_PAGE_METADATA_VERSION, PageId, StoredPageMetadata, decode_forward_key, decode_labels,
-    decode_metadata, decode_metadata_key, decode_page_sequence, decode_postings, decode_stream_id,
-    dictionary_key, encode_labels, encode_metadata, encode_page_sequence, encode_postings,
-    encode_stream_id, field_stats_key, forward_key, forward_range, metadata_key, metadata_range,
+    PageId, StoredPageMetadata, decode_forward_key, decode_labels, decode_metadata,
+    decode_metadata_key, decode_page_sequence, decode_postings, decode_stream_id, dictionary_key,
+    encode_labels, encode_metadata, encode_page_sequence, encode_postings, encode_stream_id,
+    field_stats_key, forward_key, forward_range, metadata_key, metadata_range,
     next_page_sequence_key, next_stream_id_key, payload_key, posting_key, segment_for,
-    term_directory_key, term_posting_block_key, term_stats_key,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamId};
-use crate::namespace::Namespace;
+use crate::model::{
+    Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
+};
 use crate::page::{Page, PageBuilder};
 use crate::search::{
-    BlockDirectoryEntry, DIRECTORY_ENTRIES, FieldStats, IndexDelta, POSTINGS_PER_BLOCK, TermStats,
-    block_max_scores, decode as decode_search, encode as encode_search, source_matches,
+    IndexDelta, block_max_scores, decode_field_stats, encode_field_stats, source_matches,
+    term_index_writes,
 };
-use crate::segment::LogSegmentExtractor;
+
+/// Terms whose index records are read concurrently while building a write.
+const TERM_INDEX_CONCURRENCY: usize = 32;
+/// Page payloads fetched concurrently within one query segment.
+const PAGE_READ_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteReport {
@@ -45,6 +54,35 @@ pub enum Durability {
     #[default]
     Written,
     Durable,
+}
+
+/// Pages a query may still read, shareable across the databases it spans.
+#[derive(Debug)]
+pub(crate) struct PageBudget {
+    limit: usize,
+    remaining: AtomicUsize,
+}
+
+impl PageBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            remaining: AtomicUsize::new(limit),
+        }
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn take(&self) -> Result<()> {
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map(drop)
+            .map_err(|_| Error::Query(format!("query exceeded max_pages ({})", self.limit)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -72,8 +110,8 @@ impl LogDb {
     pub async fn open(config: Config) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
-        let semantics =
-            StorageSemantics::new().with_segment_extractor(LogSegmentExtractor::shared());
+        let semantics = StorageSemantics::new()
+            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
         let storage = StorageBuilder::new(&config.storage)
             .await?
             .with_semantics(semantics)
@@ -103,191 +141,29 @@ impl LogDb {
         batches: Vec<LogBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
-        let mut groups: BTreeMap<(SegmentId, [u8; 16]), (Labels, Vec<LogEntry>)> = BTreeMap::new();
-        for batch in batches {
-            let fingerprint = batch.labels.fingerprint();
-            for entry in batch.entries {
-                let segment = segment_for(entry.timestamp_ns, self.segment_ns);
-                let group = groups
-                    .entry((segment, fingerprint))
-                    .or_insert_with(|| (batch.labels.clone(), Vec::new()));
-                if group.0 != batch.labels {
-                    return Err(Error::Invalid(
-                        "stream fingerprint collision in write batch".to_owned(),
-                    ));
-                }
-                group.1.push(entry);
-            }
-        }
+        let groups = group_by_stream(batches, self.segment_ns)?;
         if groups.is_empty() {
             return Ok(WriteReport::default());
-        }
-        for (_, entries) in groups.values_mut() {
-            entries.sort_by_key(|entry| entry.timestamp_ns);
         }
 
         let _guard = self.write_lock.lock().await;
         let ttl = self.ttl()?;
-        let page_retention = PageRetention {
+        let retention = PageRetention {
             physical_ttl: ttl,
             expires_at_unix_ms: self.logical_expiry()?,
         };
-        let mut ops = Vec::new();
-        let mut next_ids: HashMap<SegmentId, StreamId> = HashMap::new();
-        let mut next_dirty: HashMap<SegmentId, bool> = HashMap::new();
-        let mut postings: HashMap<(SegmentId, Label), RoaringBitmap> = HashMap::new();
-        let mut search_deltas: BTreeMap<SegmentId, IndexDelta> = BTreeMap::new();
-        let mut report = WriteReport {
-            streams: groups.len(),
-            ..WriteReport::default()
-        };
-
+        let mut write = PendingWrite::new(ttl, retention, groups.len());
         for ((segment, fingerprint), (labels, entries)) in groups {
-            let dictionary = dictionary_key(namespace, segment, fingerprint);
-            let stream_id = if let Some(record) = self.storage.get(dictionary.clone()).await? {
-                let stream_id = decode_stream_id(&record.value)?;
-                let existing = self
-                    .storage
-                    .get(forward_key(namespace, segment, stream_id))
-                    .await?
-                    .ok_or_else(|| Error::Corrupt("dictionary has no forward labels".to_owned()))?;
-                if decode_labels(&existing.value)? != labels {
-                    return Err(Error::Corrupt(
-                        "stream fingerprint maps to different labels".to_owned(),
-                    ));
-                }
-                ops.push(put(dictionary, encode_stream_id(stream_id), ttl));
-                ops.push(put(
-                    forward_key(namespace, segment, stream_id),
-                    encode_labels(&labels)?,
-                    ttl,
-                ));
-                stream_id
-            } else {
-                let next = match next_ids.get(&segment) {
-                    Some(next) => *next,
-                    None => {
-                        let value = self
-                            .storage
-                            .get(next_stream_id_key(namespace, segment))
-                            .await?
-                            .map(|record| decode_stream_id(&record.value))
-                            .transpose()?
-                            .unwrap_or(0);
-                        next_ids.insert(segment, value);
-                        value
-                    }
-                };
-                let following = next
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
-                next_ids.insert(segment, following);
-                next_dirty.insert(segment, true);
-                ops.push(put(dictionary, encode_stream_id(next), ttl));
-                ops.push(put(
-                    forward_key(namespace, segment, next),
-                    encode_labels(&labels)?,
-                    ttl,
-                ));
-                next
-            };
-
-            for label in labels.iter() {
-                let cache_key = (segment, label.clone());
-                if !postings.contains_key(&cache_key) {
-                    let bitmap = self
-                        .storage
-                        .get(posting_key(namespace, segment, label))
-                        .await?
-                        .map(|record| decode_postings(&record.value))
-                        .transpose()?
-                        .unwrap_or_default();
-                    postings.insert(cache_key.clone(), bitmap);
-                }
-                postings.get_mut(&cache_key).unwrap().insert(stream_id);
-            }
-
-            let page_sequence_key = next_page_sequence_key(namespace, segment, stream_id);
-            let mut next_page_sequence = self
-                .storage
-                .get(page_sequence_key.clone())
-                .await?
-                .map(|record| decode_page_sequence(&record.value))
-                .transpose()?
-                .unwrap_or(0);
-            let mut builder = PageBuilder::new(self.config.page.clone(), Instant::now())?;
-            for entry in entries {
-                report.rows += 1;
-                if let Some(page) = builder.append(entry, Instant::now())? {
-                    index_page(
-                        search_deltas.entry(segment).or_default(),
-                        stream_id,
-                        next_page_sequence,
-                        &page,
-                    )?;
-                    append_page_ops(
-                        &mut ops,
-                        namespace,
-                        segment,
-                        stream_id,
-                        next_page_sequence,
-                        page,
-                        page_retention,
-                    )?;
-                    next_page_sequence = next_page_sequence.checked_add(1).ok_or_else(|| {
-                        Error::Invalid("stream exhausted page sequences".to_owned())
-                    })?;
-                    report.pages += 1;
-                }
-            }
-            if let Some(page) = builder.finish()? {
-                index_page(
-                    search_deltas.entry(segment).or_default(),
-                    stream_id,
-                    next_page_sequence,
-                    &page,
-                )?;
-                append_page_ops(
-                    &mut ops,
-                    namespace,
-                    segment,
-                    stream_id,
-                    next_page_sequence,
-                    page,
-                    page_retention,
-                )?;
-                next_page_sequence = next_page_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("stream exhausted page sequences".to_owned()))?;
-                report.pages += 1;
-            }
-            ops.push(put(
-                page_sequence_key,
-                encode_page_sequence(next_page_sequence),
-                ttl,
-            ));
-        }
-
-        for (segment, dirty) in next_dirty {
-            if dirty {
-                ops.push(put(
-                    next_stream_id_key(namespace, segment),
-                    encode_stream_id(next_ids[&segment]),
-                    ttl,
-                ));
-            }
-        }
-        for ((segment, label), bitmap) in postings {
-            ops.push(put(
-                posting_key(namespace, segment, &label),
-                encode_postings(&bitmap)?,
-                ttl,
-            ));
-        }
-        for (segment, delta) in search_deltas {
-            self.append_search_index_ops(&mut ops, namespace, segment, delta, ttl)
+            let stream_id = self
+                .resolve_stream_id(&mut write, namespace, segment, fingerprint, &labels)
+                .await?;
+            self.add_label_postings(&mut write, namespace, segment, &labels, stream_id)
+                .await?;
+            self.append_stream_pages(&mut write, namespace, segment, stream_id, entries)
                 .await?;
         }
+        let (ops, report) = self.finish_write(write, namespace).await?;
+
         self.storage
             .apply_with_options(
                 ops,
@@ -302,6 +178,160 @@ impl LogDb {
         Ok(report)
     }
 
+    /// Returns the stream's existing ID, or allocates the segment's next one,
+    /// and rewrites its dictionary and forward-label records to refresh TTLs.
+    async fn resolve_stream_id(
+        &self,
+        write: &mut PendingWrite,
+        namespace: &Namespace,
+        segment: SegmentId,
+        fingerprint: StreamFingerprint,
+        labels: &Labels,
+    ) -> Result<StreamId> {
+        let dictionary = dictionary_key(namespace, segment, fingerprint);
+        let stream_id = match self.storage.get(dictionary.clone()).await? {
+            Some(record) => {
+                let stream_id = decode_stream_id(&record.value)?;
+                let existing = self
+                    .storage
+                    .get(forward_key(namespace, segment, stream_id))
+                    .await?
+                    .ok_or_else(|| Error::Corrupt("dictionary has no forward labels".to_owned()))?;
+                if decode_labels(&existing.value)? != *labels {
+                    return Err(Error::Corrupt(
+                        "stream fingerprint maps to different labels".to_owned(),
+                    ));
+                }
+                stream_id
+            }
+            None => self.allocate_stream_id(write, namespace, segment).await?,
+        };
+        write.put(dictionary, encode_stream_id(stream_id));
+        write.put(
+            forward_key(namespace, segment, stream_id),
+            encode_labels(labels)?,
+        );
+        Ok(stream_id)
+    }
+
+    async fn allocate_stream_id(
+        &self,
+        write: &mut PendingWrite,
+        namespace: &Namespace,
+        segment: SegmentId,
+    ) -> Result<StreamId> {
+        let next = match write.next_stream_ids.get(&segment) {
+            Some(next) => *next,
+            None => self
+                .storage
+                .get(next_stream_id_key(namespace, segment))
+                .await?
+                .map(|record| decode_stream_id(&record.value))
+                .transpose()?
+                .unwrap_or(0),
+        };
+        let following = next
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
+        write.next_stream_ids.insert(segment, following);
+        Ok(next)
+    }
+
+    async fn add_label_postings(
+        &self,
+        write: &mut PendingWrite,
+        namespace: &Namespace,
+        segment: SegmentId,
+        labels: &Labels,
+        stream_id: StreamId,
+    ) -> Result<()> {
+        for label in labels.iter() {
+            let bitmap = match write.postings.entry((segment, label.clone())) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let bitmap = self
+                        .storage
+                        .get(posting_key(namespace, segment, label))
+                        .await?
+                        .map(|record| decode_postings(&record.value))
+                        .transpose()?
+                        .unwrap_or_default();
+                    entry.insert(bitmap)
+                }
+            };
+            bitmap.insert(stream_id);
+        }
+        Ok(())
+    }
+
+    async fn append_stream_pages(
+        &self,
+        write: &mut PendingWrite,
+        namespace: &Namespace,
+        segment: SegmentId,
+        stream_id: StreamId,
+        entries: Vec<LogEntry>,
+    ) -> Result<()> {
+        let page_sequence_key = next_page_sequence_key(namespace, segment, stream_id);
+        let mut sequence = self
+            .storage
+            .get(page_sequence_key.clone())
+            .await?
+            .map(|record| decode_page_sequence(&record.value))
+            .transpose()?
+            .unwrap_or(0);
+        let row_count = entries.len();
+        let mut builder = PageBuilder::new(self.config.page.clone(), Instant::now())?;
+        for entry in entries {
+            if let Some(completed) = builder.append_with_rows(entry, Instant::now())? {
+                write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
+            }
+        }
+        if let Some(completed) = builder.finish_with_rows()? {
+            write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
+        }
+        write.report.rows += row_count;
+        write.put(page_sequence_key, encode_page_sequence(sequence));
+        Ok(())
+    }
+
+    /// Emits the records accumulated across streams: stream ID counters,
+    /// label postings, and the full-text index.
+    async fn finish_write(
+        &self,
+        write: PendingWrite,
+        namespace: &Namespace,
+    ) -> Result<(Vec<RecordOp>, WriteReport)> {
+        let PendingWrite {
+            ttl,
+            mut ops,
+            next_stream_ids,
+            postings,
+            search_deltas,
+            report,
+            ..
+        } = write;
+        for (segment, next) in next_stream_ids {
+            ops.push(put(
+                next_stream_id_key(namespace, segment),
+                encode_stream_id(next),
+                ttl,
+            ));
+        }
+        for ((segment, label), bitmap) in postings {
+            ops.push(put(
+                posting_key(namespace, segment, &label),
+                encode_postings(&bitmap)?,
+                ttl,
+            ));
+        }
+        for (segment, delta) in search_deltas {
+            self.append_search_index_ops(&mut ops, namespace, segment, delta, ttl)
+                .await?;
+        }
+        Ok((ops, report))
+    }
+
     async fn append_search_index_ops(
         &self,
         ops: &mut Vec<RecordOp>,
@@ -314,7 +344,7 @@ impl LogDb {
             .storage
             .get(field_stats_key(namespace, segment))
             .await?
-            .map(|record| decode_search::<FieldStats>(&record.value))
+            .map(|record| decode_field_stats(&record.value))
             .transpose()?
             .unwrap_or_default();
         field.documents = field
@@ -327,86 +357,24 @@ impl LogDb {
             .ok_or_else(|| Error::Invalid("segment token count overflow".into()))?;
         ops.push(put(
             field_stats_key(namespace, segment),
-            encode_search(&field)?,
+            encode_field_stats(field),
             ttl,
         ));
 
-        for (term, mut term_postings) in delta.postings {
-            term_postings.sort_by_key(|posting| posting.address);
-            let stats_key = term_stats_key(namespace, segment, &term);
-            let mut stats = self
-                .storage
-                .get(stats_key.clone())
-                .await?
-                .map(|record| decode_search::<TermStats>(&record.value))
-                .transpose()?
-                .unwrap_or_default();
-            stats.documents = stats
-                .documents
-                .checked_add(term_postings.len() as u64)
-                .ok_or_else(|| Error::Invalid("term document count overflow".into()))?;
-
-            let mut dirty_directories: BTreeMap<u32, Vec<BlockDirectoryEntry>> = BTreeMap::new();
-            for chunk in term_postings.chunks(POSTINGS_PER_BLOCK) {
-                let ordinal = stats.blocks;
-                stats.blocks = stats
-                    .blocks
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("term block ordinal overflow".into()))?;
-                let directory_ordinal = ordinal / DIRECTORY_ENTRIES as u32;
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    dirty_directories.entry(directory_ordinal)
-                {
-                    let entries = self
-                        .storage
-                        .get(term_directory_key(
-                            namespace,
-                            segment,
-                            &term,
-                            directory_ordinal,
-                        ))
-                        .await?
-                        .map(|record| decode_search::<Vec<BlockDirectoryEntry>>(&record.value))
-                        .transpose()?
-                        .unwrap_or_default();
-                    if entries.len() > DIRECTORY_ENTRIES {
-                        return Err(Error::Corrupt("term directory exceeds bound".into()));
-                    }
-                    entry.insert(entries);
-                }
-                let entries = dirty_directories.get_mut(&directory_ordinal).unwrap();
-                if entries.len() >= DIRECTORY_ENTRIES {
-                    return Err(Error::Corrupt("term directory ordinal is full".into()));
-                }
-                entries.push(BlockDirectoryEntry {
-                    ordinal,
-                    postings: u16::try_from(chunk.len())
-                        .map_err(|_| Error::Invalid("posting block exceeds u16".into()))?,
-                    max_frequency: chunk
-                        .iter()
-                        .map(|posting| posting.frequency)
-                        .max()
-                        .unwrap_or(0),
-                    min_length: chunk
-                        .iter()
-                        .map(|posting| posting.length)
-                        .min()
-                        .unwrap_or(0),
-                });
-                ops.push(put(
-                    term_posting_block_key(namespace, segment, &term, ordinal),
-                    encode_search(&chunk)?,
-                    ttl,
-                ));
-            }
-            for (ordinal, entries) in dirty_directories {
-                ops.push(put(
-                    term_directory_key(namespace, segment, &term, ordinal),
-                    encode_search(&entries)?,
-                    ttl,
-                ));
-            }
-            ops.push(put(stats_key, encode_search(&stats)?, ttl));
+        let storage = self.storage.as_ref();
+        let mut writes = std::pin::pin!(
+            futures::stream::iter(delta.postings)
+                .map(|(term, postings)| {
+                    term_index_writes(storage, namespace, segment, term, postings)
+                })
+                .buffer_unordered(TERM_INDEX_CONCURRENCY)
+        );
+        while let Some(term_writes) = writes.try_next().await? {
+            ops.extend(
+                term_writes
+                    .into_iter()
+                    .map(|(key, value)| put(key, value, ttl)),
+            );
         }
         Ok(())
     }
@@ -419,8 +387,14 @@ impl LogDb {
         end_ns: i64,
         matchers: &[Label],
     ) -> Result<Vec<LogRow>> {
-        self.read_bounded(namespace, start_ns, end_ns, matchers, usize::MAX)
-            .await
+        self.read_bounded(
+            namespace,
+            start_ns,
+            end_ns,
+            matchers,
+            &PageBudget::new(usize::MAX),
+        )
+        .await
     }
 
     pub(crate) async fn estimate_pages(
@@ -469,29 +443,62 @@ impl LogDb {
         Ok(estimate)
     }
 
-    /// Reads at most `max_pages` overlapping pages. This is the storage
-    /// primitive used by the query engine to put a hard bound on I/O.
+    /// Reads overlapping pages, charging each to `budget`. This is the
+    /// storage primitive used by the query engine to put a hard bound on I/O.
     pub(crate) async fn read_bounded(
         &self,
         namespace: &Namespace,
         start_ns: i64,
         end_ns: i64,
         matchers: &[Label],
-        max_pages: usize,
+        budget: &PageBudget,
     ) -> Result<Vec<LogRow>> {
+        let mut rows = Vec::new();
+        self.read_segments(
+            namespace,
+            (start_ns, end_ns),
+            matchers,
+            budget,
+            false,
+            |segment_rows| {
+                rows.extend(segment_rows);
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .await?;
+        Ok(rows)
+    }
+
+    /// Reads overlapping pages one time segment at a time, handing each
+    /// segment's rows (in stable storage order) to `consume`. Segments
+    /// partition time, so every row in a later segment is strictly later
+    /// (or, with `reverse`, strictly earlier) than every row already
+    /// consumed; `consume` returns `Break` once no later row can matter.
+    /// Only pages actually read are charged to `budget`.
+    pub(crate) async fn read_segments(
+        &self,
+        namespace: &Namespace,
+        (start_ns, end_ns): (i64, i64),
+        matchers: &[Label],
+        budget: &PageBudget,
+        reverse: bool,
+        mut consume: impl FnMut(Vec<LogRow>) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
         if end_ns < start_ns {
             return Err(Error::Invalid("end_ns must be >= start_ns".to_owned()));
         }
         let first_segment = segment_for(start_ns, self.segment_ns);
         let last_segment = segment_for(end_ns, self.segment_ns);
         let now_unix_ms = unix_time_ms()?;
-        let mut segment = first_segment;
-        let mut rows = Vec::new();
-        let mut pages_read = 0usize;
+        let (mut segment, final_segment, step) = if reverse {
+            (last_segment, first_segment, -self.segment_ns)
+        } else {
+            (first_segment, last_segment, self.segment_ns)
+        };
 
         loop {
-            let stream_ids = self.stream_ids(namespace, segment, matchers).await?;
-            for stream_id in stream_ids {
+            let mut pages = Vec::new();
+            for stream_id in self.stream_ids(namespace, segment, matchers).await? {
                 let Some(labels_record) = self
                     .storage
                     .get(forward_key(namespace, segment, stream_id))
@@ -501,7 +508,8 @@ impl LogDb {
                         "posting references missing forward labels".to_owned(),
                     ));
                 };
-                let labels = decode_labels(&labels_record.value)?;
+                let labels = Arc::new(decode_labels(&labels_record.value)?);
+                let fingerprint = labels.fingerprint();
                 let mut metadata = self
                     .storage
                     .scan_iter(metadata_range(namespace, segment, stream_id))
@@ -515,57 +523,48 @@ impl LogDb {
                     {
                         continue;
                     }
-                    if pages_read == max_pages {
-                        return Err(Error::Query(format!(
-                            "query exceeded max_pages ({max_pages})"
-                        )));
-                    }
-                    pages_read += 1;
-                    let payload = self
-                        .storage
-                        .get(payload_key(namespace, segment, stream_id, page_id))
-                        .await?
-                        .ok_or_else(|| Error::Corrupt("page metadata has no payload".to_owned()))?;
-                    let page = Page::decode(payload.value)?;
-                    rows.extend(
-                        page.decode_range(start_ns, end_ns)?
-                            .into_iter()
-                            .enumerate()
-                            .map(|(row_index, entry)| {
-                                (
-                                    page_id.sequence,
-                                    row_index,
-                                    LogRow {
-                                        labels: labels.clone(),
-                                        entry,
-                                    },
-                                )
-                            }),
-                    );
+                    budget.take()?;
+                    pages.push((stream_id, labels.clone(), fingerprint, page_id));
                 }
             }
-            if segment == last_segment {
-                break;
+            let mut decoded = futures::stream::iter(pages)
+                .map(
+                    move |(stream_id, labels, fingerprint, page_id)| async move {
+                        let payload = self
+                            .storage
+                            .get(payload_key(namespace, segment, stream_id, page_id))
+                            .await?
+                            .ok_or_else(|| {
+                                Error::Corrupt("page metadata has no payload".to_owned())
+                            })?;
+                        let entries =
+                            Page::decode(payload.value)?.decode_range(start_ns, end_ns)?;
+                        Ok::<_, Error>((labels, fingerprint, page_id, entries))
+                    },
+                )
+                .buffered(PAGE_READ_CONCURRENCY);
+            let mut rows = Vec::new();
+            while let Some((labels, fingerprint, page_id, entries)) = decoded.try_next().await? {
+                rows.extend(entries.into_iter().enumerate().map(|(row_index, entry)| {
+                    (
+                        (entry.timestamp_ns, fingerprint, page_id.sequence, row_index),
+                        LogRow {
+                            labels: labels.clone(),
+                            entry,
+                        },
+                    )
+                }));
+            }
+            rows.sort_unstable_by_key(|(key, _)| *key);
+            if consume(rows.into_iter().map(|(_, row)| row).collect())?.is_break()
+                || segment == final_segment
+            {
+                return Ok(());
             }
             segment = segment
-                .checked_add(self.segment_ns)
+                .checked_add(step)
                 .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?;
         }
-        rows.sort_by(|left, right| {
-            left.2
-                .entry
-                .timestamp_ns
-                .cmp(&right.2.entry.timestamp_ns)
-                .then_with(|| {
-                    left.2
-                        .labels
-                        .fingerprint()
-                        .cmp(&right.2.labels.fingerprint())
-                })
-                .then_with(|| left.0.cmp(&right.0))
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        Ok(rows.into_iter().map(|(_, _, row)| row).collect())
     }
 
     /// Uses the segment-local term index to identify pages and rows before
@@ -591,7 +590,7 @@ impl LogDb {
         loop {
             let stream_ids = self.stream_ids(namespace, segment, matchers).await?;
             let mut candidate_pages = Vec::new();
-            let mut allowed_pages = BTreeSet::new();
+            let mut allowed_pages = HashSet::new();
             for stream_id in stream_ids {
                 let labels_record = self
                     .storage
@@ -600,7 +599,7 @@ impl LogDb {
                     .ok_or_else(|| {
                         Error::Corrupt("posting references missing forward labels".into())
                     })?;
-                let labels = decode_labels(&labels_record.value)?;
+                let labels = Arc::new(decode_labels(&labels_record.value)?);
                 let mut metadata = self
                     .storage
                     .scan_iter(metadata_range(namespace, segment, stream_id))
@@ -654,10 +653,10 @@ impl LogDb {
                     .await?
                     .ok_or_else(|| Error::Corrupt("page metadata has no payload".to_owned()))?;
                 let page = Page::decode(payload.value)?;
-                for (row_id, entry) in page.decode_range_with_ids(start_ns, end_ns)? {
-                    let Some(score) = page_scores.get(&row_id) else {
-                        continue;
-                    };
+                for (row_id, entry) in page.decode_rows_where(start_ns, end_ns, |row_id| {
+                    page_scores.contains_key(&row_id)
+                })? {
+                    let score = &page_scores[&row_id];
                     // Stored postings are candidates, never authority.
                     if source_matches(&entry.line, terms) {
                         rows.push((
@@ -752,6 +751,95 @@ impl LogDb {
     }
 }
 
+type StreamGroups = BTreeMap<(SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+
+/// Groups entries by `(segment, stream)`, each group sorted by timestamp.
+fn group_by_stream(batches: Vec<LogBatch>, segment_ns: i64) -> Result<StreamGroups> {
+    let mut groups = StreamGroups::new();
+    for batch in batches {
+        let fingerprint = batch.labels.fingerprint();
+        for entry in batch.entries {
+            let segment = segment_for(entry.timestamp_ns, segment_ns);
+            let group = groups
+                .entry((segment, fingerprint))
+                .or_insert_with(|| (batch.labels.clone(), Vec::new()));
+            if group.0 != batch.labels {
+                return Err(Error::Invalid(
+                    "stream fingerprint collision in write batch".to_owned(),
+                ));
+            }
+            group.1.push(entry);
+        }
+    }
+    for (_, entries) in groups.values_mut() {
+        entries.sort_by_key(|entry| entry.timestamp_ns);
+    }
+    Ok(groups)
+}
+
+/// Records accumulated for one atomic write. Counters and postings shared by
+/// several streams are merged here and emitted once by `finish_write`.
+struct PendingWrite {
+    ttl: Ttl,
+    retention: PageRetention,
+    ops: Vec<RecordOp>,
+    /// Next unallocated stream ID for each segment that allocated one.
+    next_stream_ids: HashMap<SegmentId, StreamId>,
+    postings: HashMap<(SegmentId, Label), RoaringBitmap>,
+    search_deltas: BTreeMap<SegmentId, IndexDelta>,
+    report: WriteReport,
+}
+
+impl PendingWrite {
+    fn new(ttl: Ttl, retention: PageRetention, streams: usize) -> Self {
+        Self {
+            ttl,
+            retention,
+            ops: Vec::new(),
+            next_stream_ids: HashMap::new(),
+            postings: HashMap::new(),
+            search_deltas: BTreeMap::new(),
+            report: WriteReport {
+                streams,
+                ..WriteReport::default()
+            },
+        }
+    }
+
+    fn put(&mut self, key: Bytes, value: Bytes) {
+        self.ops.push(put(key, value, self.ttl));
+    }
+
+    fn add_page(
+        &mut self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        stream_id: StreamId,
+        sequence: &mut u64,
+        (page, rows): (Page, Vec<LogEntry>),
+    ) -> Result<()> {
+        self.search_deltas.entry(segment).or_default().add_page(
+            stream_id,
+            *sequence,
+            rows.iter().map(|row| row.line.as_str()),
+        )?;
+        append_page_ops(
+            &mut self.ops,
+            namespace,
+            segment,
+            stream_id,
+            *sequence,
+            page,
+            self.retention,
+        )?;
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("stream exhausted page sequences".to_owned()))?;
+        self.report.pages += 1;
+        Ok(())
+    }
+}
+
 fn append_page_ops(
     ops: &mut Vec<RecordOp>,
     namespace: &Namespace,
@@ -769,14 +857,12 @@ fn append_page_ops(
         sequence,
     };
     let metadata = StoredPageMetadata {
-        version: CURRENT_PAGE_METADATA_VERSION,
         expires_at_unix_ms: retention.expires_at_unix_ms,
         min_timestamp_ns,
         max_timestamp_ns,
         row_count: page.row_count(),
         payload_bytes: u32::try_from(bytes.len())
             .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
-        blocks: page.blocks().to_vec(),
     };
     ops.push(put(
         metadata_key(namespace, segment, stream_id, page_id),
@@ -789,21 +875,6 @@ fn append_page_ops(
         retention.physical_ttl,
     ));
     Ok(())
-}
-
-fn index_page(
-    search_delta: &mut IndexDelta,
-    stream_id: StreamId,
-    sequence: u64,
-    page: &Page,
-) -> Result<()> {
-    search_delta.add_page(
-        stream_id,
-        sequence,
-        page.decode_range(i64::MIN, i64::MAX)?
-            .into_iter()
-            .map(|entry| entry.line),
-    )
 }
 
 fn put(key: Bytes, value: Bytes, ttl: Ttl) -> RecordOp {
@@ -971,6 +1042,43 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].entry, rows[1].entry);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_writes_top_up_the_trailing_posting_block() {
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::default();
+        for timestamp in 1..=5 {
+            db.write(
+                &namespace,
+                vec![LogBatch::new(
+                    labels("search", "prod"),
+                    vec![LogEntry::new(timestamp, "needle in haystack")],
+                )],
+            )
+            .await
+            .unwrap();
+        }
+        let stats = db
+            .storage
+            .get(crate::codec::term_stats_key(&namespace, 0, "needle"))
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = crate::search::decode_term_stats(&stats.value).unwrap();
+        assert_eq!(stats.documents, 5);
+        assert_eq!(stats.blocks, 1);
+
+        let terms = vec!["needle".to_owned()];
+        for top_k in [None, Some(2)] {
+            let rows = db
+                .read_match_bounded(&namespace, 0, 10, &[], (&terms, top_k), 10)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.len(), 5);
+        }
         db.close().await.unwrap();
     }
 

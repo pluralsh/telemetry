@@ -1,4 +1,5 @@
 pub mod config;
+pub mod openapi;
 
 mod http;
 mod internal_writer;

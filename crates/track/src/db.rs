@@ -3,13 +3,14 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::storage::{PutOptions, PutRecordOp, Record, RecordOp, Storage, Ttl, WriteOptions};
 use common::{StorageBuilder, StorageSemantics};
+use futures::{StreamExt, TryStreamExt, stream};
 use opentelemetry_proto::tonic::{
     common::v1::KeyValue,
     trace::v1::{ResourceSpans, ScopeSpans},
@@ -18,16 +19,20 @@ use prost::Message;
 use tokio::sync::Mutex;
 
 use crate::codec::{
-    METADATA_VERSION, StoredPageMetadata, TraceLocator, decode_indices, decode_locator,
-    decode_locator_trace_id, decode_metadata, decode_metadata_sequence, decode_posting_sequence,
-    decode_sequence, encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key,
+    PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices, decode_locator,
+    decode_locator_trace_id, decode_metadata, decode_posting_sequence, decode_sequence,
+    encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key,
     locator_namespace_range, locator_range, metadata_key, metadata_range, next_sequence_key,
     payload_key, posting_key, posting_range, segment_for,
 };
+
+/// Concurrent storage reads per query stage.
+const READ_CONCURRENCY: usize = 32;
+/// Traces materialized per batch, bounding how many pages are held at once.
+const MATERIALIZE_BATCH: usize = 256;
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Config, Error, Namespace, Page, PageBuilder,
     QueryOptions, Result, SegmentId, Trace, TraceBatch, TraceId, TraceQlResult,
-    TraceSegmentExtractor,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,8 +69,8 @@ impl TraceDb {
         config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
-        let semantics =
-            StorageSemantics::new().with_segment_extractor(TraceSegmentExtractor::shared());
+        let semantics = StorageSemantics::new()
+            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
         let storage = StorageBuilder::new(&config.storage)
             .await?
             .with_semantics(semantics)
@@ -130,21 +135,23 @@ impl TraceDb {
                 .transpose()?
                 .unwrap_or(0);
             let mut builder = PageBuilder::new(self.config.page.clone())?;
-            for trace in traces {
-                if let Some(page) = builder.append(trace)? {
-                    append_page_ops(&mut ops, namespace, segment, sequence, page, retention)?;
-                    sequence = sequence
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
-                    report.pages += 1;
-                }
-            }
-            if let Some(page) = builder.finish()? {
-                append_page_ops(&mut ops, namespace, segment, sequence, page, retention)?;
+            let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
+                append_page_ops(
+                    &mut ops, namespace, segment, sequence, &page, &traces, retention,
+                )?;
                 sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
                 report.pages += 1;
+                Ok(())
+            };
+            for trace in traces {
+                if let Some(completed) = builder.append_with_traces(trace)? {
+                    cut_page(completed)?;
+                }
+            }
+            if let Some(completed) = builder.finish_with_traces()? {
+                cut_page(completed)?;
             }
             ops.push(put(
                 sequence_key,
@@ -175,55 +182,7 @@ impl TraceDb {
         trace_id: TraceId,
     ) -> Result<Option<Trace>> {
         let now = unix_time_ms()?;
-        let mut locators = self
-            .storage
-            .scan_iter(locator_range(namespace, trace_id))
-            .await?;
-        let mut continuations = Vec::new();
-        while let Some(record) = locators.next().await? {
-            let locator = decode_locator(&record.value)?;
-            if locator.is_expired_at(now) {
-                continue;
-            }
-            let Some(metadata_record) = self
-                .storage
-                .get(metadata_key(
-                    namespace,
-                    locator.segment,
-                    locator.page_sequence,
-                ))
-                .await?
-            else {
-                return Err(Error::Corrupt(
-                    "trace locator references missing page metadata".to_owned(),
-                ));
-            };
-            let metadata = decode_metadata(&metadata_record.value)?;
-            if metadata.is_expired_at(now) {
-                continue;
-            }
-            let payload = self
-                .storage
-                .get(payload_key(
-                    namespace,
-                    locator.segment,
-                    locator.page_sequence,
-                ))
-                .await?
-                .ok_or_else(|| Error::Corrupt("trace page metadata has no payload".to_owned()))?;
-            let page = decode_stored_page(&metadata, payload.value)?;
-            let trace = page.decode_trace(locator.trace_index as usize)?;
-            if trace.trace_id != trace_id {
-                return Err(Error::Corrupt(
-                    "trace locator points to a different trace".to_owned(),
-                ));
-            }
-            continuations.push(trace);
-        }
-        if continuations.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(merge_continuations(trace_id, continuations)?))
+        Ok(self.materialize(namespace, &[trace_id], now).await?.pop())
     }
 
     /// Exact-match scalar attribute search over an inclusive OTLP nanosecond
@@ -236,28 +195,87 @@ impl TraceDb {
         end_ns: u64,
         matchers: &[AttributeMatcher],
     ) -> Result<Vec<Trace>> {
+        let now = unix_time_ms()?;
+        let ordered = self
+            .ordered_candidates(namespace, start_ns, end_ns, matchers, now)
+            .await?;
+        let mut results = Vec::with_capacity(ordered.len());
+        for batch in ordered.chunks(MATERIALIZE_BATCH) {
+            results.extend(
+                self.load_verified(namespace, batch.to_vec(), matchers)
+                    .await?,
+            );
+        }
+        Ok(results)
+    }
+
+    /// Candidates overlapping `[start_ns, end_ns]`, in result order
+    /// `(start, trace ID)`. Exact trace bounds come from locators and page
+    /// metadata, so callers can stop loading payloads once they have enough.
+    async fn ordered_candidates(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        matchers: &[AttributeMatcher],
+        now: u64,
+    ) -> Result<Vec<Located>> {
         if end_ns < start_ns {
             return Err(Error::Invalid("end_ns must be >= start_ns".to_owned()));
         }
+        let candidates = self
+            .candidate_ids(namespace, start_ns, end_ns, matchers, now)
+            .await?;
+        let mut located = Vec::with_capacity(candidates.len());
+        for batch in candidates.chunks(MATERIALIZE_BATCH) {
+            let batch = self.scan_locators(namespace, batch, now).await?;
+            located.extend(
+                self.bound(namespace, batch)
+                    .await?
+                    .into_iter()
+                    .filter(|trace| trace.end_ns >= start_ns && trace.start_ns <= end_ns),
+            );
+        }
+        located.sort_unstable_by_key(|trace| (trace.start_ns, trace.trace_id));
+        Ok(located)
+    }
+
+    /// Loads located candidates in order, keeping those whose decoded spans
+    /// satisfy every matcher (postings only nominate candidates).
+    async fn load_verified(
+        &self,
+        namespace: &Namespace,
+        located: Vec<Located>,
+        matchers: &[AttributeMatcher],
+    ) -> Result<Vec<Trace>> {
+        let mut traces = self
+            .load_located(
+                namespace,
+                located
+                    .into_iter()
+                    .map(|trace| (trace.trace_id, trace.locators))
+                    .collect(),
+            )
+            .await?;
+        traces.retain(|trace| matchers.iter().all(|matcher| trace_matches(trace, matcher)));
+        Ok(traces)
+    }
+
+    async fn candidate_ids(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        matchers: &[AttributeMatcher],
+        now: u64,
+    ) -> Result<Vec<TraceId>> {
         let first_segment = segment_for(start_ns, self.segment_ns);
         let last_segment = segment_for(end_ns, self.segment_ns);
-        if last_segment.saturating_sub(first_segment) > 4_096 {
-            return self
-                .search_existing_locators(
-                    namespace,
-                    first_segment,
-                    last_segment,
-                    start_ns,
-                    end_ns,
-                    matchers,
-                )
-                .await;
-        }
-        let now = unix_time_ms()?;
-        let mut candidate_ids: Option<BTreeSet<TraceId>> = None;
-
-        if matchers.is_empty() {
-            let mut ids = BTreeSet::new();
+        Ok(if last_segment.saturating_sub(first_segment) > 4_096 {
+            self.existing_locator_candidates(namespace, first_segment, last_segment, now)
+                .await?
+        } else if matchers.is_empty() {
+            let mut candidates = Candidates::default();
             for segment in first_segment..=last_segment {
                 let mut metadata = self
                     .storage
@@ -265,137 +283,141 @@ impl TraceDb {
                     .await?;
                 while let Some(record) = metadata.next().await? {
                     let page_metadata = decode_metadata(&record.value)?;
-                    if page_metadata.is_expired_at(now)
-                        || page_metadata.max_timestamp_ns < start_ns
-                        || page_metadata.min_timestamp_ns > end_ns
+                    if page_metadata.is_expired_at(now) || !page_metadata.overlaps(start_ns, end_ns)
                     {
                         continue;
                     }
-                    let sequence = decode_metadata_sequence(&record.key)?;
-                    let page = self.load_page(namespace, segment, sequence).await?;
-                    for entry in page.directory() {
-                        if entry.max_timestamp_ns >= start_ns && entry.min_timestamp_ns <= end_ns {
-                            ids.insert(entry.trace_id);
+                    for trace in &page_metadata.traces {
+                        if trace.overlaps(start_ns, end_ns) {
+                            candidates.insert(trace.trace_id);
                         }
                     }
                 }
             }
-            candidate_ids = Some(ids);
+            candidates.order
         } else {
+            let mut candidates: Option<Candidates> = None;
             for matcher in matchers {
-                let mut matcher_ids = BTreeSet::new();
-                for segment in first_segment..=last_segment {
-                    let mut postings = self
-                        .storage
-                        .scan_iter(posting_range(namespace, segment, matcher))
-                        .await?;
-                    while let Some(record) = postings.next().await? {
-                        let sequence = decode_posting_sequence(&record.key)?;
-                        let Some(metadata_record) = self
-                            .storage
-                            .get(metadata_key(namespace, segment, sequence))
-                            .await?
-                        else {
-                            return Err(Error::Corrupt(
-                                "attribute posting references missing metadata".to_owned(),
-                            ));
-                        };
-                        let metadata = decode_metadata(&metadata_record.value)?;
-                        if metadata.is_expired_at(now)
-                            || metadata.max_timestamp_ns < start_ns
-                            || metadata.min_timestamp_ns > end_ns
-                        {
-                            continue;
-                        }
-                        let page = self.load_page(namespace, segment, sequence).await?;
-                        for index in decode_indices(&record.value)? {
-                            let entry = page.directory().get(index as usize).ok_or_else(|| {
-                                Error::Corrupt(
-                                    "attribute posting trace index is out of bounds".to_owned(),
-                                )
-                            })?;
-                            if entry.max_timestamp_ns >= start_ns
-                                && entry.min_timestamp_ns <= end_ns
-                            {
-                                matcher_ids.insert(entry.trace_id);
-                            }
-                        }
+                let matched = self
+                    .posting_candidates(
+                        namespace,
+                        first_segment..=last_segment,
+                        matcher,
+                        start_ns,
+                        end_ns,
+                        now,
+                    )
+                    .await?;
+                candidates = Some(match candidates {
+                    None => matched,
+                    Some(mut candidates) => {
+                        candidates.retain_in(&matched);
+                        candidates
                     }
-                }
-                candidate_ids = Some(match candidate_ids {
-                    None => matcher_ids,
-                    Some(ids) => ids.intersection(&matcher_ids).copied().collect(),
                 });
             }
-        }
-
-        let mut results = Vec::new();
-        for trace_id in candidate_ids.unwrap_or_default() {
-            let Some(trace) = self.get_trace(namespace, trace_id).await? else {
-                continue;
-            };
-            let (min, max) = trace.timestamp_range();
-            if max >= start_ns
-                && min <= end_ns
-                && matchers
-                    .iter()
-                    .all(|matcher| trace_matches(&trace, matcher))
-            {
-                results.push(trace);
-            }
-        }
-        results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
-        Ok(results)
+            candidates.unwrap_or_default().order
+        })
     }
 
-    async fn search_existing_locators(
+    /// Resolves one matcher's postings to trace IDs through page metadata,
+    /// which carries the page directory, so no payload is fetched.
+    async fn posting_candidates(
+        &self,
+        namespace: &Namespace,
+        segments: std::ops::RangeInclusive<SegmentId>,
+        matcher: &AttributeMatcher,
+        start_ns: u64,
+        end_ns: u64,
+        now: u64,
+    ) -> Result<Candidates> {
+        let mut candidates = Candidates::default();
+        for segment in segments {
+            let mut postings = self
+                .storage
+                .scan_iter(posting_range(namespace, segment, matcher))
+                .await?;
+            let mut pages = Vec::new();
+            while let Some(record) = postings.next().await? {
+                pages.push((
+                    decode_posting_sequence(&record.key)?,
+                    decode_indices(&record.value)?,
+                ));
+            }
+            let mut pages = stream::iter(pages)
+                .map(|(sequence, indices)| async move {
+                    let record = self
+                        .storage
+                        .get(metadata_key(namespace, segment, sequence))
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corrupt(
+                                "attribute posting references missing metadata".to_owned(),
+                            )
+                        })?;
+                    Ok::<_, Error>((decode_metadata(&record.value)?, indices))
+                })
+                .buffered(READ_CONCURRENCY);
+            while let Some((metadata, indices)) = pages.try_next().await? {
+                if metadata.is_expired_at(now) || !metadata.overlaps(start_ns, end_ns) {
+                    continue;
+                }
+                for index in indices {
+                    let trace = metadata.traces.get(index as usize).ok_or_else(|| {
+                        Error::Corrupt("attribute posting trace index is out of bounds".to_owned())
+                    })?;
+                    if trace.overlaps(start_ns, end_ns) {
+                        candidates.insert(trace.trace_id);
+                    }
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Candidate IDs from every live locator whose page lies in the segment
+    /// range, for spans too wide to enumerate segment by segment.
+    async fn existing_locator_candidates(
         &self,
         namespace: &Namespace,
         first_segment: SegmentId,
         last_segment: SegmentId,
-        start_ns: u64,
-        end_ns: u64,
-        matchers: &[AttributeMatcher],
-    ) -> Result<Vec<Trace>> {
-        let now = unix_time_ms()?;
+        now: u64,
+    ) -> Result<Vec<TraceId>> {
         let mut records = self
             .storage
             .scan_iter(locator_namespace_range(namespace))
             .await?;
-        let mut ids = BTreeSet::new();
+        let mut first_pages = HashMap::new();
         while let Some(record) = records.next().await? {
             let locator = decode_locator(&record.value)?;
             if !locator.is_expired_at(now)
                 && locator.segment >= first_segment
                 && locator.segment <= last_segment
             {
-                ids.insert(decode_locator_trace_id(&record.key)?);
+                first_pages
+                    .entry(decode_locator_trace_id(&record.key)?)
+                    .or_insert((locator.segment, locator.page_sequence));
             }
         }
-
-        let mut results = Vec::new();
-        for trace_id in ids {
-            let Some(trace) = self.get_trace(namespace, trace_id).await? else {
-                continue;
-            };
-            let (min, max) = trace.timestamp_range();
-            if max >= start_ns
-                && min <= end_ns
-                && matchers
-                    .iter()
-                    .all(|matcher| trace_matches(&trace, matcher))
-            {
-                results.push(trace);
-            }
-        }
-        results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
-        Ok(results)
+        Ok(order_by_first_page(first_pages))
     }
 
     /// Enumerates up to `limit` live traces by scanning locator records that
     /// actually exist. Unlike a full-range search, this does not walk every
     /// theoretical time segment between zero and `u64::MAX`.
     pub async fn scan_traces(&self, namespace: &Namespace, limit: usize) -> Result<Vec<Trace>> {
+        let scanned = self.scan_trace_ids(namespace, limit).await?;
+        self.load_scanned(namespace, scanned).await
+    }
+
+    /// The first `limit` live trace IDs in ID order, with each trace's first
+    /// page. Reads locators only.
+    pub(crate) async fn scan_trace_ids(
+        &self,
+        namespace: &Namespace,
+        limit: usize,
+    ) -> Result<Vec<ScannedTrace>> {
         if limit == 0 {
             return Err(Error::Invalid(
                 "trace scan limit must be greater than zero".to_owned(),
@@ -406,22 +428,43 @@ impl TraceDb {
             .storage
             .scan_iter(locator_namespace_range(namespace))
             .await?;
-        let mut ids = BTreeSet::new();
-        while ids.len() < limit {
-            let Some(record) = records.next().await? else {
-                break;
-            };
-            if decode_locator(&record.value)?.is_expired_at(now) {
+        let mut scanned: Vec<ScannedTrace> = Vec::new();
+        // Locator keys sort by trace ID, so a trace's continuations are adjacent.
+        while let Some(record) = records.next().await? {
+            let locator = decode_locator(&record.value)?;
+            if locator.is_expired_at(now) {
                 continue;
             }
-            ids.insert(decode_locator_trace_id(&record.key)?);
-        }
-        let mut traces = Vec::with_capacity(ids.len());
-        for trace_id in ids {
-            if let Some(trace) = self.get_trace(namespace, trace_id).await? {
-                traces.push(trace);
+            let trace_id = decode_locator_trace_id(&record.key)?;
+            if scanned.last().is_some_and(|last| last.trace_id == trace_id) {
+                continue;
             }
+            if scanned.len() == limit {
+                break;
+            }
+            scanned.push(ScannedTrace {
+                trace_id,
+                first_page: (locator.segment, locator.page_sequence),
+            });
         }
+        Ok(scanned)
+    }
+
+    /// Loads traces found by [`scan_trace_ids`](Self::scan_trace_ids),
+    /// ordered by start time.
+    pub(crate) async fn load_scanned(
+        &self,
+        namespace: &Namespace,
+        scanned: Vec<ScannedTrace>,
+    ) -> Result<Vec<Trace>> {
+        let now = unix_time_ms()?;
+        let candidates = order_by_first_page(
+            scanned
+                .into_iter()
+                .map(|scanned| (scanned.trace_id, scanned.first_page))
+                .collect(),
+        );
+        let mut traces = self.materialize(namespace, &candidates, now).await?;
         traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         Ok(traces)
     }
@@ -467,43 +510,52 @@ impl TraceDb {
             .into());
         }
         let plan = crate::traceql::plan(query)?;
-        let candidates = self
-            .search(namespace, start_ns, end_ns, &plan.pushdown)
+        let now = unix_time_ms()?;
+        // Candidates are already in result order `(start, trace ID)`, so the
+        // first `limit` matches are the answer and later candidates are never
+        // loaded.
+        let ordered = self
+            .ordered_candidates(namespace, start_ns, end_ns, &plan.pushdown, now)
             .await?;
-        if candidates.len() > options.max_candidate_traces {
-            return Err(crate::traceql::QueryError::Limit(format!(
-                "{} candidate traces exceeds maximum {}",
-                candidates.len(),
-                options.max_candidate_traces
-            ))
-            .into());
-        }
         let mut results = Vec::new();
-        let mut tasks = tokio::task::JoinSet::new();
-        for trace in candidates {
-            while tasks.len() >= options.max_concurrency {
-                let result = tasks
-                    .join_next()
-                    .await
-                    .expect("query task set is non-empty")
+        let mut loaded = 0;
+        let mut remaining = ordered.as_slice();
+        while results.len() < options.limit && !remaining.is_empty() {
+            let wanted = (options.limit - results.len())
+                .max(options.max_concurrency)
+                .min(MATERIALIZE_BATCH)
+                .min(remaining.len());
+            let (batch, rest) = remaining.split_at(wanted);
+            remaining = rest;
+            let traces = self
+                .load_verified(namespace, batch.to_vec(), &plan.pushdown)
+                .await?;
+            loaded += traces.len();
+            if loaded > options.max_candidate_traces {
+                return Err(crate::traceql::QueryError::Limit(format!(
+                    "{loaded} candidate traces exceeds maximum {}",
+                    options.max_candidate_traces
+                ))
+                .into());
+            }
+            let mut executed = stream::iter(traces)
+                .map(|trace| {
+                    let query = plan.query.clone();
+                    let max_spans = options.max_spans_per_trace;
+                    tokio::spawn(async move { crate::traceql::execute(&trace, &query, max_spans) })
+                })
+                .buffered(options.max_concurrency);
+            while let Some(result) = executed.next().await {
+                let result = result
                     .map_err(|error| Error::Invalid(format!("TraceQL task failed: {error}")))??;
                 if let Some(result) = result {
                     results.push(result);
+                    if results.len() == options.limit {
+                        break;
+                    }
                 }
             }
-            let query = plan.query.clone();
-            let max_spans = options.max_spans_per_trace;
-            tasks.spawn(async move { crate::traceql::execute(&trace, &query, max_spans) });
         }
-        while let Some(result) = tasks.join_next().await {
-            let result = result
-                .map_err(|error| Error::Invalid(format!("TraceQL task failed: {error}")))??;
-            if let Some(result) = result {
-                results.push(result);
-            }
-        }
-        results.sort_by_key(|result| (result.start_ns, result.trace_id));
-        results.truncate(options.limit);
         Ok(results)
     }
 
@@ -517,24 +569,152 @@ impl TraceDb {
         Ok(())
     }
 
-    async fn load_page(
+    /// Decodes every live continuation of each trace and merges them. Work
+    /// runs in bounded batches: locator scans and payload fetches are
+    /// concurrent within a batch, and each page is fetched once per batch no
+    /// matter how many of its traces are wanted. Callers order `trace_ids` by
+    /// page so batches share pages.
+    async fn materialize(
         &self,
         namespace: &Namespace,
-        segment: SegmentId,
-        sequence: u64,
-    ) -> Result<Page> {
-        let metadata = self
-            .storage
-            .get(metadata_key(namespace, segment, sequence))
-            .await?
-            .ok_or_else(|| Error::Corrupt("trace page metadata is missing".to_owned()))?;
-        let metadata = decode_metadata(&metadata.value)?;
-        let payload = self
-            .storage
-            .get(payload_key(namespace, segment, sequence))
-            .await?
-            .ok_or_else(|| Error::Corrupt("trace page payload is missing".to_owned()))?;
-        decode_stored_page(&metadata, payload.value)
+        trace_ids: &[TraceId],
+        now: u64,
+    ) -> Result<Vec<Trace>> {
+        let mut traces = Vec::with_capacity(trace_ids.len());
+        for batch in trace_ids.chunks(MATERIALIZE_BATCH) {
+            let located = self.scan_locators(namespace, batch, now).await?;
+            traces.extend(self.load_located(namespace, located).await?);
+        }
+        Ok(traces)
+    }
+
+    /// Live locators of each trace, concurrently.
+    async fn scan_locators(
+        &self,
+        namespace: &Namespace,
+        trace_ids: &[TraceId],
+        now: u64,
+    ) -> Result<Vec<(TraceId, Vec<TraceLocator>)>> {
+        stream::iter(trace_ids.iter().copied())
+            .map(|trace_id| async move {
+                let mut records = self
+                    .storage
+                    .scan_iter(locator_range(namespace, trace_id))
+                    .await?;
+                let mut locators = Vec::new();
+                while let Some(record) = records.next().await? {
+                    let locator = decode_locator(&record.value)?;
+                    if !locator.is_expired_at(now) {
+                        locators.push(locator);
+                    }
+                }
+                Ok::<_, Error>((trace_id, locators))
+            })
+            .buffered(READ_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
+    /// Exact time bounds of each located trace from its pages' metadata:
+    /// merging continuations only drops duplicate spans, so the merged trace
+    /// spans the union of its continuations' ranges. Traces with no live
+    /// continuation are dropped.
+    async fn bound(
+        &self,
+        namespace: &Namespace,
+        located: Vec<(TraceId, Vec<TraceLocator>)>,
+    ) -> Result<Vec<Located>> {
+        let wanted: BTreeSet<PageRef> = located
+            .iter()
+            .flat_map(|(_, locators)| locators.iter().map(TraceLocator::page))
+            .collect();
+        let metadata: HashMap<PageRef, StoredPageMetadata> = stream::iter(wanted)
+            .map(|page @ (segment, sequence)| async move {
+                let record = self
+                    .storage
+                    .get(metadata_key(namespace, segment, sequence))
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corrupt("trace locator references missing metadata".to_owned())
+                    })?;
+                Ok::<_, Error>((page, decode_metadata(&record.value)?))
+            })
+            .buffer_unordered(READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+        located
+            .into_iter()
+            .filter(|(_, locators)| !locators.is_empty())
+            .map(|(trace_id, locators)| {
+                let mut start_ns = u64::MAX;
+                let mut end_ns = 0;
+                for locator in &locators {
+                    let trace = metadata[&locator.page()]
+                        .traces
+                        .get(locator.trace_index as usize)
+                        .filter(|trace| trace.trace_id == trace_id)
+                        .ok_or_else(|| {
+                            Error::Corrupt("trace locator disagrees with page metadata".to_owned())
+                        })?;
+                    start_ns = start_ns.min(trace.min_timestamp_ns);
+                    end_ns = end_ns.max(trace.max_timestamp_ns);
+                }
+                Ok(Located {
+                    trace_id,
+                    locators,
+                    start_ns,
+                    end_ns,
+                })
+            })
+            .collect()
+    }
+
+    /// Fetches each referenced page once, then decodes and merges every
+    /// trace's continuations, preserving input order.
+    async fn load_located(
+        &self,
+        namespace: &Namespace,
+        located: Vec<(TraceId, Vec<TraceLocator>)>,
+    ) -> Result<Vec<Trace>> {
+        let wanted: BTreeSet<PageRef> = located
+            .iter()
+            .flat_map(|(_, locators)| locators.iter().map(TraceLocator::page))
+            .collect();
+        let pages: HashMap<PageRef, Page> = stream::iter(wanted)
+            .map(|page @ (segment, sequence)| async move {
+                let payload = self
+                    .storage
+                    .get(payload_key(namespace, segment, sequence))
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corrupt("trace locator references a missing page".to_owned())
+                    })?;
+                Ok::<_, Error>((page, Page::decode(payload.value)?))
+            })
+            .buffer_unordered(READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut traces = Vec::with_capacity(located.len());
+        for (trace_id, locators) in located {
+            if locators.is_empty() {
+                continue;
+            }
+            let continuations = locators
+                .iter()
+                .map(|locator| {
+                    let trace =
+                        pages[&locator.page()].decode_trace(locator.trace_index as usize)?;
+                    if trace.trace_id != trace_id {
+                        return Err(Error::Corrupt(
+                            "trace locator points to a different trace".to_owned(),
+                        ));
+                    }
+                    Ok(trace)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            traces.push(merge_continuations(trace_id, continuations)?);
+        }
+        Ok(traces)
     }
 
     fn ttl(&self) -> Result<Ttl> {
@@ -563,32 +743,47 @@ impl TraceDb {
     }
 }
 
-fn decode_stored_page(metadata: &StoredPageMetadata, payload: Bytes) -> Result<Page> {
-    if payload.len() != metadata.payload_bytes as usize {
-        return Err(Error::Corrupt(
-            "trace page payload length disagrees with metadata".to_owned(),
-        ));
+/// Search candidates deduplicated in discovery order, which follows page
+/// order so materialization batches share pages.
+#[derive(Default)]
+struct Candidates {
+    order: Vec<TraceId>,
+    seen: HashSet<TraceId>,
+}
+
+impl Candidates {
+    fn insert(&mut self, trace_id: TraceId) {
+        if self.seen.insert(trace_id) {
+            self.order.push(trace_id);
+        }
     }
-    let page = Page::decode(payload)?;
-    if page.directory().len() != metadata.trace_count as usize
-        || page
-            .directory()
-            .iter()
-            .map(|entry| entry.min_timestamp_ns)
-            .min()
-            != Some(metadata.min_timestamp_ns)
-        || page
-            .directory()
-            .iter()
-            .map(|entry| entry.max_timestamp_ns)
-            .max()
-            != Some(metadata.max_timestamp_ns)
-    {
-        return Err(Error::Corrupt(
-            "trace page directory disagrees with metadata".to_owned(),
-        ));
+
+    fn retain_in(&mut self, other: &Self) {
+        self.order.retain(|trace_id| other.seen.contains(trace_id));
+        self.seen.retain(|trace_id| other.seen.contains(trace_id));
     }
-    Ok(page)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScannedTrace {
+    pub(crate) trace_id: TraceId,
+    first_page: PageRef,
+}
+
+/// A trace's live continuations and exact time bounds, before any payload
+/// is fetched.
+#[derive(Clone, Debug)]
+struct Located {
+    trace_id: TraceId,
+    locators: Vec<TraceLocator>,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+fn order_by_first_page(first_pages: HashMap<TraceId, PageRef>) -> Vec<TraceId> {
+    let mut ordered: Vec<_> = first_pages.into_iter().collect();
+    ordered.sort_unstable_by_key(|&(trace_id, page)| (page, trace_id));
+    ordered.into_iter().map(|(trace_id, _)| trace_id).collect()
 }
 
 fn append_page_ops(
@@ -596,31 +791,31 @@ fn append_page_ops(
     namespace: &Namespace,
     segment: SegmentId,
     sequence: u64,
-    page: Page,
+    page: &Page,
+    traces: &[Trace],
     retention: Retention,
 ) -> Result<()> {
-    let bytes = page.bytes();
-    let min_timestamp_ns = page
-        .directory()
-        .iter()
-        .map(|entry| entry.min_timestamp_ns)
-        .min()
-        .unwrap();
-    let max_timestamp_ns = page
-        .directory()
-        .iter()
-        .map(|entry| entry.max_timestamp_ns)
-        .max()
-        .unwrap();
+    let directory = page.directory();
     let metadata = StoredPageMetadata {
-        version: METADATA_VERSION,
         expires_at_unix_ms: retention.expires_at_unix_ms,
-        min_timestamp_ns,
-        max_timestamp_ns,
-        trace_count: u32::try_from(page.directory().len())
-            .map_err(|_| Error::Invalid("page trace count exceeds u32".to_owned()))?,
-        payload_bytes: u32::try_from(bytes.len())
-            .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
+        min_timestamp_ns: directory
+            .iter()
+            .map(|entry| entry.min_timestamp_ns)
+            .min()
+            .unwrap(),
+        max_timestamp_ns: directory
+            .iter()
+            .map(|entry| entry.max_timestamp_ns)
+            .max()
+            .unwrap(),
+        traces: directory
+            .iter()
+            .map(|entry| PageTrace {
+                trace_id: entry.trace_id,
+                min_timestamp_ns: entry.min_timestamp_ns,
+                max_timestamp_ns: entry.max_timestamp_ns,
+            })
+            .collect(),
     };
     ops.push(put(
         metadata_key(namespace, segment, sequence),
@@ -629,17 +824,18 @@ fn append_page_ops(
     ));
     ops.push(put(
         payload_key(namespace, segment, sequence),
-        bytes,
+        page.bytes(),
         retention.physical_ttl,
     ));
 
-    let mut postings: Vec<(AttributeMatcher, Vec<u32>)> = Vec::new();
-    for (index, entry) in page.directory().iter().enumerate() {
-        let trace = page.decode_trace(index)?;
+    // Keyed by the encoded posting key, which already identifies matchers
+    // exactly (scope, name, and typed value, with doubles compared by bits).
+    let mut postings: HashMap<Bytes, Vec<u32>> = HashMap::new();
+    for (index, (entry, trace)) in page.directory().iter().zip(traces).enumerate() {
+        debug_assert_eq!(entry.trace_id, trace.trace_id);
         ops.push(put(
             locator_key(namespace, trace.trace_id, segment, sequence),
             encode_locator(&TraceLocator {
-                version: METADATA_VERSION,
                 segment,
                 page_sequence: sequence,
                 trace_index: u32::try_from(index)
@@ -649,28 +845,18 @@ fn append_page_ops(
             retention.physical_ttl,
         ));
         let mut seen = Vec::new();
-        collect_trace_attributes(&trace, &mut seen);
+        collect_trace_attributes(trace, &mut seen);
         for matcher in seen {
-            if let Some((_, indices)) = postings.iter_mut().find(|(existing, _)| {
-                existing.scope == matcher.scope
-                    && existing.name == matcher.name
-                    && existing.value.exact_eq(&matcher.value)
-            }) {
-                indices.push(index as u32);
-            } else {
-                postings.push((matcher, vec![index as u32]));
-            }
+            postings
+                .entry(posting_key(namespace, segment, &matcher, sequence))
+                .or_default()
+                .push(index as u32);
         }
-        debug_assert_eq!(entry.trace_id, trace.trace_id);
     }
-    for (matcher, mut indices) in postings {
+    for (key, mut indices) in postings {
         indices.sort_unstable();
         indices.dedup();
-        ops.push(put(
-            posting_key(namespace, segment, &matcher, sequence),
-            encode_indices(&indices)?,
-            retention.physical_ttl,
-        ));
+        ops.push(put(key, encode_indices(&indices)?, retention.physical_ttl));
     }
     Ok(())
 }
@@ -985,6 +1171,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_merges_continuations_across_pages_and_batches() {
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::default();
+        let count = MATERIALIZE_BATCH as u64 + 3;
+        let single_span = |index: u64, span_id: u8, start_ns: u64| {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&(index + 1).to_be_bytes());
+            Trace::new(
+                TraceId::new(id).unwrap(),
+                vec![ResourceSpans {
+                    scope_spans: vec![ScopeSpans {
+                        spans: vec![Span {
+                            trace_id: id.to_vec(),
+                            span_id: vec![span_id; 8],
+                            start_time_unix_nano: start_ns,
+                            end_time_unix_nano: start_ns + 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            )
+            .unwrap()
+        };
+        let traces: Vec<_> = (0..count)
+            .map(|index| single_span(index, 1, 1 + index))
+            .collect();
+        db.write(&namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+        db.write(
+            &namespace,
+            vec![TraceBatch::new(vec![single_span(0, 2, 5)])],
+        )
+        .await
+        .unwrap();
+
+        let found = db.search(&namespace, 0, 1_000, &[]).await.unwrap();
+        assert_eq!(found.len(), count as usize);
+        let merged = found
+            .iter()
+            .find(|trace| trace.trace_id == traces[0].trace_id)
+            .unwrap();
+        assert_eq!(merged.spans().count(), 2);
+        assert_eq!(
+            db.scan_traces(&namespace, 2).await.unwrap().len(),
+            2,
+            "scan limit counts distinct traces"
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn exact_typed_search_distinguishes_values_and_intersects_matchers() {
         let db = TraceDb::open(test_config()).await.unwrap();
         let namespace = Namespace::default();
@@ -1249,6 +1489,63 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matched_spans[0].name, "first");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn traceql_limit_stops_loading_without_changing_results() {
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::default();
+        // Start order is the reverse of ID order, spread over several pages.
+        for chunk in (1..=30u8).collect::<Vec<_>>().chunks(10) {
+            db.write(
+                &namespace,
+                vec![TraceBatch::new(
+                    chunk
+                        .iter()
+                        .map(|&id| trace(id, u64::from(31 - id) * 10, "span", vec![], vec![]))
+                        .collect(),
+                )],
+            )
+            .await
+            .unwrap();
+        }
+        // A later continuation moves trace 1 from last to first.
+        let mut early = trace(1, 5, "early", vec![], vec![]);
+        early.resource_spans[0].scope_spans[0].spans[0].span_id = vec![0xee; 8];
+        db.write(&namespace, vec![TraceBatch::new(vec![early])])
+            .await
+            .unwrap();
+        let query = |options| db.query_traceql(&namespace, 0, 1_000, "{}", options);
+        let key = |results: Vec<TraceQlResult>| {
+            results
+                .into_iter()
+                .map(|result| (result.start_ns, result.trace_id))
+                .collect::<Vec<_>>()
+        };
+        let all = key(query(QueryOptions::default()).await.unwrap());
+        assert_eq!(all.len(), 30);
+        assert_eq!(all[0], (5, TraceId::new([1; 16]).unwrap()));
+        assert!(all.is_sorted());
+        for limit in [1, 3, 8, 29, 30] {
+            let limited = key(query(QueryOptions {
+                limit,
+                max_concurrency: 2,
+                ..QueryOptions::default()
+            })
+            .await
+            .unwrap());
+            assert_eq!(limited, all[..limit], "limit {limit}");
+        }
+        // Only the first batch is loaded, so a cap below the match count holds.
+        let limited = query(QueryOptions {
+            limit: 3,
+            max_candidate_traces: 10,
+            ..QueryOptions::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(key(limited), all[..3]);
         db.close().await.unwrap();
     }
 

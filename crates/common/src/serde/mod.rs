@@ -3,6 +3,7 @@
 pub mod encoding;
 pub mod key_prefix;
 pub mod record_tag;
+pub mod scope;
 pub mod seq_block;
 pub mod sortable;
 pub mod subsystem;

@@ -94,7 +94,7 @@ pub fn decode_fixed_element_array<T: Decode>(
 }
 
 /// Namespace-aware key format version.
-pub const KEY_VERSION: u8 = 0x03;
+pub const KEY_VERSION: u8 = 0x01;
 
 /// Subsystem byte for timeseries storage (see [`common::serde::subsystem`]).
 pub const SUBSYSTEM: u8 = common::serde::subsystem::TIMESERIES;
@@ -104,7 +104,7 @@ pub const MIN_PREFIX_AND_RECORD_TYPE_LEN: usize = KEY_PREFIX_LEN + 1 + 4 + 1 + 1
 
 /// Record type enumeration for timeseries storage.
 ///
-/// Encoded as a single byte at position 7 of every bucket-scoped key.
+/// Encoded as the single byte after `bucket_size` in every bucket-scoped key.
 /// `0x01` is reserved (formerly `BucketList`, now superseded by SlateDB
 /// segments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +135,7 @@ impl RecordType {
     }
 }
 
-/// Writes the 8-byte bucket-scoped header `[subsystem, version,
+/// Writes the bucket-scoped header `[subsystem, version, namespace\0,
 /// time_bucket(4 BE), bucket_size, record_type]` to `buf`.
 ///
 /// `bucket.size == 0` is reserved and panics.

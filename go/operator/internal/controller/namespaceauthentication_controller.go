@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -62,6 +63,9 @@ func (r *NamespaceAuthenticationReconciler) Reconcile(ctx context.Context, req c
 		Type: "Ready", Status: status, Reason: reason, Message: message,
 		ObservedGeneration: auth.Generation, LastTransitionTime: metav1.NewTime(time.Now()),
 	})
+	if equality.Semantic.DeepEqual(base.Status, auth.Status) {
+		return ctrl.Result{}, nil
+	}
 	return ctrl.Result{}, r.Status().Patch(ctx, auth, client.MergeFrom(base))
 }
 

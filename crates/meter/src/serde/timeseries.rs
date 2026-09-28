@@ -4,6 +4,8 @@ use crate::model::Sample;
 
 use super::*;
 use bytes::Bytes;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use tsz::stream::{BufferedWriter, Error as TszError, Read as TszRead};
 use tsz::{Bit, DataPoint, Decode, Encode, StdDecoder, StdEncoder};
 
@@ -255,40 +257,42 @@ pub(crate) fn merge_batch_time_series(
         return Ok(sources[0].clone());
     }
 
-    // Decode all sources into (priority, timestamp, value) triples.
-    // Priority is the source index: higher index = newer = wins on tie.
-    let mut samples: Vec<(usize, i64, f64)> = Vec::new();
-    for (priority, source) in sources.iter().enumerate() {
-        let iter = TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty");
-        for result in iter {
-            let sample = result?;
-            samples.push((priority, sample.timestamp_ms, sample.value));
+    // K-way merge over the sources' decoders; every encoded stream is sorted
+    // by timestamp. Priority is the source index: higher = newer = wins a
+    // timestamp tie. The heap holds one head per source ordered by
+    // (timestamp, newest first), so every source holding the smallest pending
+    // timestamp is at its head when that timestamp is popped. The first pop
+    // wins; later samples at the same timestamp (older sources, or repeats
+    // within one source) are dropped.
+    let mut iters = sources
+        .iter()
+        .map(|source| TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty"))
+        .collect::<Vec<_>>();
+    let mut values = vec![0.0; iters.len()];
+    let mut heap = BinaryHeap::with_capacity(iters.len());
+    for (priority, iter) in iters.iter_mut().enumerate() {
+        if let Some(sample) = iter.next().transpose()? {
+            values[priority] = sample.value;
+            heap.push(Reverse((sample.timestamp_ms, Reverse(priority))));
+        }
+    }
+
+    let mut encoder: Option<StdEncoder<BufferedWriter>> = None;
+    let mut last = None;
+    while let Some(Reverse((timestamp, Reverse(priority)))) = heap.pop() {
+        if last != Some(timestamp) {
+            last = Some(timestamp);
+            encoder
+                .get_or_insert_with(|| StdEncoder::new(timestamp as u64, BufferedWriter::new()))
+                .encode(DataPoint::new(timestamp as u64, values[priority]));
+        }
+        if let Some(sample) = iters[priority].next().transpose()? {
+            values[priority] = sample.value;
+            heap.push(Reverse((sample.timestamp_ms, Reverse(priority))));
         }
     }
     // If all iterators returned None immediately, treat as empty.
-    if samples.is_empty() {
-        return Ok(Bytes::new());
-    }
-
-    // Sort by timestamp ascending, then by priority descending (newest first)
-    samples.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
-    // Dedup by timestamp, keeping the first (highest priority) entry (last write wins)
-    samples.dedup_by(|a, b| a.1 == b.1);
-
-    // Encode the merged result
-    let writer = BufferedWriter::new();
-    let start_time = samples[0].1 as u64;
-    let mut encoder = StdEncoder::new(start_time, writer);
-
-    for &(_, timestamp, value) in &samples {
-        encoder.encode(DataPoint::new(timestamp as u64, value));
-    }
-
-    // Close encoder to get compressed data
-    let compressed = encoder.close();
-
-    // Convert directly to Bytes without copying
-    Ok(Bytes::from(compressed))
+    Ok(encoder.map_or_else(Bytes::new, |encoder| Bytes::from(encoder.close())))
 }
 
 #[cfg(test)]
@@ -616,6 +620,62 @@ mod tests {
 
         // then
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn should_match_sort_and_dedup_oracle_on_random_operands() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for _ in 0..200 {
+            let sources: Vec<Vec<Sample>> = (0..1 + next(5))
+                .map(|_| {
+                    (0..next(12))
+                        .map(|_| Sample {
+                            // A narrow range forces ties within and across sources.
+                            timestamp_ms: next(16) as i64 * 1000,
+                            value: next(1_000) as f64,
+                        })
+                        .collect()
+                })
+                .collect();
+            let encoded: Vec<Bytes> = sources
+                .iter()
+                .map(|points| {
+                    TimeSeriesValue {
+                        points: points.clone(),
+                    }
+                    .encode()
+                    .unwrap()
+                })
+                .collect();
+
+            let mut expected: Vec<(usize, Sample)> = encoded
+                .iter()
+                .enumerate()
+                .flat_map(|(priority, bytes)| {
+                    TimeSeriesValue::decode(bytes)
+                        .unwrap()
+                        .points
+                        .into_iter()
+                        .map(move |sample| (priority, sample))
+                })
+                .collect();
+            expected.sort_by(|a, b| a.1.timestamp_ms.cmp(&b.1.timestamp_ms).then(b.0.cmp(&a.0)));
+            // A single non-empty source is passed through untouched.
+            if encoded.iter().filter(|bytes| !bytes.is_empty()).count() > 1 {
+                expected.dedup_by(|a, b| a.1.timestamp_ms == b.1.timestamp_ms);
+            }
+            let expected: Vec<Sample> = expected.into_iter().map(|(_, sample)| sample).collect();
+
+            let (existing, operands) = encoded.split_first().unwrap();
+            let merged = merge_batch_time_series(Some(existing.clone()), operands).unwrap();
+            assert_eq!(TimeSeriesValue::decode(&merged).unwrap().points, expected);
+        }
     }
 
     #[test]

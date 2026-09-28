@@ -61,55 +61,63 @@ pub(crate) struct TsdbWriteDelta {
 }
 
 impl TsdbWriteDelta {
-    fn ingest(&mut self, series: &Series) -> Result<(), String> {
-        let mut sorted_labels = series.labels.clone();
-        sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-        let fingerprint = sorted_labels.fingerprint();
+    fn ingest(&mut self, series: Series) -> Result<(), String> {
+        let Series {
+            mut labels,
+            metric_type,
+            unit,
+            samples,
+            ..
+        } = series;
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
+        let fingerprint = labels.fingerprint();
 
         // Record the series in the active-series HLL once per ingest call.
         // HLL inserts are idempotent (fetch_max), so repeated records of the
         // same fingerprint across batches don't inflate the estimate.
         self.active_series.record(fingerprint);
 
-        for sample in &series.samples {
-            self.ingest_sample(
-                &sorted_labels,
-                fingerprint,
-                &series.unit,
-                series.metric_type,
-                sample.clone(),
-            )?;
+        let bucket_start_ms = self.bucket.start as i64 * 60 * 1000;
+        let bucket_end_ms =
+            (self.bucket.start as i64 + self.bucket.size_in_mins() as i64) * 60 * 1000;
+        // Resolved on the first in-range sample, so a series whose first
+        // sample is rejected is never registered.
+        let mut series_id = None;
+        for sample in samples {
+            if sample.timestamp_ms < bucket_start_ms || sample.timestamp_ms >= bucket_end_ms {
+                return Err(format!(
+                    "Sample timestamp {} is outside bucket range [{}, {})",
+                    sample.timestamp_ms, bucket_start_ms, bucket_end_ms
+                ));
+            }
+            let id = *series_id.get_or_insert_with(|| {
+                self.resolve_series(&labels, fingerprint, &unit, metric_type)
+            });
+            self.samples
+                .entry(id)
+                .or_insert_with(|| SeriesSamples {
+                    metric_name: labels
+                        .iter()
+                        .find(|l| l.name == "__name__")
+                        .map(|l| l.value.clone())
+                        .unwrap_or_default(),
+                    points: Vec::new(),
+                })
+                .points
+                .push(sample);
         }
         Ok(())
     }
 
-    fn ingest_sample(
+    /// Looks up the series ID, registering the series and its indexes if new.
+    fn resolve_series(
         &mut self,
         labels: &[Label],
         fingerprint: SeriesFingerprint,
         unit: &Option<String>,
         metric_type: Option<MetricType>,
-        sample: Sample,
-    ) -> Result<(), String> {
-        // Validate sample timestamp is within bucket range
-        let bucket_start_ms = self.bucket.start as i64 * 60 * 1000;
-        let bucket_end_ms =
-            (self.bucket.start as i64 + self.bucket.size_in_mins() as i64) * 60 * 1000;
-        if sample.timestamp_ms < bucket_start_ms || sample.timestamp_ms >= bucket_end_ms {
-            return Err(format!(
-                "Sample timestamp {} is outside bucket range [{}, {})",
-                sample.timestamp_ms, bucket_start_ms, bucket_end_ms
-            ));
-        }
-
-        let metric_name = labels
-            .iter()
-            .find(|l| l.name == "__name__")
-            .map(|l| l.value.clone())
-            .unwrap_or_default();
-
-        // Look up existing series_id from delta overlay or base dictionary.
-        let series_id = if let Some(&id) = self.series_dict_delta.get(&fingerprint) {
+    ) -> SeriesId {
+        if let Some(&id) = self.series_dict_delta.get(&fingerprint) {
             id
         } else if let Some(&id) = self.series_dict_base.get(&fingerprint) {
             id
@@ -137,17 +145,7 @@ impl TsdbWriteDelta {
             }
 
             id
-        };
-
-        self.samples
-            .entry(series_id)
-            .or_insert_with(|| SeriesSamples {
-                metric_name,
-                points: Vec::new(),
-            })
-            .points
-            .push(sample);
-        Ok(())
+        }
     }
 }
 
@@ -175,7 +173,7 @@ impl Delta for TsdbWriteDelta {
     }
 
     fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String> {
-        for series in &write {
+        for series in write {
             self.ingest(series)?;
         }
         Ok(())

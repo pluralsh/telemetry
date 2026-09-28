@@ -57,6 +57,7 @@ use std::collections::VecDeque;
 use std::ops::Bound;
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::manifest::{SortedRun, SsTableView, VersionedManifest};
 use slatedb::{RowEntry, SstReader, SstStats, ValueDeletable};
 
@@ -208,74 +209,111 @@ pub async fn count_in_range(
     query: &BytesRange,
 ) -> StorageResult<CountResult> {
     let mut result = CountResult::default();
+    let mut views = Vec::new();
 
     // The unsegmented default tree. Empty when an extractor is configured,
     // but walking it keeps the no-extractor case correct.
-    walk_tree(
-        sst_reader,
+    collect_tree(
         manifest.l0(),
         manifest.compacted(),
         query,
+        &mut views,
         &mut result,
-    )
-    .await?;
+    );
 
     // Each configured segment owns a disjoint prefix interval; walk only
     // those the query touches. This is where the data lives once a segment
     // extractor routes writes away from the default tree.
     for segment in manifest.segments() {
         if ranges_overlap(query, &prefix_range(segment.prefix())) {
-            walk_tree(
-                sst_reader,
+            collect_tree(
                 segment.l0(),
                 segment.compacted(),
                 query,
+                &mut views,
                 &mut result,
-            )
-            .await?;
+            );
+        }
+    }
+
+    // Each SST's walk is independent and merging is order-insensitive (sums
+    // and a max), so SSTs are read concurrently.
+    let walks = stream::iter(views)
+        .map(|(tier, view)| async move {
+            count_view(sst_reader, &view, query)
+                .await
+                .map(|walk| (tier, walk))
+        })
+        .buffer_unordered(SST_READ_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    for (tier, walk) in walks {
+        result.counts.add(walk.counts);
+        if let Some(covered_to) = walk.covered_to {
+            bump_covered_to(&mut result.covered_to, covered_to);
+        }
+        match tier {
+            Tier::L0 => {
+                let l0 = &mut result.stats.l0;
+                l0.ssts_total += walk.tier.ssts_total;
+                l0.ssts_with_data += walk.tier.ssts_with_data;
+                l0.blocks_with_data += walk.tier.blocks_with_data;
+                l0.records += walk.tier.records;
+            }
+            Tier::SortedRun => {
+                let runs = &mut result.stats.sorted_runs;
+                runs.ssts_total += walk.tier.ssts_total;
+                runs.ssts_with_data += walk.tier.ssts_with_data;
+                runs.blocks_with_data += walk.tier.blocks_with_data;
+                runs.records += walk.tier.records;
+            }
         }
     }
     Ok(result)
 }
 
-/// Walks one LSM tree (a default tree or a single segment's tree): every L0
-/// SST plus the covering views of each sorted run. Accumulates counts,
-/// `covered_to`, and per-tier data-distribution stats into `result`.
-async fn walk_tree(
-    sst_reader: &SstReader,
+const SST_READ_CONCURRENCY: usize = 16;
+
+#[derive(Clone, Copy)]
+enum Tier {
+    L0,
+    SortedRun,
+}
+
+/// Collects the SST views of one LSM tree (a default tree or a single
+/// segment's tree) that the walk must read: every L0 SST plus the covering
+/// views of each sorted run. Counts overlapping runs into `result`.
+fn collect_tree(
     l0: &VecDeque<SsTableView>,
     compacted: &[SortedRun],
     query: &BytesRange,
+    views: &mut Vec<(Tier, SsTableView)>,
     result: &mut CountResult,
-) -> StorageResult<()> {
+) {
     // L0: not range-partitioned, so every SST is checked.
-    let mut l0_walk = TierWalk::default();
-    for view in l0 {
-        count_view(sst_reader, view, query, result, &mut l0_walk).await?;
-    }
-    result.stats.l0.ssts_total += l0_walk.ssts_total;
-    result.stats.l0.ssts_with_data += l0_walk.ssts_with_data;
-    result.stats.l0.blocks_with_data += l0_walk.blocks_with_data;
-    result.stats.l0.records += l0_walk.records;
+    views.extend(l0.iter().map(|view| (Tier::L0, view.clone())));
 
     // Sorted runs: range-partitioned, so only the views covering the query
     // are checked. A run counts as overlapping if it yields any such view.
-    let mut sr_walk = TierWalk::default();
     for run in compacted {
-        let mut overlaps = false;
-        for view in run.tables_covering_range::<BytesRange>(query.clone()) {
-            overlaps = true;
-            count_view(sst_reader, view, query, result, &mut sr_walk).await?;
-        }
-        if overlaps {
+        let before = views.len();
+        views.extend(
+            run.tables_covering_range::<BytesRange>(query.clone())
+                .into_iter()
+                .map(|view| (Tier::SortedRun, view.clone())),
+        );
+        if views.len() > before {
             result.stats.sorted_runs.runs += 1;
         }
     }
-    result.stats.sorted_runs.ssts_total += sr_walk.ssts_total;
-    result.stats.sorted_runs.ssts_with_data += sr_walk.ssts_with_data;
-    result.stats.sorted_runs.blocks_with_data += sr_walk.blocks_with_data;
-    result.stats.sorted_runs.records += sr_walk.records;
-    Ok(())
+}
+
+/// One SST's contribution to a [`count_in_range`] walk.
+#[derive(Default)]
+struct ViewWalk {
+    counts: BlockOpCounts,
+    covered_to: Option<Bytes>,
+    tier: TierWalk,
 }
 
 /// The key interval a segment owns: `[prefix, prefix++)`, where `prefix++`
@@ -304,23 +342,22 @@ async fn count_view(
     sst_reader: &SstReader,
     view: &SsTableView,
     query: &BytesRange,
-    result: &mut CountResult,
-    tier: &mut TierWalk,
-) -> StorageResult<()> {
+) -> StorageResult<ViewWalk> {
+    let mut walk = ViewWalk::default();
     let sst_file = sst_reader
         .open_with_handle(view.sst.clone())
         .map_err(StorageError::from_storage)?;
     let sst_id = sst_file.id();
     // This SST belongs to the tier (its index/stats footer were read) even
     // if no block ends up overlapping the query.
-    tier.ssts_total += 1;
+    walk.tier.ssts_total += 1;
 
-    let Some(stats) = sst_file.stats().await.map_err(StorageError::from_storage)? else {
+    let (stats, index) = futures::try_join!(sst_file.stats(), sst_file.index())
+        .map_err(StorageError::from_storage)?;
+    let Some(stats) = stats else {
         tracing::warn!(?sst_id, "SST has no stats block; skipping");
-        return Ok(());
+        return Ok(walk);
     };
-
-    let index = sst_file.index().await.map_err(StorageError::from_storage)?;
     let last_entry = sst_file.info().last_entry.clone();
 
     let n = index.len();
@@ -347,9 +384,9 @@ async fn count_view(
             && let Some(last) = last_entry.as_ref()
         {
             let block_counts = block_counts_from_stats(&stats, i, sst_id);
-            result.counts.add(block_counts);
-            tier.add_block(block_counts);
-            bump_covered_to(&mut result.covered_to, last.clone());
+            walk.counts.add(block_counts);
+            walk.tier.add_block(block_counts);
+            bump_covered_to(&mut walk.covered_to, last.clone());
             witness_pos = Some(pos);
             break;
         }
@@ -360,9 +397,9 @@ async fn count_view(
             .map_err(StorageError::from_storage)?;
         let (block_counts, block_max) = count_rows_in_range_with_max(&rows, query);
         if let Some(max) = block_max {
-            result.counts.add(block_counts);
-            tier.add_block(block_counts);
-            bump_covered_to(&mut result.covered_to, max);
+            walk.counts.add(block_counts);
+            walk.tier.add_block(block_counts);
+            bump_covered_to(&mut walk.covered_to, max);
             witness_pos = Some(pos);
             break;
         }
@@ -372,9 +409,9 @@ async fn count_view(
 
     let Some(witness_pos) = witness_pos else {
         // No SST contents in query.
-        return Ok(());
+        return Ok(walk);
     };
-    tier.ssts_with_data += 1;
+    walk.tier.ssts_with_data += 1;
 
     // Forward pass for blocks below the witness. Cheap stats path when
     // contained; read for boundary blocks (needed to filter rows by query).
@@ -389,11 +426,11 @@ async fn count_view(
                 .map_err(StorageError::from_storage)?;
             count_rows_in_range_with_max(&rows, query).0
         };
-        result.counts.add(block_counts);
-        tier.add_block(block_counts);
+        walk.counts.add(block_counts);
+        walk.tier.add_block(block_counts);
     }
 
-    Ok(())
+    Ok(walk)
 }
 
 fn bump_covered_to(covered_to: &mut Option<Bytes>, candidate: Bytes) {

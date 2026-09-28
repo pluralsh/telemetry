@@ -21,4 +21,10 @@ pub enum Error {
     TraceQl(#[from] crate::traceql::QueryError),
 }
 
+impl From<common::serde::DeserializeError> for Error {
+    fn from(error: common::serde::DeserializeError) -> Self {
+        Self::Corrupt(error.message)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

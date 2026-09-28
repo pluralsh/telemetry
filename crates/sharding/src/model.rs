@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 pub const DEFAULT_VIRTUAL_SHARDS: u32 = 8;
-pub const DEFAULT_IO_CONCURRENCY_MULTIPLIER: u32 = 4;
+pub const DEFAULT_IO_CONCURRENCY_MULTIPLIER: u32 = 8;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
@@ -253,20 +253,6 @@ impl ShardMap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ShardingConfig {
-    pub virtual_shards: u32,
-}
-
-impl Default for ShardingConfig {
-    fn default() -> Self {
-        Self {
-            virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
     #[error("virtual shard count must be greater than zero")]
@@ -334,17 +320,6 @@ mod tests {
             ),
             Err(ModelError::Overlap { .. })
         ));
-    }
-
-    #[test]
-    fn config_defaults_to_eight_virtual_shards() {
-        assert_eq!(ShardingConfig::default().virtual_shards, 8);
-        assert_eq!(
-            serde_json::from_str::<ShardingConfig>("{}")
-                .unwrap()
-                .virtual_shards,
-            8
-        );
     }
 
     #[test]

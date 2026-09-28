@@ -37,7 +37,7 @@ write:
 
 sharding:
   virtual_shards: 8
-  io_concurrency_multiplier: 4
+  io_concurrency_multiplier: 8
   backend: standalone
 
 request:
@@ -45,8 +45,8 @@ request:
   max_query_entries: 5000
   max_query_pages: 10000
   max_structured_metadata_fields: 128
-  query_concurrency: 8
-  max_in_flight_query_bytes: 67108864
+  query_concurrency: 16
+  max_in_flight_query_bytes: 134217728
 
 cache:
   query_entries: 256

@@ -3,16 +3,20 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 use common::storage::config::StorageConfig;
 pub use meter_server::config::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
 use serde::{Deserialize, Serialize};
-use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServerMode {
-    Writer,
-    Reader,
-    #[default]
-    Standalone,
+pub use sharding::server::{ServerMode, StaticOwner};
+
+#[derive(Debug, Clone, Default)]
+pub struct LineProduct;
+
+impl sharding::server::Product for LineProduct {
+    const NAME: &'static str = "line";
+    const OWNER_PORT: u16 = 9091;
 }
+
+pub type ShardingConfig = sharding::server::ShardingConfig<LineProduct>;
+pub type ShardingBackend = sharding::server::ShardingBackend<LineProduct>;
+pub type KubernetesShardingConfig = sharding::server::KubernetesShardingConfig<LineProduct>;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,77 +41,6 @@ impl Default for WriteConfig {
             durability: Durability::Written,
             remote_concurrency: 16,
             remote_retries: 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(tag = "backend", rename_all = "snake_case")]
-pub enum ShardingBackend {
-    #[default]
-    Standalone,
-    Static {
-        owner_id: String,
-        owners: Vec<StaticOwner>,
-    },
-    Kubernetes(KubernetesShardingConfig),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StaticOwner {
-    pub id: String,
-    pub ordinal: u32,
-    pub endpoint: String,
-    pub start_shard: u32,
-    pub end_shard: u32,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KubernetesShardingConfig {
-    pub namespace: String,
-    pub stateful_set: String,
-    pub headless_service: String,
-    pub owner_port: u16,
-    pub assignment_config_map: String,
-    pub coordinator_lease: String,
-    pub shard_lease_prefix: String,
-    pub lease_duration_seconds: u64,
-    pub renew_interval_seconds: u64,
-}
-
-impl Default for KubernetesShardingConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "default".into(),
-            stateful_set: "line".into(),
-            headless_service: "line-headless".into(),
-            owner_port: 9091,
-            assignment_config_map: "line-shard-assignments".into(),
-            coordinator_lease: "line-shard-coordinator".into(),
-            shard_lease_prefix: "line-shard".into(),
-            lease_duration_seconds: 15,
-            renew_interval_seconds: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ShardingConfig {
-    pub virtual_shards: u32,
-    pub io_concurrency_multiplier: u32,
-    #[serde(flatten)]
-    pub kind: ShardingBackend,
-}
-
-impl Default for ShardingConfig {
-    fn default() -> Self {
-        Self {
-            virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
-            kind: ShardingBackend::Standalone,
         }
     }
 }
@@ -175,8 +108,8 @@ impl Default for RequestConfig {
             max_query_entries: 5_000,
             max_query_pages: 10_000,
             max_structured_metadata_fields: 128,
-            query_concurrency: 8,
-            max_in_flight_query_bytes: 64 * 1024 * 1024,
+            query_concurrency: 16,
+            max_in_flight_query_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -260,8 +193,6 @@ impl Config {
             || self.request.query_concurrency == 0
             || self.request.max_in_flight_query_bytes == 0
             || self.write.remote_concurrency == 0
-            || self.sharding.virtual_shards == 0
-            || self.sharding.io_concurrency_multiplier == 0
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
@@ -272,39 +203,9 @@ impl Config {
                 "at least one namespace is required".to_owned(),
             ));
         }
-        if self.mode == ServerMode::Standalone
-            && !matches!(self.sharding.kind, ShardingBackend::Standalone)
-        {
-            return Err(ConfigError::Validation(
-                "standalone mode requires the standalone sharding backend".into(),
-            ));
-        }
-        if let ShardingBackend::Static { owner_id, owners } = &self.sharding.kind {
-            if !owners.iter().any(|owner| &owner.id == owner_id) {
-                return Err(ConfigError::Validation(
-                    "static owner_id has no owner entry".into(),
-                ));
-            }
-            let mut ranges = owners
-                .iter()
-                .map(|owner| (owner.start_shard, owner.end_shard))
-                .collect::<Vec<_>>();
-            ranges.sort_unstable();
-            let mut expected = 0;
-            for (start, end) in ranges {
-                if start != expected || end <= start || end > self.sharding.virtual_shards {
-                    return Err(ConfigError::Validation(
-                        "static owners must exactly cover all virtual shards".into(),
-                    ));
-                }
-                expected = end;
-            }
-            if expected != self.sharding.virtual_shards {
-                return Err(ConfigError::Validation(
-                    "static owners must exactly cover all virtual shards".into(),
-                ));
-            }
-        }
+        self.sharding
+            .validate(self.mode)
+            .map_err(ConfigError::Validation)?;
         let mut names = HashSet::new();
         for namespace in &self.namespaces {
             line::Namespace::new(&namespace.name).map_err(|error| {

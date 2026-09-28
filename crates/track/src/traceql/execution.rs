@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use opentelemetry_proto::tonic::{
@@ -572,7 +573,7 @@ fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
             let (StaticValue::String(value), StaticValue::String(pattern)) = (left, right) else {
                 return None;
             };
-            let matched = Regex::new(pattern).ok()?.is_match(value);
+            let matched = regex_is_match(pattern, value)?;
             Some(if op == BinaryOp::Regex {
                 matched
             } else {
@@ -581,6 +582,30 @@ fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+const REGEX_CACHE_CAPACITY: usize = 256;
+
+thread_local! {
+    /// Comparisons run per span, so patterns compile once per worker thread.
+    static REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+}
+
+/// Returns `None` for an invalid pattern.
+fn regex_is_match(pattern: &str, value: &str) -> Option<bool> {
+    REGEX_CACHE.with(|cache| {
+        if let Some(regex) = cache.borrow().get(pattern) {
+            return Some(regex.is_match(value));
+        }
+        let regex = Regex::new(pattern).ok()?;
+        let matched = regex.is_match(value);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(pattern.to_owned(), regex);
+        Some(matched)
+    })
 }
 
 fn static_equal(left: &StaticValue, right: &StaticValue) -> bool {

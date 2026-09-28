@@ -1,6 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, ShardId};
 use tokio::sync::{RwLock, Semaphore};
 
@@ -253,28 +256,60 @@ impl ShardedTrack {
                 "trace scan limit must be greater than zero".to_owned(),
             ));
         }
+        // Select the globally first `limit` IDs from locators alone, then
+        // load only those, so S shards never materialize S × limit traces.
         let databases = self.databases().await;
+        let concurrency = self.io_permits.available_permits().max(1);
         let permits = Arc::clone(&self.io_permits);
-        let mut results = stream::iter(databases.into_iter().map(|database| {
-            let permits = Arc::clone(&permits);
-            async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
-                database.scan_traces(namespace, limit).await
-            }
-        }))
-        .buffer_unordered(self.io_permits.available_permits().max(1))
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
+        let mut scanned =
+            stream::iter(databases.into_iter().enumerate().map(|(shard, database)| {
+                let permits = Arc::clone(&permits);
+                async move {
+                    let _permit = permits
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+                    let scanned = database.scan_trace_ids(namespace, limit).await?;
+                    Ok::<_, Error>((database, shard, scanned))
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut selected = scanned
+            .iter()
+            .flat_map(|(_, shard, ids)| ids.iter().map(move |id| (id.trace_id, *shard)))
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.truncate(limit);
+        let keep = selected.into_iter().collect::<HashSet<_>>();
+        for (_, shard, ids) in &mut scanned {
+            ids.retain(|id| keep.contains(&(id.trace_id, *shard)));
+        }
+
+        let permits = Arc::clone(&self.io_permits);
+        let mut results = stream::iter(
+            scanned
+                .into_iter()
+                .filter(|(_, _, ids)| !ids.is_empty())
+                .map(|(database, _, ids)| {
+                    let permits = Arc::clone(&permits);
+                    async move {
+                        let _permit = permits.acquire_owned().await.map_err(|_| {
+                            Error::Invalid("shard I/O limiter is closed".to_owned())
+                        })?;
+                        database.load_scanned(namespace, ids).await
+                    }
+                }),
+        )
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
-        results.truncate(limit);
         Ok(results)
     }
 
@@ -417,6 +452,42 @@ mod tests {
         extra.close_shard(ShardId::new(1)).await.unwrap();
         database.close().await.unwrap();
         extra.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sharded_scan_selects_the_same_traces_as_unsharded() {
+        let namespace = Namespace::new("tenant").unwrap();
+        // Start times run opposite to ID order, so the selection is by ID.
+        let traces = (1..=12)
+            .map(|id| trace(id, 1_000 - u64::from(id)))
+            .collect::<Vec<_>>();
+        let oracle = TraceDb::open(config()).await.unwrap();
+        oracle
+            .write(&namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+        let sharded = ShardedTrack::open(
+            config(),
+            ShardingOptions::new(4, 2).unwrap(),
+            (0..4).map(ShardId::new),
+        )
+        .await
+        .unwrap();
+        sharded
+            .write(
+                &namespace,
+                vec![TraceBatch::new(traces)],
+                Durability::Written,
+            )
+            .await
+            .unwrap();
+        for limit in [1, 5, 12, 20] {
+            assert_eq!(
+                sharded.scan_traces(&namespace, limit).await.unwrap(),
+                oracle.scan_traces(&namespace, limit).await.unwrap(),
+                "limit {limit}"
+            );
+        }
     }
 
     #[tokio::test]

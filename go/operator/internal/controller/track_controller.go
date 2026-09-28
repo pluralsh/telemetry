@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -363,6 +364,9 @@ func (r *TrackReconciler) setStatus(ctx context.Context, track *telemetryv1alpha
 		current.Status.ReaderEndpoint = current.Status.WriterEndpoint
 	}
 	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: conditionReady, Status: status, Reason: reason, Message: message, ObservedGeneration: current.Generation, LastTransitionTime: metav1.NewTime(time.Now())})
+	if equality.Semantic.DeepEqual(base.Status, current.Status) {
+		return nil
+	}
 	return r.Status().Patch(ctx, current, client.MergeFrom(base))
 }
 

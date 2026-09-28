@@ -122,7 +122,7 @@ not bytes. Default `268435456`.
 
 - `sharding.virtual_shards`: number of deterministic virtual shards. Default `8`; must be greater
   than zero. Keep it identical across all processes sharing a dataset.
-- `sharding.io_concurrency_multiplier`: global shard I/O permits per open shard. Default `4`;
+- `sharding.io_concurrency_multiplier`: global shard I/O permits per open shard. Default `8`;
   must be greater than zero. Increase it when I/O latency leaves shard operations idle.
 - `sharding.backend`: `standalone` (default), `static`, or `kubernetes`.
 
@@ -139,6 +139,8 @@ not bytes. Default `268435456`.
 and uses Leases for coordinator and shard ownership. The server must be built with the
 `kubernetes` feature (enabled by default) and have namespace-scoped RBAC. Fields are:
 
+- `database`: database name. Every Lease is labeled `telemetry.plural.sh/meter=<database>`,
+  and lease watches select on that label. Must be a valid label value. Default `meter`.
 - `namespace`: Kubernetes namespace. Default `default`.
 - `stateful_set`: writer StatefulSet name. Default `meter`.
 - `headless_service`: writer headless Service used for owner DNS. Default `meter-headless`.

@@ -50,6 +50,7 @@ track = { path = "../track" }
 tracing.workspace = true
 tracing-subscriber = "0.3.23"
 ulid.workspace = true
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"

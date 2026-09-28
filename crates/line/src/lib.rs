@@ -9,18 +9,16 @@ mod db;
 mod error;
 pub mod logql;
 mod model;
-mod namespace;
 mod page;
 mod query;
 mod search;
-mod segment;
 mod sharded;
 
+pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
 pub use config::{Config, PageConfig};
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};
-pub use namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
 pub use page::{BlockMetadata, Page, PageBuilder};
 pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,

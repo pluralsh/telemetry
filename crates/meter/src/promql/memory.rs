@@ -58,6 +58,17 @@ struct Inner {
     cap: usize,
     reserved: AtomicUsize,
     high_water: AtomicUsize,
+    /// Set for [`scoped`](MemoryReservation::scoped) reservations: every grow
+    /// and release is mirrored into the parent ledger.
+    parent: Option<MemoryReservation>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(parent) = &self.parent {
+            parent.release(*self.reserved.get_mut());
+        }
+    }
 }
 
 impl MemoryReservation {
@@ -68,6 +79,22 @@ impl MemoryReservation {
                 cap,
                 reserved: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
+                parent: None,
+            }),
+        }
+    }
+
+    /// A child ledger for a sub-plan whose lifetime is shorter than the
+    /// query's. Grows count against this reservation's cap; whatever the
+    /// child still holds when its last clone drops is released back here, so
+    /// an operator that forgets to release cannot leak past the scope.
+    pub fn scoped(&self) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                cap: self.inner.cap,
+                reserved: AtomicUsize::new(0),
+                high_water: AtomicUsize::new(0),
+                parent: Some(self.clone()),
             }),
         }
     }
@@ -92,6 +119,12 @@ impl MemoryReservation {
     /// Zero-byte requests always succeed without touching state.
     pub fn try_grow(&self, bytes: usize) -> Result<(), QueryError> {
         if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(parent) = &self.inner.parent {
+            parent.try_grow(bytes)?;
+            let new = self.inner.reserved.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.bump_high_water(new);
             return Ok(());
         }
 
@@ -144,9 +177,12 @@ impl MemoryReservation {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => break,
                 Err(observed) => current = observed,
             }
+        }
+        if let Some(parent) = &self.inner.parent {
+            parent.release(bytes.min(current));
         }
     }
 
@@ -403,6 +439,28 @@ mod tests {
             }
             other => panic!("expected MemoryLimit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scoped_reservations_charge_the_parent_and_return_leaks_on_drop() {
+        // given: a scope under a 100-byte query ledger
+        let query = MemoryReservation::new(100);
+        let scope = query.scoped();
+
+        // when: the scope grows, releases part, and fails past the cap
+        scope.try_grow(60).unwrap();
+        scope.release(10);
+        assert!(scope.clone().try_grow(60).is_err());
+
+        // then: the parent sees the scope's net usage
+        assert_eq!(query.reserved(), 50);
+        assert_eq!(scope.reserved(), 50);
+
+        // when: the scope drops without releasing its remaining bytes
+        drop(scope);
+
+        // then: they go back to the parent
+        assert_eq!(query.reserved(), 0);
     }
 
     #[test]

@@ -159,7 +159,17 @@ pub struct SubqueryOp {
 
     // Runtime state ---------------------------------------------------------
     next_outer_step: usize,
+    /// Child for `next_outer_step` and the samples drained from it so far.
+    /// Kept across `Pending` so a storage wait resumes rather than replans.
+    in_flight: Option<InFlight>,
     errored: bool,
+}
+
+struct InFlight {
+    inner_window: TimeRange,
+    child: Box<dyn Operator + Send>,
+    per_series_ts: Vec<Vec<i64>>,
+    per_series_vs: Vec<Vec<f64>>,
 }
 
 impl SubqueryOp {
@@ -225,6 +235,7 @@ impl SubqueryOp {
             inner_step_ms,
             reservation,
             next_outer_step: 0,
+            in_flight: None,
             errored: false,
         }
     }
@@ -263,72 +274,67 @@ impl SubqueryOp {
         outer_step_idx: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<MatrixWindowBatch, QueryError>> {
-        let effective_t = self.effective_times[outer_step_idx];
-        // Window `(effective - range, effective]`, encoded as the
-        // inclusive-exclusive `TimeRange` `[effective - range + 1,
-        // effective + 1)`. `effective_t` already folds in the subquery's
-        // `@` / `offset` modifiers (see `SubqueryOp::with_effective_times`).
-        let inner_window = TimeRange::new(
-            effective_t.saturating_sub(self.range_ms).saturating_add(1),
-            effective_t.saturating_add(1),
-        );
-
-        // Build the child. Factory failure is terminal for the subquery.
-        let mut child = match (self.factory)(inner_window, self.inner_step_ms) {
-            Ok(c) => c,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-
-        // Validate: child series roster must match ours. A `Deferred`
-        // child means `count_values` inside a subquery, which is out of
-        // scope for v1 (RFC §"Core Data Model").
-        debug_assert!(
-            !child.schema().series.is_deferred(),
-            "subquery child must publish a static schema (count_values in subquery is v1 out-of-scope)"
-        );
         let series_count = self.series.len();
+        if self.in_flight.is_none() {
+            let effective_t = self.effective_times[outer_step_idx];
+            // Window `(effective - range, effective]`, encoded as the
+            // inclusive-exclusive `TimeRange` `[effective - range + 1,
+            // effective + 1)`. `effective_t` already folds in the subquery's
+            // `@` / `offset` modifiers (see `SubqueryOp::with_effective_times`).
+            let inner_window = TimeRange::new(
+                effective_t.saturating_sub(self.range_ms).saturating_add(1),
+                effective_t.saturating_add(1),
+            );
+            // Factory failure is terminal for the subquery.
+            let child = match (self.factory)(inner_window, self.inner_step_ms) {
+                Ok(c) => c,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            // A `Deferred` child means `count_values` inside a subquery,
+            // which is out of scope for v1 (RFC §"Core Data Model").
+            debug_assert!(
+                !child.schema().series.is_deferred(),
+                "subquery child must publish a static schema (count_values in subquery is v1 out-of-scope)"
+            );
+            self.in_flight = Some(InFlight {
+                inner_window,
+                child,
+                per_series_ts: vec![Vec::new(); series_count],
+                per_series_vs: vec![Vec::new(); series_count],
+            });
+        }
+        let in_flight = self.in_flight.as_mut().expect("in-flight child");
 
         // Drain the child. Each `StepBatch` is an instant-vector of the
         // inner expression's value at some inner step; the child may
         // emit multiple batches covering the inner grid in chunks.
-        let outer_cells = series_count; // one row of cells for the single outer step
-        let mut buffers = match WindowBuffers::allocate(&self.reservation, outer_cells) {
-            Ok(b) => b,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        // Scratch per-series sample buffers — we collect into these so we
-        // can pack per-cell slices contiguously into the flat output
-        // arrays (consumer expects per-cell row-major layout matching
-        // 3a.2's emission).
-        let mut per_series_ts: Vec<Vec<i64>> = (0..series_count).map(|_| Vec::new()).collect();
-        let mut per_series_vs: Vec<Vec<f64>> = (0..series_count).map(|_| Vec::new()).collect();
-
         loop {
-            match child.next(cx) {
-                Poll::Pending => {
-                    // `SubqueryOp` does not persist partial child state
-                    // across polls — the whole child sweep happens within
-                    // a single `windows()` invocation. If the underlying
-                    // storage is async-ready under back pressure, the
-                    // *caller*'s task will re-poll us and we rebuild from
-                    // scratch. Revisit once a `Concurrent` wrapper
-                    // exercises the real async path.
-                    return Poll::Pending;
-                }
+            match in_flight.child.next(cx) {
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => break,
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
                 Poll::Ready(Some(Ok(batch))) => {
                     if let Err(err) = Self::absorb_batch(
                         &batch,
-                        inner_window,
-                        &mut per_series_ts,
-                        &mut per_series_vs,
+                        in_flight.inner_window,
+                        &mut in_flight.per_series_ts,
+                        &mut in_flight.per_series_vs,
                     ) {
                         return Poll::Ready(Err(err));
                     }
                 }
             }
         }
+        let InFlight {
+            per_series_ts,
+            per_series_vs,
+            ..
+        } = self.in_flight.take().expect("in-flight child");
+
+        let mut buffers = match WindowBuffers::allocate(&self.reservation, series_count) {
+            Ok(b) => b,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
 
         // Pack per-series scratch into the flat output buffers. Each
         // cell's samples land contiguously; `CellIndex` records its
@@ -455,6 +461,7 @@ impl SubqueryOp {
             }
             Poll::Ready(Err(err)) => {
                 self.errored = true;
+                self.in_flight = None;
                 Poll::Ready(Some(Err(err)))
             }
         }
@@ -780,6 +787,73 @@ mod tests {
 
         // then: factory called once per outer step.
         assert_eq!(*counter.lock().unwrap(), 4);
+    }
+
+    /// Returns `Pending` on its first poll, like a child waiting on storage.
+    struct PendingOnce {
+        inner: ScriptedChild,
+        pending: bool,
+    }
+
+    impl Operator for PendingOnce {
+        fn schema(&self) -> &OperatorSchema {
+            self.inner.schema()
+        }
+
+        fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+            if std::mem::take(&mut self.pending) {
+                return Poll::Pending;
+            }
+            self.inner.next(cx)
+        }
+    }
+
+    #[test]
+    fn should_resume_a_pending_child_instead_of_replanning() {
+        // given: one outer step whose child is pending on its first poll
+        let outer_grid = StepGrid {
+            start_ms: 100,
+            end_ms: 100,
+            step_ms: 60,
+            step_count: 1,
+        };
+        let series = mk_labels(1);
+        let series_clone = series.clone();
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = calls.clone();
+        let factory: ChildFactory = Box::new(move |_tr, step_ms| {
+            *calls_clone.lock().unwrap() += 1;
+            let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
+            let batches = (0..ts_arc.len())
+                .map(|i| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(i as f64)]))
+                .collect();
+            let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
+            Ok(Box::new(PendingOnce {
+                inner: ScriptedChild::new(schema, batches),
+                pending: true,
+            }) as Box<dyn Operator + Send>)
+        });
+        let mut op = SubqueryOp::new(
+            factory,
+            series,
+            outer_grid,
+            30,
+            10,
+            MemoryReservation::new(1 << 20),
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // when
+        assert!(op.windows(&mut cx).is_pending());
+        let batch = match op.windows(&mut cx) {
+            Poll::Ready(Some(Ok(b))) => b,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // then: the same child finished the step
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(batch.cell_samples(0, 0).1, &[0.0, 1.0, 2.0]);
     }
 
     #[test]

@@ -2,15 +2,20 @@ use std::{collections::HashSet, env, fmt, fs, net::SocketAddr, path::Path};
 
 use common::storage::config::SlateDbStorageConfig;
 use serde::{Deserialize, Serialize};
-use sharding::{DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServerMode {
-    Writer,
-    Reader,
-    Standalone,
+pub use sharding::server::{ServerMode, StaticOwner};
+
+#[derive(Debug, Clone, Default)]
+pub struct MeterProduct;
+
+impl sharding::server::Product for MeterProduct {
+    const NAME: &'static str = "meter";
+    const OWNER_PORT: u16 = 9090;
 }
+
+pub type ShardingConfig = sharding::server::ShardingConfig<MeterProduct>;
+pub type ShardingBackend = sharding::server::ShardingBackend<MeterProduct>;
+pub type KubernetesShardingConfig = sharding::server::KubernetesShardingConfig<MeterProduct>;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -111,77 +116,6 @@ impl Default for WriteConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(tag = "backend", rename_all = "snake_case")]
-pub enum ShardingBackend {
-    #[default]
-    Standalone,
-    Static {
-        owner_id: String,
-        owners: Vec<StaticOwner>,
-    },
-    Kubernetes(KubernetesShardingConfig),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StaticOwner {
-    pub id: String,
-    pub ordinal: u32,
-    pub endpoint: String,
-    pub start_shard: u32,
-    pub end_shard: u32,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KubernetesShardingConfig {
-    pub namespace: String,
-    pub stateful_set: String,
-    pub headless_service: String,
-    pub owner_port: u16,
-    pub assignment_config_map: String,
-    pub coordinator_lease: String,
-    pub shard_lease_prefix: String,
-    pub lease_duration_seconds: u64,
-    pub renew_interval_seconds: u64,
-}
-
-impl Default for KubernetesShardingConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "default".to_owned(),
-            stateful_set: "meter".to_owned(),
-            headless_service: "meter-headless".to_owned(),
-            owner_port: 9090,
-            assignment_config_map: "meter-shard-assignments".to_owned(),
-            coordinator_lease: "meter-shard-coordinator".to_owned(),
-            shard_lease_prefix: "meter-shard".to_owned(),
-            lease_duration_seconds: 15,
-            renew_interval_seconds: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ShardingConfig {
-    pub virtual_shards: u32,
-    pub io_concurrency_multiplier: u32,
-    #[serde(flatten)]
-    pub kind: ShardingBackend,
-}
-
-impl Default for ShardingConfig {
-    fn default() -> Self {
-        Self {
-            virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
-            kind: ShardingBackend::Standalone,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub unauthenticated: bool,
@@ -273,16 +207,6 @@ impl Config {
                 "path_prefix must be empty or start with '/' and must not end with '/'".to_owned(),
             ));
         }
-        if self.sharding.virtual_shards == 0 {
-            return Err(ConfigError::Validation(
-                "sharding.virtual_shards must be greater than zero".to_owned(),
-            ));
-        }
-        if self.sharding.io_concurrency_multiplier == 0 {
-            return Err(ConfigError::Validation(
-                "sharding.io_concurrency_multiplier must be greater than zero".to_owned(),
-            ));
-        }
         if self.namespaces.is_empty() {
             return Err(ConfigError::Validation(
                 "at least one namespace is required".to_owned(),
@@ -332,39 +256,9 @@ impl Config {
                 )));
             }
         }
-        if self.mode == ServerMode::Standalone
-            && !matches!(self.sharding.kind, ShardingBackend::Standalone)
-        {
-            return Err(ConfigError::Validation(
-                "standalone mode requires the standalone sharding backend".to_owned(),
-            ));
-        }
-        if let ShardingBackend::Static { owners, owner_id } = &self.sharding.kind {
-            if !owners.iter().any(|owner| &owner.id == owner_id) {
-                return Err(ConfigError::Validation(format!(
-                    "static owner_id {owner_id} has no owner entry"
-                )));
-            }
-            let mut ranges = owners
-                .iter()
-                .map(|owner| (owner.start_shard, owner.end_shard))
-                .collect::<Vec<_>>();
-            ranges.sort_unstable();
-            let mut expected = 0;
-            for (start, end) in ranges {
-                if start != expected || end <= start || end > self.sharding.virtual_shards {
-                    return Err(ConfigError::Validation(
-                        "static owners must exactly cover all virtual shards".to_owned(),
-                    ));
-                }
-                expected = end;
-            }
-            if expected != self.sharding.virtual_shards {
-                return Err(ConfigError::Validation(
-                    "static owners must exactly cover all virtual shards".to_owned(),
-                ));
-            }
-        }
+        self.sharding
+            .validate(self.mode)
+            .map_err(ConfigError::Validation)?;
         Ok(())
     }
 }
@@ -389,7 +283,7 @@ mod tests {
     fn defaults_and_validation() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         assert_eq!(config.sharding.virtual_shards, 8);
-        assert_eq!(config.sharding.io_concurrency_multiplier, 4);
+        assert_eq!(config.sharding.io_concurrency_multiplier, 8);
         assert!(!config.auth.unauthenticated);
         config.validate().unwrap();
         let invalid: Config =

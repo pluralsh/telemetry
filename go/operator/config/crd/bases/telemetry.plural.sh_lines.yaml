@@ -251,7 +251,7 @@ spec:
                   request:
                     properties:
                       maxInFlightQueryBytes:
-                        default: 67108864
+                        default: 134217728
                         format: int64
                         minimum: 1
                         type: integer
@@ -276,7 +276,7 @@ spec:
                         minimum: 1
                         type: integer
                       queryConcurrency:
-                        default: 8
+                        default: 16
                         format: int32
                         minimum: 1
                         type: integer
@@ -293,7 +293,7 @@ spec:
                   sharding:
                     properties:
                       ioConcurrencyMultiplier:
-                        default: 4
+                        default: 8
                         format: int32
                         minimum: 1
                         type: integer

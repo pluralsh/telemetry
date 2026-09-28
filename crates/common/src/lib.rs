@@ -2,6 +2,7 @@ pub mod bytes;
 pub mod clock;
 pub mod coordinator;
 pub mod display;
+pub mod namespace;
 pub mod sequence;
 pub mod serde;
 pub mod storage;

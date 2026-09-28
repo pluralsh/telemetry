@@ -247,7 +247,7 @@ func Role(value any) *rbacv1.Role {
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{verbGet, "list", "watch", "create", "update", "patch"}},
 			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, "list", "watch", "create", "update", "patch", "delete"}},
-			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet}},
+			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet, "list", "watch"}},
 		},
 	}
 }

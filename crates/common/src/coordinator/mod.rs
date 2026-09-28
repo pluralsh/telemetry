@@ -102,12 +102,11 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             pause_handles.insert(name.to_string(), pause_hdl);
         }
 
-        // this is the channel that sends FlushEvents to be flushed
-        // by a background task so that the process of converting deltas
-        // to storage operations is non-blocking. for now, we apply no
-        // backpressure on this channel, so writes will block if more than
-        // one flush is pending
-        let (flush_tx, flush_rx) = mpsc::channel(2);
+        // FlushEvents go to a background task so converting deltas to storage
+        // operations never runs on the write path. When this queue is full
+        // the write task defers freezing (see `PendingFlush`) rather than
+        // blocking, so writes keep being applied during slow flushes.
+        let (flush_tx, flush_rx) = mpsc::channel(FLUSH_QUEUE_CAPACITY);
 
         let flush_stop_tok = CancellationToken::new();
         let stop_tok = CancellationToken::new();
@@ -195,10 +194,31 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
     }
 }
 
+/// Frozen deltas (or storage flushes) queued for the flush task. Each queued
+/// delta is also held in the view, so this bounds frozen-delta memory.
+const FLUSH_QUEUE_CAPACITY: usize = 2;
+
+/// Flush work requested while the flush queue was full, sent in order
+/// (delta first, then storage) as soon as the queue has room. Deferring the
+/// freeze keeps the write loop applying writes to the live delta instead of
+/// stalling on the flush task.
+#[derive(Default)]
+struct PendingFlush {
+    delta: Option<FlushReason>,
+    storage: bool,
+}
+
+impl PendingFlush {
+    fn is_pending(&self) -> bool {
+        self.delta.is_some() || self.storage
+    }
+}
+
 struct WriteCoordinatorTask<D: Delta> {
     config: WriteCoordinatorConfig,
     delta: CurrentDelta<D>,
     flush_tx: mpsc::Sender<FlushEvent<D>>,
+    pending: PendingFlush,
     write_rxs: Vec<PausableReceiver<D>>,
     watermarks: Arc<EpochWatermarks>,
     view: Arc<BroadcastedView<D>>,
@@ -243,6 +263,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             delta: CurrentDelta::new(delta),
             write_rxs,
             flush_tx,
+            pending: PendingFlush::default(),
             watermarks,
             view: initial_view,
             // Epochs start at 1 because watch channels initialize to 0 (meaning "nothing
@@ -296,7 +317,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                                 epoch: self.epoch.saturating_sub(1),
                                 result: (),
                             }));
-                            self.handle_flush(FlushReason::Explicit, flush_storage).await;
+                            self.request_flush(FlushReason::Explicit, flush_storage);
                         }
                         None => {
                             // All write channels closed
@@ -306,7 +327,11 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                 }
 
                 _ = self.flush_interval.tick() => {
-                    self.handle_flush(FlushReason::Interval, false).await;
+                    self.request_flush(FlushReason::Interval, false);
+                }
+
+                _ = has_room(&self.flush_tx), if self.pending.is_pending() => {
+                    self.send_pending();
                 }
 
                 _ = self.stop_tok.cancelled() => {
@@ -315,8 +340,11 @@ impl<D: Delta> WriteCoordinatorTask<D> {
             }
         }
 
-        // Flush any remaining pending writes before shutdown
-        self.handle_flush(FlushReason::Shutdown, false).await;
+        // Flush any remaining pending writes before shutdown, waiting for room.
+        self.request_flush(FlushReason::Shutdown, false);
+        while self.pending.is_pending() && has_room(&self.flush_tx).await {
+            self.send_pending();
+        }
 
         // Signal the flush task to stop
         self.flush_stop_tok.cancel();
@@ -359,24 +387,56 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         let estimated = self.delta.estimate_size();
         ::metrics::gauge!(metrics::COORDINATOR_DELTA_ESTIMATED_BYTES).set(estimated as f64);
         if estimated >= self.config.flush_size_threshold {
-            self.handle_flush(FlushReason::SizeThreshold, false).await;
+            self.request_flush(FlushReason::SizeThreshold, false);
         }
 
         Ok(())
     }
 
-    async fn handle_flush(&mut self, reason: FlushReason, flush_storage: bool) {
-        self.flush_if_delta_has_writes(reason).await;
-        if flush_storage {
-            self.send_flush_event(FlushEvent::FlushStorage).await;
+    /// Queues a delta flush (if the delta has writes) and optionally a
+    /// storage flush, sending whatever the flush queue has room for now.
+    fn request_flush(&mut self, reason: FlushReason, flush_storage: bool) {
+        let deferred = self.pending.is_pending();
+        if self.epoch != self.delta_start_epoch && self.pending.delta.is_none() {
+            self.pending.delta = Some(reason);
+        }
+        self.pending.storage |= flush_storage;
+        // Already-deferred work is sent by the run loop once there is room.
+        if !deferred {
+            self.send_pending();
         }
     }
 
-    async fn flush_if_delta_has_writes(&mut self, reason: FlushReason) {
-        if self.epoch == self.delta_start_epoch {
-            return;
+    /// Sends pending flush work in order until done or the queue is full.
+    /// A deferred delta keeps absorbing writes, so it is frozen only once it
+    /// can be sent.
+    fn send_pending(&mut self) {
+        while self.pending.is_pending() {
+            let permit = match self.flush_tx.clone().try_reserve_owned() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    ::metrics::counter!(metrics::COORDINATOR_FLUSH_DEFERRED_TOTAL).increment(1);
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending = PendingFlush::default();
+                    return;
+                }
+            };
+            ::metrics::gauge!(metrics::COORDINATOR_FLUSH_EVENT_QUEUE_DEPTH)
+                .set(FLUSH_QUEUE_CAPACITY.saturating_sub(self.flush_tx.capacity()) as f64);
+            let event = match self.pending.delta.take() {
+                Some(reason) => self.freeze(reason),
+                None => {
+                    self.pending.storage = false;
+                    FlushEvent::FlushStorage
+                }
+            };
+            permit.send(event);
         }
+    }
 
+    fn freeze(&mut self, reason: FlushReason) -> FlushEvent<D> {
         self.flush_interval.reset();
 
         ::metrics::counter!(metrics::COORDINATOR_FLUSH_TOTAL, "reason" => reason.as_str())
@@ -398,27 +458,16 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         // update the view before sending the flush msg to ensure the flusher sees
         // the frozen reader when updating the view post-flush
         self.view.update_delta_frozen(stamped_frozen_reader, reader);
-        // this is the blocking section of the flush, new writes will not be accepted
-        // until the event is sent to the FlushTask
-        self.send_flush_event(FlushEvent::FlushDelta {
+        FlushEvent::FlushDelta {
             frozen: stamped_frozen,
-        })
-        .await;
+        }
     }
+}
 
-    async fn send_flush_event(&self, event: FlushEvent<D>) {
-        // Sample queue depth (in-flight events) just before sending. `max_capacity`
-        // and `capacity` are cheap atomic reads.
-        let max = self.flush_tx.max_capacity();
-        let free = self.flush_tx.capacity();
-        ::metrics::gauge!(metrics::COORDINATOR_FLUSH_EVENT_QUEUE_DEPTH)
-            .set(max.saturating_sub(free) as f64);
-
-        let send_start = std::time::Instant::now();
-        let _ = self.flush_tx.send(event).await;
-        ::metrics::histogram!(metrics::COORDINATOR_FLUSH_EVENT_SEND_DURATION_SECONDS)
-            .record(send_start.elapsed().as_secs_f64());
-    }
+/// Resolves once the flush queue has a free slot (`false` if it closed).
+/// Only the write task sends, so the slot is still free when it acts.
+async fn has_room<T>(flush_tx: &mpsc::Sender<T>) -> bool {
+    flush_tx.reserve().await.is_ok()
 }
 
 /// Reason a flush was triggered. Used as a low-cardinality `reason` label.
@@ -594,84 +643,69 @@ impl EpochWatermarks {
     }
 }
 
+/// The latest [`View`], readable without locking, plus a broadcast of every
+/// view transition.
+///
+/// Readers load `view` lock-free. Updates and [`subscribe`](Self::subscribe)
+/// hold `publish`, so a subscriber's initial view is exactly the view that
+/// precedes the first broadcast it receives.
 pub(crate) struct BroadcastedView<D: Delta> {
-    inner: Mutex<BroadcastedViewInner<D>>,
+    view: arc_swap::ArcSwap<View<D>>,
+    publish: Mutex<broadcast::Sender<Arc<View<D>>>>,
 }
 
 impl<D: Delta> BroadcastedView<D> {
     fn new(initial_view: View<D>) -> Self {
         let (view_tx, _) = broadcast::channel(16);
         Self {
-            inner: Mutex::new(BroadcastedViewInner {
-                view: Arc::new(initial_view),
-                view_tx,
-            }),
+            view: arc_swap::ArcSwap::from_pointee(initial_view),
+            publish: Mutex::new(view_tx),
         }
     }
 
     fn update_flush_finished(&self, snapshot: D::Snapshot, epoch_range: Range<u64>) {
-        self.inner
-            .lock()
-            .expect("lock poisoned")
-            .update_flush_finished(snapshot, epoch_range);
+        self.update(|view| {
+            let mut frozen = view.frozen.clone();
+            let last = frozen
+                .pop()
+                .expect("frozen should not be empty when flush completes");
+            assert_eq!(last.epoch_range, epoch_range);
+            View {
+                current: view.current.clone(),
+                frozen,
+                snapshot,
+                last_written_delta: Some(last),
+            }
+        });
     }
 
     fn update_delta_frozen(&self, frozen: EpochStamped<D::FrozenView>, reader: D::DeltaView) {
-        self.inner
-            .lock()
-            .expect("lock poisoned")
-            .update_delta_frozen(frozen, reader);
+        self.update(|view| {
+            let mut new_frozen = vec![frozen];
+            new_frozen.extend(view.frozen.iter().cloned());
+            View {
+                current: reader,
+                frozen: new_frozen,
+                snapshot: view.snapshot.clone(),
+                last_written_delta: view.last_written_delta.clone(),
+            }
+        });
+    }
+
+    fn update(&self, next: impl FnOnce(&View<D>) -> View<D>) {
+        let view_tx = self.publish.lock().expect("lock poisoned");
+        let view = Arc::new(next(&self.view.load()));
+        self.view.store(Arc::clone(&view));
+        let _ = view_tx.send(view);
     }
 
     fn current(&self) -> Arc<View<D>> {
-        self.inner.lock().expect("lock poisoned").current()
+        self.view.load_full()
     }
 
     fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
-        self.inner.lock().expect("lock poisoned").subscribe()
-    }
-}
-
-struct BroadcastedViewInner<D: Delta> {
-    view: Arc<View<D>>,
-    view_tx: tokio::sync::broadcast::Sender<Arc<View<D>>>,
-}
-
-impl<D: Delta> BroadcastedViewInner<D> {
-    fn update_flush_finished(&mut self, snapshot: D::Snapshot, epoch_range: Range<u64>) {
-        let mut new_frozen = self.view.frozen.clone();
-        let last = new_frozen
-            .pop()
-            .expect("frozen should not be empty when flush completes");
-        assert_eq!(last.epoch_range, epoch_range);
-        self.view = Arc::new(View {
-            current: self.view.current.clone(),
-            frozen: new_frozen,
-            snapshot,
-            last_written_delta: Some(last),
-        });
-        self.view_tx.send(self.view.clone());
-    }
-
-    fn update_delta_frozen(&mut self, frozen: EpochStamped<D::FrozenView>, reader: D::DeltaView) {
-        // Update read state: add frozen delta to front, update current reader
-        let mut new_frozen = vec![frozen];
-        new_frozen.extend(self.view.frozen.iter().cloned());
-        self.view = Arc::new(View {
-            current: reader,
-            frozen: new_frozen,
-            snapshot: self.view.snapshot.clone(),
-            last_written_delta: self.view.last_written_delta.clone(),
-        });
-        self.view_tx.send(self.view.clone());
-    }
-
-    fn current(&self) -> Arc<View<D>> {
-        self.view.clone()
-    }
-
-    fn subscribe(&self) -> (broadcast::Receiver<Arc<View<D>>>, Arc<View<D>>) {
-        (self.view_tx.subscribe(), self.view.clone())
+        let view_tx = self.publish.lock().expect("lock poisoned");
+        (view_tx.subscribe(), self.view.load_full())
     }
 }
 
@@ -1698,6 +1732,59 @@ mod tests {
         coordinator.stop().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_keep_applying_writes_when_flush_queue_is_full() {
+        // given: the first flush blocks inside the flusher
+        let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["default".to_string()],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher.clone(),
+        );
+        let handle = coordinator.handle("default");
+        coordinator.start();
+        let write = |key: String| TestWrite {
+            key,
+            value: 1,
+            size: 1,
+        };
+        handle.try_write(write("blocked".into())).await.unwrap();
+        handle.flush(false).await.unwrap();
+        flush_started_rx.await.unwrap();
+
+        // when: more flushes are requested than the queue holds
+        for i in 0..FLUSH_QUEUE_CAPACITY + 2 {
+            handle.try_write(write(format!("queued{i}"))).await.unwrap();
+            handle.flush(false).await.unwrap();
+        }
+
+        // then: the write loop is not stalled on the flush task
+        let mut last = handle.try_write(write("last".into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), last.wait(Durability::Applied))
+            .await
+            .expect("write loop stalled behind a full flush queue")
+            .unwrap();
+
+        // and: once flushing resumes, every write is flushed exactly once
+        unblock_tx.send(()).await.unwrap();
+        handle.flush(false).await.unwrap();
+        last.wait(Durability::Written).await.unwrap();
+        let events = flusher.flushed_events();
+        assert!(events.len() <= FLUSH_QUEUE_CAPACITY + 3);
+        for pair in events.windows(2) {
+            assert_eq!(pair[0].epoch_range.end, pair[1].epoch_range.start);
+        }
+        let keys: HashSet<_> = events
+            .iter()
+            .flat_map(|event| event.val.writes.keys().cloned())
+            .collect();
+        assert_eq!(keys.len(), FLUSH_QUEUE_CAPACITY + 4);
+
+        coordinator.stop().await;
+    }
+
     // ============================================================================
     // Backpressure Tests
     // ============================================================================
@@ -2406,7 +2493,9 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let _ = handle.flush(false).await.unwrap();
+            // Wait so flushes are not coalesced while the flush queue is full.
+            let mut flushed = handle.flush(false).await.unwrap();
+            flushed.wait(Durability::Written).await.unwrap();
         }
 
         // make changes durable

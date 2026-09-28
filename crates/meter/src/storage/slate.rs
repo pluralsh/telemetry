@@ -27,6 +27,7 @@ use common::storage::{
     StorageError, StorageResult, WriteOptions, WriteResult,
 };
 use common::{BytesRange, Ttl, create_object_store};
+use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use slatedb::config::{
     CheckpointOptions, CheckpointScope, DbReaderOptions, ScanOptions, Settings,
@@ -322,6 +323,9 @@ impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
 }
 
 impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
+    /// In-flight point gets for the batch index lookups.
+    const BATCH_GET_CONCURRENCY: usize = 64;
+
     /// Retrieves a single value by exact key. Returns `Ok(None)` if absent.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get(&self, key: Bytes) -> StorageResult<Option<Bytes>> {
@@ -336,7 +340,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
             dirty: false,
             read_ahead_bytes: 1024 * 1024,
             cache_blocks: true,
-            max_fetch_tasks: 4,
+            max_fetch_tasks: 8,
             order: IterationOrder::Ascending,
             filter_context: None,
         };
@@ -473,8 +477,20 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         terms: &[Label],
     ) -> crate::util::Result<InvertedIndex> {
         let result = InvertedIndex::default();
-        for term in terms {
-            if let Some(postings) = self.get_inverted_index_term(bucket, term).await? {
+        // Futures are built up front so the stream type carries no closure;
+        // a closure over `&Label` trips async_trait's `Send` inference.
+        let fetches: Vec<_> = terms
+            .iter()
+            .map(|term| async move {
+                self.get_inverted_index_term(bucket, term)
+                    .await
+                    .map(|postings| (term, postings))
+            })
+            .collect();
+        let mut fetches =
+            futures::stream::iter(fetches).buffer_unordered(Self::BATCH_GET_CONCURRENCY);
+        while let Some((term, postings)) = fetches.try_next().await? {
+            if let Some(postings) = postings {
                 result.postings.insert(term.clone(), postings);
             }
         }
@@ -525,8 +541,18 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         series_ids: &[SeriesId],
     ) -> crate::util::Result<ForwardIndex> {
         let result = ForwardIndex::default();
-        for &series_id in series_ids {
-            if let Some(spec) = self.get_forward_index_one(bucket, series_id).await? {
+        let fetches: Vec<_> = series_ids
+            .iter()
+            .map(|&series_id| async move {
+                self.get_forward_index_one(bucket, series_id)
+                    .await
+                    .map(|spec| (series_id, spec))
+            })
+            .collect();
+        let mut fetches =
+            futures::stream::iter(fetches).buffer_unordered(Self::BATCH_GET_CONCURRENCY);
+        while let Some((series_id, spec)) = fetches.try_next().await? {
+            if let Some(spec) = spec {
                 result.series.insert(series_id, spec);
             }
         }
@@ -641,7 +667,7 @@ where
     /// Number of SSTs warmed concurrently. Each `warm_sst` issues object-store
     /// reads for the SST's filters, index, and data blocks, so this bounds the
     /// in-flight fetch fan-out.
-    const WARM_CONCURRENCY: usize = 16;
+    const WARM_CONCURRENCY: usize = 32;
 
     /// Warms the block cache for the SSTs backing `buckets`.
     ///
@@ -668,8 +694,6 @@ where
         include_samples: bool,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
-        use futures::stream::{StreamExt, TryStreamExt};
-
         let wanted: HashSet<TimeBucket> = buckets.into_iter().collect();
 
         let manifest = self.db.status().current_manifest;

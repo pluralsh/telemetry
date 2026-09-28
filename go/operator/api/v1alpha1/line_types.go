@@ -54,10 +54,10 @@ type LineRequestSpec struct {
 	// +kubebuilder:default=128
 	MaxStructuredMetadataFields *int64 `json:"maxStructuredMetadataFields,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=8
+	// +kubebuilder:default=16
 	QueryConcurrency *int32 `json:"queryConcurrency,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=67108864
+	// +kubebuilder:default=134217728
 	MaxInFlightQueryBytes *int64 `json:"maxInFlightQueryBytes,omitempty"`
 }
 

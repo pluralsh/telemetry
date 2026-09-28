@@ -41,7 +41,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", "flush_interval_seconds: 60",
-		"virtual_shards: 8", "io_concurrency_multiplier: 4",
+		"virtual_shards: 8", "io_concurrency_multiplier: 8",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
 		"path: /etc/meter/secrets/global-read-0-password",
@@ -127,6 +127,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"otlp_grpc: 0.0.0.0:4317",
 		"jaeger_grpc: 0.0.0.0:14250",
 		"backend: kubernetes",
+		"database: traces",
 		"stateful_set: traces-writer",
 		"headless_service: traces-writer-headless",
 		"max_candidates: 10000",

@@ -10,6 +10,9 @@ The project breakdown is, following a musical theme:
 2. Line - Loki-compatible log store
 3. Track - Tempo-compatible trace store
 
+Storage formats, indexing, APIs, configuration, sharding, and authentication
+are documented in the [technical documentation](documentation/README.md).
+
 Track accepts OTLP over HTTP (`4318`-style namespace routes) and gRPC (`4317`),
 Zipkin JSON, and Jaeger collector gRPC (`14250`). Its Tempo-compatible read API
 includes trace lookup, TraceQL search, and canonical v1/v2 tag discovery. In

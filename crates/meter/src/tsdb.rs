@@ -845,6 +845,33 @@ async fn resolve_selector_in_bucket<R: QueryReader>(
     Ok(out)
 }
 
+/// Resolves every (bucket, selector) pair concurrently, folding each
+/// resolved series into `sink` as results arrive.
+async fn resolve_selectors<R: QueryReader>(
+    reader: &R,
+    buckets: &[TimeBucket],
+    selectors: &[VectorSelector],
+    mut sink: impl FnMut(Labels),
+) -> std::result::Result<(), QueryError> {
+    let index_cache = crate::promql::index_cache::IndexCache::new();
+    let index_cache = &index_cache;
+    let pairs: Vec<(TimeBucket, usize)> = buckets
+        .iter()
+        .flat_map(|bucket| (0..selectors.len()).map(|selector| (*bucket, selector)))
+        .collect();
+    let mut resolved = stream::iter(pairs)
+        .map(|(bucket, selector)| {
+            resolve_selector_in_bucket(reader, index_cache, bucket, &selectors[selector])
+        })
+        .buffer_unordered(DISCOVERY_BUCKET_READAHEAD);
+    while let Some(found) = resolved.try_next().await? {
+        for (_, labels) in found {
+            sink(labels);
+        }
+    }
+    Ok(())
+}
+
 /// Discover series matching any of the given selectors.
 pub(crate) async fn discover_series<R: QueryReader>(
     reader: &R,
@@ -862,16 +889,11 @@ pub(crate) async fn discover_series<R: QueryReader>(
     }
 
     let selectors = parse_selectors(matchers)?;
-    let index_cache = crate::promql::index_cache::IndexCache::new();
     let mut unique_series: HashSet<Labels> = HashSet::new();
-    for bucket in &buckets {
-        for selector in &selectors {
-            let found = resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
-            for (_, labels) in found {
-                unique_series.insert(labels);
-            }
-        }
-    }
+    resolve_selectors(reader, &buckets, &selectors, |labels| {
+        unique_series.insert(labels);
+    })
+    .await?;
 
     let mut result: Vec<Labels> = unique_series.into_iter().collect();
     result.sort();
@@ -893,18 +915,14 @@ pub(crate) async fn discover_labels<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let index_cache = crate::promql::index_cache::IndexCache::new();
-            for bucket in &buckets {
-                for selector in &selectors {
-                    let found =
-                        resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
-                    for (_, labels) in found {
-                        for attr in labels.iter() {
-                            label_names.insert(attr.name.clone());
-                        }
+            resolve_selectors(reader, &buckets, &selectors, |labels| {
+                for attr in labels.iter() {
+                    if !label_names.contains(&attr.name) {
+                        label_names.insert(attr.name.clone());
                     }
                 }
-            }
+            })
+            .await?;
         }
         _ => {
             let width = buckets.len().clamp(1, DISCOVERY_BUCKET_READAHEAD);
@@ -942,18 +960,14 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let index_cache = crate::promql::index_cache::IndexCache::new();
-            for bucket in &buckets {
-                for selector in &selectors {
-                    let found =
-                        resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
-                    for (_, labels) in found {
-                        if let Some(v) = labels.get(label_name) {
-                            values.insert(v.to_string());
-                        }
-                    }
+            resolve_selectors(reader, &buckets, &selectors, |labels| {
+                if let Some(v) = labels.get(label_name)
+                    && !values.contains(v)
+                {
+                    values.insert(v.to_string());
                 }
-            }
+            })
+            .await?;
         }
         _ => {
             let width = buckets.len().clamp(1, DISCOVERY_BUCKET_READAHEAD);
@@ -1217,35 +1231,50 @@ impl Tsdb {
     ) -> Result<()> {
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
+        let mut metadata: HashMap<String, Vec<MetricMetadata>> = HashMap::new();
 
         // First pass: group all series by bucket
         for series in series_list {
             let series_sample_count = series.samples.len();
             total_samples += series_sample_count;
 
-            if let Some(metric_name) = series
-                .labels
+            let Series {
+                labels,
+                metric_type,
+                unit,
+                description,
+                samples,
+            } = series;
+
+            if let Some(metric_name) = labels
                 .iter()
                 .find(|l| l.name == "__name__")
-                .map(|l| l.value.clone())
+                .map(|l| l.value.as_str())
             {
-                let entry = MetricMetadata {
-                    metric_name: metric_name.clone(),
-                    metric_type: series.metric_type,
-                    description: series.description.clone(),
-                    unit: series.unit.clone(),
-                };
-                let mut catalog = self.metadata_catalog.write().await;
-                let entries = catalog.entry(metric_name).or_default();
-                if !entries.contains(&entry) {
-                    entries.push(entry);
+                let known = metadata.get(metric_name).is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.metric_type == metric_type
+                            && entry.description == description
+                            && entry.unit == unit
+                    })
+                });
+                if !known {
+                    metadata
+                        .entry(metric_name.to_owned())
+                        .or_default()
+                        .push(MetricMetadata {
+                            metric_name: metric_name.to_owned(),
+                            metric_type,
+                            description: description.clone(),
+                            unit: unit.clone(),
+                        });
                 }
             }
 
             // Group samples by bucket for this series
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
-            for sample in series.samples {
+            for sample in samples {
                 let bucket = TimeBucket::round_to_hour(
                     std::time::UNIX_EPOCH
                         + std::time::Duration::from_millis(sample.timestamp_ms as u64),
@@ -1253,19 +1282,42 @@ impl Tsdb {
                 bucket_samples.entry(bucket).or_default().push(sample);
             }
 
-            // Create a series for each bucket and add to bucket_series_map
-            for (bucket, samples) in bucket_samples {
-                let bucket_series = Series {
-                    labels: series.labels.clone(),
-                    metric_type: series.metric_type,
-                    unit: series.unit.clone(),
-                    description: series.description.clone(),
+            // One series per bucket; the last bucket takes the owned fields,
+            // so the common single-bucket series is never cloned.
+            let mut groups: Vec<_> = bucket_samples.into_iter().collect();
+            let Some((last_bucket, last_samples)) = groups.pop() else {
+                continue;
+            };
+            for (bucket, samples) in groups {
+                bucket_series_map.entry(bucket).or_default().push(Series {
+                    labels: labels.clone(),
+                    metric_type,
+                    unit: unit.clone(),
+                    description: description.clone(),
                     samples,
-                };
-                bucket_series_map
-                    .entry(bucket)
-                    .or_default()
-                    .push(bucket_series);
+                });
+            }
+            bucket_series_map
+                .entry(last_bucket)
+                .or_default()
+                .push(Series {
+                    labels,
+                    metric_type,
+                    unit,
+                    description,
+                    samples: last_samples,
+                });
+        }
+
+        if !metadata.is_empty() {
+            let mut catalog = self.metadata_catalog.write().await;
+            for (metric_name, batch) in metadata {
+                let entries = catalog.entry(metric_name).or_default();
+                for entry in batch {
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
+                }
             }
         }
 
@@ -3121,18 +3173,9 @@ mod tests {
         }
 
         /// Subquery end-to-end at >512 series (RFC 0007 6.3.9 audit item
-        /// 10). Ignored because `SubqueryOp`'s
-        /// `tokio::task::block_in_place` path inside
-        /// [`build_subquery`](crate::promql::plan::physical) re-invokes
-        /// the child factory synchronously per outer step and does not
-        /// release the child's reservation on drop, causing the 1 GiB
-        /// plan-time cap to fill before the query completes. This is a
-        /// pre-existing subquery resource-accounting bug, not a
-        /// tile-boundary bug — the operators themselves absorb multi-tile
-        /// input correctly (verified by the per-operator stress tests in
-        /// 6.3.9). Re-enable once subquery reservation cleanup lands.
+        /// 10): each outer step's child must resume across storage waits
+        /// and return its reservation when dropped.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[ignore = "pre-existing subquery reservation leak; see doc comment"]
         async fn should_eval_sum_over_time_subquery_with_over_512_series() {
             const N_SERIES: usize = 600;
             let tsdb = create_tsdb_with_large_roster("m", N_SERIES).await;

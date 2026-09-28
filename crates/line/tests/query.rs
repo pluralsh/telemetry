@@ -410,6 +410,70 @@ async fn bounded_page_reads_fail_before_unbounded_io() {
 }
 
 #[tokio::test]
+async fn log_queries_stop_reading_once_the_limit_survives_the_pipeline() {
+    let db = LogDb::open(config("query-early-stop")).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    // One two-row page per ten-second segment.
+    let lines = [
+        (S, "keep"),
+        (2 * S, "drop"),
+        (11 * S, "keep"),
+        (12 * S, "keep"),
+        (21 * S, "drop"),
+        (22 * S, "drop"),
+        (31 * S, "keep"),
+        (32 * S, "keep"),
+    ];
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            lines
+                .iter()
+                .map(|&(timestamp, line)| LogEntry::new(timestamp, line))
+                .collect(),
+        )],
+    )
+    .await
+    .unwrap();
+    let request = QueryRequest::range(r#"{app="api"} |= "keep""#, 0, 40 * S, S);
+    let timestamps = |result: QueryResult| {
+        let QueryResult::Streams(streams) = result else {
+            panic!("expected streams");
+        };
+        streams
+            .into_iter()
+            .flat_map(|stream| stream.entries)
+            .map(|entry| entry.timestamp_ns)
+            .collect::<Vec<_>>()
+    };
+
+    let bounded = |limit, max_pages, direction| QueryOptions {
+        limit,
+        max_pages,
+        direction,
+        ..QueryOptions::default()
+    };
+    // The first segment yields one survivor, so the second must be read.
+    let result = db
+        .query(&namespace, &request, bounded(2, 2, Direction::Forward))
+        .await
+        .unwrap();
+    assert_eq!(timestamps(result), vec![S, 11 * S]);
+    let result = db
+        .query(&namespace, &request, bounded(2, 1, Direction::Backward))
+        .await
+        .unwrap();
+    assert_eq!(timestamps(result), vec![32 * S, 31 * S]);
+    let error = db
+        .query(&namespace, &request, bounded(10, 2, Direction::Forward))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("max_pages"));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn executes_every_metric_operator_category() {
     let (db, namespace) = database("query-operator-matrix").await;
     for operation in [

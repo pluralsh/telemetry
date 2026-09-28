@@ -1275,7 +1275,9 @@ where
         let effective_t = tr.end_ms_exclusive.saturating_sub(1);
         let grid = inner_grid(effective_t, sub_range_ms, inner_step_ms);
         let src = source_arc.clone();
-        let res = reservation_inner.clone();
+        // Each child is dropped after its outer step; the scope returns
+        // anything its operators still hold at that point.
+        let res = reservation_inner.scoped();
         let ctx_cp = ctx_copy.clone();
         let plan = inner_plan.clone();
         // Drive the async recursive planner to completion using a

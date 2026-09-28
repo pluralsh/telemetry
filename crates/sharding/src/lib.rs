@@ -7,6 +7,7 @@ mod backend;
 mod model;
 mod planner;
 mod runtime;
+pub mod server;
 mod traits;
 
 #[cfg(feature = "kubernetes")]
@@ -18,7 +19,7 @@ pub use backend::{
 };
 pub use model::{
     Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_MULTIPLIER,
-    DEFAULT_VIRTUAL_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange, ShardingConfig,
+    DEFAULT_VIRTUAL_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange,
 };
 pub use planner::{PlanError, balanced_contiguous};
 pub use runtime::{ManagerError, OwnershipManager, OwnershipManagerConfig, OwnershipState};

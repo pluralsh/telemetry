@@ -9,7 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const MAX_NAMESPACE_LEN: usize = 255;
 
-/// A validated tenant boundary. Every persisted Track key contains it.
+/// A validated tenant boundary. Every persisted key contains it, so it must
+/// stay free of NUL and control characters used as key delimiters.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Namespace(String);
 
@@ -35,7 +36,7 @@ impl Namespace {
         &self.0
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 }

@@ -96,8 +96,10 @@ impl ShardingOptions {
     }
 
     pub fn route(self, namespace: &Namespace, labels: &[crate::Label]) -> ShardId {
-        let mut labels = labels.to_vec();
-        labels.sort();
+        let mut labels: Vec<&crate::Label> = labels.iter().collect();
+        if !labels.is_sorted() {
+            labels.sort_unstable();
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(namespace.as_bytes());
         for label in labels {
@@ -212,18 +214,16 @@ impl ShardedMeter {
     }
 
     pub async fn write(&self, series: Vec<Series>, visibility: Visibility) -> Result<()> {
-        for (shard, batch) in self.group(series)? {
-            self.writers[&shard]
-                .write_with_visibility(batch, visibility)
-                .await?;
-        }
+        let writes = self
+            .group(series)?
+            .into_iter()
+            .map(|(shard, batch)| self.writers[&shard].write_with_visibility(batch, visibility));
+        futures::future::try_join_all(writes).await?;
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        for writer in self.writers.values() {
-            writer.flush().await?;
-        }
+        futures::future::try_join_all(self.writers.values().map(|writer| writer.flush())).await?;
         Ok(())
     }
 
@@ -307,7 +307,7 @@ impl ShardedMeter {
             unique.extend(labels);
         }
         let mut labels: Vec<_> = unique.into_iter().collect();
-        labels.sort_by_key(|labels| format!("{labels:?}"));
+        labels.sort_unstable();
         Ok(labels)
     }
 

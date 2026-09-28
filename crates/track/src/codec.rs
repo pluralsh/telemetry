@@ -5,7 +5,9 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
-use serde::{Deserialize, Serialize};
+use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
+use common::serde::sortable::encode_i64_sortable;
+use common::serde::varint::{var_u32, var_u64};
 
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
@@ -13,7 +15,13 @@ use crate::{
 
 pub(crate) const KEY_VERSION: u8 = 1;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
-pub(crate) const METADATA_VERSION: u8 = 1;
+const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
+/// Persisted by SlateDB; renaming it makes existing databases unopenable.
+pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
+    ScopedSegmentExtractor::new("track-trace/v1", KEY_SCOPE);
+/// Leading byte of page metadata and locator values.
+const VALUE_VERSION: u8 = 1;
+const HAS_EXPIRY: u8 = 1;
 
 /// Locator records deliberately live in one fixed routing segment per
 /// namespace. This makes trace-by-ID a single-shard lookup after data pages are
@@ -31,14 +39,28 @@ enum RecordType {
     AttributePosting = 5,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Page metadata carries a compact copy of the page's trace directory so
+/// search can resolve candidate trace IDs without fetching payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredPageMetadata {
-    pub version: u8,
     pub expires_at_unix_ms: Option<u64>,
     pub min_timestamp_ns: u64,
     pub max_timestamp_ns: u64,
-    pub trace_count: u32,
-    pub payload_bytes: u32,
+    /// Strictly ordered by trace ID, index-aligned with the payload directory.
+    pub traces: Vec<PageTrace>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PageTrace {
+    pub trace_id: TraceId,
+    pub min_timestamp_ns: u64,
+    pub max_timestamp_ns: u64,
+}
+
+impl PageTrace {
+    pub(crate) fn overlaps(&self, start_ns: u64, end_ns: u64) -> bool {
+        self.max_timestamp_ns >= start_ns && self.min_timestamp_ns <= end_ns
+    }
 }
 
 impl StoredPageMetadata {
@@ -46,21 +68,31 @@ impl StoredPageMetadata {
         self.expires_at_unix_ms
             .is_some_and(|expires_at| unix_ms >= expires_at)
     }
+
+    pub(crate) fn overlaps(&self, start_ns: u64, end_ns: u64) -> bool {
+        self.max_timestamp_ns >= start_ns && self.min_timestamp_ns <= end_ns
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TraceLocator {
-    pub version: u8,
     pub segment: SegmentId,
     pub page_sequence: u64,
     pub trace_index: u32,
     pub expires_at_unix_ms: Option<u64>,
 }
 
+/// A page's `(segment, sequence)` address.
+pub(crate) type PageRef = (SegmentId, u64);
+
 impl TraceLocator {
     pub(crate) fn is_expired_at(&self, unix_ms: u64) -> bool {
         self.expires_at_unix_ms
             .is_some_and(|expires_at| unix_ms >= expires_at)
+    }
+
+    pub(crate) fn page(&self) -> PageRef {
+        (self.segment, self.page_sequence)
     }
 }
 
@@ -71,7 +103,7 @@ pub(crate) fn segment_for(timestamp_ns: u64, segment_ns: u64) -> SegmentId {
 #[cfg(test)]
 pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
     let mut bytes = BytesMut::new();
-    write_scope(&mut bytes, namespace, segment);
+    KEY_SCOPE.write(&mut bytes, namespace, segment);
     bytes.freeze()
 }
 
@@ -91,6 +123,7 @@ pub(crate) fn metadata_range(namespace: &Namespace, segment: SegmentId) -> Bytes
     BytesRange::prefix(record_prefix(namespace, segment, RecordType::PageMetadata).freeze())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_metadata_sequence(key: &[u8]) -> Result<u64> {
     let (_, _, record_type, offset) = parse_record_prefix(key)?;
     if record_type != RecordType::PageMetadata || key.len() != offset + 8 {
@@ -107,7 +140,7 @@ pub(crate) fn locator_key(
 ) -> Bytes {
     let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator);
     bytes.extend_from_slice(trace_id.as_bytes());
-    bytes.put_u64(encode_sortable_i64(segment));
+    bytes.put_u64(encode_i64_sortable(segment));
     bytes.put_u64(sequence);
     bytes.freeze()
 }
@@ -170,36 +203,159 @@ pub(crate) fn decode_sequence(value: &[u8]) -> Result<u64> {
         .map_err(|_| Error::Corrupt("page sequence must contain eight bytes".to_owned()))
 }
 
+/// Trace timestamps are stored relative to the page minimum, so the
+/// directory costs about 20 bytes per trace.
 pub(crate) fn encode_metadata(value: &StoredPageMetadata) -> Result<Bytes> {
-    Ok(Bytes::from(serde_json::to_vec(value)?))
+    let page_span = value
+        .max_timestamp_ns
+        .checked_sub(value.min_timestamp_ns)
+        .ok_or_else(|| Error::Invalid("page max timestamp precedes min timestamp".to_owned()))?;
+    let mut bytes = value_header(value.expires_at_unix_ms, 24 + value.traces.len() * 24);
+    var_u64::serialize(value.min_timestamp_ns, &mut bytes);
+    var_u64::serialize(page_span, &mut bytes);
+    var_u32::serialize(
+        u32::try_from(value.traces.len())
+            .map_err(|_| Error::Invalid("page trace count exceeds u32".to_owned()))?,
+        &mut bytes,
+    );
+    for trace in &value.traces {
+        let (Some(offset), Some(span)) = (
+            trace.min_timestamp_ns.checked_sub(value.min_timestamp_ns),
+            trace.max_timestamp_ns.checked_sub(trace.min_timestamp_ns),
+        ) else {
+            return Err(Error::Invalid(
+                "trace timestamps fall outside page bounds".to_owned(),
+            ));
+        };
+        bytes.extend_from_slice(trace.trace_id.as_bytes());
+        var_u64::serialize(offset, &mut bytes);
+        var_u64::serialize(span, &mut bytes);
+    }
+    Ok(bytes.freeze())
 }
 
 pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
-    let metadata: StoredPageMetadata = serde_json::from_slice(value)?;
-    if metadata.version != METADATA_VERSION
-        || metadata.trace_count == 0
-        || metadata.min_timestamp_ns > metadata.max_timestamp_ns
-    {
-        return Err(Error::Corrupt(
-            "invalid trace page metadata version or bounds".to_owned(),
-        ));
+    let corrupt = || Error::Corrupt("invalid trace page metadata bounds".to_owned());
+    let (expires_at_unix_ms, mut buf) = value_body(value, "trace page metadata")?;
+    let min_timestamp_ns = read_u64(&mut buf)?;
+    let max_timestamp_ns = min_timestamp_ns
+        .checked_add(read_u64(&mut buf)?)
+        .ok_or_else(|| Error::Corrupt("page max timestamp overflows".to_owned()))?;
+    let count = read_u32(&mut buf)? as usize;
+    if count == 0 {
+        return Err(corrupt());
     }
-    Ok(metadata)
+    let mut traces = Vec::with_capacity(count.min(buf.len() / 18));
+    let (mut observed_min, mut observed_max) = (u64::MAX, 0);
+    for _ in 0..count {
+        let (id, rest) = buf
+            .split_first_chunk::<16>()
+            .ok_or_else(|| Error::Corrupt("truncated trace page metadata".to_owned()))?;
+        buf = rest;
+        let trace_id = TraceId::new(*id).map_err(|error| Error::Corrupt(error.to_string()))?;
+        let trace_min = min_timestamp_ns
+            .checked_add(read_u64(&mut buf)?)
+            .ok_or_else(corrupt)?;
+        let trace_max = trace_min
+            .checked_add(read_u64(&mut buf)?)
+            .ok_or_else(corrupt)?;
+        if trace_max > max_timestamp_ns
+            || traces
+                .last()
+                .is_some_and(|prior: &PageTrace| prior.trace_id >= trace_id)
+        {
+            return Err(corrupt());
+        }
+        observed_min = observed_min.min(trace_min);
+        observed_max = observed_max.max(trace_max);
+        traces.push(PageTrace {
+            trace_id,
+            min_timestamp_ns: trace_min,
+            max_timestamp_ns: trace_max,
+        });
+    }
+    expect_consumed(buf, "trace page metadata")?;
+    if observed_min != min_timestamp_ns || observed_max != max_timestamp_ns {
+        return Err(corrupt());
+    }
+    Ok(StoredPageMetadata {
+        expires_at_unix_ms,
+        min_timestamp_ns,
+        max_timestamp_ns,
+        traces,
+    })
 }
 
 pub(crate) fn encode_locator(value: &TraceLocator) -> Result<Bytes> {
-    Ok(Bytes::from(serde_json::to_vec(value)?))
+    let mut bytes = value_header(value.expires_at_unix_ms, 20);
+    bytes.put_i64(value.segment);
+    var_u64::serialize(value.page_sequence, &mut bytes);
+    var_u32::serialize(value.trace_index, &mut bytes);
+    Ok(bytes.freeze())
 }
 
 pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
-    let locator: TraceLocator = serde_json::from_slice(value)?;
-    if locator.version != METADATA_VERSION {
-        return Err(Error::Corrupt(format!(
-            "unsupported trace locator version {}",
-            locator.version
-        )));
-    }
+    let (expires_at_unix_ms, mut buf) = value_body(value, "trace locator")?;
+    let (segment, rest) = buf
+        .split_first_chunk::<8>()
+        .ok_or_else(|| Error::Corrupt("truncated trace locator".to_owned()))?;
+    buf = rest;
+    let locator = TraceLocator {
+        segment: i64::from_be_bytes(*segment),
+        page_sequence: read_u64(&mut buf)?,
+        trace_index: read_u32(&mut buf)?,
+        expires_at_unix_ms,
+    };
+    expect_consumed(buf, "trace locator")?;
     Ok(locator)
+}
+
+fn value_header(expires_at_unix_ms: Option<u64>, capacity: usize) -> BytesMut {
+    let mut bytes = BytesMut::with_capacity(capacity);
+    bytes.put_u8(VALUE_VERSION);
+    match expires_at_unix_ms {
+        Some(expires_at) => {
+            bytes.put_u8(HAS_EXPIRY);
+            var_u64::serialize(expires_at, &mut bytes);
+        }
+        None => bytes.put_u8(0),
+    }
+    bytes
+}
+
+/// Returns the logical expiry and the remaining payload.
+fn value_body<'a>(value: &'a [u8], what: &str) -> Result<(Option<u64>, &'a [u8])> {
+    match value {
+        [VALUE_VERSION, flags, rest @ ..] => {
+            let mut buf = rest;
+            let expires_at = match *flags {
+                0 => None,
+                HAS_EXPIRY => Some(read_u64(&mut buf)?),
+                flags => return Err(Error::Corrupt(format!("unknown {what} flags {flags}"))),
+            };
+            Ok((expires_at, buf))
+        }
+        [version, ..] => Err(Error::Corrupt(format!(
+            "unsupported {what} version {version}"
+        ))),
+        [] => Err(Error::Corrupt(format!("empty {what}"))),
+    }
+}
+
+fn read_u32(buf: &mut &[u8]) -> Result<u32> {
+    var_u32::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
+}
+
+fn read_u64(buf: &mut &[u8]) -> Result<u64> {
+    var_u64::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
+}
+
+fn expect_consumed(buf: &[u8], what: &str) -> Result<()> {
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Corrupt(format!("trailing bytes in {what}")))
+    }
 }
 
 pub(crate) fn encode_indices(indices: &[u32]) -> Result<Bytes> {
@@ -259,7 +415,7 @@ fn posting_prefix(
         }
         AttributeValue::Int(value) => {
             bytes.put_u8(3);
-            bytes.put_u64(encode_sortable_i64(*value));
+            bytes.put_u64(encode_i64_sortable(*value));
         }
         AttributeValue::Double(value) => {
             bytes.put_u8(4);
@@ -282,35 +438,17 @@ fn sequence_key(
 
 fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
     let mut bytes = BytesMut::new();
-    write_scope(&mut bytes, namespace, segment);
+    KEY_SCOPE.write(&mut bytes, namespace, segment);
     bytes.put_u8(record_type as u8);
     bytes
 }
 
-fn write_scope(bytes: &mut BytesMut, namespace: &Namespace, segment: SegmentId) {
-    bytes.put_u8(SUBSYSTEM);
-    bytes.put_u8(KEY_VERSION);
-    common::serde::terminated_bytes::serialize(namespace.as_bytes(), bytes);
-    bytes.put_u64(encode_sortable_i64(segment));
-}
-
 fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType, usize)> {
-    if bytes.len() < 12 || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
-        return Err(Error::Corrupt("invalid Track key prefix".to_owned()));
-    }
-    let mut suffix = &bytes[2..];
-    let namespace_bytes = common::serde::terminated_bytes::deserialize(&mut suffix)
-        .map_err(|error| Error::Corrupt(error.to_string()))?;
-    if suffix.len() < 9 {
-        return Err(Error::Corrupt("truncated Track key scope".to_owned()));
-    }
-    let namespace = Namespace::new(
-        String::from_utf8(namespace_bytes.to_vec())
-            .map_err(|error| Error::Corrupt(format!("namespace is not UTF-8: {error}")))?,
-    )
-    .map_err(|error| Error::Corrupt(error.to_string()))?;
-    let segment = decode_sortable_i64(&suffix[..8]);
-    let record_type = match suffix[8] {
+    let (namespace, segment, scope_len) = KEY_SCOPE.parse(bytes)?;
+    let Some(&record_type) = bytes.get(scope_len) else {
+        return Err(Error::Corrupt("key is missing its record type".to_owned()));
+    };
+    let record_type = match record_type {
         1 => RecordType::NextPageSequence,
         2 => RecordType::PageMetadata,
         3 => RecordType::PagePayload,
@@ -318,34 +456,18 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         5 => RecordType::AttributePosting,
         value => return Err(Error::Corrupt(format!("unknown Track record type {value}"))),
     };
-    Ok((
-        namespace,
-        segment,
-        record_type,
-        bytes.len() - suffix.len() + 9,
-    ))
+    Ok((namespace, segment, record_type, scope_len + 1))
 }
-
-pub(crate) fn routing_prefix_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 12 || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
-        return None;
-    }
-    let namespace_end = bytes[2..].iter().position(|byte| *byte == 0)? + 2;
-    let length = namespace_end + 1 + 8;
-    (bytes.len() >= length).then_some(length)
-}
-
-fn encode_sortable_i64(value: i64) -> u64 {
-    (value as u64) ^ (1_u64 << 63)
-}
-
-fn decode_sortable_i64(bytes: &[u8]) -> i64 {
-    (u64::from_be_bytes(bytes.try_into().unwrap()) ^ (1_u64 << 63)) as i64
-}
-
 #[cfg(test)]
 mod tests {
+    use slatedb::PrefixExtractor;
+
     use super::*;
+
+    #[test]
+    fn segment_extractor_name_is_stable() {
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "track-trace/v1");
+    }
 
     #[test]
     fn keys_route_by_namespace_and_time_segment() {
@@ -354,7 +476,7 @@ mod tests {
         assert!(key.starts_with(&segment_prefix(&namespace, -2)));
         assert_eq!(decode_metadata_sequence(&key).unwrap(), 7);
         assert_eq!(
-            routing_prefix_len(&key),
+            KEY_SCOPE.prefix_len(&key),
             Some(segment_prefix(&namespace, -2).len())
         );
     }
@@ -367,6 +489,87 @@ mod tests {
         let second = locator_key(&namespace, id, 4, 5);
         assert_ne!(first, second);
         assert!(first.starts_with(&segment_prefix(&namespace, LOCATOR_SEGMENT)));
+    }
+
+    #[test]
+    fn metadata_and_locators_roundtrip_in_binary() {
+        for expires_at_unix_ms in [None, Some(0), Some(u64::MAX)] {
+            let metadata = StoredPageMetadata {
+                expires_at_unix_ms,
+                min_timestamp_ns: 5,
+                max_timestamp_ns: u64::MAX,
+                traces: vec![
+                    PageTrace {
+                        trace_id: TraceId::new([1; 16]).unwrap(),
+                        min_timestamp_ns: 9,
+                        max_timestamp_ns: u64::MAX,
+                    },
+                    PageTrace {
+                        trace_id: TraceId::new([2; 16]).unwrap(),
+                        min_timestamp_ns: 5,
+                        max_timestamp_ns: 5,
+                    },
+                ],
+            };
+            assert_eq!(
+                decode_metadata(&encode_metadata(&metadata).unwrap()).unwrap(),
+                metadata
+            );
+            let locator = TraceLocator {
+                segment: i64::MIN,
+                page_sequence: u64::MAX,
+                trace_index: 12,
+                expires_at_unix_ms,
+            };
+            assert_eq!(
+                decode_locator(&encode_locator(&locator).unwrap()).unwrap(),
+                locator
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_value_versions() {
+        let mut locator = encode_locator(&TraceLocator {
+            segment: -4,
+            page_sequence: 2,
+            trace_index: 1,
+            expires_at_unix_ms: None,
+        })
+        .unwrap()
+        .to_vec();
+        locator[0] = VALUE_VERSION + 1;
+        assert!(decode_locator(&locator).is_err());
+        assert!(decode_metadata(br#"{"version":1}"#).is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_inconsistent_directories() {
+        let trace = |id: u8, min: u64, max: u64| PageTrace {
+            trace_id: TraceId::new([id; 16]).unwrap(),
+            min_timestamp_ns: min,
+            max_timestamp_ns: max,
+        };
+        let metadata = |traces| StoredPageMetadata {
+            expires_at_unix_ms: None,
+            min_timestamp_ns: 10,
+            max_timestamp_ns: 20,
+            traces,
+        };
+        for invalid in [
+            metadata(vec![trace(2, 10, 20), trace(1, 10, 20)]),
+            metadata(vec![trace(1, 10, 15)]),
+            metadata(vec![trace(1, 12, 20)]),
+            metadata(vec![trace(1, 10, 25)]),
+        ] {
+            let encoded = encode_metadata(&invalid).unwrap();
+            assert!(decode_metadata(&encoded).is_err(), "{invalid:?}");
+        }
+        assert!(encode_metadata(&metadata(vec![trace(1, 5, 20)])).is_err());
+        assert!(
+            encode_metadata(&metadata(Vec::new()))
+                .is_ok_and(|bytes| decode_metadata(&bytes).is_err())
+        );
     }
 
     #[test]

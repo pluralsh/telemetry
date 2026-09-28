@@ -5,7 +5,7 @@
 //! coexists with a production writer without fencing — unlike `Db::open()`,
 //! which always fences the previous writer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -359,7 +359,7 @@ impl TimeSeriesDbReader {
             .get_buckets_in_range(None, None)
             .await
             .map_err(|error| QueryError::Execution(error.to_string()))?;
-        let mut entries = Vec::new();
+        let mut by_metric: BTreeMap<String, Vec<MetricMetadata>> = BTreeMap::new();
         for bucket in buckets {
             let index = self
                 .storage
@@ -378,6 +378,7 @@ impl TimeSeriesDbReader {
                 if metric.is_some_and(|filter| filter != metric_name) {
                     continue;
                 }
+                let entries = by_metric.entry(metric_name.clone()).or_default();
                 let entry = MetricMetadata {
                     metric_name,
                     metric_type: spec.metric_type,
@@ -389,15 +390,14 @@ impl TimeSeriesDbReader {
                 }
             }
         }
-        entries.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
-        Ok(entries)
+        Ok(by_metric.into_values().flatten().collect())
     }
 }
 
 // ── TsdbReadEngine for TimeSeriesDbReader ────────────────────────────
 
 /// Maximum number of buckets to load concurrently.
-const BUCKET_LOAD_CONCURRENCY: usize = 8;
+const BUCKET_LOAD_CONCURRENCY: usize = 16;
 
 #[async_trait]
 impl TsdbReadEngine for TimeSeriesDbReader {

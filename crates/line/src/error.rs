@@ -22,4 +22,10 @@ pub enum Error {
     Regex(#[from] regex::Error),
 }
 
+impl From<common::serde::DeserializeError> for Error {
+    fn from(error: common::serde::DeserializeError) -> Self {
+        Self::Corrupt(error.message)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

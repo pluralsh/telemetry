@@ -12,6 +12,7 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 - [Line](#line)
 - [Meter](#meter)
 - [NamespaceAuthentication](#namespaceauthentication)
+- [Track](#track)
 
 
 
@@ -66,6 +67,7 @@ _Appears in:_
 _Appears in:_
 - [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
+- [TrackConfigSpec](#trackconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -259,6 +261,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -295,6 +298,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -458,8 +462,8 @@ _Appears in:_
 | `maxQueryEntries` _integer_ |  | 5000 | Minimum: 1 <br /> |
 | `maxQueryPages` _integer_ |  | 10000 | Minimum: 1 <br /> |
 | `maxStructuredMetadataFields` _integer_ |  | 128 | Minimum: 1 <br /> |
-| `queryConcurrency` _integer_ |  | 8 | Minimum: 1 <br /> |
-| `maxInFlightQueryBytes` _integer_ |  | 67108864 | Minimum: 1 <br /> |
+| `queryConcurrency` _integer_ |  | 16 | Minimum: 1 <br /> |
+| `maxInFlightQueryBytes` _integer_ |  | 134217728 | Minimum: 1 <br /> |
 
 
 #### LineSpec
@@ -648,6 +652,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -665,6 +670,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -685,11 +691,12 @@ _Appears in:_
 _Appears in:_
 - [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
+- [TrackConfigSpec](#trackconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `virtualShards` _integer_ |  | 8 | Minimum: 1 <br /> |
-| `ioConcurrencyMultiplier` _integer_ |  | 4 | Minimum: 1 <br /> |
+| `ioConcurrencyMultiplier` _integer_ |  | 8 | Minimum: 1 <br /> |
 | `leaseDurationSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
 | `renewIntervalSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 
@@ -705,6 +712,7 @@ _Appears in:_
 _Appears in:_
 - [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
+- [TrackConfigSpec](#trackconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -713,6 +721,115 @@ _Appears in:_
 | `objectStore` _[ObjectStoreSpec](#objectstorespec)_ |  |  |  |
 | `blockCache` _[CacheSpec](#cachespec)_ |  |  |  |
 | `metaCache` _[CacheSpec](#cachespec)_ |  |  |  |
+
+
+#### Track
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `Track` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[TrackSpec](#trackspec)_ |  |  |  |
+
+
+#### TrackConfigSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [TrackSpec](#trackspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:track \} |  |
+| `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
+| `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
+| `page` _[TrackPageSpec](#trackpagespec)_ |  |  |  |
+| `write` _[WriteSpec](#writespec)_ |  |  |  |
+| `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
+| `request` _[TrackRequestSpec](#trackrequestspec)_ |  |  |  |
+| `auth` _[AuthSpec](#authspec)_ |  |  |  |
+| `namespaces` _string array_ |  | [default] |  |
+
+
+
+
+#### TrackPageSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [TrackConfigSpec](#trackconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `targetSizeBytes` _integer_ |  | 1048576 | Minimum: 1 <br /> |
+| `maxSizeBytes` _integer_ |  | 4194304 | Minimum: 1 <br /> |
+| `maxTraces` _integer_ |  | 1024 | Minimum: 1 <br /> |
+
+
+#### TrackRequestSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [TrackConfigSpec](#trackconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxRequestBytes` _integer_ |  | 10485760 | Minimum: 1 <br /> |
+| `requestConcurrency` _integer_ |  | 64 | Minimum: 1 <br /> |
+| `maxCandidates` _integer_ |  | 10000 | Minimum: 1 <br /> |
+| `maxSpansPerTrace` _integer_ |  | 100000 | Minimum: 1 <br /> |
+| `queryConcurrency` _integer_ |  | 8 | Minimum: 1 <br /> |
+| `maxQueryLimit` _integer_ |  | 1000 | Minimum: 1 <br /> |
+
+
+#### TrackSpec
+
+
+
+TrackSpec defines the desired state of Track.
+
+
+
+_Appears in:_
+- [Track](#track)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[TrackMode](#trackmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the canonical Track container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/track \} |  |
+| `config` _[TrackConfigSpec](#trackconfigspec)_ |  |  |  |
+| `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9092 httpPort:3200 type:ClusterIP \} |  |
+| `ingress` _[IngressSpec](#ingressspec)_ |  |  |  |
+| `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
+
+
 
 
 #### VolumeSpec
@@ -743,6 +860,7 @@ _Appears in:_
 _Appears in:_
 - [LineSpec](#linespec)
 - [MeterSpec](#meterspec)
+- [TrackSpec](#trackspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -765,6 +883,7 @@ _Appears in:_
 _Appears in:_
 - [LineConfigSpec](#lineconfigspec)
 - [MeterConfigSpec](#meterconfigspec)
+- [TrackConfigSpec](#trackconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
