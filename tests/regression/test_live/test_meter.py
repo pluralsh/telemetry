@@ -35,7 +35,7 @@ def meter() -> MeterSuite:
     )
     with project:
         # Readers require every writer-created shard manifest to exist.
-        project.execute("up", "--detach", "meter-reader", timeout=180)
+        project.execute("up", "--detach", "--build", "meter-reader", timeout=900)
         wait_http("http://localhost:18082/-/ready")
         suite = MeterSuite.from_env()
         suite.seed()

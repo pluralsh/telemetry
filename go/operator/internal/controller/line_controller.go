@@ -346,7 +346,7 @@ func (r *LineReconciler) workloadsReady(ctx context.Context, line *telemetryv1al
 			return false, fmt.Sprintf("%s has %d/%d ready replicas", component, sts.Status.ReadyReplicas, desired), nil
 		}
 	}
-	return true, "all workloads are ready", nil
+	return true, messageWorkloadsReady, nil
 }
 
 func (r *LineReconciler) setStatus(ctx context.Context, line *telemetryv1alpha1.Line, status metav1.ConditionStatus, reason, message, hash string) error {

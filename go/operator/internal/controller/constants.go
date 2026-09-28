@@ -31,6 +31,7 @@ const (
 	reasonReconcileFailed      = "ReconcileFailed"
 	reasonStorageResizing      = "StorageResizing"
 	reasonStorageResizeBlocked = "StorageResizeBlocked"
+	messageWorkloadsReady      = "all workloads are ready"
 
 	suffixConfig        = "config"
 	suffixHeadless      = "headless"

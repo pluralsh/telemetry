@@ -42,6 +42,8 @@ const (
 	portHTTP                  = "http"
 	portGRPC                  = "grpc"
 	verbGet                   = "get"
+	verbList                  = "list"
+	verbWatch                 = "watch"
 	productUserID       int64 = 10001
 
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
@@ -245,9 +247,9 @@ func Role(value any) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, ComponentNone)},
 		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{verbGet, "list", "watch", "create", "update", "patch"}},
-			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, "list", "watch", "create", "update", "patch", "delete"}},
-			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet, "list", "watch"}},
+			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
+			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch", "delete"}},
+			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
 		},
 	}
 }

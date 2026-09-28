@@ -4,16 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: lines.telemetry.plural.sh
+  name: tracks.telemetry.plural.sh
 spec:
   group: telemetry.plural.sh
   names:
-    kind: Line
-    listKind: LineList
-    plural: lines
+    kind: Track
+    listKind: TrackList
+    plural: tracks
     shortNames:
-    - line
-    singular: line
+    - track
+    singular: track
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -48,7 +48,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: LineSpec defines the desired state of Line.
+            description: TrackSpec defines the desired state of Track.
             properties:
               config:
                 properties:
@@ -211,14 +211,6 @@ spec:
                           HTTP APIs.
                         type: boolean
                     type: object
-                  cache:
-                    properties:
-                      queryEntries:
-                        default: 256
-                        format: int64
-                        minimum: 0
-                        type: integer
-                    type: object
                   namespaces:
                     default:
                     - default
@@ -227,18 +219,13 @@ spec:
                     type: array
                   page:
                     properties:
-                      maxAgeSeconds:
-                        default: 5
+                      maxSizeBytes:
+                        default: 4194304
                         format: int64
                         minimum: 1
                         type: integer
-                      maxRows:
-                        default: 8192
-                        format: int64
-                        minimum: 1
-                        type: integer
-                      rowsPerBlock:
-                        default: 256
+                      maxTraces:
+                        default: 1024
                         format: int64
                         minimum: 1
                         type: integer
@@ -250,18 +237,13 @@ spec:
                     type: object
                   request:
                     properties:
-                      maxInFlightQueryBytes:
-                        default: 134217728
-                        format: int64
-                        minimum: 1
-                        type: integer
-                      maxQueryEntries:
-                        default: 5000
-                        format: int64
-                        minimum: 1
-                        type: integer
-                      maxQueryPages:
+                      maxCandidates:
                         default: 10000
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      maxQueryLimit:
+                        default: 1000
                         format: int64
                         minimum: 1
                         type: integer
@@ -270,13 +252,18 @@ spec:
                         format: int64
                         minimum: 1
                         type: integer
-                      maxStructuredMetadataFields:
-                        default: 128
+                      maxSpansPerTrace:
+                        default: 100000
                         format: int64
                         minimum: 1
                         type: integer
                       queryConcurrency:
-                        default: 16
+                        default: 8
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      requestConcurrency:
+                        default: 64
                         format: int32
                         minimum: 1
                         type: integer
@@ -319,7 +306,7 @@ spec:
                         || self.renewIntervalSeconds < self.leaseDurationSeconds'
                   storage:
                     default:
-                      path: line
+                      path: track
                     properties:
                       blockCache:
                         properties:
@@ -742,11 +729,6 @@ spec:
                       settingsPath:
                         type: string
                     type: object
-                  visibilityIntervalSeconds:
-                    default: 1
-                    format: int64
-                    minimum: 1
-                    type: integer
                   write:
                     properties:
                       durability:
@@ -776,7 +758,7 @@ spec:
               image:
                 default:
                   pullPolicy: IfNotPresent
-                  repository: ghcr.io/pluralsh/line
+                  repository: ghcr.io/pluralsh/track
                 properties:
                   pullPolicy:
                     default: IfNotPresent
@@ -9463,8 +9445,8 @@ spec:
                 type: object
               service:
                 default:
-                  grpcPort: 9091
-                  httpPort: 3100
+                  grpcPort: 9092
+                  httpPort: 3200
                   type: ClusterIP
                 properties:
                   annotations:
@@ -9496,7 +9478,7 @@ spec:
                 type: object
               version:
                 description: |-
-                  Version is the canonical Line container image tag. It must be SemVer
+                  Version is the canonical Track container image tag. It must be SemVer
                   without a leading "v". When omitted, deprecated image.tag is used, then
                   the operator's default version.
                 pattern: ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$
@@ -18132,7 +18114,7 @@ spec:
                 both are set
               rule: '!has(self.version) || !has(self.image) || !has(self.image.tag)
                 || self.version == self.image.tag'
-            - message: Line does not support ingress.pathPrefix because namespace
+            - message: Track does not support ingress.pathPrefix because namespace
                 API routes are fixed
               rule: '!has(self.ingress.pathPrefix) || self.ingress.pathPrefix.size()
                 == 0'

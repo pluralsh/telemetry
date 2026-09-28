@@ -21,9 +21,11 @@ const (
 	TrackKey  = "track.yaml"
 	ReaderKey = "reader.yaml"
 
-	sourceFile     = "file"
-	modeStandalone = "standalone"
-	modeWriter     = "writer"
+	sourceFile       = "file"
+	sourceURL        = "url"
+	defaultNamespace = "default"
+	modeStandalone   = "standalone"
+	modeWriter       = "writer"
 )
 
 type Credential struct {
@@ -107,7 +109,7 @@ func Render(input Input) (Result, error) {
 			data["jwks.json"] = append([]byte(nil), input.JWT.JWKS...)
 			jwt.JWKS = renderJWKS{Source: sourceFile, Path: secretsPath + "/jwks.json"}
 		case input.JWT.URL != "":
-			jwt.JWKS = renderJWKS{Source: "url", URL: input.JWT.URL}
+			jwt.JWKS = renderJWKS{Source: sourceURL, URL: input.JWT.URL}
 		default:
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
@@ -115,7 +117,7 @@ func Render(input Input) (Result, error) {
 
 	names := lo.Uniq(input.Meter.Spec.Config.Namespaces)
 	if len(names) == 0 {
-		names = []string{"default"}
+		names = []string{defaultNamespace}
 	}
 	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
 	sort.Strings(names)
@@ -190,14 +192,14 @@ func renderLine(input Input) (Result, error) {
 			data["jwks.json"] = append([]byte(nil), input.JWT.JWKS...)
 			jwt.JWKS = renderJWKS{Source: sourceFile, Path: secretsPath + "/jwks.json"}
 		case input.JWT.URL != "":
-			jwt.JWKS = renderJWKS{Source: "url", URL: input.JWT.URL}
+			jwt.JWKS = renderJWKS{Source: sourceURL, URL: input.JWT.URL}
 		default:
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
 	names := lo.Uniq(line.Spec.Config.Namespaces)
 	if len(names) == 0 {
-		names = []string{"default"}
+		names = []string{defaultNamespace}
 	}
 	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
 	sort.Strings(names)
@@ -290,14 +292,14 @@ func renderTrack(input Input) (Result, error) {
 			data["jwks.json"] = append([]byte(nil), input.JWT.JWKS...)
 			jwt.JWKS = renderJWKS{Source: sourceFile, Path: secretsPath + "/jwks.json"}
 		case input.JWT.URL != "":
-			jwt.JWKS = renderJWKS{Source: "url", URL: input.JWT.URL}
+			jwt.JWKS = renderJWKS{Source: sourceURL, URL: input.JWT.URL}
 		default:
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
 	names := lo.Uniq(track.Spec.Config.Namespaces)
 	if len(names) == 0 {
-		names = []string{"default"}
+		names = []string{defaultNamespace}
 	}
 	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
 	sort.Strings(names)
