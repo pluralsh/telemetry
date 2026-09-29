@@ -21,7 +21,7 @@ provisional envelope for one writer:
   this substantially.
 - Track: 20,000–60,000 spans/s when a span averages approximately 500 bytes.
 
-These ranges assume batched ingestion, default `written` durability, limited
+These ranges assume batched ingestion, default `applied` durability, limited
 writer-side reads, and an object store in the same region. They are deliberately
 below SlateDB's best public results. Do not multiply the upper bound by the
 writer count without testing shared object-store, compactor, and network limits.
@@ -87,8 +87,69 @@ writes. This supports Telemetry's separation of writer and reader roles.
 SlateDB's [tuning guidance][slatedb-tuning] quotes expected object-store write
 latency of 50–100 ms for S3 Standard, 5–10 ms for S3 Express One Zone, and
 5–20 ms for MinIO. Synchronous small writes therefore require group commit or
-application batching. Default `written` ingestion does not wait for each
-object-store round trip; `durable` ingestion does.
+application batching. `written` ingestion does not wait for each object-store
+round trip; `durable` ingestion does.
+
+## Shared write-buffer behavior
+
+Meter, Line, and Track use the same bounded, per-storage-shard write
+coordinator. A request is validated and merged into a live in-memory delta;
+the coordinator freezes deltas by size, time, or an explicit durability
+barrier. Line coalesces entries by namespace, segment, routing slot, and stream
+fingerprint. Track coalesces traces by namespace, segment, and routing slot.
+This allows separate client requests to share product page and index work.
+
+The requested durability level controls acknowledgement:
+
+- `applied` acknowledges after the write has entered the live delta. It gives
+  the most opportunity for cross-request coalescing but can lose acknowledged
+  data if the process exits before a flush. This is the default for telemetry
+  throughput.
+- `written` freezes through the request's epoch and waits until its coalesced
+  batch has entered SlateDB's writable state. It does not force a remote
+  object-store flush.
+- `durable` also waits for SlateDB's object-store flush. Its latency therefore
+  includes object-store PUT latency.
+
+All three products default `write.flush_interval_seconds` to 10 seconds. For
+`applied` and `written` writes, read-only replicas normally observe data within
+roughly 0–10 seconds plus manifest polling and flush latency; size-triggered or
+explicit flushes can make it visible sooner. This durable interval is separate
+from `buffer_flush_interval_milliseconds`, which controls when Line and Track
+freeze and apply their live in-memory deltas.
+
+The queue is deliberately bounded. A full queue produces protocol-specific
+backpressure (`429` plus `Retry-After` for HTTP and `UNAVAILABLE` for OTLP or
+Jaeger gRPC) rather than unbounded memory growth. Storage or drain
+unavailability returns `503` or `UNAVAILABLE`; clients should reroute or retry.
+OpenTelemetry Collector exporters and Grafana Alloy retry these responses with
+backoff by default. Grafana Alloy also retries Loki and Prometheus remote-write
+`429` responses by default. Stock Prometheus requires
+`remote_write.queue_config.retry_on_http_429: true`; without it, Prometheus
+drops a batch rejected with `429`. All conforming remote-write senders retry
+the `5xx` responses used for transient storage and drain failures.
+Legacy applications that send directly with native Zipkin or Jaeger client
+reporters commonly do not retry rejected batches at all. Put an OpenTelemetry
+Collector or another durable agent between those applications and Telemetry
+when overload loss is unacceptable; changing the response code cannot make
+those legacy reporters replay a dropped batch.
+
+Plan coordinator memory per open storage shard as:
+
+```text
+live delta + up to two frozen deltas + queued request payloads
+```
+
+`buffer_size_threshold_bytes` bounds each delta approximately, not total
+process memory. `buffer_queue_capacity` counts queued commands rather than
+bytes. Lower `buffer_flush_interval_milliseconds` reduces `applied` latency and
+drain work but also reduces batching. Raise the size threshold only after
+measuring process RSS and flush latency.
+
+During migration, the drain gate waits for already-admitted writes to finish,
+rejects later local writes, then runs `drain → flush → close → lease release`.
+The flush advances buffered writes through durable storage before the source
+checkpoint is cloned, so every acknowledged pre-drain write is included.
 
 ## Product write behavior
 
@@ -108,9 +169,11 @@ Meter capacity depends on both samples/s and active-series behavior:
 
 ### Line
 
-Line commits each accepted group as one atomic SlateDB `WriteBatch`. It does
-not force an object-store flush per request. A periodic visibility flush makes
-complete accepted batches visible to read-only replicas.
+Line turns each frozen delta into coalesced SlateDB `WriteBatch` operations.
+Default `applied` requests can coalesce across the configured time and size
+window. `written` requests force a coordinator barrier but not an object-store
+flush. The common periodic durable flush makes complete accepted batches
+visible to read-only replicas.
 
 Large batches let Line fill its approximately 1 MiB pages, resolve a stream once
 for more entries, and combine posting updates. Small requests increase lock,
@@ -119,8 +182,9 @@ therefore be tested independently from byte throughput.
 
 ### Track
 
-Track also commits pages, locators, metadata, and posting fragments in one
-atomic SlateDB `WriteBatch`, followed by periodic reader-visibility flushes.
+Track also coalesces pages, locators, metadata, and posting fragments before
+committing atomic SlateDB `WriteBatch` operations, followed by periodic
+durable flushes that establish reader visibility.
 Trace batches should be large enough to fill approximately 1 MiB pages without
 turning an entire object-store buffer object into one oversized transaction.
 
@@ -303,7 +367,7 @@ The minimum workload set is:
 1. Direct, small client requests to expose request overhead.
 2. Direct, 1–4 MiB client batches.
 3. Buffer-coalesced 1–4 MiB per-shard writes when the buffer integration exists.
-4. Default `written` durability.
+4. Default `applied` durability, with `written` as a throughput comparison.
 5. `durable` mode as a latency-focused comparison.
 6. Stable-cardinality and high-churn variants.
 7. Concurrent representative reads to detect cache and object-store contention.

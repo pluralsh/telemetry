@@ -11,6 +11,7 @@ use tonic::{Request, Response, Status as GrpcStatus};
 use crate::{
     AppState,
     config::ServerMode,
+    http::ApiError,
     jaeger::{
         Batch, KeyValue as JaegerKeyValue, PostSpansRequest, PostSpansResponse, Process,
         Span as JaegerSpan, ValueType,
@@ -82,7 +83,7 @@ impl CollectorService for AppState {
             .map_err(|error| GrpcStatus::invalid_argument(error.to_string()))?;
         self.route_write(&namespace, batches, ulid::Ulid::new().to_string())
             .await
-            .map_err(|error| GrpcStatus::unavailable(error.to_string()))?;
+            .map_err(ApiError::into_grpc_status)?;
         Ok(Response::new(PostSpansResponse {}))
     }
 }

@@ -86,7 +86,7 @@ impl AppState {
         let db = Arc::new(if config.mode == ServerMode::Reader {
             ShardedLine::open_readers_with_routing(
                 config.line_config(),
-                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
                 &assignment.routing,
                 slatedb::config::DbReaderOptions {
@@ -98,7 +98,7 @@ impl AppState {
         } else {
             ShardedLine::open_with_routing(
                 config.line_config(),
-                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
                 &assignment.routing,
             )
@@ -147,7 +147,7 @@ impl AppState {
                         config: state.config.line_config(),
                         options: ShardingOptions::new(
                             state.assignment.read().await.virtual_shards,
-                            state.config.sharding.io_concurrency_multiplier,
+                            state.config.sharding.io_concurrency_limit,
                         )?,
                     }),
                     Arc::clone(&state.assignment),
@@ -156,7 +156,7 @@ impl AppState {
                 state.tasks.lock().await.extend(tasks);
             }
         }
-        state.start_visibility_task().await;
+        state.start_durable_flush_task().await;
         Ok(state)
     }
 
@@ -233,7 +233,7 @@ impl AppState {
         let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
+            self.config.sharding.io_concurrency_limit,
         )
         .map_err(ApiError::internal)?;
         let mut groups: HashMap<(Owner, ShardId), Vec<LogBatch>> = HashMap::new();
@@ -286,7 +286,11 @@ impl AppState {
         shard: ShardId,
         batches: Vec<LogBatch>,
     ) -> Result<(), ApiError> {
-        if self.draining_shards.read().await.contains(&shard) {
+        // Hold the read guard until the write completes. Migration and
+        // shutdown take the lock exclusively before flushing, which makes
+        // their flush a barrier for every write admitted before the drain.
+        let draining = self.draining_shards.read().await;
+        if draining.contains(&shard) {
             return Err(ApiError::unavailable("local shard is draining"));
         }
         let database = self
@@ -297,7 +301,7 @@ impl AppState {
         database
             .write_with_durability(namespace, batches, durability(self.config.write.durability))
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(ApiError::from_line)?;
         self.mark_dirty();
         self.invalidate_queries().await;
         Ok(())
@@ -360,13 +364,16 @@ impl AppState {
         for task in self.tasks.lock().await.drain(..) {
             task.await?;
         }
+        let open_shards = self.db.open_shards().await;
+        let mut draining = self.draining_shards.write().await;
+        draining.extend(open_shards);
         self.db.flush().await?;
         self.db.close().await?;
         Ok(())
     }
 
-    async fn start_visibility_task(&self) {
-        let seconds = self.config.visibility_interval_seconds;
+    async fn start_durable_flush_task(&self) {
+        let seconds = self.config.write.flush_interval_seconds;
         if seconds == 0 {
             return;
         }
@@ -382,7 +389,7 @@ impl AppState {
                             if let Err(error) = state.db.flush().await {
                                 state.ready.store(false, Ordering::Release);
                                 state.dirty.store(true, Ordering::Release);
-                                tracing::error!(%error, "Line visibility flush failed");
+                                tracing::error!(%error, "Line durable flush failed");
                             } else {
                                 state.invalidate_queries().await;
                             }
@@ -576,7 +583,7 @@ mod tests {
             storage: StorageConfig::InMemory,
             sharding: ShardingConfig {
                 virtual_shards: 2,
-                io_concurrency_multiplier: 4,
+                io_concurrency_limit: 64,
                 kind: ShardingBackend::Static {
                     owner_id: owner_id.into(),
                     owners: vec![
@@ -671,6 +678,45 @@ mod tests {
         state.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn drain_waits_for_admitted_write_guard_and_rejects_later_writes() {
+        let state = AppState::open(Config {
+            storage: StorageConfig::InMemory,
+            namespaces: vec![NamespaceConfig {
+                name: "tenant".into(),
+                auth: Default::default(),
+            }],
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::new("tenant").unwrap();
+        let batch = batch_on_shard(&namespace, 1);
+        let routing = state.assignment.read().await.routing.clone();
+        let shard = state.db.route(&routing, &namespace, &batch.labels);
+
+        // This is the admission guard held by write_local for the full write.
+        let admitted = state.draining_shards.read().await;
+        let draining = Arc::clone(&state.draining_shards);
+        let drain = tokio::spawn(async move {
+            draining.write().await.insert(shard);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain passed an admitted in-flight write"
+        );
+
+        drop(admitted);
+        drain.await.unwrap();
+        let error = state
+            .write_local(&namespace, shard, vec![batch])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("local shard is draining"));
+        state.shutdown().await.unwrap();
+    }
+
     #[cfg(feature = "kubernetes")]
     #[tokio::test]
     async fn line_lifecycle_opens_drains_flushes_and_closes_a_shard() {
@@ -755,6 +801,7 @@ mod tests {
             .await
             .unwrap();
 
+        writer_b.db.flush().await.unwrap();
         let result = writer_b
             .db
             .query(

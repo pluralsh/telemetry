@@ -173,11 +173,20 @@ type StorageSpec struct {
 
 type WriteSpec struct {
 	// +kubebuilder:validation:Enum=applied;written;durable
-	// +kubebuilder:default=written
+	// +kubebuilder:default=applied
 	Durability Durability `json:"durability,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=60
+	// +kubebuilder:default=10
 	FlushIntervalSeconds *int64 `json:"flushIntervalSeconds,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=10000
+	BufferQueueCapacity *int32 `json:"bufferQueueCapacity,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=10000
+	BufferFlushIntervalMilliseconds *int64 `json:"bufferFlushIntervalMilliseconds,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=67108864
+	BufferSizeThresholdBytes *int64 `json:"bufferSizeThresholdBytes,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=16
 	RemoteConcurrency *int32 `json:"remoteConcurrency,omitempty"`
@@ -189,8 +198,9 @@ type WriteSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds < self.leaseDurationSeconds",message="renewIntervalSeconds must be less than leaseDurationSeconds"
 type ShardingSpec struct {
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=8
-	IOConcurrencyMultiplier *int32 `json:"ioConcurrencyMultiplier,omitempty"`
+	// +kubebuilder:default=128
+	// IOConcurrencyLimit bounds concurrent storage I/O operations per pod.
+	IOConcurrencyLimit *int32 `json:"ioConcurrencyLimit,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=15
 	LeaseDurationSeconds *int64 `json:"leaseDurationSeconds,omitempty"`

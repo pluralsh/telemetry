@@ -279,8 +279,10 @@ spec:
                     type: integer
                   sharding:
                     properties:
-                      ioConcurrencyMultiplier:
-                        default: 8
+                      ioConcurrencyLimit:
+                        default: 128
+                        description: IOConcurrencyLimit bounds concurrent storage
+                          I/O operations per pod.
                         format: int32
                         minimum: 1
                         type: integer
@@ -724,22 +726,32 @@ spec:
                       settingsPath:
                         type: string
                     type: object
-                  visibilityIntervalSeconds:
-                    default: 1
-                    format: int64
-                    minimum: 0
-                    type: integer
                   write:
                     properties:
+                      bufferFlushIntervalMilliseconds:
+                        default: 10000
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      bufferQueueCapacity:
+                        default: 10000
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      bufferSizeThresholdBytes:
+                        default: 67108864
+                        format: int64
+                        minimum: 1
+                        type: integer
                       durability:
-                        default: written
+                        default: applied
                         enum:
                         - applied
                         - written
                         - durable
                         type: string
                       flushIntervalSeconds:
-                        default: 60
+                        default: 10
                         format: int64
                         minimum: 0
                         type: integer

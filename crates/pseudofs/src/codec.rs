@@ -3,12 +3,22 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
+use std::sync::Arc;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use slatedb::{PrefixExtractor, PrefixTarget};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+
+pub(crate) const KEY_VERSION: u8 = 1;
+pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::PSEUDOFS;
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "pseudofs/v1";
+const SEGMENT_PREFIX_LEN: usize = 2;
+const TENANT_PREFIX_LEN: usize = SEGMENT_PREFIX_LEN + 2 + 1 + 16;
+const DIRECTORY_NAME_OFFSET: usize = TENANT_PREFIX_LEN + 16;
 
 const INODE: u8 = b'i';
 const DIRECTORY_ENTRY: u8 = b'd';
@@ -17,17 +27,54 @@ const CHUNK: u8 = b'c';
 const UPLOAD: u8 = b'u';
 const GARBAGE: u8 = b'x';
 
-pub(crate) fn inode_key(id: Uuid) -> Bytes {
-    tagged_uuid(INODE, id)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TenantScope {
+    pub(crate) slot: u16,
+    pub(crate) root_id: Uuid,
 }
 
-pub(crate) fn directory_prefix(parent: Uuid) -> Bytes {
-    tagged_uuid(DIRECTORY_ENTRY, parent)
+pub(crate) struct PseudofsSegmentExtractor;
+
+impl PseudofsSegmentExtractor {
+    pub(crate) fn shared() -> Arc<dyn PrefixExtractor> {
+        Arc::new(Self)
+    }
 }
 
-pub(crate) fn directory_entry_key(parent: Uuid, name: &str) -> Bytes {
-    let mut key = BytesMut::with_capacity(17 + name.len());
-    key.put_u8(DIRECTORY_ENTRY);
+impl PrefixExtractor for PseudofsSegmentExtractor {
+    fn name(&self) -> &str {
+        SEGMENT_EXTRACTOR_NAME
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let bytes = match target {
+            PrefixTarget::Point(bytes) | PrefixTarget::Prefix(bytes) => bytes.as_ref(),
+        };
+        let valid =
+            bytes.len() >= SEGMENT_PREFIX_LEN && bytes[0] == SUBSYSTEM && bytes[1] == KEY_VERSION;
+        match target {
+            PrefixTarget::Point(_) => {
+                assert!(
+                    valid && bytes.len() >= TENANT_PREFIX_LEN,
+                    "{SEGMENT_EXTRACTOR_NAME} received malformed key: {bytes:02x?}"
+                );
+                Some(SEGMENT_PREFIX_LEN)
+            }
+            PrefixTarget::Prefix(_) => valid.then_some(SEGMENT_PREFIX_LEN),
+        }
+    }
+}
+
+pub(crate) fn inode_key(scope: TenantScope, id: Uuid) -> Bytes {
+    tagged_uuid(scope, INODE, id)
+}
+
+pub(crate) fn directory_prefix(scope: TenantScope, parent: Uuid) -> Bytes {
+    tagged_uuid(scope, DIRECTORY_ENTRY, parent)
+}
+
+pub(crate) fn directory_entry_key(scope: TenantScope, parent: Uuid, name: &str) -> Bytes {
+    let mut key = record_prefix(scope, DIRECTORY_ENTRY, 16 + name.len());
     key.extend_from_slice(parent.as_bytes());
     key.extend_from_slice(name.as_bytes());
     key.freeze()
@@ -35,39 +82,53 @@ pub(crate) fn directory_entry_key(parent: Uuid, name: &str) -> Bytes {
 
 pub(crate) fn directory_entry_name(key: &[u8]) -> Result<String> {
     let raw = key
-        .get(17..)
+        .get(DIRECTORY_NAME_OFFSET..)
         .ok_or_else(|| Error::Corrupt("short directory-entry key".to_owned()))?;
     String::from_utf8(raw.to_vec())
         .map_err(|_| Error::Corrupt("non-UTF-8 directory-entry key".to_owned()))
 }
 
-pub(crate) fn generation_key(inode: Uuid, generation: Uuid) -> Bytes {
-    tagged_two_uuids(GENERATION, inode, generation)
+pub(crate) fn generation_key(scope: TenantScope, inode: Uuid, generation: Uuid) -> Bytes {
+    tagged_two_uuids(scope, GENERATION, inode, generation)
 }
 
-pub(crate) fn chunk_key(inode: Uuid, generation: Uuid, index: u64) -> Bytes {
-    let mut key = BytesMut::with_capacity(41);
-    key.put_u8(CHUNK);
+pub(crate) fn chunk_key(scope: TenantScope, inode: Uuid, generation: Uuid, index: u64) -> Bytes {
+    let mut key = record_prefix(scope, CHUNK, 40);
     key.extend_from_slice(inode.as_bytes());
     key.extend_from_slice(generation.as_bytes());
     key.put_u64(index);
     key.freeze()
 }
 
-pub(crate) fn upload_key(generation: Uuid) -> Bytes {
-    tagged_uuid(UPLOAD, generation)
+pub(crate) fn upload_key(scope: TenantScope, generation: Uuid) -> Bytes {
+    tagged_uuid(scope, UPLOAD, generation)
 }
 
-pub(crate) fn upload_prefix() -> Bytes {
-    Bytes::from_static(&[UPLOAD])
+pub(crate) fn upload_prefix(slot: u16) -> Bytes {
+    slot_record_prefix(slot, UPLOAD)
 }
 
-pub(crate) fn garbage_key(head: Uuid) -> Bytes {
-    tagged_uuid(GARBAGE, head)
+pub(crate) fn garbage_key(scope: TenantScope, head: Uuid) -> Bytes {
+    tagged_uuid(scope, GARBAGE, head)
 }
 
-pub(crate) fn garbage_prefix() -> Bytes {
-    Bytes::from_static(&[GARBAGE])
+pub(crate) fn garbage_prefix(slot: u16) -> Bytes {
+    slot_record_prefix(slot, GARBAGE)
+}
+
+pub(crate) fn tenant_scope_from_key(key: &[u8]) -> Result<TenantScope> {
+    if key.len() < TENANT_PREFIX_LEN || key[0] != SUBSYSTEM || key[1] != KEY_VERSION {
+        return Err(Error::Corrupt("malformed PseudoFS record key".to_owned()));
+    }
+    let slot = u16::from_be_bytes(key[2..4].try_into().unwrap());
+    if slot >= sharding::ROUTING_SLOT_COUNT {
+        return Err(Error::Corrupt(format!(
+            "routing slot exceeds 12 bits: {slot}"
+        )));
+    }
+    let root_id = Uuid::from_slice(&key[5..21])
+        .map_err(|error| Error::Corrupt(format!("invalid tenant root ID: {error}")))?;
+    Ok(TenantScope { slot, root_id })
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Bytes> {
@@ -81,18 +142,37 @@ pub(crate) fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
         .map_err(|error| Error::Corrupt(format!("cannot decode metadata: {error}")))
 }
 
-fn tagged_uuid(tag: u8, id: Uuid) -> Bytes {
-    let mut key = BytesMut::with_capacity(17);
-    key.put_u8(tag);
+fn tagged_uuid(scope: TenantScope, tag: u8, id: Uuid) -> Bytes {
+    let mut key = record_prefix(scope, tag, 16);
     key.extend_from_slice(id.as_bytes());
     key.freeze()
 }
 
-fn tagged_two_uuids(tag: u8, first: Uuid, second: Uuid) -> Bytes {
-    let mut key = BytesMut::with_capacity(33);
-    key.put_u8(tag);
+fn tagged_two_uuids(scope: TenantScope, tag: u8, first: Uuid, second: Uuid) -> Bytes {
+    let mut key = record_prefix(scope, tag, 32);
     key.extend_from_slice(first.as_bytes());
     key.extend_from_slice(second.as_bytes());
+    key.freeze()
+}
+
+fn record_prefix(scope: TenantScope, tag: u8, suffix_len: usize) -> BytesMut {
+    assert!(scope.slot < sharding::ROUTING_SLOT_COUNT);
+    let mut key = BytesMut::with_capacity(TENANT_PREFIX_LEN + suffix_len);
+    key.put_u8(SUBSYSTEM);
+    key.put_u8(KEY_VERSION);
+    key.put_u16(scope.slot);
+    key.put_u8(tag);
+    key.extend_from_slice(scope.root_id.as_bytes());
+    key
+}
+
+fn slot_record_prefix(slot: u16, tag: u8) -> Bytes {
+    assert!(slot < sharding::ROUTING_SLOT_COUNT);
+    let mut key = BytesMut::with_capacity(5);
+    key.put_u8(SUBSYSTEM);
+    key.put_u8(KEY_VERSION);
+    key.put_u16(slot);
+    key.put_u8(tag);
     key.freeze()
 }
 
@@ -100,18 +180,62 @@ fn tagged_two_uuids(tag: u8, first: Uuid, second: Uuid) -> Bytes {
 mod tests {
     use super::*;
 
+    fn scope(slot: u16) -> TenantScope {
+        TenantScope {
+            slot,
+            root_id: Uuid::from_u128(1),
+        }
+    }
+
     #[test]
     fn directory_entry_round_trip() {
         let parent = Uuid::new_v4();
-        let key = directory_entry_key(parent, "notes.txt");
+        let scope = scope(17);
+        let key = directory_entry_key(scope, parent, "notes.txt");
         assert_eq!(directory_entry_name(&key).unwrap(), "notes.txt");
-        assert!(key.starts_with(&directory_prefix(parent)));
+        assert!(key.starts_with(&directory_prefix(scope, parent)));
     }
 
     #[test]
     fn chunk_indices_sort_lexicographically() {
         let inode = Uuid::new_v4();
         let generation = Uuid::new_v4();
-        assert!(chunk_key(inode, generation, 1) < chunk_key(inode, generation, 2));
+        let scope = scope(17);
+        assert!(chunk_key(scope, inode, generation, 1) < chunk_key(scope, inode, generation, 2));
+    }
+
+    #[test]
+    fn routing_slot_immediately_follows_segment_prefix_for_every_record_family() {
+        let scope = scope(0x0123);
+        let inode = Uuid::new_v4();
+        let generation = Uuid::new_v4();
+        let keys = [
+            inode_key(scope, inode),
+            directory_entry_key(scope, inode, "name"),
+            generation_key(scope, inode, generation),
+            chunk_key(scope, inode, generation, 0),
+            upload_key(scope, generation),
+            garbage_key(scope, generation),
+        ];
+        for key in keys {
+            assert_eq!(&key[..2], &[SUBSYSTEM, KEY_VERSION]);
+            assert_eq!(
+                u16::from_be_bytes(key[2..4].try_into().unwrap()),
+                scope.slot
+            );
+        }
+    }
+
+    #[test]
+    fn slot_ranges_sort_before_record_family_and_tenant() {
+        let low = scope(17);
+        let high = TenantScope {
+            slot: 18,
+            root_id: Uuid::nil(),
+        };
+        assert!(
+            garbage_key(low, Uuid::from_u128(u128::MAX))
+                < chunk_key(high, Uuid::nil(), Uuid::nil(), 0)
+        );
     }
 }

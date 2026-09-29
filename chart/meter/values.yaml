@@ -70,8 +70,8 @@ config:
       capacity: 134217728
   readerCacheCapacity: 268435456
   write:
-    durability: written
-    flush_interval_seconds: 60
+    durability: applied
+    flush_interval_seconds: 10
     remote_concurrency: 16
     remote_retries: 2
   auth:
@@ -97,7 +97,7 @@ config:
         write: []
 
 sharding:
-  ioConcurrencyMultiplier: 8
+  ioConcurrencyLimit: 128
   leaseDurationSeconds: 15
   renewIntervalSeconds: 5
 

@@ -84,19 +84,24 @@ page:
   max_size_bytes: 4194304 # Hard encoded page limit; 4 MiB.
   max_traces: 1024 # Maximum traces in one page.
 
-# Successful periodic L0 flushes make accepted writes visible to readers.
-visibility_interval_seconds: 1
-
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
-  durability: written
+  durability: applied
+  # Durable object-store flush and read-replica visibility interval; 0 disables it.
+  flush_interval_seconds: 10
+  # Per-storage-shard coordinator bounds. Memory can include the live delta,
+  # up to two frozen deltas, and queued request payloads.
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864 # 64 MiB.
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
 
 sharding:
   # Storage-shard count fixed when the dataset is created.
   virtual_shards: 8
-  io_concurrency_multiplier: 8
+  # Fixed per-pod storage I/O budget; independent of storage-shard count.
+  io_concurrency_limit: 128
   backend: standalone
 
   # Static backend alternative. Ranges are half-open and must exactly cover

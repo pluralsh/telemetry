@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use sharding::{
-    DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
+    DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
     ShardId, ShardMap,
 };
 use slatedb::config::DbReaderOptions;
@@ -20,33 +20,33 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardingOptions {
     virtual_shards: u32,
-    io_concurrency_multiplier: u32,
+    io_concurrency_limit: u32,
 }
 
 impl Default for ShardingOptions {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+            io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
         }
     }
 }
 
 impl ShardingOptions {
-    pub fn new(virtual_shards: u32, io_concurrency_multiplier: u32) -> Result<Self> {
+    pub fn new(virtual_shards: u32, io_concurrency_limit: u32) -> Result<Self> {
         if virtual_shards == 0 {
             return Err(Error::Invalid(
                 "virtual shard count must be greater than zero".to_owned(),
             ));
         }
-        if io_concurrency_multiplier == 0 {
+        if io_concurrency_limit == 0 {
             return Err(Error::Invalid(
-                "I/O concurrency multiplier must be greater than zero".to_owned(),
+                "I/O concurrency limit must be greater than zero".to_owned(),
             ));
         }
         Ok(Self {
             virtual_shards,
-            io_concurrency_multiplier,
+            io_concurrency_limit,
         })
     }
 
@@ -54,8 +54,8 @@ impl ShardingOptions {
         self.virtual_shards
     }
 
-    pub const fn io_concurrency_multiplier(self) -> u32 {
-        self.io_concurrency_multiplier
+    pub const fn io_concurrency_limit(self) -> u32 {
+        self.io_concurrency_limit
     }
 
     pub fn route(
@@ -118,16 +118,13 @@ impl ShardedTrack {
             );
             shard_slots.insert(shard, slots);
         }
-        let permits = (options.virtual_shards() as usize)
-            .max(1)
-            .saturating_mul(options.io_concurrency_multiplier() as usize);
         Ok(Self {
             config,
             options,
             shards: RwLock::new(databases),
             shard_slots: RwLock::new(shard_slots),
             reader_options: None,
-            io_permits: Arc::new(Semaphore::new(permits)),
+            io_permits: Arc::new(Semaphore::new(options.io_concurrency_limit() as usize)),
         })
     }
 
@@ -155,16 +152,13 @@ impl ShardedTrack {
             );
             shard_slots.insert(shard, slots);
         }
-        let permits = (options.virtual_shards() as usize)
-            .max(1)
-            .saturating_mul(options.io_concurrency_multiplier() as usize);
         Ok(Self {
             config,
             options,
             shards: RwLock::new(databases),
             shard_slots: RwLock::new(shard_slots),
             reader_options: Some(reader_options),
-            io_permits: Arc::new(Semaphore::new(permits)),
+            io_permits: Arc::new(Semaphore::new(options.io_concurrency_limit() as usize)),
         })
     }
 

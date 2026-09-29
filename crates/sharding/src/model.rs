@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use crate::{HashRange, HashRangeMap, RoutingError, hash_routing_key};
 
 pub const DEFAULT_VIRTUAL_SHARDS: u32 = 8;
-pub const DEFAULT_IO_CONCURRENCY_MULTIPLIER: u32 = 8;
+pub const DEFAULT_IO_CONCURRENCY_LIMIT: u32 = 128;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,

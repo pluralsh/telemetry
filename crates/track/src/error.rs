@@ -7,6 +7,10 @@
 pub enum Error {
     #[error("invalid trace data: {0}")]
     Invalid(String),
+    #[error("write buffer is full")]
+    Backpressure,
+    #[error("Track writer is temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("corrupt Track record: {0}")]
     Corrupt(String),
     #[error("storage error: {0}")]

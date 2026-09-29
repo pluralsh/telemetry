@@ -79,10 +79,23 @@ async fn otlp_http(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
+) -> Response {
+    let json_request = content_type(&headers) == Some("application/json");
+    match otlp_http_result(&state, namespace, headers, body).await {
+        Ok(response) => response,
+        Err(error) => error.into_otlp_response(json_request),
+    }
+}
+
+async fn otlp_http_result(
+    state: &AppState,
+    namespace: String,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
-    require_write_mode(&state)?;
-    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(&state, body.len())?;
+    require_write_mode(state)?;
+    authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
+    check_size(state, body.len())?;
     let _permit = state
         .request_limit
         .acquire()
@@ -105,7 +118,7 @@ async fn otlp_http(
         return Err(ApiError::unsupported_media());
     };
     let batches = trace_batches(request).map_err(ApiError::bad_request)?;
-    write_batches(&state, namespace, batches).await?;
+    write_batches(state, namespace, batches).await?;
     if is_json {
         Ok(Json(json!({})).into_response())
     } else {
@@ -510,7 +523,6 @@ async fn write_batches(
     state
         .route_write(&namespace, batches, ulid::Ulid::new().to_string())
         .await
-        .map_err(ApiError::unavailable)
 }
 
 async fn authorize_namespace(
@@ -679,7 +691,7 @@ impl ApiError {
         }
     }
 
-    fn internal(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
@@ -693,11 +705,84 @@ impl ApiError {
         }
     }
 
-    fn unavailable(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn unavailable(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: error.to_string(),
         }
+    }
+
+    pub(crate) fn from_track(error: track::Error) -> Self {
+        match error {
+            track::Error::Invalid(_) => Self::bad_request(error),
+            track::Error::Backpressure => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: error.to_string(),
+            },
+            track::Error::Unavailable(_) | track::Error::Storage(_) => Self::unavailable(error),
+            track::Error::Corrupt(_)
+            | track::Error::Json(_)
+            | track::Error::Protobuf(_)
+            | track::Error::Compression(_)
+            | track::Error::TraceQl(_) => Self::internal(error),
+        }
+    }
+
+    pub(crate) fn into_grpc_status(self) -> tonic::Status {
+        match self.status {
+            StatusCode::BAD_REQUEST => tonic::Status::invalid_argument(self.message),
+            StatusCode::UNAUTHORIZED => tonic::Status::unauthenticated(self.message),
+            StatusCode::NOT_FOUND => tonic::Status::not_found(self.message),
+            StatusCode::PAYLOAD_TOO_LARGE => tonic::Status::resource_exhausted(self.message),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                tonic::Status::unavailable(self.message)
+            }
+            _ => tonic::Status::internal(self.message),
+        }
+    }
+
+    pub(crate) fn into_otlp_grpc_status(self) -> tonic_otlp::Status {
+        match self.status {
+            StatusCode::BAD_REQUEST => tonic_otlp::Status::invalid_argument(self.message),
+            StatusCode::UNAUTHORIZED => tonic_otlp::Status::unauthenticated(self.message),
+            StatusCode::NOT_FOUND => tonic_otlp::Status::not_found(self.message),
+            StatusCode::PAYLOAD_TOO_LARGE => tonic_otlp::Status::resource_exhausted(self.message),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                tonic_otlp::Status::unavailable(self.message)
+            }
+            _ => tonic_otlp::Status::internal(self.message),
+        }
+    }
+
+    fn into_otlp_response(self, json_response: bool) -> Response {
+        let code = grpc_code_for_http(self.status);
+        let status = self.status;
+        let mut response = if json_response {
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(json!({"code": code, "message": self.message})),
+            )
+                .into_response()
+        } else {
+            let encoded = GoogleRpcStatus {
+                code,
+                message: self.message,
+            }
+            .encode_to_vec();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/x-protobuf")],
+                encoded,
+            )
+                .into_response()
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
     }
 
     fn unauthorized() -> Self {
@@ -724,10 +809,104 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.status,
             Json(json!({"status":"error","error":self.message})),
         )
-            .into_response()
+            .into_response();
+        if retry {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GoogleRpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+fn grpc_code_for_http(status: StatusCode) -> i32 {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => 3,
+        StatusCode::NOT_FOUND => 5,
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => 8,
+        StatusCode::INTERNAL_SERVER_ERROR => 13,
+        StatusCode::SERVICE_UNAVAILABLE => 14,
+        StatusCode::UNAUTHORIZED => 16,
+        _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn zipkin_backpressure_is_retryable() {
+        let response = ApiError::from_track(track::Error::Backpressure).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn otlp_http_errors_use_google_rpc_status_mappings() {
+        let protobuf = ApiError::from_track(track::Error::Backpressure).into_otlp_response(false);
+        assert_eq!(protobuf.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(protobuf.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            protobuf.headers()[header::CONTENT_TYPE],
+            "application/x-protobuf"
+        );
+        let body = to_bytes(protobuf.into_body(), usize::MAX).await.unwrap();
+        let status = GoogleRpcStatus::decode(body).unwrap();
+        assert_eq!(status.code, 8);
+        assert_eq!(status.message, "write buffer is full");
+
+        let json = ApiError::unavailable("flusher stopped").into_otlp_response(true);
+        assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(json.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"code": 14, "message": "flusher stopped"})
+        );
+    }
+
+    #[test]
+    fn grpc_retryable_errors_map_to_unavailable() {
+        assert_eq!(
+            ApiError::from_track(track::Error::Backpressure)
+                .into_otlp_grpc_status()
+                .code(),
+            tonic_otlp::Code::Unavailable
+        );
+        assert_eq!(
+            ApiError::unavailable("flusher stopped")
+                .into_otlp_grpc_status()
+                .code(),
+            tonic_otlp::Code::Unavailable
+        );
+        assert_eq!(
+            ApiError::from_track(track::Error::Backpressure)
+                .into_grpc_status()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            ApiError::unavailable("flusher stopped")
+                .into_grpc_status()
+                .code(),
+            tonic::Code::Unavailable
+        );
     }
 }

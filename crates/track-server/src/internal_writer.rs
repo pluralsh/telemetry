@@ -147,7 +147,7 @@ impl InternalWriter for AppState {
             .collect::<Vec<_>>();
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
+            self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
         if batches
@@ -190,7 +190,7 @@ impl InternalWriter for AppState {
         database
             .write_with_durability(&namespace, std::mem::take(&mut batches), durability)
             .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
+            .map_err(track_status)?;
         if !request.request_id.is_empty() {
             completed.insert(request.request_id);
         }
@@ -199,6 +199,20 @@ impl InternalWriter for AppState {
             accepted_traces,
             accepted_spans,
         }))
+    }
+}
+
+fn track_status(error: track::Error) -> Status {
+    match error {
+        track::Error::Invalid(_) => Status::invalid_argument(error.to_string()),
+        track::Error::Backpressure | track::Error::Unavailable(_) | track::Error::Storage(_) => {
+            Status::unavailable(error.to_string())
+        }
+        track::Error::Corrupt(_)
+        | track::Error::Json(_)
+        | track::Error::Protobuf(_)
+        | track::Error::Compression(_)
+        | track::Error::TraceQl(_) => Status::internal(error.to_string()),
     }
 }
 

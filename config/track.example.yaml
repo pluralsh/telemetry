@@ -28,17 +28,19 @@ page:
   max_size_bytes: 4194304
   max_traces: 1024
 
-# Successful periodic L0 flushes make accepted writes visible to readers.
-visibility_interval_seconds: 1
-
 write:
-  durability: written
+  durability: applied
+  # Durable object-store flush and read-replica visibility interval.
+  flush_interval_seconds: 10
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
   remote_concurrency: 16
   remote_retries: 2
 
 sharding:
   virtual_shards: 8
-  io_concurrency_multiplier: 8
+  io_concurrency_limit: 128
   backend: standalone
 
 request:

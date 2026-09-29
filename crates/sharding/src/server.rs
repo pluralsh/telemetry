@@ -6,7 +6,7 @@ use std::{fmt, marker::PhantomData, net::SocketAddr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_LIMIT,
     DEFAULT_VIRTUAL_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange,
 };
 
@@ -30,7 +30,7 @@ pub enum ServerMode {
 #[serde(default, bound = "P: Product")]
 pub struct ShardingConfig<P: Product> {
     pub virtual_shards: u32,
-    pub io_concurrency_multiplier: u32,
+    pub io_concurrency_limit: u32,
     #[serde(flatten)]
     pub kind: ShardingBackend<P>,
 }
@@ -39,7 +39,7 @@ impl<P: Product> Default for ShardingConfig<P> {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+            io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
             kind: ShardingBackend::Standalone,
         }
     }
@@ -153,8 +153,8 @@ impl<P: Product> ShardingConfig<P> {
         if self.virtual_shards == 0 {
             return Err("sharding.virtual_shards must be greater than zero".to_owned());
         }
-        if self.io_concurrency_multiplier == 0 {
-            return Err("sharding.io_concurrency_multiplier must be greater than zero".to_owned());
+        if self.io_concurrency_limit == 0 {
+            return Err("sharding.io_concurrency_limit must be greater than zero".to_owned());
         }
         if mode == ServerMode::Standalone && !matches!(self.kind, ShardingBackend::Standalone) {
             return Err("standalone mode requires the standalone sharding backend".to_owned());
@@ -530,7 +530,7 @@ mod tests {
     fn static_config(owners: &[(u32, u32)]) -> ShardingConfig<Demo> {
         ShardingConfig {
             virtual_shards: 8,
-            io_concurrency_multiplier: 4,
+            io_concurrency_limit: 64,
             kind: ShardingBackend::Static {
                 owner_id: "owner-0".to_owned(),
                 owners: owners
@@ -561,7 +561,7 @@ mod tests {
     fn kubernetes_database_must_be_a_label_value() {
         let config = |database: &str| ShardingConfig::<Demo> {
             virtual_shards: 8,
-            io_concurrency_multiplier: 4,
+            io_concurrency_limit: 64,
             kind: ShardingBackend::Kubernetes(KubernetesShardingConfig {
                 database: database.to_owned(),
                 ..KubernetesShardingConfig::default()
@@ -605,10 +605,7 @@ mod tests {
         };
         assert_eq!(settings.namespace, "observability");
         assert_eq!(settings.stateful_set, "demo");
-        assert_eq!(
-            config.io_concurrency_multiplier,
-            DEFAULT_IO_CONCURRENCY_MULTIPLIER
-        );
+        assert_eq!(config.io_concurrency_limit, DEFAULT_IO_CONCURRENCY_LIMIT);
     }
 
     #[test]

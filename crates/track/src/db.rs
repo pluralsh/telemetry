@@ -6,11 +6,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use common::coordinator::{
+    Delta, Durability as CoordinatorDurability, Flusher, WriteCoordinator, WriteCoordinatorHandle,
+    WriteError,
+};
 use common::storage::{
-    PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
+    PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, StorageSnapshot, Ttl,
 };
 use common::{StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -36,8 +42,11 @@ const READ_CONCURRENCY: usize = 32;
 const MATERIALIZE_BATCH: usize = 256;
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Config, Error, Namespace, Page, PageBuilder,
-    QueryOptions, Result, SegmentId, Trace, TraceBatch, TraceId, TraceQlResult,
+    PageConfig, QueryOptions, Result, SegmentId, Trace, TraceBatch, TraceId, TraceQlResult,
 };
+
+const WRITE_CHANNEL: &str = "write";
+const TRACK_FLUSH_PAGES: &str = "track_flush_pages";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
@@ -49,8 +58,12 @@ pub enum Durability {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteReport {
+    /// Input traces accepted from this request.
     pub traces: usize,
+    /// Reserved for API compatibility. Pages are formed across requests by
+    /// the flusher and reported through `track_flush_pages`.
     pub pages: usize,
+    /// Input spans accepted from this request.
     pub spans: usize,
 }
 
@@ -64,10 +77,10 @@ struct Retention {
 pub struct TraceDb {
     storage: Arc<dyn StorageRead>,
     writer: Option<Arc<dyn Storage>>,
-    config: Config,
+    write_handle: Option<WriteCoordinatorHandle<TraceWriteDelta>>,
+    write_coordinator: Mutex<Option<WriteCoordinator<TraceWriteDelta, TraceFlusher>>>,
     segment_ns: u64,
     owned_slots: Range<u16>,
-    write_lock: Mutex<()>,
 }
 
 impl TraceDb {
@@ -92,13 +105,28 @@ impl TraceDb {
             .build()
             .await?;
         let storage_read = storage.clone();
+        let initial_snapshot = storage.snapshot().await?;
+        let flusher = TraceFlusher {
+            storage: storage.clone(),
+            page_config: config.page.clone(),
+            retention: config.retention,
+        };
+        let mut write_coordinator = WriteCoordinator::new(
+            config.write_buffer.clone(),
+            vec![WRITE_CHANNEL],
+            (),
+            initial_snapshot,
+            flusher,
+        );
+        let write_handle = write_coordinator.handle(WRITE_CHANNEL);
+        write_coordinator.start();
         Ok(Self {
             storage: storage_read,
             writer: Some(storage),
-            config,
+            write_handle: Some(write_handle),
+            write_coordinator: Mutex::new(Some(write_coordinator)),
             segment_ns,
             owned_slots,
-            write_lock: Mutex::new(()),
         })
     }
 
@@ -127,16 +155,16 @@ impl TraceDb {
         Ok(Self {
             storage,
             writer: None,
-            config,
+            write_handle: None,
+            write_coordinator: Mutex::new(None),
             segment_ns,
             owned_slots,
-            write_lock: Mutex::new(()),
         })
     }
 
-    fn writer(&self) -> Result<&dyn Storage> {
-        self.writer
-            .as_deref()
+    fn write_handle(&self) -> Result<&WriteCoordinatorHandle<TraceWriteDelta>> {
+        self.write_handle
+            .as_ref()
             .ok_or_else(|| Error::Invalid("writes are unavailable on a read-only database".into()))
     }
 
@@ -181,64 +209,32 @@ impl TraceDb {
         for traces in groups.values_mut() {
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
-
-        let _guard = self.write_lock.lock().await;
-        let retention = Retention {
-            physical_ttl: self.ttl()?,
-            expires_at_unix_ms: self.logical_expiry()?,
+        let write = TraceWrite {
+            namespace: namespace.clone(),
+            groups,
+            report,
         };
-        let mut ops = Vec::new();
-        for ((segment, slot), traces) in groups {
-            let sequence_key = next_sequence_key(namespace, segment, slot);
-            let mut sequence = self
-                .storage
-                .get(sequence_key.clone())
-                .await?
-                .map(|record| decode_sequence(&record.value))
-                .transpose()?
-                .unwrap_or(0);
-            let mut builder = PageBuilder::new(self.config.page.clone())?;
-            let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
-                append_page_ops(
-                    &mut ops,
-                    namespace,
-                    PageWriteId {
-                        segment,
-                        slot,
-                        sequence,
-                    },
-                    &page,
-                    &traces,
-                    retention,
-                )?;
-                sequence = sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
-                report.pages += 1;
-                Ok(())
-            };
-            for trace in traces {
-                if let Some(completed) = builder.append_with_traces(trace)? {
-                    cut_page(completed)?;
-                }
-            }
-            if let Some(completed) = builder.finish_with_traces()? {
-                cut_page(completed)?;
-            }
-            ops.push(put(
-                sequence_key,
-                encode_sequence(sequence),
-                retention.physical_ttl,
-            ));
+        let handle = self.write_handle()?;
+        let mut write_handle = handle
+            .try_write(write)
+            .await
+            .map_err(|error| map_write_error(error.discard_inner()))?;
+        let report = write_handle
+            .wait(CoordinatorDurability::Applied)
+            .await
+            .map_err(map_write_error)?;
+        if durability != Durability::Applied {
+            let flush_storage = durability == Durability::Durable;
+            let mut flush_handle = handle.flush(flush_storage).await.map_err(map_write_error)?;
+            flush_handle
+                .wait(if flush_storage {
+                    CoordinatorDurability::Durable
+                } else {
+                    CoordinatorDurability::Written
+                })
+                .await
+                .map_err(map_write_error)?;
         }
-        self.writer()?
-            .apply_with_options(
-                ops,
-                WriteOptions {
-                    await_durable: durability == Durability::Durable,
-                },
-            )
-            .await?;
         Ok(report)
     }
 
@@ -646,13 +642,26 @@ impl TraceDb {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        if let Some(storage) = &self.writer {
-            storage.flush().await?;
+        if let Some(handle) = &self.write_handle {
+            let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
+            flush_handle
+                .wait(CoordinatorDurability::Written)
+                .await
+                .map_err(map_write_error)?;
+        }
+        if let Some(writer) = &self.writer {
+            writer.flush().await?;
         }
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
+        if let Some(coordinator) = self.write_coordinator.lock().await.take() {
+            coordinator
+                .stop()
+                .await
+                .map_err(|error| Error::Invalid(format!("write coordinator stopped: {error}")))?;
+        }
         self.storage.close().await?;
         Ok(())
     }
@@ -819,30 +828,192 @@ impl TraceDb {
         }
         Ok(traces)
     }
+}
 
-    fn ttl(&self) -> Result<Ttl> {
-        self.config
-            .retention
-            .map(|duration| {
-                u64::try_from(duration.as_millis())
-                    .map(Ttl::ExpireAfter)
-                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))
-            })
-            .transpose()
-            .map(|ttl| ttl.unwrap_or(Ttl::NoExpiry))
+struct TraceWrite {
+    namespace: Namespace,
+    groups: BTreeMap<(SegmentId, u16), Vec<Trace>>,
+    report: WriteReport,
+}
+
+type TraceGroup = (Namespace, SegmentId, u16);
+
+#[derive(Default)]
+struct TraceWriteDelta {
+    groups: BTreeMap<TraceGroup, Vec<Trace>>,
+    estimated_size: usize,
+}
+
+impl Delta for TraceWriteDelta {
+    type Context = ();
+    type Write = TraceWrite;
+    type Frozen = BTreeMap<TraceGroup, Vec<Trace>>;
+    type FrozenView = ();
+    type ApplyResult = WriteReport;
+    type DeltaView = ();
+    type Snapshot = Arc<dyn StorageSnapshot>;
+
+    fn init((): Self::Context) -> Self {
+        Self::default()
     }
 
-    fn logical_expiry(&self) -> Result<Option<u64>> {
-        self.config
-            .retention
-            .map(|retention| {
-                let retention_ms = u64::try_from(retention.as_millis())
-                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))?;
-                unix_time_ms()?
-                    .checked_add(retention_ms)
-                    .ok_or_else(|| Error::Invalid("retention expiry overflows u64".to_owned()))
-            })
-            .transpose()
+    fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
+        for ((segment, slot), traces) in write.groups {
+            self.estimated_size = self.estimated_size.saturating_add(
+                traces
+                    .iter()
+                    .flat_map(|trace| &trace.resource_spans)
+                    .map(Message::encoded_len)
+                    .sum::<usize>(),
+            );
+            self.groups
+                .entry((write.namespace.clone(), segment, slot))
+                .or_default()
+                .extend(traces);
+        }
+        Ok(write.report)
+    }
+
+    fn estimate_size(&self) -> usize {
+        self.estimated_size
+    }
+
+    fn freeze(mut self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        for traces in self.groups.values_mut() {
+            traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
+        }
+        (self.groups, (), ())
+    }
+
+    fn reader(&self) -> Self::DeltaView {}
+}
+
+struct TraceFlusher {
+    storage: Arc<dyn Storage>,
+    page_config: PageConfig,
+    retention: Option<Duration>,
+}
+
+#[async_trait]
+impl Flusher<TraceWriteDelta> for TraceFlusher {
+    async fn flush_delta(
+        &mut self,
+        frozen: BTreeMap<TraceGroup, Vec<Trace>>,
+        _epoch_range: &Range<u64>,
+    ) -> std::result::Result<Arc<dyn StorageSnapshot>, String> {
+        let pages = direct_write(
+            self.storage.as_ref(),
+            &self.page_config,
+            self.retention,
+            frozen,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        metrics::histogram!(TRACK_FLUSH_PAGES).record(pages as f64);
+        self.storage
+            .snapshot()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn flush_storage(&self) -> std::result::Result<(), String> {
+        self.storage
+            .flush()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn direct_write(
+    storage: &dyn Storage,
+    page_config: &PageConfig,
+    retention: Option<Duration>,
+    groups: BTreeMap<TraceGroup, Vec<Trace>>,
+) -> Result<usize> {
+    if groups.is_empty() {
+        return Ok(0);
+    }
+    let retention = retention_values(retention)?;
+    let mut ops = Vec::new();
+    let mut pages = 0usize;
+    for ((namespace, segment, slot), traces) in groups {
+        let sequence_key = next_sequence_key(&namespace, segment, slot);
+        let mut sequence = storage
+            .get(sequence_key.clone())
+            .await?
+            .map(|record| decode_sequence(&record.value))
+            .transpose()?
+            .unwrap_or(0);
+        let mut builder = PageBuilder::new(page_config.clone())?;
+        let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
+            append_page_ops(
+                &mut ops,
+                &namespace,
+                PageWriteId {
+                    segment,
+                    slot,
+                    sequence,
+                },
+                &page,
+                &traces,
+                retention,
+            )?;
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
+            pages = pages.saturating_add(1);
+            Ok(())
+        };
+        for trace in traces {
+            if let Some(completed) = builder.append_with_traces(trace)? {
+                cut_page(completed)?;
+            }
+        }
+        if let Some(completed) = builder.finish_with_traces()? {
+            cut_page(completed)?;
+        }
+        ops.push(put(
+            sequence_key,
+            encode_sequence(sequence),
+            retention.physical_ttl,
+        ));
+    }
+    storage.apply(ops).await?;
+    Ok(pages)
+}
+
+fn retention_values(retention: Option<Duration>) -> Result<Retention> {
+    let physical_ttl = retention
+        .map(|duration| {
+            u64::try_from(duration.as_millis())
+                .map(Ttl::ExpireAfter)
+                .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))
+        })
+        .transpose()?
+        .unwrap_or(Ttl::NoExpiry);
+    let expires_at_unix_ms = retention
+        .map(|duration| {
+            let duration = u64::try_from(duration.as_millis())
+                .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))?;
+            unix_time_ms()?
+                .checked_add(duration)
+                .ok_or_else(|| Error::Invalid("retention expiry overflows u64".to_owned()))
+        })
+        .transpose()?;
+    Ok(Retention {
+        physical_ttl,
+        expires_at_unix_ms,
+    })
+}
+
+fn map_write_error(error: WriteError) -> Error {
+    match error {
+        WriteError::Backpressure(_) | WriteError::TimeoutError(_) => Error::Backpressure,
+        WriteError::Shutdown => Error::Unavailable("write coordinator is shut down".to_owned()),
+        WriteError::ApplyError(_, message) => Error::Invalid(message),
+        WriteError::FlushError(message) | WriteError::Internal(message) => {
+            Error::Unavailable(message)
+        }
     }
 }
 
@@ -1134,6 +1305,7 @@ mod tests {
                 max_size_bytes: 128 * 1024,
                 max_traces: 16,
             },
+            write_buffer: Default::default(),
         }
     }
 
@@ -1181,6 +1353,18 @@ mod tests {
         .unwrap()
     }
 
+    fn traces_in_same_slot(namespace: &Namespace) -> (Trace, Trace) {
+        let mut first_by_slot = HashMap::new();
+        for id in 1..=u8::MAX {
+            let trace = trace(id, u64::from(id), "span", Vec::new(), Vec::new());
+            let slot = crate::routing::routing_slot(namespace, trace.trace_id);
+            if let Some(first) = first_by_slot.insert(slot, trace.clone()) {
+                return (first, trace);
+            }
+        }
+        panic!("expected a routing-slot collision");
+    }
+
     #[tokio::test]
     async fn stores_traces_in_slot_local_pages_and_isolates_namespaces() {
         let db = TraceDb::open(test_config()).await.unwrap();
@@ -1195,14 +1379,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let expected_pages = [
-            crate::routing::routing_slot(&tenant_a, first.trace_id),
-            crate::routing::routing_slot(&tenant_a, second.trace_id),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .len();
-        assert_eq!(report.pages, expected_pages);
+        assert_eq!(report.pages, 0);
         assert_eq!(report.traces, 2);
         db.write(
             &tenant_b,
@@ -1274,6 +1451,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applied_writes_coalesce_into_pages_across_requests_in_timestamp_order() {
+        let mut config = test_config();
+        config.page.max_traces = 16;
+        let db = TraceDb::open(config).await.unwrap();
+        let namespace = Namespace::new("coalesced").unwrap();
+        let (mut early, mut late) = traces_in_same_slot(&namespace);
+        early.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano = 10;
+        early.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = 11;
+        late.resource_spans[0].scope_spans[0].spans[0].start_time_unix_nano = 20;
+        late.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = 21;
+        let slot = crate::routing::routing_slot(&namespace, early.trace_id);
+
+        let late_report = db
+            .write_with_durability(
+                &namespace,
+                vec![TraceBatch::new(vec![late.clone()])],
+                Durability::Applied,
+            )
+            .await
+            .unwrap();
+        let early_report = db
+            .write_with_durability(
+                &namespace,
+                vec![TraceBatch::new(vec![early.clone()])],
+                Durability::Applied,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            late_report,
+            WriteReport {
+                traces: 1,
+                pages: 0,
+                spans: 1
+            }
+        );
+        assert_eq!(
+            early_report,
+            WriteReport {
+                traces: 1,
+                pages: 0,
+                spans: 1
+            }
+        );
+        assert!(
+            db.get_trace(&namespace, early.trace_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "Applied acknowledges the in-memory delta only"
+        );
+
+        db.flush().await.unwrap();
+        let mut records = db
+            .storage
+            .scan_iter(metadata_range(&namespace, 0, slot))
+            .await
+            .unwrap();
+        let page = records.next().await.unwrap().unwrap();
+        let metadata = decode_metadata(&page.value).unwrap();
+        assert_eq!(
+            metadata
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id)
+                .collect::<Vec<_>>(),
+            vec![early.trace_id, late.trace_id]
+        );
+        assert!(records.next().await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn written_write_flushes_delta_before_returning() {
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("written").unwrap();
+        let original = trace(1, 1, "written", Vec::new(), Vec::new());
+
+        db.write_with_durability(
+            &namespace,
+            vec![TraceBatch::new(vec![original.clone()])],
+            Durability::Written,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_trace(&namespace, original.trace_id).await.unwrap(),
+            Some(original)
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_write_is_visible_to_a_new_storage_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.retention = None;
+        config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "track-durable".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        });
+        let namespace = Namespace::new("durable").unwrap();
+        let original = trace(1, 1, "durable", Vec::new(), Vec::new());
+        let db = TraceDb::open(config.clone()).await.unwrap();
+
+        db.write_with_durability(
+            &namespace,
+            vec![TraceBatch::new(vec![original.clone()])],
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+        let reader = TraceDb::open_reader_with_slots(
+            config,
+            0..sharding::ROUTING_SLOT_COUNT,
+            DbReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reader
+                .get_trace(&namespace, original.trace_id)
+                .await
+                .unwrap(),
+            Some(original)
+        );
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_drains_applied_delta_before_storage_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.retention = None;
+        config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "track-shutdown".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        });
+        let namespace = Namespace::new("shutdown").unwrap();
+        let original = trace(1, 1, "pending", Vec::new(), Vec::new());
+        let db = TraceDb::open(config.clone()).await.unwrap();
+        db.write_with_durability(
+            &namespace,
+            vec![TraceBatch::new(vec![original.clone()])],
+            Durability::Applied,
+        )
+        .await
+        .unwrap();
+
+        db.close().await.unwrap();
+        let reopened = TraceDb::open(config).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_trace(&namespace, original.trace_id)
+                .await
+                .unwrap(),
+            Some(original)
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn opened_slot_range_rejects_non_authoritative_access() {
         let namespace = Namespace::new("owned-slots").unwrap();
         let trace = trace(1, 1, "outside", Vec::new(), Vec::new());
@@ -1314,7 +1666,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(report.pages, 2);
+        assert_eq!(report.pages, 0);
         assert_eq!(
             db.get_trace(&namespace, late.trace_id).await.unwrap(),
             Some(late.clone())

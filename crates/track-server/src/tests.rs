@@ -88,6 +88,7 @@ async fn protobuf_ingest_then_tempo_search_and_trace_lookup() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    state.db.flush().await.unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -120,7 +121,7 @@ async fn protobuf_ingest_then_tempo_search_and_trace_lookup() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn periodic_visibility_flushes_accepted_writes() {
+async fn periodic_durable_flushes_accepted_writes() {
     let state = state(ServerMode::Standalone, true).await;
     let response = router(state.clone())
         .oneshot(
@@ -135,7 +136,7 @@ async fn periodic_visibility_flushes_accepted_writes() {
     assert!(state.has_pending_visibility());
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
     for _ in 0..100 {
         if !state.has_pending_visibility() {
             break;
@@ -144,7 +145,7 @@ async fn periodic_visibility_flushes_accepted_writes() {
     }
     assert!(
         !state.has_pending_visibility(),
-        "visibility task did not flush the accepted write"
+        "durable flush task did not flush the accepted write"
     );
     state.shutdown().await.unwrap();
 }
@@ -166,6 +167,7 @@ async fn zipkin_ingest_translates_and_is_queryable() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    state.db.flush().await.unwrap();
     let response = app
         .oneshot(
             Request::get("/read/ns/tenant/api/traces/00000000000000000000000000000001")
@@ -194,6 +196,7 @@ async fn canonical_tag_endpoints_finish_and_return_tempo_shapes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    state.db.flush().await.unwrap();
     for (path, expected) in [
         (
             "/read/ns/tenant/api/search/tags",
@@ -278,6 +281,7 @@ async fn jaeger_collector_converts_process_span_and_log_data() {
         .insert("x-scope-orgid", "tenant".parse().unwrap());
     CollectorService::post_spans(&state, request).await.unwrap();
 
+    state.db.flush().await.unwrap();
     let routing = state.assignment.read().await.routing.clone();
     let trace = state
         .db

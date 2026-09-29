@@ -8,13 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use common::storage::{PutRecordOp, Record, RecordOp, Storage, StorageRead, WriteOptions};
-use common::{BytesRange, StorageBuilder};
+use common::{BytesRange, StorageBuilder, StorageSemantics};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::codec::{
-    chunk_key, decode, directory_entry_key, directory_entry_name, directory_prefix, encode,
-    garbage_key, garbage_prefix, generation_key, inode_key, upload_key, upload_prefix,
+    PseudofsSegmentExtractor, TenantScope, chunk_key, decode, directory_entry_key,
+    directory_entry_name, directory_prefix, encode, garbage_key, garbage_prefix, generation_key,
+    inode_key, tenant_scope_from_key, upload_key, upload_prefix,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -47,7 +48,7 @@ struct CompactionRequest {
 pub struct FileUpload {
     fs: PseudoFs,
     tenant: String,
-    root_id: Uuid,
+    scope: TenantScope,
     path: String,
     inode_id: Uuid,
     generation_id: Uuid,
@@ -65,7 +66,13 @@ pub struct FileUpload {
 impl PseudoFs {
     pub async fn open(config: Config) -> Result<Self> {
         config.validate().map_err(Error::InvalidPath)?;
-        let storage = StorageBuilder::new(&config.storage).await?.build().await?;
+        let semantics =
+            StorageSemantics::new().with_segment_extractor(PseudofsSegmentExtractor::shared());
+        let storage = StorageBuilder::new(&config.storage)
+            .await?
+            .with_semantics(semantics)
+            .build()
+            .await?;
         let (compaction_tx, mut compaction_rx) = mpsc::channel::<CompactionRequest>(64);
         let fs = Self {
             inner: Arc::new(Inner {
@@ -154,10 +161,10 @@ impl PseudoFs {
         path: &str,
     ) -> Result<mpsc::Receiver<Result<Bytes>>> {
         let normalized = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         let snapshot = self.inner.storage.snapshot().await?;
         let inode = self
-            .resolve_from(snapshot.as_ref(), tenant, root_id, &normalized)
+            .resolve_from(snapshot.as_ref(), tenant, scope, &normalized)
             .await?;
         if inode.kind == FileKind::Directory {
             return Err(Error::IsDirectory(normalized));
@@ -171,7 +178,7 @@ impl PseudoFs {
                 return Err(Error::Corrupt("generation chain is cyclic".to_owned()));
             }
             let generation: Generation = self
-                .get_json_from(snapshot.as_ref(), generation_key(inode.id, id))
+                .get_json_from(snapshot.as_ref(), generation_key(scope, inode.id, id))
                 .await?
                 .ok_or_else(|| Error::Corrupt(format!("missing generation {id}")))?;
             cursor = generation.previous;
@@ -184,7 +191,7 @@ impl PseudoFs {
             for generation in generations {
                 for index in 0..generation.chunk_count {
                     let chunk = match snapshot
-                        .get(chunk_key(inode.id, generation.id, index))
+                        .get(chunk_key(scope, inode.id, generation.id, index))
                         .await
                     {
                         Ok(Some(record)) => Ok(record.value),
@@ -280,11 +287,11 @@ impl PseudoFs {
 
     pub async fn start_upload(&self, tenant: &str, path: &str, append: bool) -> Result<FileUpload> {
         let path = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         if path == "/" {
             return Err(Error::IsDirectory(path));
         }
-        let existing = match self.resolve_from_storage(tenant, root_id, &path).await {
+        let existing = match self.resolve_from_storage(tenant, scope, &path).await {
             Ok(inode) => {
                 if inode.kind == FileKind::Directory {
                     return Err(Error::IsDirectory(path));
@@ -313,12 +320,15 @@ impl PseudoFs {
         };
         self.inner
             .storage
-            .put(vec![put(upload_key(generation_id), encode(&marker)?)])
+            .put(vec![put(
+                upload_key(scope, generation_id),
+                encode(&marker)?,
+            )])
             .await?;
         Ok(FileUpload {
             fs: self.clone(),
             tenant: tenant.to_owned(),
-            root_id,
+            scope,
             path,
             inode_id,
             generation_id,
@@ -342,7 +352,7 @@ impl PseudoFs {
         exist_ok: bool,
     ) -> Result<()> {
         let path = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         if path == "/" {
             return if exist_ok {
                 Ok(())
@@ -351,7 +361,7 @@ impl PseudoFs {
             };
         }
         let _guard = self.inner.mutation_lock.lock().await;
-        if let Ok(inode) = self.resolve_from_storage(tenant, root_id, &path).await {
+        if let Ok(inode) = self.resolve_from_storage(tenant, scope, &path).await {
             return if inode.kind == FileKind::Directory && exist_ok {
                 Ok(())
             } else {
@@ -361,11 +371,11 @@ impl PseudoFs {
         let (parent_path, name) = parent_and_name(&path)?;
         let mut ops = Vec::new();
         let parent = if parents {
-            self.ensure_directory_path(tenant, root_id, &parent_path, &mut ops)
+            self.ensure_directory_path(tenant, scope, &parent_path, &mut ops)
                 .await?
         } else {
             let inode = self
-                .resolve_from_storage(tenant, root_id, &parent_path)
+                .resolve_from_storage(tenant, scope, &parent_path)
                 .await?;
             if inode.kind != FileKind::Directory {
                 return Err(Error::NotDirectory(parent_path));
@@ -373,10 +383,10 @@ impl PseudoFs {
             inode.id
         };
         let inode = Inode::directory(Uuid::new_v4(), tenant.to_owned(), now());
-        ops.push(put_op(inode_key(inode.id), encode(&inode)?));
+        ops.push(put_op(inode_key(scope, inode.id), encode(&inode)?));
         ops.push(put_op(
-            directory_entry_key(parent, &name),
-            directory_entry_value(root_id, inode.id, inode.kind),
+            directory_entry_key(scope, parent, &name),
+            directory_entry_value(scope.root_id, inode.id, inode.kind),
         ));
         self.apply_records(ops, Durability::Written).await?;
         drop(_guard);
@@ -385,61 +395,61 @@ impl PseudoFs {
 
     pub async fn unlink(&self, tenant: &str, path: &str, durability: Durability) -> Result<()> {
         let path = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         if path == "/" {
             return Err(Error::RootOperation);
         }
         let _guard = self.inner.mutation_lock.lock().await;
-        let inode = self.resolve_from_storage(tenant, root_id, &path).await?;
+        let inode = self.resolve_from_storage(tenant, scope, &path).await?;
         if inode.kind == FileKind::Directory {
             return Err(Error::IsDirectory(path));
         }
         let (parent_path, name) = parent_and_name(&path)?;
         let parent = self
-            .resolve_from_storage(tenant, root_id, &parent_path)
+            .resolve_from_storage(tenant, scope, &parent_path)
             .await?;
         let garbage = inode.head.map(|head| GarbageMarker {
             inode_id: inode.id,
             head,
         });
         let mut ops = vec![
-            RecordOp::Delete(directory_entry_key(parent.id, &name)),
-            RecordOp::Delete(inode_key(inode.id)),
+            RecordOp::Delete(directory_entry_key(scope, parent.id, &name)),
+            RecordOp::Delete(inode_key(scope, inode.id)),
         ];
         if let Some(marker) = &garbage {
-            ops.push(put_op(garbage_key(marker.head), encode(marker)?));
+            ops.push(put_op(garbage_key(scope, marker.head), encode(marker)?));
         }
         self.apply_records(ops, durability).await?;
         drop(_guard);
         self.finish_durability(durability).await?;
         if let Some(marker) = garbage {
-            let _ = self.cleanup_generation_chain(&marker).await;
+            let _ = self.cleanup_generation_chain(scope, &marker).await;
         }
         Ok(())
     }
 
     pub async fn rmdir(&self, tenant: &str, path: &str, durability: Durability) -> Result<()> {
         let path = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         if path == "/" {
             return Err(Error::RootOperation);
         }
         let _guard = self.inner.mutation_lock.lock().await;
-        let inode = self.resolve_from_storage(tenant, root_id, &path).await?;
+        let inode = self.resolve_from_storage(tenant, scope, &path).await?;
         if inode.kind != FileKind::Directory {
             return Err(Error::NotDirectory(path));
         }
-        if self.has_directory_entries(inode.id).await? {
+        if self.has_directory_entries(scope, inode.id).await? {
             return Err(Error::DirectoryNotEmpty(path));
         }
         let (parent_path, name) = parent_and_name(&path)?;
         let parent = self
-            .resolve_from_storage(tenant, root_id, &parent_path)
+            .resolve_from_storage(tenant, scope, &parent_path)
             .await?;
         self.apply_records(
             vec![
-                RecordOp::Delete(directory_entry_key(parent.id, &name)),
-                RecordOp::Delete(inode_key(inode.id)),
+                RecordOp::Delete(directory_entry_key(scope, parent.id, &name)),
+                RecordOp::Delete(inode_key(scope, inode.id)),
             ],
             durability,
         )
@@ -463,16 +473,20 @@ impl PseudoFs {
         path: &str,
     ) -> Result<mpsc::Receiver<Result<DirectoryEntry>>> {
         let path = normalize_path(path)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         let snapshot = self.inner.storage.snapshot().await?;
         let inode = self
-            .resolve_from(snapshot.as_ref(), tenant, root_id, &path)
+            .resolve_from(snapshot.as_ref(), tenant, scope, &path)
             .await?;
         if inode.kind != FileKind::Directory {
             return Err(Error::NotDirectory(path));
         }
         let mut iter = snapshot
-            .scan_prefix_iter(directory_prefix(inode.id), BytesRange::unbounded(), None)
+            .scan_prefix_iter(
+                directory_prefix(scope, inode.id),
+                BytesRange::unbounded(),
+                None,
+            )
             .await?;
         let (sender, receiver) = mpsc::channel(32);
         let tenant = tenant.to_owned();
@@ -492,17 +506,17 @@ impl PseudoFs {
                         decode_directory_entry(&record.value)?;
                     let kind = match (stored_kind, entry_root) {
                         (Some(kind), Some(entry_root)) => {
-                            ensure_directory_entry_root(entry_root, root_id)?;
+                            ensure_directory_entry_root(entry_root, scope.root_id)?;
                             kind
                         }
                         (stored_kind, entry_root) => {
                             if let Some(entry_root) = entry_root {
-                                ensure_directory_entry_root(entry_root, root_id)?;
+                                ensure_directory_entry_root(entry_root, scope.root_id)?;
                             }
                             let child =
-                                snapshot.get(inode_key(child_id)).await?.ok_or_else(|| {
-                                    Error::Corrupt(format!("missing inode {child_id}"))
-                                })?;
+                                snapshot.get(inode_key(scope, child_id)).await?.ok_or_else(
+                                    || Error::Corrupt(format!("missing inode {child_id}")),
+                                )?;
                             let child = decode::<Inode>(&child.value)?;
                             ensure_inode_tenant(&child, &tenant)?;
                             stored_kind.unwrap_or(child.kind)
@@ -550,7 +564,7 @@ impl PseudoFs {
     ) -> Result<String> {
         let source = normalize_path(source)?;
         let target = normalize_path(target)?;
-        let root_id = self.ensure_tenant(tenant).await?;
+        let scope = self.ensure_tenant(tenant).await?;
         if source == "/" || target == "/" {
             return Err(Error::RootOperation);
         }
@@ -563,20 +577,20 @@ impl PseudoFs {
             ));
         }
         let _guard = self.inner.mutation_lock.lock().await;
-        let source_inode = self.resolve_from_storage(tenant, root_id, &source).await?;
+        let source_inode = self.resolve_from_storage(tenant, scope, &source).await?;
         let (source_parent_path, source_name) = parent_and_name(&source)?;
         let source_parent = self
-            .resolve_from_storage(tenant, root_id, &source_parent_path)
+            .resolve_from_storage(tenant, scope, &source_parent_path)
             .await?;
         let (target_parent_path, target_name) = parent_and_name(&target)?;
         let mut ops = Vec::new();
         let target_parent = self
-            .ensure_directory_path(tenant, root_id, &target_parent_path, &mut ops)
+            .ensure_directory_path(tenant, scope, &target_parent_path, &mut ops)
             .await?;
         let mut garbage = None;
-        if let Ok(existing) = self.resolve_from_storage(tenant, root_id, &target).await {
+        if let Ok(existing) = self.resolve_from_storage(tenant, scope, &target).await {
             if existing.kind == FileKind::Directory
-                && self.has_directory_entries(existing.id).await?
+                && self.has_directory_entries(scope, existing.id).await?
             {
                 return Err(Error::DirectoryNotEmpty(target));
             }
@@ -587,28 +601,29 @@ impl PseudoFs {
                     Error::NotDirectory(target)
                 });
             }
-            ops.push(RecordOp::Delete(inode_key(existing.id)));
+            ops.push(RecordOp::Delete(inode_key(scope, existing.id)));
             garbage = existing.head.map(|head| GarbageMarker {
                 inode_id: existing.id,
                 head,
             });
             if let Some(marker) = &garbage {
-                ops.push(put_op(garbage_key(marker.head), encode(marker)?));
+                ops.push(put_op(garbage_key(scope, marker.head), encode(marker)?));
             }
         }
         ops.push(RecordOp::Delete(directory_entry_key(
+            scope,
             source_parent.id,
             &source_name,
         )));
         ops.push(put_op(
-            directory_entry_key(target_parent, &target_name),
-            directory_entry_value(root_id, source_inode.id, source_inode.kind),
+            directory_entry_key(scope, target_parent, &target_name),
+            directory_entry_value(scope.root_id, source_inode.id, source_inode.kind),
         ));
         self.apply_records(ops, durability).await?;
         drop(_guard);
         self.finish_durability(durability).await?;
         if let Some(marker) = garbage {
-            let _ = self.cleanup_generation_chain(&marker).await;
+            let _ = self.cleanup_generation_chain(scope, &marker).await;
         }
         Ok(target)
     }
@@ -688,46 +703,50 @@ impl PseudoFs {
         }
     }
 
-    async fn ensure_tenant(&self, tenant: &str) -> Result<Uuid> {
+    async fn ensure_tenant(&self, tenant: &str) -> Result<TenantScope> {
         validate_tenant(tenant)?;
-        let root_id = tenant_root_id(tenant);
-        if let Some(root) = self.get_inode(root_id).await? {
+        let scope = tenant_scope(tenant);
+        if let Some(root) = self.get_inode(scope, scope.root_id).await? {
             ensure_inode_tenant(&root, tenant)?;
-            return Ok(root_id);
+            return Ok(scope);
         }
 
         let _guard = self.inner.mutation_lock.lock().await;
-        if let Some(root) = self.get_inode(root_id).await? {
+        if let Some(root) = self.get_inode(scope, scope.root_id).await? {
             ensure_inode_tenant(&root, tenant)?;
-            return Ok(root_id);
+            return Ok(scope);
         }
-        let root = Inode::directory(root_id, tenant.to_owned(), now());
+        let root = Inode::directory(scope.root_id, tenant.to_owned(), now());
         self.inner
             .storage
-            .put(vec![put(inode_key(root_id), encode(&root)?)])
+            .put(vec![put(inode_key(scope, scope.root_id), encode(&root)?)])
             .await?;
         self.inner.storage.flush().await?;
-        Ok(root_id)
+        Ok(scope)
     }
 
     async fn cleanup_staged_uploads(&self) -> Result<()> {
         let snapshot = self.inner.storage.snapshot().await?;
-        let mut iter = snapshot
-            .scan_prefix_iter(upload_prefix(), BytesRange::unbounded(), None)
-            .await?;
         let mut ops = Vec::new();
-        while let Some(record) = iter.next().await? {
-            let marker: UploadMarker = decode(&record.value)?;
-            for index in 0..marker.chunk_count {
-                ops.push(RecordOp::Delete(chunk_key(
-                    marker.inode_id,
-                    marker.generation_id,
-                    index,
-                )));
+        for slot in 0..sharding::ROUTING_SLOT_COUNT {
+            let mut iter = snapshot
+                .scan_prefix_iter(upload_prefix(slot), BytesRange::unbounded(), None)
+                .await?;
+            while let Some(record) = iter.next().await? {
+                let scope = tenant_scope_from_key(&record.key)?;
+                let marker: UploadMarker = decode(&record.value)?;
+                for index in 0..marker.chunk_count {
+                    ops.push(RecordOp::Delete(chunk_key(
+                        scope,
+                        marker.inode_id,
+                        marker.generation_id,
+                        index,
+                    )));
+                    self.flush_delete_batch(&mut ops).await?;
+                }
+                ops.push(RecordOp::Delete(record.key));
                 self.flush_delete_batch(&mut ops).await?;
             }
-            ops.push(RecordOp::Delete(record.key));
-            self.flush_delete_batch(&mut ops).await?;
         }
         if !ops.is_empty() {
             self.inner.storage.apply(ops).await?;
@@ -738,17 +757,24 @@ impl PseudoFs {
 
     async fn cleanup_garbage(&self) -> Result<()> {
         let snapshot = self.inner.storage.snapshot().await?;
-        let mut iter = snapshot
-            .scan_prefix_iter(garbage_prefix(), BytesRange::unbounded(), None)
-            .await?;
-        while let Some(record) = iter.next().await? {
-            let marker = decode::<GarbageMarker>(&record.value)?;
-            self.cleanup_generation_chain(&marker).await?;
+        for slot in 0..sharding::ROUTING_SLOT_COUNT {
+            let mut iter = snapshot
+                .scan_prefix_iter(garbage_prefix(slot), BytesRange::unbounded(), None)
+                .await?;
+            while let Some(record) = iter.next().await? {
+                let scope = tenant_scope_from_key(&record.key)?;
+                let marker = decode::<GarbageMarker>(&record.value)?;
+                self.cleanup_generation_chain(scope, &marker).await?;
+            }
         }
         Ok(())
     }
 
-    async fn cleanup_generation_chain(&self, marker: &GarbageMarker) -> Result<()> {
+    async fn cleanup_generation_chain(
+        &self,
+        scope: TenantScope,
+        marker: &GarbageMarker,
+    ) -> Result<()> {
         let mut cursor = Some(marker.head);
         let mut ops = Vec::new();
         let mut traversed = 0_u64;
@@ -759,12 +785,17 @@ impl PseudoFs {
                     "generation chain exceeds traversal limit".to_owned(),
                 ));
             }
-            let key = generation_key(marker.inode_id, id);
+            let key = generation_key(scope, marker.inode_id, id);
             let Some(generation) = self.get_json::<Generation>(key.clone()).await? else {
                 break;
             };
             for index in 0..generation.chunk_count {
-                ops.push(RecordOp::Delete(chunk_key(marker.inode_id, id, index)));
+                ops.push(RecordOp::Delete(chunk_key(
+                    scope,
+                    marker.inode_id,
+                    id,
+                    index,
+                )));
                 self.flush_delete_batch(&mut ops).await?;
             }
             ops.push(RecordOp::Delete(key));
@@ -774,7 +805,7 @@ impl PseudoFs {
         if !ops.is_empty() {
             self.inner.storage.apply(std::mem::take(&mut ops)).await?;
         }
-        ops.push(RecordOp::Delete(garbage_key(marker.head)));
+        ops.push(RecordOp::Delete(garbage_key(scope, marker.head)));
         self.inner.storage.apply(ops).await?;
         Ok(())
     }
@@ -787,12 +818,17 @@ impl PseudoFs {
     }
 
     async fn resolve(&self, tenant: &str, path: &str) -> Result<Inode> {
-        let root_id = self.ensure_tenant(tenant).await?;
-        self.resolve_from_storage(tenant, root_id, path).await
+        let scope = self.ensure_tenant(tenant).await?;
+        self.resolve_from_storage(tenant, scope, path).await
     }
 
-    async fn resolve_from_storage(&self, tenant: &str, root_id: Uuid, path: &str) -> Result<Inode> {
-        self.resolve_from(self.inner.storage.as_ref(), tenant, root_id, path)
+    async fn resolve_from_storage(
+        &self,
+        tenant: &str,
+        scope: TenantScope,
+        path: &str,
+    ) -> Result<Inode> {
+        self.resolve_from(self.inner.storage.as_ref(), tenant, scope, path)
             .await
     }
 
@@ -800,12 +836,12 @@ impl PseudoFs {
         &self,
         storage: &dyn StorageRead,
         tenant: &str,
-        root_id: Uuid,
+        scope: TenantScope,
         path: &str,
     ) -> Result<Inode> {
         let normalized = normalize_path(path)?;
         let mut inode = self
-            .get_inode_from(storage, root_id)
+            .get_inode_from(storage, scope, scope.root_id)
             .await?
             .ok_or_else(|| Error::Corrupt("root inode is missing".to_owned()))?;
         ensure_inode_tenant(&inode, tenant)?;
@@ -817,15 +853,15 @@ impl PseudoFs {
                 return Err(Error::NotDirectory(normalized.clone()));
             }
             let entry = storage
-                .get(directory_entry_key(inode.id, component))
+                .get(directory_entry_key(scope, inode.id, component))
                 .await?
                 .ok_or_else(|| Error::NotFound(normalized.clone()))?;
             let (child_id, _, entry_root) = decode_directory_entry(&entry.value)?;
             if let Some(entry_root) = entry_root {
-                ensure_directory_entry_root(entry_root, root_id)?;
+                ensure_directory_entry_root(entry_root, scope.root_id)?;
             }
             inode = self
-                .get_inode_from(storage, child_id)
+                .get_inode_from(storage, scope, child_id)
                 .await?
                 .ok_or_else(|| Error::Corrupt(format!("missing inode {child_id}")))?;
             ensure_inode_tenant(&inode, tenant)?;
@@ -836,25 +872,25 @@ impl PseudoFs {
     async fn ensure_directory_path(
         &self,
         tenant: &str,
-        root_id: Uuid,
+        scope: TenantScope,
         path: &str,
         ops: &mut Vec<RecordOp>,
     ) -> Result<Uuid> {
         let normalized = normalize_path(path)?;
         let mut current = self
-            .get_inode(root_id)
+            .get_inode(scope, scope.root_id)
             .await?
             .ok_or_else(|| Error::Corrupt("root inode is missing".to_owned()))?;
         ensure_inode_tenant(&current, tenant)?;
         for component in components(&normalized) {
-            let key = directory_entry_key(current.id, component);
+            let key = directory_entry_key(scope, current.id, component);
             if let Some(record) = self.inner.storage.get(key.clone()).await? {
                 let (child_id, _, entry_root) = decode_directory_entry(&record.value)?;
                 if let Some(entry_root) = entry_root {
-                    ensure_directory_entry_root(entry_root, root_id)?;
+                    ensure_directory_entry_root(entry_root, scope.root_id)?;
                 }
                 current = self
-                    .get_inode(child_id)
+                    .get_inode(scope, child_id)
                     .await?
                     .ok_or_else(|| Error::Corrupt(format!("missing inode {child_id}")))?;
                 ensure_inode_tenant(&current, tenant)?;
@@ -863,10 +899,10 @@ impl PseudoFs {
                 }
             } else {
                 let child = Inode::directory(Uuid::new_v4(), tenant.to_owned(), now());
-                ops.push(put_op(inode_key(child.id), encode(&child)?));
+                ops.push(put_op(inode_key(scope, child.id), encode(&child)?));
                 ops.push(put_op(
                     key,
-                    directory_entry_value(root_id, child.id, child.kind),
+                    directory_entry_value(scope.root_id, child.id, child.kind),
                 ));
                 current = child;
             }
@@ -874,12 +910,18 @@ impl PseudoFs {
         Ok(current.id)
     }
 
-    async fn get_inode(&self, id: Uuid) -> Result<Option<Inode>> {
-        self.get_inode_from(self.inner.storage.as_ref(), id).await
+    async fn get_inode(&self, scope: TenantScope, id: Uuid) -> Result<Option<Inode>> {
+        self.get_inode_from(self.inner.storage.as_ref(), scope, id)
+            .await
     }
 
-    async fn get_inode_from(&self, storage: &dyn StorageRead, id: Uuid) -> Result<Option<Inode>> {
-        self.get_json_from(storage, inode_key(id)).await
+    async fn get_inode_from(
+        &self,
+        storage: &dyn StorageRead,
+        scope: TenantScope,
+        id: Uuid,
+    ) -> Result<Option<Inode>> {
+        self.get_json_from(storage, inode_key(scope, id)).await
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, key: Bytes) -> Result<Option<T>> {
@@ -898,11 +940,11 @@ impl PseudoFs {
             .transpose()
     }
 
-    async fn has_directory_entries(&self, id: Uuid) -> Result<bool> {
+    async fn has_directory_entries(&self, scope: TenantScope, id: Uuid) -> Result<bool> {
         let mut iter = self
             .inner
             .storage
-            .scan_prefix_iter(directory_prefix(id), BytesRange::unbounded(), None)
+            .scan_prefix_iter(directory_prefix(scope, id), BytesRange::unbounded(), None)
             .await?;
         Ok(iter.next().await?.is_some())
     }
@@ -979,6 +1021,7 @@ impl FileUpload {
         for (offset, chunk) in chunks.into_iter().enumerate() {
             ops.push(put_op(
                 chunk_key(
+                    self.scope,
                     self.inode_id,
                     self.generation_id,
                     self.chunk_count + offset as u64,
@@ -986,7 +1029,10 @@ impl FileUpload {
                 chunk,
             ));
         }
-        ops.push(put_op(upload_key(self.generation_id), encode(&marker)?));
+        ops.push(put_op(
+            upload_key(self.scope, self.generation_id),
+            encode(&marker)?,
+        ));
         self.fs.inner.storage.apply(ops).await?;
         self.chunk_count = next_count;
         Ok(())
@@ -1000,7 +1046,7 @@ impl FileUpload {
         let _guard = self.fs.inner.mutation_lock.lock().await;
         let current = match self
             .fs
-            .resolve_from_storage(&self.tenant, self.root_id, &self.path)
+            .resolve_from_storage(&self.tenant, self.scope, &self.path)
             .await
         {
             Ok(inode) => Some(inode),
@@ -1016,7 +1062,7 @@ impl FileUpload {
         let mut ops = Vec::new();
         let parent = self
             .fs
-            .ensure_directory_path(&self.tenant, self.root_id, &parent_path, &mut ops)
+            .ensure_directory_path(&self.tenant, self.scope, &parent_path, &mut ops)
             .await?;
         let previous = if self.append {
             self.expected_head
@@ -1059,15 +1105,18 @@ impl FileUpload {
         inode.head = Some(self.generation_id);
         inode.generation_count = generation_count;
         ops.push(put_op(
-            generation_key(self.inode_id, self.generation_id),
+            generation_key(self.scope, self.inode_id, self.generation_id),
             encode(&generation)?,
         ));
-        ops.push(put_op(inode_key(self.inode_id), encode(&inode)?));
         ops.push(put_op(
-            directory_entry_key(parent, &name),
-            directory_entry_value(self.root_id, self.inode_id, FileKind::File),
+            inode_key(self.scope, self.inode_id),
+            encode(&inode)?,
         ));
-        ops.push(RecordOp::Delete(upload_key(self.generation_id)));
+        ops.push(put_op(
+            directory_entry_key(self.scope, parent, &name),
+            directory_entry_value(self.scope.root_id, self.inode_id, FileKind::File),
+        ));
+        ops.push(RecordOp::Delete(upload_key(self.scope, self.generation_id)));
         let garbage = if self.append {
             None
         } else {
@@ -1077,13 +1126,16 @@ impl FileUpload {
             })
         };
         if let Some(marker) = &garbage {
-            ops.push(put_op(garbage_key(marker.head), encode(marker)?));
+            ops.push(put_op(
+                garbage_key(self.scope, marker.head),
+                encode(marker)?,
+            ));
         }
         self.fs.apply_records(ops, durability).await?;
         drop(_guard);
         self.fs.finish_durability(durability).await?;
         if let Some(marker) = garbage {
-            let _ = self.fs.cleanup_generation_chain(&marker).await;
+            let _ = self.fs.cleanup_generation_chain(self.scope, &marker).await;
         }
         self.finished = true;
         let compact =
@@ -1108,13 +1160,14 @@ impl FileUpload {
         let mut ops = Vec::with_capacity(DELETE_BATCH_OPS);
         for index in 0..self.chunk_count {
             ops.push(RecordOp::Delete(chunk_key(
+                self.scope,
                 self.inode_id,
                 self.generation_id,
                 index,
             )));
             self.fs.flush_delete_batch(&mut ops).await?;
         }
-        ops.push(RecordOp::Delete(upload_key(self.generation_id)));
+        ops.push(RecordOp::Delete(upload_key(self.scope, self.generation_id)));
         self.fs.inner.storage.apply(ops).await?;
         self.finished = true;
         Ok(())
@@ -1174,6 +1227,13 @@ fn tenant_root_id(tenant: &str) -> Uuid {
     let mut id = [0_u8; 16];
     id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     Uuid::from_bytes(id)
+}
+
+fn tenant_scope(tenant: &str) -> TenantScope {
+    TenantScope {
+        slot: crate::routing::routing_slot(tenant),
+        root_id: tenant_root_id(tenant),
+    }
 }
 
 fn ensure_inode_tenant(inode: &Inode, tenant: &str) -> Result<()> {

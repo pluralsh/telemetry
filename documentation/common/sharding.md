@@ -66,6 +66,10 @@ and target shards and owners, moved hash range, target routing map, and phase:
 Routing and shard count remain unchanged through preparation, draining, and
 cloning. Writes are retried during the short drain/clone window, so no
 acknowledged writes can fall between a clone checkpoint and cutover.
+The source's ingress read lock is held through coordinator acceptance. Taking
+the exclusive drain lock therefore waits for every admitted write, rejects new
+local writes, and orders coordinator flush and durable SlateDB flush before
+close, Lease release, and checkpoint creation.
 Consequently, failed preparation or cloning cannot expose a partial target. All
 transitions increment the assignment generation and use the ShardMap
 `resourceVersion` compare-and-swap. The source-side preparation hook is
@@ -92,7 +96,9 @@ implemented.
 - Storage keys encode the 12-bit routing slot inside each existing
   namespace/time segment, allowing projected clones to select a contiguous
   slot interval without increasing SlateDB segment count.
-- `io_concurrency_multiplier` sets global shard I/O permits per open shard.
+- `io_concurrency_limit` sets a fixed per-pod storage I/O budget. Its default
+  is 128, independent of how many storage shards a standalone process or
+  reader opens. Kubernetes writers normally own one storage shard per pod.
 - Set `renew_interval_seconds` comfortably below
   `lease_duration_seconds` (defaults 5 and 15).
 - Every forwarding participant must share `auth.internal` when it is enabled.

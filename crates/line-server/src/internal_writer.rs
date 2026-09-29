@@ -149,7 +149,7 @@ impl InternalWriter for AppState {
         }
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
+            self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
         let mut batches = request
@@ -203,7 +203,7 @@ impl InternalWriter for AppState {
             .write_with_durability(&namespace, std::mem::take(&mut batches), durability)
             .await
         {
-            return Err(Status::unavailable(error.to_string()));
+            return Err(line_status(error));
         }
         if let Some(requests) = idempotency.as_mut() {
             requests.insert(request.request_id);
@@ -215,6 +215,20 @@ impl InternalWriter for AppState {
             accepted_streams,
             accepted_entries,
         }))
+    }
+}
+
+fn line_status(error: line::Error) -> Status {
+    match error {
+        line::Error::Invalid(_) => Status::invalid_argument(error.to_string()),
+        line::Error::Backpressure | line::Error::Unavailable(_) | line::Error::Storage(_) => {
+            Status::unavailable(error.to_string())
+        }
+        line::Error::Corrupt(_)
+        | line::Error::Json(_)
+        | line::Error::Compression(_)
+        | line::Error::Query(_)
+        | line::Error::Regex(_) => Status::internal(error.to_string()),
     }
 }
 

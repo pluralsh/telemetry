@@ -254,6 +254,7 @@ impl MiniTsdb {
         storage: Arc<Storage>,
         retention: Option<Duration>,
         active_series: Arc<ActiveSeriesTracker>,
+        write_buffer: WriteCoordinatorConfig,
     ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
@@ -290,7 +291,7 @@ impl MiniTsdb {
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut write_coordinator = WriteCoordinator::new(
-            WriteCoordinatorConfig::default(),
+            write_buffer,
             vec![WRITE_CHANNEL.to_string()],
             context,
             initial_snapshot,

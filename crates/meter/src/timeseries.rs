@@ -62,6 +62,7 @@ pub struct TimeSeriesDb {
     storage: Arc<Storage>,
     namespaces: RwLock<std::collections::HashMap<Namespace, Arc<Tsdb>>>,
     retention: Option<Duration>,
+    write_buffer: common::coordinator::WriteCoordinatorConfig,
 }
 
 impl TimeSeriesDb {
@@ -107,6 +108,7 @@ impl TimeSeriesDb {
             storage,
             namespaces: RwLock::new(std::collections::HashMap::new()),
             retention: config.retention,
+            write_buffer: config.write_buffer,
         })
     }
 
@@ -118,10 +120,11 @@ impl TimeSeriesDb {
         namespaces
             .entry(namespace.clone())
             .or_insert_with(|| {
-                Arc::new(Tsdb::with_retention_scoped(
+                Arc::new(Tsdb::with_retention_scoped_and_buffer(
                     namespace.clone(),
                     Arc::clone(&self.storage),
                     self.retention,
+                    self.write_buffer.clone(),
                 ))
             })
             .clone()

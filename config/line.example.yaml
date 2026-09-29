@@ -27,17 +27,19 @@ page:
   max_age_seconds: 5
   rows_per_block: 256
 
-# Periodic L0 flush interval; accepted writes become query-visible after flush.
-visibility_interval_seconds: 1
-
 write:
-  durability: written
+  durability: applied
+  # Durable object-store flush and read-replica visibility interval.
+  flush_interval_seconds: 10
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
   remote_concurrency: 16
   remote_retries: 2
 
 sharding:
   virtual_shards: 8
-  io_concurrency_multiplier: 8
+  io_concurrency_limit: 128
   backend: standalone
 
 request:

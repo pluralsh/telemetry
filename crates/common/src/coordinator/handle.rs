@@ -50,24 +50,74 @@ pub struct EpochWatcher {
     pub applied_rx: watch::Receiver<u64>,
     pub written_rx: watch::Receiver<u64>,
     pub durable_rx: watch::Receiver<u64>,
+    pub terminal_rx: watch::Receiver<Option<String>>,
 }
 
 impl EpochWatcher {
+    fn terminal_error<W>(&self) -> Option<WriteError<W>> {
+        self.terminal_rx
+            .borrow()
+            .clone()
+            .map(WriteError::FlushError)
+    }
+
     /// Waits until the given epoch has reached the specified durability level.
     ///
     /// Returns `Err` if the corresponding [`EpochWatermarks`](super::EpochWatermarks)
     /// was dropped (i.e. the writer shut down).
-    pub async fn wait(
-        &mut self,
-        epoch: u64,
-        durability: Durability,
-    ) -> Result<(), watch::error::RecvError> {
+    pub async fn wait(&mut self, epoch: u64, durability: Durability) -> WriteResult<()> {
+        if durability == Durability::Applied {
+            return self
+                .applied_rx
+                .wait_for(|curr| *curr >= epoch)
+                .await
+                .map(|_| ())
+                .map_err(|_| WriteError::Shutdown);
+        }
+        let reached = match durability {
+            Durability::Applied => unreachable!(),
+            Durability::Written => *self.written_rx.borrow() >= epoch,
+            Durability::Durable => *self.durable_rx.borrow() >= epoch,
+        };
+        if reached {
+            return Ok(());
+        }
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         let rx = match durability {
-            Durability::Applied => &mut self.applied_rx,
+            Durability::Applied => unreachable!(),
             Durability::Written => &mut self.written_rx,
             Durability::Durable => &mut self.durable_rx,
         };
-        rx.wait_for(|curr| *curr >= epoch).await.map(|_| ())
+
+        enum WaitOutcome {
+            Reached,
+            Closed,
+            Terminal(String),
+        }
+        let outcome = tokio::select! {
+            biased;
+            result = rx.wait_for(|curr| *curr >= epoch) => {
+                match result {
+                    Ok(_) => WaitOutcome::Reached,
+                    Err(_) => WaitOutcome::Closed,
+                }
+            }
+            result = self.terminal_rx.wait_for(|error| error.is_some()) => {
+                match result {
+                    Ok(error) => WaitOutcome::Terminal(
+                        error.as_ref().expect("terminal error is present").clone()
+                    ),
+                    Err(_) => WaitOutcome::Closed,
+                }
+            }
+        };
+        match outcome {
+            WaitOutcome::Reached => Ok(()),
+            WaitOutcome::Terminal(error) => Err(WriteError::FlushError(error)),
+            WaitOutcome::Closed => Err(self.terminal_error().unwrap_or(WriteError::Shutdown)),
+        }
     }
 }
 
@@ -106,11 +156,13 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
     }
 
     async fn recv(&self) -> WriteResult<WriteApplied<M>> {
-        self.inner
-            .clone()
-            .await
-            .map_err(|_| WriteError::Shutdown)?
-            .map_err(|e| WriteError::ApplyError(e.epoch, e.error))
+        match self.inner.clone().await {
+            Ok(result) => result.map_err(|e| WriteError::ApplyError(e.epoch, e.error)),
+            Err(_) => Err(self
+                .watchers
+                .terminal_error()
+                .unwrap_or(WriteError::Shutdown)),
+        }
     }
 
     /// Returns the epoch assigned to this write.
@@ -129,10 +181,7 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
     pub async fn wait(&mut self, durability: Durability) -> WriteResult<M> {
         let WriteApplied { epoch, result } = self.recv().await?;
 
-        self.watchers
-            .wait(epoch, durability)
-            .await
-            .map_err(|_| WriteError::Shutdown)?;
+        self.watchers.wait(epoch, durability).await?;
         Ok(result)
     }
 }
@@ -149,6 +198,10 @@ pub struct WriteCoordinatorHandle<D: Delta> {
 }
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
+    fn terminal_error<W>(&self) -> Option<WriteError<W>> {
+        self.watchers.terminal_error()
+    }
+
     pub(crate) fn new(
         name: String,
         write_tx: mpsc::Sender<WriteCommand<D>>,
@@ -219,6 +272,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         timeout: Duration,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         const COMMAND: &str = "write_timeout";
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         self.record_queue_depth();
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -245,7 +301,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
             Err(mpsc::error::SendTimeoutError::Closed(WriteCommand::Write { .. })) => {
                 self.record_send(COMMAND, "shutdown", started);
                 self.record_backpressure(COMMAND, "closed");
-                Err(WriteError::Shutdown)
+                Err(self.terminal_error().unwrap_or(WriteError::Shutdown))
             }
             Err(_) => unreachable!("sent a Write command"),
         }
@@ -265,6 +321,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         write: D::Write,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         const COMMAND: &str = "write";
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         self.record_queue_depth();
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -283,7 +342,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
             Err(mpsc::error::SendError(WriteCommand::Write { .. })) => {
                 self.record_send(COMMAND, "shutdown", started);
                 self.record_backpressure(COMMAND, "closed");
-                Err(WriteError::Shutdown)
+                Err(self.terminal_error().unwrap_or(WriteError::Shutdown))
             }
             Err(_) => unreachable!("sent a Write command"),
         }
@@ -300,6 +359,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         write: D::Write,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         const COMMAND: &str = "try_write";
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         self.record_queue_depth();
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -320,7 +382,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
             Err(mpsc::error::TrySendError::Closed(WriteCommand::Write { .. })) => {
                 self.record_send(COMMAND, "shutdown", started);
                 self.record_backpressure(COMMAND, "closed");
-                Err(WriteError::Shutdown)
+                Err(self.terminal_error().unwrap_or(WriteError::Shutdown))
             }
             Err(_) => unreachable!("sent a Write command"),
         }
@@ -334,6 +396,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Returns a handle that can be used to wait for the flush to complete.
     pub async fn flush(&self, flush_storage: bool) -> WriteResult<WriteHandle> {
         const COMMAND: &str = "flush";
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         self.record_queue_depth();
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -354,7 +419,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.record_send(COMMAND, "shutdown", started);
                 self.record_backpressure(COMMAND, "closed");
-                Err(WriteError::Shutdown)
+                Err(self.terminal_error().unwrap_or(WriteError::Shutdown))
             }
         }
     }
@@ -389,10 +454,16 @@ mod tests {
         flushed: watch::Receiver<u64>,
         durable: watch::Receiver<u64>,
     ) -> EpochWatcher {
+        static TERMINAL_TX: std::sync::OnceLock<watch::Sender<Option<String>>> =
+            std::sync::OnceLock::new();
+        let terminal_rx = TERMINAL_TX
+            .get_or_init(|| watch::channel(None).0)
+            .subscribe();
         EpochWatcher {
             applied_rx: applied,
             written_rx: flushed,
             durable_rx: durable,
+            terminal_rx,
         }
     }
 

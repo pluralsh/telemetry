@@ -25,32 +25,31 @@ use crate::{
 };
 
 async fn state(namespaces: Vec<NamespaceConfig>) -> AppState {
-    state_with_visibility(namespaces, 3600).await
+    state_with_flush_interval(namespaces, 3600).await
 }
 
-async fn state_with_visibility(
+async fn state_with_flush_interval(
     namespaces: Vec<NamespaceConfig>,
-    visibility_interval_seconds: u64,
+    flush_interval_seconds: u64,
 ) -> AppState {
     let mut config = Config {
         storage: StorageConfig::InMemory,
-        visibility_interval_seconds,
         namespaces,
         ..Config::default()
     };
+    config.write.flush_interval_seconds = flush_interval_seconds;
     config.auth.unauthenticated = true;
     AppState::open(config).await.unwrap()
 }
 
 async fn authenticated_state(namespaces: Vec<NamespaceConfig>) -> AppState {
-    AppState::open(Config {
+    let mut config = Config {
         storage: StorageConfig::InMemory,
-        visibility_interval_seconds: 3600,
         namespaces,
         ..Config::default()
-    })
-    .await
-    .unwrap()
+    };
+    config.write.flush_interval_seconds = 3600;
+    AppState::open(config).await.unwrap()
 }
 
 fn namespace(name: &str) -> NamespaceConfig {
@@ -462,7 +461,7 @@ async fn post_forms_and_all_loki_result_shapes_are_supported() {
 
 #[tokio::test(start_paused = true)]
 async fn gzip_loki_json_and_visibility_flush_make_writes_queryable() {
-    let state = state_with_visibility(vec![namespace("tenant")], 1).await;
+    let state = state_with_flush_interval(vec![namespace("tenant")], 1).await;
     let body = json!({"streams":[{"stream":{"app":"visible"},"values":[
         ["1000000000","after flush"]
     ]}]})

@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
-use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use common::{
+    coordinator::WriteCoordinatorConfig,
+    storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig},
+};
 
 /// Configuration for opening a [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb) database.
 ///
@@ -26,6 +29,7 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDb
 ///     storage: SlateDbStorageConfig::default(),
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
+///     ..Default::default()
 /// };
 /// let ts = meter::TimeSeriesDb::open(config).await?;
 /// # Ok(())
@@ -50,6 +54,9 @@ pub struct Config {
     /// Data older than this duration may be automatically deleted during
     /// compaction. Set to `None` to retain data indefinitely.
     pub retention: Option<Duration>,
+
+    /// Bounds and flush triggers for each bucket/routing-slot write delta.
+    pub write_buffer: WriteCoordinatorConfig,
 }
 
 impl Default for Config {
@@ -69,6 +76,7 @@ impl Default for Config {
             },
             flush_interval: Duration::from_secs(60),
             retention: None,
+            write_buffer: WriteCoordinatorConfig::default(),
         }
     }
 }

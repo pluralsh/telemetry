@@ -65,15 +65,12 @@ type TrackConfigSpec struct {
 	// +kubebuilder:default=3600
 	SegmentDurationSeconds *int64 `json:"segmentDurationSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	RetentionSeconds *int64        `json:"retentionSeconds,omitempty"`
-	Page             TrackPageSpec `json:"page,omitempty"`
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=1
-	VisibilityIntervalSeconds *int64           `json:"visibilityIntervalSeconds,omitempty"`
-	Write                     WriteSpec        `json:"write,omitempty"`
-	Sharding                  ShardingSpec     `json:"sharding,omitempty"`
-	Request                   TrackRequestSpec `json:"request,omitempty"`
-	Auth                      AuthSpec         `json:"auth,omitempty"`
+	RetentionSeconds *int64           `json:"retentionSeconds,omitempty"`
+	Page             TrackPageSpec    `json:"page,omitempty"`
+	Write            WriteSpec        `json:"write,omitempty"`
+	Sharding         ShardingSpec     `json:"sharding,omitempty"`
+	Request          TrackRequestSpec `json:"request,omitempty"`
+	Auth             AuthSpec         `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

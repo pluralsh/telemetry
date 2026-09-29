@@ -23,6 +23,9 @@ pub const KEYVALUE: u8 = 0x04;
 /// Trace database (OTLP traces and attribute indexes).
 pub const TRACE: u8 = 0x05;
 
+/// Pseudo-filesystem database.
+pub const PSEUDOFS: u8 = 0x06;
+
 /// Returns the canonical name for a known subsystem byte, or `None`.
 ///
 /// Intended for diagnostics, logging, and tooling that inspects raw keys.
@@ -33,6 +36,7 @@ pub fn name(byte: u8) -> Option<&'static str> {
         LOG => Some("log"),
         KEYVALUE => Some("keyvalue"),
         TRACE => Some("trace"),
+        PSEUDOFS => Some("pseudofs"),
         _ => None,
     }
 }
@@ -48,6 +52,7 @@ mod tests {
         assert_eq!(name(LOG), Some("log"));
         assert_eq!(name(KEYVALUE), Some("keyvalue"));
         assert_eq!(name(TRACE), Some("trace"));
+        assert_eq!(name(PSEUDOFS), Some("pseudofs"));
     }
 
     #[test]

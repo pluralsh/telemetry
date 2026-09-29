@@ -19,6 +19,7 @@ fn config(path: &str) -> Config {
         }),
         segment_duration: Duration::from_secs(10),
         retention: None,
+        write_buffer: Default::default(),
         page: PageConfig {
             target_size_bytes: 1024,
             max_rows: 2,

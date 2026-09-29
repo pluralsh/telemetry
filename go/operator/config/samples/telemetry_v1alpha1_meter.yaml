@@ -33,8 +33,8 @@ spec:
         type: FoyerMemory
         capacity: 134217728
     write:
-      durability: written
-      flushIntervalSeconds: 60
+      durability: applied
+      flushIntervalSeconds: 10
       remoteConcurrency: 16
     namespaces:
       - default

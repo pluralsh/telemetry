@@ -1006,6 +1006,7 @@ pub(crate) struct Tsdb {
     /// stamp records with a bucket-aligned `Ttl::ExpireAt`. `None` disables
     /// per-record expiration.
     retention: Option<Duration>,
+    write_buffer: common::coordinator::WriteCoordinatorConfig,
 
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
@@ -1029,6 +1030,20 @@ impl Tsdb {
         storage: Arc<Storage>,
         retention: Option<Duration>,
     ) -> Self {
+        Self::with_retention_scoped_and_buffer(
+            namespace,
+            storage,
+            retention,
+            common::coordinator::WriteCoordinatorConfig::default(),
+        )
+    }
+
+    pub(crate) fn with_retention_scoped_and_buffer(
+        namespace: Namespace,
+        storage: Arc<Storage>,
+        retention: Option<Duration>,
+        write_buffer: common::coordinator::WriteCoordinatorConfig,
+    ) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -1042,6 +1057,7 @@ impl Tsdb {
             ingest_cache,
             bucket_creation: Mutex::new(()),
             retention,
+            write_buffer,
             metadata_catalog: RwLock::new(HashMap::new()),
             active_series,
         }
@@ -1081,6 +1097,7 @@ impl Tsdb {
                 self.storage.clone(),
                 self.retention,
                 self.active_series.clone(),
+                self.write_buffer.clone(),
             )
             .await?,
         );

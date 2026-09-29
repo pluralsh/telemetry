@@ -28,7 +28,7 @@ pub use migration::{
     mark_prepared, mark_ready, plan_next_split, prepare_owned_split, run_migration_worker,
 };
 pub use model::{
-    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_LIMIT,
     DEFAULT_VIRTUAL_SHARDS, MigrationPhase, ModelError, Owner, ShardId, ShardMap, ShardMigration,
     ShardRange, ShardSplit,
 };

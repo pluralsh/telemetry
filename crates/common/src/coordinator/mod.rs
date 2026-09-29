@@ -287,7 +287,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
     async fn run_coordinator(
         mut self,
-        flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
+        mut flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
     ) -> Result<(), String> {
         // Reset the interval to start fresh from when run() is called
         self.flush_interval.reset();
@@ -336,6 +336,12 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
                 _ = self.stop_tok.cancelled() => {
                     break;
+                }
+
+                result = &mut flush_task_jh => {
+                    return result
+                        .map_err(|e| format!("flush task panicked: {}", e))?
+                        .map_err(|e| format!("flush task error: {}", e));
                 }
             }
         }
@@ -502,24 +508,31 @@ struct FlushTask<D: Delta, F: Flusher<D>> {
 impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     fn run(mut self) -> tokio::task::JoinHandle<WriteResult<()>> {
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = self.flush_rx.recv() => {
-                        let Some(event) = event else {
+            let result = async {
+                loop {
+                    tokio::select! {
+                        event = self.flush_rx.recv() => {
+                            let Some(event) = event else {
+                                break;
+                            };
+                            self.handle_event(event).await?;
+                        }
+                        _ = self.stop_tok.cancelled() => {
                             break;
-                        };
-                        self.handle_event(event).await?;
-                    }
-                    _ = self.stop_tok.cancelled() => {
-                        break;
+                        }
                     }
                 }
+                // drain all remaining flush events
+                while let Ok(event) = self.flush_rx.try_recv() {
+                    self.handle_event(event).await?;
+                }
+                Ok(())
             }
-            // drain all remaining flush events
-            while let Ok(event) = self.flush_rx.try_recv() {
-                self.handle_event(event).await;
+            .await;
+            if let Err(WriteError::FlushError(error)) = &result {
+                self.watermarks.fail_flush(error.clone());
             }
-            Ok(())
+            result
         })
     }
 
@@ -610,6 +623,7 @@ pub struct EpochWatermarks {
     applied_tx: tokio::sync::watch::Sender<u64>,
     written_tx: tokio::sync::watch::Sender<u64>,
     durable_tx: tokio::sync::watch::Sender<u64>,
+    terminal_tx: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl EpochWatermarks {
@@ -617,15 +631,18 @@ impl EpochWatermarks {
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(0);
         let (written_tx, written_rx) = tokio::sync::watch::channel(0);
         let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
+        let (terminal_tx, terminal_rx) = tokio::sync::watch::channel(None);
         let watcher = EpochWatcher {
             applied_rx,
             written_rx,
             durable_rx,
+            terminal_rx,
         };
         let watermarks = EpochWatermarks {
             applied_tx,
             written_tx,
             durable_tx,
+            terminal_tx,
         };
         (watermarks, watcher)
     }
@@ -640,6 +657,16 @@ impl EpochWatermarks {
 
     pub fn update_durable(&self, epoch: u64) {
         let _ = self.durable_tx.send(epoch);
+    }
+
+    fn fail_flush(&self, error: String) {
+        let _ = self.terminal_tx.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(error);
+            true
+        });
     }
 }
 
@@ -880,6 +907,8 @@ mod tests {
     #[derive(Default)]
     struct TestFlusherState {
         flushed_events: Vec<Arc<EpochStamped<FrozenTestDelta>>>,
+        delta_error: Option<String>,
+        storage_error: Option<String>,
         /// Signals when a flush starts (before blocking)
         flush_started_tx: Option<oneshot::Sender<()>>,
         /// Blocks flush until signaled
@@ -910,8 +939,35 @@ mod tests {
             let flusher = Self {
                 state: Arc::new(Mutex::new(TestFlusherState {
                     flushed_events: Vec::new(),
+                    delta_error: None,
+                    storage_error: None,
                     flush_started_tx: Some(started_tx),
                     unblock_rx: Some(unblock_rx),
+                })),
+                storage: Arc::new(InMemoryStorage::new()),
+            };
+            (flusher, started_rx, unblock_tx)
+        }
+
+        fn failing_delta(error: &str) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(TestFlusherState {
+                    delta_error: Some(error.to_string()),
+                    ..Default::default()
+                })),
+                storage: Arc::new(InMemoryStorage::new()),
+            }
+        }
+
+        fn failing_storage_control(error: &str) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (unblock_tx, unblock_rx) = mpsc::channel(1);
+            let flusher = Self {
+                state: Arc::new(Mutex::new(TestFlusherState {
+                    storage_error: Some(error.to_string()),
+                    flush_started_tx: Some(started_tx),
+                    unblock_rx: Some(unblock_rx),
+                    ..Default::default()
                 })),
                 storage: Arc::new(InMemoryStorage::new()),
             };
@@ -937,7 +993,11 @@ mod tests {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
-                state.flush_started_tx.take()
+                if state.storage_error.is_none() {
+                    state.flush_started_tx.take()
+                } else {
+                    None
+                }
             };
             if let Some(tx) = flush_started_tx {
                 let _ = tx.send(());
@@ -946,10 +1006,17 @@ mod tests {
             // Block if test wants to control timing
             let unblock_rx = {
                 let mut state = self.state.lock().unwrap();
-                state.unblock_rx.take()
+                if state.storage_error.is_none() {
+                    state.unblock_rx.take()
+                } else {
+                    None
+                }
             };
             if let Some(mut rx) = unblock_rx {
                 rx.recv().await;
+            }
+            if let Some(error) = self.state.lock().unwrap().delta_error.clone() {
+                return Err(error);
             }
 
             // Write records to storage
@@ -996,6 +1063,9 @@ mod tests {
             };
             if let Some(mut rx) = unblock_rx {
                 rx.recv().await;
+            }
+            if let Some(error) = self.state.lock().unwrap().storage_error.clone() {
+                return Err(error);
             }
 
             Ok(())
@@ -1888,6 +1958,158 @@ mod tests {
 
         // cleanup
         coordinator.stop().await;
+    }
+
+    // ============================================================================
+    // Terminal Flush Failure Tests
+    // ============================================================================
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_propagate_flush_delta_failure() {
+        let flusher = TestFlusher::failing_delta("flush delta failed");
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["active", "queued"],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher,
+        );
+        let active = coordinator.handle("active");
+        let queued = coordinator.handle("queued");
+        coordinator.pause_handle("queued").pause();
+        let mut queued_write = queued
+            .try_write(TestWrite {
+                key: "queued".into(),
+                value: 3,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        coordinator.start();
+
+        let mut written = active
+            .try_write(TestWrite {
+                key: "written".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        let mut durable = active
+            .try_write(TestWrite {
+                key: "durable".into(),
+                value: 2,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        written.wait(Durability::Applied).await.unwrap();
+        durable.wait(Durability::Applied).await.unwrap();
+        active.flush(false).await.unwrap();
+
+        let written_error =
+            tokio::time::timeout(Duration::from_secs(5), written.wait(Durability::Written))
+                .await
+                .expect("Written waiter hung")
+                .unwrap_err();
+        assert!(
+            matches!(written_error, WriteError::FlushError(msg) if msg == "flush delta failed")
+        );
+        assert!(
+            matches!(durable.wait(Durability::Durable).await, Err(WriteError::FlushError(msg)) if msg == "flush delta failed")
+        );
+        assert!(
+            matches!(queued_write.wait(Durability::Applied).await, Err(WriteError::FlushError(msg)) if msg == "flush delta failed")
+        );
+        assert!(matches!(
+            active.try_write(TestWrite {
+                key: "new".into(),
+                value: 4,
+                size: 10,
+            }).await,
+            Err(WriteError::FlushError(msg)) if msg == "flush delta failed"
+        ));
+        assert!(
+            coordinator
+                .stop()
+                .await
+                .unwrap_err()
+                .contains("flush delta failed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_propagate_flush_storage_failure() {
+        let (flusher, storage_started, unblock_storage) =
+            TestFlusher::failing_storage_control("flush storage failed");
+        let mut coordinator = WriteCoordinator::new(
+            test_config(),
+            vec!["active", "queued"],
+            TestContext::default(),
+            flusher.initial_snapshot().await,
+            flusher,
+        );
+        let active = coordinator.handle("active");
+        let queued = coordinator.handle("queued");
+        coordinator.pause_handle("queued").pause();
+        let mut queued_write = queued
+            .try_write(TestWrite {
+                key: "queued".into(),
+                value: 3,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        coordinator.start();
+
+        let mut durable = active
+            .try_write(TestWrite {
+                key: "durable".into(),
+                value: 1,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        durable.wait(Durability::Applied).await.unwrap();
+        active.flush(true).await.unwrap();
+        storage_started.await.unwrap();
+
+        let mut written = active
+            .try_write(TestWrite {
+                key: "written".into(),
+                value: 2,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        written.wait(Durability::Applied).await.unwrap();
+        active.flush(false).await.unwrap().epoch().await.unwrap();
+        unblock_storage.send(()).await.unwrap();
+
+        assert!(
+            matches!(durable.wait(Durability::Durable).await, Err(WriteError::FlushError(msg)) if msg == "flush storage failed")
+        );
+        assert!(
+            matches!(written.wait(Durability::Written).await, Err(WriteError::FlushError(msg)) if msg == "flush storage failed")
+        );
+        assert!(
+            matches!(queued_write.wait(Durability::Applied).await, Err(WriteError::FlushError(msg)) if msg == "flush storage failed")
+        );
+        assert!(matches!(
+            active.try_write(TestWrite {
+                key: "new".into(),
+                value: 4,
+                size: 10,
+            }).await,
+            Err(WriteError::FlushError(msg)) if msg == "flush storage failed"
+        ));
+        assert!(
+            coordinator
+                .stop()
+                .await
+                .unwrap_err()
+                .contains("flush storage failed")
+        );
     }
 
     // ============================================================================

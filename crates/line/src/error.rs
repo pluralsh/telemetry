@@ -8,6 +8,10 @@
 pub enum Error {
     #[error("invalid log data: {0}")]
     Invalid(String),
+    #[error("write buffer is full")]
+    Backpressure,
+    #[error("Line writer is temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("corrupt Line record: {0}")]
     Corrupt(String),
     #[error("storage error: {0}")]

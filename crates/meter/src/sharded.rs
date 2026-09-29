@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use sharding::{
-    DEFAULT_IO_CONCURRENCY_MULTIPLIER, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
+    DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
     ShardId, ShardMap, hash_routing_key,
 };
 use slatedb::config::DbReaderOptions;
@@ -34,10 +34,8 @@ use crate::{
 const SOURCE_BUCKET_BITS: u32 = 40;
 const SOURCE_BUCKET_MASK: u64 = (1 << SOURCE_BUCKET_BITS) - 1;
 
-fn shard_io_semaphore(shards: usize, multiplier: u32) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(
-        shards.max(1).saturating_mul(multiplier as usize),
-    ))
+fn shard_io_semaphore(limit: u32) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(limit as usize))
 }
 
 async fn acquire_io_permit(permits: &Arc<Semaphore>) -> OwnedSemaphorePermit {
@@ -51,33 +49,33 @@ async fn acquire_io_permit(permits: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardingOptions {
     virtual_shards: u32,
-    io_concurrency_multiplier: u32,
+    io_concurrency_limit: u32,
 }
 
 impl Default for ShardingOptions {
     fn default() -> Self {
         Self {
             virtual_shards: DEFAULT_VIRTUAL_SHARDS,
-            io_concurrency_multiplier: DEFAULT_IO_CONCURRENCY_MULTIPLIER,
+            io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
         }
     }
 }
 
 impl ShardingOptions {
-    pub fn new(virtual_shards: u32, io_concurrency_multiplier: u32) -> Result<Self> {
+    pub fn new(virtual_shards: u32, io_concurrency_limit: u32) -> Result<Self> {
         if virtual_shards == 0 {
             return Err(Error::InvalidInput(
                 "virtual shard count must be greater than zero".to_string(),
             ));
         }
-        if io_concurrency_multiplier == 0 {
+        if io_concurrency_limit == 0 {
             return Err(Error::InvalidInput(
-                "I/O concurrency multiplier must be greater than zero".to_string(),
+                "I/O concurrency limit must be greater than zero".to_string(),
             ));
         }
         Ok(Self {
             virtual_shards,
-            io_concurrency_multiplier,
+            io_concurrency_limit,
         })
     }
 
@@ -85,8 +83,8 @@ impl ShardingOptions {
         self.virtual_shards
     }
 
-    pub const fn io_concurrency_multiplier(self) -> u32 {
-        self.io_concurrency_multiplier
+    pub const fn io_concurrency_limit(self) -> u32 {
+        self.io_concurrency_limit
     }
 
     pub fn shard_path(self, base: &str, shard: ShardId) -> Result<String> {
@@ -172,7 +170,7 @@ impl ShardedMeter {
         Ok(Self {
             config,
             options,
-            io_permits: shard_io_semaphore(writers.len(), options.io_concurrency_multiplier()),
+            io_permits: shard_io_semaphore(options.io_concurrency_limit()),
             writers: RwLock::new(writers),
             readers: RwLock::new(BTreeMap::new()),
             reader_slots: RwLock::new(BTreeMap::new()),
@@ -240,7 +238,7 @@ impl ShardedMeter {
             config,
             options,
             writers: RwLock::new(BTreeMap::new()),
-            io_permits: shard_io_semaphore(readers.len(), options.io_concurrency_multiplier()),
+            io_permits: shard_io_semaphore(options.io_concurrency_limit()),
             readers: RwLock::new(readers),
             reader_slots: RwLock::new(reader_slots),
             reader_options: Some(reader_options),
@@ -1178,7 +1176,7 @@ mod tests {
         };
         let sharded = ShardedMeter::open_writers(
             config("sharded"),
-            ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap(),
+            ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
             [ShardId::new(0), ShardId::new(1)],
         )
         .await
@@ -1202,7 +1200,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
         let one = HashRangeMap::bootstrap(1).unwrap();
         let two = one.grow_to(2).unwrap();
 
@@ -1390,15 +1388,14 @@ mod tests {
                 .unwrap(),
             "meter/shard-0003"
         );
-        assert!(ShardingOptions::new(0, DEFAULT_IO_CONCURRENCY_MULTIPLIER).is_err());
+        assert!(ShardingOptions::new(0, DEFAULT_IO_CONCURRENCY_LIMIT).is_err());
         assert!(ShardingOptions::new(DEFAULT_VIRTUAL_SHARDS, 0).is_err());
     }
 
     #[test]
-    fn shard_io_budget_uses_configured_multiplier() {
-        assert_eq!(shard_io_semaphore(8, 4).available_permits(), 32);
-        assert_eq!(shard_io_semaphore(8, 2).available_permits(), 16);
-        assert_eq!(shard_io_semaphore(0, 4).available_permits(), 4);
+    fn shard_io_budget_uses_fixed_process_limit() {
+        assert_eq!(shard_io_semaphore(128).available_permits(), 128);
+        assert_eq!(shard_io_semaphore(32).available_permits(), 32);
     }
 
     #[tokio::test]
@@ -1414,7 +1411,7 @@ mod tests {
             ..Default::default()
         };
         let routing = HashRangeMap::bootstrap(2).unwrap().grow_to(3).unwrap();
-        let options = ShardingOptions::new(3, DEFAULT_IO_CONCURRENCY_MULTIPLIER).unwrap();
+        let options = ShardingOptions::new(3, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
         let db =
             ShardedMeter::open_writers_with_routing(config, options, [ShardId::new(2)], &routing)
                 .await

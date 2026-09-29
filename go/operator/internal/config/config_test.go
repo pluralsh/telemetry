@@ -40,8 +40,8 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MeterKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 268435456", "flush_interval_seconds: 60",
-		"virtual_shards: 1", "io_concurrency_multiplier: 8",
+		"reader_cache_capacity: 268435456", "flush_interval_seconds: 10",
+		"virtual_shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
 		"path: /etc/meter/secrets/global-read-0-password",
@@ -130,7 +130,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"database: traces",
 		"stateful_set: traces-writer",
 		"headless_service: traces-writer-headless",
-		"visibility_interval_seconds: 1",
+		"flush_interval_seconds: 10",
 		"max_candidates: 10000",
 	} {
 		if !strings.Contains(writer, expected) {
@@ -143,14 +143,14 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 }
 
 func TestRenderShardedRoles(t *testing.T) {
-	ioConcurrencyMultiplier := int32(7)
+	ioConcurrencyLimit := int32(96)
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
 		Spec: telemetryv1alpha1.MeterSpec{
 			Mode: telemetryv1alpha1.MeterModeSharded,
 			Config: telemetryv1alpha1.MeterConfigSpec{
 				Sharding: telemetryv1alpha1.ShardingSpec{
-					IOConcurrencyMultiplier: &ioConcurrencyMultiplier,
+					IOConcurrencyLimit: &ioConcurrencyLimit,
 				},
 			},
 		},
@@ -162,7 +162,7 @@ func TestRenderShardedRoles(t *testing.T) {
 	if !strings.Contains(string(result.Data[MeterKey]), "mode: writer") ||
 		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
 		!strings.Contains(string(result.Data[MeterKey]), "shard_map: example-writer-shard-map") ||
-		!strings.Contains(string(result.Data[MeterKey]), "io_concurrency_multiplier: 7") ||
+		!strings.Contains(string(result.Data[MeterKey]), "io_concurrency_limit: 96") ||
 		strings.Contains(string(result.Data[MeterKey]), "virtual_shards:") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
@@ -185,7 +185,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
 		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
-		"segment_duration_seconds: 3600", "visibility_interval_seconds: 1",
+		"segment_duration_seconds: 3600", "flush_interval_seconds: 10",
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
 		"path: /var/run/secrets/line/internal-token", "name: tenant-a",
 	} {
@@ -193,7 +193,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 			t.Errorf("rendered Line config missing %q:\n%s", expected, rendered)
 		}
 	}
-	for _, invalid := range []string{"path_prefix:", "reader_cache_capacity:", "flush_interval_seconds:"} {
+	for _, invalid := range []string{"path_prefix:", "reader_cache_capacity:", "visibility_interval_seconds:"} {
 		if strings.Contains(rendered, invalid) {
 			t.Errorf("rendered Line config contains unsupported field %q:\n%s", invalid, rendered)
 		}

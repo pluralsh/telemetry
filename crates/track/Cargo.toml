@@ -19,6 +19,7 @@ common = { version = "0.1.0", path = "../common" }
 futures.workspace = true
 lalrpop-util = "0.23.1"
 logos = "0.16.1"
+metrics.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 regex.workspace = true

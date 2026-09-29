@@ -11,7 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use common::coordinator::{
+    Delta, Durability as CoordinatorDurability, Flusher, WriteCoordinator, WriteCoordinatorHandle,
+    WriteError,
+};
 use common::storage::{
     PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
 };
@@ -45,6 +50,7 @@ use crate::search::{
 const TERM_INDEX_CONCURRENCY: usize = 32;
 /// Page payloads fetched concurrently within one query segment.
 const PAGE_READ_CONCURRENCY: usize = 16;
+const WRITE_CHANNEL: &str = "write";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteReport {
@@ -107,10 +113,10 @@ struct PageRetention {
 pub struct LogDb {
     storage: Arc<dyn StorageRead>,
     writer: Option<Arc<dyn Storage>>,
-    config: Config,
     segment_ns: i64,
     owned_slots: Range<u16>,
-    write_lock: Mutex<()>,
+    write_handle: Option<WriteCoordinatorHandle<LineWriteDelta>>,
+    write_coordinator: Mutex<Option<WriteCoordinator<LineWriteDelta, LineFlusher>>>,
 }
 
 impl LogDb {
@@ -134,13 +140,31 @@ impl LogDb {
             .build()
             .await?;
         let storage_read = storage.clone();
+        let direct_writer = Arc::new(DirectWriter {
+            storage: storage_read.clone(),
+            writer: storage.clone(),
+            config: config.clone(),
+            owned_slots: owned_slots.clone(),
+        });
+        let mut write_coordinator = WriteCoordinator::new(
+            config.write_buffer.clone(),
+            vec![WRITE_CHANNEL],
+            (),
+            (),
+            LineFlusher {
+                direct_writer,
+                storage: storage.clone(),
+            },
+        );
+        let write_handle = write_coordinator.handle(WRITE_CHANNEL);
+        write_coordinator.start();
         Ok(Self {
             storage: storage_read,
             writer: Some(storage),
-            config,
             segment_ns,
             owned_slots,
-            write_lock: Mutex::new(()),
+            write_handle: Some(write_handle),
+            write_coordinator: Mutex::new(Some(write_coordinator)),
         })
     }
 
@@ -168,16 +192,16 @@ impl LogDb {
         Ok(Self {
             storage,
             writer: None,
-            config,
             segment_ns,
             owned_slots,
-            write_lock: Mutex::new(()),
+            write_handle: None,
+            write_coordinator: Mutex::new(None),
         })
     }
 
-    fn writer(&self) -> Result<&dyn Storage> {
-        self.writer
-            .as_deref()
+    fn write_handle(&self) -> Result<&WriteCoordinatorHandle<LineWriteDelta>> {
+        self.write_handle
+            .as_ref()
             .ok_or_else(|| Error::Invalid("writes are unavailable on a read-only database".into()))
     }
 
@@ -201,40 +225,104 @@ impl LogDb {
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
+        if let Some((_, slot, _)) = groups
+            .keys()
+            .find(|(_, slot, _)| !self.owned_slots.contains(slot))
+        {
+            return Err(Error::Invalid(format!(
+                "routing slot {slot} is outside opened shard range {:?}",
+                self.owned_slots
+            )));
+        }
+        let write = LineWrite {
+            namespace: namespace.clone(),
+            groups,
+        };
+        let mut write_handle = self
+            .write_handle()?
+            .try_write(write)
+            .await
+            .map_err(map_write_error)?;
+        let report = write_handle
+            .wait(CoordinatorDurability::Applied)
+            .await
+            .map_err(map_write_error)?;
 
-        let _guard = self.write_lock.lock().await;
+        if durability != Durability::Applied {
+            let mut flush_handle = self
+                .write_handle()?
+                .flush(false)
+                .await
+                .map_err(map_write_error)?;
+            flush_handle
+                .wait(CoordinatorDurability::Written)
+                .await
+                .map_err(map_write_error)?;
+        }
+        if durability == Durability::Durable {
+            self.writer
+                .as_ref()
+                .expect("write handle requires writer")
+                .flush()
+                .await?;
+        }
+        Ok(report)
+    }
+}
+
+struct DirectWriter {
+    storage: Arc<dyn StorageRead>,
+    writer: Arc<dyn Storage>,
+    config: Config,
+    owned_slots: Range<u16>,
+}
+
+impl DirectWriter {
+    async fn write_groups(&self, groups: FrozenLineWriteDelta) -> Result<()> {
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
             expires_at_unix_ms: self.logical_expiry()?,
         };
-        let mut write = PendingWrite::new(ttl, retention, groups.len());
-        for ((segment, slot, fingerprint), (labels, entries)) in groups {
-            if !self.owned_slots.contains(&slot) {
-                return Err(Error::Invalid(format!(
-                    "routing slot {slot} is outside opened shard range {:?}",
-                    self.owned_slots
-                )));
+        let mut by_namespace: BTreeMap<Namespace, StreamGroups> = BTreeMap::new();
+        for ((namespace, segment, slot, fingerprint), group) in groups.groups {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .insert((segment, slot, fingerprint), group);
+        }
+        let mut all_ops = Vec::new();
+        for (namespace, groups) in by_namespace {
+            let mut write = PendingWrite::new(ttl, retention, groups.len());
+            for ((segment, slot, fingerprint), (labels, entries)) in groups {
+                if !self.owned_slots.contains(&slot) {
+                    return Err(Error::Invalid(format!(
+                        "routing slot {slot} is outside opened shard range {:?}",
+                        self.owned_slots
+                    )));
+                }
+                let stream_id = self
+                    .resolve_stream_id(&mut write, &namespace, segment, slot, fingerprint, &labels)
+                    .await?;
+                self.add_label_postings(&mut write, &namespace, segment, slot, &labels, stream_id)
+                    .await?;
+                self.append_stream_pages(&mut write, &namespace, segment, slot, stream_id, entries)
+                    .await?;
             }
-            let stream_id = self
-                .resolve_stream_id(&mut write, namespace, segment, slot, fingerprint, &labels)
-                .await?;
-            self.add_label_postings(&mut write, namespace, segment, slot, &labels, stream_id)
-                .await?;
-            self.append_stream_pages(&mut write, namespace, segment, slot, stream_id, entries)
+            let (ops, _) = self.finish_write(write, &namespace).await?;
+            all_ops.extend(ops);
+        }
+        if !all_ops.is_empty() {
+            self.writer
+                .apply_with_options(
+                    all_ops,
+                    WriteOptions {
+                        await_durable: false,
+                    },
+                )
                 .await?;
         }
-        let (ops, report) = self.finish_write(write, namespace).await?;
-
-        self.writer()?
-            .apply_with_options(
-                ops,
-                WriteOptions {
-                    await_durable: durability == Durability::Durable,
-                },
-            )
-            .await?;
-        Ok(report)
+        Ok(())
     }
 
     /// Returns the stream's existing ID, or allocates the segment's next one,
@@ -460,6 +548,33 @@ impl LogDb {
         Ok(())
     }
 
+    fn ttl(&self) -> Result<Ttl> {
+        self.config
+            .retention
+            .map(|duration| {
+                u64::try_from(duration.as_millis())
+                    .map(Ttl::ExpireAfter)
+                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))
+            })
+            .transpose()
+            .map(|ttl| ttl.unwrap_or(Ttl::NoExpiry))
+    }
+
+    fn logical_expiry(&self) -> Result<Option<u64>> {
+        self.config
+            .retention
+            .map(|retention| {
+                let retention_ms = u64::try_from(retention.as_millis())
+                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))?;
+                unix_time_ms()?
+                    .checked_add(retention_ms)
+                    .ok_or_else(|| Error::Invalid("retention expiry overflows u64".to_owned()))
+            })
+            .transpose()
+    }
+}
+
+impl LogDb {
     /// Reads rows in the inclusive timestamp range matching every exact label.
     pub async fn read(
         &self,
@@ -767,14 +882,31 @@ impl LogDb {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        if let Some(storage) = &self.writer {
-            storage.flush().await?;
+        if let Some(handle) = &self.write_handle {
+            let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;
+            flush_handle
+                .wait(CoordinatorDurability::Written)
+                .await
+                .map_err(map_write_error)?;
+            self.writer
+                .as_ref()
+                .expect("write handle requires writer")
+                .flush()
+                .await?;
         }
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.storage.close().await?;
+        let coordinator_result =
+            if let Some(coordinator) = self.write_coordinator.lock().await.take() {
+                coordinator.stop().await.map_err(Error::Invalid)
+            } else {
+                Ok(())
+            };
+        let storage_result = self.storage.close().await.map_err(Error::from);
+        coordinator_result?;
+        storage_result?;
         Ok(())
     }
 
@@ -825,34 +957,137 @@ impl LogDb {
         }
         Ok(streams)
     }
-
-    fn ttl(&self) -> Result<Ttl> {
-        self.config
-            .retention
-            .map(|duration| {
-                u64::try_from(duration.as_millis())
-                    .map(Ttl::ExpireAfter)
-                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))
-            })
-            .transpose()
-            .map(|ttl| ttl.unwrap_or(Ttl::NoExpiry))
-    }
-
-    fn logical_expiry(&self) -> Result<Option<u64>> {
-        self.config
-            .retention
-            .map(|retention| {
-                let retention_ms = u64::try_from(retention.as_millis())
-                    .map_err(|_| Error::Invalid("retention exceeds u64 milliseconds".to_owned()))?;
-                unix_time_ms()?
-                    .checked_add(retention_ms)
-                    .ok_or_else(|| Error::Invalid("retention expiry overflows u64".to_owned()))
-            })
-            .transpose()
-    }
 }
 
 type StreamGroups = BTreeMap<(SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+type CoordinatedStreamGroups =
+    BTreeMap<(Namespace, SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+
+struct LineWrite {
+    namespace: Namespace,
+    groups: StreamGroups,
+}
+
+struct FrozenLineWriteDelta {
+    groups: CoordinatedStreamGroups,
+}
+
+struct LineWriteDelta {
+    groups: CoordinatedStreamGroups,
+}
+
+impl Delta for LineWriteDelta {
+    type Context = ();
+    type Write = LineWrite;
+    type Frozen = FrozenLineWriteDelta;
+    type FrozenView = ();
+    type ApplyResult = WriteReport;
+    type DeltaView = ();
+    type Snapshot = ();
+
+    fn init((): Self::Context) -> Self {
+        Self {
+            groups: BTreeMap::new(),
+        }
+    }
+
+    fn apply(&mut self, write: Self::Write) -> std::result::Result<WriteReport, String> {
+        let report = WriteReport {
+            streams: write.groups.len(),
+            pages: 0,
+            rows: write
+                .groups
+                .values()
+                .map(|(_, entries)| entries.len())
+                .sum(),
+        };
+        for ((segment, slot, fingerprint), (labels, _)) in &write.groups {
+            if let Some((existing, _)) =
+                self.groups
+                    .get(&(write.namespace.clone(), *segment, *slot, *fingerprint))
+                && existing != labels
+            {
+                return Err("stream fingerprint collision across writes".to_owned());
+            }
+        }
+        for ((segment, slot, fingerprint), (labels, mut entries)) in write.groups {
+            let group = self
+                .groups
+                .entry((write.namespace.clone(), segment, slot, fingerprint))
+                .or_insert_with(|| (labels.clone(), Vec::new()));
+            group.1.append(&mut entries);
+        }
+        Ok(report)
+    }
+
+    fn estimate_size(&self) -> usize {
+        self.groups
+            .values()
+            .map(|(labels, entries)| {
+                labels
+                    .iter()
+                    .map(|label| label.name.len() + label.value.len())
+                    .sum::<usize>()
+                    + entries
+                        .iter()
+                        .map(|entry| size_of::<i64>() + entry.line.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn freeze(mut self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        for (_, entries) in self.groups.values_mut() {
+            entries.sort_by_key(|entry| entry.timestamp_ns);
+        }
+        (
+            FrozenLineWriteDelta {
+                groups: self.groups,
+            },
+            (),
+            (),
+        )
+    }
+
+    fn reader(&self) -> Self::DeltaView {}
+}
+
+struct LineFlusher {
+    direct_writer: Arc<DirectWriter>,
+    storage: Arc<dyn Storage>,
+}
+
+#[async_trait]
+impl Flusher<LineWriteDelta> for LineFlusher {
+    async fn flush_delta(
+        &mut self,
+        frozen: FrozenLineWriteDelta,
+        _epoch_range: &Range<u64>,
+    ) -> std::result::Result<(), String> {
+        self.direct_writer
+            .write_groups(frozen)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn flush_storage(&self) -> std::result::Result<(), String> {
+        self.storage
+            .flush()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn map_write_error<T>(error: WriteError<T>) -> Error {
+    match error {
+        WriteError::Backpressure(_) | WriteError::TimeoutError(_) => Error::Backpressure,
+        WriteError::Shutdown => Error::Unavailable("write coordinator is shut down".to_owned()),
+        WriteError::ApplyError(_, message) => Error::Invalid(message),
+        WriteError::FlushError(message) | WriteError::Internal(message) => {
+            Error::Unavailable(message)
+        }
+    }
+}
 
 /// Groups entries by `(segment, routing slot, stream)`, sorted by timestamp.
 fn group_by_stream(
@@ -1045,6 +1280,7 @@ mod tests {
                 max_age: Duration::from_secs(60),
                 rows_per_block: 1,
             },
+            write_buffer: Default::default(),
         }
     }
 
@@ -1212,6 +1448,138 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].entry, rows[1].entry);
         db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn applied_writes_coalesce_before_flush() {
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("coalesced").unwrap();
+        let labels = labels("api", "prod");
+        let slot = crate::routing::routing_slot(&namespace, &labels);
+
+        for (timestamp, line) in [(1, "first"), (2, "second")] {
+            let report = db
+                .write_with_durability(
+                    &namespace,
+                    vec![LogBatch::new(
+                        labels.clone(),
+                        vec![LogEntry::new(timestamp, line)],
+                    )],
+                    Durability::Applied,
+                )
+                .await
+                .unwrap();
+            assert_eq!(report.rows, 1);
+            assert_eq!(report.streams, 1);
+            assert_eq!(report.pages, 0);
+        }
+
+        assert!(db.read(&namespace, 0, 3, &[]).await.unwrap().is_empty());
+        db.flush().await.unwrap();
+
+        let rows = db.read(&namespace, 0, 3, &[]).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let (_, stream_id) = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+        let mut pages = db
+            .storage
+            .scan_iter(metadata_range(&namespace, 0, slot, stream_id))
+            .await
+            .unwrap();
+        let mut page_count = 0;
+        while pages.next().await.unwrap().is_some() {
+            page_count += 1;
+        }
+        assert_eq!(page_count, 1);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn written_and_durable_force_the_expected_flushes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "durability-levels".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        });
+        let namespace = Namespace::new("durability").unwrap();
+        let db = LogDb::open(config.clone()).await.unwrap();
+
+        db.write_with_durability(
+            &namespace,
+            vec![LogBatch::new(
+                labels("api", "prod"),
+                vec![LogEntry::new(1, "applied")],
+            )],
+            Durability::Applied,
+        )
+        .await
+        .unwrap();
+        assert!(db.read(&namespace, 0, 3, &[]).await.unwrap().is_empty());
+
+        db.write_with_durability(
+            &namespace,
+            vec![LogBatch::new(
+                labels("api", "prod"),
+                vec![LogEntry::new(2, "written")],
+            )],
+            Durability::Written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
+
+        db.write_with_durability(
+            &namespace,
+            vec![LogBatch::new(
+                labels("api", "prod"),
+                vec![LogEntry::new(3, "durable")],
+            )],
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+
+        let reopened = LogDb::open(config).await.unwrap();
+        assert_eq!(reopened.read(&namespace, 0, 4, &[]).await.unwrap().len(), 3);
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_drains_and_close_stops_the_coordinator() {
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("flush-close").unwrap();
+        db.write_with_durability(
+            &namespace,
+            vec![LogBatch::new(
+                labels("api", "prod"),
+                vec![LogEntry::new(1, "pending")],
+            )],
+            Durability::Applied,
+        )
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+        assert_eq!(db.read(&namespace, 0, 2, &[]).await.unwrap().len(), 1);
+        db.close().await.unwrap();
+
+        let error = db
+            .write(
+                &namespace,
+                vec![LogBatch::new(
+                    labels("api", "prod"),
+                    vec![LogEntry::new(2, "after close")],
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shut down"));
     }
 
     #[tokio::test]

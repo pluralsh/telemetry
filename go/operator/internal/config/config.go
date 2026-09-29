@@ -249,11 +249,14 @@ func renderLine(input Input) (Result, error) {
 				MaxAgeSeconds:   int64Value(spec.Page.MaxAgeSeconds, 5),
 				RowsPerBlock:    int64Value(spec.Page.RowsPerBlock, 256),
 			},
-			VisibilityIntervalSeconds: int64Value(spec.VisibilityIntervalSeconds, 1),
-			Write: renderLineWrite{
-				Durability:        lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityWritten)),
-				RemoteConcurrency: int32Value(spec.Write.RemoteConcurrency, 16),
-				RemoteRetries:     int32Value(spec.Write.RemoteRetries, 2),
+			Write: renderWrite{
+				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 10),
+				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
+				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 10000),
+				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
+				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
+				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
 			Sharding: renderShardingConfig(line.Name, line.Namespace, spec.Sharding, resources.GRPCPort(line), component),
 			Request: renderLineRequest{
@@ -341,16 +344,23 @@ func renderTrack(input Input) (Result, error) {
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(track)),
 				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
 			},
-			Storage:                   renderStorageConfig(spec.Storage, descriptor),
-			SegmentDurationSeconds:    int64Value(spec.SegmentDurationSeconds, 3600),
-			RetentionSeconds:          spec.RetentionSeconds,
-			Page:                      renderTrackPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
-			VisibilityIntervalSeconds: int64Value(spec.VisibilityIntervalSeconds, 1),
-			Write:                     renderLineWrite{Durability: lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityWritten)), RemoteConcurrency: int32Value(spec.Write.RemoteConcurrency, 16), RemoteRetries: int32Value(spec.Write.RemoteRetries, 2)},
-			Sharding:                  renderShardingConfig(track.Name, track.Namespace, spec.Sharding, resources.GRPCPort(track), component),
-			Request:                   renderTrackRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
-			Auth:                      renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
-			Namespaces:                namespaces,
+			Storage:                renderStorageConfig(spec.Storage, descriptor),
+			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
+			RetentionSeconds:       spec.RetentionSeconds,
+			Page:                   renderTrackPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
+			Write: renderWrite{
+				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 10),
+				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
+				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 10000),
+				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
+				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
+				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
+			},
+			Sharding:   renderShardingConfig(track.Name, track.Namespace, spec.Sharding, resources.GRPCPort(track), component),
+			Request:    renderTrackRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
+			Auth:       renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces: namespaces,
 		})
 	}
 	writerMode := modeStandalone
@@ -465,26 +475,29 @@ func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath strin
 
 func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	return renderWrite{
-		Durability:           lo.CoalesceOrEmpty(string(spec.Durability), string(telemetryv1alpha1.DurabilityWritten)),
-		FlushIntervalSeconds: int64Value(spec.FlushIntervalSeconds, 60),
-		RemoteConcurrency:    int32Value(spec.RemoteConcurrency, 16),
-		RemoteRetries:        int32Value(spec.RemoteRetries, 2),
+		Durability:                      lo.CoalesceOrEmpty(string(spec.Durability), string(telemetryv1alpha1.DurabilityApplied)),
+		FlushIntervalSeconds:            int64Value(spec.FlushIntervalSeconds, 10),
+		BufferQueueCapacity:             int32Value(spec.BufferQueueCapacity, 10000),
+		BufferFlushIntervalMilliseconds: int64Value(spec.BufferFlushIntervalMilliseconds, 10000),
+		BufferSizeThresholdBytes:        int64Value(spec.BufferSizeThresholdBytes, 67108864),
+		RemoteConcurrency:               int32Value(spec.RemoteConcurrency, 16),
+		RemoteRetries:                   int32Value(spec.RemoteRetries, 2),
 	}
 }
 
 func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
-	ioConcurrencyMultiplier := int32Value(spec.IOConcurrencyMultiplier, 8)
+	ioConcurrencyLimit := int32Value(spec.IOConcurrencyLimit, 128)
 	if component == modeStandalone {
 		virtual := int32(1)
 		return renderSharding{
-			VirtualShards: &virtual, IOConcurrencyMultiplier: ioConcurrencyMultiplier,
+			VirtualShards: &virtual, IOConcurrencyLimit: ioConcurrencyLimit,
 			Backend: modeStandalone,
 		}
 	}
 	writer := resourceName(name, modeWriter)
 	return renderSharding{
-		IOConcurrencyMultiplier: ioConcurrencyMultiplier,
-		Backend:                 "kubernetes", Database: resourceName(name, ""), Namespace: namespace,
+		IOConcurrencyLimit: ioConcurrencyLimit,
+		Backend:            "kubernetes", Database: resourceName(name, ""), Namespace: namespace,
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
 		OwnerPort: grpcPort, ShardMap: resourceName(name, "writer-shard-map"),
 		CoordinatorLease: resourceName(name, "writer-shard-coordinator"), ShardLeasePrefix: resourceName(name, "writer-shard"),
@@ -545,33 +558,31 @@ type renderConfig struct {
 	Namespaces          []renderNamespace `json:"namespaces"`
 }
 type renderLineConfig struct {
-	Mode                      string               `json:"mode"`
-	Listeners                 renderListeners      `json:"listeners"`
-	Storage                   renderStorage        `json:"storage"`
-	SegmentDurationSeconds    int64                `json:"segment_duration_seconds"`
-	RetentionSeconds          *int64               `json:"retention_seconds,omitempty"`
-	Page                      renderLinePage       `json:"page"`
-	VisibilityIntervalSeconds int64                `json:"visibility_interval_seconds"`
-	Write                     renderLineWrite      `json:"write"`
-	Sharding                  renderSharding       `json:"sharding"`
-	Request                   renderLineRequest    `json:"request"`
-	Cache                     renderLineQueryCache `json:"cache"`
-	Auth                      renderAuth           `json:"auth"`
-	Namespaces                []renderNamespace    `json:"namespaces"`
+	Mode                   string               `json:"mode"`
+	Listeners              renderListeners      `json:"listeners"`
+	Storage                renderStorage        `json:"storage"`
+	SegmentDurationSeconds int64                `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64               `json:"retention_seconds,omitempty"`
+	Page                   renderLinePage       `json:"page"`
+	Write                  renderWrite          `json:"write"`
+	Sharding               renderSharding       `json:"sharding"`
+	Request                renderLineRequest    `json:"request"`
+	Cache                  renderLineQueryCache `json:"cache"`
+	Auth                   renderAuth           `json:"auth"`
+	Namespaces             []renderNamespace    `json:"namespaces"`
 }
 type renderTrackConfig struct {
-	Mode                      string             `json:"mode"`
-	Listeners                 renderListeners    `json:"listeners"`
-	Storage                   renderStorage      `json:"storage"`
-	SegmentDurationSeconds    int64              `json:"segment_duration_seconds"`
-	RetentionSeconds          *int64             `json:"retention_seconds,omitempty"`
-	Page                      renderTrackPage    `json:"page"`
-	VisibilityIntervalSeconds int64              `json:"visibility_interval_seconds"`
-	Write                     renderLineWrite    `json:"write"`
-	Sharding                  renderSharding     `json:"sharding"`
-	Request                   renderTrackRequest `json:"request"`
-	Auth                      renderAuth         `json:"auth"`
-	Namespaces                []renderNamespace  `json:"namespaces"`
+	Mode                   string             `json:"mode"`
+	Listeners              renderListeners    `json:"listeners"`
+	Storage                renderStorage      `json:"storage"`
+	SegmentDurationSeconds int64              `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64             `json:"retention_seconds,omitempty"`
+	Page                   renderTrackPage    `json:"page"`
+	Write                  renderWrite        `json:"write"`
+	Sharding               renderSharding     `json:"sharding"`
+	Request                renderTrackRequest `json:"request"`
+	Auth                   renderAuth         `json:"auth"`
+	Namespaces             []renderNamespace  `json:"namespaces"`
 }
 type renderPseudoFSConfig struct {
 	Listener                string                   `json:"listener"`
@@ -604,11 +615,6 @@ type renderLinePage struct {
 	MaxRows         int64 `json:"max_rows"`
 	MaxAgeSeconds   int64 `json:"max_age_seconds"`
 	RowsPerBlock    int64 `json:"rows_per_block"`
-}
-type renderLineWrite struct {
-	Durability        string `json:"durability"`
-	RemoteConcurrency int32  `json:"remote_concurrency"`
-	RemoteRetries     int32  `json:"remote_retries"`
 }
 type renderLineRequest struct {
 	MaxRequestBytes             int64 `json:"max_request_bytes"`
@@ -660,25 +666,28 @@ type renderCache struct {
 	SubmitQueueSizeThreshold *int64 `json:"submit_queue_size_threshold,omitempty"`
 }
 type renderWrite struct {
-	Durability           string `json:"durability"`
-	FlushIntervalSeconds int64  `json:"flush_interval_seconds"`
-	RemoteConcurrency    int32  `json:"remote_concurrency"`
-	RemoteRetries        int32  `json:"remote_retries"`
+	Durability                      string `json:"durability"`
+	FlushIntervalSeconds            int64  `json:"flush_interval_seconds"`
+	BufferQueueCapacity             int32  `json:"buffer_queue_capacity"`
+	BufferFlushIntervalMilliseconds int64  `json:"buffer_flush_interval_milliseconds"`
+	BufferSizeThresholdBytes        int64  `json:"buffer_size_threshold_bytes"`
+	RemoteConcurrency               int32  `json:"remote_concurrency"`
+	RemoteRetries                   int32  `json:"remote_retries"`
 }
 type renderSharding struct {
-	VirtualShards           *int32 `json:"virtual_shards,omitempty"`
-	IOConcurrencyMultiplier int32  `json:"io_concurrency_multiplier"`
-	Backend                 string `json:"backend"`
-	Database                string `json:"database,omitempty"`
-	Namespace               string `json:"namespace,omitempty"`
-	StatefulSet             string `json:"stateful_set,omitempty"`
-	HeadlessService         string `json:"headless_service,omitempty"`
-	OwnerPort               int32  `json:"owner_port,omitempty"`
-	ShardMap                string `json:"shard_map,omitempty"`
-	CoordinatorLease        string `json:"coordinator_lease,omitempty"`
-	ShardLeasePrefix        string `json:"shard_lease_prefix,omitempty"`
-	LeaseDurationSeconds    int64  `json:"lease_duration_seconds,omitempty"`
-	RenewIntervalSeconds    int64  `json:"renew_interval_seconds,omitempty"`
+	VirtualShards        *int32 `json:"virtual_shards,omitempty"`
+	IOConcurrencyLimit   int32  `json:"io_concurrency_limit"`
+	Backend              string `json:"backend"`
+	Database             string `json:"database,omitempty"`
+	Namespace            string `json:"namespace,omitempty"`
+	StatefulSet          string `json:"stateful_set,omitempty"`
+	HeadlessService      string `json:"headless_service,omitempty"`
+	OwnerPort            int32  `json:"owner_port,omitempty"`
+	ShardMap             string `json:"shard_map,omitempty"`
+	CoordinatorLease     string `json:"coordinator_lease,omitempty"`
+	ShardLeasePrefix     string `json:"shard_lease_prefix,omitempty"`
+	LeaseDurationSeconds int64  `json:"lease_duration_seconds,omitempty"`
+	RenewIntervalSeconds int64  `json:"renew_interval_seconds,omitempty"`
 }
 type renderFileSecret struct {
 	Source string `json:"source"`

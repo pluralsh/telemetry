@@ -84,9 +84,13 @@ reader_cache_capacity: 268435456
 write:
   # applied: in-memory delta; written: SlateDB mutable state/fresh snapshot;
   # durable: object-store flush before acknowledgement. Default: written.
-  durability: written
+  durability: applied
   # Seconds between durable writer flushes. Default 60; 0 disables the task.
-  flush_interval_seconds: 60
+  flush_interval_seconds: 10
+  # Per-bucket/routing-slot in-memory write coordinator limits.
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
   # Maximum concurrent shard-forwarding batches. Default 16.
   remote_concurrency: 16
   # Retries after the initial stale-ownership gRPC attempt. Default 2.
@@ -95,7 +99,7 @@ write:
 sharding:
   # Initial/desired storage-shard count; online changes may only increase it.
   virtual_shards: 8
-  io_concurrency_multiplier: 8 # Default 8; global shard I/O permits per open shard.
+  io_concurrency_limit: 128 # Concurrent storage I/O operations per pod.
   backend: standalone
 
   # Static split-deployment alternative. Ranges are half-open and must exactly

@@ -27,6 +27,7 @@ use sharding::{
 
 use crate::{
     config::{Config, NamespaceConfig, ServerMode, ShardingBackend},
+    http::ApiError,
     internal_writer::to_proto_request,
 };
 
@@ -83,7 +84,7 @@ impl AppState {
         let db = Arc::new(if config.mode == ServerMode::Reader {
             ShardedTrack::open_readers_with_routing(
                 config.track_config(),
-                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
                 &assignment.routing,
                 slatedb::config::DbReaderOptions {
@@ -95,7 +96,7 @@ impl AppState {
         } else {
             ShardedTrack::open_with_routing(
                 config.track_config(),
-                ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?,
+                ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
                 &assignment.routing,
             )
@@ -145,7 +146,7 @@ impl AppState {
                         config: state.config.track_config(),
                         options: ShardingOptions::new(
                             state.assignment.read().await.virtual_shards,
-                            state.config.sharding.io_concurrency_multiplier,
+                            state.config.sharding.io_concurrency_limit,
                         )?,
                     }),
                     Arc::clone(&state.assignment),
@@ -154,7 +155,7 @@ impl AppState {
                 state.tasks.lock().await.extend(tasks);
             }
         }
-        state.start_visibility_task().await;
+        state.start_durable_flush_task().await;
         Ok(state)
     }
 
@@ -193,19 +194,20 @@ impl AppState {
         namespace: &Namespace,
         batches: Vec<TraceBatch>,
         request_id: String,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ApiError> {
         let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
-        )?;
+            self.config.sharding.io_concurrency_limit,
+        )
+        .map_err(ApiError::internal)?;
         let mut groups = HashMap::<(Owner, ShardId), Vec<Trace>>::new();
         for trace in batches.into_iter().flat_map(|batch| batch.traces) {
             let shard = options.route(&assignment.routing, namespace, trace.trace_id);
             let owner = assignment
                 .owner_of(shard)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("shard has no active owner"))?;
+                .ok_or_else(|| ApiError::unavailable("shard has no active owner"))?;
             groups.entry((owner, shard)).or_default().push(trace);
         }
         let results = stream::iter(groups.into_iter().map(|((owner, shard), traces)| {
@@ -213,7 +215,11 @@ impl AppState {
             let namespace = namespace.clone();
             let request_id = format!("{request_id}-{}", shard.get());
             async move {
-                let _permit = state.remote_limit.acquire().await?;
+                let _permit = state
+                    .remote_limit
+                    .acquire()
+                    .await
+                    .map_err(|_| ApiError::unavailable("server is shutting down"))?;
                 let batches = vec![TraceBatch::new(traces)];
                 if owner.id == state.local_owner {
                     state.write_local(&namespace, shard, batches).await
@@ -245,18 +251,22 @@ impl AppState {
         namespace: &Namespace,
         shard: ShardId,
         batches: Vec<TraceBatch>,
-    ) -> anyhow::Result<()> {
-        if self.draining_shards.read().await.contains(&shard) {
-            anyhow::bail!("local shard is draining");
+    ) -> Result<(), ApiError> {
+        // Keep the read guard for the entire write so migration and shutdown
+        // can use the exclusive lock as an in-flight write barrier.
+        let draining = self.draining_shards.read().await;
+        if draining.contains(&shard) {
+            return Err(ApiError::unavailable("local shard is draining"));
         }
         let database = self
             .db
             .shard(shard)
             .await
-            .ok_or_else(|| anyhow::anyhow!("local shard is not open"))?;
+            .ok_or_else(|| ApiError::unavailable("local shard is not open"))?;
         database
             .write_with_durability(namespace, batches, durability(self.config.write.durability))
-            .await?;
+            .await
+            .map_err(ApiError::from_track)?;
         self.dirty.store(true, Ordering::Release);
         Ok(())
     }
@@ -269,22 +279,32 @@ impl AppState {
         batches: Vec<TraceBatch>,
         mut generation: u64,
         request_id: String,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ApiError> {
         for attempt in 0..=self.config.write.remote_retries {
-            let endpoint = owner_endpoint(&self.config, &owner)?;
-            let mut client = InternalWriterClient::connect(format!("http://{endpoint}")).await?;
-            let mut request = Request::new(to_proto_request(
-                namespace,
-                shard,
-                generation,
-                &request_id,
-                self.config.write.durability,
-                batches.clone(),
-            )?);
+            let endpoint = owner_endpoint(&self.config, &owner)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let mut client = InternalWriterClient::connect(format!("http://{endpoint}"))
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let mut request = Request::new(
+                to_proto_request(
+                    namespace,
+                    shard,
+                    generation,
+                    &request_id,
+                    self.config.write.durability,
+                    batches.clone(),
+                )
+                .map_err(ApiError::internal)?,
+            );
             if let Some(secret) = &self.config.auth.internal {
                 request.metadata_mut().insert(
                     "authorization",
-                    MetadataValue::try_from(format!("Bearer {}", secret.expose()?))?,
+                    MetadataValue::try_from(format!(
+                        "Bearer {}",
+                        secret.expose().map_err(ApiError::internal)?
+                    ))
+                    .map_err(ApiError::internal)?,
                 );
             }
             match client.write(request).await {
@@ -298,12 +318,12 @@ impl AppState {
                     owner = assignment
                         .owner_of(shard)
                         .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("shard owner disappeared"))?;
+                        .ok_or_else(|| ApiError::unavailable("shard owner disappeared"))?;
                 }
-                Err(status) => return Err(status.into()),
+                Err(status) => return Err(ApiError::unavailable(status.to_string())),
             }
         }
-        anyhow::bail!("remote write retries exhausted")
+        Err(ApiError::unavailable("remote write retries exhausted"))
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -312,13 +332,16 @@ impl AppState {
         for task in self.tasks.lock().await.drain(..) {
             task.await?;
         }
+        let open_shards = self.db.open_shards().await;
+        let mut draining = self.draining_shards.write().await;
+        draining.extend(open_shards);
         self.db.flush().await?;
         self.db.close().await?;
         Ok(())
     }
 
-    async fn start_visibility_task(&self) {
-        let seconds = self.config.visibility_interval_seconds;
+    async fn start_durable_flush_task(&self) {
+        let seconds = self.config.write.flush_interval_seconds;
         if seconds == 0 {
             return;
         }
@@ -335,7 +358,7 @@ impl AppState {
                         {
                             state.ready.store(false, Ordering::Release);
                             state.dirty.store(true, Ordering::Release);
-                            tracing::error!(%error, "Track visibility flush failed");
+                            tracing::error!(%error, "Track durable flush failed");
                         }
                     }
                 }
@@ -508,8 +531,44 @@ pub(crate) fn durability(value: crate::config::Durability) -> track::Durability 
 
 #[cfg(test)]
 mod tests {
+    use common::storage::config::StorageConfig;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
     use super::*;
     use crate::config::{KubernetesShardingConfig, ShardingConfig};
+
+    fn batch_on_shard(
+        namespace: &Namespace,
+        routing: &sharding::HashRangeMap,
+        shard: u32,
+    ) -> TraceBatch {
+        let options = ShardingOptions::new(2, 4).unwrap();
+        let trace = (1..=u8::MAX)
+            .map(|id| {
+                let trace_id = track::TraceId::new([id; 16]).unwrap();
+                Trace::new(
+                    trace_id,
+                    vec![ResourceSpans {
+                        scope_spans: vec![ScopeSpans {
+                            spans: vec![Span {
+                                trace_id: trace_id.as_bytes().to_vec(),
+                                span_id: vec![id; 8],
+                                name: "admitted".into(),
+                                start_time_unix_nano: 1,
+                                end_time_unix_nano: 2,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                )
+                .unwrap()
+            })
+            .find(|trace| options.route(routing, namespace, trace.trace_id).get() == shard)
+            .unwrap();
+        TraceBatch::new(vec![trace])
+    }
 
     #[test]
     fn kubernetes_assignment_uses_stable_statefulset_endpoint() {
@@ -517,7 +576,7 @@ mod tests {
             mode: ServerMode::Writer,
             sharding: ShardingConfig {
                 virtual_shards: 8,
-                io_concurrency_multiplier: 4,
+                io_concurrency_limit: 64,
                 kind: ShardingBackend::Kubernetes(KubernetesShardingConfig {
                     namespace: "observability".into(),
                     stateful_set: "track-writer".into(),
@@ -536,11 +595,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn drain_waits_for_admitted_write_guard_and_rejects_later_writes() {
+        let state = AppState::open(Config {
+            storage: StorageConfig::InMemory,
+            namespaces: vec![NamespaceConfig {
+                name: "tenant".into(),
+                auth: Default::default(),
+            }],
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::new("tenant").unwrap();
+        let routing = state.assignment.read().await.routing.clone();
+        let batch = batch_on_shard(&namespace, &routing, 1);
+        let shard = state
+            .db
+            .route(&routing, &namespace, batch.traces[0].trace_id);
+
+        // This is the admission guard held by write_local for the full write.
+        let admitted = state.draining_shards.read().await;
+        let draining = Arc::clone(&state.draining_shards);
+        let drain = tokio::spawn(async move {
+            draining.write().await.insert(shard);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain passed an admitted in-flight write"
+        );
+
+        drop(admitted);
+        drain.await.unwrap();
+        let error = state
+            .write_local(&namespace, shard, vec![batch])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("local shard is draining"));
+        state.shutdown().await.unwrap();
+    }
+
     #[cfg(feature = "kubernetes")]
     #[tokio::test]
     async fn track_lifecycle_opens_drains_flushes_and_closes_shard() {
-        use common::storage::config::StorageConfig;
-
         let db = Arc::new(
             ShardedTrack::open(
                 track::Config {

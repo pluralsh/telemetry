@@ -111,15 +111,15 @@ not bytes. Default `268435456`.
 ## `write`
 
 - `write.durability`: acknowledgement guarantee. Valid values are `applied`, `written`, and
-  `durable`; default `written`.
+  `durable`; default `applied`.
   - `applied`: accepted into the in-memory delta, but not necessarily visible to snapshot-backed
     queries.
   - `written`: moved into SlateDB mutable state and visible to a fresh snapshot, but not yet
     guaranteed across restart.
   - `durable`: flushed to the configured object store before acknowledgement.
-- `write.flush_interval_seconds`: seconds between durable flushes of active writers. Default `60`;
-  `0` disables the periodic task. This bounds persistence and split-reader visibility for
-  `applied` and `written` requests. Shutdown also flushes open writers.
+- `write.flush_interval_seconds`: seconds between durable flushes of active writers. All products
+  default to `10`; `0` disables the periodic task. This bounds persistence and split-reader
+  visibility for `applied` and `written` requests. Shutdown also flushes open writers.
 - `write.remote_concurrency`: maximum concurrent shard batches forwarded to owners. Default `16`.
 - `write.remote_retries`: retries after the initial internal gRPC attempt when ownership
   generation is stale. Default `2`.
@@ -129,7 +129,8 @@ not bytes. Default `268435456`.
 - `sharding.virtual_shards`: storage-shard count for standalone and static backends. Default `8`;
   must be greater than zero and remain identical across processes and restarts. Kubernetes derives
   the desired storage-shard count from writer StatefulSet replicas instead.
-- `sharding.io_concurrency_multiplier`: global shard I/O permits per open shard. Default `8`;
+- `sharding.io_concurrency_limit`: fixed concurrent storage I/O operations per
+  pod. Default `128`; it does not scale with the number of open shards.
   must be greater than zero. Increase it when I/O latency leaves shard operations idle.
 - `sharding.backend`: `standalone` (default), `static`, or `kubernetes`.
 

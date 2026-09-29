@@ -8,7 +8,7 @@ use prost::Message;
 use tonic_otlp::{Request, Response, Status};
 use track::{Namespace, trace_batches};
 
-use crate::{AppState, config::ServerMode};
+use crate::{AppState, config::ServerMode, http::ApiError};
 
 #[tonic::async_trait]
 impl TraceService for AppState {
@@ -69,7 +69,7 @@ impl TraceService for AppState {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.route_write(&namespace, batches, ulid::Ulid::new().to_string())
             .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
+            .map_err(ApiError::into_otlp_grpc_status)?;
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success: None,
         }))

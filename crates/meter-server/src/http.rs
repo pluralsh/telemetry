@@ -96,8 +96,20 @@ async fn otlp_http(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
+) -> Response {
+    match otlp_http_result(&state, namespace, headers, body).await {
+        Ok(response) => response,
+        Err(error) => error.into_otlp_response(),
+    }
+}
+
+async fn otlp_http_result(
+    state: &AppState,
+    namespace: String,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
-    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
+    authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
     let id = request_id(&headers, &body);
     let request = ExportMetricsServiceRequest::decode(body).map_err(ApiError::bad_request)?;
     let series = OtelConverter::new(OtelConfig::default())
@@ -548,6 +560,40 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn from_meter(error: meter::Error) -> Self {
+        match error {
+            meter::Error::InvalidInput(_) | meter::Error::Encoding(_) => Self::bad_request(error),
+            meter::Error::Backpressure => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: error.to_string(),
+            },
+            meter::Error::Storage(_) => Self::unavailable(error),
+            meter::Error::Internal(_) => Self::internal(error),
+        }
+    }
+
+    fn into_otlp_response(self) -> Response {
+        let status = self.status;
+        let encoded = GoogleRpcStatus {
+            code: grpc_code_for_http(status),
+            message: self.message,
+        }
+        .encode_to_vec();
+        let mut response = (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/x-protobuf")],
+            encoded,
+        )
+            .into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
+    }
+
     pub(crate) fn not_found(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -565,10 +611,83 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.status,
             Json(json!({"status":"error","errorType":"server","error":self.message})),
         )
-            .into_response()
+            .into_response();
+        if retry {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GoogleRpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+fn grpc_code_for_http(status: StatusCode) -> i32 {
+    match status {
+        StatusCode::BAD_REQUEST => 3,
+        StatusCode::NOT_FOUND => 5,
+        StatusCode::TOO_MANY_REQUESTS => 8,
+        StatusCode::INTERNAL_SERVER_ERROR => 13,
+        StatusCode::SERVICE_UNAVAILABLE => 14,
+        StatusCode::UNAUTHORIZED => 16,
+        _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[test]
+    fn remote_write_backpressure_is_retryable() {
+        let response = ApiError::from_meter(meter::Error::Backpressure).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn remote_write_storage_failure_is_service_unavailable() {
+        let response =
+            ApiError::from_meter(meter::Error::Storage("flusher stopped".into())).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn otlp_http_errors_use_google_rpc_status() {
+        let response = ApiError::from_meter(meter::Error::Backpressure).into_otlp_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-protobuf"
+        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status = GoogleRpcStatus::decode(body).unwrap();
+        assert_eq!(status.code, 8);
+        assert_eq!(status.message, "Backpressure: write queue is full");
     }
 }

@@ -21,8 +21,8 @@ pub type KubernetesShardingConfig = sharding::server::KubernetesShardingConfig<L
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
-    Applied,
     #[default]
+    Applied,
     Written,
     Durable,
 }
@@ -31,6 +31,11 @@ pub enum Durability {
 #[serde(default, deny_unknown_fields)]
 pub struct WriteConfig {
     pub durability: Durability,
+    /// Interval between durable storage flushes. Zero disables periodic flushes.
+    pub flush_interval_seconds: u64,
+    pub buffer_queue_capacity: usize,
+    pub buffer_flush_interval_milliseconds: u64,
+    pub buffer_size_threshold_bytes: usize,
     pub remote_concurrency: usize,
     pub remote_retries: usize,
 }
@@ -38,7 +43,11 @@ pub struct WriteConfig {
 impl Default for WriteConfig {
     fn default() -> Self {
         Self {
-            durability: Durability::Written,
+            durability: Durability::Applied,
+            flush_interval_seconds: 10,
+            buffer_queue_capacity: 10_000,
+            buffer_flush_interval_milliseconds: 10_000,
+            buffer_size_threshold_bytes: 64 * 1024 * 1024,
             remote_concurrency: 16,
             remote_retries: 2,
         }
@@ -137,9 +146,6 @@ pub struct Config {
     pub segment_duration_seconds: u64,
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
-    /// Interval between L0 flushes. A successful flush makes accepted writes
-    /// visible to readers.
-    pub visibility_interval_seconds: u64,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -158,7 +164,6 @@ impl Default for Config {
             segment_duration_seconds: core.segment_duration.as_secs(),
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
-            visibility_interval_seconds: 1,
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
@@ -192,6 +197,9 @@ impl Config {
             || self.request.max_structured_metadata_fields == 0
             || self.request.query_concurrency == 0
             || self.request.max_in_flight_query_bytes == 0
+            || self.write.buffer_queue_capacity == 0
+            || self.write.buffer_flush_interval_milliseconds == 0
+            || self.write.buffer_size_threshold_bytes == 0
             || self.write.remote_concurrency == 0
         {
             return Err(ConfigError::Validation(
@@ -238,6 +246,13 @@ impl Config {
                 max_rows: self.page.max_rows,
                 max_age: Duration::from_secs(self.page.max_age_seconds),
                 rows_per_block: self.page.rows_per_block,
+            },
+            write_buffer: common::coordinator::WriteCoordinatorConfig {
+                queue_capacity: self.write.buffer_queue_capacity,
+                flush_interval: Duration::from_millis(
+                    self.write.buffer_flush_interval_milliseconds,
+                ),
+                flush_size_threshold: self.write.buffer_size_threshold_bytes,
             },
         }
     }

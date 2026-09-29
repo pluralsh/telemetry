@@ -498,11 +498,24 @@ async fn otlp_logs(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
+) -> Response {
+    let json_request = content_type(&headers) == Some("application/json");
+    match otlp_logs_result(&state, namespace, headers, body).await {
+        Ok(response) => response,
+        Err(error) => error.into_otlp_response(json_request),
+    }
+}
+
+async fn otlp_logs_result(
+    state: &AppState,
+    namespace: String,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
-    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(&state, body.len())?;
+    authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
+    check_size(state, body.len())?;
     let body = decode_content(&headers, &body, false)?;
-    check_size(&state, body.len())?;
+    check_size(state, body.len())?;
     let json_request = content_type(&headers) == Some("application/json");
     let request: ExportLogsServiceRequest = if json_request {
         serde_json::from_slice(&body).map_err(ApiError::bad_request)?
@@ -515,7 +528,7 @@ async fn otlp_logs(
         return Err(ApiError::unsupported_media());
     };
     let batches = otlp_batches(request, state.config.request.max_structured_metadata_fields)?;
-    write_batches(&state, namespace, batches).await?;
+    write_batches(state, namespace, batches).await?;
     let response = ExportLogsServiceResponse {
         partial_success: None,
     };
@@ -1032,6 +1045,53 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn from_line(error: line::Error) -> Self {
+        match error {
+            line::Error::Invalid(_) => Self::bad_request(error),
+            line::Error::Backpressure => Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: error.to_string(),
+            },
+            line::Error::Unavailable(_) | line::Error::Storage(_) => Self::unavailable(error),
+            line::Error::Corrupt(_)
+            | line::Error::Json(_)
+            | line::Error::Compression(_)
+            | line::Error::Query(_)
+            | line::Error::Regex(_) => Self::internal(error),
+        }
+    }
+
+    fn into_otlp_response(self, json_response: bool) -> Response {
+        let code = grpc_code_for_http(self.status);
+        let status = self.status;
+        let mut response = if json_response {
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(json!({"code": code, "message": self.message})),
+            )
+                .into_response()
+        } else {
+            let encoded = GoogleRpcStatus {
+                code,
+                message: self.message,
+            }
+            .encode_to_vec();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/x-protobuf")],
+                encoded,
+            )
+                .into_response()
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
+    }
+
     fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -1056,7 +1116,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.status,
             Json(json!({
                 "status":"error",
@@ -1064,12 +1125,40 @@ impl IntoResponse for ApiError {
                 "error":self.message
             })),
         )
-            .into_response()
+            .into_response();
+        if retry {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GoogleRpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+fn grpc_code_for_http(status: StatusCode) -> i32 {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => 3,
+        StatusCode::NOT_FOUND => 5,
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => 8,
+        StatusCode::INTERNAL_SERVER_ERROR => 13,
+        StatusCode::SERVICE_UNAVAILABLE => 14,
+        StatusCode::UNAUTHORIZED => 16,
+        _ => 2,
     }
 }
 
 #[cfg(test)]
 mod parameter_tests {
+    use axum::body::to_bytes;
+
     use super::*;
 
     #[test]
@@ -1089,5 +1178,37 @@ mod parameter_tests {
         assert_eq!(parse_seconds_or_duration("1m30s").unwrap(), 90_000_000_000);
         assert!(parse_seconds_or_duration("0").unwrap() == 0);
         assert!(parse_seconds_or_duration("invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn loki_backpressure_is_retryable() {
+        let response = ApiError::from_line(line::Error::Backpressure).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn otlp_errors_use_google_rpc_status_mappings() {
+        let protobuf = ApiError::from_line(line::Error::Backpressure).into_otlp_response(false);
+        assert_eq!(protobuf.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(protobuf.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            protobuf.headers()[header::CONTENT_TYPE],
+            "application/x-protobuf"
+        );
+        let body = to_bytes(protobuf.into_body(), usize::MAX).await.unwrap();
+        let status = GoogleRpcStatus::decode(body).unwrap();
+        assert_eq!(status.code, 8);
+        assert_eq!(status.message, "write buffer is full");
+
+        let json = ApiError::unavailable("flusher stopped").into_otlp_response(true);
+        assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(json.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"code": 14, "message": "flusher stopped"})
+        );
     }
 }

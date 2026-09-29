@@ -6,7 +6,7 @@ segment, records sort first by a 12-bit routing slot derived from the canonical
 `ShardedLine` routing key.
 
 ```text
-Common key scope
+Record prefix
 ┌───────────┬─────────┬─────────────────┬──────────────────┬──────────────┬─────────────┐
 │ subsystem │ version │    namespace    │   time segment   │ routing slot │ record type │
 │ 0x03      │ 0x02    │ TerminatedBytes │ sortable i64 BE  │ u16 BE       │ u8          │
@@ -16,7 +16,8 @@ Common key scope
 `TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Routing
 slots are in `0..4096`; the unused high four bits of their `u16` encoding are
 zero. Version 2 is a hard format switch: version-1 Line databases are not read
-by this format.
+by this format. In the layouts below, `record prefix` means the complete prefix
+above through the record-type byte.
 
 | ID | Record | Purpose |
 | --- | --- | --- |
@@ -32,19 +33,19 @@ by this format.
 
 ```text
 NextStreamId (0x01)
-KEY   common scope │ routing slot
+KEY   record prefix
 VALUE stream_id: u32 BE
 
 StreamDictionary (0x02)
-KEY   common scope │ routing slot │ label fingerprint: 16 bytes
+KEY   record prefix │ label fingerprint: 16 bytes
 VALUE stream_id: u32 BE
 
 ForwardLabels (0x03)
-KEY   common scope │ routing slot │ stream_id: u32 BE
+KEY   record prefix │ stream_id: u32 BE
 VALUE 0x01 │ count: var_u32 │ (name len: var_u32 │ name │ value len: var_u32 │ value) × count
 
 LabelPostings (0x04)
-KEY   common scope │ routing slot │ label name: TerminatedBytes │ label value: raw UTF-8
+KEY   record prefix │ label name: TerminatedBytes │ label value: raw UTF-8
 VALUE RoaringBitmap<stream_id: u32>
 ```
 
@@ -57,7 +58,7 @@ half-open slot range and writes and scans are restricted to that range.
 
 ```text
 PageMetadata (0x05)
-KEY   common scope │ routing slot │ stream_id: u32 │ first timestamp: sortable i64 │ sequence: u64
+KEY   record prefix │ stream_id: u32 │ first timestamp: sortable i64 │ sequence: u64
 VALUE ┌─────────┬───────┬─────────────────────┬──────────────┬─────────────────┬──────────┬───────────────┐
       │ version │ flags │ expiry ms           │ min ts       │ max − min ts    │ rows     │ payload bytes │
       │ u8 = 1  │ u8    │ var_u64 if flags&1  │ i64 BE       │ var_u64         │ var_u32  │ var_u32       │
@@ -68,7 +69,7 @@ KEY   same page address as PageMetadata
 VALUE immutable LINE page (layout below)
 
 NextPageSequence (0x07)
-KEY   common scope │ routing slot │ stream_id: u32
+KEY   record prefix │ stream_id: u32
 VALUE next sequence: u64 BE
 ```
 
@@ -101,20 +102,20 @@ structured metadata. Blocks decompress independently.
 
 ```text
 SearchFieldStats (0x08)
-KEY   common scope │ routing slot
+KEY   record prefix
 VALUE 0x01 │ documents: var_u64 │ total tokens: var_u64
 
 SearchTermStats (0x09)
-KEY   common scope │ routing slot │ term: TerminatedBytes
+KEY   record prefix │ term: TerminatedBytes
 VALUE 0x01 │ document frequency: var_u64 │ posting blocks: var_u32
 
 SearchTermDirectory (0x0a)
-KEY   common scope │ routing slot │ term: TerminatedBytes │ directory ordinal: u32
+KEY   record prefix │ term: TerminatedBytes │ directory ordinal: u32
 VALUE 0x01 │ count: var_u32 │ entry × count
       entry: ordinal Δ │ postings │ max frequency │ min length   (var_u32 each)
 
 SearchPostingBlock (0x0b)
-KEY   common scope │ routing slot │ term: TerminatedBytes │ block ordinal: u32
+KEY   record prefix │ term: TerminatedBytes │ block ordinal: u32
 VALUE 0x01 │ count: var_u32 │ posting × count, sorted by address
       posting: stream Δ: var_u32
                stream Δ ≠ 0 → page sequence: var_u64 │ row ID: var_u32

@@ -13,7 +13,7 @@ page:
   max_rows: 128
   max_age_seconds: 1
   rows_per_block: 32
-visibility_interval_seconds: 1
+write: { flush_interval_seconds: 1 }
 cache: { query_entries: 0 }
 auth: { unauthenticated: true }
 namespaces:

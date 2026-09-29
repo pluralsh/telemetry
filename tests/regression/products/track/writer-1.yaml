@@ -17,7 +17,7 @@ page: { target_size_bytes: 16384, max_size_bytes: 1048576, max_traces: 2 }
 write: { durability: durable, remote_concurrency: 8, remote_retries: 3 }
 sharding:
   virtual_shards: 16
-  io_concurrency_multiplier: 2
+  io_concurrency_limit: 2
   backend: static
   owner_id: track-writer-1
   owners:

@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use common::coordinator::WriteCoordinatorConfig;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, StorageConfig};
 
 #[derive(Clone, Debug)]
@@ -13,6 +14,7 @@ pub struct Config {
     pub segment_duration: Duration,
     pub retention: Option<Duration>,
     pub page: PageConfig,
+    pub write_buffer: WriteCoordinatorConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +41,7 @@ impl Default for Config {
             segment_duration: Duration::from_secs(60 * 60),
             retention: None,
             page: PageConfig::default(),
+            write_buffer: WriteCoordinatorConfig::default(),
         }
     }
 }
@@ -63,6 +66,9 @@ impl Config {
         if self.page.target_size_bytes == 0
             || self.page.max_size_bytes == 0
             || self.page.max_traces == 0
+            || self.write_buffer.queue_capacity == 0
+            || self.write_buffer.flush_interval.is_zero()
+            || self.write_buffer.flush_size_threshold == 0
         {
             return Err(crate::Error::Invalid(
                 "page size and trace limits must be positive".to_owned(),

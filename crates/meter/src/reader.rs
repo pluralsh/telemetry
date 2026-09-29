@@ -796,6 +796,7 @@ mod tests {
             storage: storage_config.clone(),
             flush_interval: Duration::from_secs(60),
             retention: None,
+            write_buffer: Default::default(),
         })
         .await
         .unwrap();
@@ -928,6 +929,7 @@ mod tests {
             storage: storage_config.clone(),
             flush_interval: Duration::from_secs(60),
             retention: None,
+            write_buffer: Default::default(),
         })
         .await
         .unwrap();
@@ -951,6 +953,7 @@ mod tests {
             storage: storage_config,
             flush_interval: Duration::from_secs(60),
             retention: None,
+            write_buffer: Default::default(),
         })
         .await
         .unwrap();
@@ -1110,6 +1113,7 @@ mod tests {
             storage: storage_config.clone(),
             flush_interval: Duration::from_secs(60),
             retention: None,
+            write_buffer: Default::default(),
         })
         .await
         .unwrap();

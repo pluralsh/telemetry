@@ -130,7 +130,7 @@ impl InternalWriter for AppState {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
+            self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
         let mut series = Vec::with_capacity(request.series.len());

@@ -89,8 +89,8 @@ impl Default for ListenerConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
-    Applied,
     #[default]
+    Applied,
     Written,
     Durable,
 }
@@ -100,6 +100,9 @@ pub enum Durability {
 pub struct WriteConfig {
     pub durability: Durability,
     pub flush_interval_seconds: u64,
+    pub buffer_queue_capacity: usize,
+    pub buffer_flush_interval_milliseconds: u64,
+    pub buffer_size_threshold_bytes: usize,
     pub remote_concurrency: usize,
     pub remote_retries: usize,
 }
@@ -107,8 +110,11 @@ pub struct WriteConfig {
 impl Default for WriteConfig {
     fn default() -> Self {
         Self {
-            durability: Durability::Written,
-            flush_interval_seconds: 60,
+            durability: Durability::Applied,
+            flush_interval_seconds: 10,
+            buffer_queue_capacity: 10_000,
+            buffer_flush_interval_milliseconds: 10_000,
+            buffer_size_threshold_bytes: 64 * 1024 * 1024,
             remote_concurrency: 16,
             remote_retries: 2,
         }
@@ -198,6 +204,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.write.buffer_queue_capacity == 0
+            || self.write.buffer_flush_interval_milliseconds == 0
+            || self.write.buffer_size_threshold_bytes == 0
+            || self.write.remote_concurrency == 0
+        {
+            return Err(ConfigError::Validation(
+                "write buffer and concurrency limits must be greater than zero".to_owned(),
+            ));
+        }
         if !self.path_prefix.is_empty()
             && (!self.path_prefix.starts_with('/')
                 || self.path_prefix.len() == 1
@@ -283,7 +298,7 @@ mod tests {
     fn defaults_and_validation() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         assert_eq!(config.sharding.virtual_shards, 8);
-        assert_eq!(config.sharding.io_concurrency_multiplier, 8);
+        assert_eq!(config.sharding.io_concurrency_limit, 128);
         assert!(!config.auth.unauthenticated);
         config.validate().unwrap();
         let invalid: Config =

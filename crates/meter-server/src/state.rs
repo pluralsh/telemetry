@@ -71,7 +71,7 @@ impl AppState {
             _ => assignment_for(&config)?,
         };
         let shard_count = assignment.virtual_shards;
-        let options = ShardingOptions::new(shard_count, config.sharding.io_concurrency_multiplier)?;
+        let options = ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?;
         let meter_config = meter_config(&config);
         let writer_shards = if config.mode == ServerMode::Standalone {
             (0..shard_count).map(ShardId::new).collect::<Vec<_>>()
@@ -280,7 +280,7 @@ impl AppState {
         let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
             assignment.virtual_shards,
-            self.config.sharding.io_concurrency_multiplier,
+            self.config.sharding.io_concurrency_limit,
         )
         .map_err(ApiError::internal)?;
         let mut groups: HashMap<(Owner, ShardId), Vec<Series>> = HashMap::new();
@@ -353,7 +353,7 @@ impl AppState {
                     visibility(durability),
                 )
                 .await
-                .map_err(ApiError::internal);
+                .map_err(ApiError::from_meter);
         }
         drop(draining);
         Err(ApiError::unavailable("local shard is not open"))
@@ -543,6 +543,11 @@ pub(crate) fn meter_config(config: &Config) -> meter::Config {
         storage: config.storage.clone(),
         flush_interval: Duration::from_secs(config.write.flush_interval_seconds),
         retention: None,
+        write_buffer: common::coordinator::WriteCoordinatorConfig {
+            queue_capacity: config.write.buffer_queue_capacity,
+            flush_interval: Duration::from_millis(config.write.buffer_flush_interval_milliseconds),
+            flush_size_threshold: config.write.buffer_size_threshold_bytes,
+        },
     }
 }
 
