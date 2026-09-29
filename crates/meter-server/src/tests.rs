@@ -141,10 +141,17 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
     assert_eq!(unprefixed.status(), StatusCode::NOT_FOUND);
 
     let health = app
+        .clone()
         .oneshot(HttpRequest::get("/-/healthy").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
+
+    let metrics = app
+        .oneshot(HttpRequest::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
 }
 
 #[tokio::test]

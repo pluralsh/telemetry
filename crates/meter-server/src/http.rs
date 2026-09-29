@@ -40,7 +40,7 @@ pub fn router(state: AppState) -> Router {
                 }
             }),
         )
-        .route("/metrics", get(|| async { "# meter_server_up 1\n" }));
+        .route("/metrics", get(crate::runtime_metrics::scrape));
 
     if state.config.mode != ServerMode::Writer {
         let read_routes = Router::new()

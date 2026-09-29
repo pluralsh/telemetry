@@ -68,6 +68,7 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
 
     for (path, expected) in [
         ("/-/healthy", StatusCode::OK),
+        ("/metrics", StatusCode::OK),
         (
             "/line/read/ns/tenant/loki/api/v1/query?query=%7Bapp%3D%22test%22%7D",
             StatusCode::OK,
@@ -77,6 +78,7 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
             StatusCode::NOT_FOUND,
         ),
         ("/line/-/healthy", StatusCode::NOT_FOUND),
+        ("/line/metrics", StatusCode::NOT_FOUND),
     ] {
         let response = app
             .clone()

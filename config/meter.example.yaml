@@ -82,9 +82,10 @@ storage:
 reader_cache_capacity: 268435456
 
 cache_warmer:
-  enabled: true
+  enabled: false
   warm_range_seconds: 7200
   timeout_seconds: 30
+  concurrency: 2
   include_payloads: false
 
 write:

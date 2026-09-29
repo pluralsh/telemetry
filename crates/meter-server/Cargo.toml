@@ -36,6 +36,8 @@ http-body-util = "0.1.5"
 jsonwebtoken.workspace = true
 kube = { workspace = true, optional = true }
 meter = { path = "../meter", features = ["remote-write", "otel"] }
+metrics.workspace = true
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry-proto.workspace = true
 prost.workspace = true
 proto = { path = "../proto" }

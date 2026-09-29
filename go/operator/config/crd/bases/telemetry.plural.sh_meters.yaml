@@ -214,8 +214,13 @@ spec:
                     type: object
                   cacheWarmer:
                     properties:
+                      concurrency:
+                        default: 2
+                        format: int32
+                        minimum: 1
+                        type: integer
                       enabled:
-                        default: true
+                        default: false
                         type: boolean
                       includePayloads:
                         default: false

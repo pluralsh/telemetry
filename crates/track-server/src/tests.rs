@@ -58,9 +58,11 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
 
     for (path, expected) in [
         ("/-/healthy", StatusCode::OK),
+        ("/metrics", StatusCode::OK),
         ("/track/read/ns/tenant/api/echo", StatusCode::OK),
         ("/read/ns/tenant/api/echo", StatusCode::NOT_FOUND),
         ("/track/-/healthy", StatusCode::NOT_FOUND),
+        ("/track/metrics", StatusCode::NOT_FOUND),
     ] {
         let response = app
             .clone()

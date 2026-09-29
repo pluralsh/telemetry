@@ -18,8 +18,7 @@ use common::coordinator::{
     WriteError,
 };
 use common::discovery::{
-    CatalogBatch, DiscoveryCache, DiscoveryValue, catalog_range, names as catalog_names,
-    values as catalog_values,
+    CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
 use common::storage::{
     PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
@@ -138,6 +137,7 @@ impl LogDb {
         namespace: &Namespace,
         warm_range: Duration,
         include_payloads: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> Result<()> {
         let Some(slate) = self.storage.slate_read() else {
@@ -149,17 +149,13 @@ impl LogDb {
             .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
             .unwrap_or(i64::MAX);
         let range_ns = i64::try_from(warm_range.as_nanos()).unwrap_or(i64::MAX);
-        let partitions = self
+        let prefixes = self
             .discovery_segments(end_ns.saturating_sub(range_ns), end_ns)?
             .into_iter()
-            .map(|segment| {
-                let prefix = segment_prefix(namespace, segment);
-                let range = catalog_range(&prefix);
-                (prefix, range)
-            })
+            .map(|segment| segment_prefix(namespace, segment))
             .collect::<Vec<_>>();
         slate
-            .warm_prefixes(&partitions, include_payloads, cancel)
+            .warm_prefixes("line", &prefixes, include_payloads, concurrency, cancel)
             .await?;
         Ok(())
     }

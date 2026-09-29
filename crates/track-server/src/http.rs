@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         );
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route("/metrics", get(meter_server::runtime_metrics::scrape))
         .route("/-/ready", get(readiness));
     let app = if state.config.path_prefix.is_empty() {
         app.merge(public)

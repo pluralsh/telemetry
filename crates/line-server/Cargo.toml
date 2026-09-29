@@ -35,6 +35,7 @@ futures.workspace = true
 line = { path = "../line" }
 kube = { workspace = true, optional = true }
 meter-server = { path = "../meter-server", default-features = false }
+metrics.workspace = true
 opentelemetry-proto = { workspace = true, features = ["logs", "with-serde"] }
 prost.workspace = true
 proto = { path = "../proto" }

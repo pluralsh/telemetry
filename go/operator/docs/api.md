@@ -213,9 +213,10 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `enabled` _boolean_ |  | true |  |
+| `enabled` _boolean_ |  | false |  |
 | `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
 | `timeoutSeconds` _integer_ |  | 30 | Minimum: 1 <br /> |
+| `concurrency` _integer_ |  | 2 | Minimum: 1 <br /> |
 | `includePayloads` _boolean_ |  | false |  |
 
 

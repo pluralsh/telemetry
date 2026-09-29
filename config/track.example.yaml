@@ -53,9 +53,10 @@ request:
   max_query_limit: 1000
 
 cache_warmer:
-  enabled: true
+  enabled: false
   warm_range_seconds: 7200
   timeout_seconds: 30
+  concurrency: 2
   include_payloads: false
 
 auth:

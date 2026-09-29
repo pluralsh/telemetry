@@ -16,6 +16,8 @@ pub struct CacheWarmerConfig {
     pub warm_range_seconds: u64,
     /// Maximum time startup warming may delay readiness.
     pub timeout_seconds: u64,
+    /// Maximum number of SSTs warmed concurrently.
+    pub concurrency: usize,
     /// Whether to warm payload/sample blocks in addition to indexes and metadata.
     pub include_payloads: bool,
 }
@@ -23,9 +25,10 @@ pub struct CacheWarmerConfig {
 impl Default for CacheWarmerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             warm_range_seconds: 7_200,
             timeout_seconds: 30,
+            concurrency: 2,
             include_payloads: false,
         }
     }
@@ -297,13 +300,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_warmer_defaults_to_recent_payload_warming() {
+    fn cache_warmer_is_safe_and_opt_in_by_default() {
         assert_eq!(
             CacheWarmerConfig::default(),
             CacheWarmerConfig {
-                enabled: true,
+                enabled: false,
                 warm_range_seconds: 7_200,
                 timeout_seconds: 30,
+                concurrency: 2,
                 include_payloads: false,
             }
         );

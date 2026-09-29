@@ -51,7 +51,7 @@ use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
 use crate::serde::timeseries::TimeSeriesValue;
-use crate::serde::{TimeBucketScoped, bucket_slot_metadata_range, bucket_slots_range};
+use crate::serde::{TimeBucketScoped, bucket_slots_range};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};
 
@@ -318,6 +318,7 @@ pub(crate) trait WarmStorage: StorageRead {
         namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> StorageResult<()>;
 }
@@ -333,10 +334,11 @@ where
         namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
         self.reader()
-            .warm(namespace, buckets, include_samples, cancel)
+            .warm(namespace, buckets, include_samples, concurrency, cancel)
             .await
     }
 }
@@ -779,23 +781,17 @@ impl<T> StorageReaderInner<T>
 where
     T: DbReadOps + DbMetadataOps + DbCacheManagerOps + Send + Sync,
 {
-    /// Number of SSTs warmed concurrently. Each `warm_sst` issues object-store
-    /// reads for the SST's filters, index, and data blocks, so this bounds the
-    /// in-flight fetch fan-out.
-    const WARM_CONCURRENCY: usize = 32;
-
     /// Warms the block cache for the SSTs backing `buckets`.
     ///
     /// Each timeseries bucket is its own SlateDB segment (RFC-0024). This
     /// resolves the requested buckets to the SSTs currently live in the
     /// manifest and warms, for each, the SST filters and index plus the data
-    /// blocks of the bucket's index record types (series dictionary, forward
-    /// index, inverted index). When `include_samples` is set the sample data
-    /// blocks are warmed too; otherwise they are skipped — the common case
-    /// where only the metadata needed to plan queries is wanted in cache.
+    /// blocks of the bucket when `include_samples` is set. Metadata-only
+    /// warming deliberately stays in SlateDB's metadata cache so application
+    /// index records cannot evict sample payloads from the data cache.
     ///
-    /// SSTs are warmed concurrently (see [`Self::WARM_CONCURRENCY`]). Warming
-    /// is a no-op for buckets with no live segment, and SlateDB itself treats
+    /// SSTs are warmed up to the caller-provided concurrency. Warming is a
+    /// no-op for buckets with no live segment, and SlateDB itself treats
     /// `warm_sst` as a no-op when no block cache is configured.
     ///
     /// If `cancel` fires the warm stops promptly, dropping (and thereby
@@ -808,6 +804,7 @@ where
         namespace: &Namespace,
         buckets: Vec<TimeBucket>,
         include_samples: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
         let wanted: HashSet<TimeBucket> = buckets.into_iter().collect();
@@ -849,8 +846,22 @@ where
             .collect();
 
         futures::stream::iter(work)
-            .map(|(sst_id, targets)| async move { self.db.warm_sst(sst_id, &targets).await })
-            .buffer_unordered(Self::WARM_CONCURRENCY)
+            .map(|(sst_id, targets)| async move {
+                let result = self.db.warm_sst(sst_id, &targets).await;
+                metrics::counter!(
+                    "telemetry_cache_warmer_ssts_total",
+                    "product" => "meter",
+                    "status" => if result.is_ok() { "success" } else { "error" },
+                    "payloads" => if include_samples {
+                        "included"
+                    } else {
+                        "excluded"
+                    }
+                )
+                .increment(1);
+                result
+            })
+            .buffer_unordered(concurrency.max(1))
             .take_until(cancel.cancelled())
             .try_collect::<Vec<()>>()
             .await
@@ -860,21 +871,16 @@ where
 }
 
 /// Builds the [`CacheTarget`]s for warming one bucket's SSTs: the SST filters
-/// and index, the data blocks of the index record types (series dictionary,
-/// forward index, inverted index), and — only when `include_samples` — the
-/// sample data blocks. Each `Data` range is scoped to `bucket`, so these
-/// targets apply only to that bucket's segment.
+/// and index, and — only when `include_samples` — the bucket's data blocks.
+/// Metadata-only warming therefore uses the dedicated metadata cache and
+/// cannot displace sample payloads from the data cache.
 fn bucket_cache_targets(
     namespace: &Namespace,
     bucket: &TimeBucket,
     owned_slots: Range<u16>,
     include_samples: bool,
 ) -> Vec<CacheTarget> {
-    let mut targets = Vec::with_capacity(if include_samples {
-        3
-    } else {
-        2 + usize::from(owned_slots.end - owned_slots.start)
-    });
+    let mut targets = Vec::with_capacity(if include_samples { 3 } else { 2 });
     targets.push(CacheTarget::Filters);
     targets.push(CacheTarget::Index);
     if include_samples {
@@ -883,14 +889,6 @@ fn bucket_cache_targets(
             bucket,
             owned_slots,
         )));
-    } else {
-        for routing_slot in owned_slots {
-            targets.push(CacheTarget::data::<Bytes, _>(bucket_slot_metadata_range(
-                namespace,
-                bucket,
-                routing_slot,
-            )));
-        }
     }
     targets
 }
@@ -1408,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_warm_targets_consolidate_metadata_per_slot() {
+    fn metadata_only_cache_warm_targets_avoid_data_cache() {
         let namespace = Namespace::new("tenant").unwrap();
         let bucket = TimeBucket {
             start: 12345,
@@ -1416,7 +1414,7 @@ mod tests {
         };
         assert_eq!(
             bucket_cache_targets(&namespace, &bucket, 10..14, false).len(),
-            6
+            2
         );
         assert_eq!(
             bucket_cache_targets(&namespace, &bucket, 10..14, true).len(),
@@ -1772,15 +1770,15 @@ mod tests {
         // config has no block cache.
         let cancel = CancellationToken::new();
         storage
-            .warm(&namespace, buckets.clone(), true, &cancel)
+            .warm(&namespace, buckets.clone(), true, 2, &cancel)
             .await
             .unwrap();
         storage
-            .warm(&namespace, buckets, false, &cancel)
+            .warm(&namespace, buckets, false, 2, &cancel)
             .await
             .unwrap();
         storage
-            .warm(&namespace, vec![], true, &cancel)
+            .warm(&namespace, vec![], true, 2, &cancel)
             .await
             .unwrap();
         storage
@@ -1791,6 +1789,7 @@ mod tests {
                     size: 1,
                 }],
                 false,
+                2,
                 &cancel,
             )
             .await
@@ -1805,7 +1804,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .warm(&namespace, buckets, true, &cancelled)
+            .warm(&namespace, buckets, true, 2, &cancelled)
             .await
             .unwrap();
 

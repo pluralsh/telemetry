@@ -19,6 +19,7 @@ const (
 	testCacheWarmerConfig   = "cache_warmer:"
 	testWarmRangeConfig     = "warm_range_seconds: 7200"
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
+	testWarmConcurrency     = "concurrency: 2"
 	testWarmPayloadsConfig  = "include_payloads: false"
 )
 
@@ -48,7 +49,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", testFlushIntervalConfig,
-		testCacheWarmerConfig, testWarmRangeConfig, testWarmTimeoutConfig, testWarmPayloadsConfig,
+		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		"virtual_shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
@@ -162,6 +163,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		testCacheWarmerConfig,
 		testWarmRangeConfig,
 		testWarmTimeoutConfig,
+		testWarmConcurrency,
 		testWarmPayloadsConfig,
 		"name: tenant-a",
 		"path: /etc/track/secrets/namespace-track-auth-password",
@@ -234,7 +236,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
 		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
 		"segment_duration_seconds: 3600", testFlushIntervalConfig,
-		testCacheWarmerConfig, testWarmRangeConfig, testWarmTimeoutConfig, testWarmPayloadsConfig,
+		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
 		"path: /var/run/secrets/line/internal-token", "name: tenant-a", "path_prefix: /logs",
 	} {
@@ -293,13 +295,15 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 }
 
 func TestRenderCacheWarmerOverrides(t *testing.T) {
-	enabled, includePayloads := false, true
+	enabled, includePayloads := true, true
 	warmRangeSeconds := int64(3600)
 	timeoutSeconds := int64(15)
+	concurrency := int32(4)
 	cacheWarmer := &telemetryv1alpha1.CacheWarmerSpec{
 		Enabled:          &enabled,
 		WarmRangeSeconds: &warmRangeSeconds,
 		TimeoutSeconds:   &timeoutSeconds,
+		Concurrency:      &concurrency,
 		IncludePayloads:  &includePayloads,
 	}
 	products := []struct {
@@ -344,9 +348,10 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 			rendered := string(result.Data[product.key])
 			for _, expected := range []string{
 				testCacheWarmerConfig,
-				"enabled: false",
+				"enabled: true",
 				"warm_range_seconds: 3600",
 				"timeout_seconds: 15",
+				"concurrency: 4",
 				"include_payloads: true",
 			} {
 				if !strings.Contains(rendered, expected) {

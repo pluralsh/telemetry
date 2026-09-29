@@ -110,8 +110,6 @@ pub struct SlateReadHandle {
 }
 
 impl SlateReadHandle {
-    const WARM_CONCURRENCY: usize = 16;
-
     /// Counts physical write operations in `range` by walking the live
     /// manifest's persisted SSTs. See [`sst_blocks::count_in_range`].
     pub async fn count_in_range(
@@ -128,16 +126,19 @@ impl SlateReadHandle {
         self.source.manifest()
     }
 
-    /// Warms cache blocks for live SlateDB segments matching `partitions`.
+    /// Warms cache blocks for live SlateDB segments matching `prefixes`.
     ///
-    /// Filters, SST indexes, and each partition's selective catalog range are
-    /// always warmed. When `include_data` is true, every data block in the
-    /// matching segment keyspace is warmed as well. Backends without a
-    /// configured cache treat warming as a no-op.
+    /// Filters and SST indexes are always warmed into SlateDB's metadata cache.
+    /// When `include_data` is true, every data block in the matching segment
+    /// keyspace is also warmed. Metadata-only warming intentionally avoids
+    /// catalog data blocks so it cannot displace payloads from the data cache.
+    /// Backends without a configured cache treat warming as a no-op.
     pub async fn warm_prefixes(
         &self,
-        partitions: &[(Bytes, BytesRange)],
+        product: &'static str,
+        prefixes: &[Bytes],
         include_data: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
         let manifest = self.source.manifest();
@@ -145,14 +146,10 @@ impl SlateReadHandle {
             .segments()
             .iter()
             .filter_map(|segment| {
-                let (prefix, catalog_range) = partitions
+                let prefix = prefixes
                     .iter()
-                    .find(|(prefix, _)| segment.prefix() == prefix.as_ref())?;
-                let mut targets = vec![
-                    CacheTarget::Filters,
-                    CacheTarget::Index,
-                    CacheTarget::data::<Bytes, _>(catalog_range.clone()),
-                ];
+                    .find(|prefix| segment.prefix() == prefix.as_ref())?;
+                let mut targets = vec![CacheTarget::Filters, CacheTarget::Index];
                 if include_data {
                     targets.push(CacheTarget::data::<Bytes, _>(BytesRange::prefix(
                         prefix.clone(),
@@ -179,12 +176,20 @@ impl SlateReadHandle {
 
         futures::stream::iter(work)
             .map(|(id, targets)| async move {
-                match &self.source {
+                let result = match &self.source {
                     ManifestSource::Db(db) => db.warm_sst(id, &targets).await,
                     ManifestSource::Reader(reader) => reader.warm_sst(id, &targets).await,
-                }
+                };
+                metrics::counter!(
+                    "telemetry_cache_warmer_ssts_total",
+                    "product" => product,
+                    "status" => if result.is_ok() { "success" } else { "error" },
+                    "payloads" => if include_data { "included" } else { "excluded" }
+                )
+                .increment(1);
+                result
             })
-            .buffer_unordered(Self::WARM_CONCURRENCY)
+            .buffer_unordered(concurrency.max(1))
             .take_until(cancel.cancelled())
             .try_collect::<Vec<()>>()
             .await

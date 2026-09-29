@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{StreamExt, stream};
@@ -201,24 +201,52 @@ impl AppState {
             .collect::<Vec<_>>();
         let warm_range = Duration::from_secs(self.config.cache_warmer.warm_range_seconds);
         let warm_timeout = Duration::from_secs(self.config.cache_warmer.timeout_seconds);
+        let concurrency = self.config.cache_warmer.concurrency;
         let include_payloads = self.config.cache_warmer.include_payloads;
         let database = Arc::clone(&self.db);
         let cancellation = self.cancellation.clone();
         let cache_warmed = Arc::clone(&self.cache_warmed);
         let task = tokio::spawn(async move {
-            match tokio::time::timeout(
+            let started = Instant::now();
+            metrics::gauge!("telemetry_cache_warmer_active", "product" => "line").set(1.0);
+            let status = match tokio::time::timeout(
                 warm_timeout,
-                database.warm_recent(&namespaces, warm_range, include_payloads, &cancellation),
+                database.warm_recent(
+                    &namespaces,
+                    warm_range,
+                    include_payloads,
+                    concurrency,
+                    &cancellation,
+                ),
             )
             .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "line cache warming failed"),
-                Err(_) => tracing::warn!(
-                    timeout_seconds = warm_timeout.as_secs(),
-                    "line cache warming timed out"
-                ),
-            }
+                Ok(Ok(())) => "success",
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "line cache warming failed");
+                    "error"
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_seconds = warm_timeout.as_secs(),
+                        "line cache warming timed out"
+                    );
+                    "timeout"
+                }
+            };
+            metrics::gauge!("telemetry_cache_warmer_active", "product" => "line").set(0.0);
+            metrics::counter!(
+                "telemetry_cache_warmer_runs_total",
+                "product" => "line",
+                "status" => status
+            )
+            .increment(1);
+            metrics::histogram!(
+                "telemetry_cache_warmer_duration_seconds",
+                "product" => "line",
+                "status" => status
+            )
+            .record(started.elapsed().as_secs_f64());
             cache_warmed.store(true, Ordering::Release);
         });
         self.tasks.lock().await.push(task);

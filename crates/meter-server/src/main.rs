@@ -17,6 +17,8 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     meter_server::install_rustls_crypto_provider()?;
     tracing_subscriber::fmt::init();
+    meter_server::runtime_metrics::install_recorder()?;
+    metrics::gauge!("telemetry_server_up", "product" => "meter").set(1.0);
     let args = Args::parse();
     let config = Config::from_path(args.config)?;
     let http_addr = config.listeners.http;

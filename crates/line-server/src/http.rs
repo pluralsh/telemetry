@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs));
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route("/metrics", get(meter_server::runtime_metrics::scrape))
         .route(
             "/-/ready",
             get(|State(state): State<AppState>| async move {

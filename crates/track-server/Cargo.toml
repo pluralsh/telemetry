@@ -32,6 +32,7 @@ common = { path = "../common" }
 futures.workspace = true
 kube = { workspace = true, optional = true }
 meter-server = { path = "../meter-server", default-features = false }
+metrics.workspace = true
 opentelemetry-proto = { workspace = true, features = ["trace", "with-serde", "gen-tonic"] }
 prost.workspace = true
 prost-types = "0.13"

@@ -98,8 +98,19 @@ impl ShardedTrack {
         namespaces: &[Namespace],
         warm_range: Duration,
         include_payloads: bool,
+        concurrency: usize,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        let concurrency = concurrency
+            .max(1)
+            .min(self.options.io_concurrency_limit() as usize);
+        let permit_count = u32::try_from(concurrency).unwrap_or(u32::MAX);
+        let _warm_permits = tokio::select! {
+            permits = self.io_permits.clone().acquire_many_owned(permit_count) => {
+                permits.expect("shard I/O semaphore must remain open")
+            }
+            () = cancel.cancelled() => return Ok(()),
+        };
         let databases = self
             .shards
             .read()
@@ -113,7 +124,7 @@ impl ShardedTrack {
                     return Ok(());
                 }
                 database
-                    .warm_recent(namespace, warm_range, include_payloads, cancel)
+                    .warm_recent(namespace, warm_range, include_payloads, concurrency, cancel)
                     .await?;
             }
         }

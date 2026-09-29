@@ -4,6 +4,7 @@ pub mod openapi;
 
 mod http;
 mod internal_writer;
+pub mod runtime_metrics;
 mod state;
 
 pub use http::router;

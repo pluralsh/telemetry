@@ -220,6 +220,11 @@ impl Config {
                 "cache_warmer.timeout_seconds must be greater than zero when enabled".into(),
             ));
         }
+        if self.cache_warmer.enabled && self.cache_warmer.concurrency == 0 {
+            return Err(ConfigError::Validation(
+                "cache_warmer.concurrency must be greater than zero when enabled".into(),
+            ));
+        }
         if self.namespaces.is_empty() {
             return Err(ConfigError::Validation(
                 "at least one namespace is required".into(),

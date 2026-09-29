@@ -266,6 +266,11 @@ func (in *CacheWarmerSpec) DeepCopyInto(out *CacheWarmerSpec) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.Concurrency != nil {
+		in, out := &in.Concurrency, &out.Concurrency
+		*out = new(int32)
+		**out = **in
+	}
 	if in.IncludePayloads != nil {
 		in, out := &in.IncludePayloads, &out.IncludePayloads
 		*out = new(bool)

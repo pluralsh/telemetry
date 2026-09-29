@@ -55,6 +55,9 @@ Read APIs are under `{path_prefix}/read/ns/{namespace}` and write APIs are under
 `/federate`. Write routes are `/api/v1/write` (Prometheus remote write) and `/v1/metrics`
 (OTLP/HTTP protobuf).
 `/-/healthy`, `/-/ready`, and `/metrics` are not namespace-prefixed.
+Every Meter, Line, and Track process exposes its internal `metrics` crate recorder at `GET /metrics`
+using the Prometheus text exposition format. Scrape the product's HTTP service and port directly;
+the endpoint includes cache-warmer, SlateDB, query, ingestion, and process-role metrics.
 
 ## `storage`
 
@@ -112,19 +115,22 @@ not bytes. Default `268435456`.
 
 ## `cache_warmer`
 
-The startup cache warmer applies to Meter, Line, and Track readers and standalone servers. It runs
-in the background while health checks remain available; readiness remains false until warming
-finishes. Writer-only processes skip warming. Errors are logged and do not permanently block
-readiness. Line and Track always warm their compact discovery-catalog blocks; payload warming is
-separately controlled.
+The opt-in startup cache warmer applies to Meter, Line, and Track readers and standalone servers.
+It runs in the background while health checks remain available; readiness remains false until
+warming finishes. Writer-only processes skip warming. Errors are logged and do not permanently
+block readiness. Warming consumes permits from the same pod-wide storage I/O budget as queries.
+Metadata-only warming is restricted to SlateDB filters and SST indexes, which use the dedicated
+metadata cache and cannot evict payload blocks from the data cache.
 
-- `cache_warmer.enabled`: enables startup warming. Default `true`.
+- `cache_warmer.enabled`: enables startup warming. Default `false`.
 - `cache_warmer.warm_range_seconds`: recent time range to warm. Default `7200`; must be greater
   than zero when warming is enabled.
 - `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false. Default `30`;
   timeout is fail-open.
+- `cache_warmer.concurrency`: maximum concurrent SST warm operations and number of permits reserved
+  from the pod-wide storage I/O budget. Default `2`; must be greater than zero when warming is enabled.
 - `cache_warmer.include_payloads`: also warms metric samples, log pages, and trace pages. When
-  false, structural indexes and product discovery catalogs are still warmed. Default `false`.
+  false, only SlateDB filters and SST indexes are warmed. Default `false`.
 
 ## `write`
 

@@ -164,7 +164,7 @@ type CacheSpec struct {
 }
 
 type CacheWarmerSpec struct {
-	// +kubebuilder:default=true
+	// +kubebuilder:default=false
 	Enabled *bool `json:"enabled,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=7200
@@ -172,6 +172,9 @@ type CacheWarmerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=30
 	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=2
+	Concurrency *int32 `json:"concurrency,omitempty"`
 	// +kubebuilder:default=false
 	IncludePayloads *bool `json:"includePayloads,omitempty"`
 }
