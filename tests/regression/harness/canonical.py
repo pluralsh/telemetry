@@ -20,11 +20,22 @@ def _labels(value: dict[str, Any]) -> dict[str, str]:
     return {key: str(value[key]) for key in sorted(value)}
 
 
+def _metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _metadata(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        items = [_metadata(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
 def canonicalize(response: dict[str, Any]) -> dict[str, Any]:
     """Remove implementation metadata and deterministically order Loki results."""
     if response.get("status") != "success":
         return response
     data = response["data"]
+    if isinstance(data, list):
+        return {"status": "success", "data": _metadata(data)}
     kind = data["resultType"]
     result = data["result"]
     if kind == "streams":

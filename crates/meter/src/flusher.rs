@@ -334,6 +334,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_flush_discovery_catalog_with_metric_metadata() {
+        let storage = create_test_storage().await;
+        let mut flusher = TsdbFlusher {
+            storage: storage.clone(),
+            retention: None,
+            active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+        };
+        let ctx = TsdbContext {
+            namespace: crate::Namespace::default(),
+            bucket: create_test_bucket(),
+            routing_slot: 0,
+            series_dict: Arc::new(HashMap::new()),
+            next_series_id: 0,
+            active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+        };
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let mut series =
+            create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
+        series.description = Some("HTTP requests".to_owned());
+        series.unit = Some("requests".to_owned());
+        delta.apply(vec![series]).unwrap();
+        let (frozen, _, _) = delta.freeze();
+
+        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        let namespace = crate::Namespace::default();
+        let buckets = [create_test_bucket()];
+        let cache = crate::discovery::MeterDiscoveryCache::new();
+
+        assert_eq!(
+            crate::discovery::names(snapshot.clone(), &namespace, &buckets, &cache)
+                .await
+                .unwrap(),
+            vec!["__name__", "env"]
+        );
+        assert_eq!(
+            crate::discovery::values(snapshot.clone(), &namespace, &buckets, "env", &cache)
+                .await
+                .unwrap(),
+            vec!["prod"]
+        );
+        let metadata = crate::discovery::metadata(
+            snapshot,
+            &namespace,
+            &buckets,
+            Some("http_requests"),
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].description.as_deref(), Some("HTTP requests"));
+        assert_eq!(metadata[0].unit.as_deref(), Some("requests"));
+    }
+
+    #[tokio::test]
     async fn should_skip_empty_delta() {
         // given
         let storage = create_test_storage().await;

@@ -498,6 +498,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_catalog_survives_flush_and_reopen() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage = SlateDbStorageConfig {
+            path: "discovery-data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        };
+        let namespace = Namespace::new("durable-discovery").unwrap();
+        let timestamp = 1_700_000_000_000;
+
+        {
+            let db = TimeSeriesDb::open(Config {
+                storage: storage.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let mut series = Series::new(
+                "requests_total",
+                vec![Label::new("region", "west")],
+                vec![Sample::new(timestamp, 1.0)],
+            );
+            series.metric_type = Some(crate::MetricType::Gauge);
+            series.description = Some("Durable requests".to_owned());
+            series.unit = Some("requests".to_owned());
+            db.write_with_visibility(&namespace, vec![series], Visibility::Durable)
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let reopened = TimeSeriesDb::open(Config {
+            storage,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let range = SystemTime::UNIX_EPOCH
+            ..=SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp as u64 + 1);
+        assert_eq!(
+            reopened
+                .labels(&namespace, None, range.clone())
+                .await
+                .unwrap(),
+            vec!["__name__", "region"]
+        );
+        assert_eq!(
+            reopened
+                .label_values(&namespace, "region", None, range)
+                .await
+                .unwrap(),
+            vec!["west"]
+        );
+        let metadata = reopened
+            .metadata(&namespace, Some("requests_total"))
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].description.as_deref(), Some("Durable requests"));
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shared_storage_isolates_namespace_ingest_and_metadata_state() {
         let db = TimeSeriesDb::open(Config {
             storage: SlateDbStorageConfig {

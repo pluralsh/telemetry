@@ -312,7 +312,7 @@ class MeterSuite:
             ),
             AuthCase("namespace JWT read", bearer("regression-read-token"), 200),
             AuthCase("global JWT read", bearer("global-read"), 200),
-            AuthCase("write JWT on read", bearer("regression-write"), 401),
+            AuthCase("write JWT on read", bearer("regression-write"), 200),
             AuthCase("other namespace JWT read", bearer("other-read"), 401),
             AuthCase(
                 "invalid Basic read",

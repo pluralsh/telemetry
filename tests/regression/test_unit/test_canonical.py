@@ -30,6 +30,23 @@ def test_streams_and_labels_are_sorted_and_metadata_is_dropped() -> None:
     }
 
 
+def test_metadata_results_are_sorted_recursively() -> None:
+    response = {
+        "status": "success",
+        "data": [
+            {"z": "last", "a": "first"},
+            {"service": "api", "labels": ["zone", "app"]},
+        ],
+    }
+    assert canonicalize(response) == {
+        "status": "success",
+        "data": [
+            {"a": "first", "z": "last"},
+            {"labels": ["app", "zone"], "service": "api"},
+        ],
+    }
+
+
 @pytest.mark.parametrize("kind", ["vector", "matrix", "scalar"])
 def test_metric_numbers_are_normalized(kind: str) -> None:
     results = {

@@ -393,6 +393,35 @@ async fn metadata_filters_and_federate_renders_complete_labels() {
         metadata_json["data"]["federated_metric"][0]["type"],
         "gauge"
     );
+    let labels = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/read/ns/alpha/api/v1/labels")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(labels.status(), StatusCode::OK);
+    let labels_body = labels.into_body().collect().await.unwrap().to_bytes();
+    let labels_json: serde_json::Value = serde_json::from_slice(&labels_body).unwrap();
+    assert_eq!(
+        labels_json["data"],
+        serde_json::json!(["__name__", "instance", "region"])
+    );
+    let values = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/read/ns/alpha/api/v1/label/region/values")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(values.status(), StatusCode::OK);
+    let values_body = values.into_body().collect().await.unwrap().to_bytes();
+    let values_json: serde_json::Value = serde_json::from_slice(&values_body).unwrap();
+    assert_eq!(values_json["data"], serde_json::json!(["us\\east"]));
     let isolated = app
         .clone()
         .oneshot(
@@ -459,6 +488,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     );
     item.metric_type = Some(meter::MetricType::Gauge);
     item.unit = Some("items".to_owned());
+    item.description = Some("Durably visible metric".to_owned());
     state
         .route_write(
             "alpha",
@@ -513,6 +543,10 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     .unwrap();
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata[0].unit.as_deref(), Some("items"));
+    assert_eq!(
+        metadata[0].description.as_deref(),
+        Some("Durably visible metric")
+    );
     reader.close().await.unwrap();
     state.shutdown().await.unwrap();
 }
