@@ -30,7 +30,7 @@ func TestStorageExpansionPatchesPVCAndOrphanDeletesStatefulSet(t *testing.T) {
 		}
 	}
 	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: storageTestNamespace, UID: types.UID("meter")},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: storageTestNamespace, UID: types.UID("meter")},
 		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{
 			DataVolume: persistentVolume("20Gi", nil),
 		}},
@@ -70,7 +70,7 @@ func TestStorageErrorsMapToMeterStatusErrors(t *testing.T) {
 		}
 	}
 	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: storageTestNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: storageTestNamespace},
 		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{
 			DataVolume: &telemetryv1alpha1.VolumeSpec{PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{}},
 		}},

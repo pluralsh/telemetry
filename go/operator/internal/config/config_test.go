@@ -10,9 +10,11 @@ import (
 )
 
 const (
-	testMeterName      = "example"
-	testMeterNamespace = "test"
-	testBucket         = "meter"
+	testMeterName           = "example"
+	testMeterNamespace      = "test"
+	testBucket              = "meter"
+	testTenantNamespace     = "tenant-a"
+	testFlushIntervalConfig = "flush_interval_seconds: 10"
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
@@ -27,7 +29,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 		Meter:  meter,
 		Global: Access{Read: []Credential{{Username: "reader", Password: []byte("s3cret")}}},
 		Namespaces: []NamespaceAccess{{
-			Name: "tenant-a", KeyPrefix: "tenant-auth",
+			Name: testTenantNamespace, KeyPrefix: "tenant-auth",
 			Access: Access{Write: []Credential{{Username: "writer", Password: []byte("tenant-secret"), DataKey: "namespace-tenant-auth-password"}}},
 		}},
 		InternalTokenPath: "/var/run/secrets/meter/internal-token",
@@ -40,7 +42,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MeterKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 268435456", "flush_interval_seconds: 10",
+		"reader_cache_capacity: 268435456", testFlushIntervalConfig,
 		"virtual_shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
@@ -129,7 +131,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 	result, err := Render(Input{
 		Track: track, InternalToken: []byte("token"),
 		Namespaces: []NamespaceAccess{{
-			Name: "tenant-a",
+			Name: testTenantNamespace,
 			Access: Access{Read: []Credential{{
 				Username: "tempo", Password: []byte("tenant-secret"), DataKey: "namespace-track-auth-password",
 			}}},
@@ -149,7 +151,7 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"database: traces",
 		"stateful_set: traces-writer",
 		"headless_service: traces-writer-headless",
-		"flush_interval_seconds: 10",
+		testFlushIntervalConfig,
 		"max_candidates: 10000",
 		"name: tenant-a",
 		"path: /etc/track/secrets/namespace-track-auth-password",
@@ -198,7 +200,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testMeterNamespace},
 		Spec: telemetryv1alpha1.LineSpec{
 			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/logs"},
-			Config:  telemetryv1alpha1.LineConfigSpec{Namespaces: []string{"tenant-a"}},
+			Config:  telemetryv1alpha1.LineConfigSpec{Namespaces: []string{testTenantNamespace}},
 		},
 	}
 	result, err := Render(Input{Line: line, InternalToken: []byte("token")})
@@ -209,7 +211,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
 		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
-		"segment_duration_seconds: 3600", "flush_interval_seconds: 10",
+		"segment_duration_seconds: 3600", testFlushIntervalConfig,
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
 		"path: /var/run/secrets/line/internal-token", "name: tenant-a", "path_prefix: /logs",
 	} {

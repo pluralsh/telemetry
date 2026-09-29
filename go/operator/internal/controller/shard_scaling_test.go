@@ -63,14 +63,14 @@ func TestMissingShardMapScaleUpAndDownscaleConservatism(t *testing.T) {
 		t.Fatal(err)
 	}
 	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.MeterSpec{
 			Mode:   telemetryv1alpha1.ProductModeSharded,
 			Writer: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(5))},
 		},
 	}
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "example-writer", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: testMeterName + "-writer", Namespace: testNamespace},
 		Spec:       appsv1.StatefulSetSpec{Replicas: lo.ToPtr(int32(3))},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(meter, sts).Build()

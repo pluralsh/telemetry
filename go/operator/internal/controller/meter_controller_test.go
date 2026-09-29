@@ -41,6 +41,7 @@ import (
 
 const (
 	testNamespace                = "default"
+	testMeterName                = "example"
 	testPasswordKey              = "password"
 	testTenantNamespace          = "tenant-a"
 	testServiceAccountAnnotation = "eks.amazonaws.com/role-arn"
