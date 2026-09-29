@@ -112,8 +112,8 @@ var _ = Describe("Line Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, ingress)).To(Succeed())
 			created = append(created, ingress)
 			Expect(ingress.Spec.Rules[0].HTTP.Paths).To(ContainElements(
-				HaveField("Path", "/write/ns"),
-				HaveField("Path", "/read/ns"),
+				HaveField("Path", "/write"),
+				HaveField("Path", "/read"),
 			))
 
 			components := []string{name}
