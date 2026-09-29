@@ -41,6 +41,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - networking.k8s.io
   resources:
   - ingresses
@@ -108,6 +120,9 @@ rules:
   resources:
   - shardmaps
   verbs:
+  - create
   - get
   - list
+  - patch
+  - update
   - watch
