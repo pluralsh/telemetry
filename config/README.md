@@ -110,6 +110,19 @@ Cache variants are:
 readers. The current implementation does not install a weight function, so the unit is entries,
 not bytes. Default `268435456`.
 
+## `cache_warmer`
+
+The startup cache warmer applies to Meter, Line, and Track readers and standalone servers. It runs
+in the background while health checks remain available; readiness remains false until warming
+finishes. Writer-only processes skip warming. Errors are logged and do not permanently block
+readiness.
+
+- `cache_warmer.enabled`: enables startup warming. Default `true`.
+- `cache_warmer.warm_range_seconds`: recent time range to warm. Default `7200`; must be greater
+  than zero when warming is enabled.
+- `cache_warmer.include_payloads`: warms SST data blocks in addition to metadata, filters, and
+  indexes. Default `true`.
+
 ## `write`
 
 - `write.durability`: acknowledgement guarantee. Valid values are `applied`, `written`, and

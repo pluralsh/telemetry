@@ -28,6 +28,7 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use slatedb::config::DbReaderOptions;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
     LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices,
@@ -93,6 +94,36 @@ pub struct TraceDb {
 impl TraceDb {
     pub async fn open(config: Config) -> Result<Self> {
         Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
+    }
+
+    /// Warms SlateDB caches for recent trace segments in this shard.
+    pub async fn warm_recent(
+        &self,
+        namespace: &Namespace,
+        warm_range: Duration,
+        include_payloads: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let Some(slate) = self.storage.slate_read() else {
+            return Ok(());
+        };
+        let end_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(u64::MAX);
+        let range_ns = u64::try_from(warm_range.as_nanos()).unwrap_or(u64::MAX);
+        let mut prefixes = self
+            .catalog_segments(namespace, end_ns.saturating_sub(range_ns), end_ns)
+            .await?
+            .into_iter()
+            .map(|segment| segment_prefix(namespace, segment))
+            .collect::<Vec<_>>();
+        prefixes.push(segment_prefix(namespace, LOCATOR_SEGMENT));
+        slate
+            .warm_prefixes(&prefixes, include_payloads, cancel)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {

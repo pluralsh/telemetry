@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration};
 
-use common::storage::config::StorageConfig;
+use common::{CacheWarmerConfig, storage::config::StorageConfig};
 pub use meter_server::config::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
 use serde::{Deserialize, Serialize};
 
@@ -152,6 +152,7 @@ pub struct Config {
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
     pub cache: CacheConfig,
+    pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub namespaces: Vec<NamespaceConfig>,
 }
@@ -171,6 +172,7 @@ impl Default for Config {
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
             cache: CacheConfig::default(),
+            cache_warmer: CacheWarmerConfig::default(),
             auth: AuthConfig::default(),
             namespaces: vec![NamespaceConfig {
                 name: "default".to_owned(),
@@ -216,6 +218,11 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
+            ));
+        }
+        if self.cache_warmer.enabled && self.cache_warmer.warm_range_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "cache_warmer.warm_range_seconds must be greater than zero when enabled".to_owned(),
             ));
         }
         if self.namespaces.is_empty() {

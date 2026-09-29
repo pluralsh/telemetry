@@ -95,6 +95,10 @@ impl TimeSeriesDb {
         Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
     }
 
+    pub(crate) fn storage_read(&self) -> Storage {
+        (*self.storage).clone()
+    }
+
     pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
         let storage = Arc::new(
             Storage::try_new_with_object_store_and_slots(

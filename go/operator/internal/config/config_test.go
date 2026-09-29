@@ -15,6 +15,9 @@ const (
 	testBucket              = "meter"
 	testTenantNamespace     = "tenant-a"
 	testFlushIntervalConfig = "flush_interval_seconds: 10"
+	testCacheWarmerConfig   = "cache_warmer:"
+	testWarmRangeConfig     = "warm_range_seconds: 7200"
+	testWarmPayloadsConfig  = "include_payloads: true"
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
@@ -43,6 +46,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", testFlushIntervalConfig,
+		testCacheWarmerConfig, testWarmRangeConfig, testWarmPayloadsConfig,
 		"virtual_shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/meter/data",
 		"path_prefix: /meter",
@@ -153,6 +157,9 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"headless_service: traces-writer-headless",
 		testFlushIntervalConfig,
 		"max_candidates: 10000",
+		testCacheWarmerConfig,
+		testWarmRangeConfig,
+		testWarmPayloadsConfig,
 		"name: tenant-a",
 		"path: /etc/track/secrets/namespace-track-auth-password",
 	} {
@@ -212,6 +219,7 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
 		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
 		"segment_duration_seconds: 3600", testFlushIntervalConfig,
+		testCacheWarmerConfig, testWarmRangeConfig, testWarmPayloadsConfig,
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
 		"path: /var/run/secrets/line/internal-token", "name: tenant-a", "path_prefix: /logs",
 	} {
@@ -238,6 +246,68 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 	}
 	if !strings.Contains(reader, "mode: reader") || !strings.Contains(reader, "backend: kubernetes") {
 		t.Fatalf("unexpected Line reader config:\n%s", reader)
+	}
+}
+
+func TestRenderCacheWarmerOverrides(t *testing.T) {
+	enabled, includePayloads := false, false
+	warmRangeSeconds := int64(3600)
+	cacheWarmer := &telemetryv1alpha1.CacheWarmerSpec{
+		Enabled:          &enabled,
+		WarmRangeSeconds: &warmRangeSeconds,
+		IncludePayloads:  &includePayloads,
+	}
+	products := []struct {
+		name  string
+		input Input
+		key   string
+	}{
+		{
+			name: "meter",
+			input: Input{Meter: &telemetryv1alpha1.Meter{
+				Spec: telemetryv1alpha1.MeterSpec{
+					Config: telemetryv1alpha1.MeterConfigSpec{CacheWarmer: cacheWarmer},
+				},
+			}},
+			key: MeterKey,
+		},
+		{
+			name: "line",
+			input: Input{Line: &telemetryv1alpha1.Line{
+				Spec: telemetryv1alpha1.LineSpec{
+					Config: telemetryv1alpha1.LineConfigSpec{CacheWarmer: cacheWarmer},
+				},
+			}},
+			key: LineKey,
+		},
+		{
+			name: "track",
+			input: Input{Track: &telemetryv1alpha1.Track{
+				Spec: telemetryv1alpha1.TrackSpec{
+					Config: telemetryv1alpha1.TrackConfigSpec{CacheWarmer: cacheWarmer},
+				},
+			}},
+			key: TrackKey,
+		},
+	}
+	for _, product := range products {
+		t.Run(product.name, func(t *testing.T) {
+			result, err := Render(product.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered := string(result.Data[product.key])
+			for _, expected := range []string{
+				testCacheWarmerConfig,
+				"enabled: false",
+				"warm_range_seconds: 3600",
+				"include_payloads: false",
+			} {
+				if !strings.Contains(rendered, expected) {
+					t.Errorf("rendered config missing %q:\n%s", expected, rendered)
+				}
+			}
+		})
 	}
 }
 

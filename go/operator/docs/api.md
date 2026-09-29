@@ -198,6 +198,26 @@ _Appears in:_
 | `FoyerMemory` |  |
 
 
+#### CacheWarmerSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [LineConfigSpec](#lineconfigspec)
+- [MeterConfigSpec](#meterconfigspec)
+- [TrackConfigSpec](#trackconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ |  | true |  |
+| `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
+| `includePayloads` _boolean_ |  | true |  |
+
+
 #### DataStoreReference
 
 
@@ -475,6 +495,7 @@ _Appears in:_
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `request` _[LineRequestSpec](#linerequestspec)_ |  |  |  |
 | `cache` _[LineCacheSpec](#linecachespec)_ |  |  |  |
+| `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
 
@@ -580,6 +601,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:meter \} |  |
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
+| `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
@@ -1065,6 +1087,7 @@ _Appears in:_
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `request` _[TrackRequestSpec](#trackrequestspec)_ |  |  |  |
+| `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
 

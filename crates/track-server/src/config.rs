@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration};
 
-use common::storage::config::StorageConfig;
+use common::{CacheWarmerConfig, storage::config::StorageConfig};
 pub use meter_server::config::{Access, AuthConfig};
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +139,7 @@ pub struct Config {
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
+    pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub namespaces: Vec<NamespaceConfig>,
 }
@@ -157,6 +158,7 @@ impl Default for Config {
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
+            cache_warmer: CacheWarmerConfig::default(),
             auth: AuthConfig::default(),
             namespaces: vec![NamespaceConfig {
                 name: "default".into(),
@@ -206,6 +208,11 @@ impl Config {
         if self.page.target_size_bytes > self.page.max_size_bytes {
             return Err(ConfigError::Validation(
                 "page target_size_bytes cannot exceed max_size_bytes".into(),
+            ));
+        }
+        if self.cache_warmer.enabled && self.cache_warmer.warm_range_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "cache_warmer.warm_range_seconds must be greater than zero when enabled".into(),
             ));
         }
         if self.namespaces.is_empty() {

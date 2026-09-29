@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
@@ -50,6 +50,7 @@ fn test_config(mode: ServerMode) -> Config {
         ..Config::default()
     };
     config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
     config
 }
 
@@ -69,6 +70,7 @@ fn state(mode: ServerMode) -> AppState {
         cancellation: CancellationToken::new(),
         background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         flush_runs: Arc::new(AtomicU64::new(0)),
+        cache_warmed: Arc::new(AtomicBool::new(true)),
     }
 }
 

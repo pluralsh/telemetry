@@ -163,6 +163,16 @@ type CacheSpec struct {
 	SubmitQueueSizeThreshold *int64    `json:"submitQueueSizeThreshold,omitempty"`
 }
 
+type CacheWarmerSpec struct {
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=7200
+	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
+	// +kubebuilder:default=true
+	IncludePayloads *bool `json:"includePayloads,omitempty"`
+}
+
 type StorageSpec struct {
 	Path         string          `json:"path,omitempty"`
 	SettingsPath string          `json:"settingsPath,omitempty"`

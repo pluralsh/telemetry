@@ -6,6 +6,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Startup policy for preloading recent SlateDB blocks into configured caches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheWarmerConfig {
+    /// Whether startup warming is enabled.
+    pub enabled: bool,
+    /// Recent wall-clock window to warm.
+    pub warm_range_seconds: u64,
+    /// Whether to warm payload/sample blocks in addition to indexes and metadata.
+    pub include_payloads: bool,
+}
+
+impl Default for CacheWarmerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warm_range_seconds: 7_200,
+            include_payloads: true,
+        }
+    }
+}
+
 /// Top-level storage configuration.
 ///
 /// Defaults to `SlateDb` with a local `/tmp/opendata-storage` directory.
@@ -270,6 +292,18 @@ pub struct LocalObjectStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_warmer_defaults_to_recent_payload_warming() {
+        assert_eq!(
+            CacheWarmerConfig::default(),
+            CacheWarmerConfig {
+                enabled: true,
+                warm_range_seconds: 7_200,
+                include_payloads: true,
+            }
+        );
+    }
 
     #[test]
     fn should_default_to_slatedb_with_local_data_dir() {

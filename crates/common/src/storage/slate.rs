@@ -12,14 +12,17 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::manifest::VersionedManifest;
 use slatedb::{
-    Db, DbIterator, DbReader, DbSnapshot, FilterContext, MergeOperator as SlateDbMergeOperator,
-    MergeOperatorError, SstReader, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
+    CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbSnapshot, FilterContext,
+    MergeOperator as SlateDbMergeOperator, MergeOperatorError, SstReader, WriteBatch,
+    config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -107,6 +110,8 @@ pub struct SlateReadHandle {
 }
 
 impl SlateReadHandle {
+    const WARM_CONCURRENCY: usize = 16;
+
     /// Counts physical write operations in `range` by walking the live
     /// manifest's persisted SSTs. See [`sst_blocks::count_in_range`].
     pub async fn count_in_range(
@@ -121,6 +126,64 @@ impl SlateReadHandle {
     /// files; each call reflects the latest flushed state of the live source.
     pub fn manifest(&self) -> VersionedManifest {
         self.source.manifest()
+    }
+
+    /// Warms cache blocks for live SlateDB segments matching `prefixes`.
+    ///
+    /// Filters and SST indexes are always warmed. When `include_data` is true,
+    /// every data block in the matching segment keyspace is warmed as well.
+    /// Backends without a configured cache treat warming as a no-op.
+    pub async fn warm_prefixes(
+        &self,
+        prefixes: &[Bytes],
+        include_data: bool,
+        cancel: &CancellationToken,
+    ) -> StorageResult<()> {
+        let manifest = self.source.manifest();
+        let work = manifest
+            .segments()
+            .iter()
+            .filter_map(|segment| {
+                let prefix = prefixes
+                    .iter()
+                    .find(|prefix| segment.prefix() == prefix.as_ref())?
+                    .clone();
+                let mut targets = vec![CacheTarget::Filters, CacheTarget::Index];
+                if include_data {
+                    targets.push(CacheTarget::data::<Bytes, _>(BytesRange::prefix(prefix)));
+                }
+                let targets: Arc<[CacheTarget]> = targets.into();
+                Some(
+                    segment
+                        .l0()
+                        .iter()
+                        .map(|view| view.sst.id)
+                        .chain(
+                            segment
+                                .compacted()
+                                .iter()
+                                .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
+                        )
+                        .map(move |id| (id, targets.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        futures::stream::iter(work)
+            .map(|(id, targets)| async move {
+                match &self.source {
+                    ManifestSource::Db(db) => db.warm_sst(id, &targets).await,
+                    ManifestSource::Reader(reader) => reader.warm_sst(id, &targets).await,
+                }
+            })
+            .buffer_unordered(Self::WARM_CONCURRENCY)
+            .take_until(cancel.cancelled())
+            .try_collect::<Vec<()>>()
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(())
     }
 }
 

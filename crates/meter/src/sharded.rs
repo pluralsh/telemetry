@@ -12,6 +12,7 @@ use sharding::{
 };
 use slatedb::config::DbReaderOptions;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{SeriesId, TimeBucket};
@@ -22,6 +23,7 @@ use crate::promql::source::{
 use crate::promql::source_adapter::QueryReaderSource;
 use crate::query::QueryReader;
 use crate::reader::ReaderQueryReader;
+use crate::storage::{StorageRead, WarmStorage};
 use crate::tsdb::{
     TsdbQueryReader, TsdbReadEngine, duration_to_ms, execute_query_source,
     preload_ranges_for_query, query_value_to_range_samples, system_time_to_ms,
@@ -134,6 +136,70 @@ pub struct ShardedMeter {
 pub type ShardedTimeseries = ShardedMeter;
 
 impl ShardedMeter {
+    /// Warms recent cache blocks for every open shard and namespace.
+    pub async fn warm_recent(
+        &self,
+        namespaces: &[Namespace],
+        warm_range: Duration,
+        include_samples: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let end = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .unwrap_or(i64::MAX);
+        let start = end.saturating_sub(i64::try_from(warm_range.as_secs()).unwrap_or(i64::MAX));
+
+        let readers = self
+            .readers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !readers.is_empty() {
+            for reader in readers {
+                let storage = reader.storage_read();
+                for namespace in namespaces {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    let buckets = storage
+                        .get_buckets_in_range(namespace, Some(start), Some(end))
+                        .await?;
+                    storage
+                        .warm(namespace, buckets, include_samples, cancel)
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        let writers = self
+            .writers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for writer in writers {
+            let storage = writer.storage_read();
+            for namespace in namespaces {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                let buckets = storage
+                    .get_buckets_in_range(namespace, Some(start), Some(end))
+                    .await?;
+                storage
+                    .warm(namespace, buckets, include_samples, cancel)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn open_writers(
         config: Config,
         options: ShardingOptions,

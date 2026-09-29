@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, fmt, fs, net::SocketAddr, path::Path};
 
-use common::storage::config::SlateDbStorageConfig;
+use common::{CacheWarmerConfig, storage::config::SlateDbStorageConfig};
 use serde::{Deserialize, Serialize};
 
 pub use sharding::server::{ServerMode, StaticOwner};
@@ -170,6 +170,7 @@ pub struct Config {
     pub path_prefix: String,
     pub storage: SlateDbStorageConfig,
     pub reader_cache_capacity: u64,
+    pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub auth: AuthConfig,
@@ -184,6 +185,7 @@ impl Default for Config {
             path_prefix: String::new(),
             storage: SlateDbStorageConfig::default(),
             reader_cache_capacity: 256 * 1024 * 1024,
+            cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             auth: AuthConfig::default(),
@@ -220,6 +222,11 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "path_prefix must be empty or start with '/' and must not end with '/'".to_owned(),
+            ));
+        }
+        if self.cache_warmer.enabled && self.cache_warmer.warm_range_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "cache_warmer.warm_range_seconds must be greater than zero when enabled".to_owned(),
             ));
         }
         if self.namespaces.is_empty() {

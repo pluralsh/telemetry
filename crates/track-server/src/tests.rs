@@ -36,6 +36,7 @@ async fn state(mode: ServerMode, unauthenticated: bool) -> AppState {
         ..Config::default()
     };
     config.auth.unauthenticated = unauthenticated;
+    config.cache_warmer.enabled = false;
     AppState::open(config).await.unwrap()
 }
 

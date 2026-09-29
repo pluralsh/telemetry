@@ -19,7 +19,7 @@ pub(crate) mod segment_extractor;
 pub(crate) mod slate;
 
 pub(crate) use slate::{
-    Storage, StorageRead, StorageReader, StorageSnapshot, Store, insert_forward_index,
+    Storage, StorageRead, StorageReader, StorageSnapshot, Store, WarmStorage, insert_forward_index,
     insert_series_id, merge_inverted_index, merge_samples,
 };
 

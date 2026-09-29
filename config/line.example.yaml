@@ -54,6 +54,11 @@ request:
 cache:
   query_entries: 256
 
+cache_warmer:
+  enabled: true
+  warm_range_seconds: 7200
+  include_payloads: true
+
 auth:
   # Namespace HTTP APIs require valid credentials unless this is explicitly true.
   unauthenticated: false

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -41,6 +41,7 @@ pub struct AppState {
     pub(crate) cancellation: CancellationToken,
     pub(crate) background_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     pub(crate) flush_runs: Arc<AtomicU64>,
+    pub(crate) cache_warmed: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -113,6 +114,7 @@ impl AppState {
         } else {
             None
         };
+        let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
         let state = Self {
             remote_limit: Arc::new(Semaphore::new(config.write.remote_concurrency)),
             config: Arc::new(config),
@@ -126,6 +128,7 @@ impl AppState {
             cancellation,
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             flush_runs: Arc::new(AtomicU64::new(0)),
+            cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
         };
         #[cfg(feature = "kubernetes")]
         if let Some(runtime) = kubernetes {
@@ -162,6 +165,7 @@ impl AppState {
                 state.background_tasks.lock().await.extend(tasks);
             }
         }
+        state.start_cache_warmer().await;
         if state.config.mode != ServerMode::Reader && state.config.write.flush_interval_seconds > 0
         {
             let flush_state = state.clone();
@@ -219,6 +223,9 @@ impl AppState {
     }
 
     pub(crate) async fn is_ready(&self) -> bool {
+        if !self.cache_warmed.load(Ordering::Acquire) {
+            return false;
+        }
         match self.config.mode {
             ServerMode::Standalone => self.readers.is_some(),
             ServerMode::Reader => {
@@ -258,6 +265,36 @@ impl AppState {
                         == expected
             }
         }
+    }
+
+    async fn start_cache_warmer(&self) {
+        if self.cache_warmed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(readers) = self.readers.clone() else {
+            self.cache_warmed.store(true, Ordering::Release);
+            return;
+        };
+        let namespaces = self
+            .config
+            .namespaces
+            .iter()
+            .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
+            .collect::<Vec<_>>();
+        let warm_range = Duration::from_secs(self.config.cache_warmer.warm_range_seconds);
+        let include_payloads = self.config.cache_warmer.include_payloads;
+        let cancellation = self.cancellation.clone();
+        let cache_warmed = Arc::clone(&self.cache_warmed);
+        let task = tokio::spawn(async move {
+            if let Err(error) = readers
+                .warm_recent(&namespaces, warm_range, include_payloads, &cancellation)
+                .await
+            {
+                tracing::warn!(%error, "meter cache warming failed");
+            }
+            cache_warmed.store(true, Ordering::Release);
+        });
+        self.background_tasks.lock().await.push(task);
     }
 
     async fn flush_active_writers(&self) -> anyhow::Result<()> {

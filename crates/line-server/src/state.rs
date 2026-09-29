@@ -42,6 +42,7 @@ pub struct AppState {
     query_cache: Arc<tokio::sync::Mutex<QueryCache>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    cache_warmed: Arc<AtomicBool>,
     cancellation: CancellationToken,
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -110,6 +111,7 @@ impl AppState {
             .cloned()
             .map(|namespace| (namespace.name.clone(), namespace))
             .collect();
+        let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
         let state = Self {
             remote_limit: Arc::new(Semaphore::new(config.write.remote_concurrency)),
             config: Arc::new(config),
@@ -123,6 +125,7 @@ impl AppState {
             query_cache: Arc::new(tokio::sync::Mutex::new(QueryCache::default())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
+            cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
             cancellation,
             tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
@@ -156,12 +159,13 @@ impl AppState {
                 state.tasks.lock().await.extend(tasks);
             }
         }
+        state.start_cache_warmer().await;
         state.start_durable_flush_task().await;
         Ok(state)
     }
 
     pub async fn is_ready(&self) -> bool {
-        if !self.ready.load(Ordering::Acquire) {
+        if !self.ready.load(Ordering::Acquire) || !self.cache_warmed.load(Ordering::Acquire) {
             return false;
         }
         match self.config.mode {
@@ -183,6 +187,33 @@ impl AppState {
                 !expected.is_empty() && self.db.open_shards().await == expected
             }
         }
+    }
+
+    async fn start_cache_warmer(&self) {
+        if self.cache_warmed.load(Ordering::Acquire) {
+            return;
+        }
+        let namespaces = self
+            .config
+            .namespaces
+            .iter()
+            .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
+            .collect::<Vec<_>>();
+        let warm_range = Duration::from_secs(self.config.cache_warmer.warm_range_seconds);
+        let include_payloads = self.config.cache_warmer.include_payloads;
+        let database = Arc::clone(&self.db);
+        let cancellation = self.cancellation.clone();
+        let cache_warmed = Arc::clone(&self.cache_warmed);
+        let task = tokio::spawn(async move {
+            if let Err(error) = database
+                .warm_recent(&namespaces, warm_range, include_payloads, &cancellation)
+                .await
+            {
+                tracing::warn!(%error, "line cache warming failed");
+            }
+            cache_warmed.store(true, Ordering::Release);
+        });
+        self.tasks.lock().await.push(task);
     }
 
     pub(crate) fn mark_dirty(&self) {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sharding::{
@@ -8,6 +9,7 @@ use sharding::{
 };
 use slatedb::config::DbReaderOptions;
 use tokio::sync::{RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::query::query_databases;
 use crate::{
@@ -86,6 +88,34 @@ pub struct ShardedLine {
 }
 
 impl ShardedLine {
+    /// Warms recent cache blocks for every open shard and namespace.
+    pub async fn warm_recent(
+        &self,
+        namespaces: &[Namespace],
+        warm_range: Duration,
+        include_payloads: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let databases = self
+            .shards
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for database in databases {
+            for namespace in namespaces {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                database
+                    .warm_recent(namespace, warm_range, include_payloads, cancel)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn open(
         config: Config,
         options: ShardingOptions,

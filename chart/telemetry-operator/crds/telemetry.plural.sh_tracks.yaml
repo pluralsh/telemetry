@@ -211,6 +211,20 @@ spec:
                           HTTP APIs.
                         type: boolean
                     type: object
+                  cacheWarmer:
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                      includePayloads:
+                        default: true
+                        type: boolean
+                      warmRangeSeconds:
+                        default: 7200
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    type: object
                   namespaces:
                     default:
                     - default

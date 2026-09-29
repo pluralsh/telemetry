@@ -70,6 +70,7 @@ type TrackConfigSpec struct {
 	Write            WriteSpec        `json:"write,omitempty"`
 	Sharding         ShardingSpec     `json:"sharding,omitempty"`
 	Request          TrackRequestSpec `json:"request,omitempty"`
+	CacheWarmer      *CacheWarmerSpec `json:"cacheWarmer,omitempty"`
 	Auth             AuthSpec         `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`

@@ -137,6 +137,7 @@ func Render(input Input) (Result, error) {
 			PathPrefix:          input.Meter.Spec.Ingress.PathPrefix,
 			Storage:             renderStorageConfig(input.Meter.Spec.Config.Storage, descriptor),
 			ReaderCacheCapacity: int64Value(input.Meter.Spec.Config.ReaderCacheCapacity, 268435456),
+			CacheWarmer:         renderCacheWarmerConfig(input.Meter.Spec.Config.CacheWarmer),
 			Write:               renderWriteConfig(input.Meter.Spec.Config.Write),
 			Sharding:            renderShardingConfig(input.Meter.Name, input.Meter.Namespace, input.Meter.Spec.Config.Sharding, grpcPort(input.Meter), mode),
 			Auth:                renderAuth{Unauthenticated: input.Meter.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
@@ -268,9 +269,10 @@ func renderLine(input Input) (Result, error) {
 				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
 				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 134217728),
 			},
-			Cache:      renderLineQueryCache{QueryEntries: int64Value(spec.Cache.QueryEntries, 256)},
-			Auth:       renderAuth{Unauthenticated: line.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
-			Namespaces: namespaces,
+			Cache:       renderLineQueryCache{QueryEntries: int64Value(spec.Cache.QueryEntries, 256)},
+			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
+			Auth:        renderAuth{Unauthenticated: line.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces:  namespaces,
 		})
 	}
 	writerMode := modeStandalone
@@ -359,10 +361,11 @@ func renderTrack(input Input) (Result, error) {
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
-			Sharding:   renderShardingConfig(track.Name, track.Namespace, spec.Sharding, resources.GRPCPort(track), component),
-			Request:    renderTrackRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
-			Auth:       renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
-			Namespaces: namespaces,
+			Sharding:    renderShardingConfig(track.Name, track.Namespace, spec.Sharding, resources.GRPCPort(track), component),
+			Request:     renderTrackRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
+			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
+			Auth:        renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces:  namespaces,
 		})
 	}
 	writerMode := modeStandalone
@@ -439,6 +442,17 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath)
 	}
 	return result
+}
+
+func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCacheWarmer {
+	if spec == nil {
+		return renderCacheWarmer{Enabled: true, WarmRangeSeconds: 7200, IncludePayloads: true}
+	}
+	return renderCacheWarmer{
+		Enabled:          boolValue(spec.Enabled, true),
+		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
+		IncludePayloads:  boolValue(spec.IncludePayloads, true),
+	}
 }
 
 func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType, objectPath string) renderObjectStore {
@@ -547,6 +561,7 @@ func uniqueDataKey(data map[string][]byte, base string) string {
 
 func int64Value(value *int64, fallback int64) int64 { return lo.FromPtrOr(value, fallback) }
 func int32Value(value *int32, fallback int32) int32 { return lo.FromPtrOr(value, fallback) }
+func boolValue(value *bool, fallback bool) bool     { return lo.FromPtrOr(value, fallback) }
 
 type renderConfig struct {
 	Mode                string            `json:"mode"`
@@ -554,6 +569,7 @@ type renderConfig struct {
 	PathPrefix          string            `json:"path_prefix,omitempty"`
 	Storage             renderStorage     `json:"storage"`
 	ReaderCacheCapacity int64             `json:"reader_cache_capacity"`
+	CacheWarmer         renderCacheWarmer `json:"cache_warmer"`
 	Write               renderWrite       `json:"write"`
 	Sharding            renderSharding    `json:"sharding"`
 	Auth                renderAuth        `json:"auth"`
@@ -571,6 +587,7 @@ type renderLineConfig struct {
 	Sharding               renderSharding       `json:"sharding"`
 	Request                renderLineRequest    `json:"request"`
 	Cache                  renderLineQueryCache `json:"cache"`
+	CacheWarmer            renderCacheWarmer    `json:"cache_warmer"`
 	Auth                   renderAuth           `json:"auth"`
 	Namespaces             []renderNamespace    `json:"namespaces"`
 }
@@ -585,6 +602,7 @@ type renderTrackConfig struct {
 	Write                  renderWrite        `json:"write"`
 	Sharding               renderSharding     `json:"sharding"`
 	Request                renderTrackRequest `json:"request"`
+	CacheWarmer            renderCacheWarmer  `json:"cache_warmer"`
 	Auth                   renderAuth         `json:"auth"`
 	Namespaces             []renderNamespace  `json:"namespaces"`
 }
@@ -630,6 +648,11 @@ type renderLineRequest struct {
 }
 type renderLineQueryCache struct {
 	QueryEntries int64 `json:"query_entries"`
+}
+type renderCacheWarmer struct {
+	Enabled          bool  `json:"enabled"`
+	WarmRangeSeconds int64 `json:"warm_range_seconds"`
+	IncludePayloads  bool  `json:"include_payloads"`
 }
 type renderListeners struct {
 	HTTP       string `json:"http"`

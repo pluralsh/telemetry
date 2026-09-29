@@ -39,6 +39,7 @@ async fn state_with_flush_interval(
     };
     config.write.flush_interval_seconds = flush_interval_seconds;
     config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
     AppState::open(config).await.unwrap()
 }
 
@@ -49,6 +50,7 @@ async fn authenticated_state(namespaces: Vec<NamespaceConfig>) -> AppState {
         ..Config::default()
     };
     config.write.flush_interval_seconds = 3600;
+    config.cache_warmer.enabled = false;
     AppState::open(config).await.unwrap()
 }
 

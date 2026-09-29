@@ -2772,6 +2772,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "unicode-segmentation",
 ]
 
@@ -5852,6 +5853,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

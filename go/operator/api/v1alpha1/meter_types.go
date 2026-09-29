@@ -32,10 +32,11 @@ type MeterConfigSpec struct {
 	Storage StorageSpec `json:"storage,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=268435456
-	ReaderCacheCapacity *int64       `json:"readerCacheCapacity,omitempty"`
-	Write               WriteSpec    `json:"write,omitempty"`
-	Sharding            ShardingSpec `json:"sharding,omitempty"`
-	Auth                AuthSpec     `json:"auth,omitempty"`
+	ReaderCacheCapacity *int64           `json:"readerCacheCapacity,omitempty"`
+	CacheWarmer         *CacheWarmerSpec `json:"cacheWarmer,omitempty"`
+	Write               WriteSpec        `json:"write,omitempty"`
+	Sharding            ShardingSpec     `json:"sharding,omitempty"`
+	Auth                AuthSpec         `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

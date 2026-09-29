@@ -13,7 +13,7 @@ pub use clock::Clock;
 pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, SequenceResult};
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
-    BlockCacheConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
+    BlockCacheConfig, CacheWarmerConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
