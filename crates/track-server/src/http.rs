@@ -21,7 +21,7 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use track::{Namespace, QueryOptions, Trace, TraceId, trace_batches};
+use track::{AttributeScope, Namespace, QueryOptions, TraceId, trace_batches};
 
 use crate::{
     AppState,
@@ -374,11 +374,23 @@ async fn tag_names(
     headers: HeaderMap,
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let (resource, span) = scoped_tag_names(
-        scan_traces(&state, &namespace, &headers).await?,
-        params.scope.as_deref(),
-    );
-    let names = resource.union(&span).collect::<BTreeSet<_>>();
+    let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let names = if params.scope.as_deref() == Some("intrinsic") {
+        intrinsic_tag_names()
+    } else {
+        state
+            .db
+            .catalog_names(
+                &namespace,
+                params.start_ns(),
+                params.end_ns(),
+                attribute_scope(params.scope.as_deref()),
+            )
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .collect()
+    };
     Ok(Json(json!({"tagNames": names})))
 }
 
@@ -388,20 +400,40 @@ async fn tag_names_v2(
     headers: HeaderMap,
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let (resource, span) = scoped_tag_names(
-        scan_traces(&state, &namespace, &headers).await?,
-        params.scope.as_deref(),
-    );
+    let namespace = catalog_namespace(&state, &namespace, &headers).await?;
     let mut scopes = Vec::new();
     if params
         .scope
         .as_deref()
         .is_none_or(|scope| scope == "resource")
     {
+        let resource = state
+            .db
+            .catalog_names(
+                &namespace,
+                params.start_ns(),
+                params.end_ns(),
+                Some(AttributeScope::Resource),
+            )
+            .await
+            .map_err(ApiError::internal)?;
         scopes.push(json!({"name": "resource", "tags": resource}));
     }
     if params.scope.as_deref().is_none_or(|scope| scope == "span") {
+        let span = state
+            .db
+            .catalog_names(
+                &namespace,
+                params.start_ns(),
+                params.end_ns(),
+                Some(AttributeScope::Span),
+            )
+            .await
+            .map_err(ApiError::internal)?;
         scopes.push(json!({"name": "span", "tags": span}));
+    }
+    if params.scope.as_deref() == Some("intrinsic") {
+        scopes.push(json!({"name": "intrinsic", "tags": intrinsic_tag_names()}));
     }
     Ok(Json(json!({"scopes": scopes})))
 }
@@ -410,20 +442,36 @@ async fn tag_values(
     State(state): State<AppState>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
+    Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let values = tag_value_set(scan_traces(&state, &namespace, &headers).await?, &name);
-    Ok(Json(
-        json!({"tagValues": values.into_iter().map(|(_, value)| value).collect::<BTreeSet<_>>()}),
-    ))
+    let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let (scope, name) = scoped_name(&name, params.scope.as_deref());
+    let values = state
+        .db
+        .catalog_values(&namespace, params.start_ns(), params.end_ns(), scope, name)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|value| discovery_value_parts(value).1)
+        .collect::<BTreeSet<_>>();
+    Ok(Json(json!({"tagValues": values})))
 }
 
 async fn tag_values_v2(
     State(state): State<AppState>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
+    Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let values = tag_value_set(scan_traces(&state, &namespace, &headers).await?, &name)
+    let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let (scope, name) = scoped_name(&name, params.scope.as_deref());
+    let values = state
+        .db
+        .catalog_values(&namespace, params.start_ns(), params.end_ns(), scope, name)
+        .await
+        .map_err(ApiError::internal)?
         .into_iter()
+        .map(discovery_value_parts)
         .map(|(kind, value)| json!({"type": kind, "value": value}))
         .collect::<Vec<_>>();
     Ok(Json(json!({"tagValues": values})))
@@ -432,74 +480,95 @@ async fn tag_values_v2(
 #[derive(Default, Deserialize)]
 struct TagParams {
     scope: Option<String>,
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    end: Option<u64>,
 }
 
-async fn scan_traces(
+impl TagParams {
+    fn start_ns(&self) -> u64 {
+        self.start.unwrap_or(0).saturating_mul(1_000_000_000)
+    }
+
+    fn end_ns(&self) -> u64 {
+        self.end
+            .unwrap_or(u64::MAX / 1_000_000_000)
+            .saturating_mul(1_000_000_000)
+    }
+}
+
+async fn catalog_namespace(
     state: &AppState,
     namespace: &str,
     headers: &HeaderMap,
-) -> Result<Vec<Trace>, ApiError> {
+) -> Result<Namespace, ApiError> {
     require_read_mode(state)?;
     authorize_namespace(state, namespace, headers, Permission::Read).await?;
-    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
-    state
-        .db
-        .scan_traces(&namespace, state.config.request.max_candidates)
-        .await
-        .map_err(ApiError::internal)
+    Namespace::new(namespace).map_err(ApiError::bad_request)
 }
 
-fn scoped_tag_names(
-    traces: Vec<Trace>,
+fn attribute_scope(scope: Option<&str>) -> Option<AttributeScope> {
+    match scope {
+        Some("resource") => Some(AttributeScope::Resource),
+        Some("span") => Some(AttributeScope::Span),
+        _ => None,
+    }
+}
+
+fn scoped_name<'a>(
+    name: &'a str,
     requested_scope: Option<&str>,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut resource_names = BTreeSet::new();
-    let mut span_names = BTreeSet::new();
-    for trace in traces {
-        for resource in trace.resource_spans {
-            if requested_scope.is_none_or(|scope| scope == "resource")
-                && let Some(resource) = resource.resource
-            {
-                resource_names.extend(resource.attributes.into_iter().map(|value| value.key));
-            }
-            if requested_scope.is_none_or(|scope| scope == "span") {
-                for scope in resource.scope_spans {
-                    for span in scope.spans {
-                        span_names.extend(span.attributes.into_iter().map(|value| value.key));
-                    }
-                }
-            }
-        }
+) -> (Option<AttributeScope>, &'a str) {
+    if let Some(name) = name.strip_prefix("resource.") {
+        (Some(AttributeScope::Resource), name)
+    } else if let Some(name) = name.strip_prefix("span.") {
+        (Some(AttributeScope::Span), name)
+    } else {
+        (attribute_scope(requested_scope), name)
     }
-    (resource_names, span_names)
 }
 
-fn tag_value_set(traces: Vec<Trace>, name: &str) -> BTreeSet<(String, String)> {
-    let (scope, name) = if let Some(name) = name.strip_prefix("resource.") {
-        (Some("resource"), name)
-    } else if let Some(name) = name.strip_prefix("span.") {
-        (Some("span"), name)
-    } else {
-        (None, name)
-    };
-    let mut values = BTreeSet::new();
-    for trace in traces {
-        for resource in trace.resource_spans {
-            if scope != Some("span")
-                && let Some(resource) = resource.resource
-            {
-                collect_values(&resource.attributes, name, &mut values);
-            }
-            if scope != Some("resource") {
-                for scope in resource.scope_spans {
-                    for span in scope.spans {
-                        collect_values(&span.attributes, name, &mut values);
-                    }
-                }
-            }
-        }
+fn discovery_value_parts(value: common::discovery::DiscoveryValue) -> (&'static str, String) {
+    match value {
+        common::discovery::DiscoveryValue::String(value) => ("string", value),
+        common::discovery::DiscoveryValue::Bool(value) => ("bool", value.to_string()),
+        common::discovery::DiscoveryValue::Int(value) => ("int", value.to_string()),
+        common::discovery::DiscoveryValue::Double(value) => ("float", value.to_string()),
     }
-    values
+}
+
+fn intrinsic_tag_names() -> BTreeSet<String> {
+    [
+        "duration",
+        "name",
+        "status",
+        "statusMessage",
+        "kind",
+        "rootServiceName",
+        "rootName",
+        "traceDuration",
+        "event:name",
+        "event:timeSinceStart",
+        "link:spanID",
+        "link:traceID",
+        "instrumentation:name",
+        "instrumentation:version",
+        "trace:id",
+        "span:id",
+        "span:parentID",
+        "span:status",
+        "span:statusMessage",
+        "span:duration",
+        "span:name",
+        "span:kind",
+        "trace:rootName",
+        "trace:rootService",
+        "trace:duration",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 async fn echo(
@@ -656,30 +725,6 @@ fn legacy_tags_query(tags: &str) -> String {
         "{}".into()
     } else {
         format!("{{ {} }}", expressions.join(" && "))
-    }
-}
-
-fn collect_values(attributes: &[KeyValue], name: &str, output: &mut BTreeSet<(String, String)>) {
-    for attribute in attributes.iter().filter(|attribute| attribute.key == name) {
-        let value = match attribute
-            .value
-            .as_ref()
-            .and_then(|value| value.value.as_ref())
-        {
-            Some(any_value::Value::StringValue(value)) => ("string", value.clone()),
-            Some(any_value::Value::BoolValue(value)) => ("bool", value.to_string()),
-            Some(any_value::Value::IntValue(value)) => ("int", value.to_string()),
-            Some(any_value::Value::DoubleValue(value)) => ("float", value.to_string()),
-            Some(any_value::Value::BytesValue(value)) => {
-                use base64::Engine;
-                (
-                    "string",
-                    base64::engine::general_purpose::STANDARD.encode(value),
-                )
-            }
-            _ => continue,
-        };
-        output.insert((value.0.to_owned(), value.1));
     }
 }
 

@@ -8,7 +8,7 @@ use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::error;
 
 use crate::Namespace;
@@ -998,6 +998,7 @@ pub(crate) struct Tsdb {
     /// TTI cache (15 min idle) for buckets being actively ingested into.
     /// Also used during queries so that unflushed data is visible.
     ingest_cache: Cache<(TimeBucket, u16), Arc<MiniTsdb>>,
+    discovery_cache: crate::discovery::MeterDiscoveryCache,
     /// Serializes cache misses so concurrent writes cannot construct two
     /// coordinators for the same bucket.
     bucket_creation: Mutex<()>,
@@ -1007,9 +1008,6 @@ pub(crate) struct Tsdb {
     /// per-record expiration.
     retention: Option<Duration>,
     write_buffer: common::coordinator::WriteCoordinatorConfig,
-
-    // Metadata catalog (keyed by metric name)
-    pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 
     /// Rolling HLL ring estimating unique series seen in the last ~15 min.
     /// Updated and published to `tsdb_active_series` by the flusher.
@@ -1055,10 +1053,10 @@ impl Tsdb {
             namespace,
             storage,
             ingest_cache,
+            discovery_cache: crate::discovery::MeterDiscoveryCache::new(),
             bucket_creation: Mutex::new(()),
             retention,
             write_buffer,
-            metadata_catalog: RwLock::new(HashMap::new()),
             active_series,
         }
     }
@@ -1262,9 +1260,11 @@ impl Tsdb {
         series_list: Vec<Series>,
         timeout: Option<Duration>,
     ) -> Result<()> {
+        if !series_list.is_empty() {
+            self.discovery_cache.clear();
+        }
         let mut bucket_series_map: HashMap<(TimeBucket, u16), Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
-        let mut metadata: HashMap<String, Vec<MetricMetadata>> = HashMap::new();
 
         // First pass: group all series by bucket
         for series in series_list {
@@ -1284,31 +1284,6 @@ impl Tsdb {
                     "routing slot {routing_slot} is outside opened shard range {:?}",
                     self.storage.owned_slots()
                 )));
-            }
-
-            if let Some(metric_name) = labels
-                .iter()
-                .find(|l| l.name == "__name__")
-                .map(|l| l.value.as_str())
-            {
-                let known = metadata.get(metric_name).is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry.metric_type == metric_type
-                            && entry.description == description
-                            && entry.unit == unit
-                    })
-                });
-                if !known {
-                    metadata
-                        .entry(metric_name.to_owned())
-                        .or_default()
-                        .push(MetricMetadata {
-                            metric_name: metric_name.to_owned(),
-                            metric_type,
-                            description: description.clone(),
-                            unit: unit.clone(),
-                        });
-                }
             }
 
             // Group samples by bucket for this series
@@ -1350,18 +1325,6 @@ impl Tsdb {
                     description,
                     samples: last_samples,
                 });
-        }
-
-        if !metadata.is_empty() {
-            let mut catalog = self.metadata_catalog.write().await;
-            for (metric_name, batch) in metadata {
-                let entries = catalog.entry(metric_name).or_default();
-                for entry in batch {
-                    if !entries.contains(&entry) {
-                        entries.push(entry);
-                    }
-                }
-            }
         }
 
         let buckets_touched = bucket_series_map.len();
@@ -1418,14 +1381,69 @@ impl Tsdb {
         &self,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let catalog = self.metadata_catalog.read().await;
+        let snapshot = self
+            .storage
+            .snapshot()
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let buckets = snapshot
+            .get_buckets_in_range(&self.namespace, None, None)
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        crate::discovery::metadata(
+            snapshot,
+            &self.namespace,
+            &buckets,
+            metric,
+            &self.discovery_cache,
+        )
+        .await
+        .map_err(|error| QueryError::Execution(error.to_string()))
+    }
 
-        let entries: Vec<MetricMetadata> = match metric {
-            Some(name) => catalog.get(name).cloned().unwrap_or_default(),
-            None => catalog.values().flatten().cloned().collect(),
-        };
+    pub(crate) async fn catalog_labels(
+        &self,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let snapshot = self
+            .storage
+            .snapshot()
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let buckets = snapshot
+            .get_buckets_in_range(&self.namespace, Some(start_secs), Some(end_secs))
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        crate::discovery::names(snapshot, &self.namespace, &buckets, &self.discovery_cache)
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))
+    }
 
-        Ok(entries)
+    pub(crate) async fn catalog_label_values(
+        &self,
+        label_name: &str,
+        start_secs: i64,
+        end_secs: i64,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let snapshot = self
+            .storage
+            .snapshot()
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let buckets = snapshot
+            .get_buckets_in_range(&self.namespace, Some(start_secs), Some(end_secs))
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        crate::discovery::values(
+            snapshot,
+            &self.namespace,
+            &buckets,
+            label_name,
+            &self.discovery_cache,
+        )
+        .await
+        .map_err(|error| QueryError::Execution(error.to_string()))
     }
 }
 
@@ -2499,6 +2517,11 @@ mod tests {
         series.unit = Some("percent".to_string());
         tsdb.ingest_samples(vec![series], None).await.unwrap();
 
+        assert!(
+            tsdb.find_metadata(None).await.unwrap().is_empty(),
+            "Applied-only metadata is not catalog-visible"
+        );
+        tsdb.flush().await.unwrap();
         let results = tsdb.find_metadata(None).await.unwrap();
 
         assert_eq!(results.len(), 1);
@@ -2684,6 +2707,11 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(
+            tsdb.find_metadata(Some("cpu")).await.unwrap().is_empty(),
+            "Applied-only metadata is not catalog-visible"
+        );
+        tsdb.flush().await.unwrap();
         let results = tsdb.find_metadata(Some("cpu")).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].metric_name, "cpu");

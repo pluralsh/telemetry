@@ -295,7 +295,13 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_labels_in_range(self.tenant(namespace).await.as_ref(), matchers, range).await
+        let tenant = self.tenant(namespace).await;
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let (start, end) = crate::util::range_bounds_to_secs(range)?;
+            tenant.catalog_labels(start, end).await
+        } else {
+            find_labels_in_range(tenant.as_ref(), matchers, range).await
+        }
     }
 
     /// Returns the set of values for a given label name.
@@ -306,13 +312,13 @@ impl TimeSeriesDb {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_label_values_in_range(
-            self.tenant(namespace).await.as_ref(),
-            label_name,
-            matchers,
-            range,
-        )
-        .await
+        let tenant = self.tenant(namespace).await;
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let (start, end) = crate::util::range_bounds_to_secs(range)?;
+            tenant.catalog_label_values(label_name, start, end).await
+        } else {
+            find_label_values_in_range(tenant.as_ref(), label_name, matchers, range).await
+        }
     }
 
     /// Returns metric metadata, optionally filtered to a single metric.

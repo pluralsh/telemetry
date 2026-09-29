@@ -272,6 +272,25 @@ async fn canonical_tag_endpoints_finish_and_return_tempo_shapes() {
                 .unwrap();
         assert_eq!(value, expected);
     }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/read/ns/tenant/api/v2/search/tags?scope=intrinsic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["scopes"][0]["name"], "intrinsic");
+    assert!(
+        value["scopes"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("trace:id"))
+    );
     state.shutdown().await.unwrap();
 }
 

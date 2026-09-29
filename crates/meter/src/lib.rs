@@ -8,6 +8,7 @@
 mod active_series;
 mod config;
 mod delta;
+mod discovery;
 pub(crate) mod error;
 mod flusher;
 mod index;

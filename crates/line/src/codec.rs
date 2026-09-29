@@ -66,7 +66,8 @@ pub(crate) fn segment_for(timestamp_ns: i64, segment_ns: i64) -> SegmentId {
     timestamp_ns.div_euclid(segment_ns) * segment_ns
 }
 
-#[cfg(test)]
+/// Namespace and time-segment prefix shared by routed records and the
+/// partition-level discovery catalog.
 pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
     let mut bytes = BytesMut::new();
     KEY_SCOPE.write(&mut bytes, namespace, segment);

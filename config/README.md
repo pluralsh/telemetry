@@ -67,7 +67,9 @@ Meter always uses SlateDB. If the whole section is omitted, it defaults to `path
   `data`.
 - `storage.settings_path`: optional path to a SlateDB TOML, JSON, or YAML settings file. If
   omitted, SlateDB loads its normal `SlateDb.toml`, `SlateDb.json`, or `SlateDb.yaml` files and
-  `SLATEDB_` environment overrides.
+  `SLATEDB_` environment overrides. See `config/SlateDb.example.toml`; Zstd is recommended for
+  object-store deployments with string-heavy discovery catalogs, while LZ4 trades compression
+  ratio for lower CPU overhead.
 - `storage.object_store`: required object-store variant:
   - `type: InMemory`: process-local, nonpersistent storage; no additional fields.
   - `type: Local`: local filesystem storage; requires `path`.

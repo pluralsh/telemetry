@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -358,6 +358,76 @@ impl ShardedLine {
         .await
     }
 
+    pub async fn label_names(
+        &self,
+        namespace: &Namespace,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<String>> {
+        let databases = self
+            .shards
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut names = BTreeSet::new();
+        for database in databases {
+            names.extend(database.label_names(namespace, start_ns, end_ns).await?);
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    pub async fn label_values(
+        &self,
+        namespace: &Namespace,
+        name: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<String>> {
+        let databases = self
+            .shards
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut values = BTreeSet::new();
+        for database in databases {
+            values.extend(
+                database
+                    .label_values(namespace, name, start_ns, end_ns)
+                    .await?,
+            );
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    pub async fn series(
+        &self,
+        namespace: &Namespace,
+        selectors: &[String],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<Labels>> {
+        let databases = self
+            .shards
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut series = BTreeSet::new();
+        for database in databases {
+            series.extend(
+                database
+                    .series(namespace, selectors, start_ns, end_ns)
+                    .await?,
+            );
+        }
+        Ok(series.into_iter().collect())
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let databases = self
             .shards
@@ -478,6 +548,26 @@ mod tests {
             .write(&routing, &namespace, batches, Durability::Written)
             .await
             .unwrap();
+        assert_eq!(
+            database.label_names(&namespace, 0, 10).await.unwrap(),
+            vec!["app"]
+        );
+        assert_eq!(
+            database
+                .label_values(&namespace, "app", 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            database
+                .series(&namespace, &[r#"{app=~".+"}"#.to_owned()], 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         let result = database
             .query(
                 &namespace,

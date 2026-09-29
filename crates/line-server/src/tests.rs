@@ -280,6 +280,74 @@ async fn json_push_and_queries_match_loki_shapes() {
 }
 
 #[tokio::test]
+async fn metadata_endpoints_return_stream_labels_only() {
+    let state = state(vec![namespace("tenant")]).await;
+    assert_eq!(
+        push(
+            &state,
+            "tenant",
+            json!({"streams":[
+                {
+                    "stream":{"app":"api","env":"prod"},
+                    "values":[["1000000000","one",{"trace_id":"a"}]]
+                },
+                {
+                    "stream":{"app":"worker","env":"staging"},
+                    "values":[["2000000000","two",{"trace_id":"b"}]]
+                }
+            ]})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let labels = query(&state, "/read/ns/tenant/loki/api/v1/labels?start=0&end=3").await;
+    assert_eq!(labels.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(labels).await,
+        json!({"status":"success","data":["app","env"]})
+    );
+
+    let values = query(
+        &state,
+        "/read/ns/tenant/loki/api/v1/label/app/values?start=0&end=3",
+    )
+    .await;
+    assert_eq!(
+        response_json(values).await,
+        json!({"status":"success","data":["api","worker"]})
+    );
+
+    let series = query(
+        &state,
+        "/read/ns/tenant/loki/api/v1/series?match%5B%5D=%7Bapp%3D~%22api%7Cworker%22%2Cenv%21%3D%22staging%22%7D&start=0&end=3",
+    )
+    .await;
+    assert_eq!(series.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(series).await,
+        json!({"status":"success","data":[{"app":"api","env":"prod"}]})
+    );
+
+    let post = router(state.clone())
+        .oneshot(
+            Request::post("/read/ns/tenant/loki/api/v1/series")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "match%5B%5D=%7Bapp%3D%22worker%22%7D&start=0&end=3",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(post).await,
+        json!({"status":"success","data":[{"app":"worker","env":"staging"}]})
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn legacy_stream_shape_folds_metadata_into_labels() {
     let state = state(vec![namespace("tenant")]).await;
     push(

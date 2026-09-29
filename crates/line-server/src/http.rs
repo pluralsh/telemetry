@@ -7,7 +7,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -40,6 +40,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/read/ns/{namespace}/loki/api/v1/query_range",
             get(query_range_get).post(query_range_post),
+        )
+        .route("/read/ns/{namespace}/loki/api/v1/labels", get(label_names))
+        .route(
+            "/read/ns/{namespace}/loki/api/v1/label/{name}/values",
+            get(label_values),
+        )
+        .route(
+            "/read/ns/{namespace}/loki/api/v1/series",
+            get(series_get).post(series_post),
         )
         .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
         .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs));
@@ -80,6 +89,22 @@ struct RangeParams {
     step: Option<String>,
     limit: Option<usize>,
     direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryParams {
+    start: Option<String>,
+    end: Option<String>,
+    since: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeriesParams {
+    #[serde(rename = "match[]", default)]
+    selectors: Vec<String>,
+    start: Option<String>,
+    end: Option<String>,
+    since: Option<String>,
 }
 
 async fn query_get(
@@ -196,6 +221,112 @@ async fn execute_query_range(
     let options = query_options(&state, params.limit, params.direction.as_deref())?;
     let request = QueryRequest::range(&params.query, start, end, step);
     query_response(state, namespace, headers, request, options).await
+}
+
+async fn label_names(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<DiscoveryParams>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let (start, end) = discovery_range(params.start, params.end, params.since)?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let names = state
+        .db
+        .label_names(&namespace, start, end)
+        .await
+        .map_err(ApiError::from_line)?;
+    Ok(Json(json!({"status":"success","data":names})))
+}
+
+async fn label_values(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<DiscoveryParams>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let (start, end) = discovery_range(params.start, params.end, params.since)?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let values = state
+        .db
+        .label_values(&namespace, &name, start, end)
+        .await
+        .map_err(ApiError::from_line)?;
+    Ok(Json(json!({"status":"success","data":values})))
+}
+
+async fn series_get(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let query = query.unwrap_or_default();
+    let params = serde_html_form::from_bytes(query.as_bytes()).map_err(ApiError::bad_request)?;
+    execute_series(state, namespace, headers, params).await
+}
+
+async fn series_post(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    check_size(&state, body.len())?;
+    let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
+    execute_series(state, namespace, headers, params).await
+}
+
+async fn execute_series(
+    state: AppState,
+    namespace: String,
+    headers: HeaderMap,
+    params: SeriesParams,
+) -> Result<Json<Value>, ApiError> {
+    authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let (start, end) = discovery_range(params.start, params.end, params.since)?;
+    let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let series = state
+        .db
+        .series(&namespace, &params.selectors, start, end)
+        .await
+        .map_err(ApiError::from_line)?;
+    let data = series
+        .iter()
+        .map(label_map)
+        .collect::<Vec<BTreeMap<String, String>>>();
+    Ok(Json(json!({"status":"success","data":data})))
+}
+
+fn discovery_range(
+    start: Option<String>,
+    end: Option<String>,
+    since: Option<String>,
+) -> Result<(i64, i64), ApiError> {
+    let now = now_ns();
+    let end = end
+        .as_deref()
+        .map(parse_timestamp)
+        .transpose()?
+        .unwrap_or(now);
+    let since = since
+        .as_deref()
+        .map(parse_duration_ns)
+        .transpose()?
+        .unwrap_or(3_600_000_000_000);
+    let start = start
+        .as_deref()
+        .map(parse_timestamp)
+        .transpose()?
+        .unwrap_or_else(|| end.min(now).saturating_sub(since));
+    if end < start {
+        return Err(ApiError::bad_request(
+            "end timestamp must not be before start",
+        ));
+    }
+    Ok((start, end))
 }
 
 async fn query_response(

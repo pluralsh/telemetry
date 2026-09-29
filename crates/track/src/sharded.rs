@@ -1,9 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+use common::discovery::DiscoveryValue;
 use futures::{StreamExt, TryStreamExt, stream};
 use sharding::{
     DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_VIRTUAL_SHARDS, HashRangeMap, ReaderShardLifecycle,
@@ -13,8 +14,8 @@ use slatedb::config::DbReaderOptions;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
-    AttributeMatcher, Config, Durability, Error, Namespace, QueryOptions, Result, Trace,
-    TraceBatch, TraceDb, TraceId, TraceQlResult, WriteReport,
+    AttributeMatcher, AttributeScope, Config, Durability, Error, Namespace, QueryOptions, Result,
+    Trace, TraceBatch, TraceDb, TraceId, TraceQlResult, WriteReport,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +472,71 @@ impl ShardedTrack {
         Ok(results)
     }
 
+    pub async fn catalog_names(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        scope: Option<AttributeScope>,
+    ) -> Result<Vec<String>> {
+        let databases = self.databases().await;
+        let permits = Arc::clone(&self.io_permits);
+        let names = stream::iter(databases.into_iter().map(|database| {
+            let permits = Arc::clone(&permits);
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+                database
+                    .catalog_names(namespace, start_ns, end_ns, scope)
+                    .await
+            }
+        }))
+        .buffer_unordered(self.io_permits.available_permits().max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(names
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
+    pub async fn catalog_values(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        scope: Option<AttributeScope>,
+        name: &str,
+    ) -> Result<Vec<DiscoveryValue>> {
+        let databases = self.databases().await;
+        let permits = Arc::clone(&self.io_permits);
+        let values = stream::iter(databases.into_iter().map(|database| {
+            let permits = Arc::clone(&permits);
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+                database
+                    .catalog_values(namespace, start_ns, end_ns, scope, name)
+                    .await
+            }
+        }))
+        .buffer_unordered(self.io_permits.available_permits().max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(values
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
     pub async fn query_traceql(
         &self,
         namespace: &Namespace,
@@ -555,6 +621,7 @@ fn slot_range(routing: &HashRangeMap, shard: ShardId) -> Result<std::ops::Range<
 #[cfg(test)]
 mod tests {
     use common::storage::config::StorageConfig;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::*;
@@ -571,6 +638,12 @@ mod tests {
                         name: format!("span-{id}"),
                         start_time_unix_nano: timestamp,
                         end_time_unix_nano: timestamp + 1,
+                        attributes: vec![KeyValue {
+                            key: "shard".to_owned(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::IntValue(i64::from(id))),
+                            }),
+                        }],
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -623,6 +696,21 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            database
+                .catalog_names(&namespace, 0, 10, Some(AttributeScope::Span))
+                .await
+                .unwrap(),
+            vec!["shard"]
+        );
+        assert_eq!(
+            database
+                .catalog_values(&namespace, 0, 10, Some(AttributeScope::Span), "shard")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         for trace in traces {
             assert_eq!(
                 database

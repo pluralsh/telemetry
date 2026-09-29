@@ -268,6 +268,29 @@ type WorkloadSpec struct {
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 	DataVolume  *VolumeSpec             `json:"dataVolume,omitempty"`
 	CacheVolume *VolumeSpec             `json:"cacheVolume,omitempty"`
+	// PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs
+	// are retained or deleted when the workload is deleted or scaled down.
+	// When omitted, remote and in-memory object stores default to Delete while
+	// Local object stores default to Retain because the data PVC is authoritative.
+	PersistentVolumeClaimRetentionPolicy *PersistentVolumeClaimRetentionPolicySpec `json:"persistentVolumeClaimRetentionPolicy,omitempty"`
+}
+
+type PersistentVolumeClaimRetentionPolicyType string
+
+const (
+	PersistentVolumeClaimRetentionPolicyRetain PersistentVolumeClaimRetentionPolicyType = "Retain"
+	PersistentVolumeClaimRetentionPolicyDelete PersistentVolumeClaimRetentionPolicyType = "Delete"
+)
+
+type PersistentVolumeClaimRetentionPolicySpec struct {
+	// WhenDeleted controls PVC retention when the StatefulSet is deleted.
+	// When omitted, the object-store-dependent workload default is used.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	WhenDeleted PersistentVolumeClaimRetentionPolicyType `json:"whenDeleted,omitempty"`
+	// WhenScaled controls PVC retention when StatefulSet replicas are reduced.
+	// When omitted, the object-store-dependent workload default is used.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	WhenScaled PersistentVolumeClaimRetentionPolicyType `json:"whenScaled,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="has(self.emptyDir) != has(self.persistentVolumeClaim)",message="exactly one of emptyDir or persistentVolumeClaim is required"

@@ -19,6 +19,16 @@ zero. Version 2 is a hard format switch: version-1 Line databases are not read
 by this format. In the layouts below, `record prefix` means the complete prefix
 above through the record-type byte.
 
+Each namespace/time-segment partition also contains the shared discovery
+catalog under reserved routing slot `0xffff` and catalog format version `1`.
+Line records every stream-label
+name and string value there with the same TTL and in the same atomic storage
+apply as label postings and pages. The catalog is partition-level rather than
+routing-slot-local, so metadata reads scan one compact prefix per requested
+time segment and union results across physical shards. Existing prerelease
+data must be reset and reingested; there is no legacy discovery fallback or
+backfill.
+
 | ID | Record | Purpose |
 | --- | --- | --- |
 | `0x01` | Next stream ID | Allocates IDs within a segment |

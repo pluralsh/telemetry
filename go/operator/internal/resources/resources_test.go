@@ -60,6 +60,46 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	}
 }
 
+func TestStatefulSetPersistentVolumeClaimRetentionPolicy(t *testing.T) {
+	t.Run("local object stores retain authoritative data", func(t *testing.T) {
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		})
+		assertPVCRetentionPolicy(t, statefulSet, appsv1.RetainPersistentVolumeClaimRetentionPolicyType, appsv1.RetainPersistentVolumeClaimRetentionPolicyType)
+	})
+
+	t.Run("remote object stores delete cache volumes", func(t *testing.T) {
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+				Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+					Type: telemetryv1alpha1.ObjectStoreAWS,
+				}},
+			}},
+		})
+		assertPVCRetentionPolicy(t, statefulSet, appsv1.DeletePersistentVolumeClaimRetentionPolicyType, appsv1.DeletePersistentVolumeClaimRetentionPolicyType)
+	})
+
+	t.Run("explicit values override each computed default independently", func(t *testing.T) {
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
+			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.MeterSpec{
+				Config: telemetryv1alpha1.MeterConfigSpec{
+					Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+						Type: telemetryv1alpha1.ObjectStoreGCP,
+					}},
+				},
+				Writer: telemetryv1alpha1.WorkloadSpec{
+					PersistentVolumeClaimRetentionPolicy: &telemetryv1alpha1.PersistentVolumeClaimRetentionPolicySpec{
+						WhenDeleted: telemetryv1alpha1.PersistentVolumeClaimRetentionPolicyRetain,
+					},
+				},
+			},
+		})
+		assertPVCRetentionPolicy(t, statefulSet, appsv1.RetainPersistentVolumeClaimRetentionPolicyType, appsv1.DeletePersistentVolumeClaimRetentionPolicyType)
+	})
+}
+
 func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 	meter := &telemetryv1alpha1.Meter{
 		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
@@ -585,6 +625,27 @@ func mustStatefulSet(t *testing.T, meter *telemetryv1alpha1.Meter) *appsv1.State
 		t.Fatal(err)
 	}
 	return statefulSet
+}
+
+func assertPVCRetentionPolicy(
+	t *testing.T,
+	statefulSet *appsv1.StatefulSet,
+	whenDeleted appsv1.PersistentVolumeClaimRetentionPolicyType,
+	whenScaled appsv1.PersistentVolumeClaimRetentionPolicyType,
+) {
+	t.Helper()
+	policy := statefulSet.Spec.PersistentVolumeClaimRetentionPolicy
+	if policy == nil {
+		t.Fatal("persistentVolumeClaimRetentionPolicy is missing")
+	}
+	if policy.WhenDeleted != whenDeleted || policy.WhenScaled != whenScaled {
+		t.Fatalf(
+			"persistentVolumeClaimRetentionPolicy = %#v, want whenDeleted=%q whenScaled=%q",
+			policy,
+			whenDeleted,
+			whenScaled,
+		)
+	}
 }
 
 func assertClaim(t *testing.T, claims []corev1.PersistentVolumeClaim, name, size string) {

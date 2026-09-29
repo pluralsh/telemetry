@@ -6,7 +6,9 @@ use common::coordinator::Delta;
 use crate::Namespace;
 use crate::active_series::ActiveSeriesTracker;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
-use crate::model::{Label, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
+use crate::model::{
+    Label, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket,
+};
 use crate::util::Fingerprint;
 
 /// Samples for a single series, bundled with the metric name needed for
@@ -33,6 +35,7 @@ pub(crate) struct FrozenTsdbDelta {
     pub(crate) routing_slot: u16,
     pub(crate) forward_index: ForwardIndex,
     pub(crate) inverted_index: InvertedIndex,
+    pub(crate) metadata: HashMap<String, MetricMetadata>,
     pub(crate) series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
     pub(crate) samples: HashMap<SeriesId, SeriesSamples>,
 }
@@ -57,6 +60,7 @@ pub(crate) struct TsdbWriteDelta {
     series_dict_delta: HashMap<SeriesFingerprint, SeriesId>,
     forward_index: ForwardIndex,
     inverted_index: InvertedIndex,
+    metadata: HashMap<String, MetricMetadata>,
     /// Samples keyed by series_id, with metric name for key encoding.
     samples: HashMap<SeriesId, SeriesSamples>,
     next_series_id: u32,
@@ -69,6 +73,7 @@ impl TsdbWriteDelta {
             mut labels,
             metric_type,
             unit,
+            description,
             samples,
             ..
         } = series;
@@ -94,7 +99,7 @@ impl TsdbWriteDelta {
                 ));
             }
             let id = *series_id.get_or_insert_with(|| {
-                self.resolve_series(&labels, fingerprint, &unit, metric_type)
+                self.resolve_series(&labels, fingerprint, &unit, metric_type, &description)
             });
             self.samples
                 .entry(id)
@@ -119,7 +124,23 @@ impl TsdbWriteDelta {
         fingerprint: SeriesFingerprint,
         unit: &Option<String>,
         metric_type: Option<MetricType>,
+        description: &Option<String>,
     ) -> SeriesId {
+        if let Some(metric_name) = labels
+            .iter()
+            .find(|label| label.name == "__name__")
+            .map(|label| label.value.clone())
+        {
+            self.metadata.insert(
+                metric_name.clone(),
+                MetricMetadata {
+                    metric_name,
+                    metric_type,
+                    description: description.clone(),
+                    unit: unit.clone(),
+                },
+            );
+        }
         if let Some(&id) = self.series_dict_delta.get(&fingerprint) {
             id
         } else if let Some(&id) = self.series_dict_base.get(&fingerprint) {
@@ -173,6 +194,7 @@ impl Delta for TsdbWriteDelta {
             series_dict_delta: HashMap::new(),
             forward_index: ForwardIndex::default(),
             inverted_index: InvertedIndex::default(),
+            metadata: HashMap::new(),
             samples: HashMap::new(),
             next_series_id: context.next_series_id,
             active_series: context.active_series,
@@ -220,6 +242,7 @@ impl Delta for TsdbWriteDelta {
             routing_slot: self.routing_slot,
             forward_index: self.forward_index,
             inverted_index: self.inverted_index,
+            metadata: self.metadata,
             series_dict_delta: self.series_dict_delta,
             samples: self.samples,
         };

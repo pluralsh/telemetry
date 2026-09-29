@@ -33,8 +33,15 @@ ulid.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion = "0.8.2"
+lz4_flex = "0.14.0"
 proptest.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 slatedb = { workspace = true, features = ["test-util"] }
 slatedb-common = { workspace = true, features = ["test-util"] }
+zstd = "0.14.0"
+
+[[bench]]
+name = "discovery_catalog"
+harness = false

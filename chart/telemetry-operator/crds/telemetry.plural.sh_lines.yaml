@@ -1322,6 +1322,30 @@ spec:
                       NodeSelector is merged with podTemplate.spec.nodeSelector. Values here
                       take precedence when the same key is configured in both places.
                     type: object
+                  persistentVolumeClaimRetentionPolicy:
+                    description: |-
+                      PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs
+                      are retained or deleted when the workload is deleted or scaled down.
+                      When omitted, remote and in-memory object stores default to Delete while
+                      Local object stores default to Retain because the data PVC is authoritative.
+                    properties:
+                      whenDeleted:
+                        description: |-
+                          WhenDeleted controls PVC retention when the StatefulSet is deleted.
+                          When omitted, the object-store-dependent workload default is used.
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
+                      whenScaled:
+                        description: |-
+                          WhenScaled controls PVC retention when StatefulSet replicas are reduced.
+                          When omitted, the object-store-dependent workload default is used.
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
+                    type: object
                   podTemplate:
                     description: |-
                       PodTemplate is the full Kubernetes pod template escape hatch. Operator
@@ -10042,6 +10066,30 @@ spec:
                     description: |-
                       NodeSelector is merged with podTemplate.spec.nodeSelector. Values here
                       take precedence when the same key is configured in both places.
+                    type: object
+                  persistentVolumeClaimRetentionPolicy:
+                    description: |-
+                      PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs
+                      are retained or deleted when the workload is deleted or scaled down.
+                      When omitted, remote and in-memory object stores default to Delete while
+                      Local object stores default to Retain because the data PVC is authoritative.
+                    properties:
+                      whenDeleted:
+                        description: |-
+                          WhenDeleted controls PVC retention when the StatefulSet is deleted.
+                          When omitted, the object-store-dependent workload default is used.
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
+                      whenScaled:
+                        description: |-
+                          WhenScaled controls PVC retention when StatefulSet replicas are reduced.
+                          When omitted, the object-store-dependent workload default is used.
+                        enum:
+                        - Retain
+                        - Delete
+                        type: string
                     type: object
                   podTemplate:
                     description: |-

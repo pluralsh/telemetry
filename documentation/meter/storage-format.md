@@ -27,6 +27,16 @@ BLAKE3 over the exact canonical Meter routing key used by `ShardedMeter`:
 namespace bytes followed by sorted `(label name, label value)` pairs separated
 with zero bytes.
 
+Each namespace/time-bucket partition also contains the shared discovery
+catalog under reserved routing slot `0xffff` and catalog format version `1`.
+Meter records label names,
+string values, and metric type/unit/help metadata there with the same TTL and
+in the same atomic storage apply as the primary indexes and samples. Catalog
+reads therefore scan one compact prefix per stored bucket instead of all 4096
+data routing slots, then union results across physical shards. Existing
+prerelease data must be reset and reingested; there is no legacy discovery
+fallback or backfill.
+
 Series IDs are allocated independently per `(bucket, routing slot)`. The
 stored `u32` sequence starts at the slot and advances by 4096, preserving
 bucket-wide uniqueness when query indexes combine multiple owned slots while

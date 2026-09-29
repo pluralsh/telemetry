@@ -30,7 +30,7 @@ impl Label {
 }
 
 /// Sorted, unique labels identifying one log stream.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Labels(Vec<Label>);
 

@@ -4,18 +4,21 @@
 // you may not use this file except in compliance with the License.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{
     Delta, Durability as CoordinatorDurability, Flusher, WriteCoordinator, WriteCoordinatorHandle,
     WriteError,
+};
+use common::discovery::{
+    CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
 use common::storage::{
     PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
@@ -34,6 +37,7 @@ use crate::codec::{
     encode_labels, encode_metadata, encode_page_sequence, encode_postings, encode_stream_id,
     field_stats_key, forward_key, forward_range, metadata_key, metadata_range,
     next_page_sequence_key, next_stream_id_key, payload_key, posting_key, segment_for,
+    segment_prefix,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -117,6 +121,8 @@ pub struct LogDb {
     owned_slots: Range<u16>,
     write_handle: Option<WriteCoordinatorHandle<LineWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<LineWriteDelta, LineFlusher>>>,
+    label_names_cache: DiscoveryCache<(Namespace, SegmentId), Vec<String>>,
+    label_values_cache: DiscoveryCache<(Namespace, SegmentId, String), Vec<String>>,
 }
 
 impl LogDb {
@@ -165,6 +171,8 @@ impl LogDb {
             owned_slots,
             write_handle: Some(write_handle),
             write_coordinator: Mutex::new(Some(write_coordinator)),
+            label_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
+            label_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
         })
     }
 
@@ -196,6 +204,8 @@ impl LogDb {
             owned_slots,
             write_handle: None,
             write_coordinator: Mutex::new(None),
+            label_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
+            label_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
         })
     }
 
@@ -225,6 +235,8 @@ impl LogDb {
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
+        self.label_names_cache.clear();
+        self.label_values_cache.clear();
         if let Some((_, slot, _)) = groups
             .keys()
             .find(|(_, slot, _)| !self.owned_slots.contains(slot))
@@ -479,6 +491,14 @@ impl DirectWriter {
             report,
             ..
         } = write;
+        let mut catalogs: BTreeMap<SegmentId, CatalogBatch> = BTreeMap::new();
+        for (segment, _, label) in postings.keys() {
+            catalogs.entry(*segment).or_default().insert(
+                "",
+                &label.name,
+                DiscoveryValue::String(label.value.clone()),
+            );
+        }
         for ((segment, slot), next) in next_stream_ids {
             ops.push(put(
                 next_stream_id_key(namespace, segment, slot),
@@ -492,6 +512,9 @@ impl DirectWriter {
                 encode_postings(&bitmap)?,
                 ttl,
             ));
+        }
+        for (segment, catalog) in catalogs {
+            ops.extend(catalog.into_ops(&segment_prefix(namespace, segment), ttl));
         }
         for ((segment, slot), delta) in search_deltas {
             self.append_search_index_ops(&mut ops, namespace, segment, slot, delta, ttl)
@@ -575,6 +598,149 @@ impl DirectWriter {
 }
 
 impl LogDb {
+    /// Returns stream-label names present in every segment touched by the
+    /// inclusive time range.
+    pub async fn label_names(
+        &self,
+        namespace: &Namespace,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<String>> {
+        self.validate_discovery_range(start_ns, end_ns)?;
+        let mut result = BTreeSet::new();
+        for segment in self.discovery_segments(start_ns, end_ns)? {
+            let key = (namespace.clone(), segment);
+            let names = if let Some(names) = self.label_names_cache.get(&key) {
+                names
+            } else {
+                let names = catalog_names(
+                    self.storage.as_ref(),
+                    &segment_prefix(namespace, segment),
+                    Some(""),
+                )
+                .await?;
+                self.label_names_cache
+                    .insert(key, names, self.is_active_segment(segment))
+            };
+            result.extend(names.iter().cloned());
+        }
+        Ok(result.into_iter().collect())
+    }
+
+    /// Returns values for one stream label across every touched time segment.
+    pub async fn label_values(
+        &self,
+        namespace: &Namespace,
+        name: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<String>> {
+        self.validate_discovery_range(start_ns, end_ns)?;
+        let mut result = BTreeSet::new();
+        for segment in self.discovery_segments(start_ns, end_ns)? {
+            let key = (namespace.clone(), segment, name.to_owned());
+            let values = if let Some(values) = self.label_values_cache.get(&key) {
+                values
+            } else {
+                let mut strings = Vec::new();
+                for value in catalog_values(
+                    self.storage.as_ref(),
+                    &segment_prefix(namespace, segment),
+                    "",
+                    name,
+                )
+                .await?
+                {
+                    match value {
+                        DiscoveryValue::String(value) => strings.push(value),
+                        _ => {
+                            return Err(Error::Corrupt(
+                                "stream-label catalog contains a non-string value".into(),
+                            ));
+                        }
+                    }
+                }
+                self.label_values_cache
+                    .insert(key, strings, self.is_active_segment(segment))
+            };
+            result.extend(values.iter().cloned());
+        }
+        Ok(result.into_iter().collect())
+    }
+
+    /// Reconstructs stream label sets selected by Loki stream selectors.
+    pub async fn series(
+        &self,
+        namespace: &Namespace,
+        selectors: &[String],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<Labels>> {
+        self.validate_discovery_range(start_ns, end_ns)?;
+        if selectors.is_empty() {
+            return Err(Error::Invalid(
+                "series requires at least one match[] selector".into(),
+            ));
+        }
+        let selectors = selectors
+            .iter()
+            .map(|selector| SeriesSelector::parse(selector))
+            .collect::<Result<Vec<_>>>()?;
+        let mut result = BTreeSet::new();
+        for segment in self.discovery_segments(start_ns, end_ns)? {
+            for selector in &selectors {
+                for (slot, stream_id) in
+                    self.stream_ids(namespace, segment, &selector.exact).await?
+                {
+                    let record = self
+                        .storage
+                        .get(forward_key(namespace, segment, slot, stream_id))
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corrupt("posting references missing forward labels".into())
+                        })?;
+                    let labels = decode_labels(&record.value)?;
+                    if selector.matches(&labels) {
+                        result.insert(labels);
+                    }
+                }
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+
+    fn validate_discovery_range(&self, start_ns: i64, end_ns: i64) -> Result<()> {
+        if end_ns < start_ns {
+            Err(Error::Invalid("end_ns must be >= start_ns".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn discovery_segments(&self, start_ns: i64, end_ns: i64) -> Result<Vec<SegmentId>> {
+        let last = segment_for(end_ns, self.segment_ns);
+        let mut segment = segment_for(start_ns, self.segment_ns);
+        let mut result = Vec::new();
+        loop {
+            result.push(segment);
+            if segment == last {
+                return Ok(result);
+            }
+            segment = segment
+                .checked_add(self.segment_ns)
+                .ok_or_else(|| Error::Invalid("discovery segment range overflow".into()))?;
+        }
+    }
+
+    fn is_active_segment(&self, segment: SegmentId) -> bool {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(i64::MAX);
+        segment_for(now_ns, self.segment_ns) == segment
+    }
+
     /// Reads rows in the inclusive timestamp range matching every exact label.
     pub async fn read(
         &self,
@@ -957,6 +1123,85 @@ impl LogDb {
         }
         Ok(streams)
     }
+}
+
+struct SeriesSelector {
+    exact: Vec<Label>,
+    matchers: Vec<SeriesMatcher>,
+}
+
+enum SeriesMatcher {
+    Equal(String, String),
+    NotEqual(String, String),
+    Regex(String, regex::Regex),
+    NotRegex(String, regex::Regex),
+}
+
+impl SeriesSelector {
+    fn parse(source: &str) -> Result<Self> {
+        use crate::logql::{Expr, MatchOp};
+
+        let query = crate::logql::parse(source).map_err(|error| Error::Query(error.to_string()))?;
+        let Expr::Log(log) = query.value else {
+            return Err(Error::Invalid(
+                "series match[] must be a stream selector".into(),
+            ));
+        };
+        if !log.stages.is_empty() || log.range.is_some() || log.offset.is_some() {
+            return Err(Error::Invalid(
+                "series match[] must contain only a stream selector".into(),
+            ));
+        }
+        let mut exact = Vec::new();
+        let mut matchers = Vec::with_capacity(log.selector.value.matchers.len());
+        for matcher in log.selector.value.matchers {
+            let matcher = matcher.value;
+            let name = matcher.label;
+            let value = matcher.value;
+            match matcher.op {
+                MatchOp::Equal => {
+                    exact.push(Label::new(&name, &value));
+                    matchers.push(SeriesMatcher::Equal(name, value));
+                }
+                MatchOp::NotEqual => {
+                    matchers.push(SeriesMatcher::NotEqual(name, value));
+                }
+                MatchOp::Regex => {
+                    matchers.push(SeriesMatcher::Regex(name, anchored_regex(&value)?));
+                }
+                MatchOp::NotRegex => {
+                    matchers.push(SeriesMatcher::NotRegex(name, anchored_regex(&value)?));
+                }
+            }
+        }
+        Ok(Self { exact, matchers })
+    }
+
+    fn matches(&self, labels: &Labels) -> bool {
+        self.matchers.iter().all(|matcher| {
+            let (name, expected) = match matcher {
+                SeriesMatcher::Equal(name, value) | SeriesMatcher::NotEqual(name, value) => {
+                    (name, Some(value))
+                }
+                SeriesMatcher::Regex(name, _) | SeriesMatcher::NotRegex(name, _) => (name, None),
+            };
+            let actual = labels
+                .iter()
+                .find(|label| label.name == *name)
+                .map_or("", |label| label.value.as_str());
+            match (matcher, expected) {
+                (SeriesMatcher::Equal(_, _), Some(expected)) => actual == expected,
+                (SeriesMatcher::NotEqual(_, _), Some(expected)) => actual != expected,
+                (SeriesMatcher::Regex(_, regex), None) => regex.is_match(actual),
+                (SeriesMatcher::NotRegex(_, regex), None) => !regex.is_match(actual),
+                _ => unreachable!(),
+            }
+        })
+    }
+}
+
+fn anchored_regex(pattern: &str) -> Result<regex::Regex> {
+    Ok(regex::Regex::new(&format!("^(?:{pattern})$"))?)
 }
 
 type StreamGroups = BTreeMap<(SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
@@ -1375,6 +1620,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovers_stream_labels_and_series_across_segments() {
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("discovery").unwrap();
+        db.write(
+            &namespace,
+            vec![
+                LogBatch::new(labels("api", "prod"), vec![LogEntry::new(1, "first")]),
+                LogBatch::new(
+                    labels("worker", "staging"),
+                    vec![LogEntry::new(11_000_000_000, "second")],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.label_names(&namespace, 0, 12_000_000_000).await.unwrap(),
+            vec!["environment", "service"]
+        );
+        assert_eq!(
+            db.label_values(&namespace, "service", 0, 12_000_000_000)
+                .await
+                .unwrap(),
+            vec!["api", "worker"]
+        );
+        assert_eq!(
+            db.label_values(&namespace, "environment", 0, 9_000_000_000)
+                .await
+                .unwrap(),
+            vec!["prod"]
+        );
+
+        let series = db
+            .series(
+                &namespace,
+                &[r#"{service=~"api|worker",environment!="staging"}"#.to_owned()],
+                0,
+                12_000_000_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(series, vec![labels("api", "prod")]);
         db.close().await.unwrap();
     }
 

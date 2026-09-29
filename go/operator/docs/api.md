@@ -694,6 +694,40 @@ _Appears in:_
 | `Gcp` |  |
 
 
+#### PersistentVolumeClaimRetentionPolicySpec
+
+
+
+
+
+
+
+_Appears in:_
+- [WorkloadSpec](#workloadspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `whenDeleted` _[PersistentVolumeClaimRetentionPolicyType](#persistentvolumeclaimretentionpolicytype)_ | WhenDeleted controls PVC retention when the StatefulSet is deleted.<br />When omitted, the object-store-dependent workload default is used. |  | Enum: [Retain Delete] <br /> |
+| `whenScaled` _[PersistentVolumeClaimRetentionPolicyType](#persistentvolumeclaimretentionpolicytype)_ | WhenScaled controls PVC retention when StatefulSet replicas are reduced.<br />When omitted, the object-store-dependent workload default is used. |  | Enum: [Retain Delete] <br /> |
+
+
+#### PersistentVolumeClaimRetentionPolicyType
+
+_Underlying type:_ _string_
+
+
+
+
+
+_Appears in:_
+- [PersistentVolumeClaimRetentionPolicySpec](#persistentvolumeclaimretentionpolicyspec)
+
+| Field | Description |
+| --- | --- |
+| `Retain` |  |
+| `Delete` |  |
+
+
 
 
 #### PseudoFS
@@ -1142,6 +1176,7 @@ _Appears in:_
 | `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ | PodTemplate is the full Kubernetes pod template escape hatch. Operator<br />required fields and the first-class scheduling fields are merged into it. |  |  |
 | `dataVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `cacheVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
+| `persistentVolumeClaimRetentionPolicy` _[PersistentVolumeClaimRetentionPolicySpec](#persistentvolumeclaimretentionpolicyspec)_ | PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs<br />are retained or deleted when the workload is deleted or scaled down.<br />When omitted, remote and in-memory object stores default to Delete while<br />Local object stores default to Retain because the data PVC is authoritative. |  |  |
 
 
 #### WriteSpec

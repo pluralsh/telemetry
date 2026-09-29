@@ -415,12 +415,34 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, component)},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: lo.Ternary(meter.Descriptor.GRPCOnly, name, Name(name, "headless")), Replicas: Replicas(meter, component),
-			PodManagementPolicy: appsv1.ParallelPodManagement,
-			UpdateStrategy:      appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			Selector:            &metav1.LabelSelector{MatchLabels: SelectorLabels(meter, component)},
-			Template:            template, VolumeClaimTemplates: claims,
+			PodManagementPolicy:                  appsv1.ParallelPodManagement,
+			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+			Selector:                             &metav1.LabelSelector{MatchLabels: SelectorLabels(meter, component)},
+			Template:                             template,
+			VolumeClaimTemplates:                 claims,
+			PersistentVolumeClaimRetentionPolicy: persistentVolumeClaimRetentionPolicy(meter, workload),
 		},
 	}, nil
+}
+
+func persistentVolumeClaimRetentionPolicy(meter *Product, workload telemetryv1alpha1.WorkloadSpec) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
+	defaultPolicy := appsv1.DeletePersistentVolumeClaimRetentionPolicyType
+	if meter.Storage.ObjectStore.Type == "" || meter.Storage.ObjectStore.Type == telemetryv1alpha1.ObjectStoreLocal {
+		defaultPolicy = appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	}
+	whenDeleted, whenScaled := defaultPolicy, defaultPolicy
+	if configured := workload.PersistentVolumeClaimRetentionPolicy; configured != nil {
+		if configured.WhenDeleted != "" {
+			whenDeleted = appsv1.PersistentVolumeClaimRetentionPolicyType(configured.WhenDeleted)
+		}
+		if configured.WhenScaled != "" {
+			whenScaled = appsv1.PersistentVolumeClaimRetentionPolicyType(configured.WhenScaled)
+		}
+	}
+	return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: whenDeleted,
+		WhenScaled:  whenScaled,
+	}
 }
 
 func volumeSpec(configured *telemetryv1alpha1.VolumeSpec, size resource.Quantity) telemetryv1alpha1.VolumeSpec {

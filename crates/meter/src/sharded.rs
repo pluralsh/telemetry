@@ -1096,6 +1096,13 @@ impl ReaderHandle {
         range: R,
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let _permit = acquire_io_permit(&permits).await;
+            return match self {
+                Self::Writer(db) => db.labels(namespace, None, range).await,
+                Self::Reader(db) => db.labels(namespace, None, range).await,
+            };
+        }
         let (start, end) = crate::util::range_bounds_to_secs(range)?;
         let reader = match self {
             Self::Writer(db) => ShardQueryReader::Writer(
@@ -1120,6 +1127,13 @@ impl ReaderHandle {
         range: R,
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let _permit = acquire_io_permit(&permits).await;
+            return match self {
+                Self::Writer(db) => db.label_values(namespace, label_name, None, range).await,
+                Self::Reader(db) => db.label_values(namespace, label_name, None, range).await,
+            };
+        }
         let (start, end) = crate::util::range_bounds_to_secs(range)?;
         let reader = match self {
             Self::Writer(db) => ShardQueryReader::Writer(
@@ -1488,6 +1502,22 @@ mod tests {
             ),
         ];
         write_both(&sharded, &unsharded, series).await;
+        let start = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_millis((TEST_TIME_MS - 1_000) as u64);
+        let end = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_millis((TEST_TIME_MS + 1_000) as u64);
+        assert_eq!(
+            sharded
+                .label_values(
+                    &Namespace::new("global-query-regression").unwrap(),
+                    "region",
+                    None,
+                    start..=end,
+                )
+                .await
+                .unwrap(),
+            vec!["east", "west"]
+        );
         assert_matches_unsharded(&sharded, &unsharded, "sum by (region) (requests_total)").await;
     }
 

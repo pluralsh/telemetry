@@ -111,6 +111,25 @@ def test_metric_endpoints_match_loki(
 
 
 @pytest.mark.docker
+def test_metadata_endpoints_match_loki(
+    stack: tuple[ComposeProject, int, int],
+) -> None:
+    _, start, end = stack
+    assert_equivalent(
+        LOKI.label_names(start_ns=start, end_ns=end),
+        LINE.label_names(start_ns=start, end_ns=end),
+    )
+    assert_equivalent(
+        LOKI.label_values("app", start_ns=start, end_ns=end),
+        LINE.label_values("app", start_ns=start, end_ns=end),
+    )
+    assert_equivalent(
+        LOKI.series(['{app=~"json|protobuf"}'], start_ns=start, end_ns=end),
+        LINE.series(['{app=~"json|protobuf"}'], start_ns=start, end_ns=end),
+    )
+
+
+@pytest.mark.docker
 def test_snappy_and_otlp_fixtures_are_queryable(
     stack: tuple[ComposeProject, int, int],
 ) -> None:

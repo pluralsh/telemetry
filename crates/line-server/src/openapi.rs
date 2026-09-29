@@ -116,6 +116,76 @@ fn query_range_get() {}
 fn query_range_post() {}
 
 #[utoipa::path(
+    get,
+    path = "/read/ns/{namespace}/loki/api/v1/labels",
+    tag = "metadata",
+    params(
+        ("namespace" = String, Path),
+        ("start" = Option<String>, Query, description = "Range start as nanoseconds, seconds, or RFC3339"),
+        ("end" = Option<String>, Query, description = "Range end as nanoseconds, seconds, or RFC3339"),
+        ("since" = Option<String>, Query, description = "Default lookback when start is omitted")
+    ),
+    responses(
+        (status = 200, description = "Sorted stream-label names", body = LokiEnvelope),
+        (status = 400, description = "Invalid time range", body = ErrorEnvelope),
+        (status = 401, description = "Authentication required")
+    )
+)]
+fn label_names() {}
+
+#[utoipa::path(
+    get,
+    path = "/read/ns/{namespace}/loki/api/v1/label/{name}/values",
+    tag = "metadata",
+    params(
+        ("namespace" = String, Path),
+        ("name" = String, Path, description = "Stream-label name"),
+        ("start" = Option<String>, Query),
+        ("end" = Option<String>, Query),
+        ("since" = Option<String>, Query)
+    ),
+    responses(
+        (status = 200, description = "Sorted values for the stream label", body = LokiEnvelope),
+        (status = 400, description = "Invalid time range", body = ErrorEnvelope),
+        (status = 401, description = "Authentication required")
+    )
+)]
+fn label_values() {}
+
+#[utoipa::path(
+    get,
+    path = "/read/ns/{namespace}/loki/api/v1/series",
+    tag = "metadata",
+    params(
+        ("namespace" = String, Path),
+        ("match[]" = Vec<String>, Query, description = "One or more Loki stream selectors"),
+        ("start" = Option<String>, Query),
+        ("end" = Option<String>, Query),
+        ("since" = Option<String>, Query)
+    ),
+    responses(
+        (status = 200, description = "Matching stream label sets", body = LokiEnvelope),
+        (status = 400, description = "Invalid selector or time range", body = ErrorEnvelope),
+        (status = 401, description = "Authentication required")
+    )
+)]
+fn series_get() {}
+
+#[utoipa::path(
+    post,
+    path = "/read/ns/{namespace}/loki/api/v1/series",
+    tag = "metadata",
+    params(("namespace" = String, Path)),
+    request_body(content = String, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Matching stream label sets", body = LokiEnvelope),
+        (status = 400, description = "Invalid selector or time range", body = ErrorEnvelope),
+        (status = 401, description = "Authentication required")
+    )
+)]
+fn series_post() {}
+
+#[utoipa::path(
     post,
     path = "/write/ns/{namespace}/loki/api/v1/push",
     tag = "ingest",
@@ -169,6 +239,10 @@ fn otlp_logs() {}
         query_post,
         query_range_get,
         query_range_post,
+        label_names,
+        label_values,
+        series_get,
+        series_post,
         loki_push,
         otlp_logs
     ),
@@ -182,6 +256,7 @@ fn otlp_logs() {}
     )),
     tags(
         (name = "query", description = "LogQL query"),
+        (name = "metadata", description = "Stream-label discovery"),
         (name = "ingest", description = "Loki and OTLP ingestion"),
         (name = "operations", description = "Health and readiness")
     )

@@ -181,6 +181,42 @@ class LokiClient:
         )
         return json.loads(body)
 
+    def label_names(self, *, start_ns: int, end_ns: int) -> dict[str, Any]:
+        parameters = urllib.parse.urlencode({"start": start_ns, "end": end_ns})
+        return json.loads(
+            self._request(
+                "GET", f"{self.read_prefix}/loki/api/v1/labels?{parameters}"
+            )
+        )
+
+    def label_values(
+        self, name: str, *, start_ns: int, end_ns: int
+    ) -> dict[str, Any]:
+        parameters = urllib.parse.urlencode({"start": start_ns, "end": end_ns})
+        name = urllib.parse.quote(name, safe="")
+        return json.loads(
+            self._request(
+                "GET",
+                f"{self.read_prefix}/loki/api/v1/label/{name}/values?{parameters}",
+            )
+        )
+
+    def series(
+        self, selectors: list[str], *, start_ns: int, end_ns: int
+    ) -> dict[str, Any]:
+        parameters = urllib.parse.urlencode(
+            [
+                *(("match[]", selector) for selector in selectors),
+                ("start", str(start_ns)),
+                ("end", str(end_ns)),
+            ]
+        )
+        return json.loads(
+            self._request(
+                "GET", f"{self.read_prefix}/loki/api/v1/series?{parameters}"
+            )
+        )
+
     def wait_for(
         self,
         query: str,

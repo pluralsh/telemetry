@@ -17,6 +17,18 @@ Common key scope
 
 `TerminatedBytes` escapes embedded delimiters and ends with `0x00`.
 
+Each namespace/time-segment partition also contains the shared discovery
+catalog under reserved routing slot `0xffff` and catalog format version `1`.
+Track records resource- and
+span-scoped attribute names plus typed scalar values there with the same TTL
+and in the same atomic storage apply as page records and attribute postings.
+Tempo tag discovery scans these compact partition prefixes and does not fetch
+trace payloads. A compact set of live segment IDs is stored as typed catalog
+values in the existing locator segment (`i64::MIN`), so unbounded tag requests
+discover partitions without scanning routing slots or trace locators. Results
+are unioned across physical shards. Existing prerelease data must be reset and
+reingested; there is no legacy discovery fallback or backfill.
+
 | ID | Record | Purpose |
 | --- | --- | --- |
 | `0x01` | Next page sequence | Allocates page IDs within a segment |

@@ -1,0 +1,6 @@
+# SlateDB settings shared by Meter, Line, and Track.
+#
+# Zstd reduces object-store transfer and is well suited to string-heavy
+# discovery catalogs. Use "lz4" instead when lower compression CPU is more
+# important than storage size.
+compression_codec = "zstd"

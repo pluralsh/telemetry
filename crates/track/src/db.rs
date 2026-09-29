@@ -15,6 +15,7 @@ use common::coordinator::{
     Delta, Durability as CoordinatorDurability, Flusher, WriteCoordinator, WriteCoordinatorHandle,
     WriteError,
 };
+use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
 use common::storage::{
     PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, StorageSnapshot, Ttl,
 };
@@ -29,11 +30,11 @@ use slatedb::config::DbReaderOptions;
 use tokio::sync::Mutex;
 
 use crate::codec::{
-    PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices, decode_locator,
-    decode_locator_trace_id, decode_metadata, decode_posting_sequence, decode_sequence,
-    encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key, locator_range,
-    locator_slot_range, metadata_key, metadata_range, next_sequence_key, payload_key, posting_key,
-    posting_range, segment_for,
+    LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices,
+    decode_locator, decode_locator_trace_id, decode_metadata, decode_posting_sequence,
+    decode_sequence, encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key,
+    locator_range, locator_slot_range, metadata_key, metadata_range, next_sequence_key,
+    payload_key, posting_key, posting_range, segment_for, segment_prefix,
 };
 
 /// Concurrent storage reads per query stage.
@@ -47,6 +48,8 @@ use crate::{
 
 const WRITE_CHANNEL: &str = "write";
 const TRACK_FLUSH_PAGES: &str = "track_flush_pages";
+const PARTITION_SCOPE: &str = "partition";
+const PARTITION_NAME: &str = "segment";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
@@ -81,6 +84,10 @@ pub struct TraceDb {
     write_coordinator: Mutex<Option<WriteCoordinator<TraceWriteDelta, TraceFlusher>>>,
     segment_ns: u64,
     owned_slots: Range<u16>,
+    catalog_names_cache:
+        DiscoveryCache<(Namespace, SegmentId, Option<AttributeScope>), Vec<String>>,
+    catalog_values_cache:
+        DiscoveryCache<(Namespace, SegmentId, Option<AttributeScope>, String), Vec<DiscoveryValue>>,
 }
 
 impl TraceDb {
@@ -127,6 +134,8 @@ impl TraceDb {
             write_coordinator: Mutex::new(Some(write_coordinator)),
             segment_ns,
             owned_slots,
+            catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
+            catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
         })
     }
 
@@ -159,6 +168,8 @@ impl TraceDb {
             write_coordinator: Mutex::new(None),
             segment_ns,
             owned_slots,
+            catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
+            catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
         })
     }
 
@@ -209,6 +220,8 @@ impl TraceDb {
         for traces in groups.values_mut() {
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
+        self.catalog_names_cache.clear();
+        self.catalog_values_cache.clear();
         let write = TraceWrite {
             namespace: namespace.clone(),
             groups,
@@ -486,6 +499,128 @@ impl TraceDb {
     pub async fn scan_traces(&self, namespace: &Namespace, limit: usize) -> Result<Vec<Trace>> {
         let scanned = self.scan_trace_ids(namespace, limit).await?;
         self.load_scanned(namespace, scanned).await
+    }
+
+    /// Lists typed scalar attribute names from the partition-local discovery
+    /// catalog without reading trace payloads.
+    pub async fn catalog_names(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        scope: Option<AttributeScope>,
+    ) -> Result<Vec<String>> {
+        let segments = self.catalog_segments(namespace, start_ns, end_ns).await?;
+        let mut names = BTreeSet::new();
+        for segment in segments {
+            let key = (namespace.clone(), segment, scope);
+            let segment_names = if let Some(names) = self.catalog_names_cache.get(&key) {
+                names
+            } else {
+                let names = discovery::names(
+                    self.storage.as_ref(),
+                    &segment_prefix(namespace, segment),
+                    scope.map(catalog_scope),
+                )
+                .await?;
+                self.catalog_names_cache
+                    .insert(key, names, self.is_active_segment(segment))
+            };
+            names.extend(segment_names.iter().cloned());
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// Lists typed scalar attribute values from the partition-local discovery
+    /// catalog without reading trace payloads.
+    pub async fn catalog_values(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        scope: Option<AttributeScope>,
+        name: &str,
+    ) -> Result<Vec<DiscoveryValue>> {
+        let segments = self.catalog_segments(namespace, start_ns, end_ns).await?;
+        let scopes: &[AttributeScope] = match scope {
+            Some(AttributeScope::Resource) => &[AttributeScope::Resource],
+            Some(AttributeScope::Span) => &[AttributeScope::Span],
+            None => &[AttributeScope::Resource, AttributeScope::Span],
+        };
+        let mut values = BTreeSet::new();
+        for segment in segments {
+            let key = (namespace.clone(), segment, scope, name.to_owned());
+            let segment_values = if let Some(values) = self.catalog_values_cache.get(&key) {
+                values
+            } else {
+                let prefix = segment_prefix(namespace, segment);
+                let mut found = BTreeSet::new();
+                for scope in scopes {
+                    found.extend(
+                        discovery::values(
+                            self.storage.as_ref(),
+                            &prefix,
+                            catalog_scope(*scope),
+                            name,
+                        )
+                        .await?,
+                    );
+                }
+                self.catalog_values_cache.insert(
+                    key,
+                    found.into_iter().collect(),
+                    self.is_active_segment(segment),
+                )
+            };
+            values.extend(segment_values.iter().cloned());
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    fn is_active_segment(&self, segment: SegmentId) -> bool {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(u64::MAX);
+        segment_for(now_ns, self.segment_ns) == segment
+    }
+
+    /// Finds live data partitions from the compact namespace partition
+    /// catalog, without routing-slot or trace-locator fan-out.
+    async fn catalog_segments(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Result<BTreeSet<SegmentId>> {
+        if end_ns < start_ns {
+            return Err(Error::Invalid("end_ns must be >= start_ns".to_owned()));
+        }
+        let first = segment_for(start_ns, self.segment_ns);
+        let last = segment_for(end_ns, self.segment_ns);
+        let mut segments = BTreeSet::new();
+        for value in discovery::values(
+            self.storage.as_ref(),
+            &segment_prefix(namespace, LOCATOR_SEGMENT),
+            PARTITION_SCOPE,
+            PARTITION_NAME,
+        )
+        .await?
+        {
+            match value {
+                DiscoveryValue::Int(segment) if segment >= first && segment <= last => {
+                    segments.insert(segment);
+                }
+                DiscoveryValue::Int(_) => {}
+                _ => {
+                    return Err(Error::Corrupt(
+                        "track partition catalog contains a non-integer segment".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(segments)
     }
 
     /// The first `limit` live trace IDs in ID order, with each trace's first
@@ -935,8 +1070,19 @@ async fn direct_write(
     }
     let retention = retention_values(retention)?;
     let mut ops = Vec::new();
+    let mut catalogs = BTreeMap::<(Namespace, SegmentId), CatalogBatch>::new();
+    let mut partition_catalogs = BTreeMap::<Namespace, CatalogBatch>::new();
     let mut pages = 0usize;
     for ((namespace, segment, slot), traces) in groups {
+        partition_catalogs
+            .entry(namespace.clone())
+            .or_default()
+            .insert(
+                PARTITION_SCOPE,
+                PARTITION_NAME,
+                DiscoveryValue::Int(segment),
+            );
+        let catalog = catalogs.entry((namespace.clone(), segment)).or_default();
         let sequence_key = next_sequence_key(&namespace, segment, slot);
         let mut sequence = storage
             .get(sequence_key.clone())
@@ -957,6 +1103,7 @@ async fn direct_write(
                 &page,
                 &traces,
                 retention,
+                catalog,
             )?;
             sequence = sequence
                 .checked_add(1)
@@ -975,6 +1122,15 @@ async fn direct_write(
         ops.push(put(
             sequence_key,
             encode_sequence(sequence),
+            retention.physical_ttl,
+        ));
+    }
+    for ((namespace, segment), catalog) in catalogs {
+        ops.extend(catalog.into_ops(&segment_prefix(&namespace, segment), retention.physical_ttl));
+    }
+    for (namespace, catalog) in partition_catalogs {
+        ops.extend(catalog.into_ops(
+            &segment_prefix(&namespace, LOCATOR_SEGMENT),
             retention.physical_ttl,
         ));
     }
@@ -1074,6 +1230,7 @@ fn append_page_ops(
     page: &Page,
     traces: &[Trace],
     retention: Retention,
+    catalog: &mut CatalogBatch,
 ) -> Result<()> {
     let directory = page.directory();
     let metadata = StoredPageMetadata {
@@ -1127,6 +1284,11 @@ fn append_page_ops(
         let mut seen = Vec::new();
         collect_trace_attributes(trace, &mut seen);
         for matcher in seen {
+            catalog.insert(
+                catalog_scope(matcher.scope),
+                matcher.name.clone(),
+                discovery_value(&matcher.value),
+            );
             postings
                 .entry(posting_key(
                     namespace,
@@ -1145,6 +1307,22 @@ fn append_page_ops(
         ops.push(put(key, encode_indices(&indices)?, retention.physical_ttl));
     }
     Ok(())
+}
+
+fn catalog_scope(scope: AttributeScope) -> &'static str {
+    match scope {
+        AttributeScope::Resource => "resource",
+        AttributeScope::Span => "span",
+    }
+}
+
+fn discovery_value(value: &AttributeValue) -> DiscoveryValue {
+    match value {
+        AttributeValue::String(value) => DiscoveryValue::String(value.clone()),
+        AttributeValue::Bool(value) => DiscoveryValue::Bool(*value),
+        AttributeValue::Int(value) => DiscoveryValue::Int(*value),
+        AttributeValue::Double(value) => DiscoveryValue::Double(*value),
+    }
 }
 
 fn collect_trace_attributes(trace: &Trace, output: &mut Vec<AttributeMatcher>) {
@@ -1850,6 +2028,113 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].trace_id, variants[1].trace_id);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_deduplicates_pages_and_segments_without_payload_reads() {
+        let mut config = test_config();
+        config.page.max_traces = 1;
+        let db = TraceDb::open(config).await.unwrap();
+        let namespace = Namespace::new("catalog").unwrap();
+        let traces = vec![
+            trace(
+                1,
+                1,
+                "first",
+                vec![attr(
+                    "service.name",
+                    any_value::Value::StringValue("api".into()),
+                )],
+                vec![attr("code", any_value::Value::IntValue(200))],
+            ),
+            trace(
+                2,
+                2,
+                "second",
+                vec![attr(
+                    "service.name",
+                    any_value::Value::StringValue("api".into()),
+                )],
+                vec![attr("error", any_value::Value::BoolValue(true))],
+            ),
+            trace(
+                3,
+                11_000_000_000,
+                "later",
+                vec![attr(
+                    "service.name",
+                    any_value::Value::StringValue("worker".into()),
+                )],
+                vec![attr("ratio", any_value::Value::DoubleValue(0.5))],
+            ),
+        ];
+        db.write(&namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+
+        // Make every data page undecodable. Catalog reads must continue to
+        // work because they only consult locators and catalog records.
+        let mut corrupt_pages = Vec::new();
+        for trace in &traces {
+            let slot = crate::routing::routing_slot(&namespace, trace.trace_id);
+            let mut locators = db
+                .storage
+                .scan_iter(locator_range(&namespace, slot, trace.trace_id))
+                .await
+                .unwrap();
+            while let Some(record) = locators.next().await.unwrap() {
+                let locator = decode_locator(&record.value).unwrap();
+                corrupt_pages.push(put(
+                    payload_key(&namespace, locator.segment, slot, locator.page_sequence),
+                    Bytes::from_static(b"not-a-page"),
+                    Ttl::NoExpiry,
+                ));
+            }
+        }
+        db.writer
+            .as_ref()
+            .unwrap()
+            .apply(corrupt_pages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.catalog_names(&namespace, 0, 20_000_000_000, None)
+                .await
+                .unwrap(),
+            vec!["code", "error", "ratio", "service.name"]
+        );
+        assert_eq!(
+            db.catalog_names(&namespace, 0, 9_999_999_999, Some(AttributeScope::Resource))
+                .await
+                .unwrap(),
+            vec!["service.name"]
+        );
+        assert_eq!(
+            db.catalog_values(
+                &namespace,
+                0,
+                9_999_999_999,
+                Some(AttributeScope::Resource),
+                "service.name"
+            )
+            .await
+            .unwrap(),
+            vec![DiscoveryValue::String("api".into())]
+        );
+        assert_eq!(
+            db.catalog_values(
+                &namespace,
+                10_000_000_000,
+                20_000_000_000,
+                Some(AttributeScope::Resource),
+                "service.name"
+            )
+            .await
+            .unwrap(),
+            vec![DiscoveryValue::String("worker".into())]
+        );
         db.close().await.unwrap();
     }
 

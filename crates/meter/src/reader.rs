@@ -5,7 +5,7 @@
 //! coexists with a production writer without fencing — unlike `Db::open()`,
 //! which always fences the previous writer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -168,6 +168,7 @@ pub struct TimeSeriesDbReader {
     storage: StorageReader,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<(Namespace, TimeBucket), Arc<MiniQueryReader<StorageReader>>>,
+    discovery_cache: crate::discovery::MeterDiscoveryCache,
 }
 
 impl TimeSeriesDbReader {
@@ -259,6 +260,7 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
+            discovery_cache: crate::discovery::MeterDiscoveryCache::new(),
         }
     }
 
@@ -366,15 +368,32 @@ impl TimeSeriesDbReader {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_labels_in_range(
-            &ScopedReader {
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let (start, end) = crate::util::range_bounds_to_secs(range)?;
+            let buckets = self
+                .storage
+                .get_buckets_in_range(namespace, Some(start), Some(end))
+                .await
+                .map_err(|error| QueryError::Execution(error.to_string()))?;
+            crate::discovery::names(
+                self.storage.clone(),
                 namespace,
-                reader: self,
-            },
-            matchers,
-            range,
-        )
-        .await
+                &buckets,
+                &self.discovery_cache,
+            )
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))
+        } else {
+            find_labels_in_range(
+                &ScopedReader {
+                    namespace,
+                    reader: self,
+                },
+                matchers,
+                range,
+            )
+            .await
+        }
     }
 
     /// Closes the underlying storage reader, flushing any caches to disk.
@@ -391,23 +410,37 @@ impl TimeSeriesDbReader {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        find_label_values_in_range(
-            &ScopedReader {
+        if matchers.is_none_or(<[&str]>::is_empty) {
+            let (start, end) = crate::util::range_bounds_to_secs(range)?;
+            let buckets = self
+                .storage
+                .get_buckets_in_range(namespace, Some(start), Some(end))
+                .await
+                .map_err(|error| QueryError::Execution(error.to_string()))?;
+            crate::discovery::values(
+                self.storage.clone(),
                 namespace,
-                reader: self,
-            },
-            label_name,
-            matchers,
-            range,
-        )
-        .await
+                &buckets,
+                label_name,
+                &self.discovery_cache,
+            )
+            .await
+            .map_err(|error| QueryError::Execution(error.to_string()))
+        } else {
+            find_label_values_in_range(
+                &ScopedReader {
+                    namespace,
+                    reader: self,
+                },
+                label_name,
+                matchers,
+                range,
+            )
+            .await
+        }
     }
 
-    /// Returns metric metadata reconstructed from durable forward indexes.
-    ///
-    /// Metadata is namespace-scoped by the reader's storage handle. Descriptions
-    /// are not part of the forward-index format, so read-only results preserve
-    /// metric type and unit while leaving descriptions unset.
+    /// Returns metric metadata from the durable discovery catalog.
     pub async fn metadata(
         &self,
         namespace: &Namespace,
@@ -418,38 +451,15 @@ impl TimeSeriesDbReader {
             .get_buckets_in_range(namespace, None, None)
             .await
             .map_err(|error| QueryError::Execution(error.to_string()))?;
-        let mut by_metric: BTreeMap<String, Vec<MetricMetadata>> = BTreeMap::new();
-        for bucket in buckets {
-            let index = self
-                .storage
-                .get_forward_index(namespace, bucket, self.storage.owned_slots())
-                .await
-                .map_err(|error| QueryError::Execution(error.to_string()))?;
-            for (_, spec) in index.all_series() {
-                let Some(metric_name) = spec
-                    .labels
-                    .iter()
-                    .find(|label| label.name == "__name__")
-                    .map(|label| label.value.clone())
-                else {
-                    continue;
-                };
-                if metric.is_some_and(|filter| filter != metric_name) {
-                    continue;
-                }
-                let entries = by_metric.entry(metric_name.clone()).or_default();
-                let entry = MetricMetadata {
-                    metric_name,
-                    metric_type: spec.metric_type,
-                    description: None,
-                    unit: spec.unit,
-                };
-                if !entries.contains(&entry) {
-                    entries.push(entry);
-                }
-            }
-        }
-        Ok(by_metric.into_values().flatten().collect())
+        crate::discovery::metadata(
+            self.storage.clone(),
+            namespace,
+            &buckets,
+            metric,
+            &self.discovery_cache,
+        )
+        .await
+        .map_err(|error| QueryError::Execution(error.to_string()))
     }
 }
 

@@ -100,7 +100,7 @@ pub const KEY_VERSION: u8 = 0x02;
 /// Subsystem byte for timeseries storage (see [`common::serde::subsystem`]).
 pub const SUBSYSTEM: u8 = common::serde::subsystem::TIMESERIES;
 
-fn write_bucket_prefix(buf: &mut BytesMut, namespace: &Namespace, bucket: &TimeBucket) {
+pub(crate) fn write_bucket_prefix(buf: &mut BytesMut, namespace: &Namespace, bucket: &TimeBucket) {
     assert!(bucket.size != 0, "bucket_size 0 is reserved");
     KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
     common::serde::terminated_bytes::serialize(namespace.as_bytes(), buf);

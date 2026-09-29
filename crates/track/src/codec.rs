@@ -100,7 +100,6 @@ pub(crate) fn segment_for(timestamp_ns: u64, segment_ns: u64) -> SegmentId {
     i64::try_from(timestamp_ns / segment_ns).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
 pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
     let mut bytes = BytesMut::new();
     KEY_SCOPE.write(&mut bytes, namespace, segment);

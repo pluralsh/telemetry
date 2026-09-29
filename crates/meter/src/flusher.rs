@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::Flusher;
+use common::discovery::{CatalogBatch, DiscoveryValue};
 use common::storage::{RecordOp, Ttl};
 
 use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
@@ -137,6 +138,27 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 )
                 .map_err(|e| e.to_string())?,
             );
+        }
+
+        let mut catalog = CatalogBatch::default();
+        for entry in frozen.inverted_index.postings.iter() {
+            catalog.insert(
+                "",
+                entry.key().name.clone(),
+                DiscoveryValue::String(entry.key().value.clone()),
+            );
+        }
+        for metadata in frozen.metadata.values() {
+            catalog.insert_metadata(
+                metadata.metric_name.clone(),
+                crate::discovery::encode_metadata(metadata),
+            );
+        }
+        for op in catalog.into_ops(
+            &crate::discovery::partition_prefix(&frozen.namespace, frozen.bucket),
+            ttl,
+        ) {
+            push_op(&mut ops, &mut estimated_bytes, op);
         }
 
         for (series_id, series_samples) in frozen.samples {
