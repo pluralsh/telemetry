@@ -135,7 +135,7 @@ func Render(input Input) (Result, error) {
 			Mode:                mode,
 			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Meter)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Meter))},
 			PathPrefix:          input.Meter.Spec.Ingress.PathPrefix,
-			Storage:             renderStorageConfig(input.Meter.Spec.Config.Storage, descriptor),
+			Storage:             renderStorageConfigForMode(input.Meter.Spec.Config.Storage, descriptor, mode),
 			ReaderCacheCapacity: int64Value(input.Meter.Spec.Config.ReaderCacheCapacity, 268435456),
 			CacheWarmer:         renderCacheWarmerConfig(input.Meter.Spec.Config.CacheWarmer),
 			Write:               renderWriteConfig(input.Meter.Spec.Config.Write),
@@ -242,7 +242,7 @@ func renderLine(input Input) (Result, error) {
 				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(line)),
 				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(line)),
 			},
-			Storage:                renderStorageConfig(spec.Storage, descriptor),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       spec.RetentionSeconds,
 			Page: renderLinePage{
@@ -348,7 +348,7 @@ func renderTrack(input Input) (Result, error) {
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(track)),
 				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
 			},
-			Storage:                renderStorageConfig(spec.Storage, descriptor),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       spec.RetentionSeconds,
 			Page:                   renderTrackPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
@@ -440,6 +440,14 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(int64(134217728))}
 	} else {
 		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath)
+	}
+	return result
+}
+
+func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, mode string) renderStorage {
+	result := renderStorageConfig(spec, descriptor)
+	if mode == modeWriter && spec.BlockCache == nil {
+		result.BlockCache = nil
 	}
 	return result
 }

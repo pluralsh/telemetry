@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
+	"github.com/pluralsh/telemetry/go/operator/internal/resources"
 )
 
 const (
@@ -172,6 +173,12 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 	if !strings.Contains(reader, "mode: reader") {
 		t.Fatalf("Track reader config missing reader mode:\n%s", reader)
 	}
+	if strings.Contains(writer, "block_cache:") {
+		t.Fatalf("Track writer unexpectedly contains the default data cache:\n%s", writer)
+	}
+	if !strings.Contains(reader, "block_cache:") {
+		t.Fatalf("Track reader is missing the default data cache:\n%s", reader)
+	}
 	if got := string(result.Data["namespace-track-auth-password"]); got != "tenant-secret" {
 		t.Fatalf("resolved Track namespace password = %q", got)
 	}
@@ -201,6 +208,12 @@ func TestRenderShardedRoles(t *testing.T) {
 		strings.Contains(string(result.Data[MeterKey]), "virtual_shards:") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
+	}
+	if strings.Contains(string(result.Data[MeterKey]), "block_cache:") {
+		t.Fatalf("Meter writer unexpectedly contains the default data cache:\n%s", result.Data[MeterKey])
+	}
+	if !strings.Contains(string(result.Data[ReaderKey]), "block_cache:") {
+		t.Fatalf("Meter reader is missing the default data cache:\n%s", result.Data[ReaderKey])
 	}
 }
 
@@ -248,6 +261,34 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 	}
 	if !strings.Contains(reader, "mode: reader") || !strings.Contains(reader, "backend: kubernetes") {
 		t.Fatalf("unexpected Line reader config:\n%s", reader)
+	}
+	if strings.Contains(writer, "block_cache:") {
+		t.Fatalf("Line writer unexpectedly contains the default data cache:\n%s", writer)
+	}
+	if !strings.Contains(reader, "block_cache:") {
+		t.Fatalf("Line reader is missing the default data cache:\n%s", reader)
+	}
+}
+
+func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
+	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MeterDescriptor, modeWriter)
+	if defaultWriter.BlockCache != nil {
+		t.Fatal("writer storage contains the default data cache")
+	}
+	if defaultWriter.MetaCache == nil {
+		t.Fatal("writer storage is missing the default metadata cache")
+	}
+
+	spec := telemetryv1alpha1.StorageSpec{
+		BlockCache: &telemetryv1alpha1.CacheSpec{Type: telemetryv1alpha1.CacheFoyerHybrid},
+	}
+	writer := renderStorageConfigForMode(spec, resources.MeterDescriptor, modeWriter)
+	if writer.BlockCache == nil {
+		t.Fatal("writer discarded an explicitly configured data cache")
+	}
+	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MeterDescriptor, modeStandalone)
+	if standalone.BlockCache == nil {
+		t.Fatal("standalone storage is missing the default data cache")
 	}
 }
 
