@@ -20,7 +20,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel a main run: a later push may not include the Chart.yaml
+  # change and therefore cannot safely retry an interrupted release publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   publish-preview:
@@ -96,9 +98,9 @@ jobs:
           registry: ghcr.io
           registry_username: ${{ github.actor }}
           registry_password: ${{ secrets.GITHUB_TOKEN }}
-  release:
+  prepare-release:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    name: Release charts
+    name: Prepare chart release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -124,54 +126,17 @@ jobs:
         with:
           path: ./chart/telemetry-operator
           release: ${{ github.ref_name }}
-      - name: Resolve and verify chart versions
-        id: versions
+      - name: Verify chart application versions
         shell: bash
         run: |
           set -euo pipefail
           release="${GITHUB_REF_NAME#v}"
-          meter_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/meter/Chart.yaml)
-          pseudofs_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/pseudofs/Chart.yaml)
-          operator_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/telemetry-operator/Chart.yaml)
           meter_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/meter/Chart.yaml)
           pseudofs_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/pseudofs/Chart.yaml)
           operator_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-operator/Chart.yaml)
           test "$meter_app_version" = "$release"
           test "$pseudofs_app_version" = "$release"
           test "$operator_app_version" = "$release"
-          echo "meter=$meter_version" >> "$GITHUB_OUTPUT"
-          echo "pseudofs=$pseudofs_version" >> "$GITHUB_OUTPUT"
-          echo "operator=$operator_version" >> "$GITHUB_OUTPUT"
-      - name: Push Meter release chart
-        uses: appany/helm-oci-chart-releaser@v0.5.0
-        with:
-          name: meter
-          repository: pluralsh/charts
-          tag: ${{ steps.versions.outputs.meter }}
-          path: chart/meter
-          registry: ghcr.io
-          registry_username: ${{ github.actor }}
-          registry_password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push PseudoFS release chart
-        uses: appany/helm-oci-chart-releaser@v0.5.0
-        with:
-          name: pseudofs
-          repository: pluralsh/charts
-          tag: ${{ steps.versions.outputs.pseudofs }}
-          path: chart/pseudofs
-          registry: ghcr.io
-          registry_username: ${{ github.actor }}
-          registry_password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push telemetry operator release chart
-        uses: appany/helm-oci-chart-releaser@v0.5.0
-        with:
-          name: telemetry-operator
-          repository: pluralsh/charts
-          tag: ${{ steps.versions.outputs.operator }}
-          path: chart/telemetry-operator
-          registry: ghcr.io
-          registry_username: ${{ github.actor }}
-          registry_password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create release metadata pull request
         uses: peter-evans/create-pull-request@v8
         with:
@@ -181,3 +146,51 @@ jobs:
           branch: release-${{ github.ref_name }}
           labels: release
           base: main
+
+  publish-release:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    name: Publish release ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: meter
+            path: chart/meter
+          - name: pseudofs
+            path: chart/pseudofs
+          - name: telemetry-operator
+            path: chart/telemetry-operator
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v5
+      - name: Detect committed chart version change
+        id: chart
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          CHART_PATH: ${{ matrix.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$BEFORE" "$AFTER" -- "$CHART_PATH/Chart.yaml"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(awk -F': *' '/^version:/ {print $2; exit}' "$CHART_PATH/Chart.yaml")
+          test -n "$version"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Push release chart
+        if: ${{ steps.chart.outputs.changed == 'true' }}
+        uses: appany/helm-oci-chart-releaser@v0.5.0
+        with:
+          name: ${{ matrix.name }}
+          repository: pluralsh/charts
+          tag: ${{ steps.chart.outputs.version }}
+          path: ${{ matrix.path }}
+          registry: ghcr.io
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
