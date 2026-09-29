@@ -46,12 +46,12 @@ use uuid::Uuid;
 use crate::Namespace;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{Label, Sample, SeriesFingerprint, SeriesId, TimeBucket};
-use crate::serde::TimeBucketScoped;
 use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
 use crate::serde::timeseries::TimeSeriesValue;
+use crate::serde::{TimeBucketScoped, bucket_slot_metadata_range, bucket_slots_range};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};
 
@@ -870,23 +870,22 @@ fn bucket_cache_targets(
     owned_slots: Range<u16>,
     include_samples: bool,
 ) -> Vec<CacheTarget> {
-    let records_per_slot = if include_samples { 4 } else { 3 };
-    let mut targets =
-        Vec::with_capacity(2 + usize::from(owned_slots.end - owned_slots.start) * records_per_slot);
+    let mut targets = Vec::with_capacity(if include_samples {
+        3
+    } else {
+        2 + usize::from(owned_slots.end - owned_slots.start)
+    });
     targets.push(CacheTarget::Filters);
     targets.push(CacheTarget::Index);
-    for routing_slot in owned_slots {
-        targets.push(CacheTarget::data::<Bytes, _>(
-            SeriesDictionaryKey::bucket_range(namespace, bucket, routing_slot),
-        ));
-        targets.push(CacheTarget::data::<Bytes, _>(
-            ForwardIndexKey::bucket_range(namespace, bucket, routing_slot),
-        ));
-        targets.push(CacheTarget::data::<Bytes, _>(
-            InvertedIndexKey::bucket_range(namespace, bucket, routing_slot),
-        ));
-        if include_samples {
-            targets.push(CacheTarget::data::<Bytes, _>(TimeSeriesKey::bucket_range(
+    if include_samples {
+        targets.push(CacheTarget::data::<Bytes, _>(bucket_slots_range(
+            namespace,
+            bucket,
+            owned_slots,
+        )));
+    } else {
+        for routing_slot in owned_slots {
+            targets.push(CacheTarget::data::<Bytes, _>(bucket_slot_metadata_range(
                 namespace,
                 bucket,
                 routing_slot,
@@ -1406,6 +1405,23 @@ mod tests {
                 owned_slots: 0..sharding::ROUTING_SLOT_COUNT,
             },
         }
+    }
+
+    #[test]
+    fn cache_warm_targets_consolidate_metadata_per_slot() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let bucket = TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        assert_eq!(
+            bucket_cache_targets(&namespace, &bucket, 10..14, false).len(),
+            6
+        );
+        assert_eq!(
+            bucket_cache_targets(&namespace, &bucket, 10..14, true).len(),
+            3
+        );
     }
 
     #[tokio::test]

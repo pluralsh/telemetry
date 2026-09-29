@@ -446,12 +446,13 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 
 func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCacheWarmer {
 	if spec == nil {
-		return renderCacheWarmer{Enabled: true, WarmRangeSeconds: 7200, IncludePayloads: true}
+		return renderCacheWarmer{Enabled: true, WarmRangeSeconds: 7200, TimeoutSeconds: 30, IncludePayloads: false}
 	}
 	return renderCacheWarmer{
 		Enabled:          boolValue(spec.Enabled, true),
 		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
-		IncludePayloads:  boolValue(spec.IncludePayloads, true),
+		TimeoutSeconds:   int64Value(spec.TimeoutSeconds, 30),
+		IncludePayloads:  boolValue(spec.IncludePayloads, false),
 	}
 }
 
@@ -652,6 +653,7 @@ type renderLineQueryCache struct {
 type renderCacheWarmer struct {
 	Enabled          bool  `json:"enabled"`
 	WarmRangeSeconds int64 `json:"warm_range_seconds"`
+	TimeoutSeconds   int64 `json:"timeout_seconds"`
 	IncludePayloads  bool  `json:"include_payloads"`
 }
 type renderListeners struct {

@@ -57,7 +57,8 @@ cache:
 cache_warmer:
   enabled: true
   warm_range_seconds: 7200
-  include_payloads: true
+  timeout_seconds: 30
+  include_payloads: false
 
 auth:
   # Namespace HTTP APIs require valid credentials unless this is explicitly true.

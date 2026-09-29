@@ -282,15 +282,23 @@ impl AppState {
             .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
             .collect::<Vec<_>>();
         let warm_range = Duration::from_secs(self.config.cache_warmer.warm_range_seconds);
+        let warm_timeout = Duration::from_secs(self.config.cache_warmer.timeout_seconds);
         let include_payloads = self.config.cache_warmer.include_payloads;
         let cancellation = self.cancellation.clone();
         let cache_warmed = Arc::clone(&self.cache_warmed);
         let task = tokio::spawn(async move {
-            if let Err(error) = readers
-                .warm_recent(&namespaces, warm_range, include_payloads, &cancellation)
-                .await
+            match tokio::time::timeout(
+                warm_timeout,
+                readers.warm_recent(&namespaces, warm_range, include_payloads, &cancellation),
+            )
+            .await
             {
-                tracing::warn!(%error, "meter cache warming failed");
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "meter cache warming failed"),
+                Err(_) => tracing::warn!(
+                    timeout_seconds = warm_timeout.as_secs(),
+                    "meter cache warming timed out"
+                ),
             }
             cache_warmed.store(true, Ordering::Release);
         });

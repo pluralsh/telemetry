@@ -215,7 +215,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `enabled` _boolean_ |  | true |  |
 | `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
-| `includePayloads` _boolean_ |  | true |  |
+| `timeoutSeconds` _integer_ |  | 30 | Minimum: 1 <br /> |
+| `includePayloads` _boolean_ |  | false |  |
 
 
 #### DataStoreReference

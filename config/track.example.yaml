@@ -55,7 +55,8 @@ request:
 cache_warmer:
   enabled: true
   warm_range_seconds: 7200
-  include_payloads: true
+  timeout_seconds: 30
+  include_payloads: false
 
 auth:
   # Namespace HTTP and OTLP gRPC APIs require credentials unless enabled.

@@ -113,15 +113,21 @@ impl TraceDb {
             .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
             .unwrap_or(u64::MAX);
         let range_ns = u64::try_from(warm_range.as_nanos()).unwrap_or(u64::MAX);
-        let mut prefixes = self
+        let mut partitions = self
             .catalog_segments(namespace, end_ns.saturating_sub(range_ns), end_ns)
             .await?
             .into_iter()
-            .map(|segment| segment_prefix(namespace, segment))
+            .map(|segment| {
+                let prefix = segment_prefix(namespace, segment);
+                let range = discovery::catalog_range(&prefix);
+                (prefix, range)
+            })
             .collect::<Vec<_>>();
-        prefixes.push(segment_prefix(namespace, LOCATOR_SEGMENT));
+        let locator_prefix = segment_prefix(namespace, LOCATOR_SEGMENT);
+        let locator_range = discovery::catalog_range(&locator_prefix);
+        partitions.push((locator_prefix, locator_range));
         slate
-            .warm_prefixes(&prefixes, include_payloads, cancel)
+            .warm_prefixes(&partitions, include_payloads, cancel)
             .await?;
         Ok(())
     }

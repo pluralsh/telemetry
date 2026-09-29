@@ -368,6 +368,19 @@ pub async fn metadata(
     Ok(metadata)
 }
 
+/// Key range containing every discovery catalog record for one partition.
+///
+/// The range is scoped to the catalog sentinel slot and current catalog
+/// format version, so warming it does not pull product payload records from
+/// the surrounding time partition into the data-block cache.
+pub fn catalog_range(partition_prefix: &[u8]) -> BytesRange {
+    let mut prefix = BytesMut::with_capacity(partition_prefix.len() + 3);
+    prefix.extend_from_slice(partition_prefix);
+    prefix.put_u16(CATALOG_SLOT);
+    prefix.put_u8(CATALOG_FORMAT_VERSION);
+    BytesRange::prefix(prefix.freeze())
+}
+
 fn name_prefix(partition_prefix: &[u8], scope: Option<&str>) -> Bytes {
     let mut prefix = record_prefix(partition_prefix, NAME_RECORD);
     if let Some(scope) = scope {
@@ -507,6 +520,21 @@ mod tests {
                 NAME_RECORD,
             ]
         );
+    }
+
+    #[test]
+    fn catalog_range_contains_catalog_records_but_not_payload_slots() {
+        let partition = b"tenant/partition";
+        let range = catalog_range(partition);
+        assert!(range.contains(name_key(partition, "", "job").as_ref()));
+        assert!(range.contains(
+            value_key(partition, "", "job", &DiscoveryValue::String("api".into())).as_ref()
+        ));
+
+        let mut payload = BytesMut::from(partition.as_slice());
+        payload.put_u16(0);
+        payload.put_u8(1);
+        assert!(!range.contains(&payload));
     }
 
     #[tokio::test]

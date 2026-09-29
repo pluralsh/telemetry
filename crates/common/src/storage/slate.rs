@@ -128,14 +128,15 @@ impl SlateReadHandle {
         self.source.manifest()
     }
 
-    /// Warms cache blocks for live SlateDB segments matching `prefixes`.
+    /// Warms cache blocks for live SlateDB segments matching `partitions`.
     ///
-    /// Filters and SST indexes are always warmed. When `include_data` is true,
-    /// every data block in the matching segment keyspace is warmed as well.
-    /// Backends without a configured cache treat warming as a no-op.
+    /// Filters, SST indexes, and each partition's selective catalog range are
+    /// always warmed. When `include_data` is true, every data block in the
+    /// matching segment keyspace is warmed as well. Backends without a
+    /// configured cache treat warming as a no-op.
     pub async fn warm_prefixes(
         &self,
-        prefixes: &[Bytes],
+        partitions: &[(Bytes, BytesRange)],
         include_data: bool,
         cancel: &CancellationToken,
     ) -> StorageResult<()> {
@@ -144,13 +145,18 @@ impl SlateReadHandle {
             .segments()
             .iter()
             .filter_map(|segment| {
-                let prefix = prefixes
+                let (prefix, catalog_range) = partitions
                     .iter()
-                    .find(|prefix| segment.prefix() == prefix.as_ref())?
-                    .clone();
-                let mut targets = vec![CacheTarget::Filters, CacheTarget::Index];
+                    .find(|(prefix, _)| segment.prefix() == prefix.as_ref())?;
+                let mut targets = vec![
+                    CacheTarget::Filters,
+                    CacheTarget::Index,
+                    CacheTarget::data::<Bytes, _>(catalog_range.clone()),
+                ];
                 if include_data {
-                    targets.push(CacheTarget::data::<Bytes, _>(BytesRange::prefix(prefix)));
+                    targets.push(CacheTarget::data::<Bytes, _>(BytesRange::prefix(
+                        prefix.clone(),
+                    )));
                 }
                 let targets: Arc<[CacheTarget]> = targets.into();
                 Some(

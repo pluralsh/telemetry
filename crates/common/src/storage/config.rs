@@ -14,6 +14,8 @@ pub struct CacheWarmerConfig {
     pub enabled: bool,
     /// Recent wall-clock window to warm.
     pub warm_range_seconds: u64,
+    /// Maximum time startup warming may delay readiness.
+    pub timeout_seconds: u64,
     /// Whether to warm payload/sample blocks in addition to indexes and metadata.
     pub include_payloads: bool,
 }
@@ -23,7 +25,8 @@ impl Default for CacheWarmerConfig {
         Self {
             enabled: true,
             warm_range_seconds: 7_200,
-            include_payloads: true,
+            timeout_seconds: 30,
+            include_payloads: false,
         }
     }
 }
@@ -300,7 +303,8 @@ mod tests {
             CacheWarmerConfig {
                 enabled: true,
                 warm_range_seconds: 7_200,
-                include_payloads: true,
+                timeout_seconds: 30,
+                include_payloads: false,
             }
         );
     }

@@ -169,7 +169,10 @@ type CacheWarmerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=7200
 	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
-	// +kubebuilder:default=true
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=30
+	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+	// +kubebuilder:default=false
 	IncludePayloads *bool `json:"includePayloads,omitempty"`
 }
 

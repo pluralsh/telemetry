@@ -217,8 +217,13 @@ spec:
                         default: true
                         type: boolean
                       includePayloads:
-                        default: true
+                        default: false
                         type: boolean
+                      timeoutSeconds:
+                        default: 30
+                        format: int64
+                        minimum: 1
+                        type: integer
                       warmRangeSeconds:
                         default: 7200
                         format: int64

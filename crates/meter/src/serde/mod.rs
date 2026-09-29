@@ -183,6 +183,35 @@ pub fn write_record_prefix(
     buf.put_u8(record_type.id());
 }
 
+/// Range containing all index metadata records for one bucket and routing
+/// slot, while excluding time-series sample records.
+pub(crate) fn bucket_slot_metadata_range(
+    namespace: &Namespace,
+    bucket: &TimeBucket,
+    routing_slot: u16,
+) -> BytesRange {
+    let mut start = BytesMut::new();
+    write_record_prefix(
+        &mut start,
+        namespace,
+        bucket,
+        routing_slot,
+        RecordType::SeriesDictionary,
+    );
+    let mut end = BytesMut::new();
+    write_record_prefix(
+        &mut end,
+        namespace,
+        bucket,
+        routing_slot,
+        RecordType::TimeSeries,
+    );
+    BytesRange::new(
+        Bound::Included(start.freeze()),
+        Bound::Excluded(end.freeze()),
+    )
+}
+
 /// Reads the bucket-scoped header from `buf`, validating subsystem, version,
 /// `bucket_size`, and the record type ID. Returns the parsed `TimeBucket` and
 /// `RecordType`.
@@ -332,5 +361,45 @@ mod tests {
         let buf = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0, 1];
         let err = parse_record_prefix(&buf).unwrap_err();
         assert!(err.message.contains("Buffer too short"));
+    }
+
+    #[test]
+    fn bucket_slot_metadata_range_excludes_samples_and_adjacent_slots() {
+        let namespace = Namespace::new("tenant-a").unwrap();
+        let bucket = TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        let range = bucket_slot_metadata_range(&namespace, &bucket, 42);
+        for record_type in [
+            RecordType::SeriesDictionary,
+            RecordType::ForwardIndex,
+            RecordType::InvertedIndex,
+        ] {
+            let mut key = BytesMut::new();
+            write_record_prefix(&mut key, &namespace, &bucket, 42, record_type);
+            key.put_u8(1);
+            assert!(range.contains(&key));
+        }
+
+        let mut samples = BytesMut::new();
+        write_record_prefix(
+            &mut samples,
+            &namespace,
+            &bucket,
+            42,
+            RecordType::TimeSeries,
+        );
+        assert!(!range.contains(&samples));
+
+        let mut adjacent = BytesMut::new();
+        write_record_prefix(
+            &mut adjacent,
+            &namespace,
+            &bucket,
+            43,
+            RecordType::SeriesDictionary,
+        );
+        assert!(!range.contains(&adjacent));
     }
 }

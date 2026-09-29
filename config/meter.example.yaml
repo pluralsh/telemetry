@@ -84,7 +84,8 @@ reader_cache_capacity: 268435456
 cache_warmer:
   enabled: true
   warm_range_seconds: 7200
-  include_payloads: true
+  timeout_seconds: 30
+  include_payloads: false
 
 write:
   # applied: in-memory delta; written: SlateDB mutable state/fresh snapshot;

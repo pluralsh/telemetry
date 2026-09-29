@@ -115,13 +115,16 @@ not bytes. Default `268435456`.
 The startup cache warmer applies to Meter, Line, and Track readers and standalone servers. It runs
 in the background while health checks remain available; readiness remains false until warming
 finishes. Writer-only processes skip warming. Errors are logged and do not permanently block
-readiness.
+readiness. Line and Track always warm their compact discovery-catalog blocks; payload warming is
+separately controlled.
 
 - `cache_warmer.enabled`: enables startup warming. Default `true`.
 - `cache_warmer.warm_range_seconds`: recent time range to warm. Default `7200`; must be greater
   than zero when warming is enabled.
-- `cache_warmer.include_payloads`: warms SST data blocks in addition to metadata, filters, and
-  indexes. Default `true`.
+- `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false. Default `30`;
+  timeout is fail-open.
+- `cache_warmer.include_payloads`: also warms metric samples, log pages, and trace pages. When
+  false, structural indexes and product discovery catalogs are still warmed. Default `false`.
 
 ## `write`
 
