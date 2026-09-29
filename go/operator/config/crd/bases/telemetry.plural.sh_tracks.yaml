@@ -18250,10 +18250,6 @@ spec:
                 both are set
               rule: '!has(self.version) || !has(self.image) || !has(self.image.tag)
                 || self.version == self.image.tag'
-            - message: Track does not support ingress.pathPrefix because namespace
-                API routes are fixed
-              rule: '!has(self.ingress.pathPrefix) || self.ingress.pathPrefix.size()
-                == 0'
           status:
             properties:
               conditions:

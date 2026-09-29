@@ -99,6 +99,30 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 		))
 	})
 
+	It("reports valid Track and Secret references as ready", func() {
+		track := &telemetryv1alpha1.Track{
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-track", Namespace: namespace},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-track-password", Namespace: namespace},
+			Data:       map[string][]byte{testPasswordKey: []byte("secret")},
+		}
+		auth := namespaceAuthentication("auth-valid-track", track.Name, secret.Name)
+		auth.Spec.DataStoreRef.Kind = dataStoreTrack
+		for _, object := range []client.Object{track, secret, auth} {
+			Expect(k8sClient.Create(ctx, object)).To(Succeed())
+			created = append(created, object)
+		}
+		reconciler := &NamespaceAuthenticationReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(auth)})
+		Expect(err).NotTo(HaveOccurred())
+		current := &telemetryv1alpha1.NamespaceAuthentication{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(auth), current)).To(Succeed())
+		Expect(meta.FindStatusCondition(current.Status.Conditions, "Ready")).To(SatisfyAll(
+			Not(BeNil()), HaveField("Status", metav1.ConditionTrue),
+		))
+	})
+
 	It("records invalid references in status without returning a reconcile error", func() {
 		auth := namespaceAuthentication("auth-invalid", "missing-meter", "missing-secret")
 		Expect(k8sClient.Create(ctx, auth)).To(Succeed())

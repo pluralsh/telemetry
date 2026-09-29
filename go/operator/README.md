@@ -1,8 +1,8 @@
 # Telemetry Operator
 
 ## Description
-The Telemetry Operator manages `Meter` metric stores, `Line` log stores, and their
-`NamespaceAuthentication` credentials. It renders Meter configuration, creates
+The Telemetry Operator manages `Meter` metric stores, `Line` log stores, `Track`
+trace stores, and their `NamespaceAuthentication` credentials. It renders product configuration, creates
 internal credentials, and reconciles the Services, StatefulSets, and
 namespace-scoped RBAC required by standalone or sharded deployments.
 
@@ -15,16 +15,13 @@ fields to different values. When neither is set, the operator uses the
 `--default-product-version` value supplied at startup. Release builds default
 that flag to their own version.
 `spec.image.repository` defaults to
-`ghcr.io/pluralsh/meter` or `ghcr.io/pluralsh/line`, and
+`ghcr.io/pluralsh/meter`, `ghcr.io/pluralsh/line`, or `ghcr.io/pluralsh/track`, and
 `spec.image.pullPolicy` defaults to `IfNotPresent`. These first-class image
 settings override image values in the product container inside `podTemplate`.
 
-Line uses fixed Loki-compatible namespace paths. Its Ingress routes
-`/write/ns/{namespace}` to writers and `/read/ns/{namespace}` to readers.
-`spec.ingress.pathPrefix` is intentionally rejected for Line because the
-server does not strip or configure a prefix. Line defaults to HTTP port 3100,
-gRPC port 9091, image `ghcr.io/pluralsh/line`, and product-specific config,
-data, cache, and secret paths.
+Line and Track use namespace paths below `/write/ns/{namespace}` and
+`/read/ns/{namespace}`. All three products support `spec.ingress.pathPrefix`
+for sharing a hostname, and their servers handle the prefix directly.
 
 Each writer or reader workload accepts `replicas`, `nodeSelector`,
 `tolerations`, `podTemplate`, `dataVolume`, and `cacheVolume`. Sharded
@@ -69,12 +66,12 @@ including optional `sizeLimit`. Persistent claims are mounted through fixed
 shrinking or changing immutable claim properties is rejected without deleting
 existing PVCs.
 
-The operator creates one ServiceAccount per Meter or Line and assigns it to every
+The operator creates one ServiceAccount per Meter, Line, or Track and assigns it to every
 managed workload. Use `spec.serviceAccount.annotations` for cloud identity
 integrations such as AWS IRSA, Azure workload identity, or GKE workload
 identity.
 
-`spec.ingress` can expose Meter through a standard Kubernetes Ingress:
+`spec.ingress` can expose any product through a standard Kubernetes Ingress:
 
 ```yaml
 spec:
@@ -96,9 +93,10 @@ spec:
 ```
 
 The operator routes `{pathPrefix}/write` to the writer Service and
-`{pathPrefix}/read` to the reader Service. Both routes target the same Service
-for standalone instances. Meter serves the prefix directly, so the Ingress
-must not strip or rewrite it. Health, readiness, and metrics endpoints remain
+`{pathPrefix}/read` to the reader Service. Line and Track include `/ns` in
+those Ingress paths. Both routes target the same Service for standalone
+instances. The product serves the prefix directly, so the Ingress must not
+strip or rewrite it. Health, readiness, and metrics endpoints remain
 unprefixed and are not exposed by these routes. Disabling ingress deletes the
 operator-owned Ingress.
 
@@ -162,7 +160,7 @@ managed/workload identity, or Google application default credentials. See the
 fields and the [object-store authentication guide](docs/object-store-authentication.md)
 for complete examples.
 
-Meter and Line namespace HTTP APIs are authenticated by default. Omitted
+Meter, Line, and Track namespace HTTP APIs are authenticated by default. Omitted
 `spec.config.auth.unauthenticated` renders `false`; set it to `true` only when
 anonymous reads and writes are intentional. Health and readiness remain public.
 

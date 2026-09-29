@@ -3,6 +3,7 @@ mode: standalone
 listeners:
   http: 0.0.0.0:3100
   grpc: 0.0.0.0:9091
+path_prefix: ""
 
 storage:
   type: SlateDb

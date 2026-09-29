@@ -116,14 +116,14 @@ var (
 		ConfigPath: "/etc/line/line.yaml", SecretsPath: "/etc/line/secrets",
 		DataPath: "/var/lib/line", CachePath: "/var/cache/line",
 		InternalTokenPath: "/var/run/secrets/line/internal-token", HTTPPort: 3100, GRPCPort: 9091,
-		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: LineNameAnnotation,
+		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: LineNameAnnotation, SupportsPathPrefix: true,
 	}
 	TrackDescriptor = Descriptor{
 		Kind: "Track", Name: "track", Image: "ghcr.io/pluralsh/track", ConfigKey: "track.yaml",
 		ConfigPath: "/etc/track/track.yaml", SecretsPath: "/etc/track/secrets",
 		DataPath: "/var/lib/track", CachePath: "/var/cache/track",
 		InternalTokenPath: "/var/run/secrets/track/internal-token", HTTPPort: 3200, GRPCPort: 9092,
-		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: TrackNameAnnotation,
+		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: TrackNameAnnotation, SupportsPathPrefix: true,
 	}
 	PseudoFSDescriptor = Descriptor{
 		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",

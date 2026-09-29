@@ -211,7 +211,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `kind` _string_ |  |  | Enum: [Meter Line] <br /> |
+| `kind` _string_ |  |  | Enum: [Meter Line Track] <br /> |
 | `name` _string_ |  |  | MinLength: 1 <br /> |
 
 

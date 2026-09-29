@@ -130,6 +130,8 @@ impl Default for RequestConfig {
 pub struct Config {
     pub mode: ServerMode,
     pub listeners: ListenerConfig,
+    /// Optional prefix for public read and write HTTP APIs, such as `/track`.
+    pub path_prefix: String,
     pub storage: StorageConfig,
     pub segment_duration_seconds: u64,
     pub retention_seconds: Option<u64>,
@@ -147,6 +149,7 @@ impl Default for Config {
         Self {
             mode: ServerMode::Standalone,
             listeners: ListenerConfig::default(),
+            path_prefix: String::new(),
             storage: core.storage,
             segment_duration_seconds: core.segment_duration.as_secs(),
             retention_seconds: core.retention.map(|value| value.as_secs()),
@@ -172,6 +175,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.path_prefix.is_empty()
+            && (!self.path_prefix.starts_with('/')
+                || self.path_prefix.len() == 1
+                || self.path_prefix.ends_with('/'))
+        {
+            return Err(ConfigError::Validation(
+                "path_prefix must be empty or start with '/' and must not end with '/'".into(),
+            ));
+        }
         if self.segment_duration_seconds == 0
             || self.page.target_size_bytes == 0
             || self.page.max_size_bytes == 0
@@ -280,5 +292,21 @@ mod tests {
             }],
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn path_prefix_must_be_canonical() {
+        for invalid in ["track", "/", "/track/"] {
+            let config = Config {
+                path_prefix: invalid.into(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        let config = Config {
+            path_prefix: "/track".into(),
+            ..Config::default()
+        };
+        config.validate().unwrap();
     }
 }

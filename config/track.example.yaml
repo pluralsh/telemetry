@@ -5,6 +5,7 @@ listeners:
   grpc: 0.0.0.0:9092
   otlp_grpc: 0.0.0.0:4317
   jaeger_grpc: 0.0.0.0:14250
+path_prefix: ""
 
 storage:
   type: SlateDb

@@ -46,5 +46,5 @@ does not authorize public APIs. Configure the same value on every writer and
 reader that can forward requests.
 
 The operator can render Basic credentials and JWT settings from Kubernetes
-Secrets. `NamespaceAuthentication` resources currently target Meter and Line;
+Secrets. `NamespaceAuthentication` resources can target Meter, Line, and Track;
 other credentials can be supplied through each datastore's main config.

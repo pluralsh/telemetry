@@ -27,3 +27,18 @@ spec:
   secretKeyRef:
     name: loki-basic-auth
     key: password
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: tempo-reader
+spec:
+  dataStoreRef:
+    kind: Track
+    name: track-sample
+  namespace: default
+  username: tempo
+  permission: read
+  secretKeyRef:
+    name: tempo-basic-auth
+    key: password

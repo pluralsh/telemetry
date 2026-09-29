@@ -32,7 +32,18 @@ const ENCODING_FLAGS: &str = "x-loki-response-encoding-flags";
 const CATEGORIZE_LABELS: &str = "categorize-labels";
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
+        .route(
+            "/read/ns/{namespace}/loki/api/v1/query",
+            get(query_get).post(query_post),
+        )
+        .route(
+            "/read/ns/{namespace}/loki/api/v1/query_range",
+            get(query_range_get).post(query_range_post),
+        )
+        .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
+        .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs));
+    let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route(
             "/-/ready",
@@ -43,18 +54,13 @@ pub fn router(state: AppState) -> Router {
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             }),
-        )
-        .route(
-            "/read/ns/{namespace}/loki/api/v1/query",
-            get(query_get).post(query_post),
-        )
-        .route(
-            "/read/ns/{namespace}/loki/api/v1/query_range",
-            get(query_range_get).post(query_range_post),
-        )
-        .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
-        .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs))
-        .with_state(state)
+        );
+    let app = if state.config.path_prefix.is_empty() {
+        app.merge(public)
+    } else {
+        app.nest(&state.config.path_prefix, public)
+    };
+    app.with_state(state)
 }
 
 #[derive(Debug, Deserialize)]

@@ -217,7 +217,7 @@ func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 	line := &telemetryv1alpha1.Line{
 		ObjectMeta: metav1.ObjectMeta{Name: testLineName, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.LineSpec{Ingress: telemetryv1alpha1.IngressSpec{
-			Enabled: true, Hostname: "logs.example.com",
+			Enabled: true, Hostname: "logs.example.com", PathPrefix: "/line",
 		}},
 	}
 	statefulSet, err := StatefulSet(StatefulSetInput{
@@ -240,13 +240,25 @@ func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 		t.Fatalf("Line config mount is missing: %#v", container.VolumeMounts)
 	}
 	paths := Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/write/ns", line.Name)
-	assertIngressPath(t, paths, "/read/ns", line.Name)
+	assertIngressPath(t, paths, "/line/write/ns", line.Name)
+	assertIngressPath(t, paths, "/line/read/ns", line.Name)
 
 	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
 	paths = Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/write/ns", line.Name+"-writer")
-	assertIngressPath(t, paths, "/read/ns", line.Name+"-reader")
+	assertIngressPath(t, paths, "/line/write/ns", line.Name+"-writer")
+	assertIngressPath(t, paths, "/line/read/ns", line.Name+"-reader")
+}
+
+func TestTrackIngressUsesPathPrefix(t *testing.T) {
+	track := &telemetryv1alpha1.Track{
+		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: testNamespace},
+		Spec: telemetryv1alpha1.TrackSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "traces.example.com", PathPrefix: "/track",
+		}},
+	}
+	paths := Ingress(track).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/track/write/ns", track.Name)
+	assertIngressPath(t, paths, "/track/read/ns", track.Name)
 }
 
 func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {

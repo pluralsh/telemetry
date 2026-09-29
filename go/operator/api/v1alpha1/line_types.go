@@ -89,7 +89,6 @@ type LineConfigSpec struct {
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0",message="reader replicas must be zero in Standalone mode"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1",message="writer replicas must be one in Standalone mode"
 // +kubebuilder:validation:XValidation:rule="!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag",message="spec.version and deprecated spec.image.tag must match when both are set"
-// +kubebuilder:validation:XValidation:rule="!has(self.ingress.pathPrefix) || self.ingress.pathPrefix.size() == 0",message="Line does not support ingress.pathPrefix because namespace API routes are fixed"
 type LineSpec struct {
 	// +kubebuilder:validation:Enum=Standalone;Sharded
 	// +kubebuilder:default=Standalone

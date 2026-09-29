@@ -29,9 +29,7 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/-/healthy", get(|| async { StatusCode::OK }))
-        .route("/-/ready", get(readiness))
+    let public = Router::new()
         .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
         .route("/write/ns/{namespace}/api/v2/spans", post(zipkin))
         .route(
@@ -62,8 +60,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/read/ns/{namespace}/api/metrics/query_range",
             get(metrics_unsupported),
-        )
-        .with_state(state)
+        );
+    let app = Router::new()
+        .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route("/-/ready", get(readiness));
+    let app = if state.config.path_prefix.is_empty() {
+        app.merge(public)
+    } else {
+        app.nest(&state.config.path_prefix, public)
+    };
+    app.with_state(state)
 }
 
 async fn readiness(State(state): State<AppState>) -> StatusCode {

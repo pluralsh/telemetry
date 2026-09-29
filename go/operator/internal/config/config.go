@@ -235,7 +235,8 @@ func renderLine(input Input) (Result, error) {
 	makeConfig := func(component string) ([]byte, error) {
 		spec := line.Spec.Config
 		return yaml.Marshal(renderLineConfig{
-			Mode: component,
+			Mode:       component,
+			PathPrefix: line.Spec.Ingress.PathPrefix,
 			Listeners: renderListeners{
 				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(line)),
 				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(line)),
@@ -338,7 +339,8 @@ func renderTrack(input Input) (Result, error) {
 	makeConfig := func(component string) ([]byte, error) {
 		spec := track.Spec.Config
 		return yaml.Marshal(renderTrackConfig{
-			Mode: component,
+			Mode:       component,
+			PathPrefix: track.Spec.Ingress.PathPrefix,
 			Listeners: renderListeners{
 				HTTP:     fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(track)),
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(track)),
@@ -560,6 +562,7 @@ type renderConfig struct {
 type renderLineConfig struct {
 	Mode                   string               `json:"mode"`
 	Listeners              renderListeners      `json:"listeners"`
+	PathPrefix             string               `json:"path_prefix,omitempty"`
 	Storage                renderStorage        `json:"storage"`
 	SegmentDurationSeconds int64                `json:"segment_duration_seconds"`
 	RetentionSeconds       *int64               `json:"retention_seconds,omitempty"`
@@ -574,6 +577,7 @@ type renderLineConfig struct {
 type renderTrackConfig struct {
 	Mode                   string             `json:"mode"`
 	Listeners              renderListeners    `json:"listeners"`
+	PathPrefix             string             `json:"path_prefix,omitempty"`
 	Storage                renderStorage      `json:"storage"`
 	SegmentDurationSeconds int64              `json:"segment_duration_seconds"`
 	RetentionSeconds       *int64             `json:"retention_seconds,omitempty"`

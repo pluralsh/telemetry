@@ -65,6 +65,7 @@ spec:
                     enum:
                     - Meter
                     - Line
+                    - Track
                     type: string
                   name:
                     minLength: 1

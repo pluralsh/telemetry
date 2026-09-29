@@ -96,6 +96,15 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 			}},
 			key: LineKey,
 		},
+		{
+			name: "track",
+			input: Input{Track: &telemetryv1alpha1.Track{
+				Spec: telemetryv1alpha1.TrackSpec{Config: telemetryv1alpha1.TrackConfigSpec{
+					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
+				}},
+			}},
+			key: TrackKey,
+		},
 	} {
 		t.Run(product.name, func(t *testing.T) {
 			result, err := Render(product.input)
@@ -113,10 +122,19 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 	track := &telemetryv1alpha1.Track{
 		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: "observability"},
 		Spec: telemetryv1alpha1.TrackSpec{
-			Mode: telemetryv1alpha1.TrackModeSharded,
+			Mode:    telemetryv1alpha1.TrackModeSharded,
+			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/traces"},
 		},
 	}
-	result, err := Render(Input{Track: track, InternalToken: []byte("token")})
+	result, err := Render(Input{
+		Track: track, InternalToken: []byte("token"),
+		Namespaces: []NamespaceAccess{{
+			Name: "tenant-a",
+			Access: Access{Read: []Credential{{
+				Username: "tempo", Password: []byte("tenant-secret"), DataKey: "namespace-track-auth-password",
+			}}},
+		}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,12 +144,15 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		"mode: writer",
 		"otlp_grpc: 0.0.0.0:4317",
 		"jaeger_grpc: 0.0.0.0:14250",
+		"path_prefix: /traces",
 		"backend: kubernetes",
 		"database: traces",
 		"stateful_set: traces-writer",
 		"headless_service: traces-writer-headless",
 		"flush_interval_seconds: 10",
 		"max_candidates: 10000",
+		"name: tenant-a",
+		"path: /etc/track/secrets/namespace-track-auth-password",
 	} {
 		if !strings.Contains(writer, expected) {
 			t.Errorf("Track writer config missing %q:\n%s", expected, writer)
@@ -139,6 +160,9 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 	}
 	if !strings.Contains(reader, "mode: reader") {
 		t.Fatalf("Track reader config missing reader mode:\n%s", reader)
+	}
+	if got := string(result.Data["namespace-track-auth-password"]); got != "tenant-secret" {
+		t.Fatalf("resolved Track namespace password = %q", got)
 	}
 }
 
@@ -187,13 +211,13 @@ func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
 		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
 		"segment_duration_seconds: 3600", "flush_interval_seconds: 10",
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
-		"path: /var/run/secrets/line/internal-token", "name: tenant-a",
+		"path: /var/run/secrets/line/internal-token", "name: tenant-a", "path_prefix: /logs",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Errorf("rendered Line config missing %q:\n%s", expected, rendered)
 		}
 	}
-	for _, invalid := range []string{"path_prefix:", "reader_cache_capacity:", "visibility_interval_seconds:"} {
+	for _, invalid := range []string{"reader_cache_capacity:", "visibility_interval_seconds:"} {
 		if strings.Contains(rendered, invalid) {
 			t.Errorf("rendered Line config contains unsupported field %q:\n%s", invalid, rendered)
 		}

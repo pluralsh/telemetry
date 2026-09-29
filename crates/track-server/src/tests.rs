@@ -39,6 +39,38 @@ async fn state(mode: ServerMode, unauthenticated: bool) -> AppState {
     AppState::open(config).await.unwrap()
 }
 
+#[tokio::test]
+async fn path_prefix_scopes_public_apis_but_not_health() {
+    let mut config = Config {
+        path_prefix: "/track".into(),
+        mode: ServerMode::Standalone,
+        storage: StorageConfig::InMemory,
+        namespaces: vec![NamespaceConfig {
+            name: "tenant".into(),
+            auth: Default::default(),
+        }],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+
+    for (path, expected) in [
+        ("/-/healthy", StatusCode::OK),
+        ("/track/read/ns/tenant/api/echo", StatusCode::OK),
+        ("/read/ns/tenant/api/echo", StatusCode::NOT_FOUND),
+        ("/track/-/healthy", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+    }
+    state.shutdown().await.unwrap();
+}
+
 fn otlp_request() -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {

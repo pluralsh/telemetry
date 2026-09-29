@@ -120,9 +120,10 @@ rejected.
 Line defaults to `ghcr.io/pluralsh/line`, HTTP port 3100, and gRPC port 9091.
 Its ingress routes `/write/ns` to writers and `/read/ns` to readers so the
 remaining path segment is the Line namespace required by its Loki-compatible
-API. Line rejects `spec.ingress.pathPrefix` because its server routes are fixed.
+API. Line and Track support `spec.ingress.pathPrefix`; the prefix is added
+before these namespace routes and handled directly by the server.
 
-Managed Meter and Line namespace HTTP APIs deny anonymous access by default.
+Managed Meter, Line, and Track namespace HTTP APIs deny anonymous access by default.
 Omitting `spec.config.auth.unauthenticated` renders `false`; explicitly set it
 to `true` only for workloads that intentionally allow anonymous reads and
 writes. Health and readiness endpoints remain public.
@@ -138,12 +139,13 @@ identity, or Google application default credentials. Configure cloud identity
 annotations on the Meter-managed ServiceAccount with
 `spec.serviceAccount.annotations`.
 
-## Meter ingress
+## Product ingress
 
 Set `spec.ingress.enabled`, `hostname`, and optionally `ingressClass`, metadata,
-and TLS settings to create an Ingress for a Meter. TLS defaults to the
-`<meter-name>-tls` Secret. Set the optional `pathPrefix`, such as `/meter`, when
+and TLS settings to create an Ingress for a product. TLS defaults to the
+`<product-name>-tls` Secret. Set the optional `pathPrefix`, such as `/meter`, when
 sharing a hostname. The operator routes `{pathPrefix}/write` to writers and
-`{pathPrefix}/read` to readers; both routes target the same Service for a
-standalone Meter. The server handles the prefix directly, so no Ingress rewrite
-is required. Health, readiness, and metrics endpoints remain unprefixed.
+`{pathPrefix}/read` to readers, with `/ns` appended for Line and Track; both
+routes target the same Service for a standalone product. The server handles
+the prefix directly, so no Ingress rewrite is required. Health, readiness, and
+metrics endpoints remain unprefixed.

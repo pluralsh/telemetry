@@ -52,6 +52,40 @@ async fn authenticated_state(namespaces: Vec<NamespaceConfig>) -> AppState {
     AppState::open(config).await.unwrap()
 }
 
+#[tokio::test]
+async fn path_prefix_scopes_public_apis_but_not_health() {
+    let mut config = Config {
+        path_prefix: "/line".to_owned(),
+        storage: StorageConfig::InMemory,
+        namespaces: vec![namespace("tenant")],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+
+    for (path, expected) in [
+        ("/-/healthy", StatusCode::OK),
+        (
+            "/line/read/ns/tenant/loki/api/v1/query?query=%7Bapp%3D%22test%22%7D",
+            StatusCode::OK,
+        ),
+        (
+            "/read/ns/tenant/loki/api/v1/query?query=%7Bapp%3D%22test%22%7D",
+            StatusCode::NOT_FOUND,
+        ),
+        ("/line/-/healthy", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+    }
+    state.shutdown().await.unwrap();
+}
+
 fn namespace(name: &str) -> NamespaceConfig {
     NamespaceConfig {
         name: name.to_owned(),
