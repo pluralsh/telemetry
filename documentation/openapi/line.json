@@ -39,6 +39,152 @@
         }
       }
     },
+    "/read/ns/{namespace}/loki/api/v1/label/{name}/values": {
+      "get": {
+        "tags": [
+          "metadata"
+        ],
+        "operationId": "label_values",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stream-label name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted values for the stream label",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LokiEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid time range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      }
+    },
+    "/read/ns/{namespace}/loki/api/v1/labels": {
+      "get": {
+        "tags": [
+          "metadata"
+        ],
+        "operationId": "label_names",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "Range start as nanoseconds, seconds, or RFC3339",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "description": "Range end as nanoseconds, seconds, or RFC3339",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Default lookback when start is omitted",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted stream-label names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LokiEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid time range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      }
+    },
     "/read/ns/{namespace}/loki/api/v1/query": {
       "get": {
         "tags": [
@@ -295,6 +441,136 @@
         }
       }
     },
+    "/read/ns/{namespace}/loki/api/v1/series": {
+      "get": {
+        "tags": [
+          "metadata"
+        ],
+        "operationId": "series_get",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "match[]",
+            "in": "query",
+            "description": "One or more Loki stream selectors",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching stream label sets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LokiEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selector or time range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "metadata"
+        ],
+        "operationId": "series_post",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matching stream label sets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LokiEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selector or time range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      }
+    },
     "/write/ns/{namespace}/loki/api/v1/push": {
       "post": {
         "tags": [
@@ -484,6 +760,10 @@
     {
       "name": "query",
       "description": "LogQL query"
+    },
+    {
+      "name": "metadata",
+      "description": "Stream-label discovery"
     },
     {
       "name": "ingest",
