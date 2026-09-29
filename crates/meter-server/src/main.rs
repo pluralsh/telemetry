@@ -15,9 +15,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("failed to install rustls ring crypto provider"))?;
+    meter_server::install_rustls_crypto_provider()?;
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let config = Config::from_path(args.config)?;

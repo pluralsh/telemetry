@@ -16,6 +16,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    meter_server::install_rustls_crypto_provider()?;
     tracing_subscriber::fmt::init();
     let config = Config::from_path(Args::parse().config)?;
     let http_address = config.listeners.http;
