@@ -240,13 +240,13 @@ func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 		t.Fatalf("Line config mount is missing: %#v", container.VolumeMounts)
 	}
 	paths := Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/line/write/ns", line.Name)
-	assertIngressPath(t, paths, "/line/read/ns", line.Name)
+	assertIngressPath(t, paths, "/line/write", line.Name)
+	assertIngressPath(t, paths, "/line/read", line.Name)
 
 	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
 	paths = Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/line/write/ns", line.Name+"-writer")
-	assertIngressPath(t, paths, "/line/read/ns", line.Name+"-reader")
+	assertIngressPath(t, paths, "/line/write", line.Name+"-writer")
+	assertIngressPath(t, paths, "/line/read", line.Name+"-reader")
 }
 
 func TestTrackIngressUsesPathPrefix(t *testing.T) {
@@ -257,8 +257,8 @@ func TestTrackIngressUsesPathPrefix(t *testing.T) {
 		}},
 	}
 	paths := Ingress(track).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/track/write/ns", track.Name)
-	assertIngressPath(t, paths, "/track/read/ns", track.Name)
+	assertIngressPath(t, paths, "/track/write", track.Name)
+	assertIngressPath(t, paths, "/track/read", track.Name)
 }
 
 func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {

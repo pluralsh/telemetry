@@ -19,9 +19,10 @@ that flag to their own version.
 `spec.image.pullPolicy` defaults to `IfNotPresent`. These first-class image
 settings override image values in the product container inside `podTemplate`.
 
-Line and Track use namespace paths below `/write/ns/{namespace}` and
-`/read/ns/{namespace}`. All three products support `spec.ingress.pathPrefix`
-for sharing a hostname, and their servers handle the prefix directly.
+All products use `/write` and `/read` Ingress routing prefixes. Their public
+APIs continue below `/write/ns/{namespace}` and `/read/ns/{namespace}`. All
+three products support `spec.ingress.pathPrefix` for sharing a hostname, and
+their servers handle the prefix directly.
 
 Each writer or reader workload accepts `replicas`, `nodeSelector`,
 `tolerations`, `podTemplate`, `dataVolume`, and `cacheVolume`. Sharded
@@ -93,12 +94,11 @@ spec:
 ```
 
 The operator routes `{pathPrefix}/write` to the writer Service and
-`{pathPrefix}/read` to the reader Service. Line and Track include `/ns` in
-those Ingress paths. Both routes target the same Service for standalone
-instances. The product serves the prefix directly, so the Ingress must not
-strip or rewrite it. Health, readiness, and metrics endpoints remain
-unprefixed and are not exposed by these routes. Disabling ingress deletes the
-operator-owned Ingress.
+`{pathPrefix}/read` to the reader Service for every product. Both routes target
+the same Service for standalone instances. The product serves the prefix
+directly, so the Ingress must not strip or rewrite it. Health, readiness, and
+metrics endpoints remain unprefixed and are not exposed by these routes.
+Disabling ingress deletes the operator-owned Ingress.
 
 This module is part of the repository's `go/` workspace. The supported
 installation method is the published OCI Helm chart. The generated

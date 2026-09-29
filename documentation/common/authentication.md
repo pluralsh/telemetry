@@ -1,7 +1,8 @@
 # Authentication and tenancy
 
 Every public data route names a configured namespace. Unknown namespaces return
-`404`, and read/write permission is evaluated independently.
+`404`. Read credentials authorize reads only; write credentials authorize both
+reads and writes.
 
 ```text
 request for namespace X
@@ -17,7 +18,8 @@ namespace public.
 ## Basic authentication
 
 Basic credentials may be global or namespace-specific, and are assigned to
-either `read` or `write`. Passwords can come from a literal, environment
+either `read` or `write`. The `write` permission includes `read`. Passwords can
+come from a literal, environment
 variable, or UTF-8 file. File values have trailing CR/LF removed and secrets
 are redacted from debug output. Prefer mounted files or environment-backed
 secrets over literals.
@@ -34,7 +36,7 @@ Required claims:
 - `exp`: valid expiration.
 - `namespace`: Rust regular expression matching the requested namespace. Use
   anchors, for example `^tenant-a$`, when exact matching is intended.
-- `permission`: exactly `read` or `write`.
+- `permission`: exactly `read` or `write`; `write` also authorizes reads.
 
 `nbf` is checked when present. `iss` and `aud` become required when configured.
 The JWT header must contain a known `kid` and an algorithm matching the JWK.

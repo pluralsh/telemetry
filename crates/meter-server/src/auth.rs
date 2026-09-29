@@ -23,6 +23,12 @@ pub enum Permission {
     Write,
 }
 
+impl Permission {
+    fn allows(self, requested: Self) -> bool {
+        self == Self::Write || self == requested
+    }
+}
+
 #[derive(Clone)]
 pub struct JwtAuthenticator {
     inner: Arc<JwtAuthenticatorInner>,
@@ -111,7 +117,7 @@ impl JwtAuthenticator {
             return false;
         };
         let _ = (data.claims.exp, data.claims.nbf);
-        data.claims.permission == permission
+        data.claims.permission.allows(permission)
             && Regex::new(&data.claims.namespace).is_ok_and(|pattern| pattern.is_match(namespace))
     }
 
@@ -204,16 +210,16 @@ pub async fn authorize(
         };
     }
     global
-        .iter()
-        .chain(namespace_credentials.iter())
+        .chain(namespace_credentials)
         .any(|credential| credential_matches(credential, header))
 }
 
-fn credentials(access: &Access, permission: Permission) -> &[Credential] {
-    match permission {
-        Permission::Read => &access.read,
-        Permission::Write => &access.write,
-    }
+fn credentials(access: &Access, permission: Permission) -> impl Iterator<Item = &Credential> {
+    access
+        .read
+        .iter()
+        .filter(move |_| permission == Permission::Read)
+        .chain(access.write.iter())
 }
 
 fn credential_matches(credential: &Credential, header: &str) -> bool {
@@ -425,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_jwks_authorizes_namespace_regex_and_exact_permission() {
+    async fn local_jwks_authorizes_namespace_regex_and_permission_hierarchy() {
         let jwt = authenticator(None, None).await;
         let read = token(Some(KID), r"^tenant-[0-9]+$", "read", future(), None, None);
         assert!(
@@ -466,7 +472,7 @@ mod tests {
         );
         let write = token(Some(KID), "^tenant-42$", "write", future(), None, None);
         assert!(
-            !authorize(
+            authorize(
                 &bearer(&write),
                 false,
                 &Access::default(),
@@ -581,7 +587,7 @@ mod tests {
             .await
         );
         assert!(
-            !authorize(
+            authorize(
                 &basic("tenant-writer", "tenant-password"),
                 false,
                 &global,
@@ -589,6 +595,18 @@ mod tests {
                 Some(&jwt),
                 "tenant",
                 Permission::Read,
+            )
+            .await
+        );
+        assert!(
+            !authorize(
+                &basic("global-reader", "global-password"),
+                false,
+                &global,
+                &namespace,
+                Some(&jwt),
+                "tenant",
+                Permission::Write,
             )
             .await
         );

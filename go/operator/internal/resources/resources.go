@@ -45,6 +45,8 @@ const (
 	verbGet                   = "get"
 	verbList                  = "list"
 	verbWatch                 = "watch"
+	routeRead                 = "/read"
+	routeWrite                = "/write"
 	productUserID       int64 = 10001
 
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
@@ -109,21 +111,21 @@ var (
 		ConfigPath: "/etc/meter/meter.yaml", SecretsPath: "/etc/meter/secrets",
 		DataPath: "/var/lib/meter", CachePath: "/var/cache/meter",
 		InternalTokenPath: InternalTokenPath, HTTPPort: 8080, GRPCPort: 9090,
-		ReadRoute: "/read", WriteRoute: "/write", NameAnnotation: MeterNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: MeterNameAnnotation, SupportsPathPrefix: true,
 	}
 	LineDescriptor = Descriptor{
 		Kind: "Line", Name: "line", Image: "ghcr.io/pluralsh/line", ConfigKey: "line.yaml",
 		ConfigPath: "/etc/line/line.yaml", SecretsPath: "/etc/line/secrets",
 		DataPath: "/var/lib/line", CachePath: "/var/cache/line",
 		InternalTokenPath: "/var/run/secrets/line/internal-token", HTTPPort: 3100, GRPCPort: 9091,
-		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: LineNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: LineNameAnnotation, SupportsPathPrefix: true,
 	}
 	TrackDescriptor = Descriptor{
 		Kind: "Track", Name: "track", Image: "ghcr.io/pluralsh/track", ConfigKey: "track.yaml",
 		ConfigPath: "/etc/track/track.yaml", SecretsPath: "/etc/track/secrets",
 		DataPath: "/var/lib/track", CachePath: "/var/cache/track",
 		InternalTokenPath: "/var/run/secrets/track/internal-token", HTTPPort: 3200, GRPCPort: 9092,
-		ReadRoute: "/read/ns", WriteRoute: "/write/ns", NameAnnotation: TrackNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: TrackNameAnnotation, SupportsPathPrefix: true,
 	}
 	PseudoFSDescriptor = Descriptor{
 		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",
