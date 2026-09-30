@@ -42,11 +42,6 @@ const METADATA_STAGE_READAHEAD: usize = 32;
 /// Cross-bucket readahead for sample batching.
 const SAMPLE_STAGE_READAHEAD: usize = 32;
 
-/// Series sample reads in flight within one bucket run. Worst-case in-flight
-/// sample gets = `SAMPLE_STAGE_READAHEAD * SAMPLES_PER_RUN_CONCURRENCY`, still
-/// capped by the sharded reader's I/O permits.
-const SAMPLES_PER_RUN_CONCURRENCY: usize = 8;
-
 /// Per-key index-fetch fan-out inside one bucket's resolve path. Worst-case
 /// in-flight gets during build_physical = `METADATA_STAGE_READAHEAD * INDEX_PER_KEY`.
 const INDEX_PER_KEY_CONCURRENCY: usize = 64;
@@ -219,24 +214,20 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
         return Ok(None);
     }
 
-    // Fan out: one forward-index get per candidate, parallel through the
-    // index cache. Duplicate ids are filtered with a sort+dedup first so
-    // we don't waste concurrency slots.
+    // One batched forward-index read through the index cache, which the
+    // storage reader serves with a key-range scan when the ids are dense.
     let mut unique_ids = candidates.clone();
     unique_ids.sort_unstable();
     unique_ids.dedup();
-    let specs: HashMap<SeriesId, crate::index::SeriesSpec> =
-        stream::iter(unique_ids.into_iter().map(|sid| async move {
-            let slot = index_cache
-                .forward_index_one(reader, &bucket, sid)
-                .await
-                .map_err(|e| internal_err(e.to_string()))?;
-            Ok::<_, QueryError>(slot.as_ref().as_ref().map(|spec| (sid, spec.clone())))
-        }))
-        .buffer_unordered(INDEX_PER_KEY_CONCURRENCY)
-        .try_filter_map(|x| async move { Ok(x) })
-        .try_collect()
-        .await?;
+    let slots = index_cache
+        .forward_index_many(reader, &bucket, &unique_ids)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let specs: HashMap<SeriesId, crate::index::SeriesSpec> = unique_ids
+        .into_iter()
+        .zip(slots)
+        .filter_map(|(sid, slot)| slot.as_ref().as_ref().map(|spec| (sid, spec.clone())))
+        .collect();
 
     // Apply negative / empty-string matchers using the materialised specs.
     let needs_filter = selector_util::has_negative_matchers(selector)
@@ -325,11 +316,12 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     Ok(out)
 }
 
-/// Sample reads within a run are polled concurrently inside this task (never
-/// spawned), up to [`SAMPLES_PER_RUN_CONCURRENCY`]; ordered buffering keeps
-/// at most that many series' samples in memory beyond the block itself.
-/// Metric names ride on the `ResolvedSeriesRef`, populated by
-/// `resolve_one_bucket` — no forward-index lookup here.
+/// Sample reads are issued as one [`QueryReader::samples_many`] per metric
+/// name in the run, polled inside this task (never spawned), so storage can
+/// serve a metric's contiguous series with a single range scan. Worst-case
+/// in-flight batches = `SAMPLE_STAGE_READAHEAD`, still capped by the sharded
+/// reader's I/O permits. Metric names ride on the `ResolvedSeriesRef`,
+/// populated by `resolve_one_bucket` — no forward-index lookup here.
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
     run: BucketRun,
@@ -351,45 +343,26 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
     let start_ms = time_range.start_ms.saturating_sub(1);
     let end_ms = time_range.end_ms_exclusive.saturating_sub(1);
 
-    let bucket = &bucket;
-    let mut fetched = stream::iter(series[run.range.clone()].to_vec())
-        .map(|series_ref| async move {
-            reader
-                .samples(
-                    bucket,
-                    series_ref.series_id as SeriesId,
-                    &series_ref.metric_name,
-                    start_ms,
-                    end_ms,
-                )
-                .await
-                .map_err(|e| internal_err(e.to_string()))
-        })
-        .buffered(SAMPLES_PER_RUN_CONCURRENCY)
-        .enumerate();
-    while let Some((col_idx, samples)) = fetched.next().await {
-        let SeriesData { floats, histograms } = samples?;
-        let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
-        ts_col.reserve(floats.len());
-        val_col.reserve(floats.len());
-        // Preserve stale markers verbatim as STALE_NAN — the
-        // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
-        // which survives the unmodified `s.value` copy below
-        // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
-        // contract).
-        for s in floats {
-            ts_col.push(s.timestamp_ms);
-            val_col.push(s.value);
-        }
-        let (hts_col, h_col) = (
-            &mut block.histogram_timestamps[col_idx],
-            &mut block.histograms[col_idx],
-        );
-        hts_col.reserve(histograms.len());
-        h_col.reserve(histograms.len());
-        for h in histograms {
-            hts_col.push(h.timestamp_ms);
-            h_col.push(Arc::new(h.histogram));
+    let refs = &series[run.range.clone()];
+    let mut order: Vec<usize> = (0..refs.len()).collect();
+    order.sort_by(|&a, &b| refs[a].metric_name.cmp(&refs[b].metric_name));
+    for group in order.chunk_by(|&a, &b| refs[a].metric_name == refs[b].metric_name) {
+        let series_ids: Vec<SeriesId> = group
+            .iter()
+            .map(|&i| refs[i].series_id as SeriesId)
+            .collect();
+        let fetched = reader
+            .samples_many(
+                &bucket,
+                &refs[group[0]].metric_name,
+                &series_ids,
+                start_ms,
+                end_ms,
+            )
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        for (&col_idx, samples) in group.iter().zip(fetched) {
+            fill_column(&mut block, col_idx, samples);
         }
     }
 
@@ -397,6 +370,32 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
         series_range: run.range,
         samples: block,
     })
+}
+
+fn fill_column(block: &mut SampleBlock, col_idx: usize, samples: SeriesData) {
+    let SeriesData { floats, histograms } = samples;
+    let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
+    ts_col.reserve(floats.len());
+    val_col.reserve(floats.len());
+    // Preserve stale markers verbatim as STALE_NAN — the
+    // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
+    // which survives the unmodified `s.value` copy below
+    // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
+    // contract).
+    for s in floats {
+        ts_col.push(s.timestamp_ms);
+        val_col.push(s.value);
+    }
+    let (hts_col, h_col) = (
+        &mut block.histogram_timestamps[col_idx],
+        &mut block.histograms[col_idx],
+    );
+    hts_col.reserve(histograms.len());
+    h_col.reserve(histograms.len());
+    for h in histograms {
+        hts_col.push(h.timestamp_ms);
+        h_col.push(Arc::new(h.histogram));
+    }
 }
 
 /// A same-bucket contiguous sub-slice of `request.series`.

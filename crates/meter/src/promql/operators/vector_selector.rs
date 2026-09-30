@@ -166,6 +166,30 @@ pub(crate) fn histogram_sample_bytes(h: &FloatHistogram) -> usize {
         + buckets.saturating_mul(std::mem::size_of::<crate::histogram::Bucket>())
 }
 
+/// Flatten a chunk's per-series source handles into one request, returning
+/// each request entry's series offset within the chunk.
+///
+/// Entries are ordered by `(bucket_id, series_id)` so every bucket forms one
+/// contiguous run the source can fetch in a single batch (and, in storage,
+/// a single key-range scan) rather than one run per series. Each series'
+/// handles are already sorted by that key (see `resolve_leaf`), so a stable
+/// sort keeps their relative order and samples still arrive per series in
+/// bucket order.
+pub(crate) fn flatten_bucket_major(
+    request_series: &[Arc<[ResolvedSeriesRef]>],
+) -> (Vec<ResolvedSeriesRef>, Vec<usize>) {
+    let mut entries: Vec<(ResolvedSeriesRef, usize)> = Vec::new();
+    for (series_off, series_refs) in request_series.iter().enumerate() {
+        debug_assert!(
+            !series_refs.is_empty(),
+            "every logical series must have at least one source handle",
+        );
+        entries.extend(series_refs.iter().map(|sref| (sref.clone(), series_off)));
+    }
+    entries.sort_by_key(|(sref, _)| (sref.bucket_id, sref.series_id));
+    entries.into_iter().unzip()
+}
+
 // ---------------------------------------------------------------------------
 // Lookback / @ / offset resolution
 // ---------------------------------------------------------------------------
@@ -421,21 +445,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     }
 
     fn chunk_request(&self, chunk_start: usize, chunk_end: usize) -> (SamplesRequest, Vec<usize>) {
-        let mut flat: Vec<ResolvedSeriesRef> = Vec::new();
-        let mut request_to_series: Vec<usize> = Vec::new();
-        for (series_off, series_refs) in self.request_series[chunk_start..chunk_end]
-            .iter()
-            .enumerate()
-        {
-            debug_assert!(
-                !series_refs.is_empty(),
-                "every logical series must have at least one source handle",
-            );
-            for sref in series_refs.iter() {
-                flat.push(sref.clone());
-                request_to_series.push(series_off);
-            }
-        }
+        let (flat, request_to_series) =
+            flatten_bucket_major(&self.request_series[chunk_start..chunk_end]);
         let window = self
             .effective_times
             .time_range_with_lookback(self.lookback_ms);

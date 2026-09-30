@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
+use common::{BytesRange, StorageError};
+use futures::{StreamExt, TryStreamExt};
 
 use crate::storage::{Storage, StorageRead, StorageSnapshot};
 
@@ -14,10 +18,11 @@ use crate::active_series::ActiveSeriesTracker;
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
-use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, Series, SeriesData, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
-use crate::serde::key::TimeSeriesKey;
+use crate::serde::forward_index::ForwardIndexValue;
+use crate::serde::key::{ForwardIndexKey, TimeSeriesKey};
 use crate::util::Result;
 
 /// Per-bucket query reader over any storage read handle — a
@@ -164,6 +169,153 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
             None => Ok(SeriesData::default()),
         }
     }
+
+    /// One key-range scan instead of a point get per series: a metric's
+    /// time-series keys are contiguous and ordered by series ID, so the scan
+    /// reads them sequentially (with read-ahead) rather than probing every
+    /// SST once per series. Falls back to point gets for small or sparse
+    /// requests, where the scan would mostly read unrequested series.
+    async fn samples_many(
+        &self,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesData>> {
+        if !scan_worthwhile(series_ids) {
+            let fetches: Vec<_> = series_ids
+                .iter()
+                .map(|&series_id| self.samples(series_id, metric_name, start_ms, end_ms))
+                .collect();
+            return futures::stream::iter(fetches)
+                .buffered(crate::query::SAMPLES_MANY_CONCURRENCY)
+                .try_collect()
+                .await;
+        }
+        let key = |series_id| {
+            TimeSeriesKey {
+                namespace: self.namespace.clone(),
+                bucket: self.bucket,
+                metric_name: metric_name.to_string(),
+                series_id,
+            }
+            .encode()
+        };
+        self.scan_series(key, series_ids, IoKindLocal::SamplesFetch, |value| {
+            crate::promql::trace::record_bytes(
+                crate::promql::trace::IoKind::Deserialize,
+                value.len() as u64,
+            );
+            io_trace_sync(IoKindLocal::Deserialize, || {
+                SeriesData::decode_range(value, start_ms, end_ms).map_err(|e| {
+                    Error::Internal(format!("Invalid timeseries data in storage: {e}"))
+                })
+            })
+        })
+        .await
+    }
+
+    /// Scan-backed like [`Self::samples_many`]: forward-index keys are
+    /// ordered by series ID within the bucket.
+    async fn forward_index_many(&self, series_ids: &[SeriesId]) -> Result<Vec<Option<SeriesSpec>>> {
+        if !scan_worthwhile(series_ids) {
+            let fetches: Vec<_> = series_ids
+                .iter()
+                .map(|&series_id| self.forward_index_one(series_id))
+                .collect();
+            return futures::stream::iter(fetches)
+                .buffered(crate::query::FORWARD_INDEX_MANY_CONCURRENCY)
+                .try_collect()
+                .await;
+        }
+        let key = |series_id| {
+            ForwardIndexKey {
+                namespace: self.namespace.clone(),
+                bucket: self.bucket,
+                series_id,
+            }
+            .encode()
+        };
+        self.scan_series(key, series_ids, IoKindLocal::ForwardIndexFetch, |value| {
+            Ok(Some(ForwardIndexValue::decode(value)?.into()))
+        })
+        .await
+    }
+}
+
+impl<R: StorageRead> MiniQueryReader<R> {
+    /// Decode the values of `series_ids` from one scan over keys built by
+    /// `key` (which must end in the big-endian series ID), returned in
+    /// `series_ids` order. Requested series with no key get `T::default()`.
+    /// `series_ids` must be non-empty.
+    async fn scan_series<T: Default + Clone>(
+        &self,
+        key: impl Fn(SeriesId) -> Bytes,
+        series_ids: &[SeriesId],
+        kind: IoKindLocal,
+        mut decode: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let mut wanted: Vec<(SeriesId, usize)> = series_ids.iter().copied().zip(0..).collect();
+        wanted.sort_unstable();
+        let mut out = vec![T::default(); series_ids.len()];
+        let mut next = 0;
+        let range = BytesRange::new(
+            Bound::Included(key(wanted[0].0)),
+            Bound::Included(key(wanted[wanted.len() - 1].0)),
+        );
+        let mut iter = io_trace_async(kind, self.snapshot.scan(range)).await?;
+        while next < wanted.len() {
+            let Some(record) = io_trace_async(kind, iter.next())
+                .await
+                .map_err(StorageError::from_storage)?
+            else {
+                break;
+            };
+            let Some(series_id) = record
+                .key
+                .len()
+                .checked_sub(4)
+                .and_then(|at| record.key[at..].try_into().ok())
+                .map(SeriesId::from_be_bytes)
+            else {
+                continue;
+            };
+            while wanted.get(next).is_some_and(|&(id, _)| id < series_id) {
+                next += 1;
+            }
+            if wanted.get(next).is_none_or(|&(id, _)| id != series_id) {
+                continue;
+            }
+            crate::promql::trace::record_bytes(kind, record.value.len() as u64);
+            let value = decode(record.value.as_ref())?;
+            while let Some(&(id, position)) = wanted.get(next)
+                && id == series_id
+            {
+                out[position] = value.clone();
+                next += 1;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Below this many series a batch uses point gets.
+const SCAN_MIN_SERIES: usize = 8;
+/// A batch scans only when its series-ID span is at most this many IDs per
+/// requested series, bounding the unrequested keys a scan reads.
+const SCAN_MAX_SPAN_PER_SERIES: u64 = 16;
+
+/// Whether `series_ids` is large and dense enough for a range scan to beat
+/// point gets.
+fn scan_worthwhile(series_ids: &[SeriesId]) -> bool {
+    if series_ids.len() < SCAN_MIN_SERIES {
+        return false;
+    }
+    let (Some(&min_id), Some(&max_id)) = (series_ids.iter().min(), series_ids.iter().max()) else {
+        return false;
+    };
+    let span = u64::from(max_id - min_id) + 1;
+    span <= series_ids.len() as u64 * SCAN_MAX_SPAN_PER_SERIES
 }
 
 // ─── trace helpers ──────────────────────────────────────────────────

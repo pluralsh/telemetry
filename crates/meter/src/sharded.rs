@@ -529,6 +529,28 @@ impl QueryReader for ShardQueryReader {
         }
     }
 
+    async fn samples_many(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<crate::model::SeriesData>> {
+        match self {
+            Self::Writer(reader) => {
+                reader
+                    .samples_many(bucket, metric_name, series_ids, start_ms, end_ms)
+                    .await
+            }
+            Self::Reader(reader) => {
+                reader
+                    .samples_many(bucket, metric_name, series_ids, start_ms, end_ms)
+                    .await
+            }
+        }
+    }
+
     async fn forward_index_one(
         &self,
         bucket: &TimeBucket,
@@ -537,6 +559,17 @@ impl QueryReader for ShardQueryReader {
         match self {
             Self::Writer(reader) => reader.forward_index_one(bucket, series_id).await,
             Self::Reader(reader) => reader.forward_index_one(bucket, series_id).await,
+        }
+    }
+
+    async fn forward_index_many(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<SeriesSpec>>> {
+        match self {
+            Self::Writer(reader) => reader.forward_index_many(bucket, series_ids).await,
+            Self::Reader(reader) => reader.forward_index_many(bucket, series_ids).await,
         }
     }
 
@@ -619,6 +652,20 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
             .await
     }
 
+    async fn samples_many(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<crate::model::SeriesData>> {
+        let _permit = self.acquire().await?;
+        self.inner
+            .samples_many(bucket, metric_name, series_ids, start_ms, end_ms)
+            .await
+    }
+
     async fn forward_index_one(
         &self,
         bucket: &TimeBucket,
@@ -626,6 +673,15 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
     ) -> Result<Option<SeriesSpec>> {
         let _permit = self.acquire().await?;
         self.inner.forward_index_one(bucket, series_id).await
+    }
+
+    async fn forward_index_many(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<SeriesSpec>>> {
+        let _permit = self.acquire().await?;
+        self.inner.forward_index_many(bucket, series_ids).await
     }
 
     async fn inverted_index_term(

@@ -253,13 +253,59 @@ impl Serialize for PromSample {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut tup = serializer.serialize_tuple(2)?;
         tup.serialize_element(&(self.0 as f64 / 1000.0))?;
-        tup.serialize_element(&format_float(self.1))?;
+        tup.serialize_element(&PromFloat(self.1))?;
         tup.end()
     }
 }
 
-fn format_float(v: f64) -> String {
-    common::display::prometheus_json_float(v)
+/// A sample value serialized as its Prometheus JSON string
+/// ([`common::display::prometheus_json_float`]) without a heap allocation in
+/// the common case: range results carry one per point.
+struct PromFloat(f64);
+
+impl Serialize for PromFloat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use std::fmt::Write;
+        let v = self.0;
+        let abs = v.abs();
+        // In this range the Prometheus spelling is plain `Display`.
+        if v.is_finite() && (abs == 0.0 || (1e-6..1e21).contains(&abs)) {
+            let mut buf = StackStr::<64>::new();
+            if write!(buf, "{v}").is_ok() {
+                return serializer.serialize_str(buf.as_str());
+            }
+        }
+        serializer.serialize_str(&common::display::prometheus_json_float(v))
+    }
+}
+
+/// Fixed-capacity UTF-8 buffer; writes past capacity fail.
+struct StackStr<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackStr<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).expect("only whole str writes are accepted")
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackStr<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 fn parse_float(s: &str) -> Result<f64, std::num::ParseFloatError> {
@@ -296,8 +342,8 @@ impl Serialize for PromHistogram<'_> {
             .filter(|b| b.count != 0.0)
             .collect();
         let mut s = serializer.serialize_struct("Histogram", 3)?;
-        s.serialize_field("count", &format_float(h.count))?;
-        s.serialize_field("sum", &format_float(h.sum))?;
+        s.serialize_field("count", &PromFloat(h.count))?;
+        s.serialize_field("sum", &PromFloat(h.sum))?;
         if !buckets.is_empty() {
             let custom = h.uses_custom_buckets();
             let wire: Vec<WireBucket> = buckets
@@ -329,9 +375,9 @@ impl Serialize for WireBucket {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut tup = serializer.serialize_tuple(4)?;
         tup.serialize_element(&self.0)?;
-        tup.serialize_element(&format_float(self.1))?;
-        tup.serialize_element(&format_float(self.2))?;
-        tup.serialize_element(&format_float(self.3))?;
+        tup.serialize_element(&PromFloat(self.1))?;
+        tup.serialize_element(&PromFloat(self.2))?;
+        tup.serialize_element(&PromFloat(self.3))?;
         tup.end()
     }
 }

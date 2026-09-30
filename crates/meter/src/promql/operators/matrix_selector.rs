@@ -676,21 +676,9 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
     }
 
     fn chunk_request(&self, chunk_start: usize, chunk_end: usize) -> (SamplesRequest, Vec<usize>) {
-        let mut flat: Vec<ResolvedSeriesRef> = Vec::new();
-        let mut request_to_series: Vec<usize> = Vec::new();
-        for (series_off, series_refs) in self.request_series[chunk_start..chunk_end]
-            .iter()
-            .enumerate()
-        {
-            debug_assert!(
-                !series_refs.is_empty(),
-                "every logical series must have at least one source handle",
-            );
-            for sref in series_refs.iter() {
-                flat.push(sref.clone());
-                request_to_series.push(series_off);
-            }
-        }
+        let (flat, request_to_series) = super::vector_selector::flatten_bucket_major(
+            &self.request_series[chunk_start..chunk_end],
+        );
         let window = self.effective_times.time_range_with_range(self.range_ms);
         (
             SamplesRequest::new(Arc::from(flat), window),

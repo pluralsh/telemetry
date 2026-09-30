@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -8,6 +9,12 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, QueryOptions, SeriesData};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
+
+/// In-flight per-series reads for the default `samples_many`.
+pub(crate) const SAMPLES_MANY_CONCURRENCY: usize = 8;
+
+/// In-flight per-series reads for the default `forward_index_many`.
+pub(crate) const FORWARD_INDEX_MANY_CONCURRENCY: usize = 64;
 
 /// Trait for read-only queries within a single time bucket.
 /// This is the bucket-scoped interface that works with bucket-local series IDs.
@@ -54,11 +61,45 @@ pub(crate) trait BucketQueryReader: Send + Sync {
         end_ms: i64,
     ) -> Result<SeriesData>;
 
+    /// [`Self::samples`] for several series of one metric, returned in
+    /// `series_ids` order.
+    async fn samples_many(
+        &self,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesData>> {
+        // Futures are built up front so the stream type carries no closure;
+        // a borrowing closure trips async_trait's `Send` inference.
+        let fetches: Vec<_> = series_ids
+            .iter()
+            .map(|&series_id| self.samples(series_id, metric_name, start_ms, end_ms))
+            .collect();
+        stream::iter(fetches)
+            .buffered(SAMPLES_MANY_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
     /// Fetch a single forward-index entry by series id. Returns `None` if
     /// the series isn't present in the bucket. Intended for callers that
     /// want to own fan-out concurrency themselves (see
     /// `crate::promql::source_adapter`).
     async fn forward_index_one(&self, series_id: SeriesId) -> Result<Option<SeriesSpec>>;
+
+    /// [`Self::forward_index_one`] for several series, returned in
+    /// `series_ids` order.
+    async fn forward_index_many(&self, series_ids: &[SeriesId]) -> Result<Vec<Option<SeriesSpec>>> {
+        let fetches: Vec<_> = series_ids
+            .iter()
+            .map(|&series_id| self.forward_index_one(series_id))
+            .collect();
+        stream::iter(fetches)
+            .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
+            .try_collect()
+            .await
+    }
 
     /// Fetch a single inverted-index posting by term. Returns `None` if
     /// the term isn't present in the bucket. See [`Self::forward_index_one`].
@@ -106,6 +147,26 @@ pub(crate) trait QueryReader: Send + Sync {
         end_ms: i64,
     ) -> Result<SeriesData>;
 
+    /// [`Self::samples`] for several series of one metric in `bucket`,
+    /// returned in `series_ids` order. See [`BucketQueryReader::samples_many`].
+    async fn samples_many(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesData>> {
+        let fetches: Vec<_> = series_ids
+            .iter()
+            .map(|&series_id| self.samples(bucket, series_id, metric_name, start_ms, end_ms))
+            .collect();
+        stream::iter(fetches)
+            .buffered(SAMPLES_MANY_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
     /// Fetch a single forward-index entry within `bucket`. See
     /// [`BucketQueryReader::forward_index_one`].
     async fn forward_index_one(
@@ -113,6 +174,23 @@ pub(crate) trait QueryReader: Send + Sync {
         bucket: &TimeBucket,
         series_id: SeriesId,
     ) -> Result<Option<SeriesSpec>>;
+
+    /// Forward-index entries within `bucket`, returned in `series_ids`
+    /// order. See [`BucketQueryReader::forward_index_many`].
+    async fn forward_index_many(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<SeriesSpec>>> {
+        let fetches: Vec<_> = series_ids
+            .iter()
+            .map(|&series_id| self.forward_index_one(bucket, series_id))
+            .collect();
+        stream::iter(fetches)
+            .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
+            .try_collect()
+            .await
+    }
 
     /// Fetch a single inverted-index posting within `bucket`. See
     /// [`BucketQueryReader::inverted_index_term`].
@@ -211,6 +289,20 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
             .await
     }
 
+    async fn samples_many(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesData>> {
+        let _permit = acquire(&self.limits.samples).await;
+        self.inner
+            .samples_many(bucket, metric_name, series_ids, start_ms, end_ms)
+            .await
+    }
+
     async fn forward_index_one(
         &self,
         bucket: &TimeBucket,
@@ -218,6 +310,15 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
     ) -> Result<Option<SeriesSpec>> {
         let _permit = acquire(&self.limits.metadata).await;
         self.inner.forward_index_one(bucket, series_id).await
+    }
+
+    async fn forward_index_many(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<SeriesSpec>>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.forward_index_many(bucket, series_ids).await
     }
 
     async fn inverted_index_term(

@@ -18,6 +18,42 @@ fn prom_sample_serializes_as_tuple() {
 }
 
 #[test]
+fn should_spell_prom_float_like_prometheus_json_float() {
+    // given: values on both sides of the plain/exponent boundaries
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        0.1 + 0.2,
+        1e-6,
+        9.99e-7,
+        1e-7,
+        123_456_789.123_456_78,
+        -1.797_693_134_862_315_7e20,
+        9.999_999_999_999_999e20,
+        1e21,
+        1.5e21,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        5e-324,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for v in values {
+        // when
+        let json = serde_json::to_value(PromFloat(v)).unwrap();
+        // then
+        assert_eq!(
+            json.as_str().unwrap(),
+            common::display::prometheus_json_float(v),
+            "{v:e}"
+        );
+    }
+}
+
+#[test]
 fn prom_samples_serializes_as_array() {
     let samples = vec![(1000, 1.5), (2000, 2.5)];
     let wrapper = PromSamples(&samples);

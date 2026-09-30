@@ -114,6 +114,89 @@ async fn should_ingest_and_query_single_bucket() {
 }
 
 #[tokio::test]
+async fn should_match_per_series_reads_for_batched_scans() {
+    // given: two metrics with interleaved series ids, so `m`'s forward-index
+    // id range also covers `other`'s series
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage);
+    let bucket = TimeBucket::hour(60);
+    let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+    for i in 0..24 {
+        let name = if i % 3 == 0 { "other" } else { "m" };
+        let instance = i.to_string();
+        for t in 0..3 {
+            let sample = create_sample(
+                name,
+                vec![("instance", instance.as_str())],
+                3_600_000 + t * 15_000,
+                (i * 10 + t) as f64,
+            );
+            mini.ingest(&sample).await.unwrap();
+        }
+    }
+    tsdb.flush().await.unwrap();
+    let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+    let term = Label::metric_name("m");
+    let mut ids: Vec<SeriesId> = reader
+        .inverted_index(&bucket, std::slice::from_ref(&term))
+        .await
+        .unwrap()
+        .intersect(vec![term])
+        .iter()
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 16);
+    let (start_ms, end_ms) = (3_600_000, 3_615_000);
+    let other_id = (ids[0]..ids[ids.len() - 1])
+        .find(|id| !ids.contains(id))
+        .unwrap();
+    let requests: Vec<(&str, Vec<SeriesId>)> = vec![
+        ("dense", ids.clone()),
+        (
+            "unordered with duplicates and an absent key",
+            ids.iter()
+                .rev()
+                .copied()
+                .chain([ids[3], ids[3], other_id])
+                .collect(),
+        ),
+        ("sparse fallback", {
+            let mut sparse = ids[..8].to_vec();
+            sparse.push(ids[0] + 10_000);
+            sparse
+        }),
+    ];
+
+    for (case, request) in requests {
+        // when
+        let batched = reader
+            .samples_many(&bucket, "m", &request, start_ms, end_ms)
+            .await
+            .unwrap();
+        let specs = reader.forward_index_many(&bucket, &request).await.unwrap();
+
+        // then: identical to one read per series, in request order
+        assert_eq!(batched.len(), request.len(), "{case}");
+        assert_eq!(specs.len(), request.len(), "{case}");
+        // `(start_ms, end_ms]` holds the second of three samples.
+        assert!(batched.iter().any(|s| s.floats.len() == 1), "{case}");
+        for ((&id, samples), spec) in request.iter().zip(&batched).zip(&specs) {
+            let expected = reader
+                .samples(&bucket, id, "m", start_ms, end_ms)
+                .await
+                .unwrap();
+            assert_eq!(samples, &expected, "{case}: series {id}");
+            let expected_spec = reader.forward_index_one(&bucket, id).await.unwrap();
+            assert_eq!(
+                format!("{spec:?}"),
+                format!("{expected_spec:?}"),
+                "{case}: series {id}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn should_query_across_multiple_buckets() {
     let storage = Arc::new(in_memory_storage().await);
     use crate::test_utils::assertions::assert_approx_eq;

@@ -108,6 +108,21 @@ impl QueryReader for ReaderQueryReader {
         mini.samples(series_id, metric_name, start_ms, end_ms).await
     }
 
+    async fn samples_many(
+        &self,
+        bucket: &TimeBucket,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<crate::model::SeriesData>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.samples_many(metric_name, series_ids, start_ms, end_ms)
+            .await
+    }
+
     async fn forward_index_one(
         &self,
         bucket: &TimeBucket,
@@ -117,6 +132,17 @@ impl QueryReader for ReaderQueryReader {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
         mini.forward_index_one(series_id).await
+    }
+
+    async fn forward_index_many(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<crate::index::SeriesSpec>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_many(series_ids).await
     }
 
     async fn inverted_index_term(

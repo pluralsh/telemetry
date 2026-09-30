@@ -172,7 +172,7 @@ async fn query(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Query(params): Query<InstantQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     execute_query(state, namespace, headers, params).await
 }
 
@@ -181,7 +181,7 @@ async fn query_form(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query(state, namespace, headers, params).await
 }
@@ -191,7 +191,7 @@ async fn execute_query(
     namespace: String,
     headers: HeaderMap,
     params: InstantQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     let reader = reader(&state, &namespace).await?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
@@ -217,7 +217,7 @@ async fn query_range(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Query(params): Query<RangeQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     execute_query_range(state, namespace, headers, params).await
 }
 
@@ -226,7 +226,7 @@ async fn query_range_form(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query_range(state, namespace, headers, params).await
 }
@@ -236,7 +236,7 @@ async fn execute_query_range(
     namespace: String,
     headers: HeaderMap,
     params: RangeQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     if params.step <= 0.0 || params.end < params.start {
         return Err(ApiError::bad_request("invalid range or step"));
@@ -515,10 +515,15 @@ fn time_range(start: Option<f64>, end: Option<f64>) -> RangeInclusive<SystemTime
 
 /// Query results go through Meter's Prometheus wire encoders so native
 /// histograms (`histogram` / `histograms`) and float spellings match upstream.
-fn prom_json(response: impl serde::Serialize) -> Result<Json<Value>, ApiError> {
-    serde_json::to_value(response)
-        .map(Json)
-        .map_err(ApiError::internal)
+/// Serialized straight to bytes: an intermediate `serde_json::Value` costs a
+/// map node and a `String` per point on large range results.
+fn prom_json(response: impl serde::Serialize) -> Result<Response, ApiError> {
+    let body = serde_json::to_vec(&response).map_err(ApiError::internal)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
 }
 
 fn request_id(headers: &HeaderMap, body: &[u8]) -> String {

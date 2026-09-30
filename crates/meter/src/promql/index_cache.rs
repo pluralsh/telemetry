@@ -130,6 +130,48 @@ impl IndexCache {
         self.forward_series.insert(key, value.clone());
         Ok(value)
     }
+
+    /// Batch form of [`Self::forward_index_one`], sharing its cache: hits
+    /// are served from the cache and the misses are fetched in one
+    /// [`QueryReader::forward_index_many`] call. Returned in `series_ids`
+    /// order.
+    pub(crate) async fn forward_index_many<R: QueryReader + ?Sized>(
+        &self,
+        reader: &R,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<ForwardSeriesValue>> {
+        let mut out: Vec<Option<ForwardSeriesValue>> = series_ids
+            .iter()
+            .map(|&series_id| {
+                self.forward_series
+                    .get(&(*bucket, series_id))
+                    .map(|hit| hit.clone())
+            })
+            .collect();
+        let (miss_positions, miss_ids): (Vec<usize>, Vec<SeriesId>) = out
+            .iter()
+            .zip(series_ids)
+            .enumerate()
+            .filter(|(_, (slot, _))| slot.is_none())
+            .map(|(position, (_, &series_id))| (position, series_id))
+            .unzip();
+        if !miss_ids.is_empty() {
+            let fetched = reader.forward_index_many(bucket, &miss_ids).await?;
+            for ((position, series_id), spec) in
+                miss_positions.into_iter().zip(miss_ids).zip(fetched)
+            {
+                let value: ForwardSeriesValue = Arc::new(spec);
+                self.forward_series
+                    .insert((*bucket, series_id), value.clone());
+                out[position] = Some(value);
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|slot| slot.expect("every slot is a hit or was fetched"))
+            .collect())
+    }
 }
 
 #[cfg(test)]
