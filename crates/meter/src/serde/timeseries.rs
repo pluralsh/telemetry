@@ -4,7 +4,7 @@ use crate::histogram::{Bucket, CounterResetHint, FloatHistogram};
 use crate::model::{HistogramSample, Sample, SeriesData};
 
 use super::*;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -234,8 +234,12 @@ fn is_histogram_value(bytes: &[u8]) -> bool {
 ///
 /// Float-only values encode as a bare Gorilla stream ([`TimeSeriesValue`]).
 /// Values with histograms encode as the marker byte, the length-prefixed
-/// Gorilla float stream, then the histogram section. Within one value a
-/// timestamp holds at most one sample type; a histogram wins a collision.
+/// Gorilla float stream, then the histogram section: the sample count, then
+/// per sample a delta-of-delta timestamp and the histogram encoded against
+/// the previous one ([`encode_histogram`]). A value never references data
+/// outside itself, so merge operands decode (and partially merge)
+/// independently. Within one value a timestamp holds at most one sample
+/// type; a histogram wins a collision.
 impl SeriesData {
     pub fn encode(mut self) -> Result<Bytes, EncodingError> {
         if self.histograms.is_empty() {
@@ -256,170 +260,392 @@ impl SeriesData {
         }
         .encode()?;
 
-        let mut buf = BytesMut::new();
-        buf.put_u8(HISTOGRAM_VALUE_MARKER);
+        let estimate: usize = self
+            .histograms
+            .iter()
+            .map(|s| 16 + 2 * (s.histogram.positive.len() + s.histogram.negative.len()))
+            .sum();
+        let mut buf = Vec::with_capacity(floats.len() + 20 + estimate);
+        buf.push(HISTOGRAM_VALUE_MARKER);
         put_uvarint(&mut buf, floats.len() as u64);
-        buf.put_slice(&floats);
+        buf.extend_from_slice(&floats);
         put_uvarint(&mut buf, self.histograms.len() as u64);
         let mut prev_ts = 0i64;
-        let mut prev_custom: Option<&Arc<[f64]>> = None;
+        let mut prev_delta = 0i64;
+        let mut prev: Option<&FloatHistogram> = None;
         for sample in &self.histograms {
-            put_varint(&mut buf, sample.timestamp_ms.wrapping_sub(prev_ts));
+            let delta = sample.timestamp_ms.wrapping_sub(prev_ts);
+            put_varint(&mut buf, delta.wrapping_sub(prev_delta));
             prev_ts = sample.timestamp_ms;
-            encode_histogram(&mut buf, &sample.histogram, &mut prev_custom);
+            prev_delta = delta;
+            encode_histogram(&mut buf, &sample.histogram, prev);
+            prev = Some(&sample.histogram);
         }
-        Ok(buf.freeze())
+        Ok(Bytes::from(buf))
     }
 
     /// Decodes the samples with `start_ms < timestamp <= end_ms`. Stored
     /// values are sorted by timestamp (encode and merge both guarantee it),
-    /// so float-only decoding stops past `end_ms`.
+    /// so decoding stops past `end_ms`.
     pub fn decode_range(buf: &[u8], start_ms: i64, end_ms: i64) -> Result<Self, EncodingError> {
-        if is_histogram_value(buf) {
-            let mut data = Self::decode(buf)?;
-            data.retain_range(start_ms, end_ms);
-            return Ok(data);
-        }
-        let Some(iter) = TimeSeriesIterator::new(buf) else {
-            return Ok(Self::default());
-        };
-        let mut floats = Vec::new();
-        for sample in iter {
-            let sample = sample?;
-            if sample.timestamp_ms > end_ms {
-                break;
-            }
-            if sample.timestamp_ms > start_ms {
-                floats.push(sample);
-            }
-        }
-        Ok(Self {
-            floats,
-            histograms: Vec::new(),
-        })
+        Self::decode_bounded(buf, Some((start_ms, end_ms)))
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        Self::decode_bounded(buf, None)
+    }
+
+    fn decode_bounded(buf: &[u8], range: Option<(i64, i64)>) -> Result<Self, EncodingError> {
         if !is_histogram_value(buf) {
             return Ok(Self {
-                floats: TimeSeriesValue::decode(buf)?.points,
+                floats: decode_floats(buf, range)?,
                 histograms: Vec::new(),
             });
         }
         let mut cursor = &buf[1..];
         let float_len = get_uvarint(&mut cursor)? as usize;
-        let float_bytes = take(&mut cursor, float_len)?;
-        let floats = TimeSeriesValue::decode(float_bytes)?.points;
+        let floats = decode_floats(take(&mut cursor, float_len)?, range)?;
         let count = get_uvarint(&mut cursor)? as usize;
-        let mut histograms = Vec::with_capacity(count.min(cursor.len()));
-        let mut ts = 0i64;
-        let mut prev_custom: Option<Arc<[f64]>> = None;
-        for _ in 0..count {
-            ts = ts.wrapping_add(get_varint(&mut cursor)?);
-            histograms.push(HistogramSample {
-                timestamp_ms: ts,
-                histogram: decode_histogram(&mut cursor, &mut prev_custom)?,
-            });
-        }
+        let histograms = decode_histograms(&mut cursor, count, range)?;
         Ok(Self { floats, histograms })
     }
 }
 
-fn encode_histogram<'a>(
-    buf: &mut BytesMut,
-    h: &'a FloatHistogram,
-    prev_custom: &mut Option<&'a Arc<[f64]>>,
-) {
-    buf.put_u8(match h.counter_reset_hint {
+fn decode_floats(buf: &[u8], range: Option<(i64, i64)>) -> Result<Vec<Sample>, EncodingError> {
+    let Some(iter) = TimeSeriesIterator::new(buf) else {
+        return Ok(Vec::new());
+    };
+    let Some((start_ms, end_ms)) = range else {
+        return iter.collect();
+    };
+    let mut floats = Vec::new();
+    for sample in iter {
+        let sample = sample?;
+        if sample.timestamp_ms > end_ms {
+            break;
+        }
+        if sample.timestamp_ms > start_ms {
+            floats.push(sample);
+        }
+    }
+    Ok(floats)
+}
+
+/// Samples are decoded in order since each depends on the one before;
+/// those before the range are decoded but only kept as the next base.
+fn decode_histograms(
+    cursor: &mut &[u8],
+    count: usize,
+    range: Option<(i64, i64)>,
+) -> Result<Vec<HistogramSample>, EncodingError> {
+    let mut histograms: Vec<HistogramSample> = Vec::new();
+    if range.is_none() {
+        histograms.reserve(count.min(cursor.len()));
+    }
+    let mut skipped: Option<FloatHistogram> = None;
+    let mut ts = 0i64;
+    let mut delta = 0i64;
+    for _ in 0..count {
+        delta = delta.wrapping_add(get_varint(cursor)?);
+        ts = ts.wrapping_add(delta);
+        if range.is_some_and(|(_, end_ms)| ts > end_ms) {
+            break;
+        }
+        let prev = match &skipped {
+            Some(h) => Some(h),
+            None => histograms.last().map(|s| &s.histogram),
+        };
+        let histogram = decode_histogram(cursor, prev)?;
+        if range.is_none_or(|(start_ms, _)| ts > start_ms) {
+            skipped = None;
+            histograms.push(HistogramSample {
+                timestamp_ms: ts,
+                histogram,
+            });
+        } else {
+            skipped = Some(histogram);
+        }
+    }
+    Ok(histograms)
+}
+
+const HINT_MASK: u8 = 0b11;
+const FLAG_LAYOUT: u8 = 1 << 2;
+const FLAG_INTEGER: u8 = 1 << 3;
+const FLAG_SAME_CUSTOM: u8 = 1 << 4;
+const KNOWN_FLAGS: u8 = HINT_MASK | FLAG_LAYOUT | FLAG_INTEGER | FLAG_SAME_CUSTOM;
+
+/// Encodes `h` against `prev`, the value's previous histogram.
+///
+/// A flags byte carries the counter reset hint and whether the bucket
+/// layout (schema, zero threshold, custom bounds, bucket indices) is
+/// restated; when it is not, the layout is `prev`'s. Restated custom bounds
+/// equal to `prev`'s are flagged rather than written. Then `zero_count`,
+/// `count`, `sum` and the bucket counts follow, each relative to `prev`'s
+/// value for the same field or bucket index (zero when absent): zigzag
+/// varint deltas when every count is an exact integer, XOR of the f64 bits
+/// ([`put_xor`]) otherwise. `sum` is always XOR-encoded.
+fn encode_histogram(buf: &mut Vec<u8>, h: &FloatHistogram, prev: Option<&FloatHistogram>) {
+    let integer = [h.zero_count, h.count]
+        .into_iter()
+        .chain(h.positive.iter().chain(&h.negative).map(|b| b.count))
+        .all(|count| as_integer(count).is_some());
+    let restate = !prev.is_some_and(|p| same_layout(p, h));
+    let same_custom = restate
+        && h.uses_custom_buckets()
+        && prev.is_some_and(|p| {
+            p.uses_custom_buckets() && same_bits(&p.custom_values, &h.custom_values)
+        });
+
+    let mut flags = match h.counter_reset_hint {
         CounterResetHint::Unknown => 0,
         CounterResetHint::CounterReset => 1,
         CounterResetHint::NotCounterReset => 2,
         CounterResetHint::Gauge => 3,
-    });
-    put_varint(buf, i64::from(h.schema));
-    buf.put_f64_le(h.zero_threshold);
-    buf.put_f64_le(h.zero_count);
-    buf.put_f64_le(h.count);
-    buf.put_f64_le(h.sum);
-    if h.uses_custom_buckets() {
-        if prev_custom.is_some_and(|prev| prev[..] == h.custom_values[..]) {
-            buf.put_u8(1);
-        } else {
-            buf.put_u8(0);
+    };
+    if restate {
+        flags |= FLAG_LAYOUT;
+    }
+    if integer {
+        flags |= FLAG_INTEGER;
+    }
+    if same_custom {
+        flags |= FLAG_SAME_CUSTOM;
+    }
+    buf.push(flags);
+
+    if restate {
+        put_varint(buf, i64::from(h.schema));
+        buf.put_f64_le(h.zero_threshold);
+        if h.uses_custom_buckets() && !same_custom {
             put_uvarint(buf, h.custom_values.len() as u64);
             for &bound in h.custom_values.iter() {
                 buf.put_f64_le(bound);
             }
-            *prev_custom = Some(&h.custom_values);
         }
+        encode_indices(buf, &h.positive);
+        encode_indices(buf, &h.negative);
     }
-    encode_buckets(buf, &h.positive);
-    encode_buckets(buf, &h.negative);
+
+    let empty;
+    let base = match prev {
+        Some(p) => p,
+        None => {
+            empty = FloatHistogram::default();
+            &empty
+        }
+    };
+    put_count(buf, integer, h.zero_count, base.zero_count);
+    put_count(buf, integer, h.count, base.count);
+    put_xor(buf, h.sum.to_bits() ^ base.sum.to_bits());
+    let mut positive_base = BaseCounts::new(&base.positive);
+    for bucket in &h.positive {
+        put_count(buf, integer, bucket.count, positive_base.get(bucket.index));
+    }
+    let mut negative_base = BaseCounts::new(&base.negative);
+    for bucket in &h.negative {
+        put_count(buf, integer, bucket.count, negative_base.get(bucket.index));
+    }
 }
 
 fn decode_histogram(
     cursor: &mut &[u8],
-    prev_custom: &mut Option<Arc<[f64]>>,
+    prev: Option<&FloatHistogram>,
 ) -> Result<FloatHistogram, EncodingError> {
-    let counter_reset_hint = match get_u8(cursor)? {
+    let flags = get_u8(cursor)?;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(EncodingError {
+            message: format!("invalid histogram flags {flags:#x}"),
+        });
+    }
+    let counter_reset_hint = match flags & HINT_MASK {
         0 => CounterResetHint::Unknown,
         1 => CounterResetHint::CounterReset,
         2 => CounterResetHint::NotCounterReset,
-        3 => CounterResetHint::Gauge,
-        other => {
-            return Err(EncodingError {
-                message: format!("invalid histogram counter reset hint {other}"),
-            });
+        _ => CounterResetHint::Gauge,
+    };
+    let integer = flags & FLAG_INTEGER != 0;
+
+    let mut h = if flags & FLAG_LAYOUT != 0 {
+        let schema = i32::try_from(get_varint(cursor)?).map_err(|_| EncodingError {
+            message: "histogram schema out of range".to_string(),
+        })?;
+        let mut h = FloatHistogram {
+            schema,
+            zero_threshold: get_f64(cursor)?,
+            ..FloatHistogram::default()
+        };
+        if h.uses_custom_buckets() {
+            h.custom_values = if flags & FLAG_SAME_CUSTOM != 0 {
+                prev.filter(|p| p.uses_custom_buckets())
+                    .map(|p| p.custom_values.clone())
+                    .ok_or_else(|| EncodingError {
+                        message: "histogram references missing custom bounds".to_string(),
+                    })?
+            } else {
+                let len = get_uvarint(cursor)? as usize;
+                (0..len)
+                    .map(|_| get_f64(cursor))
+                    .collect::<Result<Arc<[f64]>, _>>()?
+            };
+        }
+        h.positive = decode_indices(cursor)?;
+        h.negative = decode_indices(cursor)?;
+        h
+    } else {
+        let p = prev.ok_or_else(|| EncodingError {
+            message: "histogram references missing bucket layout".to_string(),
+        })?;
+        FloatHistogram {
+            schema: p.schema,
+            zero_threshold: p.zero_threshold,
+            custom_values: p.custom_values.clone(),
+            positive: p.positive.clone(),
+            negative: p.negative.clone(),
+            ..FloatHistogram::default()
         }
     };
-    let schema = i32::try_from(get_varint(cursor)?).map_err(|_| EncodingError {
-        message: "histogram schema out of range".to_string(),
-    })?;
-    let zero_threshold = get_f64(cursor)?;
-    let zero_count = get_f64(cursor)?;
-    let count = get_f64(cursor)?;
-    let sum = get_f64(cursor)?;
-    let mut h = FloatHistogram {
-        counter_reset_hint,
-        schema,
-        zero_threshold,
-        zero_count,
-        count,
-        sum,
-        ..FloatHistogram::default()
+    h.counter_reset_hint = counter_reset_hint;
+
+    let empty;
+    let base = match prev {
+        Some(p) => p,
+        None => {
+            empty = FloatHistogram::default();
+            &empty
+        }
     };
-    if h.uses_custom_buckets() {
-        h.custom_values = if get_u8(cursor)? == 1 {
-            prev_custom.clone().ok_or_else(|| EncodingError {
-                message: "histogram references missing custom bounds".to_string(),
-            })?
-        } else {
-            let len = get_uvarint(cursor)? as usize;
-            let bounds = (0..len)
-                .map(|_| get_f64(cursor))
-                .collect::<Result<Arc<[f64]>, _>>()?;
-            *prev_custom = Some(bounds.clone());
-            bounds
-        };
+    h.zero_count = get_count(cursor, integer, base.zero_count)?;
+    h.count = get_count(cursor, integer, base.count)?;
+    h.sum = f64::from_bits(get_xor(cursor)? ^ base.sum.to_bits());
+    let mut positive_base = BaseCounts::new(&base.positive);
+    for bucket in &mut h.positive {
+        bucket.count = get_count(cursor, integer, positive_base.get(bucket.index))?;
     }
-    h.positive = decode_buckets(cursor)?;
-    h.negative = decode_buckets(cursor)?;
+    let mut negative_base = BaseCounts::new(&base.negative);
+    for bucket in &mut h.negative {
+        bucket.count = get_count(cursor, integer, negative_base.get(bucket.index))?;
+    }
     Ok(h)
 }
 
-/// Buckets as a count, then per bucket the index gap from the previous
-/// bucket (the first index is absolute) and the count.
-fn encode_buckets(buf: &mut BytesMut, buckets: &[Bucket]) {
+fn same_layout(a: &FloatHistogram, b: &FloatHistogram) -> bool {
+    let same_indices = |x: &[Bucket], y: &[Bucket]| {
+        x.len() == y.len() && x.iter().zip(y).all(|(x, y)| x.index == y.index)
+    };
+    a.schema == b.schema
+        && a.zero_threshold.to_bits() == b.zero_threshold.to_bits()
+        && (Arc::ptr_eq(&a.custom_values, &b.custom_values)
+            || same_bits(&a.custom_values, &b.custom_values))
+        && same_indices(&a.positive, &b.positive)
+        && same_indices(&a.negative, &b.negative)
+}
+
+/// Bitwise equality, so reused bounds decode bit-identical (`-0.0`, NaN).
+fn same_bits(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+/// Resolves the previous sample's count for each bucket index, visited in
+/// ascending order; indices it lacks count as zero.
+struct BaseCounts<'a> {
+    buckets: &'a [Bucket],
+    next: usize,
+}
+
+impl<'a> BaseCounts<'a> {
+    fn new(buckets: &'a [Bucket]) -> Self {
+        Self { buckets, next: 0 }
+    }
+
+    fn get(&mut self, index: i32) -> f64 {
+        while self.buckets.get(self.next).is_some_and(|b| b.index < index) {
+            self.next += 1;
+        }
+        match self.buckets.get(self.next) {
+            Some(b) if b.index == index => b.count,
+            _ => 0.0,
+        }
+    }
+}
+
+/// 2^53: every integer up to this magnitude is exactly representable.
+const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+/// `v` as an integer when the conversion round-trips bit-exactly.
+fn as_integer(v: f64) -> Option<i64> {
+    let i = v as i64;
+    (i as f64 == v && v.abs() <= MAX_EXACT_INTEGER && (i != 0 || v.is_sign_positive())).then_some(i)
+}
+
+fn put_count(buf: &mut Vec<u8>, integer: bool, value: f64, base: f64) {
+    if integer {
+        let value = as_integer(value).expect("integer mode requires integer counts");
+        put_varint(buf, value - as_integer(base).unwrap_or(0));
+    } else {
+        put_xor(buf, value.to_bits() ^ base.to_bits());
+    }
+}
+
+fn get_count(cursor: &mut &[u8], integer: bool, base: f64) -> Result<f64, EncodingError> {
+    if integer {
+        let value = as_integer(base)
+            .unwrap_or(0)
+            .checked_add(get_varint(cursor)?)
+            .ok_or_else(|| EncodingError {
+                message: "histogram count delta overflow".to_string(),
+            })?;
+        Ok(value as f64)
+    } else {
+        Ok(f64::from_bits(get_xor(cursor)? ^ base.to_bits()))
+    }
+}
+
+/// Byte-aligned XOR packing: a header byte holding the number of leading
+/// (high nibble) and trailing (low nibble) zero bytes, then the remaining
+/// bytes big-endian. An unchanged value is the single byte `0x80`.
+fn put_xor(buf: &mut Vec<u8>, xor: u64) {
+    if xor == 0 {
+        buf.push(0x80);
+        return;
+    }
+    let leading = xor.leading_zeros() / 8;
+    let trailing = xor.trailing_zeros() / 8;
+    buf.push(((leading << 4) | trailing) as u8);
+    buf.put_uint(xor >> (trailing * 8), (8 - leading - trailing) as usize);
+}
+
+fn get_xor(cursor: &mut &[u8]) -> Result<u64, EncodingError> {
+    let header = get_u8(cursor)?;
+    if header == 0x80 {
+        return Ok(0);
+    }
+    let leading = u32::from(header >> 4);
+    let trailing = u32::from(header & 0x0f);
+    if leading + trailing >= 8 {
+        return Err(EncodingError {
+            message: format!("invalid histogram xor header {header:#x}"),
+        });
+    }
+    let body = take(cursor, (8 - leading - trailing) as usize)?
+        .iter()
+        .fold(0u64, |acc, &byte| (acc << 8) | u64::from(byte));
+    Ok(body << (trailing * 8))
+}
+
+/// Bucket indices as a count, then per bucket the gap from the previous
+/// index (the first is absolute).
+fn encode_indices(buf: &mut Vec<u8>, buckets: &[Bucket]) {
     put_uvarint(buf, buckets.len() as u64);
     let mut next = 0i64;
     for bucket in buckets {
         put_varint(buf, i64::from(bucket.index) - next);
         next = i64::from(bucket.index) + 1;
-        buf.put_f64_le(bucket.count);
     }
 }
 
-fn decode_buckets(cursor: &mut &[u8]) -> Result<Vec<Bucket>, EncodingError> {
+/// Decodes indices written by [`encode_indices`], with zero counts.
+fn decode_indices(cursor: &mut &[u8]) -> Result<Vec<Bucket>, EncodingError> {
     let len = get_uvarint(cursor)? as usize;
     let mut buckets = Vec::with_capacity(len.min(cursor.len()));
     let mut next = 0i64;
@@ -429,23 +655,20 @@ fn decode_buckets(cursor: &mut &[u8]) -> Result<Vec<Bucket>, EncodingError> {
             message: "histogram bucket index out of range".to_string(),
         })?;
         next = i64::from(index) + 1;
-        buckets.push(Bucket {
-            index,
-            count: get_f64(cursor)?,
-        });
+        buckets.push(Bucket { index, count: 0.0 });
     }
     Ok(buckets)
 }
 
-fn put_uvarint(buf: &mut BytesMut, mut value: u64) {
+fn put_uvarint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
-        buf.put_u8(value as u8 | 0x80);
+        buf.push(value as u8 | 0x80);
         value >>= 7;
     }
-    buf.put_u8(value as u8);
+    buf.push(value as u8);
 }
 
-fn put_varint(buf: &mut BytesMut, value: i64) {
+fn put_varint(buf: &mut Vec<u8>, value: i64) {
     put_uvarint(buf, ((value << 1) ^ (value >> 63)) as u64);
 }
 
@@ -1299,5 +1522,181 @@ mod tests {
         .encode()
         .unwrap();
         assert!(SeriesData::decode(&encoded[..encoded.len() - 3]).is_err());
+    }
+
+    fn buckets(entries: &[(i32, f64)]) -> Vec<Bucket> {
+        entries
+            .iter()
+            .map(|&(index, count)| Bucket { index, count })
+            .collect()
+    }
+
+    fn assert_bit_identical(actual: &[HistogramSample], expected: &[HistogramSample]) {
+        let bits = |h: &FloatHistogram| {
+            let counts = |b: &[Bucket]| {
+                b.iter()
+                    .map(|b| (b.index, b.count.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            (
+                h.counter_reset_hint,
+                h.schema,
+                h.zero_threshold.to_bits(),
+                h.zero_count.to_bits(),
+                h.count.to_bits(),
+                h.sum.to_bits(),
+                counts(&h.positive),
+                counts(&h.negative),
+                h.custom_values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            assert_eq!(a.timestamp_ms, e.timestamp_ms);
+            assert_eq!(bits(&a.histogram), bits(&e.histogram));
+        }
+    }
+
+    #[test]
+    fn should_round_trip_histogram_edge_cases_bit_exactly() {
+        // given: layout changes (bucket added, removed, schema change),
+        // a counter reset, fractional counts between integer samples, a
+        // negative-zero count, NaN and stale sums, and custom bounds that
+        // repeat across a layout change
+        let bounds: Arc<[f64]> = Arc::from(vec![0.5, 1.0, 2.0]);
+        let exp = |schema, positive: &[(i32, f64)], count, sum| FloatHistogram {
+            schema,
+            zero_threshold: 1e-128,
+            zero_count: 1.0,
+            count,
+            sum,
+            positive: buckets(positive),
+            negative: buckets(&[(-2, 1.0)]),
+            ..FloatHistogram::default()
+        };
+        let samples = vec![
+            histogram_sample(1000, exp(1, &[(0, 3.0), (1, 5.0)], 10.0, 2.5)),
+            histogram_sample(2000, exp(1, &[(0, 4.0), (1, 9.0)], 15.0, 3.75)),
+            histogram_sample(3000, exp(1, &[(0, 4.0), (1, 9.0), (4, 2.0)], 17.0, 4.0)),
+            histogram_sample(4000, exp(1, &[(1, 12.0), (4, 2.0)], 16.0, 4.5)),
+            histogram_sample(
+                5000,
+                FloatHistogram {
+                    counter_reset_hint: CounterResetHint::CounterReset,
+                    ..exp(1, &[(1, 1.0), (4, 0.0)], 3.0, 0.1)
+                },
+            ),
+            histogram_sample(6000, exp(1, &[(1, 1.5), (4, 0.25)], 3.75, 0.2)),
+            histogram_sample(7000, exp(1, &[(1, 2.0), (4, -0.0)], 4.0, f64::NAN)),
+            histogram_sample(8000, exp(0, &[(0, 2.0)], 4.0, 0.3)),
+            histogram_sample(9000, FloatHistogram::stale_marker()),
+            histogram_sample(10_000, custom_histogram(&bounds)),
+            histogram_sample(
+                11_000,
+                FloatHistogram {
+                    positive: buckets(&[(0, 1.0), (1, 3.0)]),
+                    ..custom_histogram(&bounds)
+                },
+            ),
+        ];
+        let value = SeriesData {
+            floats: Vec::new(),
+            histograms: samples.clone(),
+        };
+
+        // when
+        let decoded = SeriesData::decode(&value.encode().unwrap()).unwrap();
+
+        // then
+        assert_bit_identical(&decoded.histograms, &samples);
+        assert!(decoded.histograms[8].histogram.is_stale_marker());
+        assert!(Arc::ptr_eq(
+            &decoded.histograms[9].histogram.custom_values,
+            &decoded.histograms[10].histogram.custom_values
+        ));
+    }
+
+    #[test]
+    fn should_delta_encode_steady_integer_histograms_compactly() {
+        // given: 20 buckets growing by small integer increments
+        let samples: Vec<_> = (0..60i64)
+            .map(|i| {
+                let positive: Vec<_> = (0..20)
+                    .map(|b| Bucket {
+                        index: b,
+                        count: (i * (i64::from(b) + 1)) as f64,
+                    })
+                    .collect();
+                histogram_sample(
+                    i * 15_000,
+                    FloatHistogram {
+                        count: positive.iter().map(|b| b.count).sum(),
+                        sum: i as f64 * 0.5,
+                        positive,
+                        ..FloatHistogram::default()
+                    },
+                )
+            })
+            .collect();
+
+        // when
+        let encoded = SeriesData {
+            floats: Vec::new(),
+            histograms: samples.clone(),
+        }
+        .encode()
+        .unwrap();
+
+        // then: well under the 8 bytes per bucket of raw counts
+        assert!(
+            encoded.len() < samples.len() * 20 * 2,
+            "encoded {} bytes",
+            encoded.len()
+        );
+        assert_eq!(SeriesData::decode(&encoded).unwrap().histograms, samples);
+    }
+
+    #[test]
+    fn should_decode_histogram_range_across_delta_chain() {
+        // given: floats and histograms interleaved over ten timestamps
+        let value = SeriesData {
+            floats: (0..10)
+                .filter(|i| i % 2 == 1)
+                .map(|i| Sample::new(i * 1000, i as f64))
+                .collect(),
+            histograms: (0..10)
+                .filter(|i| i % 2 == 0)
+                .map(|i| histogram_sample(i * 1000, exponential_histogram(10.0 + i as f64)))
+                .collect(),
+        };
+        let encoded = value.clone().encode().unwrap();
+
+        for (start_ms, end_ms) in [(-1, 9000), (2500, 6000), (3999, 4000), (8000, 20_000)] {
+            // when
+            let ranged = SeriesData::decode_range(&encoded, start_ms, end_ms).unwrap();
+
+            // then: matches a full decode filtered to (start, end]
+            let mut expected = value.clone();
+            expected.retain_range(start_ms, end_ms);
+            assert_eq!(ranged, expected, "range ({start_ms}, {end_ms}]");
+        }
+    }
+
+    #[test]
+    fn should_reject_unknown_histogram_flags() {
+        let mut encoded = SeriesData {
+            floats: Vec::new(),
+            histograms: vec![histogram_sample(0, exponential_histogram(4.0))],
+        }
+        .encode()
+        .unwrap()
+        .to_vec();
+        // marker, empty float stream length, sample count, timestamp
+        assert_eq!(&encoded[..4], &[HISTOGRAM_VALUE_MARKER, 0, 1, 0]);
+        encoded[4] |= 0x80;
+        assert!(SeriesData::decode(&encoded).is_err());
     }
 }

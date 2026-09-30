@@ -10,6 +10,7 @@ from .auth import basic, bearer
 from .client import PrometheusClient, Target
 from .fixture import (
     assert_spans_writer_ranges,
+    classic_histogram_fixture,
     native_histogram_fixture,
     regression_fixture,
     series,
@@ -22,6 +23,7 @@ from .normalize import (
     result_len,
 )
 from .wire import (
+    otlp_explicit_histogram_fixture,
     otlp_exponential_histogram_fixture,
     otlp_fixture,
     remote_write_body,
@@ -100,6 +102,48 @@ NATIVE_RANGE_QUERIES = (
     (
         "native range quantile",
         "histogram_quantile(0.9, rate(regression_native_seconds[5m]))",
+        ("__name__",),
+    ),
+)
+
+CLASSIC_INSTANT_QUERIES = (
+    ("classic bucket selector", "regression_classic_seconds_bucket", ()),
+    (
+        "classic bucket rate",
+        "rate(regression_classic_seconds_bucket[5m])",
+        ("__name__",),
+    ),
+    (
+        "classic quantile",
+        "histogram_quantile(0.9, rate(regression_classic_seconds_bucket[5m]))",
+        ("__name__",),
+    ),
+    (
+        "classic aggregated quantile",
+        "histogram_quantile(0.5, sum by (le) "
+        "(rate(regression_classic_seconds_bucket[5m])))",
+        (),
+    ),
+    (
+        "classic average",
+        "rate(regression_classic_seconds_sum[5m]) "
+        "/ rate(regression_classic_seconds_count[5m])",
+        (),
+    ),
+    ("otlp explicit buckets", "otlp_regression_duration_bucket", OTLP_IGNORED_LABELS),
+    ("otlp explicit count", "otlp_regression_duration_count", OTLP_IGNORED_LABELS),
+    (
+        "otlp explicit quantile",
+        "histogram_quantile(0.5, otlp_regression_duration_bucket)",
+        (*OTLP_IGNORED_LABELS, "__name__"),
+    ),
+)
+
+CLASSIC_RANGE_QUERIES = (
+    ("classic range buckets", "regression_classic_seconds_bucket", ()),
+    (
+        "classic range quantile",
+        "histogram_quantile(0.9, rate(regression_classic_seconds_bucket[5m]))",
         ("__name__",),
     ),
 )
@@ -183,6 +227,37 @@ class MeterSuite:
             error="Meter reader did not observe durable writer data within 60s",
         )
         self.seed_native_histograms()
+        self.seed_classic_histograms()
+
+    def seed_classic_histograms(self) -> None:
+        body = remote_write_body(classic_histogram_fixture(self.base_ms))
+        for name, target in (("Prometheus", self.prometheus), ("Meter", self.writer)):
+            response = self.client.remote_write(
+                target, body, request_id="regression-classic"
+            )
+            assert 200 <= response.status < 300, (
+                f"{name} classic histogram write failed: "
+                f"{response.status} {response.body!r}"
+            )
+        otlp = otlp_explicit_histogram_fixture(
+            tuple(self.base_ms + index * 60_000 for index in range(5, 10))
+        ).SerializeToString()
+        for name, target, path in (
+            ("Prometheus", self.prometheus, "/api/v1/otlp/v1/metrics"),
+            ("Meter", self.writer, "/v1/metrics"),
+        ):
+            response = self.client.otlp_write(
+                target, otlp, path=path, request_id="regression-otlp-classic"
+            )
+            assert 200 <= response.status < 300, (
+                f"{name} OTLP explicit histogram write failed: "
+                f"{response.status} {response.body!r}"
+            )
+        for metric in (
+            "regression_classic_seconds_bucket",
+            "otlp_regression_duration_bucket",
+        ):
+            self.wait_for_metric(metric, timeout=60)
 
     def seed_native_histograms(self) -> None:
         body = remote_write_body(native_histogram_fixture(self.base_ms))

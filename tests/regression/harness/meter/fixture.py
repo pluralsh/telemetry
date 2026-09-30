@@ -176,6 +176,57 @@ def native_histogram_fixture(base_ms: int) -> tuple[Series, ...]:
     )
 
 
+CLASSIC_BOUNDS = ("0.1", "0.5", "1", "+Inf")
+
+
+def classic_histogram_fixture(base_ms: int) -> tuple[Series, ...]:
+    """Classic `le`-labelled histograms: cumulative `_bucket` series plus
+    `_sum` and `_count`, sharing the float fixture's timestamps.
+
+    Instance `a` grows monotonically; instance `b` resets at index 6.
+    """
+    times = tuple(base_ms + index * 60_000 for index in range(10))
+    result: list[Series] = []
+    for instance, resets in (("a", False), ("b", True)):
+        labels = (("instance", instance), ("job", NAMESPACE))
+        values = tuple(
+            index - 6 if resets and index >= 6 else index for index in range(10)
+        )
+        per_bucket = tuple((v, 3 * v + 1, 2 * v, v + 2) for v in values)
+        for position, bound in enumerate(CLASSIC_BOUNDS):
+            result.append(
+                series(
+                    "regression_classic_seconds_bucket",
+                    (*labels, ("le", bound)),
+                    tuple(
+                        (timestamp, float(sum(counts[: position + 1])))
+                        for timestamp, counts in zip(times, per_bucket, strict=True)
+                    ),
+                )
+            )
+        result.append(
+            series(
+                "regression_classic_seconds_count",
+                labels,
+                tuple(
+                    (timestamp, float(sum(counts)))
+                    for timestamp, counts in zip(times, per_bucket, strict=True)
+                ),
+            )
+        )
+        result.append(
+            series(
+                "regression_classic_seconds_sum",
+                labels,
+                tuple(
+                    (timestamp, 0.37 * v)
+                    for timestamp, v in zip(times, values, strict=True)
+                ),
+            )
+        )
+    return tuple(result)
+
+
 def fixture_shard(value: Series) -> int:
     hasher = blake3.blake3()
     hasher.update(NAMESPACE.encode())

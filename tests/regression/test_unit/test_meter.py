@@ -5,7 +5,9 @@ import pytest
 import snappy
 from harness.meter.auth import JWT_KEY_ID, JWT_SECRET, bearer
 from harness.meter.fixture import (
+    CLASSIC_BOUNDS,
     assert_spans_writer_ranges,
+    classic_histogram_fixture,
     fixture_shard,
     native_histogram_fixture,
     regression_fixture,
@@ -82,6 +84,27 @@ def test_native_fixture_resets_instance_b() -> None:
     assert counts[6] < counts[5]
     growing = [histogram.count for histogram in by_instance["a"].histograms]
     assert growing == sorted(growing)
+
+
+def test_classic_fixture_buckets_are_cumulative() -> None:
+    value = classic_histogram_fixture(BASE_MS)
+    counts = {}
+    for instance in ("a", "b"):
+        by_name_le = {
+            (labels["__name__"], labels.get("le")): [s.value for s in item.samples]
+            for item in value
+            if (labels := dict(item.labels))["instance"] == instance
+        }
+        buckets = [
+            by_name_le[("regression_classic_seconds_bucket", le)]
+            for le in CLASSIC_BOUNDS
+        ]
+        for step in zip(*buckets, strict=True):
+            assert list(step) == sorted(step)
+        counts[instance] = by_name_le[("regression_classic_seconds_count", None)]
+        assert counts[instance] == buckets[-1]
+    assert counts["a"] == sorted(counts["a"])
+    assert counts["b"][6] < counts["b"][5]
 
 
 def _histogram_response(buckets: list[list[object]]) -> dict[str, object]:

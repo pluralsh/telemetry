@@ -18,6 +18,8 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import (
     ExponentialHistogram,
     ExponentialHistogramDataPoint,
     Gauge,
+    Histogram,
+    HistogramDataPoint,
     Metric,
     NumberDataPoint,
     ResourceMetrics,
@@ -257,6 +259,40 @@ def otlp_fixture(timestamp_ms: int) -> ExportMetricsServiceRequest:
                         as_double=42.5,
                     )
                 ]
+            ),
+        )
+    )
+
+
+def otlp_explicit_histogram_fixture(
+    timestamps_ms: tuple[int, ...],
+) -> ExportMetricsServiceRequest:
+    """Cumulative explicit-bucket histogram, which both receivers expand
+    into classic `_bucket`/`_sum`/`_count` series."""
+    start_ns = (timestamps_ms[0] - 60_000) * 1_000_000
+    points = []
+    for index, timestamp in enumerate(timestamps_ms, start=1):
+        buckets = [index, 2 * index + 1, 0, index + 3]
+        points.append(
+            HistogramDataPoint(
+                attributes=[_kv("host", "host-a")],
+                start_time_unix_nano=start_ns,
+                time_unix_nano=timestamp * 1_000_000,
+                count=sum(buckets),
+                sum=0.8 * index,
+                explicit_bounds=[0.25, 0.5, 2.5],
+                bucket_counts=buckets,
+            )
+        )
+    return _otlp_request(
+        Metric(
+            name="otlp.regression.duration",
+            description="OTLP regression explicit-bucket histogram",
+            histogram=Histogram(
+                aggregation_temporality=(
+                    AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE
+                ),
+                data_points=points,
             ),
         )
     )

@@ -4,6 +4,8 @@ import pytest
 from harness.compose import ComposeProject
 from harness.meter.normalize import result_len
 from harness.meter.suite import (
+    CLASSIC_INSTANT_QUERIES,
+    CLASSIC_RANGE_QUERIES,
     DISCOVERY_QUERIES,
     INSTANT_QUERIES,
     NATIVE_INSTANT_QUERIES,
@@ -109,6 +111,36 @@ def test_native_histogram_instant_matches_prometheus(
     ids=lambda value: value if isinstance(value, str) else None,
 )
 def test_native_histogram_range_matches_prometheus(
+    meter: MeterSuite,
+    name: str,
+    expression: str,
+    ignored_labels: tuple[str, ...],
+) -> None:
+    meter.compare_range(name, expression, ignored_labels)
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    ("name", "expression", "ignored_labels"),
+    CLASSIC_INSTANT_QUERIES,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_classic_histogram_instant_matches_prometheus(
+    meter: MeterSuite,
+    name: str,
+    expression: str,
+    ignored_labels: tuple[str, ...],
+) -> None:
+    meter.compare_instant(name, expression, ignored_labels)
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    ("name", "expression", "ignored_labels"),
+    CLASSIC_RANGE_QUERIES,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_classic_histogram_range_matches_prometheus(
     meter: MeterSuite,
     name: str,
     expression: str,
