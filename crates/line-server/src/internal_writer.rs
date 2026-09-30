@@ -1,11 +1,11 @@
-use line::{Field, Fields, Label, Labels, LogBatch, LogEntry, Namespace, ShardingOptions};
-use meter_server::auth::secure_eq;
+use line::{Field, Fields, Label, Labels, LogBatch, LogEntry, Namespace, routing::route};
 use proto::line::internal::v1::{
     Durability as ProtoDurability, Field as ProtoField, Label as ProtoLabel,
     LogBatch as ProtoLogBatch, LogEntry as ProtoLogEntry, Namespace as ProtoNamespace,
     WriteBatchRequest, WriteBatchResponse,
     internal_writer_server::{InternalWriter, InternalWriterServer},
 };
+use server_common::internal_rpc;
 use sharding::ShardId;
 use tonic::{Request, Response, Status};
 
@@ -98,22 +98,15 @@ impl InternalWriter for AppState {
         &self,
         request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
-        if let Some(secret) = &self.config.auth.internal {
-            let expected = secret
-                .expose()
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let provided = request
-                .metadata()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .unwrap_or_default();
-            if !secure_eq(provided, &expected) {
-                return Err(Status::unauthenticated(
-                    "invalid internal cluster credential",
-                ));
-            }
-        }
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        internal_rpc::verify(request.metadata(), token.as_deref())?;
         let request = request.into_inner();
         let namespace = request
             .namespace
@@ -125,34 +118,15 @@ impl InternalWriter for AppState {
         }
         let namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let shard = ShardId::new(
-            request
-                .shard_id
-                .try_into()
-                .map_err(|_| Status::invalid_argument("shard id is out of range"))?,
-        );
-        let assignment = self.assignment.read().await;
-        if request.assignment_generation != assignment.generation.get() {
-            return Err(Status::failed_precondition(format!(
-                "stale_ownership: requested generation {}, current generation {}",
-                request.assignment_generation,
-                assignment.generation.get()
-            )));
-        }
-        if assignment
-            .owner_of(shard)
-            .is_none_or(|owner| owner.id != self.local_owner)
-        {
-            return Err(Status::failed_precondition(
-                "non_owner: shard is not owned by this server",
-            ));
-        }
-        let options = ShardingOptions::new(
-            assignment.shard_count,
-            self.config.sharding.io_concurrency_limit,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
-        let mut batches = request
+        let shard = internal_rpc::shard_id(request.shard_id)?;
+        let assignment = self.router.assignment().read().await;
+        internal_rpc::check_ownership(
+            &assignment,
+            request.assignment_generation,
+            shard,
+            self.router.local_owner(),
+        )?;
+        let batches = request
             .batches
             .into_iter()
             .map(from_proto_batch)
@@ -160,7 +134,7 @@ impl InternalWriter for AppState {
             .map_err(Status::invalid_argument)?;
         if batches.iter().any(|batch| {
             batch.entries.iter().any(|entry| {
-                options.route(&assignment, &namespace, &batch.labels, entry.timestamp_ns) != shard
+                route(&assignment, &namespace, &batch.labels, entry.timestamp_ns) != shard
             })
         }) {
             return Err(Status::invalid_argument(
@@ -184,9 +158,6 @@ impl InternalWriter for AppState {
             }));
         }
         drop(assignment);
-        if self.draining_shards.read().await.contains(&shard) {
-            return Err(Status::unavailable("local shard is draining"));
-        }
         // The wire durability is authoritative for forwarded requests.
         let durability = match ProtoDurability::try_from(request.durability)
             .unwrap_or(ProtoDurability::Applied)
@@ -195,24 +166,20 @@ impl InternalWriter for AppState {
             ProtoDurability::Written => line::Durability::Written,
             ProtoDurability::Durable => line::Durability::Durable,
         };
-        let database = self
-            .db
-            .shard(shard)
+        let admitted = self
+            .router
+            .admit(shard)
             .await
-            .ok_or_else(|| Status::unavailable("local shard is not open"))?;
-        if let Err(error) = database
-            .write_with_durability(&namespace, std::mem::take(&mut batches), durability)
+            .map_err(|error| internal_rpc::route_status(&error))?;
+        self.write_local(&namespace, shard, batches, durability)
             .await
-        {
-            return Err(line_status(error));
-        }
+            .map_err(line_status)?;
+        drop(admitted);
         if let Some(requests) = idempotency.as_mut() {
             requests.insert(request.request_id);
         }
-        self.mark_dirty();
-        self.invalidate_queries().await;
         Ok(Response::new(WriteBatchResponse {
-            assignment_generation: self.assignment.read().await.generation.get(),
+            assignment_generation: self.router.assignment().read().await.generation.get(),
             accepted_streams,
             accepted_entries,
         }))
@@ -222,9 +189,10 @@ impl InternalWriter for AppState {
 fn line_status(error: line::Error) -> Status {
     match error {
         line::Error::Invalid(_) => Status::invalid_argument(error.to_string()),
-        line::Error::Backpressure | line::Error::Unavailable(_) | line::Error::Storage(_) => {
-            Status::unavailable(error.to_string())
-        }
+        line::Error::Backpressure
+        | line::Error::Unavailable(_)
+        | line::Error::Storage(_)
+        | line::Error::Shard(_) => Status::unavailable(error.to_string()),
         line::Error::Corrupt(_)
         | line::Error::Json(_)
         | line::Error::Compression(_)
@@ -264,7 +232,6 @@ mod tests {
 
     fn request(generation: u64, request_id: &str) -> WriteBatchRequest {
         let namespace = Namespace::new("tenant").unwrap();
-        let options = ShardingOptions::new(2, 4).unwrap();
         let routing = sharding::ShardMap::new(
             sharding::AssignmentGeneration::new(1),
             2,
@@ -279,7 +246,7 @@ mod tests {
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()
             })
-            .find(|labels| options.route(&routing, &namespace, labels, 1).get() == 1)
+            .find(|labels| route(&routing, &namespace, labels, 1).get() == 1)
             .unwrap();
         to_proto_request(
             &namespace,

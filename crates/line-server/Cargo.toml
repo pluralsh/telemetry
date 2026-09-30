@@ -34,7 +34,6 @@ flate2 = "1"
 futures.workspace = true
 line = { path = "../line" }
 kube = { workspace = true, optional = true }
-meter-server = { path = "../meter-server", default-features = false }
 metrics.workspace = true
 opentelemetry-proto = { workspace = true, features = ["logs", "with-serde"] }
 prost.workspace = true
@@ -44,6 +43,7 @@ serde_html_form = "0.4.1"
 serde_json.workspace = true
 serde_yaml.workspace = true
 sharding = { path = "../sharding" }
+server-common = { path = "../server-common" }
 slatedb.workspace = true
 snap.workspace = true
 tokio.workspace = true

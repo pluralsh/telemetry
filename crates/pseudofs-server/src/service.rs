@@ -31,6 +31,7 @@ impl Service {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn ensure_unary_read(&self, tenant: &str, path: &str) -> Result<(), Status> {
         let size = self.fs.stat(tenant, path).await.map_err(status)?.size;
         if size > self.max_unary_file_size_bytes {

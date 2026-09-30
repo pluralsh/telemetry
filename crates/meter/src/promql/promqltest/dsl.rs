@@ -109,9 +109,8 @@ impl Parser {
         lines: &[&str],
         i: &mut usize,
     ) -> Result<Option<Command>, String> {
-        let rest = match line.strip_prefix("load ") {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(rest) = line.strip_prefix("load ") else {
+            return Ok(None);
         };
 
         let interval = parse_duration(rest)?;
@@ -143,9 +142,8 @@ impl Parser {
         lines: &[&str],
         i: &mut usize,
     ) -> Result<Option<Command>, String> {
-        let rest = match line.strip_prefix("eval instant at ") {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(rest) = line.strip_prefix("eval instant at ") else {
+            return Ok(None);
         };
 
         // Parse time and query from same line or next line
@@ -347,24 +345,26 @@ fn parse_multiple_value_exprs(s: &str) -> Result<Vec<(i64, f64)>, String> {
 fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     let s = s.trim();
 
-    // Check for expansion syntax: "start+step x count"
+    // Check for expansion syntax: "start+step x count", "start-step x count"
+    // or the "start x count" shorthand for a zero step.
     // Prometheus promqltest semantics are inclusive:
     // "0+10x5" => 6 samples: [0, 10, 20, 30, 40, 50].
     // Example: "0+10x100" => [0, 10, 20, ..., 1000].
-    if s.contains('+') && s.contains('x') {
-        let (lhs, count_str) = s
-            .split_once('x')
-            .ok_or_else(|| format!("Invalid expansion syntax: {}", s))?;
-        let (start_str, step_str) = lhs
-            .split_once('+')
-            .ok_or_else(|| format!("Invalid expansion syntax: {}", s))?;
-
+    if let Some((lhs, count_str)) = s.split_once('x')
+        && lhs != "_"
+    {
+        let (start_str, step) = match expansion_split(lhs) {
+            Some((start_str, sign, step_str)) => {
+                let step: f64 = step_str
+                    .parse()
+                    .map_err(|_| format!("Invalid step value: {}", step_str))?;
+                (start_str, sign * step)
+            }
+            None => (lhs, 0.0),
+        };
         let start: f64 = start_str
             .parse()
             .map_err(|_| format!("Invalid start value: {}", start_str))?;
-        let step: f64 = step_str
-            .parse()
-            .map_err(|_| format!("Invalid step value: {}", step_str))?;
         let count: usize = count_str
             .parse()
             .map_err(|_| format!("Invalid count: {}", count_str))?;
@@ -384,6 +384,23 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
             })
             .collect()
     }
+}
+
+/// Split `start±step` at the operator, skipping a leading sign and the
+/// sign of an exponent (`1e-3`).
+fn expansion_split(lhs: &str) -> Option<(&str, f64, &str)> {
+    let bytes = lhs.as_bytes();
+    (1..bytes.len()).find_map(|i| {
+        let sign = match bytes[i] {
+            b'+' => 1.0,
+            b'-' => -1.0,
+            _ => return None,
+        };
+        if matches!(bytes[i - 1], b'e' | b'E') {
+            return None;
+        }
+        Some((&lhs[..i], sign, &lhs[i + 1..]))
+    })
 }
 
 fn parse_expected(line: &str) -> Result<RangeSample, String> {

@@ -7,19 +7,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{StreamExt, stream};
 use line::{Durability as LineDurability, LogBatch, Namespace, ShardedLine, ShardingOptions};
-use meter_server::auth::JwtAuthenticator;
 use proto::line::internal::v1::internal_writer_client::InternalWriterClient;
-use sharding::{Owner, ShardId, ShardMap, server::owned_shards};
-use tokio::{sync::Semaphore, task::JoinHandle};
+use server_common::auth::JwtAuthenticator;
+use server_common::internal_rpc::{self, ChannelPool};
+use sharding::{
+    AssignmentGeneration, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
+    server::owned_shards, shard_request_id,
+};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, metadata::MetadataValue};
+use tonic::Request;
 
 #[cfg(feature = "kubernetes")]
-use sharding::{
-    AssignmentGeneration, BoxError, EpochPolicy, ShardLifecycle, server::KubernetesRuntime,
-};
+use sharding::{EpochPolicy, RoutedShardLifecycle, server::KubernetesRuntime};
 
 use crate::{
     config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
@@ -33,11 +34,9 @@ pub struct AppState {
     pub(crate) db: Arc<ShardedLine>,
     pub(crate) jwt: Option<JwtAuthenticator>,
     pub(crate) namespaces: Arc<HashMap<String, NamespaceConfig>>,
-    pub(crate) assignment: Arc<tokio::sync::RwLock<ShardMap>>,
-    pub(crate) local_owner: String,
+    pub(crate) router: Arc<WriteRouter>,
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    pub(crate) draining_shards: Arc<tokio::sync::RwLock<HashSet<ShardId>>>,
-    remote_limit: Arc<Semaphore>,
+    channels: Arc<ChannelPool>,
     query_cache: Arc<tokio::sync::Mutex<QueryCache>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
@@ -112,16 +111,22 @@ impl AppState {
             .map(|namespace| (namespace.name.clone(), namespace))
             .collect();
         let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
+        let router = WriteRouter::new(
+            local_owner,
+            Arc::new(tokio::sync::RwLock::new(assignment)),
+            RouterLimits {
+                remote_concurrency: config.write.remote_concurrency,
+                remote_retries: config.write.remote_retries,
+            },
+        );
         let state = Self {
-            remote_limit: Arc::new(Semaphore::new(config.write.remote_concurrency)),
             config: Arc::new(config),
             db,
             jwt,
             namespaces: Arc::new(namespaces),
-            assignment: Arc::new(tokio::sync::RwLock::new(assignment)),
-            local_owner,
+            router: Arc::new(router),
             completed_requests: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            draining_shards: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            channels: Arc::new(ChannelPool::default()),
             query_cache: Arc::new(tokio::sync::Mutex::new(QueryCache::default())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
@@ -134,18 +139,18 @@ impl AppState {
             if state.config.mode == ServerMode::Reader {
                 let task = runtime.spawn_reader(
                     Arc::clone(&state.db),
-                    Arc::clone(&state.assignment),
+                    Arc::clone(state.router.assignment()),
                     &state.cancellation,
                 );
                 state.tasks.lock().await.push(task);
             } else {
-                let lifecycle = Arc::new(LineShardLifecycle {
-                    db: Arc::clone(&state.db),
-                    draining_shards: Arc::clone(&state.draining_shards),
-                });
+                let lifecycle = Arc::new(RoutedShardLifecycle::new(
+                    Arc::clone(state.db.shards()),
+                    Arc::clone(&state.router),
+                ));
                 let tasks = runtime.spawn(
                     lifecycle,
-                    Arc::clone(&state.assignment),
+                    Arc::clone(state.router.assignment()),
                     &state.cancellation,
                 );
                 state.tasks.lock().await.extend(tasks);
@@ -162,15 +167,16 @@ impl AppState {
         }
         match self.config.mode {
             ServerMode::Standalone | ServerMode::Reader => {
-                let expected = (0..self.assignment.read().await.shard_count)
+                let expected = (0..self.router.assignment().read().await.shard_count)
                     .map(ShardId::new)
                     .collect::<Vec<_>>();
-                self.db.open_shards().await == expected
+                self.db.shards().ids().await == expected
             }
             ServerMode::Writer => {
-                let assignment = self.assignment.read().await;
-                let expected = owned_shards(&assignment, &self.local_owner).collect::<Vec<_>>();
-                !expected.is_empty() && self.db.open_shards().await == expected
+                let assignment = self.router.assignment().read().await;
+                let expected =
+                    owned_shards(&assignment, self.router.local_owner()).collect::<Vec<_>>();
+                !expected.is_empty() && self.db.shards().ids().await == expected
             }
         }
     }
@@ -283,53 +289,22 @@ impl AppState {
         batches: Vec<LogBatch>,
         request_id: String,
     ) -> Result<(), ApiError> {
-        let assignment = self.assignment.read().await.clone();
-        let options = ShardingOptions::new(
-            assignment.shard_count,
-            self.config.sharding.io_concurrency_limit,
-        )
-        .map_err(ApiError::internal)?;
-        let mut groups: HashMap<(Owner, ShardId), Vec<LogBatch>> = HashMap::new();
-        for (shard, batches) in options.split(&assignment, namespace, batches) {
-            let owner = assignment
-                .owner_of(shard)
-                .cloned()
-                .ok_or_else(|| ApiError::unavailable("shard has no active owner"))?;
-            groups.insert((owner, shard), batches);
-        }
-        let results = stream::iter(groups.into_iter().map(|((owner, shard), batches)| {
-            let state = self.clone();
-            let namespace = namespace.clone();
-            let request_id = format!("{request_id}-{}", shard.get());
-            async move {
-                let _permit = state
-                    .remote_limit
-                    .acquire()
-                    .await
-                    .map_err(|_| ApiError::unavailable("server is shutting down"))?;
-                if owner.id == state.local_owner {
-                    state.write_local(&namespace, shard, batches).await
-                } else {
-                    state
-                        .write_remote(
-                            &namespace,
-                            owner,
-                            shard,
-                            batches,
-                            assignment.generation.get(),
-                            request_id,
-                        )
-                        .await
-                }
-            }
-        }))
-        .buffer_unordered(self.config.write.remote_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-        for result in results {
-            result?;
-        }
-        Ok(())
+        let assignment = self.router.assignment().read().await.clone();
+        let groups = line::routing::split(&assignment, namespace, batches);
+        self.router
+            .dispatch(
+                &assignment,
+                groups,
+                |shard, batches| self.write_unguarded(namespace, shard, batches),
+                |owner, shard, generation, batches| {
+                    let request_id = shard_request_id(&request_id, shard);
+                    async move {
+                        self.write_remote(namespace, owner, shard, batches, generation, &request_id)
+                            .await
+                    }
+                },
+            )
+            .await
     }
 
     pub(crate) async fn write_local(
@@ -337,77 +312,86 @@ impl AppState {
         namespace: &Namespace,
         shard: ShardId,
         batches: Vec<LogBatch>,
-    ) -> Result<(), ApiError> {
-        // Hold the read guard until the write completes. Migration and
-        // shutdown take the lock exclusively before flushing, which makes
-        // their flush a barrier for every write admitted before the drain.
-        let draining = self.draining_shards.read().await;
-        if draining.contains(&shard) {
-            return Err(ApiError::unavailable("local shard is draining"));
-        }
-        let database = self
-            .db
-            .shard(shard)
-            .await
-            .ok_or_else(|| ApiError::unavailable("local shard is not open"))?;
+        durability: LineDurability,
+    ) -> Result<(), line::Error> {
+        let database = self.db.shards().require(shard).await?;
         database
-            .write_with_durability(namespace, batches, durability(self.config.write.durability))
-            .await
-            .map_err(ApiError::from_line)?;
+            .write_with_durability(namespace, batches, durability)
+            .await?;
         self.mark_dirty();
         self.invalidate_queries().await;
         Ok(())
     }
 
+    async fn write_unguarded(
+        &self,
+        namespace: &Namespace,
+        shard: ShardId,
+        batches: Vec<LogBatch>,
+    ) -> Result<(), ApiError> {
+        self.write_local(
+            namespace,
+            shard,
+            batches,
+            durability(self.config.write.durability),
+        )
+        .await
+        .map_err(crate::http::line_error)
+    }
+
     async fn write_remote(
         &self,
         namespace: &Namespace,
-        mut owner: Owner,
+        owner: Owner,
         shard: ShardId,
         batches: Vec<LogBatch>,
-        mut generation: u64,
-        request_id: String,
+        generation: AssignmentGeneration,
+        request_id: &str,
     ) -> Result<(), ApiError> {
-        for attempt in 0..=self.config.write.remote_retries {
-            let endpoint = owner_endpoint(&self.config, &owner)?;
-            let mut client = InternalWriterClient::connect(format!("http://{endpoint}"))
-                .await
-                .map_err(|error| ApiError::unavailable(error.to_string()))?;
-            let mut request = Request::new(to_proto_request(
-                namespace,
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()
+            .map_err(ApiError::internal)?;
+        self.router
+            .forward(
+                owner,
                 shard,
                 generation,
-                &request_id,
-                self.config.write.durability,
-                batches.clone(),
-            ));
-            if let Some(secret) = &self.config.auth.internal {
-                request.metadata_mut().insert(
-                    "authorization",
-                    MetadataValue::try_from(format!(
-                        "Bearer {}",
-                        secret.expose().map_err(ApiError::internal)?
-                    ))
-                    .map_err(ApiError::internal)?,
-                );
-            }
-            match client.write(request).await {
-                Ok(_) => return Ok(()),
-                Err(status)
-                    if status.code() == tonic::Code::FailedPrecondition
-                        && attempt < self.config.write.remote_retries =>
-                {
-                    let assignment = self.assignment.read().await;
-                    generation = assignment.generation.get();
-                    owner = assignment
-                        .owner_of(shard)
-                        .cloned()
-                        .ok_or_else(|| ApiError::unavailable("shard owner disappeared"))?;
-                }
-                Err(status) => return Err(ApiError::unavailable(status.to_string())),
-            }
-        }
-        Err(ApiError::unavailable("remote write retries exhausted"))
+                &batches,
+                |owner, generation, batches| {
+                    let request = to_proto_request(
+                        namespace,
+                        shard,
+                        generation.get(),
+                        request_id,
+                        self.config.write.durability,
+                        batches.clone(),
+                    );
+                    let token = token.as_deref();
+                    let endpoint = owner_endpoint(&self.config, owner);
+                    async move {
+                        let unavailable = |status: &tonic::Status| ApiError::unavailable(status);
+                        let endpoint = endpoint.map_err(sharding::ForwardError::Failed)?;
+                        let channel = self.channels.channel(&endpoint).map_err(|status| {
+                            sharding::ForwardError::Failed(unavailable(&status))
+                        })?;
+                        let mut request = Request::new(request);
+                        internal_rpc::authorize(&mut request, token).map_err(|status| {
+                            sharding::ForwardError::Failed(unavailable(&status))
+                        })?;
+                        InternalWriterClient::new(channel)
+                            .write(request)
+                            .await
+                            .map(drop)
+                            .map_err(|status| internal_rpc::forward_error(&status, unavailable))
+                    }
+                },
+            )
+            .await
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -416,9 +400,9 @@ impl AppState {
         for task in self.tasks.lock().await.drain(..) {
             task.await?;
         }
-        let open_shards = self.db.open_shards().await;
-        let mut draining = self.draining_shards.write().await;
-        draining.extend(open_shards);
+        self.router
+            .start_draining(self.db.shards().ids().await)
+            .await;
         self.db.flush().await?;
         self.db.close().await?;
         Ok(())
@@ -454,42 +438,7 @@ impl AppState {
     }
 }
 
-#[cfg(feature = "kubernetes")]
-struct LineShardLifecycle {
-    db: Arc<ShardedLine>,
-    draining_shards: Arc<tokio::sync::RwLock<HashSet<ShardId>>>,
-}
-
-#[cfg(feature = "kubernetes")]
-#[tonic::async_trait]
-impl ShardLifecycle for LineShardLifecycle {
-    async fn open(
-        &self,
-        shard: ShardId,
-        _generation: AssignmentGeneration,
-    ) -> Result<(), BoxError> {
-        self.db.open_shard(shard).await?;
-        self.draining_shards.write().await.remove(&shard);
-        Ok(())
-    }
-
-    async fn drain(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.draining_shards.write().await.insert(shard);
-        Ok(())
-    }
-
-    async fn flush(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.db.flush_shard(shard).await?;
-        Ok(())
-    }
-
-    async fn close(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.db.close_shard(shard).await?;
-        Ok(())
-    }
-}
-
-fn durability(value: Durability) -> LineDurability {
+pub(crate) fn durability(value: Durability) -> LineDurability {
     match value {
         Durability::Applied => LineDurability::Applied,
         Durability::Written => LineDurability::Written,
@@ -511,8 +460,8 @@ fn owner_endpoint(config: &Config, owner: &Owner) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use common::storage::config::StorageConfig;
-    use line::{Label, Labels, LogEntry, QueryOptions, QueryRequest, QueryResult};
-    use sharding::{Assignment, AssignmentGeneration, AssignmentState, Owner, ShardRange};
+    use line::{Label, Labels, LogEntry, QueryOptions, QueryRequest, QueryResult, routing::route};
+    use sharding::{Assignment, AssignmentState, ShardRange};
     use tokio::net::TcpListener;
     use tonic::transport::Server;
 
@@ -571,13 +520,12 @@ mod tests {
     }
 
     fn batch_on_shard(namespace: &Namespace, shard: u32) -> LogBatch {
-        let options = ShardingOptions::new(2, 4).unwrap();
         let routing = two_shards();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()
             })
-            .find(|labels| options.route(&routing, namespace, labels, 1).get() == shard)
+            .find(|labels| route(&routing, namespace, labels, 1).get() == shard)
             .unwrap();
         LogBatch::new(labels, vec![LogEntry::new(1, "forwarded")])
     }
@@ -622,13 +570,13 @@ mod tests {
         .unwrap();
         let namespace = Namespace::new("tenant").unwrap();
         let batch = batch_on_shard(&namespace, 1);
-        let routing = state.assignment.read().await.clone();
-        let shard = state.db.route(&routing, &namespace, &batch.labels, 1);
-        state.draining_shards.write().await.insert(shard);
+        let routing = state.router.assignment().read().await.clone();
+        let shard = route(&routing, &namespace, &batch.labels, 1);
+        state.router.start_draining([shard]).await;
 
         assert!(
             state
-                .write_local(&namespace, shard, vec![batch])
+                .route_write(&namespace, vec![batch], "drained".into())
                 .await
                 .is_err()
         );
@@ -649,14 +597,13 @@ mod tests {
         .unwrap();
         let namespace = Namespace::new("tenant").unwrap();
         let batch = batch_on_shard(&namespace, 1);
-        let routing = state.assignment.read().await.clone();
-        let shard = state.db.route(&routing, &namespace, &batch.labels, 1);
+        let routing = state.router.assignment().read().await.clone();
+        let shard = route(&routing, &namespace, &batch.labels, 1);
 
-        // This is the admission guard held by write_local for the full write.
-        let admitted = state.draining_shards.read().await;
-        let draining = Arc::clone(&state.draining_shards);
+        let admitted = state.router.admit(shard).await.unwrap();
+        let router = Arc::clone(&state.router);
         let drain = tokio::spawn(async move {
-            draining.write().await.insert(shard);
+            router.start_draining([shard]).await;
         });
         tokio::task::yield_now().await;
         assert!(
@@ -667,7 +614,7 @@ mod tests {
         drop(admitted);
         drain.await.unwrap();
         let error = state
-            .write_local(&namespace, shard, vec![batch])
+            .route_write(&namespace, vec![batch], "after-drain".into())
             .await
             .unwrap_err();
         assert!(format!("{error:?}").contains("local shard is draining"));
@@ -677,6 +624,8 @@ mod tests {
     #[cfg(feature = "kubernetes")]
     #[tokio::test]
     async fn line_lifecycle_opens_drains_flushes_and_closes_a_shard() {
+        use sharding::ShardLifecycle;
+
         let db = Arc::new(
             ShardedLine::open(
                 line::Config {
@@ -689,23 +638,27 @@ mod tests {
             .await
             .unwrap(),
         );
-        let draining = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
-        let lifecycle = LineShardLifecycle {
-            db: Arc::clone(&db),
-            draining_shards: Arc::clone(&draining),
-        };
+        let router = Arc::new(WriteRouter::new(
+            "writer",
+            Arc::new(tokio::sync::RwLock::new(two_shards())),
+            RouterLimits {
+                remote_concurrency: 1,
+                remote_retries: 0,
+            },
+        ));
+        let lifecycle = RoutedShardLifecycle::new(Arc::clone(db.shards()), Arc::clone(&router));
         let shard = ShardId::new(1);
 
         lifecycle
             .open(shard, AssignmentGeneration::new(1))
             .await
             .unwrap();
-        assert!(db.contains_shard(shard).await);
+        assert!(db.shards().contains(shard).await);
         lifecycle.drain(shard).await.unwrap();
-        assert!(draining.read().await.contains(&shard));
+        assert!(router.is_draining(shard).await);
         lifecycle.flush(shard).await.unwrap();
         lifecycle.close(shard).await.unwrap();
-        assert!(!db.contains_shard(shard).await);
+        assert!(!db.shards().contains(shard).await);
     }
 
     #[tokio::test]
@@ -715,8 +668,8 @@ mod tests {
         let writer_b = AppState::open(config("writer-b", endpoint.to_string()))
             .await
             .unwrap();
-        let current = writer_b.assignment.read().await.clone();
-        *writer_b.assignment.write().await = with_generation(&current, 2);
+        let current = writer_b.router.assignment().read().await.clone();
+        *writer_b.router.assignment().write().await = with_generation(&current, 2);
         let cancel = CancellationToken::new();
         let server = tokio::spawn(
             Server::builder()
@@ -730,8 +683,8 @@ mod tests {
         let writer_a = AppState::open(config("writer-a", endpoint.to_string()))
             .await
             .unwrap();
-        let current = writer_a.assignment.read().await.clone();
-        *writer_a.assignment.write().await = with_generation(&current, 2);
+        let current = writer_a.router.assignment().read().await.clone();
+        *writer_a.router.assignment().write().await = with_generation(&current, 2);
         let namespace = Namespace::new("tenant").unwrap();
         let batch = batch_on_shard(&namespace, 1);
         writer_a
@@ -740,8 +693,8 @@ mod tests {
                 Owner::new("writer-b", 1),
                 ShardId::new(1),
                 vec![batch],
-                1,
-                "retry-request".into(),
+                AssignmentGeneration::new(1),
+                "retry-request",
             )
             .await
             .unwrap();

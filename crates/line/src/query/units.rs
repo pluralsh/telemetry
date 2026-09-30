@@ -1,8 +1,5 @@
 use super::*;
 
-pub(super) static DURATION_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|ms|s|m|h|d|w)").expect("static duration regex")
-});
 pub(super) static BYTE_SIZE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)?$").expect("static bytes regex")
 });
@@ -10,34 +7,7 @@ pub(super) static ANSI_ESCAPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("static ANSI regex"));
 
 pub(super) fn parse_duration_ns(source: &str) -> Result<i64> {
-    let mut total = 0.0;
-    let mut consumed = 0;
-    for captures in DURATION_TOKEN.captures_iter(source) {
-        let matched = captures.get(0).expect("full capture");
-        if matched.start() != consumed {
-            return Err(Error::Query(format!("invalid duration {source:?}")));
-        }
-        consumed = matched.end();
-        let value: f64 = captures[1]
-            .parse()
-            .map_err(|_| Error::Query(format!("invalid duration {source:?}")))?;
-        let unit = match &captures[2] {
-            "ns" => 1.0,
-            "us" | "µs" => 1_000.0,
-            "ms" => 1_000_000.0,
-            "s" => 1_000_000_000.0,
-            "m" => 60_000_000_000.0,
-            "h" => 3_600_000_000_000.0,
-            "d" => 86_400_000_000_000.0,
-            "w" => 604_800_000_000_000.0,
-            _ => unreachable!(),
-        };
-        total += value * unit;
-    }
-    if consumed != source.len() || consumed == 0 || total > i64::MAX as f64 {
-        return Err(Error::Query(format!("invalid duration {source:?}")));
-    }
-    Ok(total as i64)
+    common::time::parse_duration_ns(source).map_err(|error| Error::Query(error.to_string()))
 }
 
 pub(super) fn parse_bytes(source: &str) -> Result<f64> {

@@ -27,6 +27,8 @@
 //! a stray `Deferred`-stamped batch surfaces as [`ReshapeError`] rather
 //! than panicking.
 
+use std::collections::BTreeMap;
+
 use crate::model::{InstantSample, Labels, QueryValue, RangeSample};
 
 use super::batch::{SchemaRef, SeriesSchema, StepBatch};
@@ -94,24 +96,12 @@ pub fn reshape_instant(
                 "reshape_instant saw batch with step_count={step_count}; expected 1",
             )));
         }
-        let step_ts = batch.step_timestamps_slice()[0];
-        for series_off in 0..series_count {
-            // Row-major-by-step ⇒ cell index for step 0 is just the
-            // series offset. Fast path: skip validity checks via direct
-            // indexing.
-            let cell = series_off;
-            if !batch.validity.get(cell) {
-                continue;
-            }
+        for (series_off, step_ts, value) in valid_cells(&batch) {
             let global_idx = (batch.series_range.start + series_off) as u32;
-            // One clone per emitted sample == one clone per valid output
-            // series in instant mode (each series contributes at most
-            // one sample).
-            let labels = schema.labels(global_idx).clone();
             samples.push(InstantSample {
-                labels,
+                labels: schema.labels(global_idx).clone(),
                 timestamp_ms: step_ts,
-                value: batch.values[cell],
+                value,
             });
         }
     }
@@ -144,79 +134,79 @@ pub fn reshape_range(
     plan: &PhysicalPlan,
     batches: Vec<StepBatch>,
 ) -> Result<QueryValue, ReshapeError> {
-    // Scalar-root path.
     if plan.root_is_scalar {
-        let mut samples: Vec<(i64, f64)> = Vec::new();
-        for batch in &batches {
-            check_batch_shape(batch)?;
-            let step_count = batch.step_count();
-            let series_count = batch.series_count();
-            if step_count == 0 || series_count == 0 {
-                continue;
-            }
-            let ts_slice = batch.step_timestamps_slice();
-            for (step_off, &step_ts) in ts_slice.iter().enumerate().take(step_count) {
-                for series_off in 0..series_count {
-                    let cell = batch.cell_index(step_off, series_off);
-                    if !batch.validity.get(cell) {
-                        continue;
-                    }
-                    samples.push((step_ts, batch.values[cell]));
-                }
-            }
-        }
-        if samples.is_empty() {
-            return Ok(QueryValue::Matrix(Vec::new()));
-        }
-        // Batches may arrive out of order (e.g. from `Coalesce`), so
-        // sort defensively.
-        samples.sort_by_key(|(ts, _)| *ts);
-        return Ok(QueryValue::Matrix(vec![RangeSample {
-            labels: Labels::empty(),
-            samples,
-        }]));
+        return reshape_scalar_range(&batches);
     }
 
     // Aggregate per global series index so out-of-order batch emission
     // still produces stable `RangeSample`s. `or_insert_with` clones each
     // series' `Labels` exactly once — the first time a valid cell for
     // that series is seen — never per step.
-    use std::collections::BTreeMap;
     let mut per_series: BTreeMap<u32, (Labels, Vec<(i64, f64)>)> = BTreeMap::new();
-
-    for batch in batches {
-        check_batch_shape(&batch)?;
-        let schema = batch_static_schema(&batch)?;
-        let step_count = batch.step_count();
-        let series_count = batch.series_count();
-        if step_count == 0 || series_count == 0 {
-            continue;
-        }
-        let ts_slice = batch.step_timestamps_slice();
-        for series_off in 0..series_count {
+    for batch in &batches {
+        check_batch_shape(batch)?;
+        let schema = batch_static_schema(batch)?;
+        for (series_off, step_ts, value) in valid_cells(batch) {
             let global_idx = (batch.series_range.start + series_off) as u32;
-            for (step_off, &step_ts) in ts_slice.iter().enumerate().take(step_count) {
-                let cell = batch.cell_index(step_off, series_off);
-                if !batch.validity.get(cell) {
-                    continue;
-                }
-                let entry = per_series
-                    .entry(global_idx)
-                    .or_insert_with(|| (schema.labels(global_idx).clone(), Vec::new()));
-                entry.1.push((step_ts, batch.values[cell]));
-            }
+            per_series
+                .entry(global_idx)
+                .or_insert_with(|| (schema.labels(global_idx).clone(), Vec::new()))
+                .1
+                .push((step_ts, value));
         }
     }
 
     // Steps within a single batch arrive in order, but batches from
     // different operators (Coalesce, Concurrent) may interleave step
     // ranges across series — sort per series to be safe.
-    let mut out: Vec<RangeSample> = Vec::with_capacity(per_series.len());
-    for (_idx, (labels, mut samples)) in per_series.into_iter() {
-        samples.sort_by_key(|(ts, _)| *ts);
-        out.push(RangeSample { labels, samples });
-    }
+    let out = per_series
+        .into_values()
+        .map(|(labels, mut samples)| {
+            samples.sort_by_key(|(ts, _)| *ts);
+            RangeSample { labels, samples }
+        })
+        .collect();
     Ok(QueryValue::Matrix(out))
+}
+
+/// Scalar-root range plans collapse into a single anonymous `RangeSample`.
+fn reshape_scalar_range(batches: &[StepBatch]) -> Result<QueryValue, ReshapeError> {
+    let mut samples: Vec<(i64, f64)> = Vec::new();
+    for batch in batches {
+        check_batch_shape(batch)?;
+        samples.extend(valid_cells(batch).map(|(_, step_ts, value)| (step_ts, value)));
+    }
+    if samples.is_empty() {
+        return Ok(QueryValue::Matrix(Vec::new()));
+    }
+    // Batches may arrive out of order (e.g. from `Coalesce`), so sort
+    // defensively.
+    samples.sort_by_key(|(ts, _)| *ts);
+    Ok(QueryValue::Matrix(vec![RangeSample {
+        labels: Labels::empty(),
+        samples,
+    }]))
+}
+
+/// Yields `(series_offset, step_timestamp, value)` for every valid cell of
+/// a shape-checked batch, in step-major order.
+fn valid_cells(batch: &StepBatch) -> impl Iterator<Item = (usize, i64, f64)> + '_ {
+    let series_count = batch.series_count();
+    batch
+        .step_timestamps_slice()
+        .iter()
+        .take(batch.step_count())
+        .enumerate()
+        .flat_map(move |(step_off, &step_ts)| {
+            (0..series_count).map(move |series_off| (step_off, series_off, step_ts))
+        })
+        .filter_map(move |(step_off, series_off, step_ts)| {
+            let cell = batch.cell_index(step_off, series_off);
+            batch
+                .validity
+                .get(cell)
+                .then(|| (series_off, step_ts, batch.values[cell]))
+        })
 }
 
 /// Repeats `StepBatch::new`'s debug invariants at the wire boundary so

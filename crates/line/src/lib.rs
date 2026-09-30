@@ -13,7 +13,7 @@ pub mod logql;
 mod model;
 mod page;
 mod query;
-mod routing;
+pub mod routing;
 mod search;
 mod sharded;
 
@@ -28,7 +28,8 @@ pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,
     QueryRequest, QueryResult, Sample, VectorSample,
 };
-pub use sharded::{ShardedLine, ShardingOptions};
+pub use sharded::ShardedLine;
+pub use sharding::ShardingOptions;
 
 /// Persisted SlateDB segment extractor identifier.
 pub const SEGMENT_EXTRACTOR_NAME: &str = codec::SEGMENT_EXTRACTOR_NAME;

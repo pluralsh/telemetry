@@ -1,0 +1,203 @@
+# Float-only ports of upstream Prometheus `functions.test` / `histograms.test`
+# cases whose upstream sections are ignored in `functions.test` because they
+# load native histograms, which meter does not store.
+
+# Tests for deriv() and predict_linear().
+load 5m
+	testcounter_reset_middle_total	0+10x4 0+10x5
+	http_requests_total{job="app-server", instance="1", group="canary"}		0+80x10
+	http_requests_inf{job="app-server", instance="1", group="canary"}	-Inf 0+80x10 Inf
+
+# deriv should return the same as rate in simple cases.
+eval instant at 50m deriv(http_requests_total{group="canary", instance="1", job="app-server"}[50m])
+	{group="canary", instance="1", job="app-server"} 0.26666666666666666
+
+eval instant at 50m deriv(testcounter_reset_middle_total[100m])
+	{} 0.010606060606060607
+
+# deriv should return NaN in case of +Inf or -Inf found.
+eval instant at 100m deriv(http_requests_inf[100m])
+	{job="app-server", instance="1", group="canary"} NaN
+
+eval instant at 50m predict_linear(testcounter_reset_middle_total[50m], 3600)
+	{} 70
+
+eval instant at 50m predict_linear(testcounter_reset_middle_total[50m], 1h)
+	{} 70
+
+# The regression intercept is taken at the evaluation time, not at `@`.
+eval instant at 50m predict_linear(testcounter_reset_middle_total[55m] @ 3000, 3600)
+	{} 76.81818181818181
+
+eval instant at 10m predict_linear(testcounter_reset_middle_total[55m] @ 3000, 3600)
+	{} 51.36363636363637
+
+eval instant at 70m predict_linear(testcounter_reset_middle_total[55m] @ 3000, 3600)
+	{} 89.54545454545455
+
+eval instant at 100m predict_linear(http_requests_inf[100m], 6000)
+	{job="app-server", instance="1", group="canary"} NaN
+
+eval instant at 50m predict_linear(http_requests_total[50m], 3600) - (http_requests_total + deriv(http_requests_total[50m]) * 3600)
+	{group="canary", instance="1", job="app-server"} 0
+
+clear
+
+# Tests for sort/sort_desc.
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+	http_requests{job="api-server", instance="1", group="production"}	0+20x10
+	http_requests{job="api-server", instance="0", group="canary"}		0+30x10
+	http_requests{job="api-server", instance="1", group="canary"}		0+40x10
+	http_requests{job="api-server", instance="2", group="canary"}		NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN
+	http_requests{job="app-server", instance="0", group="production"}	0+50x10
+	http_requests{job="app-server", instance="1", group="production"}	0+60x10
+	http_requests{job="app-server", instance="0", group="canary"}		0+70x10
+	http_requests{job="app-server", instance="1", group="canary"}		0+80x10
+
+eval instant at 50m sort(http_requests)
+	expect ordered
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+
+eval instant at 50m sort_desc(http_requests)
+	expect ordered
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+
+
+# Test for absent().
+eval instant at 50m absent(nonexistent)
+	{} 1
+
+# Upstream uses `method=~".x"`; the series source only supports literal
+# alternations.
+eval instant at 50m absent(nonexistent{job="testjob", instance="testinstance", method=~"a|x"})
+	{instance="testinstance", job="testjob"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job="testjob2",foo="bar"})
+	{foo="bar"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job="testjob2",job="three",foo="bar"})
+	{foo="bar"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job=~"testjob2",foo="bar"})
+	{foo="bar"} 1
+
+clear
+
+# Don't return anything when there's something there.
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+
+eval instant at 50m absent(http_requests)
+
+eval instant at 50m absent(sum(http_requests))
+
+
+
+clear
+
+eval instant at 50m absent(sum(nonexistent{job="testjob", instance="testinstance"}))
+	{} 1
+
+eval instant at 50m absent(max(nonexistent))
+	{} 1
+
+eval instant at 50m absent(nonexistent > 1)
+	{} 1
+
+eval instant at 50m absent(a + b)
+	{} 1
+
+eval instant at 50m absent(a and b)
+	{} 1
+
+eval instant at 50m absent(rate(nonexistent[5m]))
+	{} 1
+
+clear
+
+# Testdata for absent_over_time()
+eval instant at 1m absent_over_time(http_requests_total[5m])
+	{} 1
+
+eval instant at 1m absent_over_time(http_requests_total{handler="/foo"}[5m])
+	{handler="/foo"} 1
+
+eval instant at 1m absent_over_time(http_requests_total{handler!="/foo"}[5m])
+	{} 1
+
+eval instant at 1m absent_over_time(http_requests_total{handler="/foo", handler="/bar", handler="/foobar"}[5m])
+	{} 1
+
+eval instant at 1m absent_over_time(rate(nonexistent[5m])[5m:])
+	{} 1
+
+eval instant at 1m absent_over_time(http_requests_total{handler="/foo", handler="/bar", instance="127.0.0.1"}[5m])
+	{instance="127.0.0.1"} 1
+
+load 1m
+	http_requests_total{path="/foo",instance="127.0.0.1",job="httpd"}	1+1x10
+	http_requests_total{path="/bar",instance="127.0.0.1",job="httpd"}	1+1x10
+	httpd_handshake_failures_total{instance="127.0.0.1",job="node"}	1+1x15
+	httpd_log_lines_total{instance="127.0.0.1",job="node"}	1
+	ssl_certificate_expiry_seconds{job="ingress"} NaN NaN NaN NaN NaN
+
+eval instant at 5m absent_over_time(http_requests_total[5m])
+
+eval instant at 5m absent_over_time(rate(http_requests_total[5m])[5m:1m])
+
+eval instant at 0m absent_over_time(httpd_log_lines_total[30s])
+
+eval instant at 1m absent_over_time(httpd_log_lines_total[30s])
+	{} 1
+
+eval instant at 15m absent_over_time(http_requests_total[5m])
+	{} 1
+
+eval instant at 15m absent_over_time(http_requests_total[10m])
+
+eval instant at 16m absent_over_time(http_requests_total[6m])
+	{} 1
+
+eval instant at 16m absent_over_time(http_requests_total[16m])
+
+eval instant at 16m absent_over_time(httpd_handshake_failures_total[1m])
+	{} 1
+
+eval instant at 16m absent_over_time(httpd_handshake_failures_total[2m])
+
+eval instant at 16m absent_over_time({instance="127.0.0.1"}[5m])
+
+eval instant at 21m absent_over_time({instance="127.0.0.1"}[5m])
+	{instance="127.0.0.1"} 1
+
+eval instant at 21m absent_over_time({instance="127.0.0.1"}[20m])
+
+eval instant at 21m absent_over_time({job="grok"}[20m])
+	{job="grok"} 1
+
+eval instant at 30m absent_over_time({instance="127.0.0.1"}[5m:5s])
+	{} 1
+
+eval instant at 5m absent_over_time({job="ingress"}[4m])
+
+eval instant at 10m absent_over_time({job="ingress"}[4m])
+	{job="ingress"} 1
+
+clear

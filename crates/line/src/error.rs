@@ -24,6 +24,8 @@ pub enum Error {
     Query(String),
     #[error("regular expression error: {0}")]
     Regex(#[from] regex::Error),
+    #[error(transparent)]
+    Shard(#[from] sharding::ShardSetError),
 }
 
 impl From<common::serde::DeserializeError> for Error {

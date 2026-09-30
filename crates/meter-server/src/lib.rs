@@ -1,33 +1,13 @@
-pub mod auth;
 pub mod config;
 pub mod openapi;
 
 mod http;
 mod internal_writer;
-pub mod runtime_metrics;
 mod state;
 
 pub use http::router;
 pub use internal_writer::grpc_service;
 pub use state::AppState;
-
-pub fn install_rustls_crypto_provider() -> anyhow::Result<()> {
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        return Ok(());
-    }
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("failed to install rustls ring crypto provider"))
-}
-
-#[cfg(test)]
-mod crypto_tests {
-    #[test]
-    fn installs_a_provider_when_multiple_are_compiled() {
-        super::install_rustls_crypto_provider().unwrap();
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
-    }
-}
 
 #[cfg(test)]
 use config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend, StaticOwner};

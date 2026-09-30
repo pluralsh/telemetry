@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::BytesRange;
-use common::storage::{PutOptions, PutRecordOp, Record, RecordOp, Storage, Ttl, WriteOptions};
+use common::storage::{RecordOp, Storage, Ttl, WriteOptions};
 
 use crate::Namespace;
 use crate::codec::{
@@ -392,12 +392,12 @@ impl Compactor {
         );
 
         let mut ops = Vec::with_capacity(2 + inputs.len() * 2);
-        ops.push(put(
+        ops.push(RecordOp::put_with_ttl(
             metadata_key(namespace, segment, stream_id, first.page_id),
             encode_metadata(&metadata)?,
             ttl,
         ));
-        ops.push(put(
+        ops.push(RecordOp::put_with_ttl(
             payload_key(namespace, segment, stream_id, first.page_id, metadata.level),
             bytes,
             ttl,
@@ -419,7 +419,7 @@ impl Compactor {
                 tracked.page_id,
                 tracked.metadata.level,
             );
-            ops.push(put(
+            ops.push(RecordOp::put_with_ttl(
                 tombstone.clone(),
                 encode_deadline(deadline_unix_ms),
                 ttl,
@@ -509,17 +509,6 @@ fn is_small(page: &PageConfig, metadata: &StoredPageMetadata) -> bool {
         && (metadata.row_count as usize).saturating_mul(2) < page.max_rows
 }
 
-fn put(key: Bytes, value: Bytes, ttl: Ttl) -> RecordOp {
-    RecordOp::Put(PutRecordOp::new_with_options(
-        Record::new(key, value),
-        PutOptions { ttl },
-    ))
-}
-
 fn unix_time_ms() -> Result<u64> {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| Error::Invalid("system clock is before the Unix epoch".to_owned()))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| Error::Invalid("Unix timestamp exceeds u64 milliseconds".to_owned()))
+    common::time::checked_now_ms().map_err(|error| Error::Invalid(error.to_string()))
 }

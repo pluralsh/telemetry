@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::Labels;
+
 use super::lowering::LoweringContext;
 use super::parallelism::Parallelism;
 use super::plan_types::{
@@ -143,6 +145,15 @@ pub fn describe_logical(plan: &LogicalPlan) -> PlanNode {
                 .with_arg("grouping", grouping_to_value(grouping))
                 .with_children(children)
         }
+        LogicalPlan::Sort { order, child } => PlanNode::new("Sort")
+            .with_arg("order", format!("{order:?}"))
+            .with_children(vec![describe_logical(child)]),
+        LogicalPlan::Histogram { kind, child } => PlanNode::new("Histogram")
+            .with_arg("kind", format!("{kind:?}"))
+            .with_children(vec![describe_logical(child)]),
+        LogicalPlan::Absent { labels, child } => PlanNode::new("Absent")
+            .with_arg("labels", labels_to_value(labels))
+            .with_children(vec![describe_logical(child)]),
         LogicalPlan::Subquery {
             child,
             range_ms,
@@ -321,6 +332,13 @@ fn describe_physical_inner(
                 .with_arg("grouping", grouping_to_value(grouping))
                 .with_children(children)
         }
+        LogicalPlan::Sort { child, .. } => describe_physical_inner(child, ctx, false),
+        LogicalPlan::Histogram { kind, child } => PlanNode::new("HistogramOp")
+            .with_arg("kind", format!("{kind:?}"))
+            .with_children(vec![describe_physical_inner(child, ctx, false)]),
+        LogicalPlan::Absent { labels, child } => PlanNode::new("AbsentOp")
+            .with_arg("labels", labels_to_value(labels))
+            .with_children(vec![describe_physical_inner(child, ctx, false)]),
         LogicalPlan::Subquery { .. } => PlanNode::new("SubqueryOp").with_arg(
             "error",
             "bare Subquery without a Rollup parent is unsupported in v1",
@@ -465,6 +483,14 @@ fn grouping_to_value(g: &AggregateGrouping) -> serde_json::Value {
         labels.iter().cloned().collect::<Vec<_>>().into(),
     );
     serde_json::Value::Object(m)
+}
+
+fn labels_to_value(labels: &Labels) -> serde_json::Value {
+    labels
+        .iter()
+        .map(|l| (l.name.clone(), serde_json::Value::String(l.value.clone())))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 fn matching_to_value(m: &BinaryMatching) -> serde_json::Value {

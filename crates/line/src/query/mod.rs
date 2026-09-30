@@ -322,7 +322,9 @@ pub(crate) async fn query_databases(
             let global_permits = Arc::clone(&global_permits);
             let plan = &plan;
             async move {
-                let weight = estimate.compressed_bytes.max(1).min(byte_budget as u64) as u32;
+                let weight =
+                    u32::try_from(estimate.compressed_bytes.max(1).min(byte_budget as u64))
+                        .unwrap_or(u32::MAX);
                 let _permit = permits
                     .acquire_many_owned(weight)
                     .await

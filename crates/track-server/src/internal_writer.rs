@@ -1,4 +1,3 @@
-use meter_server::auth::secure_eq;
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use prost::Message;
 use proto::track::internal::v1::{
@@ -7,9 +6,10 @@ use proto::track::internal::v1::{
     internal_writer_server::{InternalWriter, InternalWriterServer},
     trace_payload,
 };
+use server_common::internal_rpc;
 use sharding::ShardId;
 use tonic::{Request, Response, Status};
-use track::{Namespace, ShardingOptions, TraceBatch, trace_batches_from_resource_spans};
+use track::{Namespace, TraceBatch, routing::route_trace, trace_batches_from_resource_spans};
 
 use crate::{config::Durability, state::AppState};
 
@@ -93,22 +93,15 @@ impl InternalWriter for AppState {
         &self,
         request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
-        if let Some(secret) = &self.config.auth.internal {
-            let expected = secret
-                .expose()
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let provided = request
-                .metadata()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .unwrap_or_default();
-            if !secure_eq(provided, &expected) {
-                return Err(Status::unauthenticated(
-                    "invalid internal cluster credential",
-                ));
-            }
-        }
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        internal_rpc::verify(request.metadata(), token.as_deref())?;
         let request = request.into_inner();
         let namespace_name = request
             .namespace
@@ -120,23 +113,15 @@ impl InternalWriter for AppState {
         }
         let namespace = Namespace::new(namespace_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let shard = ShardId::new(
-            request
-                .shard_id
-                .try_into()
-                .map_err(|_| Status::invalid_argument("shard id is out of range"))?,
-        );
-        let assignment = self.assignment.read().await;
-        if request.assignment_generation != assignment.generation.get() {
-            return Err(Status::failed_precondition("stale_ownership"));
-        }
-        if assignment
-            .owner_of(shard)
-            .is_none_or(|owner| owner.id != self.local_owner)
-        {
-            return Err(Status::failed_precondition("non_owner"));
-        }
-        let mut batches = request
+        let shard = internal_rpc::shard_id(request.shard_id)?;
+        let assignment = self.router.assignment().read().await;
+        internal_rpc::check_ownership(
+            &assignment,
+            request.assignment_generation,
+            shard,
+            self.router.local_owner(),
+        )?;
+        let batches = request
             .traces
             .into_iter()
             .map(decode_payload)
@@ -145,15 +130,10 @@ impl InternalWriter for AppState {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let options = ShardingOptions::new(
-            assignment.shard_count,
-            self.config.sharding.io_concurrency_limit,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
         if batches
             .iter()
             .flat_map(|batch| &batch.traces)
-            .any(|trace| options.route_trace(&assignment, &namespace, trace) != shard)
+            .any(|trace| route_trace(&assignment, &namespace, trace) != shard)
         {
             return Err(Status::invalid_argument("misrouted_trace"));
         }
@@ -172,9 +152,6 @@ impl InternalWriter for AppState {
             }));
         }
         drop(assignment);
-        if self.draining_shards.read().await.contains(&shard) {
-            return Err(Status::unavailable("local shard is draining"));
-        }
         let durability = match ProtoDurability::try_from(request.durability)
             .unwrap_or(ProtoDurability::Applied)
         {
@@ -182,20 +159,20 @@ impl InternalWriter for AppState {
             ProtoDurability::Written => track::Durability::Written,
             ProtoDurability::Durable => track::Durability::Durable,
         };
-        let database = self
-            .db
-            .shard(shard)
+        let admitted = self
+            .router
+            .admit(shard)
             .await
-            .ok_or_else(|| Status::unavailable("local shard is not open"))?;
-        database
-            .write_with_durability(&namespace, std::mem::take(&mut batches), durability)
+            .map_err(|error| internal_rpc::route_status(&error))?;
+        self.write_local(&namespace, shard, batches, durability)
             .await
             .map_err(track_status)?;
+        drop(admitted);
         if !request.request_id.is_empty() {
             completed.insert(request.request_id);
         }
         Ok(Response::new(WriteBatchResponse {
-            assignment_generation: self.assignment.read().await.generation.get(),
+            assignment_generation: self.router.assignment().read().await.generation.get(),
             accepted_traces,
             accepted_spans,
         }))
@@ -213,6 +190,7 @@ fn track_status(error: track::Error) -> Status {
         | track::Error::Protobuf(_)
         | track::Error::Compression(_)
         | track::Error::TraceQl(_) => Status::internal(error.to_string()),
+        track::Error::Shard(_) => Status::unavailable(error.to_string()),
     }
 }
 

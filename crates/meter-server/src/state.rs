@@ -1,26 +1,28 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use futures::{StreamExt, stream};
 use meter::{Namespace, Series, ShardedMeter, ShardingOptions, Visibility};
 use proto::meter::internal::v1::internal_writer_client::InternalWriterClient;
-use sharding::{Owner, ShardId, ShardMap, server::owned_shards};
-use tokio::sync::{RwLock, Semaphore};
+use server_common::internal_rpc::{self, ChannelPool};
+use sharding::{
+    AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
+    server::owned_shards, shard_request_id,
+};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, metadata::MetadataValue};
+use tonic::Request;
 
 #[cfg(feature = "kubernetes")]
-use sharding::{
-    AssignmentGeneration, BoxError, EpochPolicy, ShardLifecycle, server::KubernetesRuntime,
-};
+use sharding::{EpochPolicy, RoutedShardLifecycle, server::KubernetesRuntime};
+
+use server_common::auth::JwtAuthenticator;
 
 use crate::{
-    auth::JwtAuthenticator,
     config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
     http::ApiError,
     internal_writer::to_proto_request,
@@ -32,11 +34,9 @@ pub struct AppState {
     pub(crate) jwt: Option<JwtAuthenticator>,
     pub(crate) writers: Option<Arc<ShardedMeter>>,
     pub(crate) readers: Option<Arc<ShardedMeter>>,
-    pub(crate) assignment: Arc<RwLock<ShardMap>>,
-    pub(crate) local_owner: String,
-    pub(crate) remote_limit: Arc<Semaphore>,
+    pub(crate) router: Arc<WriteRouter>,
+    pub(crate) channels: Arc<ChannelPool>,
     pub(crate) completed_requests: Arc<Mutex<HashSet<(String, String)>>>,
-    pub(crate) draining_shards: Arc<RwLock<HashSet<ShardId>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) background_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     pub(crate) flush_runs: Arc<AtomicU64>,
@@ -107,16 +107,22 @@ impl AppState {
             None
         };
         let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
+        let router = WriteRouter::new(
+            local_owner,
+            Arc::new(RwLock::new(assignment)),
+            RouterLimits {
+                remote_concurrency: config.write.remote_concurrency,
+                remote_retries: config.write.remote_retries,
+            },
+        );
         let state = Self {
-            remote_limit: Arc::new(Semaphore::new(config.write.remote_concurrency)),
             config: Arc::new(config),
             jwt,
             writers,
             readers,
-            assignment: Arc::new(RwLock::new(assignment)),
-            local_owner,
+            router: Arc::new(router),
+            channels: Arc::new(ChannelPool::default()),
             completed_requests: Arc::new(Mutex::new(HashSet::new())),
-            draining_shards: Arc::new(RwLock::new(HashSet::new())),
             cancellation,
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             flush_runs: Arc::new(AtomicU64::new(0)),
@@ -131,22 +137,22 @@ impl AppState {
                         .as_ref()
                         .expect("reader mode must open sharded meter")
                         .clone(),
-                    Arc::clone(&state.assignment),
+                    Arc::clone(state.router.assignment()),
                     &state.cancellation,
                 );
                 state.background_tasks.lock().await.push(task);
             } else {
-                let lifecycle = Arc::new(MeterShardLifecycle {
-                    writers: state
-                        .writers
-                        .as_ref()
-                        .expect("writer mode must open sharded meter")
-                        .clone(),
-                    draining_shards: Arc::clone(&state.draining_shards),
-                });
+                let writers = state
+                    .writers
+                    .as_ref()
+                    .expect("writer mode must open sharded meter");
+                let lifecycle = Arc::new(RoutedShardLifecycle::new(
+                    Arc::clone(writers.shards()),
+                    Arc::clone(&state.router),
+                ));
                 let tasks = runtime.spawn(
                     lifecycle,
-                    Arc::clone(&state.assignment),
+                    Arc::clone(state.router.assignment()),
                     &state.cancellation,
                 );
                 state.background_tasks.lock().await.extend(tasks);
@@ -189,6 +195,10 @@ impl AppState {
             task.await?;
         }
         if let Some(writers) = &self.writers {
+            self.router
+                .start_draining(writers.shards().ids().await)
+                .await;
+            writers.flush().await?;
             writers.close().await?;
         }
         if let Some(readers) = &self.readers
@@ -216,34 +226,22 @@ impl AppState {
         match self.config.mode {
             ServerMode::Standalone => self.readers.is_some(),
             ServerMode::Reader => {
-                let expected = (0..self.assignment.read().await.shard_count)
+                let expected = (0..self.router.assignment().read().await.shard_count)
                     .map(ShardId::new)
                     .collect::<Vec<_>>();
                 match &self.readers {
-                    Some(readers) => readers.reader_shards().await == expected,
+                    Some(readers) => readers.shards().ids().await == expected,
                     None => false,
                 }
             }
             ServerMode::Writer => {
-                let assignment = self.assignment.read().await;
-                let expected = (0..assignment.shard_count)
-                    .map(ShardId::new)
-                    .filter(|shard| {
-                        assignment
-                            .owner_of(*shard)
-                            .is_some_and(|owner| owner.id == self.local_owner)
-                    })
-                    .collect::<HashSet<_>>();
+                let assignment = self.router.assignment().read().await;
+                let expected =
+                    owned_shards(&assignment, self.router.local_owner()).collect::<Vec<_>>();
                 let Some(writers) = &self.writers else {
                     return false;
                 };
-                !expected.is_empty()
-                    && writers
-                        .writer_shards()
-                        .await
-                        .into_iter()
-                        .collect::<HashSet<_>>()
-                        == expected
+                !expected.is_empty() && writers.shards().ids().await == expected
             }
         }
     }
@@ -329,188 +327,129 @@ impl AppState {
         durability: Durability,
         request_id: String,
     ) -> Result<(), ApiError> {
-        let meter_namespace =
-            Namespace::new(namespace).map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let assignment = self.assignment.read().await.clone();
-        let options = ShardingOptions::new(
-            assignment.shard_count,
-            self.config.sharding.io_concurrency_limit,
-        )
-        .map_err(ApiError::internal)?;
-        let mut groups: HashMap<(Owner, ShardId), Vec<Series>> = HashMap::new();
-        for (shard, batch) in options.split(&assignment, &meter_namespace, series) {
-            let owner = assignment
-                .owner_of(shard)
-                .cloned()
-                .ok_or_else(|| ApiError::unavailable("shard has no active owner"))?;
-            groups.insert((owner, shard), batch);
-        }
-        let results = stream::iter(groups.into_iter().map(|((owner, shard), batch)| {
-            let state = self.clone();
-            let namespace = namespace.to_owned();
-            let request_id = format!("{request_id}-{}", shard.get());
-            async move {
-                let _permit = state
-                    .remote_limit
-                    .acquire()
-                    .await
-                    .map_err(|_| ApiError::unavailable("server is shutting down"))?;
-                if owner.id == state.local_owner {
-                    state
-                        .write_local(&namespace, shard, batch, durability)
-                        .await
-                } else {
-                    state
-                        .write_remote(
-                            &namespace,
+        let meter_namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+        let assignment = self.router.assignment().read().await.clone();
+        let groups = meter::routing::split(&assignment, &meter_namespace, series);
+        self.router
+            .dispatch(
+                &assignment,
+                groups,
+                |shard, batch| {
+                    let meter_namespace = &meter_namespace;
+                    async move {
+                        self.write_local(meter_namespace, shard, batch, durability)
+                            .await
+                            .map_err(crate::http::meter_error)
+                    }
+                },
+                |owner, shard, generation, batch| {
+                    let request_id = shard_request_id(&request_id, shard);
+                    async move {
+                        self.write_remote(
+                            RemoteWrite {
+                                namespace,
+                                shard,
+                                durability,
+                                request_id: &request_id,
+                            },
                             owner,
-                            shard,
+                            generation,
                             batch,
-                            durability,
-                            assignment.generation.get(),
-                            request_id,
                         )
                         .await
-                }
-            }
-        }))
-        .buffer_unordered(self.config.write.remote_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-        for result in results {
-            result?;
-        }
-        Ok(())
+                    }
+                },
+            )
+            .await
     }
 
+    /// Writes to an open local shard. Callers must hold the router's
+    /// admission guard for `shard`.
     pub(crate) async fn write_local(
         &self,
-        namespace: &str,
+        namespace: &Namespace,
         shard: ShardId,
         series: Vec<Series>,
         durability: Durability,
-    ) -> Result<(), ApiError> {
-        // Held across the write: `drain` takes this lock exclusively, so it
-        // waits for in-flight writes before the shard is flushed and handed off.
-        let draining = self.draining_shards.read().await;
-        if draining.contains(&shard) {
-            return Err(ApiError::unavailable("local shard is draining"));
-        }
-        if let Some(writers) = &self.writers {
-            return writers
-                .write_shard(
-                    &Namespace::new(namespace)
-                        .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                    shard,
-                    series,
-                    visibility(durability),
-                )
-                .await
-                .map_err(ApiError::from_meter);
-        }
-        drop(draining);
-        Err(ApiError::unavailable("local shard is not open"))
+    ) -> Result<(), meter::Error> {
+        let Some(writers) = &self.writers else {
+            return Err(sharding::ShardSetError::NotOpen(shard).into());
+        };
+        writers
+            .write_shard(namespace, shard, series, visibility(durability))
+            .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn write_remote(
         &self,
-        namespace: &str,
-        mut owner: Owner,
-        shard: ShardId,
+        target: RemoteWrite<'_>,
+        owner: Owner,
+        generation: AssignmentGeneration,
         series: Vec<Series>,
-        durability: Durability,
-        mut generation: u64,
-        request_id: String,
     ) -> Result<(), ApiError> {
-        for attempt in 0..=self.config.write.remote_retries {
-            let endpoint = owner_endpoint(&self.config, &owner)?;
-            let mut client = InternalWriterClient::connect(format!("http://{endpoint}"))
-                .await
-                .map_err(|error| ApiError::unavailable(error.to_string()))?;
-            let mut request = Request::new(to_proto_request(
-                namespace,
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()
+            .map_err(ApiError::internal)?;
+        let shard = target.shard;
+        self.router
+            .forward(
+                owner,
                 shard,
                 generation,
-                &request_id,
-                durability,
-                series.clone(),
-            ));
-            if let Some(secret) = &self.config.auth.internal {
-                let value = format!("Bearer {}", secret.expose().map_err(ApiError::internal)?);
-                request.metadata_mut().insert(
-                    "authorization",
-                    MetadataValue::try_from(value).map_err(ApiError::internal)?,
-                );
-            }
-            match client.write(request).await {
-                Ok(_) => return Ok(()),
-                Err(status)
-                    if status.code() == tonic::Code::FailedPrecondition
-                        && attempt < self.config.write.remote_retries =>
-                {
-                    let assignment = self.assignment.read().await;
-                    generation = assignment.generation.get();
-                    owner = assignment
-                        .owner_of(shard)
-                        .cloned()
-                        .ok_or_else(|| ApiError::unavailable("shard owner disappeared"))?;
-                }
-                Err(status) => return Err(ApiError::unavailable(status.to_string())),
-            }
-        }
-        Err(ApiError::unavailable("remote write retries exhausted"))
+                &series,
+                |owner, generation, series| {
+                    let request = to_proto_request(
+                        target.namespace,
+                        shard,
+                        generation.get(),
+                        target.request_id,
+                        target.durability,
+                        series.clone(),
+                    );
+                    let endpoint = owner_endpoint(&self.config, owner);
+                    let token = token.as_deref();
+                    async move {
+                        let unavailable = |status: &tonic::Status| ApiError::unavailable(status);
+                        let endpoint = endpoint.map_err(ForwardError::Failed)?;
+                        let channel = self
+                            .channels
+                            .channel(&endpoint)
+                            .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
+                        let mut request = Request::new(request);
+                        internal_rpc::authorize(&mut request, token)
+                            .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
+                        InternalWriterClient::new(channel)
+                            .write(request)
+                            .await
+                            .map(drop)
+                            .map_err(|status| internal_rpc::forward_error(&status, unavailable))
+                    }
+                },
+            )
+            .await
     }
 }
 
-#[cfg(feature = "kubernetes")]
-struct MeterShardLifecycle {
-    writers: Arc<ShardedMeter>,
-    draining_shards: Arc<RwLock<HashSet<ShardId>>>,
-}
-
-#[cfg(feature = "kubernetes")]
-#[tonic::async_trait]
-impl ShardLifecycle for MeterShardLifecycle {
-    async fn open(
-        &self,
-        shard: ShardId,
-        _generation: AssignmentGeneration,
-    ) -> Result<(), BoxError> {
-        {
-            let mut draining = self.draining_shards.write().await;
-            draining.remove(&shard);
-        }
-        self.writers.open_writer_shard(shard).await?;
-        Ok(())
-    }
-
-    async fn drain(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.draining_shards.write().await.insert(shard);
-        Ok(())
-    }
-
-    async fn flush(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.writers.flush_shard(shard).await?;
-        Ok(())
-    }
-
-    async fn close(&self, shard: ShardId) -> Result<(), BoxError> {
-        self.writers.close_writer_shard(shard).await?;
-        Ok(())
-    }
+/// Where a forwarded write goes and how it is written there.
+#[derive(Clone, Copy)]
+struct RemoteWrite<'a> {
+    namespace: &'a str,
+    shard: ShardId,
+    durability: Durability,
+    request_id: &'a str,
 }
 
 pub(crate) fn meter_config(config: &Config) -> meter::Config {
     meter::Config {
         storage: config.storage.clone(),
-        flush_interval: Duration::from_secs(config.write.flush_interval_seconds),
+        flush_interval: config.write.flush_interval(),
         retention: config.retention_seconds.map(Duration::from_secs),
-        write_buffer: common::coordinator::WriteCoordinatorConfig {
-            queue_capacity: config.write.buffer_queue_capacity,
-            flush_interval: Duration::from_millis(config.write.buffer_flush_interval_milliseconds),
-            flush_size_threshold: config.write.buffer_size_threshold_bytes,
-        },
+        write_buffer: config.write.write_buffer(),
     }
 }
 

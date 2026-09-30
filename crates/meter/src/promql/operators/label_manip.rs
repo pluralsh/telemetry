@@ -208,9 +208,8 @@ impl<C: Operator> LabelManipOp<C> {
     }
 
     fn drain_child(&mut self, cx: &mut Context<'_>) -> Result<Option<Vec<StepBatch>>, QueryError> {
-        let child = match self.child.as_mut() {
-            Some(child) => child,
-            None => return Ok(Some(Vec::new())),
+        let Some(child) = self.child.as_mut() else {
+            return Ok(Some(Vec::new()));
         };
 
         let mut batches = Vec::new();

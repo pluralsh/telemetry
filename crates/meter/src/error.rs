@@ -49,6 +49,9 @@ pub enum Error {
 
     /// The write coordinator queue is full.
     Backpressure,
+
+    /// A storage shard is not open here or cannot be closed yet.
+    Shard(sharding::ShardSetError),
 }
 
 impl std::error::Error for Error {}
@@ -61,6 +64,7 @@ impl std::fmt::Display for Error {
             Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             Error::Internal(msg) => write!(f, "Internal error: {}", msg),
             Error::Backpressure => write!(f, "Backpressure: write queue is full"),
+            Error::Shard(error) => write!(f, "{error}"),
         }
     }
 }
@@ -71,6 +75,12 @@ impl From<StorageError> for Error {
             StorageError::Storage(msg) => Error::Storage(msg),
             StorageError::Internal(msg) => Error::Internal(msg),
         }
+    }
+}
+
+impl From<sharding::ShardSetError> for Error {
+    fn from(err: sharding::ShardSetError) -> Self {
+        Error::Shard(err)
     }
 }
 

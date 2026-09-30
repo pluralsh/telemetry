@@ -1,7 +1,7 @@
 //! Meter adapter for the shared durable discovery catalog.
 
 use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -226,11 +226,7 @@ where
 }
 
 fn is_active_bucket(bucket: TimeBucket) -> bool {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or(i64::MAX);
+    let now_secs = common::time::now_secs();
     let start_secs = i64::from(bucket.start) * 60;
     let end_secs = start_secs.saturating_add(i64::from(bucket.size) * 60 * 60);
     now_secs >= start_secs && now_secs < end_secs

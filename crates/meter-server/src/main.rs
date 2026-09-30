@@ -15,9 +15,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    meter_server::install_rustls_crypto_provider()?;
+    server_common::runtime::install_rustls_crypto_provider()?;
     tracing_subscriber::fmt::init();
-    meter_server::runtime_metrics::install_recorder()?;
+    server_common::runtime::install_metrics_recorder()?;
     metrics::gauge!("telemetry_server_up", "product" => "meter").set(1.0);
     let args = Args::parse();
     let config = Config::from_path(args.config)?;
@@ -36,29 +36,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = http => result?,
         result = grpc => result?,
-        _ = shutdown_signal() => {}
+        _ = server_common::runtime::shutdown_signal() => {}
     }
     cancellation.cancel();
     state.shutdown().await
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
 }

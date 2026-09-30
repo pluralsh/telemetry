@@ -1,11 +1,11 @@
 use axum::http::{HeaderMap, HeaderValue, header};
-use meter_server::auth::{Permission, authorize};
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, KeyValue, any_value},
     resource::v1::Resource,
     trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span},
 };
 use prost::Message;
+use server_common::auth::{Permission, authorize};
 use tonic::{Request, Response, Status as GrpcStatus};
 
 use crate::{

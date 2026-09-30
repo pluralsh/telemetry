@@ -1,0 +1,36 @@
+[package]
+name = "server-common"
+description = "Shared HTTP and gRPC server plumbing for Telemetry product servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8.9"
+base64 = "0.23.1"
+blake3.workspace = true
+jsonwebtoken.workspace = true
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+prost.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+common = { path = "../common" }
+sharding = { path = "../sharding" }
+subtle = "2.6.1"
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+metrics.workspace = true
+tempfile.workspace = true

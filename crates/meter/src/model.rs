@@ -10,7 +10,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Series ID (unique within a time bucket)
 pub(crate) type SeriesId = u32;
@@ -152,15 +152,8 @@ impl Sample {
 
     /// Creates a sample with the current timestamp.
     ///
-    /// # Panics
-    ///
-    /// Panics if the system time is before the Unix epoch.
     pub fn now(value: f64) -> Self {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before Unix epoch")
-            .as_millis() as i64;
-        Self::new(timestamp_ms, value)
+        Self::new(common::time::now_ms(), value)
     }
 }
 
@@ -672,15 +665,9 @@ mod tests {
 
     #[test]
     fn should_create_sample_now() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let before = common::time::now_ms();
         let sample = Sample::now(100.0);
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let after = common::time::now_ms();
 
         assert!(sample.timestamp_ms >= before);
         assert!(sample.timestamp_ms <= after);

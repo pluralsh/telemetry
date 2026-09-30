@@ -14,7 +14,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -205,9 +205,14 @@ impl TraceCollector {
         Arc::new(Self::default())
     }
 
+    /// Trace stats stay usable after a panicking recorder, so poisoning is ignored.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Reserves a slot and returns its node id. Called once per operator.
     pub fn register_operator(&self, op_name: &'static str) -> usize {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         let node_id = inner.operators.len();
         inner.operators.push(OperatorStatsInner {
             node_id,
@@ -223,7 +228,7 @@ impl TraceCollector {
     }
 
     fn record_call(&self, node_id: usize, elapsed_ns: u64, batch: Option<&StepBatch>) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         let slot = &mut inner.operators[node_id];
         slot.total_ns = slot.total_ns.saturating_add(elapsed_ns);
         slot.call_count += 1;
@@ -235,12 +240,12 @@ impl TraceCollector {
 
     /// Additive.
     pub fn record_phase(&self, phase: Phase, elapsed_ns: u64) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         inner.phase_ns[phase as usize] = inner.phase_ns[phase as usize].saturating_add(elapsed_ns);
     }
 
     pub fn io_started(&self, kind: IoKind) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         let slot = inner.io.entry(kind).or_default();
         slot.in_flight += 1;
         if slot.in_flight > slot.peak_in_flight {
@@ -249,7 +254,7 @@ impl TraceCollector {
     }
 
     pub fn record_bytes(&self, kind: IoKind, bytes: u64) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         let slot = inner.io.entry(kind).or_default();
         slot.bytes = slot.bytes.saturating_add(bytes);
     }
@@ -257,7 +262,7 @@ impl TraceCollector {
     /// Records the wall `[start, start + elapsed_ns)` window and decrements
     /// `in_flight`.
     pub fn io_finished(&self, kind: IoKind, start: Instant, elapsed_ns: u64) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         let start_ns = start
             .saturating_duration_since(inner.query_start)
             .as_nanos() as u64;
@@ -278,7 +283,7 @@ impl TraceCollector {
     /// on the stack, lands in the top-level "orphan" bucket (useful for
     /// planner phases).
     pub fn record_subphase(&self, node_id: Option<usize>, label: &'static str, elapsed_ns: u64) {
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         match node_id {
             Some(id) if id < inner.operators.len() => {
                 let entry = inner.operators[id].subphases.entry(label).or_default();
@@ -296,7 +301,7 @@ impl TraceCollector {
     /// Counters are operator-scoped — no-op when no operator is on the stack.
     pub fn record_counter(&self, node_id: Option<usize>, label: &'static str, value: u64) {
         let Some(id) = node_id else { return };
-        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        let mut inner = self.lock();
         if id < inner.operators.len() {
             let entry = inner.operators[id].counters.entry(label).or_default();
             *entry = entry.saturating_add(value);
@@ -304,7 +309,7 @@ impl TraceCollector {
     }
 
     pub fn finish(&self) -> QueryTrace {
-        let inner = self.inner.lock().expect("trace collector poisoned");
+        let inner = self.lock();
         let phases: Vec<PhaseStats> = Phase::all()
             .into_iter()
             .map(|p| PhaseStats {
@@ -372,7 +377,7 @@ fn subphase_vec(map: &BTreeMap<&'static str, (u64, u64)>) -> Vec<SubphaseStats> 
             call_count: *calls,
         })
         .collect();
-    out.sort_by(|a, b| b.elapsed_ms.partial_cmp(&a.elapsed_ms).unwrap());
+    out.sort_by(|a, b| b.elapsed_ms.total_cmp(&a.elapsed_ms));
     out
 }
 

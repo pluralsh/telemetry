@@ -4,6 +4,7 @@
 // you may not use this file except in compliance with the License.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::serde::ensure_consumed;
 use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
 use common::serde::sortable::{decode_i64_sortable, encode_i64_sortable};
 use common::serde::varint::{var_u32, var_u64};
@@ -346,14 +347,14 @@ pub(crate) fn decode_labels(bytes: &[u8]) -> Result<Labels> {
         return Err(Error::Corrupt("unknown forward-label format".to_owned()));
     }
     let mut buf = &bytes[1..];
-    let count = read_u32(&mut buf)? as usize;
+    let count = var_u32::deserialize(&mut buf)? as usize;
     let mut labels = Vec::with_capacity(count.min(buf.len() / 2));
     for _ in 0..count {
         let name = read_str(&mut buf)?;
         let value = read_str(&mut buf)?;
         labels.push(Label { name, value });
     }
-    expect_consumed(buf, "forward labels")?;
+    ensure_consumed(buf, "forward labels")?;
     Labels::new(labels)
 }
 
@@ -406,7 +407,7 @@ pub(crate) fn decode_metadata(bytes: &[u8]) -> Result<StoredPageMetadata> {
     buf = rest;
     let expires_at_unix_ms = match flags {
         0 => None,
-        PAGE_METADATA_HAS_EXPIRY => Some(read_u64(&mut buf)?),
+        PAGE_METADATA_HAS_EXPIRY => Some(var_u64::deserialize(&mut buf)?),
         _ => {
             return Err(Error::Corrupt(format!(
                 "unknown page metadata flags {flags}"
@@ -419,21 +420,21 @@ pub(crate) fn decode_metadata(bytes: &[u8]) -> Result<StoredPageMetadata> {
     buf = rest;
     let min_timestamp_ns = i64::from_be_bytes(*min);
     let max_timestamp_ns = min_timestamp_ns
-        .checked_add_unsigned(read_u64(&mut buf)?)
+        .checked_add_unsigned(var_u64::deserialize(&mut buf)?)
         .ok_or_else(|| Error::Corrupt("page max timestamp overflows".to_owned()))?;
-    let row_count = read_u32(&mut buf)?;
-    let payload_bytes = read_u32(&mut buf)?;
+    let row_count = var_u32::deserialize(&mut buf)?;
+    let payload_bytes = var_u32::deserialize(&mut buf)?;
     let (&level, rest) = buf
         .split_first()
         .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
     buf = rest;
-    let written_at_unix_ms = read_u64(&mut buf)?;
-    let leaves = read_u32(&mut buf)? as usize;
+    let written_at_unix_ms = var_u64::deserialize(&mut buf)?;
+    let leaves = var_u32::deserialize(&mut buf)? as usize;
     let mut leaf_rows = Vec::with_capacity(leaves.min(buf.len()));
     for _ in 0..leaves {
-        leaf_rows.push(read_u32(&mut buf)?);
+        leaf_rows.push(var_u32::deserialize(&mut buf)?);
     }
-    expect_consumed(buf, "page metadata")?;
+    ensure_consumed(buf, "page metadata")?;
     if !leaf_rows.is_empty()
         && leaf_rows
             .iter()
@@ -463,7 +464,7 @@ fn put_str(value: &str, bytes: &mut BytesMut) -> Result<()> {
 }
 
 fn read_str(buf: &mut &[u8]) -> Result<String> {
-    let len = read_u32(buf)? as usize;
+    let len = var_u32::deserialize(buf)? as usize;
     if buf.len() < len {
         return Err(Error::Corrupt("truncated string".to_owned()));
     }
@@ -473,24 +474,8 @@ fn read_str(buf: &mut &[u8]) -> Result<String> {
         .map_err(|error| Error::Corrupt(format!("string is not UTF-8: {error}")))
 }
 
-fn read_u32(buf: &mut &[u8]) -> Result<u32> {
-    var_u32::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
-fn read_u64(buf: &mut &[u8]) -> Result<u64> {
-    var_u64::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
 fn value_len(len: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| Error::Invalid("value length exceeds u32".to_owned()))
-}
-
-fn expect_consumed(buf: &[u8], what: &str) -> Result<()> {
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Corrupt(format!("trailing bytes in {what}")))
-    }
 }
 
 pub(crate) fn encode_postings(postings: &roaring::RoaringBitmap) -> Result<Bytes> {

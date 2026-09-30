@@ -1,3 +1,4 @@
+use server_common::http::{check_size, content_type};
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
@@ -11,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use meter_server::auth::{Permission, authorize};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse},
     common::v1::{AnyValue, KeyValue, any_value},
@@ -21,6 +21,7 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use server_common::auth::{Permission, authorize};
 use track::{AttributeScope, Namespace, QueryOptions, TraceId, trace_batches};
 
 use crate::{
@@ -63,7 +64,7 @@ pub fn router(state: AppState) -> Router {
         );
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
-        .route("/metrics", get(meter_server::runtime_metrics::scrape))
+        .route("/metrics", get(server_common::runtime::scrape_metrics))
         .route("/-/ready", get(readiness));
     let app = if state.config.path_prefix.is_empty() {
         app.merge(public)
@@ -102,7 +103,7 @@ async fn otlp_http_result(
 ) -> Result<Response, ApiError> {
     require_write_mode(state)?;
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
-    check_size(state, body.len())?;
+    check_size(body.len(), state.config.request.max_request_bytes)?;
     let _permit = state
         .request_limit
         .acquire()
@@ -122,7 +123,7 @@ async fn otlp_http_result(
     ) {
         ExportTraceServiceRequest::decode(body).map_err(ApiError::bad_request)?
     } else {
-        return Err(ApiError::unsupported_media());
+        return Err(ApiError::unsupported_media("unsupported content type"));
     };
     let batches = trace_batches(request).map_err(ApiError::bad_request)?;
     write_batches(state, namespace, batches).await?;
@@ -184,9 +185,9 @@ async fn zipkin(
 ) -> Result<StatusCode, ApiError> {
     require_write_mode(&state)?;
     authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(&state, body.len())?;
+    check_size(body.len(), state.config.request.max_request_bytes)?;
     if content_type(&headers) != Some("application/json") {
-        return Err(ApiError::unsupported_media());
+        return Err(ApiError::unsupported_media("unsupported content type"));
     }
     let spans: Vec<ZipkinSpan> = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
     if spans.is_empty() {
@@ -274,7 +275,7 @@ async fn trace_by_id(
         .map_err(|_| ApiError::unavailable("server is shutting down"))?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let trace_id = TraceId::from_str(&trace_id).map_err(ApiError::bad_request)?;
-    let assignment = state.assignment.read().await.clone();
+    let assignment = state.router.assignment().read().await.clone();
     let trace = state
         .db
         .get_trace(&assignment, &namespace, trace_id)
@@ -645,22 +646,6 @@ fn require_read_mode(state: &AppState) -> Result<(), ApiError> {
     }
 }
 
-fn check_size(state: &AppState, size: usize) -> Result<(), ApiError> {
-    if size > state.config.request.max_request_bytes {
-        Err(ApiError::too_large())
-    } else {
-        Ok(())
-    }
-}
-
-fn content_type(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-}
-
 fn accepts_protobuf(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -729,182 +714,43 @@ fn legacy_tags_query(tags: &str) -> String {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
-}
+pub(crate) use server_common::ApiError;
 
-impl ApiError {
-    fn bad_request(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: error.to_string(),
+pub(crate) fn track_error(error: track::Error) -> ApiError {
+    match error {
+        track::Error::Invalid(_) => ApiError::bad_request(error),
+        track::Error::Backpressure => ApiError::too_many_requests(error),
+        track::Error::Unavailable(_) | track::Error::Storage(_) | track::Error::Shard(_) => {
+            ApiError::unavailable(error)
         }
-    }
-
-    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
-        }
-    }
-
-    fn not_found(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn unavailable(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn from_track(error: track::Error) -> Self {
-        match error {
-            track::Error::Invalid(_) => Self::bad_request(error),
-            track::Error::Backpressure => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: error.to_string(),
-            },
-            track::Error::Unavailable(_) | track::Error::Storage(_) => Self::unavailable(error),
-            track::Error::Corrupt(_)
-            | track::Error::Json(_)
-            | track::Error::Protobuf(_)
-            | track::Error::Compression(_)
-            | track::Error::TraceQl(_) => Self::internal(error),
-        }
-    }
-
-    pub(crate) fn into_grpc_status(self) -> tonic::Status {
-        match self.status {
-            StatusCode::BAD_REQUEST => tonic::Status::invalid_argument(self.message),
-            StatusCode::UNAUTHORIZED => tonic::Status::unauthenticated(self.message),
-            StatusCode::NOT_FOUND => tonic::Status::not_found(self.message),
-            StatusCode::PAYLOAD_TOO_LARGE => tonic::Status::resource_exhausted(self.message),
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                tonic::Status::unavailable(self.message)
-            }
-            _ => tonic::Status::internal(self.message),
-        }
-    }
-
-    pub(crate) fn into_otlp_grpc_status(self) -> tonic_otlp::Status {
-        match self.status {
-            StatusCode::BAD_REQUEST => tonic_otlp::Status::invalid_argument(self.message),
-            StatusCode::UNAUTHORIZED => tonic_otlp::Status::unauthenticated(self.message),
-            StatusCode::NOT_FOUND => tonic_otlp::Status::not_found(self.message),
-            StatusCode::PAYLOAD_TOO_LARGE => tonic_otlp::Status::resource_exhausted(self.message),
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                tonic_otlp::Status::unavailable(self.message)
-            }
-            _ => tonic_otlp::Status::internal(self.message),
-        }
-    }
-
-    fn into_otlp_response(self, json_response: bool) -> Response {
-        let code = grpc_code_for_http(self.status);
-        let status = self.status;
-        let mut response = if json_response {
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(json!({"code": code, "message": self.message})),
-            )
-                .into_response()
-        } else {
-            let encoded = GoogleRpcStatus {
-                code,
-                message: self.message,
-            }
-            .encode_to_vec();
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/x-protobuf")],
-                encoded,
-            )
-                .into_response()
-        };
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        }
-        response
-    }
-
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: "authentication required".into(),
-        }
-    }
-
-    fn unsupported_media() -> Self {
-        Self {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: "unsupported content type".into(),
-        }
-    }
-
-    fn too_large() -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "request body exceeds configured limit".into(),
-        }
+        track::Error::Corrupt(_)
+        | track::Error::Json(_)
+        | track::Error::Protobuf(_)
+        | track::Error::Compression(_)
+        | track::Error::TraceQl(_) => ApiError::internal(error),
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
-        let mut response = (
-            self.status,
-            Json(json!({"status":"error","error":self.message})),
-        )
-            .into_response();
-        if retry {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        }
-        response
-    }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct GoogleRpcStatus {
-    #[prost(int32, tag = "1")]
-    code: i32,
-    #[prost(string, tag = "2")]
-    message: String,
-}
-
-fn grpc_code_for_http(status: StatusCode) -> i32 {
-    match status {
-        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => 3,
-        StatusCode::NOT_FOUND => 5,
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => 8,
-        StatusCode::INTERNAL_SERVER_ERROR => 13,
-        StatusCode::SERVICE_UNAVAILABLE => 14,
-        StatusCode::UNAUTHORIZED => 16,
-        _ => 2,
-    }
+/// The OTLP collector service is built on tonic 0.12, a separate crate
+/// version from the server's own gRPC stack.
+pub(crate) fn otlp_grpc_status(error: ApiError) -> tonic_otlp::Status {
+    let status = error.into_grpc_status();
+    tonic_otlp::Status::new(
+        tonic_otlp::Code::from(status.code() as i32),
+        status.message().to_owned(),
+    )
 }
 
 #[cfg(test)]
 mod protocol_tests {
     use axum::body::to_bytes;
+    use server_common::http::GoogleRpcStatus;
 
     use super::*;
 
     #[tokio::test]
     async fn zipkin_backpressure_is_retryable() {
-        let response = ApiError::from_track(track::Error::Backpressure).into_response();
+        let response = track_error(track::Error::Backpressure).into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
@@ -912,7 +758,7 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn otlp_http_errors_use_google_rpc_status_mappings() {
-        let protobuf = ApiError::from_track(track::Error::Backpressure).into_otlp_response(false);
+        let protobuf = track_error(track::Error::Backpressure).into_otlp_response(false);
         assert_eq!(protobuf.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(protobuf.headers()[header::RETRY_AFTER], "1");
         assert_eq!(
@@ -937,19 +783,15 @@ mod protocol_tests {
     #[test]
     fn grpc_retryable_errors_map_to_unavailable() {
         assert_eq!(
-            ApiError::from_track(track::Error::Backpressure)
-                .into_otlp_grpc_status()
-                .code(),
+            otlp_grpc_status(track_error(track::Error::Backpressure)).code(),
             tonic_otlp::Code::Unavailable
         );
         assert_eq!(
-            ApiError::unavailable("flusher stopped")
-                .into_otlp_grpc_status()
-                .code(),
+            otlp_grpc_status(ApiError::unavailable("flusher stopped")).code(),
             tonic_otlp::Code::Unavailable
         );
         assert_eq!(
-            ApiError::from_track(track::Error::Backpressure)
+            track_error(track::Error::Backpressure)
                 .into_grpc_status()
                 .code(),
             tonic::Code::Unavailable

@@ -19,7 +19,7 @@ mod query;
 mod reader;
 #[cfg(feature = "remote-write")]
 pub mod remote_write;
-mod routing;
+pub mod routing;
 mod serde;
 mod sharded;
 mod storage;
@@ -45,7 +45,8 @@ pub use model::{
 #[cfg(feature = "otel")]
 pub use otel::{OtelConfig, OtelConverter};
 pub use reader::TimeSeriesDbReader;
-pub use sharded::{ShardedMeter, ShardedTimeseries, ShardingOptions};
+pub use sharded::{MeterShard, ShardedMeter, ShardedTimeseries};
+pub use sharding::ShardingOptions;
 pub use timeseries::{TimeSeriesDb, Visibility};
 
 /// Persisted SlateDB segment extractor identifier.

@@ -1,4 +1,5 @@
 use super::*;
+use common::display::sanitize_label_name;
 
 pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> {
     match stage {
@@ -188,11 +189,11 @@ pub(super) fn flatten_json(
 ) {
     if let serde_json::Value::Object(object) = value {
         for (name, value) in object {
-            let name = sanitize_label(if prefix.is_empty() {
-                name.clone()
+            let name = if prefix.is_empty() {
+                sanitize_label_name(name)
             } else {
-                format!("{prefix}_{name}")
-            });
+                sanitize_label_name(&format!("{prefix}_{name}"))
+            };
             if value.is_object() {
                 flatten_json(&name, value, output);
             } else {
@@ -206,8 +207,8 @@ pub(super) fn json_path<'a>(
     mut value: &'a serde_json::Value,
     path: &str,
 ) -> Result<Option<&'a serde_json::Value>> {
-    let mut cursor = 0usize;
     let bytes = path.as_bytes();
+    let mut cursor = 0usize;
     while cursor < path.len() {
         if bytes[cursor] == b'.' {
             cursor += 1;
@@ -215,83 +216,107 @@ pub(super) fn json_path<'a>(
                 return Err(Error::Query("JSON path cannot end with '.'".into()));
             }
         }
-        if bytes[cursor] == b'[' {
-            cursor += 1;
-            while cursor < path.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            if cursor == path.len() {
-                return Err(Error::Query("unterminated JSON path bracket".into()));
-            }
-            if bytes[cursor] == b'"' {
-                let start = cursor;
-                cursor += 1;
-                let mut escaped = false;
-                while cursor < path.len() {
-                    let byte = bytes[cursor];
-                    cursor += 1;
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == b'"' {
-                        break;
-                    }
-                }
-                let key: String = serde_json::from_str(&path[start..cursor])?;
-                while cursor < path.len() && bytes[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                if bytes.get(cursor) != Some(&b']') {
-                    return Err(Error::Query("JSON path quoted key requires ']'".into()));
-                }
-                cursor += 1;
-                let Some(next) = value.get(&key) else {
-                    return Ok(None);
-                };
-                value = next;
-            } else {
-                let start = cursor;
-                while cursor < path.len() && bytes[cursor].is_ascii_digit() {
-                    cursor += 1;
-                }
-                let index = path[start..cursor]
-                    .parse::<usize>()
-                    .map_err(|_| Error::Query("JSON array index must be an integer".into()))?;
-                while cursor < path.len() && bytes[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                if bytes.get(cursor) != Some(&b']') {
-                    return Err(Error::Query("JSON array index requires ']'".into()));
-                }
-                cursor += 1;
-                let Some(next) = value.get(index) else {
-                    return Ok(None);
-                };
-                value = next;
+        let next = if bytes[cursor] == b'[' {
+            let (step, end) = json_path_bracket(path, cursor + 1)?;
+            cursor = end;
+            match step {
+                JsonPathStep::Key(key) => value.get(key),
+                JsonPathStep::Index(index) => value.get(index),
             }
         } else {
-            let start = cursor;
-            let first = bytes[cursor];
-            if !(first.is_ascii_alphabetic() || first == b'_') {
-                return Err(Error::Query("invalid JSON path identifier".into()));
-            }
-            cursor += 1;
-            while cursor < path.len()
-                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
-            {
-                cursor += 1;
-            }
-            let Some(next) = value.get(&path[start..cursor]) else {
-                return Ok(None);
-            };
-            value = next;
-        }
-        if cursor < path.len() && bytes[cursor] != b'.' && bytes[cursor] != b'[' {
+            let end = json_path_identifier(bytes, cursor)?;
+            let next = value.get(&path[cursor..end]);
+            cursor = end;
+            next
+        };
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        value = next;
+        if cursor < path.len() && !matches!(bytes[cursor], b'.' | b'[') {
             return Err(Error::Query("invalid JSON path separator".into()));
         }
     }
     Ok(Some(value))
+}
+
+enum JsonPathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Parses the bracketed step that starts just after `[`, returning it with
+/// the position just past the closing `]`.
+fn json_path_bracket(path: &str, cursor: usize) -> Result<(JsonPathStep, usize)> {
+    let bytes = path.as_bytes();
+    let start = skip_ascii_whitespace(bytes, cursor);
+    if start == path.len() {
+        return Err(Error::Query("unterminated JSON path bracket".into()));
+    }
+    let (step, end, missing_close) = if bytes[start] == b'"' {
+        let end = quoted_end(bytes, start + 1);
+        let key = serde_json::from_str(&path[start..end])?;
+        (
+            JsonPathStep::Key(key),
+            end,
+            "JSON path quoted key requires ']'",
+        )
+    } else {
+        let end = start
+            + bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        let index = path[start..end]
+            .parse::<usize>()
+            .map_err(|_| Error::Query("JSON array index must be an integer".into()))?;
+        (
+            JsonPathStep::Index(index),
+            end,
+            "JSON array index requires ']'",
+        )
+    };
+    let close = skip_ascii_whitespace(bytes, end);
+    if bytes.get(close) != Some(&b']') {
+        return Err(Error::Query(missing_close.into()));
+    }
+    Ok((step, close + 1))
+}
+
+/// Returns the position just past the closing quote of a JSON string whose
+/// body starts at `cursor`, or the end of input if it is unterminated.
+pub(super) fn quoted_end(bytes: &[u8], mut cursor: usize) -> usize {
+    let mut escaped = false;
+    while let Some(&byte) = bytes.get(cursor) {
+        cursor += 1;
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => break,
+            _ => {}
+        }
+    }
+    cursor
+}
+
+fn json_path_identifier(bytes: &[u8], start: usize) -> Result<usize> {
+    let first = bytes[start];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(Error::Query("invalid JSON path identifier".into()));
+    }
+    let rest = bytes[start + 1..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    Ok(start + 1 + rest)
+}
+
+pub(super) fn skip_ascii_whitespace(bytes: &[u8], cursor: usize) -> usize {
+    cursor
+        + bytes[cursor..]
+            .iter()
+            .take_while(|b| b.is_ascii_whitespace())
+            .count()
 }
 
 pub(super) fn json_string(value: &serde_json::Value) -> String {
@@ -334,46 +359,14 @@ pub(super) fn parse_logfmt(
             skip_logfmt_token(line, &mut cursor);
             continue;
         }
-        let key = sanitize_label(line[key_start..cursor].to_owned());
-        let value = if line.as_bytes().get(cursor) == Some(&b'=') {
-            cursor += 1;
-            if line.as_bytes().get(cursor) == Some(&b'"') {
-                match scan_logfmt_quoted(line, &mut cursor) {
-                    Ok(value) => value,
-                    Err(error) if strict => {
-                        parse_error = Some(error);
-                        break;
-                    }
-                    Err(_) => {
-                        skip_logfmt_token(line, &mut cursor);
-                        continue;
-                    }
-                }
-            } else {
-                let start = cursor;
-                while cursor < line.len() && !line.as_bytes()[cursor].is_ascii_whitespace() {
-                    if matches!(line.as_bytes()[cursor], b'=' | b'"') {
-                        let error = format!(
-                            "logfmt syntax error at pos {} : unexpected '{}'",
-                            cursor + 1,
-                            char::from(line.as_bytes()[cursor])
-                        );
-                        if strict {
-                            parse_error = Some(error);
-                            break;
-                        }
-                        skip_logfmt_token(line, &mut cursor);
-                        break;
-                    }
-                    cursor += 1;
-                }
-                if cursor < line.len() && !line.as_bytes()[cursor].is_ascii_whitespace() {
-                    continue;
-                }
-                line[start..cursor].to_owned()
+        let key = sanitize_label_name(&line[key_start..cursor]);
+        let value = match logfmt_value(line, &mut cursor, strict) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(error) => {
+                parse_error = Some(error);
+                break;
             }
-        } else {
-            String::new()
         };
         if key.is_empty() {
             if strict {
@@ -398,7 +391,7 @@ pub(super) fn parse_logfmt(
                 .map(|expression| {
                     (
                         expression.label.clone(),
-                        all.get(&sanitize_label(expression.expression.clone()))
+                        all.get(&sanitize_label_name(&expression.expression))
                             .cloned()
                             .unwrap_or_default(),
                     )
@@ -407,6 +400,40 @@ pub(super) fn parse_logfmt(
             parse_error,
         ))
     }
+}
+
+/// Scans the value following a logfmt key. `Ok(None)` means a malformed
+/// pair was skipped; errors are only reported in strict mode.
+fn logfmt_value(
+    line: &str,
+    cursor: &mut usize,
+    strict: bool,
+) -> std::result::Result<Option<String>, String> {
+    if line.as_bytes().get(*cursor) != Some(&b'=') {
+        return Ok(Some(String::new()));
+    }
+    *cursor += 1;
+    if line.as_bytes().get(*cursor) == Some(&b'"') {
+        return match scan_logfmt_quoted(line, cursor) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if strict => Err(error),
+            Err(_) => {
+                skip_logfmt_token(line, cursor);
+                Ok(None)
+            }
+        };
+    }
+    let start = *cursor;
+    skip_logfmt_token(line, cursor);
+    let value = &line[start..*cursor];
+    if strict && let Some(offset) = value.find(['=', '"']) {
+        return Err(format!(
+            "logfmt syntax error at pos {} : unexpected '{}'",
+            start + offset + 1,
+            char::from(value.as_bytes()[offset])
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 pub(super) fn skip_logfmt_token(line: &str, cursor: &mut usize) {
@@ -465,27 +492,10 @@ pub(super) fn unpack(line: &str) -> Result<(String, BTreeMap<String, String>)> {
     let mut labels = BTreeMap::new();
     for (name, value) in object {
         if name != "_entry" {
-            labels.insert(sanitize_label(name.clone()), json_string(value));
+            labels.insert(sanitize_label_name(name), json_string(value));
         }
     }
     Ok((unpacked, labels))
-}
-
-pub(super) fn sanitize_label(name: String) -> String {
-    let mut result = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if result.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-        result.insert(0, '_');
-    }
-    result
 }
 
 pub(super) fn named_captures(regex: &Regex, line: &str) -> BTreeMap<String, String> {
@@ -627,4 +637,47 @@ pub(super) fn apply_unwrap(row: &mut Row, unwrap: &Unwrap) -> Result<bool> {
         .post_filter
         .as_ref()
         .map_or(Ok(true), |filter| label_filter(row, &filter.value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logfmt(line: &str, strict: bool) -> (BTreeMap<String, String>, Option<String>) {
+        parse_logfmt(line, strict, false, &[]).unwrap()
+    }
+
+    #[test]
+    fn logfmt_parses_bare_quoted_and_valueless_pairs() {
+        let (labels, error) = logfmt(r#"a=1 b="two words" c d=x=y"#, false);
+        assert_eq!(error, None);
+        assert_eq!(labels.get("a").map(String::as_str), Some("1"));
+        assert_eq!(labels.get("b").map(String::as_str), Some("two words"));
+        assert_eq!(labels.get("c"), None);
+        assert_eq!(labels.get("d").map(String::as_str), Some("x=y"));
+    }
+
+    #[test]
+    fn strict_logfmt_reports_unexpected_character_in_value() {
+        let (labels, error) = logfmt("a=1 b=x=y c=3", true);
+        assert_eq!(
+            error.as_deref(),
+            Some("logfmt syntax error at pos 8 : unexpected '='")
+        );
+        assert_eq!(labels.get("a").map(String::as_str), Some("1"));
+        assert_eq!(labels.get("c"), None);
+    }
+
+    #[test]
+    fn json_path_walks_keys_indexes_and_quoted_keys() {
+        let value = serde_json::json!({"a": {"b c": [10, {"d": true}]}});
+        let found = |path| json_path(&value, path).unwrap().cloned();
+        assert_eq!(found(r#"a["b c"][0]"#), Some(serde_json::json!(10)));
+        assert_eq!(found(r#"a[ "b c" ][1].d"#), Some(serde_json::json!(true)));
+        assert_eq!(found("a.missing"), None);
+        assert!(json_path(&value, "a.").is_err());
+        assert!(json_path(&value, "a[x]").is_err());
+        assert!(json_path(&value, "a[0").is_err());
+        assert!(json_path(&value, "a-b").is_err());
+    }
 }

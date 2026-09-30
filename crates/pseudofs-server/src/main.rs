@@ -44,31 +44,10 @@ async fn main() -> anyhow::Result<()> {
         .serve_with_shutdown(address, cancellation.cancelled_owned());
     tokio::select! {
         result = server => result?,
-        () = shutdown_signal() => {}
+        () = server_common::runtime::shutdown_signal() => {}
     }
     shutdown.cancel();
     fs.flush().await?;
     fs.close().await?;
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
 }

@@ -26,6 +26,7 @@ futures.workspace = true
 prost.workspace = true
 proto = { path = "../proto" }
 pseudofs = { path = "../pseudofs" }
+server-common = { path = "../server-common" }
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true

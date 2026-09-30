@@ -11,7 +11,7 @@ mod error;
 mod model;
 mod otlp;
 mod page;
-mod routing;
+pub mod routing;
 mod sharded;
 pub mod traceql;
 
@@ -24,7 +24,8 @@ pub use model::{
 };
 pub use otlp::{trace_batches, trace_batches_from_resource_spans};
 pub use page::{Page, PageBuilder, TraceDirectoryEntry};
-pub use sharded::{ShardedTrack, ShardingOptions};
+pub use sharded::ShardedTrack;
+pub use sharding::ShardingOptions;
 pub use traceql::{
     MatchedSpan, QueryOptions, QueryPlan, StaticValue as TraceQlValue, TraceQlResult,
 };

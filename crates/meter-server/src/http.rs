@@ -13,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use common::display::prometheus_float;
 use meter::{Namespace, OtelConfig, OtelConverter, QueryValue, ShardedMeter};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -20,12 +21,9 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use server_common::auth::{Permission, authorize};
 
-use crate::{
-    auth::{Permission, authorize},
-    config::ServerMode,
-    state::AppState,
-};
+use crate::{config::ServerMode, state::AppState};
 
 pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
@@ -40,7 +38,7 @@ pub fn router(state: AppState) -> Router {
                 }
             }),
         )
-        .route("/metrics", get(crate::runtime_metrics::scrape));
+        .route("/metrics", get(server_common::runtime::scrape_metrics));
 
     if state.config.mode != ServerMode::Writer {
         let read_routes = Router::new()
@@ -99,7 +97,7 @@ async fn otlp_http(
 ) -> Response {
     match otlp_http_result(&state, namespace, headers, body).await {
         Ok(response) => response,
-        Err(error) => error.into_otlp_response(),
+        Err(error) => error.into_otlp_response(false),
     }
 }
 
@@ -443,18 +441,6 @@ fn format_prometheus_labels(labels: &meter::Labels) -> String {
     }
 }
 
-fn prometheus_float(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".to_owned()
-    } else if value == f64::INFINITY {
-        "+Inf".to_owned()
-    } else if value == f64::NEG_INFINITY {
-        "-Inf".to_owned()
-    } else {
-        value.to_string()
-    }
-}
-
 async fn reader(state: &AppState, namespace: &str) -> Result<Arc<ShardedMeter>, ApiError> {
     if state.namespace(namespace).is_none() {
         return Err(ApiError::not_found("namespace is not readable"));
@@ -532,130 +518,27 @@ fn request_id(headers: &HeaderMap, body: &[u8]) -> String {
         .unwrap_or_else(|| blake3::hash(body).to_hex().to_string())
 }
 
-#[derive(Debug)]
-pub(crate) struct ApiError {
-    status: StatusCode,
-    pub(crate) message: String,
-}
+pub(crate) use server_common::ApiError;
 
-impl ApiError {
-    pub(crate) fn bad_request(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn unavailable(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn from_meter(error: meter::Error) -> Self {
-        match error {
-            meter::Error::InvalidInput(_) | meter::Error::Encoding(_) => Self::bad_request(error),
-            meter::Error::Backpressure => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: error.to_string(),
-            },
-            meter::Error::Storage(_) => Self::unavailable(error),
-            meter::Error::Internal(_) => Self::internal(error),
-        }
-    }
-
-    fn into_otlp_response(self) -> Response {
-        let status = self.status;
-        let encoded = GoogleRpcStatus {
-            code: grpc_code_for_http(status),
-            message: self.message,
-        }
-        .encode_to_vec();
-        let mut response = (
-            status,
-            [(axum::http::header::CONTENT_TYPE, "application/x-protobuf")],
-            encoded,
-        )
-            .into_response();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
-            );
-        }
-        response
-    }
-
-    pub(crate) fn not_found(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: "authentication required".to_owned(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
-        let mut response = (
-            self.status,
-            Json(json!({"status":"error","errorType":"server","error":self.message})),
-        )
-            .into_response();
-        if retry {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
-            );
-        }
-        response
-    }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct GoogleRpcStatus {
-    #[prost(int32, tag = "1")]
-    code: i32,
-    #[prost(string, tag = "2")]
-    message: String,
-}
-
-fn grpc_code_for_http(status: StatusCode) -> i32 {
-    match status {
-        StatusCode::BAD_REQUEST => 3,
-        StatusCode::NOT_FOUND => 5,
-        StatusCode::TOO_MANY_REQUESTS => 8,
-        StatusCode::INTERNAL_SERVER_ERROR => 13,
-        StatusCode::SERVICE_UNAVAILABLE => 14,
-        StatusCode::UNAUTHORIZED => 16,
-        _ => 2,
+pub(crate) fn meter_error(error: meter::Error) -> ApiError {
+    match error {
+        meter::Error::InvalidInput(_) | meter::Error::Encoding(_) => ApiError::bad_request(error),
+        meter::Error::Backpressure => ApiError::too_many_requests(error),
+        meter::Error::Storage(_) | meter::Error::Shard(_) => ApiError::unavailable(error),
+        meter::Error::Internal(_) => ApiError::internal(error),
     }
 }
 
 #[cfg(test)]
 mod protocol_tests {
     use axum::body::to_bytes;
+    use server_common::http::GoogleRpcStatus;
 
     use super::*;
 
     #[test]
     fn remote_write_backpressure_is_retryable() {
-        let response = ApiError::from_meter(meter::Error::Backpressure).into_response();
+        let response = meter_error(meter::Error::Backpressure).into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
@@ -663,8 +546,7 @@ mod protocol_tests {
 
     #[test]
     fn remote_write_storage_failure_is_service_unavailable() {
-        let response =
-            ApiError::from_meter(meter::Error::Storage("flusher stopped".into())).into_response();
+        let response = meter_error(meter::Error::Storage("flusher stopped".into())).into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -677,7 +559,7 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn otlp_http_errors_use_google_rpc_status() {
-        let response = ApiError::from_meter(meter::Error::Backpressure).into_otlp_response();
+        let response = meter_error(meter::Error::Backpressure).into_otlp_response(false);
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(

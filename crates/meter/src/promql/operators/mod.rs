@@ -18,18 +18,22 @@
 //!   arithmetic, comparisons, and set operations.
 //! - Grouping aggregates: [`aggregate`] (`sum by (…)`, `topk`, …),
 //!   [`count_values`] (deferred-schema — the one operator whose output
-//!   series depend on sample values).
+//!   series depend on sample values), [`histogram`]
+//!   (`histogram_quantile` / `histogram_fraction` over `le` buckets).
+//! - Presence: [`absent`] (`absent`, `absent_over_time`).
 //! - Shape and plumbing (no semantic change, just data movement):
 //!   [`subquery`], [`rechunk`], [`concurrent`], [`coalesce`].
 //!
 //! [`SeriesSource`]: super::source::SeriesSource
 
+pub(crate) mod absent;
 pub(crate) mod aggregate;
 pub(crate) mod binary;
 pub(crate) mod coalesce;
 pub(crate) mod coercion;
 pub(crate) mod concurrent;
 pub(crate) mod count_values;
+pub(crate) mod histogram;
 pub(crate) mod instant_fn;
 pub(crate) mod label_manip;
 pub(crate) mod matrix_selector;

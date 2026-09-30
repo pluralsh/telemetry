@@ -514,10 +514,10 @@ impl KubernetesAssignmentStore {
                 uid,
                 ..OwnerReference::default()
             });
-        let initial = match api.get_opt(&config.shard_map).await? {
-            Some(resource) => decode_assignment(&resource)?,
-            None => None,
-        };
+        let initial = api
+            .get_opt(&config.shard_map)
+            .await?
+            .and_then(|resource| decode_current(&resource));
         let (tx, _) = watch::channel(initial);
         let store = Arc::new(Self {
             api,
@@ -608,18 +608,14 @@ fn apply_assignment_update(tx: &watch::Sender<Option<ShardMap>>, next: ShardMap)
 impl AssignmentStore for KubernetesAssignmentStore {
     async fn load(&self) -> Result<Option<ShardMap>, BoxError> {
         match self.api.get_opt(&self.name).await? {
-            Some(resource) => decode_assignment(&resource),
+            Some(resource) => Ok(decode_current(&resource)),
             None => Ok(self.tx.borrow().clone()),
         }
     }
 
     async fn publish(&self, assignment: ShardMap) -> Result<(), BoxError> {
         let existing = self.api.get_opt(&self.name).await?;
-        let current = existing
-            .as_ref()
-            .map(decode_assignment)
-            .transpose()?
-            .flatten();
+        let current = existing.as_ref().and_then(decode_current);
         if current.is_some_and(|current| current.generation >= assignment.generation) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -670,6 +666,16 @@ fn encode_assignment(
     resource.metadata.owner_references = owner_reference.map(|reference| vec![reference.clone()]);
     resource.data = serde_json::json!({ "spec": assignment });
     Ok(resource)
+}
+
+/// The stored map, or `None` when it is absent or cannot be decoded (for
+/// example one written by an incompatible release), so the elected
+/// coordinator bootstraps a replacement instead of every replica failing.
+fn decode_current(resource: &DynamicObject) -> Option<ShardMap> {
+    decode_assignment(resource).unwrap_or_else(|error| {
+        tracing::warn!(%error, "ignoring undecodable Kubernetes ShardMap; the coordinator will replace it");
+        None
+    })
 }
 
 fn decode_assignment(resource: &DynamicObject) -> Result<Option<ShardMap>, BoxError> {
@@ -1060,6 +1066,25 @@ mod tests {
         .unwrap();
         assert_eq!(decode_assignment(&resource).unwrap(), Some(map));
         assert_eq!(resource.metadata.namespace.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn maps_from_incompatible_releases_are_treated_as_absent() {
+        // A pre-epoch map after the current CRD pruned its `routing` field.
+        let mut resource = DynamicObject::new("line-writer-shard-map", &shard_map_api_resource());
+        resource.data = serde_json::json!({
+            "spec": {
+                "generation": 1,
+                "shard_count": 1,
+                "assignments": [{
+                    "owner": { "id": "line-writer-0", "ordinal": 0 },
+                    "range": { "start": 0, "end": 1 },
+                    "state": "active"
+                }]
+            }
+        });
+        assert!(decode_assignment(&resource).is_err());
+        assert_eq!(decode_current(&resource), None);
     }
 
     #[test]

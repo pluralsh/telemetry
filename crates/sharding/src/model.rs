@@ -448,6 +448,8 @@ fn validate_epochs(epochs: &[RoutingEpoch]) -> Result<(), ModelError> {
 pub enum ModelError {
     #[error("shard count must be greater than zero")]
     ZeroShards,
+    #[error("I/O concurrency limit must be greater than zero")]
+    ZeroIoConcurrencyLimit,
     #[error("shard range must be non-empty and ordered, got {start}..{end}")]
     EmptyOrReversedRange { start: ShardId, end: ShardId },
     #[error("range {range} exceeds shard count {shard_count}")]

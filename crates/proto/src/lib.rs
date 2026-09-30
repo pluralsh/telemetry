@@ -1,5 +1,8 @@
 //! Generated internal protocol types for the Telemetry product family.
 
+// tonic's generated service traits return `tonic::Status` by value.
+#![allow(clippy::result_large_err)]
+
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("telemetry_descriptor");
 
 pub mod meter {

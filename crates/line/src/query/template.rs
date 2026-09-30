@@ -176,70 +176,54 @@ pub(super) fn split_top_level(input: &str, separator: char) -> Result<Vec<&str>>
 }
 
 pub(super) fn template_tokens(command: &str) -> Result<Vec<TemplateValue>> {
-    let mut result = Vec::new();
-    let mut cursor = 0usize;
     let bytes = command.as_bytes();
+    let mut result = Vec::new();
+    let mut cursor = skip_ascii_whitespace(bytes, 0);
     while cursor < command.len() {
-        while cursor < command.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor == command.len() {
-            break;
-        }
-        if bytes[cursor] == b'"' {
-            let start = cursor;
-            cursor += 1;
-            let mut escaped = false;
-            while cursor < command.len() {
-                let byte = bytes[cursor];
-                cursor += 1;
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    break;
+        let (token, end) = match bytes[cursor] {
+            b'"' => {
+                let end = quoted_end(bytes, cursor + 1);
+                if bytes[end - 1] != b'"' {
+                    return Err(Error::Query("unterminated template string".into()));
                 }
+                (serde_json::from_str(&command[cursor..end])?, end)
             }
-            if bytes.get(cursor - 1) != Some(&b'"') {
-                return Err(Error::Query("unterminated template string".into()));
+            b'(' => {
+                let end = paren_end(bytes, cursor + 1)
+                    .ok_or_else(|| Error::Query("unbalanced template parentheses".into()))?;
+                (format!("\0expr:{}", &command[cursor + 1..end - 1]), end)
             }
-            let value: String = serde_json::from_str(&command[start..cursor])?;
-            result.push(TemplateValue::String(value));
-        } else if bytes[cursor] == b'(' {
-            let start = cursor + 1;
-            let mut depth = 1usize;
-            let mut quoted = false;
-            cursor += 1;
-            while cursor < command.len() && depth != 0 {
-                match bytes[cursor] {
-                    b'"' => quoted = !quoted,
-                    b'(' if !quoted => depth += 1,
-                    b')' if !quoted => depth -= 1,
-                    _ => {}
-                }
-                cursor += 1;
+            b')' => return Err(Error::Query("unbalanced template parentheses".into())),
+            _ => {
+                let word = bytes[cursor..]
+                    .iter()
+                    .take_while(|b| !b.is_ascii_whitespace() && !matches!(b, b'(' | b')'))
+                    .count();
+                let end = cursor + word;
+                (command[cursor..end].to_owned(), end)
             }
-            if depth != 0 {
-                return Err(Error::Query("unbalanced template parentheses".into()));
-            }
-            result.push(TemplateValue::String(format!(
-                "\0expr:{}",
-                &command[start..cursor - 1]
-            )));
-        } else {
-            let start = cursor;
-            while cursor < command.len()
-                && !bytes[cursor].is_ascii_whitespace()
-                && bytes[cursor] != b'('
-                && bytes[cursor] != b')'
-            {
-                cursor += 1;
-            }
-            result.push(TemplateValue::String(command[start..cursor].to_owned()));
-        }
+        };
+        result.push(TemplateValue::String(token));
+        cursor = skip_ascii_whitespace(bytes, end);
     }
     Ok(result)
+}
+
+/// Returns the position just past the `)` closing a group whose body starts
+/// at `cursor`, or `None` if the group is unbalanced.
+fn paren_end(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quoted = false;
+    while depth != 0 {
+        match *bytes.get(cursor)? {
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    Some(cursor)
 }
 
 pub(super) fn eval_template_command(tokens: &[TemplateValue], row: &Row) -> Result<TemplateValue> {
@@ -499,15 +483,17 @@ fn numeric_function(name: &str, arguments: &[TemplateValue]) -> Result<Option<Te
             let (&first, rest) = values
                 .split_first()
                 .ok_or_else(|| Error::Query(format!("{name} requires arguments")))?;
-            rest.iter().fold(first, |value, next| match name {
-                "add" | "addf" => value + next,
-                "sub" | "subf" => value - next,
-                "mul" | "mulf" => value * next,
-                "div" => (value as i64 / *next as i64) as f64,
-                "mod" => (value as i64 % *next as i64) as f64,
-                "divf" => value / next,
-                _ => unreachable!(),
-            })
+            rest.iter().try_fold(first, |value, &next| {
+                Ok::<_, Error>(match name {
+                    "add" | "addf" => value + next,
+                    "sub" | "subf" => value - next,
+                    "mul" | "mulf" => value * next,
+                    "div" => integer_op(name, value, next, i64::checked_div)?,
+                    "mod" => integer_op(name, value, next, i64::checked_rem)?,
+                    "divf" => value / next,
+                    _ => unreachable!(),
+                })
+            })?
         }
         "min" | "minf" | "max" | "maxf" => numbers()?
             .into_iter()
@@ -743,6 +729,18 @@ pub(super) fn format_number(value: f64) -> String {
     }
 }
 
+/// Integer `div`/`mod` over truncated operands; zero divisors and overflow are query errors.
+fn integer_op(
+    name: &str,
+    lhs: f64,
+    rhs: f64,
+    op: impl FnOnce(i64, i64) -> Option<i64>,
+) -> Result<f64> {
+    op(lhs as i64, rhs as i64)
+        .map(|value| value as f64)
+        .ok_or_else(|| Error::Query(format!("{name}: division by zero or overflow")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +762,23 @@ mod tests {
             TemplateValue::Number(value) => value,
             other => panic!("{name} returned {other:?}"),
         }
+    }
+
+    #[test]
+    fn template_tokens_split_strings_groups_and_words() {
+        let tokens = template_tokens(r#" printf "%s \"q\"" (upper .a) .b "#).unwrap();
+        let texts: Vec<_> = tokens.iter().map(TemplateValue::text).collect();
+        assert_eq!(texts, ["printf", "%s \"q\"", "\0expr:upper .a", ".b"]);
+        assert!(template_tokens(r#"printf "open"#).is_err());
+        assert!(template_tokens("(upper .a").is_err());
+        assert!(template_tokens("upper )").is_err());
+    }
+
+    #[test]
+    fn integer_division_by_zero_is_a_query_error() {
+        assert!(call("div", &["7", "0"]).is_err());
+        assert!(call("mod", &["7", "0"]).is_err());
+        assert_eq!(number("divf", &["7", "0"]), f64::INFINITY);
     }
 
     #[test]

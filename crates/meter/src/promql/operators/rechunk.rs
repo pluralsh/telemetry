@@ -230,6 +230,30 @@ impl<C: Operator> RechunkOp<C> {
             validity,
         )
     }
+
+    fn matches_target(&self, batch: &StepBatch) -> bool {
+        batch_matches_target(
+            batch,
+            self.target_step_chunk,
+            self.target_series_chunk,
+            self.schema.step_grid.step_count,
+            grid_series_count(&self.schema),
+        )
+    }
+
+    /// Allocates full-grid scratch seeded with the first batch. Its
+    /// `step_timestamps` and `series` are plan-time shared, so they hold for
+    /// the whole stream.
+    fn begin_draining(&self, batch: &StepBatch) -> Result<State, QueryError> {
+        let (step_count, series_count) = self.grid_shape();
+        let mut scratch = Scratch::allocate(&self.reservation, step_count, series_count)?;
+        Self::ingest(&mut scratch, batch);
+        Ok(State::Draining {
+            scratch,
+            step_timestamps: batch.step_timestamps.clone(),
+            series: batch.series.clone(),
+        })
+    }
 }
 
 impl<C: Operator> Operator for RechunkOp<C> {
@@ -243,84 +267,36 @@ impl<C: Operator> Operator for RechunkOp<C> {
                 State::Done => {
                     return Poll::Ready(None);
                 }
-                State::Init => {
-                    // Peek the first upstream batch. If its shape matches
-                    // the target exactly and covers a tile boundary (step
-                    // offset is a multiple of target_step_chunk, series
-                    // offset likewise), passthrough. Otherwise, fall
-                    // through to full materialisation.
-                    match self.child.next(cx) {
-                        Poll::Pending => {
-                            self.state = State::Init;
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(None) => {
-                            // child is empty; nothing to emit.
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(Some(Err(e))) => {
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Ready(Some(Ok(batch))) => {
-                            if batch_matches_target(
-                                &batch,
-                                self.target_step_chunk,
-                                self.target_series_chunk,
-                                self.schema.step_grid.step_count,
-                                grid_series_count(&self.schema),
-                            ) {
-                                self.state = State::Passthrough;
-                                return Poll::Ready(Some(Ok(batch)));
-                            } else {
-                                // Spill into full materialisation. Allocate
-                                // scratch sized for the full grid.
-                                let (step_count, series_count) = self.grid_shape();
-                                let mut scratch = match Scratch::allocate(
-                                    &self.reservation,
-                                    step_count,
-                                    series_count,
-                                ) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        self.state = State::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                // Remember the first batch's `step_timestamps`
-                                // and `series` — they're invariant for the
-                                // whole stream (plan-time shared).
-                                let step_timestamps = batch.step_timestamps.clone();
-                                let series = batch.series.clone();
-                                Self::ingest(&mut scratch, &batch);
-                                self.state = State::Draining {
-                                    scratch,
-                                    step_timestamps,
-                                    series,
-                                };
-                                // fall through to the Draining arm on the
-                                // next loop iteration.
-                            }
-                        }
+                // Peek the first upstream batch. If its shape matches the
+                // target exactly and covers a tile boundary (step offset is a
+                // multiple of target_step_chunk, series offset likewise),
+                // passthrough. Otherwise, fall through to full
+                // materialisation.
+                State::Init => match self.child.next(cx) {
+                    Poll::Pending => {
+                        self.state = State::Init;
+                        return Poll::Pending;
                     }
-                }
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Ok(batch))) if self.matches_target(&batch) => {
+                        self.state = State::Passthrough;
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    // The Draining arm takes over on the next iteration.
+                    Poll::Ready(Some(Ok(batch))) => match self.begin_draining(&batch) {
+                        Ok(state) => self.state = state,
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                    },
+                },
+                // Pipe upstream batches through verbatim until the child
+                // ends or fails.
                 State::Passthrough => {
-                    // Pipe upstream batches through verbatim.
-                    match self.child.next(cx) {
-                        Poll::Pending => {
-                            self.state = State::Passthrough;
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(None) => {
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(Some(Err(e))) => {
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Ready(Some(Ok(batch))) => {
-                            self.state = State::Passthrough;
-                            return Poll::Ready(Some(Ok(batch)));
-                        }
+                    let next = self.child.next(cx);
+                    if matches!(next, Poll::Pending | Poll::Ready(Some(Ok(_)))) {
+                        self.state = State::Passthrough;
                     }
+                    return next;
                 }
                 State::Draining {
                     mut scratch,

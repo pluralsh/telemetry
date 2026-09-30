@@ -1,6 +1,9 @@
+//! Credential configuration and request authorization shared by the product
+//! servers: Basic credentials, JWT bearer tokens and the internal secret.
+
 use std::{
     collections::HashSet,
-    fs,
+    env, fmt, fs,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,12 +12,97 @@ use axum::http::{HeaderMap, header::AUTHORIZATION};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::Jwk};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{Access, Credential, JwksSource, JwtConfig};
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cannot resolve secret: {0}")]
+pub struct SecretError(String);
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum Secret {
+    Literal { value: String },
+    Env { name: String },
+    File { path: String },
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Secret([REDACTED])")
+    }
+}
+
+impl Secret {
+    pub fn expose(&self) -> Result<String, SecretError> {
+        let value = match self {
+            Self::Literal { value } => value.clone(),
+            Self::Env { name } => env::var(name)
+                .map_err(|_| SecretError(format!("environment variable {name} is unset")))?,
+            Self::File { path } => fs::read_to_string(path)
+                .map_err(|error| SecretError(format!("cannot read {path}: {error}")))?,
+        };
+        let value = value.trim_end_matches(['\r', '\n']).to_owned();
+        if value.is_empty() {
+            return Err(SecretError("secret cannot be empty".to_owned()));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Credential {
+    Basic { username: String, password: Secret },
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Access {
+    pub read: Vec<Credential>,
+    pub write: Vec<Credential>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub unauthenticated: bool,
+    pub jwt: Option<JwtConfig>,
+    pub global: Access,
+    pub internal: Option<Secret>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JwtConfig {
+    pub jwks: JwksSource,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub refresh_interval_seconds: u64,
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            jwks: JwksSource::File {
+                path: String::new(),
+            },
+            issuer: None,
+            audience: None,
+            refresh_interval_seconds: 300,
+            request_timeout_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JwksSource {
+    File { path: String },
+    Url { url: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -311,11 +399,7 @@ fn parse_algorithm(value: &str) -> Option<Algorithm> {
     }
 }
 
-pub fn secure_eq(left: &str, right: &str) -> bool {
-    let left = blake3::hash(left.as_bytes());
-    let right = blake3::hash(right.as_bytes());
-    bool::from(left.as_bytes().ct_eq(right.as_bytes()))
-}
+pub use crate::internal_rpc::secure_eq;
 
 #[cfg(test)]
 mod tests {
@@ -327,7 +411,6 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::*;
-    use crate::config::Secret;
 
     const KID: &str = "test-hs256";
     const SECRET: &[u8] = b"meter-test-only-hs256-signing-key";
@@ -639,5 +722,22 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[test]
+    fn secret_sources_and_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        fs::write(&path, "from-file\n").unwrap();
+        let secret = Secret::File {
+            path: path.display().to_string(),
+        };
+        assert_eq!(secret.expose().unwrap(), "from-file");
+        assert!(!format!("{secret:?}").contains("from-file"));
+        let literal = Secret::Literal {
+            value: "literal".to_owned(),
+        };
+        assert_eq!(literal.expose().unwrap(), "literal");
+        assert!(!format!("{literal:?}").contains("literal"));
     }
 }

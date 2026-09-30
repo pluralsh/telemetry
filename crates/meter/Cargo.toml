@@ -38,7 +38,6 @@ prost = { workspace = true, optional = true }
 promql-parser.workspace = true
 regex.workspace = true
 regex-syntax.workspace = true
-reqwest.workspace = true
 roaring.workspace = true
 ryu.workspace = true
 serde.workspace = true

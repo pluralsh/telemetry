@@ -132,6 +132,16 @@ pub enum RecordOp {
     Delete(Bytes),
 }
 
+impl RecordOp {
+    /// A put of `key` = `value` that expires according to `ttl`.
+    pub fn put_with_ttl(key: Bytes, value: Bytes, ttl: Ttl) -> Self {
+        Self::Put(PutRecordOp::new_with_options(
+            Record::new(key, value),
+            PutOptions { ttl },
+        ))
+    }
+}
+
 /// Options for write operations.
 ///
 /// Controls the durability behavior of write operations like [`Storage::put`]

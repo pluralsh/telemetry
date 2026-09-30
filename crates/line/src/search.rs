@@ -14,6 +14,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::serde::ensure_consumed;
 use common::serde::varint::{var_u32, var_u64};
 use common::storage::StorageRead;
 use futures::{StreamExt, TryStreamExt};
@@ -185,10 +186,10 @@ pub(crate) fn encode_field_stats(stats: FieldStats) -> Bytes {
 pub(crate) fn decode_field_stats(value: &[u8]) -> Result<FieldStats> {
     let mut buf = binary_body(value)?;
     let stats = FieldStats {
-        documents: read_u64(&mut buf)?,
-        total_terms: read_u64(&mut buf)?,
+        documents: var_u64::deserialize(&mut buf)?,
+        total_terms: var_u64::deserialize(&mut buf)?,
     };
-    expect_consumed(buf)?;
+    ensure_consumed(buf, "search value")?;
     Ok(stats)
 }
 
@@ -202,10 +203,10 @@ pub(crate) fn encode_term_stats(stats: TermStats) -> Bytes {
 pub(crate) fn decode_term_stats(value: &[u8]) -> Result<TermStats> {
     let mut buf = binary_body(value)?;
     let stats = TermStats {
-        documents: read_u64(&mut buf)?,
-        blocks: read_u32(&mut buf)?,
+        documents: var_u64::deserialize(&mut buf)?,
+        blocks: var_u32::deserialize(&mut buf)?,
     };
-    expect_consumed(buf)?;
+    ensure_consumed(buf, "search value")?;
     Ok(stats)
 }
 
@@ -235,7 +236,7 @@ pub(crate) fn decode_directory(value: &[u8]) -> Result<Vec<BlockDirectoryEntry>>
     let mut entries = Vec::with_capacity(count);
     let mut ordinal = 0u32;
     for index in 0..count {
-        let delta = read_u32(&mut buf)?;
+        let delta = var_u32::deserialize(&mut buf)?;
         ordinal = if index == 0 {
             delta
         } else {
@@ -245,13 +246,13 @@ pub(crate) fn decode_directory(value: &[u8]) -> Result<Vec<BlockDirectoryEntry>>
         };
         entries.push(BlockDirectoryEntry {
             ordinal,
-            postings: u16::try_from(read_u32(&mut buf)?)
+            postings: u16::try_from(var_u32::deserialize(&mut buf)?)
                 .map_err(|_| Error::Corrupt("directory posting count exceeds u16".into()))?,
-            max_frequency: read_u32(&mut buf)?,
-            min_length: read_u32(&mut buf)?,
+            max_frequency: var_u32::deserialize(&mut buf)?,
+            min_length: var_u32::deserialize(&mut buf)?,
         });
     }
-    expect_consumed(buf)?;
+    ensure_consumed(buf, "search value")?;
     Ok(entries)
 }
 
@@ -307,17 +308,17 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
     };
     let overflow = || Error::Corrupt("posting address overflow".into());
     for _ in 0..count {
-        let stream_delta = read_u32(&mut buf)?;
+        let stream_delta = var_u32::deserialize(&mut buf)?;
         if stream_delta != 0 {
             address.stream_id = address
                 .stream_id
                 .checked_add(stream_delta)
                 .ok_or_else(overflow)?;
-            address.page_sequence = read_u64(&mut buf)?;
-            address.row_id = read_u32(&mut buf)?;
+            address.page_sequence = var_u64::deserialize(&mut buf)?;
+            address.row_id = var_u32::deserialize(&mut buf)?;
         } else {
-            let page_delta = read_u64(&mut buf)?;
-            let row = read_u32(&mut buf)?;
+            let page_delta = var_u64::deserialize(&mut buf)?;
+            let row = var_u32::deserialize(&mut buf)?;
             if page_delta != 0 {
                 address.page_sequence = address
                     .page_sequence
@@ -330,11 +331,11 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
         }
         postings.push(Posting {
             address,
-            frequency: read_u32(&mut buf)?,
-            length: read_u32(&mut buf)?,
+            frequency: var_u32::deserialize(&mut buf)?,
+            length: var_u32::deserialize(&mut buf)?,
         });
     }
-    expect_consumed(buf)?;
+    ensure_consumed(buf, "search value")?;
     Ok(postings)
 }
 
@@ -355,16 +356,8 @@ fn binary_body(value: &[u8]) -> Result<&[u8]> {
     }
 }
 
-fn read_u32(buf: &mut &[u8]) -> Result<u32> {
-    var_u32::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
-fn read_u64(buf: &mut &[u8]) -> Result<u64> {
-    var_u64::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
 fn read_count(buf: &mut &[u8], bound: usize, what: &str) -> Result<usize> {
-    let count = read_u32(buf)? as usize;
+    let count = var_u32::deserialize(buf)? as usize;
     if count > bound {
         return Err(Error::Corrupt(format!("{what} exceeds bound")));
     }
@@ -373,14 +366,6 @@ fn read_count(buf: &mut &[u8], bound: usize, what: &str) -> Result<usize> {
 
 fn count_u32(count: usize) -> Result<u32> {
     u32::try_from(count).map_err(|_| Error::Invalid("search value count exceeds u32".into()))
-}
-
-fn expect_consumed(buf: &[u8]) -> Result<()> {
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Corrupt("trailing bytes in search value".into()))
-    }
 }
 
 /// Produces the key/value writes that append `postings` to one term's index.
@@ -596,22 +581,14 @@ pub(crate) async fn block_max_scores(
         );
         while let Some(postings) = blocks.try_next().await? {
             for posting in postings {
-                if !allowed_pages
-                    .contains(&(posting.address.stream_id, posting.address.page_sequence))
-                {
-                    continue;
-                }
-                let hit = Hit {
-                    frequency: posting.frequency,
-                    length: posting.length,
-                    idf: query.idf,
-                };
-                if index == 0 {
-                    candidates.entry(posting.address).or_default().push(hit);
-                } else if let Some(hits) = candidates.get_mut(&posting.address)
-                    && hits.len() == index
-                {
-                    hits.push(hit);
+                let page = (posting.address.stream_id, posting.address.page_sequence);
+                if allowed_pages.contains(&page) {
+                    let hit = Hit {
+                        frequency: posting.frequency,
+                        length: posting.length,
+                        idf: query.idf,
+                    };
+                    add_hit(&mut candidates, index, posting.address, hit);
                 }
             }
         }
@@ -629,6 +606,24 @@ pub(crate) async fn block_max_scores(
             .map(|(address, hits)| (address, score(&hits, average_length)))
             .collect(),
     ))
+}
+
+/// Records `hit` for the `index`-th term in rarest-first order. The first
+/// term seeds candidates; later terms only extend documents that matched
+/// every earlier term.
+fn add_hit(
+    candidates: &mut HashMap<DocAddress, Vec<Hit>>,
+    index: usize,
+    address: DocAddress,
+    hit: Hit,
+) {
+    if index == 0 {
+        candidates.entry(address).or_default().push(hit);
+    } else if let Some(hits) = candidates.get_mut(&address)
+        && hits.len() == index
+    {
+        hits.push(hit);
+    }
 }
 
 #[derive(Clone, Copy)]

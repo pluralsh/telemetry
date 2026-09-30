@@ -6,175 +6,54 @@ use std::{
 
 use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
-use futures::{StreamExt, TryStreamExt, stream};
 use sharding::{
-    DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_SHARDS, ReaderShardLifecycle, ShardId, ShardMap,
+    ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
+    shard_opener,
 };
 use slatedb::config::DbReaderOptions;
-use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::routing::{route_trace, trace_shards};
 use crate::{
     AttributeMatcher, AttributeScope, Config, Durability, Error, Namespace, QueryOptions, Result,
     Trace, TraceBatch, TraceDb, TraceId, TraceQlResult, WriteReport,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShardingOptions {
-    shard_count: u32,
-    io_concurrency_limit: u32,
-}
+#[async_trait]
+impl ShardDatabase for TraceDb {
+    type Error = Error;
 
-impl Default for ShardingOptions {
-    fn default() -> Self {
-        Self {
-            shard_count: DEFAULT_SHARDS,
-            io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
-        }
+    async fn flush_database(&self) -> Result<()> {
+        self.flush().await
+    }
+
+    async fn close_database(self: Arc<Self>) -> Result<()> {
+        self.close().await
     }
 }
 
-impl ShardingOptions {
-    pub fn new(shard_count: u32, io_concurrency_limit: u32) -> Result<Self> {
-        if shard_count == 0 {
-            return Err(Error::Invalid(
-                "shard count must be greater than zero".to_owned(),
-            ));
-        }
-        if io_concurrency_limit == 0 {
-            return Err(Error::Invalid(
-                "I/O concurrency limit must be greater than zero".to_owned(),
-            ));
-        }
-        Ok(Self {
-            shard_count,
-            io_concurrency_limit,
-        })
-    }
-
-    pub const fn shard_count(self) -> u32 {
-        self.shard_count
-    }
-
-    pub const fn io_concurrency_limit(self) -> u32 {
-        self.io_concurrency_limit
-    }
-
-    /// Shard owning a trace (or partial trace) whose earliest span starts
-    /// at `start_ns`.
-    pub fn route(
-        self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        trace_id: TraceId,
-        start_ns: u64,
-    ) -> ShardId {
-        assignment.route_key(
-            &crate::routing::canonical_routing_key(namespace, trace_id),
-            i64::try_from(start_ns).unwrap_or(i64::MAX),
-        )
-    }
-
-    pub fn route_trace(
-        self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        trace: &Trace,
-    ) -> ShardId {
-        self.route(
-            assignment,
-            namespace,
-            trace.trace_id,
-            trace.timestamp_range().0,
-        )
-    }
-
-    /// Every shard that may hold spans of `trace_id` across routing epochs.
-    pub fn trace_shards(
-        self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        trace_id: TraceId,
-    ) -> Vec<ShardId> {
-        assignment.shards_for_key(&crate::routing::canonical_routing_key(namespace, trace_id))
-    }
-
-    pub fn shard_storage(self, config: &Config, shard: ShardId) -> Result<Config> {
-        let mut config = config.clone();
-        config.storage = config
-            .storage
-            .with_path_suffix(&format!("shard-{:04}", shard.get()));
-        Ok(config)
-    }
+fn shard_config(config: &Config, shard: ShardId) -> Config {
+    let mut config = config.clone();
+    config.storage = config
+        .storage
+        .with_path_suffix(&ShardingOptions::shard_suffix(shard));
+    config
 }
 
 /// A facade over independently opened storage-shard trace databases.
 pub struct ShardedTrack {
-    config: Config,
-    options: ShardingOptions,
-    shards: RwLock<BTreeMap<ShardId, Arc<TraceDb>>>,
-    reader_options: Option<DbReaderOptions>,
-    io_permits: Arc<Semaphore>,
+    shards: Arc<ShardSet<TraceDb>>,
 }
 
 impl ShardedTrack {
-    /// Warms recent cache blocks for every open shard and namespace.
-    pub async fn warm_recent(
-        &self,
-        namespaces: &[Namespace],
-        warm_range: Duration,
-        include_payloads: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        let concurrency = concurrency
-            .max(1)
-            .min(self.options.io_concurrency_limit() as usize);
-        let permit_count = u32::try_from(concurrency).unwrap_or(u32::MAX);
-        let _warm_permits = tokio::select! {
-            permits = self.io_permits.clone().acquire_many_owned(permit_count) => {
-                permits.expect("shard I/O semaphore must remain open")
-            }
-            () = cancel.cancelled() => return Ok(()),
-        };
-        let databases = self
-            .shards
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for database in databases {
-            for namespace in namespaces {
-                if cancel.is_cancelled() {
-                    return Ok(());
-                }
-                database
-                    .warm_recent(namespace, warm_range, include_payloads, concurrency, cancel)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     pub async fn open(
         config: Config,
         options: ShardingOptions,
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
-        let mut databases = BTreeMap::new();
-        for shard in shards {
-            databases.insert(
-                shard,
-                Arc::new(TraceDb::open(options.shard_storage(&config, shard)?).await?),
-            );
-        }
+        let opener = shard_opener(move |shard| TraceDb::open(shard_config(&config, shard)));
         Ok(Self {
-            config,
-            options,
-            shards: RwLock::new(databases),
-            reader_options: None,
-            io_permits: Arc::new(Semaphore::new(options.io_concurrency_limit() as usize)),
+            shards: Arc::new(ShardSet::open(ShardRole::Writer, options, opener, shards).await?),
         })
     }
 
@@ -184,125 +63,44 @@ impl ShardedTrack {
         shards: impl IntoIterator<Item = ShardId>,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
-        let mut databases = BTreeMap::new();
-        for shard in shards {
-            databases.insert(
-                shard,
-                Arc::new(
-                    TraceDb::open_reader(
-                        options.shard_storage(&config, shard)?,
-                        reader_options.clone(),
-                    )
-                    .await?,
-                ),
-            );
-        }
+        let opener = shard_opener(move |shard| {
+            TraceDb::open_reader(shard_config(&config, shard), reader_options.clone())
+        });
         Ok(Self {
-            config,
-            options,
-            shards: RwLock::new(databases),
-            reader_options: Some(reader_options),
-            io_permits: Arc::new(Semaphore::new(options.io_concurrency_limit() as usize)),
+            shards: Arc::new(ShardSet::open(ShardRole::Reader, options, opener, shards).await?),
         })
     }
 
-    pub fn route_trace(
+    /// The open storage shards, for ownership lifecycle management.
+    pub fn shards(&self) -> &Arc<ShardSet<TraceDb>> {
+        &self.shards
+    }
+
+    /// Warms recent cache blocks for every open shard and namespace.
+    pub async fn warm_recent(
         &self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        trace: &Trace,
-    ) -> ShardId {
-        self.options.route_trace(assignment, namespace, trace)
+        namespaces: &[Namespace],
+        warm_range: Duration,
+        include_payloads: bool,
+        concurrency: usize,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        self.shards
+            .warm(concurrency, cancel, |database, concurrency| async move {
+                for namespace in namespaces {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    database
+                        .warm_recent(namespace, warm_range, include_payloads, concurrency, cancel)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
     }
 
-    pub async fn contains_shard(&self, shard: ShardId) -> bool {
-        self.shards.read().await.contains_key(&shard)
-    }
-
-    pub async fn shard(&self, shard: ShardId) -> Option<Arc<TraceDb>> {
-        self.shards.read().await.get(&shard).cloned()
-    }
-
-    pub async fn open_shard(&self, shard: ShardId) -> Result<()> {
-        if self.contains_shard(shard).await {
-            return Ok(());
-        }
-        let database = TraceDb::open(self.options.shard_storage(&self.config, shard)?).await?;
-        let mut shards = self.shards.write().await;
-        match shards.entry(shard) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::new(database));
-                return Ok(());
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {}
-        }
-        drop(shards);
-        database.close().await?;
-        Ok(())
-    }
-
-    pub async fn flush_shard(&self, shard: ShardId) -> Result<()> {
-        if let Some(database) = self.shard(shard).await {
-            database.flush().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn close_shard(&self, shard: ShardId) -> Result<()> {
-        let mut shards = self.shards.write().await;
-        let Some(database) = shards.remove(&shard) else {
-            return Ok(());
-        };
-        let database = match Arc::try_unwrap(database) {
-            Ok(database) => database,
-            Err(database) => {
-                shards.insert(shard, database);
-                return Err(Error::Invalid(
-                    "shard database still has in-flight references".into(),
-                ));
-            }
-        };
-        drop(shards);
-        database.close().await
-    }
-
-    pub async fn open_shard_count(&self) -> usize {
-        self.shards.read().await.len()
-    }
-
-    pub async fn open_shards(&self) -> Vec<ShardId> {
-        self.shards.read().await.keys().copied().collect()
-    }
-
-    /// Opens readers for every shard in `assignment`. Shards are never
-    /// removed because routing epochs only grow.
-    pub async fn reconcile_shards(&self, assignment: &ShardMap) -> Result<()> {
-        let reader_options = self.reader_options.as_ref().ok_or_else(|| {
-            Error::Invalid("reader reconciliation requires a reader facade".into())
-        })?;
-        let current = self.open_shards().await;
-        let mut opened = BTreeMap::new();
-        for shard in (0..assignment.shard_count).map(ShardId::new) {
-            if current.contains(&shard) {
-                continue;
-            }
-            opened.insert(
-                shard,
-                Arc::new(
-                    TraceDb::open_reader(
-                        self.options.shard_storage(&self.config, shard)?,
-                        reader_options.clone(),
-                    )
-                    .await?,
-                ),
-            );
-        }
-        if !opened.is_empty() {
-            self.shards.write().await.extend(opened);
-        }
-        Ok(())
-    }
-
+    /// Writes to shards opened locally; every routed shard must be open.
     pub async fn write(
         &self,
         assignment: &ShardMap,
@@ -313,16 +111,16 @@ impl ShardedTrack {
         let mut grouped = BTreeMap::<ShardId, Vec<Trace>>::new();
         for trace in batches.into_iter().flat_map(|batch| batch.traces) {
             grouped
-                .entry(self.route_trace(assignment, namespace, &trace))
+                .entry(route_trace(assignment, namespace, &trace))
                 .or_default()
                 .push(trace);
         }
         let mut report = WriteReport::default();
         for (shard, traces) in grouped {
-            let database = self.shard(shard).await.ok_or_else(|| {
-                Error::Invalid(format!("shard {} is not open on this node", shard.get()))
-            })?;
-            let written = database
+            let written = self
+                .shards
+                .require(shard)
+                .await?
                 .write_with_durability(namespace, vec![TraceBatch::new(traces)], durability)
                 .await?;
             report.traces = report.traces.saturating_add(written.traces);
@@ -341,16 +139,13 @@ impl ShardedTrack {
         trace_id: TraceId,
     ) -> Result<Option<Trace>> {
         let mut parts = Vec::new();
-        for shard in self.options.trace_shards(assignment, namespace, trace_id) {
-            let database = self.shard(shard).await.ok_or_else(|| {
-                Error::Invalid(format!("shard {} is not open on this node", shard.get()))
-            })?;
-            let _permit = self
-                .io_permits
-                .acquire()
-                .await
-                .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
-            parts.extend(database.get_trace(namespace, trace_id).await?);
+        for shard in trace_shards(assignment, namespace, trace_id) {
+            let database = self.shards.require(shard).await?;
+            parts.extend(
+                self.shards
+                    .with_io(database.get_trace(namespace, trace_id))
+                    .await?,
+            );
         }
         Ok(crate::db::merge_traces(parts).pop())
     }
@@ -362,27 +157,15 @@ impl ShardedTrack {
         end_ns: u64,
         matchers: &[AttributeMatcher],
     ) -> Result<Vec<Trace>> {
-        let databases = self.databases().await;
-        let permits = Arc::clone(&self.io_permits);
-        let mut results = stream::iter(databases.into_iter().map(|database| {
-            let permits = Arc::clone(&permits);
-            async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+        let per_shard = self
+            .shards
+            .fan_out(|database| async move {
                 database.search(namespace, start_ns, end_ns, matchers).await
-            }
-        }))
-        .buffer_unordered(self.io_permits.available_permits().max(1))
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        if self.shards.read().await.len() > 1 {
+            })
+            .await?;
+        let multiple_shards = per_shard.len() > 1;
+        let mut results = per_shard.into_iter().flatten().collect::<Vec<_>>();
+        if multiple_shards {
             results = crate::db::merge_traces(results);
         }
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
@@ -397,57 +180,37 @@ impl ShardedTrack {
         }
         // Select the globally first `limit` IDs from locators alone, then
         // load only those, so S shards never materialize S × limit traces.
-        let databases = self.databases().await;
-        let concurrency = self.io_permits.available_permits().max(1);
-        let permits = Arc::clone(&self.io_permits);
-        let mut scanned =
-            stream::iter(databases.into_iter().enumerate().map(|(shard, database)| {
-                let permits = Arc::clone(&permits);
-                async move {
-                    let _permit = permits
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
-                    let scanned = database.scan_trace_ids(namespace, limit).await?;
-                    Ok::<_, Error>((database, shard, scanned))
-                }
-            }))
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<_>>()
+        let mut scanned = self
+            .shards
+            .fan_out(|database| async move {
+                let ids = database.scan_trace_ids(namespace, limit).await?;
+                Ok::<_, Error>((database, ids))
+            })
             .await?;
 
         let mut selected = scanned
             .iter()
-            .flat_map(|(_, shard, ids)| ids.iter().map(move |id| (id.trace_id, *shard)))
+            .enumerate()
+            .flat_map(|(shard, (_, ids))| ids.iter().map(move |id| (id.trace_id, shard)))
             .collect::<Vec<_>>();
         selected.sort_unstable();
         selected.truncate(limit);
         let keep = selected.into_iter().collect::<HashSet<_>>();
-        for (_, shard, ids) in &mut scanned {
-            ids.retain(|id| keep.contains(&(id.trace_id, *shard)));
+        for (shard, (_, ids)) in scanned.iter_mut().enumerate() {
+            ids.retain(|id| keep.contains(&(id.trace_id, shard)));
         }
 
-        let permits = Arc::clone(&self.io_permits);
-        let mut results = stream::iter(
-            scanned
-                .into_iter()
-                .filter(|(_, _, ids)| !ids.is_empty())
-                .map(|(database, _, ids)| {
-                    let permits = Arc::clone(&permits);
-                    async move {
-                        let _permit = permits.acquire_owned().await.map_err(|_| {
-                            Error::Invalid("shard I/O limiter is closed".to_owned())
-                        })?;
-                        database.load_scanned(namespace, ids).await
-                    }
-                }),
+        let loaded = futures::future::try_join_all(
+            scanned.into_iter().filter(|(_, ids)| !ids.is_empty()).map(
+                |(database, ids)| async move {
+                    self.shards
+                        .with_io(database.load_scanned(namespace, ids))
+                        .await
+                },
+            ),
         )
-        .buffer_unordered(concurrency)
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        .await?;
+        let mut results = loaded.into_iter().flatten().collect::<Vec<_>>();
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         Ok(results)
     }
@@ -459,29 +222,15 @@ impl ShardedTrack {
         end_ns: u64,
         scope: Option<AttributeScope>,
     ) -> Result<Vec<String>> {
-        let databases = self.databases().await;
-        let permits = Arc::clone(&self.io_permits);
-        let names = stream::iter(databases.into_iter().map(|database| {
-            let permits = Arc::clone(&permits);
-            async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+        let names = self
+            .shards
+            .fan_out(|database| async move {
                 database
                     .catalog_names(namespace, start_ns, end_ns, scope)
                     .await
-            }
-        }))
-        .buffer_unordered(self.io_permits.available_permits().max(1))
-        .try_collect::<Vec<_>>()
-        .await?;
-        Ok(names
-            .into_iter()
-            .flatten()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect())
+            })
+            .await?;
+        Ok(sorted_union(names))
     }
 
     pub async fn catalog_values(
@@ -492,29 +241,15 @@ impl ShardedTrack {
         scope: Option<AttributeScope>,
         name: &str,
     ) -> Result<Vec<DiscoveryValue>> {
-        let databases = self.databases().await;
-        let permits = Arc::clone(&self.io_permits);
-        let values = stream::iter(databases.into_iter().map(|database| {
-            let permits = Arc::clone(&permits);
-            async move {
-                let _permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Invalid("shard I/O limiter is closed".to_owned()))?;
+        let values = self
+            .shards
+            .fan_out(|database| async move {
                 database
                     .catalog_values(namespace, start_ns, end_ns, scope, name)
                     .await
-            }
-        }))
-        .buffer_unordered(self.io_permits.available_permits().max(1))
-        .try_collect::<Vec<_>>()
-        .await?;
-        Ok(values
-            .into_iter()
-            .flatten()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect())
+            })
+            .await?;
+        Ok(sorted_union(values))
     }
 
     pub async fn query_traceql(
@@ -525,11 +260,12 @@ impl ShardedTrack {
         source: &str,
         options: QueryOptions,
     ) -> Result<Vec<TraceQlResult>> {
-        let databases = self.databases().await;
+        let databases = self.shards.databases().await;
         let shards = databases.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        let permits = self.shards.io_permits();
         crate::db::execute_traceql(
             &shards,
-            Some(&self.io_permits),
+            Some(&permits),
             namespace,
             (start_ns, end_ns),
             source,
@@ -539,25 +275,21 @@ impl ShardedTrack {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        for database in self.databases().await {
-            database.flush().await?;
-        }
-        Ok(())
+        self.shards.flush_all().await
     }
 
     pub async fn close(&self) -> Result<()> {
-        let databases = std::mem::take(&mut *self.shards.write().await)
-            .into_values()
-            .collect::<Vec<_>>();
-        for database in databases {
-            database.close().await?;
-        }
-        Ok(())
+        self.shards.close_all().await
     }
+}
 
-    async fn databases(&self) -> Vec<Arc<TraceDb>> {
-        self.shards.read().await.values().cloned().collect()
-    }
+fn sorted_union<T: Ord>(parts: Vec<Vec<T>>) -> Vec<T> {
+    parts
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[async_trait]
@@ -566,7 +298,7 @@ impl ReaderShardLifecycle for ShardedTrack {
         &self,
         assignment: &ShardMap,
     ) -> std::result::Result<(), sharding::BoxError> {
-        self.reconcile_shards(assignment).await.map_err(Into::into)
+        self.shards.reconcile(assignment).await.map_err(Into::into)
     }
 }
 
@@ -577,6 +309,7 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::*;
+    use crate::routing::route;
 
     fn trace(id: u8, timestamp: u64) -> Trace {
         let trace_id = TraceId::new([id; 16]).unwrap();
@@ -651,14 +384,8 @@ mod tests {
         let id = TraceId::new([3; 16]).unwrap();
         let a = Namespace::new("a").unwrap();
         let b = Namespace::new("b").unwrap();
-        assert_eq!(
-            options.route(&routing, &a, id, 0),
-            options.route(&routing, &a, id, 0)
-        );
-        assert_ne!(
-            options.route(&routing, &a, id, 0),
-            options.route(&routing, &b, id, 0)
-        );
+        assert_eq!(route(&routing, &a, id, 0), route(&routing, &a, id, 0));
+        assert_ne!(route(&routing, &a, id, 0), route(&routing, &b, id, 0));
     }
 
     #[tokio::test]
@@ -671,8 +398,7 @@ mod tests {
         let id = (1..=u8::MAX)
             .find(|id| {
                 let trace_id = TraceId::new([*id; 16]).unwrap();
-                options.route(&scaled(&assignment(1), 2, 100), &namespace, trace_id, 100)
-                    == ShardId::new(1)
+                route(&scaled(&assignment(1), 2, 100), &namespace, trace_id, 100) == ShardId::new(1)
             })
             .unwrap();
         let routing = scaled(&assignment(1), 2, 100);
@@ -758,12 +484,12 @@ mod tests {
         database.flush().await.unwrap();
 
         let extra = ShardedTrack::open(config(), options, []).await.unwrap();
-        extra.open_shard(ShardId::new(1)).await.unwrap();
-        let reference = extra.shard(ShardId::new(1)).await.unwrap();
-        assert!(extra.close_shard(ShardId::new(1)).await.is_err());
+        extra.shards().open_shard(ShardId::new(1)).await.unwrap();
+        let reference = extra.shards().get(ShardId::new(1)).await.unwrap();
+        assert!(extra.shards().close_shard(ShardId::new(1)).await.is_err());
         drop(reference);
-        extra.flush_shard(ShardId::new(1)).await.unwrap();
-        extra.close_shard(ShardId::new(1)).await.unwrap();
+        extra.shards().flush_shard(ShardId::new(1)).await.unwrap();
+        extra.shards().close_shard(ShardId::new(1)).await.unwrap();
         database.close().await.unwrap();
         extra.close().await.unwrap();
     }
@@ -781,11 +507,11 @@ mod tests {
         .unwrap();
 
         database
-            .reconcile_shards(&scaled(&assignment(1), 2, 1_000))
+            .reconcile_readers(&scaled(&assignment(1), 2, 1_000))
             .await
             .unwrap();
         assert_eq!(
-            database.open_shards().await,
+            database.shards().ids().await,
             vec![ShardId::new(0), ShardId::new(1)]
         );
         database.close().await.unwrap();

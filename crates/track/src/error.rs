@@ -23,6 +23,8 @@ pub enum Error {
     Compression(#[from] snap::Error),
     #[error(transparent)]
     TraceQl(#[from] crate::traceql::QueryError),
+    #[error(transparent)]
+    Shard(#[from] sharding::ShardSetError),
 }
 
 impl From<common::serde::DeserializeError> for Error {

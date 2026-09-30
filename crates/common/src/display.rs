@@ -48,6 +48,49 @@ pub fn format_number(value: f64) -> String {
     }
 }
 
+/// Lowercase hex encoding of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+/// Formats a sample value the way Prometheus does: `NaN`, `+Inf`, `-Inf`, or the
+/// shortest round-trip decimal (which matches Go's `FormatFloat(v, 'f', -1, 64)`).
+pub fn prometheus_float(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Rewrites `name` into a valid Prometheus label name: every character outside
+/// `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed with `_`.
+pub fn sanitize_label_name(name: &str) -> String {
+    let mut result = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if result.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        result.insert(0, '_');
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +140,26 @@ mod tests {
     fn should_handle_negative_numbers() {
         assert_eq!(format_number(-1_500.0), "-1.50K");
         assert_eq!(format_number(-42.5), "-42.50");
+    }
+
+    #[test]
+    fn should_hex_encode_bytes() {
+        assert_eq!(hex(&[0x00, 0xab, 0x0f]), "00ab0f");
+        assert_eq!(hex(&[]), "");
+    }
+
+    #[test]
+    fn should_format_prometheus_floats() {
+        assert_eq!(prometheus_float(6.0), "6");
+        assert_eq!(prometheus_float(-0.0), "-0");
+        assert_eq!(prometheus_float(f64::NAN), "NaN");
+        assert_eq!(prometheus_float(f64::INFINITY), "+Inf");
+        assert_eq!(prometheus_float(f64::NEG_INFINITY), "-Inf");
+    }
+
+    #[test]
+    fn should_sanitize_label_names() {
+        assert_eq!(sanitize_label_name("service.name"), "service_name");
+        assert_eq!(sanitize_label_name("9lives"), "_9lives");
     }
 }

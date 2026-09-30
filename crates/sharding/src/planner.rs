@@ -25,6 +25,17 @@ struct Candidate {
     extras: Vec<bool>,
 }
 
+impl Candidate {
+    fn extend(&self, extra: bool, retained: u32) -> Self {
+        let mut extras = self.extras.clone();
+        extras.push(extra);
+        Self {
+            retained: self.retained + retained,
+            extras,
+        }
+    }
+}
+
 /// Plans balanced, contiguous ownership of every shard referenced by `epochs`
 /// in stable ordinal order.
 ///
@@ -72,42 +83,7 @@ pub fn balanced_contiguous(
     let count = owners.len() as u32;
     let base = shard_count / count;
     let remainder = (shard_count % count) as usize;
-    let mut choices: Vec<Option<Candidate>> = vec![None; remainder + 1];
-    choices[0] = Some(Candidate {
-        retained: 0,
-        extras: Vec::new(),
-    });
-
-    for (index, owner) in owners.iter().enumerate() {
-        let mut next = vec![None; remainder + 1];
-        for (used, candidate) in choices.iter().enumerate() {
-            let Some(candidate) = candidate else {
-                continue;
-            };
-            for extra in [false, true] {
-                let next_used = used + usize::from(extra);
-                if next_used > remainder {
-                    continue;
-                }
-                let start = index as u32 * base + used as u32;
-                let end = start + base + u32::from(extra);
-                let retained =
-                    candidate.retained + retained_shards(previous, &owner.id, start, end);
-                let mut extras = candidate.extras.clone();
-                extras.push(extra);
-                let proposed = Candidate { retained, extras };
-                if is_better(&proposed, next[next_used].as_ref()) {
-                    next[next_used] = Some(proposed);
-                }
-            }
-        }
-        choices = next;
-    }
-
-    let extras = choices[remainder]
-        .take()
-        .expect("balanced partition always has a solution")
-        .extras;
+    let extras = choose_extras(&owners, base, remainder, previous);
     let mut start = 0;
     let assignments = owners
         .into_iter()
@@ -121,6 +97,46 @@ pub fn balanced_contiguous(
         })
         .collect();
     ShardMap::with_epochs(generation, epochs, assignments).map_err(PlanError::from)
+}
+
+/// Chooses which owners receive one of the `remainder` extra shards,
+/// maximizing shards retained from `previous`. Dynamic programming over
+/// owners in order, indexed by the number of extras handed out so far.
+fn choose_extras(
+    owners: &[Owner],
+    base: u32,
+    remainder: usize,
+    previous: Option<&ShardMap>,
+) -> Vec<bool> {
+    let mut choices: Vec<Option<Candidate>> = vec![None; remainder + 1];
+    choices[0] = Some(Candidate {
+        retained: 0,
+        extras: Vec::new(),
+    });
+    for (index, owner) in owners.iter().enumerate() {
+        let mut next = vec![None; remainder + 1];
+        let options = choices
+            .iter()
+            .enumerate()
+            .filter_map(|(used, candidate)| Some((used, candidate.as_ref()?)))
+            .flat_map(|(used, candidate)| [false, true].map(|extra| (used, candidate, extra)))
+            .filter(|(used, _, extra)| used + usize::from(*extra) <= remainder);
+        for (used, candidate, extra) in options {
+            let start = index as u32 * base + used as u32;
+            let end = start + base + u32::from(extra);
+            let proposed =
+                candidate.extend(extra, retained_shards(previous, &owner.id, start, end));
+            let slot = &mut next[used + usize::from(extra)];
+            if is_better(&proposed, slot.as_ref()) {
+                *slot = Some(proposed);
+            }
+        }
+        choices = next;
+    }
+    choices
+        .swap_remove(remainder)
+        .expect("balanced partition always has a solution")
+        .extras
 }
 
 fn retained_shards(previous: Option<&ShardMap>, owner_id: &str, start: u32, end: u32) -> u32 {

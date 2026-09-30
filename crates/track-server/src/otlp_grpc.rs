@@ -1,14 +1,14 @@
 use axum::http::{HeaderMap, HeaderValue, header};
-use meter_server::auth::{Permission, authorize};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
 };
 use prost::Message;
+use server_common::auth::{Permission, authorize};
 use tonic_otlp::{Request, Response, Status};
 use track::{Namespace, trace_batches};
 
-use crate::{AppState, config::ServerMode, http::ApiError};
+use crate::{AppState, config::ServerMode};
 
 #[tonic::async_trait]
 impl TraceService for AppState {
@@ -69,7 +69,7 @@ impl TraceService for AppState {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.route_write(&namespace, batches, ulid::Ulid::new().to_string())
             .await
-            .map_err(ApiError::into_otlp_grpc_status)?;
+            .map_err(crate::http::otlp_grpc_status)?;
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success: None,
         }))

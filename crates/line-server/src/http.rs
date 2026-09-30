@@ -1,8 +1,5 @@
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use server_common::http::{check_size, content_type};
+use std::{collections::BTreeMap, io::Read};
 
 use axum::{
     Json, Router,
@@ -12,12 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use common::display::{hex, prometheus_float, sanitize_label_name};
 use flate2::read::GzDecoder;
 use line::{
     Direction, Field, Fields, Label, Labels, LogBatch, LogEntry, Namespace, QueryOptions,
     QueryRequest, QueryResult,
 };
-use meter_server::auth::{Permission, authorize};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
     common::v1::{AnyValue, KeyValue, any_value},
@@ -25,6 +22,7 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use server_common::auth::{Permission, authorize};
 
 use crate::{AppState, config::NamespaceConfig};
 
@@ -54,7 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs));
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
-        .route("/metrics", get(meter_server::runtime_metrics::scrape))
+        .route("/metrics", get(server_common::runtime::scrape_metrics))
         .route(
             "/-/ready",
             get(|State(state): State<AppState>| async move {
@@ -123,7 +121,7 @@ async fn query_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    check_size(&state, body.len())?;
+    check_size(body.len(), state.config.request.max_request_bytes)?;
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query(state, namespace, headers, params).await
 }
@@ -141,7 +139,7 @@ async fn execute_query(
         .as_deref()
         .map(parse_timestamp)
         .transpose()?
-        .unwrap_or_else(now_ns);
+        .unwrap_or_else(common::time::now_ns);
     let options = query_options(&state, params.limit, params.direction.as_deref())?;
     let request = if is_log_query(&params.query) {
         QueryRequest::instant_logs(&params.query, timestamp)
@@ -166,7 +164,7 @@ async fn query_range_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    check_size(&state, body.len())?;
+    check_size(body.len(), state.config.request.max_request_bytes)?;
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query_range(state, namespace, headers, params).await
 }
@@ -179,7 +177,7 @@ async fn execute_query_range(
 ) -> Result<Json<Value>, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     validate_query(&params.query)?;
-    let now = now_ns();
+    let now = common::time::now_ns();
     let end = params
         .end
         .as_deref()
@@ -237,7 +235,7 @@ async fn label_names(
         .db
         .label_names(&namespace, start, end)
         .await
-        .map_err(ApiError::from_line)?;
+        .map_err(line_error)?;
     Ok(Json(json!({"status":"success","data":names})))
 }
 
@@ -254,7 +252,7 @@ async fn label_values(
         .db
         .label_values(&namespace, &name, start, end)
         .await
-        .map_err(ApiError::from_line)?;
+        .map_err(line_error)?;
     Ok(Json(json!({"status":"success","data":values})))
 }
 
@@ -275,7 +273,7 @@ async fn series_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    check_size(&state, body.len())?;
+    check_size(body.len(), state.config.request.max_request_bytes)?;
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_series(state, namespace, headers, params).await
 }
@@ -293,7 +291,7 @@ async fn execute_series(
         .db
         .series(&namespace, &params.selectors, start, end)
         .await
-        .map_err(ApiError::from_line)?;
+        .map_err(line_error)?;
     let data = series
         .iter()
         .map(label_map)
@@ -306,7 +304,7 @@ fn discovery_range(
     end: Option<String>,
     since: Option<String>,
 ) -> Result<(i64, i64), ApiError> {
-    let now = now_ns();
+    let now = common::time::now_ns();
     let end = end
         .as_deref()
         .map(parse_timestamp)
@@ -381,7 +379,7 @@ fn loki_response(result: QueryResult, categorized: bool) -> Value {
                     .map(|sample| {
                         json!({
                             "metric": label_map(&sample.labels),
-                            "value": [seconds(sample.sample.timestamp_ns), number(sample.sample.value)]
+                            "value": [seconds(sample.sample.timestamp_ns), prometheus_float(sample.sample.value)]
                         })
                     })
                     .collect(),
@@ -396,7 +394,7 @@ fn loki_response(result: QueryResult, categorized: bool) -> Value {
                         json!({
                             "metric": label_map(&series.labels),
                             "values": series.samples.into_iter().map(|sample| {
-                                json!([seconds(sample.timestamp_ns), number(sample.value)])
+                                json!([seconds(sample.timestamp_ns), prometheus_float(sample.value)])
                             }).collect::<Vec<_>>()
                         })
                     })
@@ -405,7 +403,7 @@ fn loki_response(result: QueryResult, categorized: bool) -> Value {
         ),
         QueryResult::Scalar(sample) => (
             "scalar",
-            json!([seconds(sample.timestamp_ns), number(sample.value)]),
+            json!([seconds(sample.timestamp_ns), prometheus_float(sample.value)]),
         ),
     };
     let mut data = json!({"resultType": kind, "result": result});
@@ -459,339 +457,6 @@ fn stream_values(stream: line::LogStream, categorized: bool) -> Vec<Value> {
             json!({"stream":labels.into_iter().collect::<BTreeMap<_,_>>(),"values":values})
         })
         .collect()
-}
-
-async fn loki_push(
-    State(state): State<AppState>,
-    Path(namespace): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(&state, body.len())?;
-    let content_type = content_type(&headers).unwrap_or("application/x-protobuf");
-    let protobuf = matches!(
-        content_type,
-        "application/x-protobuf" | "application/vnd.google.protobuf"
-    );
-    let body = decode_content(&headers, &body, protobuf)?;
-    check_size(&state, body.len())?;
-    let batches = if content_type == "application/json" {
-        parse_json_push(&body, state.config.request.max_structured_metadata_fields)?
-    } else if protobuf {
-        parse_protobuf_push(&body, state.config.request.max_structured_metadata_fields)?
-    } else {
-        return Err(ApiError::unsupported_media());
-    };
-    write_batches(&state, namespace, batches).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize)]
-struct JsonPush {
-    streams: Vec<JsonStream>,
-}
-
-#[derive(Deserialize)]
-struct JsonStream {
-    stream: BTreeMap<String, String>,
-    values: Vec<Vec<Value>>,
-}
-
-fn parse_json_push(body: &[u8], metadata_limit: usize) -> Result<Vec<LogBatch>, ApiError> {
-    let request: JsonPush = serde_json::from_slice(body).map_err(ApiError::bad_request)?;
-    request
-        .streams
-        .into_iter()
-        .map(|stream| {
-            let labels = Labels::new(
-                stream
-                    .stream
-                    .into_iter()
-                    .map(|(name, value)| Label::new(name, value))
-                    .collect(),
-            )
-            .map_err(ApiError::bad_request)?;
-            let entries = stream
-                .values
-                .into_iter()
-                .map(|value| json_entry(value, metadata_limit))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LogBatch::new(labels, entries))
-        })
-        .collect()
-}
-
-fn json_entry(value: Vec<Value>, metadata_limit: usize) -> Result<LogEntry, ApiError> {
-    if !(2..=3).contains(&value.len()) {
-        return Err(ApiError::bad_request(
-            "Loki values must contain timestamp, line, and optional metadata",
-        ));
-    }
-    let timestamp = value[0]
-        .as_str()
-        .ok_or_else(|| ApiError::bad_request("Loki timestamp must be a string"))?
-        .parse::<i64>()
-        .map_err(ApiError::bad_request)?;
-    let line = value[1]
-        .as_str()
-        .ok_or_else(|| ApiError::bad_request("Loki line must be a string"))?
-        .to_owned();
-    let fields = value
-        .get(2)
-        .map(|value| json_fields(value, metadata_limit))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(LogEntry::with_structured_metadata(timestamp, line, fields))
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct PushRequest {
-    #[prost(message, repeated, tag = "1")]
-    streams: Vec<StreamAdapter>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct StreamAdapter {
-    #[prost(string, tag = "1")]
-    labels: String,
-    #[prost(message, repeated, tag = "2")]
-    entries: Vec<EntryAdapter>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct EntryAdapter {
-    #[prost(message, optional, tag = "1")]
-    timestamp: Option<ProtoTimestamp>,
-    #[prost(string, tag = "2")]
-    line: String,
-    #[prost(message, repeated, tag = "3")]
-    structured_metadata: Vec<LabelPair>,
-}
-
-#[derive(Clone, Copy, PartialEq, Message)]
-struct ProtoTimestamp {
-    #[prost(int64, tag = "1")]
-    seconds: i64,
-    #[prost(int32, tag = "2")]
-    nanos: i32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct LabelPair {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(string, tag = "2")]
-    value: String,
-}
-
-fn parse_protobuf_push(body: &[u8], metadata_limit: usize) -> Result<Vec<LogBatch>, ApiError> {
-    let decoded = snap::raw::Decoder::new()
-        .decompress_vec(body)
-        .map_err(ApiError::bad_request)?;
-    let request = PushRequest::decode(decoded.as_slice()).map_err(ApiError::bad_request)?;
-    request
-        .streams
-        .into_iter()
-        .map(|stream| {
-            let labels = parse_label_set(&stream.labels)?;
-            let entries = stream
-                .entries
-                .into_iter()
-                .map(|entry| {
-                    if entry.structured_metadata.len() > metadata_limit {
-                        return Err(ApiError::bad_request("too many structured metadata fields"));
-                    }
-                    let timestamp = entry
-                        .timestamp
-                        .ok_or_else(|| ApiError::bad_request("entry timestamp is required"))?;
-                    if !(0..1_000_000_000).contains(&timestamp.nanos) {
-                        return Err(ApiError::bad_request("invalid timestamp nanos"));
-                    }
-                    let fields = Fields::new(
-                        entry
-                            .structured_metadata
-                            .into_iter()
-                            .map(|field| Field::new(field.name, field.value))
-                            .collect(),
-                    )
-                    .map_err(ApiError::bad_request)?;
-                    Ok(LogEntry::with_structured_metadata(
-                        timestamp
-                            .seconds
-                            .saturating_mul(1_000_000_000)
-                            .saturating_add(i64::from(timestamp.nanos)),
-                        entry.line,
-                        fields,
-                    ))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LogBatch::new(labels, entries))
-        })
-        .collect()
-}
-
-async fn otlp_logs(
-    State(state): State<AppState>,
-    Path(namespace): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let json_request = content_type(&headers) == Some("application/json");
-    match otlp_logs_result(&state, namespace, headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_otlp_response(json_request),
-    }
-}
-
-async fn otlp_logs_result(
-    state: &AppState,
-    namespace: String,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
-    check_size(state, body.len())?;
-    let body = decode_content(&headers, &body, false)?;
-    check_size(state, body.len())?;
-    let json_request = content_type(&headers) == Some("application/json");
-    let request: ExportLogsServiceRequest = if json_request {
-        serde_json::from_slice(&body).map_err(ApiError::bad_request)?
-    } else if matches!(
-        content_type(&headers),
-        Some("application/x-protobuf" | "application/protobuf" | "application/octet-stream")
-    ) {
-        ExportLogsServiceRequest::decode(body.as_slice()).map_err(ApiError::bad_request)?
-    } else {
-        return Err(ApiError::unsupported_media());
-    };
-    let batches = otlp_batches(request, state.config.request.max_structured_metadata_fields)?;
-    write_batches(state, namespace, batches).await?;
-    let response = ExportLogsServiceResponse {
-        partial_success: None,
-    };
-    if json_request {
-        // OTLP/JSON uses the protobuf JSON mapping, where an absent
-        // partial_success field is omitted rather than serialized as null.
-        Ok((StatusCode::OK, Json(json!({}))).into_response())
-    } else {
-        let mut encoded = Vec::new();
-        response.encode(&mut encoded).map_err(ApiError::internal)?;
-        Ok((
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/x-protobuf")],
-            encoded,
-        )
-            .into_response())
-    }
-}
-
-fn otlp_batches(
-    request: ExportLogsServiceRequest,
-    metadata_limit: usize,
-) -> Result<Vec<LogBatch>, ApiError> {
-    let mut batches = Vec::new();
-    for resource_logs in request.resource_logs {
-        let resource = resource_logs
-            .resource
-            .map(|resource| resource.attributes)
-            .unwrap_or_default();
-        let labels = Labels::new(
-            resource
-                .iter()
-                .map(|attribute| {
-                    Label::new(
-                        sanitize_label(&attribute.key),
-                        attribute.value.as_ref().map(any_value).unwrap_or_default(),
-                    )
-                })
-                .collect(),
-        )
-        .map_err(ApiError::bad_request)?;
-        for scope_logs in resource_logs.scope_logs {
-            let mut scope_fields = Vec::new();
-            if let Some(scope) = scope_logs.scope {
-                if !scope.name.is_empty() {
-                    scope_fields.push(Field::new("scope_name", scope.name));
-                }
-                if !scope.version.is_empty() {
-                    scope_fields.push(Field::new("scope_version", scope.version));
-                }
-                scope_fields.extend(key_values(scope.attributes));
-            }
-            let mut entries = Vec::new();
-            for record in scope_logs.log_records {
-                let mut fields = scope_fields.clone();
-                fields.extend(key_values(record.attributes));
-                if !record.severity_text.is_empty() {
-                    fields.push(Field::new("severity_text", record.severity_text));
-                }
-                if !record.trace_id.is_empty() {
-                    fields.push(Field::new("trace_id", hex(&record.trace_id)));
-                }
-                if !record.span_id.is_empty() {
-                    fields.push(Field::new("span_id", hex(&record.span_id)));
-                }
-                if fields.len() > metadata_limit {
-                    return Err(ApiError::bad_request("too many structured metadata fields"));
-                }
-                let fields = Fields::new(fields).map_err(ApiError::bad_request)?;
-                let timestamp = if record.time_unix_nano != 0 {
-                    record.time_unix_nano
-                } else {
-                    record.observed_time_unix_nano
-                };
-                let timestamp = i64::try_from(timestamp)
-                    .map_err(|_| ApiError::bad_request("OTLP timestamp exceeds i64"))?;
-                let line = record.body.as_ref().map(any_value).unwrap_or_default();
-                entries.push(LogEntry::with_structured_metadata(timestamp, line, fields));
-            }
-            if !entries.is_empty() {
-                batches.push(LogBatch::new(labels.clone(), entries));
-            }
-        }
-    }
-    Ok(batches)
-}
-
-fn key_values(values: Vec<KeyValue>) -> Vec<Field> {
-    values
-        .into_iter()
-        .map(|value| {
-            Field::new(
-                sanitize_label(&value.key),
-                value.value.as_ref().map(any_value).unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-fn any_value(value: &AnyValue) -> String {
-    match value.value.as_ref() {
-        Some(any_value::Value::StringValue(value)) => value.clone(),
-        Some(any_value::Value::BoolValue(value)) => value.to_string(),
-        Some(any_value::Value::IntValue(value)) => value.to_string(),
-        Some(any_value::Value::DoubleValue(value)) => number(*value),
-        Some(any_value::Value::BytesValue(value)) => hex(value),
-        Some(any_value::Value::ArrayValue(value)) => {
-            serde_json::to_string(&value.values.iter().map(any_value).collect::<Vec<String>>())
-                .unwrap_or_default()
-        }
-        Some(any_value::Value::KvlistValue(value)) => serde_json::to_string(
-            &value
-                .values
-                .iter()
-                .map(|item| {
-                    (
-                        item.key.clone(),
-                        item.value.as_ref().map(any_value).unwrap_or_default(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>(),
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    }
 }
 
 async fn write_batches(
@@ -902,49 +567,11 @@ fn parse_seconds_or_duration(value: &str) -> Result<i64, ApiError> {
 }
 
 fn parse_duration_ns(value: &str) -> Result<i64, ApiError> {
-    let mut total = 0f64;
-    let mut number = String::new();
-    let mut cursor = 0;
-    let bytes = value.as_bytes();
-    while cursor < bytes.len() {
-        while cursor < bytes.len() && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.') {
-            number.push(char::from(bytes[cursor]));
-            cursor += 1;
-        }
-        if number.is_empty() {
-            return Err(ApiError::bad_request("invalid duration"));
-        }
-        let amount = number.parse::<f64>().map_err(ApiError::bad_request)?;
-        number.clear();
-        let (unit, width) = if value[cursor..].starts_with("ms") {
-            (1_000_000f64, 2)
-        } else if value[cursor..].starts_with("us") || value[cursor..].starts_with("µs") {
-            (
-                1_000f64,
-                value[cursor..].chars().next().map_or(2, char::len_utf8) + 1,
-            )
-        } else {
-            let unit = match bytes.get(cursor).copied() {
-                Some(b'n') if bytes.get(cursor + 1) == Some(&b's') => {
-                    cursor += 1;
-                    1f64
-                }
-                Some(b's') => 1_000_000_000f64,
-                Some(b'm') => 60_000_000_000f64,
-                Some(b'h') => 3_600_000_000_000f64,
-                Some(b'd') => 86_400_000_000_000f64,
-                Some(b'w') => 604_800_000_000_000f64,
-                _ => return Err(ApiError::bad_request("invalid duration unit")),
-            };
-            (unit, 1)
-        };
-        cursor += width;
-        total += amount * unit;
-    }
-    if !total.is_finite() || total <= 0.0 || total > i64::MAX as f64 {
+    let duration = common::time::parse_duration_ns(value).map_err(ApiError::bad_request)?;
+    if duration <= 0 {
         return Err(ApiError::bad_request("duration is outside the valid range"));
     }
-    Ok(total as i64)
+    Ok(duration)
 }
 
 fn parse_label_set(value: &str) -> Result<Labels, ApiError> {
@@ -1036,24 +663,9 @@ fn decode_content(
             .map_err(ApiError::bad_request)?;
         return Ok(decoded);
     }
-    Err(ApiError::unsupported_media())
-}
-
-fn content_type(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn check_size(state: &AppState, size: usize) -> Result<(), ApiError> {
-    if size > state.config.request.max_request_bytes {
-        Err(ApiError::too_large())
-    } else {
-        Ok(())
-    }
+    Err(ApiError::unsupported_media(
+        "unsupported content type or encoding",
+    ))
 }
 
 fn encoding_flag(headers: &HeaderMap, expected: &str) -> bool {
@@ -1102,200 +714,31 @@ fn seconds(timestamp_ns: i64) -> f64 {
     (timestamp_ns / 1_000_000) as f64 / 1_000.0
 }
 
-fn number(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".to_owned()
-    } else if value == f64::INFINITY {
-        "+Inf".to_owned()
-    } else if value == f64::NEG_INFINITY {
-        "-Inf".to_owned()
-    } else {
-        value.to_string()
-    }
-}
+pub(crate) use server_common::ApiError;
 
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
+mod push;
 
-fn sanitize_label(value: &str) -> String {
-    let mut value = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if value
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_digit())
-    {
-        value.insert(0, '_');
-    }
-    value
-}
+use push::*;
 
-fn hex(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[derive(Debug)]
-pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: error.to_string(),
+pub(crate) fn line_error(error: line::Error) -> ApiError {
+    match error {
+        line::Error::Invalid(_) => ApiError::bad_request(error),
+        line::Error::Backpressure => ApiError::too_many_requests(error),
+        line::Error::Unavailable(_) | line::Error::Storage(_) | line::Error::Shard(_) => {
+            ApiError::unavailable(error)
         }
-    }
-
-    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
-        }
-    }
-
-    fn not_found(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn unavailable(error: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: error.to_string(),
-        }
-    }
-
-    pub(crate) fn from_line(error: line::Error) -> Self {
-        match error {
-            line::Error::Invalid(_) => Self::bad_request(error),
-            line::Error::Backpressure => Self {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message: error.to_string(),
-            },
-            line::Error::Unavailable(_) | line::Error::Storage(_) => Self::unavailable(error),
-            line::Error::Corrupt(_)
-            | line::Error::Json(_)
-            | line::Error::Compression(_)
-            | line::Error::Query(_)
-            | line::Error::Regex(_) => Self::internal(error),
-        }
-    }
-
-    fn into_otlp_response(self, json_response: bool) -> Response {
-        let code = grpc_code_for_http(self.status);
-        let status = self.status;
-        let mut response = if json_response {
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/json")],
-                Json(json!({"code": code, "message": self.message})),
-            )
-                .into_response()
-        } else {
-            let encoded = GoogleRpcStatus {
-                code,
-                message: self.message,
-            }
-            .encode_to_vec();
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/x-protobuf")],
-                encoded,
-            )
-                .into_response()
-        };
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        }
-        response
-    }
-
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: "authentication required".to_owned(),
-        }
-    }
-
-    fn unsupported_media() -> Self {
-        Self {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: "unsupported content type or encoding".to_owned(),
-        }
-    }
-
-    fn too_large() -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "request body exceeds configured limit".to_owned(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
-        let mut response = (
-            self.status,
-            Json(json!({
-                "status":"error",
-                "errorType": if self.status.is_server_error() {"server"} else {"bad_data"},
-                "error":self.message
-            })),
-        )
-            .into_response();
-        if retry {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        }
-        response
-    }
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct GoogleRpcStatus {
-    #[prost(int32, tag = "1")]
-    code: i32,
-    #[prost(string, tag = "2")]
-    message: String,
-}
-
-fn grpc_code_for_http(status: StatusCode) -> i32 {
-    match status {
-        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => 3,
-        StatusCode::NOT_FOUND => 5,
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => 8,
-        StatusCode::INTERNAL_SERVER_ERROR => 13,
-        StatusCode::SERVICE_UNAVAILABLE => 14,
-        StatusCode::UNAUTHORIZED => 16,
-        _ => 2,
+        line::Error::Corrupt(_)
+        | line::Error::Json(_)
+        | line::Error::Compression(_)
+        | line::Error::Query(_)
+        | line::Error::Regex(_) => ApiError::internal(error),
     }
 }
 
 #[cfg(test)]
 mod parameter_tests {
     use axum::body::to_bytes;
+    use server_common::http::GoogleRpcStatus;
 
     use super::*;
 
@@ -1320,7 +763,7 @@ mod parameter_tests {
 
     #[tokio::test]
     async fn loki_backpressure_is_retryable() {
-        let response = ApiError::from_line(line::Error::Backpressure).into_response();
+        let response = line_error(line::Error::Backpressure).into_response();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
@@ -1328,7 +771,7 @@ mod parameter_tests {
 
     #[tokio::test]
     async fn otlp_errors_use_google_rpc_status_mappings() {
-        let protobuf = ApiError::from_line(line::Error::Backpressure).into_otlp_response(false);
+        let protobuf = line_error(line::Error::Backpressure).into_otlp_response(false);
         assert_eq!(protobuf.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(protobuf.headers()[header::RETRY_AFTER], "1");
         assert_eq!(

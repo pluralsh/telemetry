@@ -8,6 +8,7 @@ mod otlp_grpc;
 mod state;
 
 pub mod jaeger {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("jaeger.api_v2");
 }
 

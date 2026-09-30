@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use common::display::hex;
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, KeyValue, any_value},
     trace::v1::Span,
@@ -782,13 +783,4 @@ fn field_name(field: &FieldExpr) -> String {
         Expr::Intrinsic(intrinsic) => format!("{intrinsic:?}"),
         _ => "expression".to_owned(),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }

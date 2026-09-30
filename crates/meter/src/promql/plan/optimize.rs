@@ -103,6 +103,18 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
             param: param.map(|param| Box::new(fold_constants(*param))),
             grouping,
         },
+        LogicalPlan::Sort { order, child } => LogicalPlan::Sort {
+            order,
+            child: Box::new(fold_constants(*child)),
+        },
+        LogicalPlan::Histogram { kind, child } => LogicalPlan::Histogram {
+            kind,
+            child: Box::new(fold_constants(*child)),
+        },
+        LogicalPlan::Absent { labels, child } => LogicalPlan::Absent {
+            labels,
+            child: Box::new(fold_constants(*child)),
+        },
         LogicalPlan::Subquery {
             child,
             range_ms,
@@ -156,7 +168,7 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
 /// foldable. Set operators (`And`/`Or`/`Unless`) are vector-only and never
 /// appear on scalar/scalar; returning `None` keeps the caller on the
 /// no-fold path for safety.
-fn apply_scalar_op(op: BinaryOpKind, a: f64, b: f64) -> Option<f64> {
+pub(super) fn apply_scalar_op(op: BinaryOpKind, a: f64, b: f64) -> Option<f64> {
     match op {
         // --- arithmetic ---
         BinaryOpKind::Add => Some(a + b),
@@ -261,6 +273,18 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
             child: Box::new(dedupe_vector_selector_matchers(*child)),
             param: param.map(|param| Box::new(dedupe_vector_selector_matchers(*param))),
             grouping,
+        },
+        LogicalPlan::Sort { order, child } => LogicalPlan::Sort {
+            order,
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
+        },
+        LogicalPlan::Histogram { kind, child } => LogicalPlan::Histogram {
+            kind,
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
+        },
+        LogicalPlan::Absent { labels, child } => LogicalPlan::Absent {
+            labels,
+            child: Box::new(dedupe_vector_selector_matchers(*child)),
         },
         LogicalPlan::Subquery {
             child,

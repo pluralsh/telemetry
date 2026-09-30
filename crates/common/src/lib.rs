@@ -7,6 +7,7 @@ pub mod namespace;
 pub mod sequence;
 pub mod serde;
 pub mod storage;
+pub mod time;
 
 pub use bytes::BytesRange;
 pub use clock::Clock;

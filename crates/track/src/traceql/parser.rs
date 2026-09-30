@@ -630,35 +630,7 @@ fn static_from_token(token: &Lexeme) -> Result<StaticValue, ParseError> {
 }
 
 fn parse_duration(source: &str) -> Option<i64> {
-    let mut total = 0_f64;
-    let mut rest = source;
-    while !rest.is_empty() {
-        let number_end = rest
-            .find(|character: char| !character.is_ascii_digit() && character != '.')
-            .unwrap_or(rest.len());
-        if number_end == 0 || number_end == rest.len() {
-            return None;
-        }
-        let value: f64 = rest[..number_end].parse().ok()?;
-        rest = &rest[number_end..];
-        let (unit, scale) = [
-            ("ns", 1_f64),
-            ("us", 1_000_f64),
-            ("µs", 1_000_f64),
-            ("ms", 1_000_000_f64),
-            ("s", 1_000_000_000_f64),
-            ("m", 60_000_000_000_f64),
-            ("h", 3_600_000_000_000_f64),
-            ("d", 86_400_000_000_000_f64),
-            ("w", 604_800_000_000_000_f64),
-            ("y", 31_536_000_000_000_000_f64),
-        ]
-        .into_iter()
-        .find(|(unit, _)| rest.starts_with(unit))?;
-        total += value * scale;
-        rest = &rest[unit.len()..];
-    }
-    (total.is_finite() && total <= i64::MAX as f64).then_some(total as i64)
+    common::time::parse_duration_ns(source).ok()
 }
 
 fn scoped_intrinsic(scope: Token, name: &str) -> Option<Intrinsic> {

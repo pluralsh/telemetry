@@ -5,6 +5,7 @@ use common::coordinator::Delta;
 
 use crate::Namespace;
 use crate::active_series::ActiveSeriesTracker;
+use crate::error::{Error, Result};
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{
     Label, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket,
@@ -65,7 +66,7 @@ pub(crate) struct TsdbWriteDelta {
 }
 
 impl TsdbWriteDelta {
-    fn ingest(&mut self, series: Series) -> Result<(), String> {
+    fn ingest(&mut self, series: Series) -> Result<()> {
         let Series {
             mut labels,
             metric_type,
@@ -82,22 +83,29 @@ impl TsdbWriteDelta {
         // same fingerprint across batches don't inflate the estimate.
         self.active_series.record(fingerprint);
 
-        let bucket_start_ms = self.bucket.start as i64 * 60 * 1000;
+        let bucket_start_ms = i64::from(self.bucket.start) * 60 * 1000;
         let bucket_end_ms =
-            (self.bucket.start as i64 + self.bucket.size_in_mins() as i64) * 60 * 1000;
+            (i64::from(self.bucket.start) + i64::from(self.bucket.size_in_mins())) * 60 * 1000;
         // Resolved on the first in-range sample, so a series whose first
         // sample is rejected is never registered.
         let mut series_id = None;
         for sample in samples {
             if sample.timestamp_ms < bucket_start_ms || sample.timestamp_ms >= bucket_end_ms {
-                return Err(format!(
+                return Err(Error::InvalidInput(format!(
                     "Sample timestamp {} is outside bucket range [{}, {})",
                     sample.timestamp_ms, bucket_start_ms, bucket_end_ms
-                ));
+                )));
             }
-            let id = *series_id.get_or_insert_with(|| {
-                self.resolve_series(&labels, fingerprint, &unit, metric_type, &description)
-            });
+            let id = match series_id {
+                Some(id) => id,
+                None => *series_id.insert(self.resolve_series(
+                    &labels,
+                    fingerprint,
+                    &unit,
+                    metric_type,
+                    &description,
+                )?),
+            };
             self.samples
                 .entry(id)
                 .or_insert_with(|| SeriesSamples {
@@ -122,7 +130,7 @@ impl TsdbWriteDelta {
         unit: &Option<String>,
         metric_type: Option<MetricType>,
         description: &Option<String>,
-    ) -> SeriesId {
+    ) -> Result<SeriesId> {
         if let Some(metric_name) = labels
             .iter()
             .find(|label| label.name == "__name__")
@@ -138,38 +146,37 @@ impl TsdbWriteDelta {
                 },
             );
         }
-        if let Some(&id) = self.series_dict_delta.get(&fingerprint) {
-            id
-        } else if let Some(&id) = self.series_dict_base.get(&fingerprint) {
-            id
-        } else {
-            // New series: allocate ID and build indexes.
-            let id = self.next_series_id;
-            self.next_series_id = self
-                .next_series_id
-                .checked_add(1)
-                .expect("series ID space exhausted for bucket");
-
-            self.series_dict_delta.insert(fingerprint, id);
-
-            let series_spec = SeriesSpec {
-                unit: unit.clone(),
-                metric_type,
-                labels: labels.to_vec(),
-            };
-            self.forward_index.series.insert(id, series_spec);
-
-            for label in labels {
-                self.inverted_index
-                    .postings
-                    .entry(label.clone())
-                    .or_default()
-                    .value_mut()
-                    .insert(id);
-            }
-
-            id
+        if let Some(&id) = self
+            .series_dict_delta
+            .get(&fingerprint)
+            .or_else(|| self.series_dict_base.get(&fingerprint))
+        {
+            return Ok(id);
         }
+        let id = self.next_series_id;
+        self.next_series_id = id
+            .checked_add(1)
+            .ok_or_else(|| Error::Internal("series ID space exhausted for bucket".to_owned()))?;
+
+        self.series_dict_delta.insert(fingerprint, id);
+
+        let series_spec = SeriesSpec {
+            unit: unit.clone(),
+            metric_type,
+            labels: labels.to_vec(),
+        };
+        self.forward_index.series.insert(id, series_spec);
+
+        for label in labels {
+            self.inverted_index
+                .postings
+                .entry(label.clone())
+                .or_default()
+                .value_mut()
+                .insert(id);
+        }
+
+        Ok(id)
     }
 }
 
@@ -197,9 +204,9 @@ impl Delta for TsdbWriteDelta {
         }
     }
 
-    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String> {
+    fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
         for series in write {
-            self.ingest(series)?;
+            self.ingest(series).map_err(|error| error.to_string())?;
         }
         Ok(())
     }

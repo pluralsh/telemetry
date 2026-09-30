@@ -4,6 +4,7 @@
 // you may not use this file except in compliance with the License.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::serde::ensure_consumed;
 use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
 use common::serde::sortable::encode_i64_sortable;
 use common::serde::varint::{var_u32, var_u64};
@@ -236,11 +237,11 @@ pub(crate) fn encode_metadata(value: &StoredPageMetadata) -> Result<Bytes> {
 pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
     let corrupt = || Error::Corrupt("invalid trace page metadata bounds".to_owned());
     let (expires_at_unix_ms, mut buf) = value_body(value, "trace page metadata")?;
-    let min_timestamp_ns = read_u64(&mut buf)?;
+    let min_timestamp_ns = var_u64::deserialize(&mut buf)?;
     let max_timestamp_ns = min_timestamp_ns
-        .checked_add(read_u64(&mut buf)?)
+        .checked_add(var_u64::deserialize(&mut buf)?)
         .ok_or_else(|| Error::Corrupt("page max timestamp overflows".to_owned()))?;
-    let count = read_u32(&mut buf)? as usize;
+    let count = var_u32::deserialize(&mut buf)? as usize;
     if count == 0 {
         return Err(corrupt());
     }
@@ -253,10 +254,10 @@ pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
         buf = rest;
         let trace_id = TraceId::new(*id).map_err(|error| Error::Corrupt(error.to_string()))?;
         let trace_min = min_timestamp_ns
-            .checked_add(read_u64(&mut buf)?)
+            .checked_add(var_u64::deserialize(&mut buf)?)
             .ok_or_else(corrupt)?;
         let trace_max = trace_min
-            .checked_add(read_u64(&mut buf)?)
+            .checked_add(var_u64::deserialize(&mut buf)?)
             .ok_or_else(corrupt)?;
         if trace_max > max_timestamp_ns
             || traces
@@ -273,7 +274,7 @@ pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
             max_timestamp_ns: trace_max,
         });
     }
-    expect_consumed(buf, "trace page metadata")?;
+    ensure_consumed(buf, "trace page metadata")?;
     if observed_min != min_timestamp_ns || observed_max != max_timestamp_ns {
         return Err(corrupt());
     }
@@ -301,11 +302,11 @@ pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
     buf = rest;
     let locator = TraceLocator {
         segment: i64::from_be_bytes(*segment),
-        page_sequence: read_u64(&mut buf)?,
-        trace_index: read_u32(&mut buf)?,
+        page_sequence: var_u64::deserialize(&mut buf)?,
+        trace_index: var_u32::deserialize(&mut buf)?,
         expires_at_unix_ms,
     };
-    expect_consumed(buf, "trace locator")?;
+    ensure_consumed(buf, "trace locator")?;
     Ok(locator)
 }
 
@@ -329,7 +330,7 @@ fn value_body<'a>(value: &'a [u8], what: &str) -> Result<(Option<u64>, &'a [u8])
             let mut buf = rest;
             let expires_at = match *flags {
                 0 => None,
-                HAS_EXPIRY => Some(read_u64(&mut buf)?),
+                HAS_EXPIRY => Some(var_u64::deserialize(&mut buf)?),
                 flags => return Err(Error::Corrupt(format!("unknown {what} flags {flags}"))),
             };
             Ok((expires_at, buf))
@@ -338,22 +339,6 @@ fn value_body<'a>(value: &'a [u8], what: &str) -> Result<(Option<u64>, &'a [u8])
             "unsupported {what} version {version}"
         ))),
         [] => Err(Error::Corrupt(format!("empty {what}"))),
-    }
-}
-
-fn read_u32(buf: &mut &[u8]) -> Result<u32> {
-    var_u32::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
-fn read_u64(buf: &mut &[u8]) -> Result<u64> {
-    var_u64::deserialize(buf).map_err(|error| Error::Corrupt(error.message))
-}
-
-fn expect_consumed(buf: &[u8], what: &str) -> Result<()> {
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Corrupt(format!("trailing bytes in {what}")))
     }
 }
 
@@ -386,10 +371,8 @@ pub(crate) fn decode_indices(value: &[u8]) -> Result<Vec<u32>> {
             "attribute posting length mismatch".to_owned(),
         ));
     }
-    Ok(value[4..]
-        .chunks_exact(4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
-        .collect())
+    let (postings, _) = value[4..].as_chunks::<4>();
+    Ok(postings.iter().copied().map(u32::from_be_bytes).collect())
 }
 
 fn posting_prefix(

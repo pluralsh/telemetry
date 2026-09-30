@@ -1,6 +1,5 @@
-//! Prometheus-compatible configuration for scraping targets.
+//! Configuration for a standalone meter instance.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,10 +13,6 @@ use uuid::Uuid;
 #[derive(Clone, Deserialize)]
 pub struct PrometheusConfig {
     #[serde(default)]
-    pub global: GlobalConfig,
-    #[serde(default)]
-    pub scrape_configs: Vec<ScrapeConfig>,
-    #[serde(default)]
     pub otel: OtelServerConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
@@ -28,7 +23,7 @@ pub struct PrometheusConfig {
     /// Defaults to 5 seconds.
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
-    /// Run in read-only mode (no writes, no scraping, no fencing).
+    /// Run in read-only mode (no writes, no fencing).
     #[serde(default)]
     pub read_only: bool,
     /// SlateDB reader configuration used when `read_only` is true.
@@ -127,8 +122,6 @@ fn default_storage() -> SlateDbStorageConfig {
 impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
-            global: GlobalConfig::default(),
-            scrape_configs: Vec::new(),
             otel: OtelServerConfig::default(),
             #[cfg(feature = "otel")]
             buffer_consumer: None,
@@ -269,55 +262,7 @@ fn default_cache_warmer() -> Option<CacheWarmerConfig> {
     })
 }
 
-/// Global configuration defaults.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GlobalConfig {
-    #[serde(default = "default_scrape_interval")]
-    pub scrape_interval: String,
-}
-
-impl Default for GlobalConfig {
-    fn default() -> Self {
-        Self {
-            scrape_interval: default_scrape_interval(),
-        }
-    }
-}
-
-fn default_scrape_interval() -> String {
-    "15s".to_string()
-}
-
-/// Configuration for a single scrape job.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScrapeConfig {
-    pub job_name: String,
-    #[serde(default)]
-    pub scrape_interval: Option<String>,
-    #[serde(default)]
-    pub static_configs: Vec<StaticConfig>,
-}
-
-impl ScrapeConfig {
-    /// Get the effective scrape interval for this job.
-    pub fn effective_interval(&self, global: &GlobalConfig) -> Duration {
-        let interval_str = self
-            .scrape_interval
-            .as_deref()
-            .unwrap_or(&global.scrape_interval);
-        parse_duration(interval_str).unwrap_or(Duration::from_secs(15))
-    }
-}
-
-/// Static target configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StaticConfig {
-    pub targets: Vec<String>,
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-}
-
-/// Load Prometheus configuration from a YAML file.
+/// Load configuration from a YAML file.
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<PrometheusConfig> {
     let contents = std::fs::read_to_string(path.as_ref()).map_err(|e| {
         crate::error::Error::InvalidInput(format!("Failed to read config file: {}", e))
@@ -400,98 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_prometheus_config() {
-        // given
-        let yaml = r#"
-global:
-  scrape_interval: 30s
-
-scrape_configs:
-  - job_name: prometheus
-    static_configs:
-      - targets:
-          - localhost:9090
-
-  - job_name: node
-    scrape_interval: 1m
-    static_configs:
-      - targets:
-          - localhost:9100
-          - localhost:9101
-        labels:
-          env: production
-"#;
-
-        // when
-        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
-
-        // then
-        assert_eq!(config.global.scrape_interval, "30s");
-        assert_eq!(config.scrape_configs.len(), 2);
-        assert!(config.otel.include_resource_attrs);
-        assert!(config.otel.include_scope_attrs);
-
-        let prometheus_job = &config.scrape_configs[0];
-        assert_eq!(prometheus_job.job_name, "prometheus");
-        assert!(prometheus_job.scrape_interval.is_none());
-        assert_eq!(prometheus_job.static_configs[0].targets.len(), 1);
-
-        let node_job = &config.scrape_configs[1];
-        assert_eq!(node_job.job_name, "node");
-        assert_eq!(node_job.scrape_interval, Some("1m".to_string()));
-        assert_eq!(node_job.static_configs[0].targets.len(), 2);
-        assert_eq!(
-            node_job.static_configs[0].labels.get("env"),
-            Some(&"production".to_string())
-        );
-    }
-
-    #[test]
-    fn should_use_default_scrape_interval() {
-        // given
-        let yaml = r#"
-scrape_configs:
-  - job_name: test
-    static_configs:
-      - targets: ['localhost:9090']
-"#;
-
-        // when
-        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
-
-        // then
-        assert_eq!(config.global.scrape_interval, "15s");
-    }
-
-    #[test]
-    fn should_compute_effective_interval() {
-        // given
-        let global = GlobalConfig {
-            scrape_interval: "30s".to_string(),
-        };
-        let job_with_override = ScrapeConfig {
-            job_name: "test".to_string(),
-            scrape_interval: Some("1m".to_string()),
-            static_configs: vec![],
-        };
-        let job_without_override = ScrapeConfig {
-            job_name: "test2".to_string(),
-            scrape_interval: None,
-            static_configs: vec![],
-        };
-
-        // when/then
-        assert_eq!(
-            job_with_override.effective_interval(&global),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            job_without_override.effective_interval(&global),
-            Duration::from_secs(30)
-        );
-    }
-
-    #[test]
     fn should_parse_otel_config() {
         // given
         let yaml = r#"
@@ -510,16 +363,8 @@ otel:
 
     #[test]
     fn should_use_default_otel_config() {
-        // given
-        let yaml = r#"
-scrape_configs:
-  - job_name: test
-    static_configs:
-      - targets: ['localhost:9090']
-"#;
-
         // when
-        let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: PrometheusConfig = serde_yaml::from_str("{}").unwrap();
 
         // then
         assert!(config.otel.include_resource_attrs);

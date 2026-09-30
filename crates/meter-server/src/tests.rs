@@ -17,10 +17,11 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDb
 use http_body_util::BodyExt;
 use proto::meter::internal::v1::internal_writer_server::InternalWriter;
 use sharding::{
-    AssignmentGeneration, AssignmentState, BoxError, DEFAULT_SHARDS, FakeAssignmentStore,
-    FakeLeaseBackend, OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
+    AssignmentGeneration, AssignmentState, BoxError, FakeAssignmentStore, FakeLeaseBackend,
+    OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
 };
-use tokio::sync::{RwLock, Semaphore};
+use sharding::{RouterLimits, WriteRouter};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
 use tower::ServiceExt;
@@ -58,15 +59,20 @@ fn state(mode: ServerMode) -> AppState {
     let config = test_config(mode);
     let (_, assignment) = assignment_for(&config).unwrap();
     AppState {
-        remote_limit: Arc::new(Semaphore::new(4)),
+        router: Arc::new(WriteRouter::new(
+            "standalone",
+            Arc::new(RwLock::new(assignment)),
+            RouterLimits {
+                remote_concurrency: 4,
+                remote_retries: 0,
+            },
+        )),
+        channels: Arc::new(server_common::internal_rpc::ChannelPool::default()),
         config: Arc::new(config),
         jwt: None,
         writers: None,
         readers: None,
-        assignment: Arc::new(RwLock::new(assignment)),
-        local_owner: "standalone".to_owned(),
         completed_requests: Arc::new(Mutex::new(HashSet::new())),
-        draining_shards: Arc::new(RwLock::new(HashSet::new())),
         cancellation: CancellationToken::new(),
         background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         flush_runs: Arc::new(AtomicU64::new(0)),
@@ -512,10 +518,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
 
     let namespace = Namespace::new("alpha").unwrap();
     let mut storage = meter_config(&config).storage;
-    storage.path = ShardingOptions::new(1, 4)
-        .unwrap()
-        .shard_path(&storage.path, ShardId::new(0))
-        .unwrap();
+    storage.path = ShardingOptions::shard_path(&storage.path, ShardId::new(0));
     let reader = meter::TimeSeriesDbReader::open(
         storage,
         slatedb::config::DbReaderOptions {
@@ -650,7 +653,7 @@ async fn grpc_rejects_stale_generation_and_non_owner() {
         )],
     )
     .unwrap();
-    state.assignment.write().await.clone_from(&map);
+    state.router.assignment().write().await.clone_from(&map);
     let non_owner = InternalWriter::write(&state, Request::new(proto_request(2, 0)))
         .await
         .unwrap_err();
@@ -664,14 +667,13 @@ async fn grpc_retries_are_idempotent() {
         .await
         .unwrap();
     let namespace = Namespace::new("alpha").unwrap();
-    let options = ShardingOptions::new(DEFAULT_SHARDS, 4).unwrap();
-    let routing = state.assignment.read().await.clone();
+    let routing = state.router.assignment().read().await.clone();
     let mut item = Series::new(
         "idempotent_total",
         vec![Label::new("instance", "a")],
         vec![Sample::new(1_700_000_000_000, 1.0)],
     );
-    let shard = options.route(&routing, &namespace, &item.labels, 1_700_000_000_000);
+    let shard = meter::routing::route(&routing, &namespace, &item.labels, 1_700_000_000_000);
     let request = WriteBatchRequest {
         namespace: Some(ProtoNamespace {
             name: "alpha".to_owned(),

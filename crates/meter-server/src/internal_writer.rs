@@ -1,13 +1,14 @@
-use meter::{Label, Namespace, Sample, Series, ShardingOptions};
+use meter::{Label, Namespace, Sample, Series, routing::route};
 use proto::meter::internal::v1::{
     Durability as ProtoDurability, Label as ProtoLabel, Namespace as ProtoNamespace,
     Sample as ProtoSample, Series as ProtoSeries, WriteBatchRequest, WriteBatchResponse,
     internal_writer_server::{InternalWriter, InternalWriterServer},
 };
+use server_common::internal_rpc;
 use sharding::ShardId;
 use tonic::{Request, Response as TonicResponse, Status};
 
-use crate::{auth::secure_eq, config::Durability, state::AppState};
+use crate::{config::Durability, state::AppState};
 
 fn proto_durability(durability: Durability) -> ProtoDurability {
     match durability {
@@ -82,22 +83,15 @@ impl InternalWriter for AppState {
         &self,
         request: Request<WriteBatchRequest>,
     ) -> Result<TonicResponse<WriteBatchResponse>, Status> {
-        if let Some(secret) = &self.config.auth.internal {
-            let expected = secret
-                .expose()
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let provided = request
-                .metadata()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .unwrap_or_default();
-            if !secure_eq(provided, &expected) {
-                return Err(Status::unauthenticated(
-                    "invalid internal cluster credential",
-                ));
-            }
-        }
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        internal_rpc::verify(request.metadata(), token.as_deref())?;
         let request = request.into_inner();
         let namespace = request
             .namespace
@@ -107,38 +101,22 @@ impl InternalWriter for AppState {
         if self.namespace(namespace).is_none() {
             return Err(Status::not_found("unknown namespace"));
         }
-        let shard_u32 = u32::try_from(request.shard_id)
-            .map_err(|_| Status::invalid_argument("shard id is out of range"))?;
-        let shard = ShardId::new(shard_u32);
-        let assignment = self.assignment.read().await;
-        if request.assignment_generation != assignment.generation.get() {
-            return Err(Status::failed_precondition(format!(
-                "stale_ownership: requested generation {}, current generation {}",
-                request.assignment_generation,
-                assignment.generation.get()
-            )));
-        }
-        if assignment
-            .owner_of(shard)
-            .is_none_or(|owner| owner.id != self.local_owner)
-        {
-            return Err(Status::failed_precondition(
-                "non_owner: shard is not owned by this server",
-            ));
-        }
+        let shard = internal_rpc::shard_id(request.shard_id)?;
+        let assignment = self.router.assignment().read().await;
+        internal_rpc::check_ownership(
+            &assignment,
+            request.assignment_generation,
+            shard,
+            self.router.local_owner(),
+        )?;
         let meter_namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let options = ShardingOptions::new(
-            assignment.shard_count,
-            self.config.sharding.io_concurrency_limit,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
         let mut series = Vec::with_capacity(request.series.len());
         let mut samples = 0;
         for item in request.series {
             let item = from_proto_series(item);
             if item.samples.iter().any(|sample| {
-                options.route(
+                route(
                     &assignment,
                     &meter_namespace,
                     &item.labels,
@@ -174,9 +152,15 @@ impl InternalWriter for AppState {
             ProtoDurability::Written => Durability::Written,
             ProtoDurability::Durable => Durability::Durable,
         };
-        self.write_local(namespace, shard, series, durability)
+        let admitted = self
+            .router
+            .admit(shard)
             .await
-            .map_err(|error| Status::unavailable(error.message))?;
+            .map_err(|error| internal_rpc::route_status(&error))?;
+        self.write_local(&meter_namespace, shard, series, durability)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        drop(admitted);
         if !request.request_id.is_empty() {
             self.completed_requests
                 .lock()
@@ -184,7 +168,7 @@ impl InternalWriter for AppState {
                 .insert((namespace.to_owned(), request.request_id));
         }
         Ok(TonicResponse::new(WriteBatchResponse {
-            assignment_generation: self.assignment.read().await.generation.get(),
+            assignment_generation: self.router.assignment().read().await.generation.get(),
             accepted_series,
             accepted_samples: samples as u64,
         }))

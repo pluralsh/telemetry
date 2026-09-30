@@ -1,8 +1,9 @@
 use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration};
 
 use common::{CacheWarmerConfig, storage::config::StorageConfig};
-pub use meter_server::config::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
 use serde::{Deserialize, Serialize};
+pub use server_common::auth::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
+pub use server_common::config::{Durability, WriteConfig};
 
 pub use sharding::server::{ServerMode, StaticOwner};
 
@@ -17,42 +18,6 @@ impl sharding::server::Product for LineProduct {
 pub type ShardingConfig = sharding::server::ShardingConfig<LineProduct>;
 pub type ShardingBackend = sharding::server::ShardingBackend<LineProduct>;
 pub type KubernetesShardingConfig = sharding::server::KubernetesShardingConfig<LineProduct>;
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Durability {
-    #[default]
-    Applied,
-    Written,
-    Durable,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WriteConfig {
-    pub durability: Durability,
-    /// Interval between durable storage flushes. Zero disables periodic flushes.
-    pub flush_interval_seconds: u64,
-    pub buffer_queue_capacity: usize,
-    pub buffer_flush_interval_milliseconds: u64,
-    pub buffer_size_threshold_bytes: usize,
-    pub remote_concurrency: usize,
-    pub remote_retries: usize,
-}
-
-impl Default for WriteConfig {
-    fn default() -> Self {
-        Self {
-            durability: Durability::Applied,
-            flush_interval_seconds: 10,
-            buffer_queue_capacity: 10_000,
-            buffer_flush_interval_milliseconds: 10_000,
-            buffer_size_threshold_bytes: 64 * 1024 * 1024,
-            remote_concurrency: 16,
-            remote_retries: 2,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -235,10 +200,7 @@ impl Config {
             || self.request.max_structured_metadata_fields == 0
             || self.request.query_concurrency == 0
             || self.request.max_in_flight_query_bytes == 0
-            || self.write.buffer_queue_capacity == 0
-            || self.write.buffer_flush_interval_milliseconds == 0
-            || self.write.buffer_size_threshold_bytes == 0
-            || self.write.remote_concurrency == 0
+            || self.write.has_zero_limit()
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
@@ -315,13 +277,7 @@ impl Config {
                 delete_delay: Duration::from_secs(self.compaction.delete_delay_seconds),
                 max_merges_per_flush: self.compaction.max_merges_per_flush,
             },
-            write_buffer: common::coordinator::WriteCoordinatorConfig {
-                queue_capacity: self.write.buffer_queue_capacity,
-                flush_interval: Duration::from_millis(
-                    self.write.buffer_flush_interval_milliseconds,
-                ),
-                flush_size_threshold: self.write.buffer_size_threshold_bytes,
-            },
+            write_buffer: self.write.write_buffer(),
         }
     }
 }

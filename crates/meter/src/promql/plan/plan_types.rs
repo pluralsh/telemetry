@@ -11,8 +11,10 @@
 
 use std::sync::Arc;
 
+use crate::model::Labels;
 use crate::promql::operators::aggregate::AggregateKind;
 use crate::promql::operators::binary::BinaryOpKind;
+use crate::promql::operators::histogram::HistogramFnKind;
 use crate::promql::operators::instant_fn::InstantFnKind;
 use crate::promql::operators::label_manip::LabelManipKind;
 use crate::promql::operators::rollup::RollupKind;
@@ -132,6 +134,18 @@ impl AggregateGrouping {
     }
 }
 
+/// Post-reshape sort order for the samples of an instant-vector root.
+///
+/// Set by the physical planner when the logical root is `sort` /
+/// `sort_desc` or a `topk` / `bottomk` aggregate, so the HTTP layer can
+/// report values in the order Prometheus clients and `promqltest` goldens
+/// expect. Range queries ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstantVectorSort {
+    DescendingValue,
+    AscendingValue,
+}
+
 fn labels_to_arc(labels: &promql_parser::label::Labels) -> Arc<[String]> {
     // `promql_parser::label::Labels` is a `HashSet<String>` under the hood;
     // materialise into a stable-ordered `Arc<[String]>` for plan equality.
@@ -227,7 +241,28 @@ pub enum LogicalPlan {
         grouping: AggregateGrouping,
     },
 
+    /// `sort` / `sort_desc`. Orders an instant-query root; a no-op
+    /// anywhere else, so the physical planner builds only the child.
+    Sort {
+        order: InstantVectorSort,
+        child: Box<LogicalPlan>,
+    },
+
     // --- breakers ---------------------------------------------------------
+    /// `histogram_quantile` / `histogram_fraction` over classic `le`
+    /// buckets, grouped by every label except `le` and `__name__`.
+    Histogram {
+        kind: HistogramFnKind,
+        child: Box<LogicalPlan>,
+    },
+
+    /// `absent(v)`, and `absent_over_time(m)` over a `count_over_time`
+    /// child: one series labelled `labels`, valued 1 where `child` is empty.
+    Absent {
+        labels: Labels,
+        child: Box<LogicalPlan>,
+    },
+
     /// `expr[range:step]` — re-grids the child onto an inner step.
     Subquery {
         child: Box<LogicalPlan>,
@@ -289,6 +324,9 @@ impl LogicalPlan {
             | Self::Rollup { .. }
             | Self::LabelManip { .. }
             | Self::Aggregate { .. }
+            | Self::Sort { .. }
+            | Self::Histogram { .. }
+            | Self::Absent { .. }
             | Self::Subquery { .. }
             | Self::Rechunk { .. }
             | Self::CountValues { .. }

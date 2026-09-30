@@ -29,7 +29,6 @@ pub(crate) mod batch;
 pub(crate) mod config;
 pub(crate) mod index_cache;
 pub(crate) mod memory;
-pub(crate) mod openmetrics;
 pub(crate) mod operator;
 pub(crate) mod operators;
 pub(crate) mod plan;

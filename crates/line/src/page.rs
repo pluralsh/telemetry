@@ -409,16 +409,12 @@ fn to_u32(value: usize, field: &str) -> Result<u32> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|value| u32::from_be_bytes(value.try_into().unwrap()))
+    common::serde::be_u32_at(bytes, offset)
         .ok_or_else(|| Error::Corrupt("truncated page integer".to_owned()))
 }
 
 fn read_i64(bytes: &[u8], offset: usize) -> Result<i64> {
-    bytes
-        .get(offset..offset + 8)
-        .map(|value| i64::from_be_bytes(value.try_into().unwrap()))
+    common::serde::be_i64_at(bytes, offset)
         .ok_or_else(|| Error::Corrupt("truncated page timestamp".to_owned()))
 }
 

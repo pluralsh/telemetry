@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, btree_map::Entry};
+use std::collections::HashSet;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use sharding::{
-    DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_SHARDS, ReaderShardLifecycle, ShardId, ShardMap,
+    ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardSetError,
+    ShardingOptions, shard_opener,
 };
 use slatedb::config::DbReaderOptions;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
@@ -35,242 +36,94 @@ use crate::{
 const SOURCE_BUCKET_BITS: u32 = 40;
 const SOURCE_BUCKET_MASK: u64 = (1 << SOURCE_BUCKET_BITS) - 1;
 
-fn shard_io_semaphore(limit: u32) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(limit as usize))
-}
-
-async fn acquire_io_permit(permits: &Arc<Semaphore>) -> OwnedSemaphorePermit {
-    permits
-        .clone()
+async fn acquire_io_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
+    Arc::clone(permits)
         .acquire_owned()
         .await
-        .expect("shard I/O semaphore must remain open")
+        .map_err(|_| ShardSetError::Closed.into())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardingOptions {
-    shard_count: u32,
-    io_concurrency_limit: u32,
+/// One storage shard, opened either as the single writer or as a reader.
+pub enum MeterShard {
+    Writer(TimeSeriesDb),
+    Reader(Box<TimeSeriesDbReader>),
 }
 
-impl Default for ShardingOptions {
-    fn default() -> Self {
-        Self {
-            shard_count: DEFAULT_SHARDS,
-            io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
+#[async_trait]
+impl ShardDatabase for MeterShard {
+    type Error = Error;
+
+    async fn flush_database(&self) -> Result<()> {
+        match self {
+            Self::Writer(db) => db.flush().await,
+            Self::Reader(_) => Ok(()),
+        }
+    }
+
+    async fn close_database(self: Arc<Self>) -> Result<()> {
+        match Arc::try_unwrap(self) {
+            Ok(Self::Writer(db)) => db.close().await,
+            Ok(Self::Reader(db)) => db.close().await,
+            Err(shared) => match &*shared {
+                Self::Reader(db) => db.close().await,
+                Self::Writer(_) => Err(Error::Internal(
+                    "shard database still has in-flight references".into(),
+                )),
+            },
         }
     }
 }
 
-impl ShardingOptions {
-    pub fn new(shard_count: u32, io_concurrency_limit: u32) -> Result<Self> {
-        if shard_count == 0 {
-            return Err(Error::InvalidInput(
-                "shard count must be greater than zero".to_string(),
-            ));
-        }
-        if io_concurrency_limit == 0 {
-            return Err(Error::InvalidInput(
-                "I/O concurrency limit must be greater than zero".to_string(),
-            ));
-        }
-        Ok(Self {
-            shard_count,
-            io_concurrency_limit,
-        })
-    }
-
-    pub const fn shard_count(self) -> u32 {
-        self.shard_count
-    }
-
-    pub const fn io_concurrency_limit(self) -> u32 {
-        self.io_concurrency_limit
-    }
-
-    pub fn shard_path(self, base: &str, shard: ShardId) -> Result<String> {
-        Ok(format!(
-            "{}/shard-{:04}",
-            base.trim_end_matches('/'),
-            shard.get()
-        ))
-    }
-
-    /// Shard owning a sample of `labels` timestamped `timestamp_ms`.
-    pub fn route(
-        self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        labels: &[crate::Label],
-        timestamp_ms: i64,
-    ) -> ShardId {
-        assignment.route_key(
-            &crate::routing::canonical_routing_key(namespace, labels),
-            timestamp_ms.saturating_mul(1_000_000),
-        )
-    }
-
-    /// Splits `series` by the shard owning each sample. A series whose
-    /// samples straddle a routing epoch cutover is written to both shards.
-    pub fn split(
-        self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        series: Vec<Series>,
-    ) -> BTreeMap<ShardId, Vec<Series>> {
-        let mut grouped: BTreeMap<ShardId, Vec<Series>> = BTreeMap::new();
-        for item in series {
-            let key = crate::routing::canonical_routing_key(namespace, &item.labels);
-            if assignment.epochs.len() == 1 {
-                grouped
-                    .entry(assignment.route_key(&key, 0))
-                    .or_default()
-                    .push(item);
-                continue;
-            }
-            let mut by_shard: BTreeMap<ShardId, Vec<Sample>> = BTreeMap::new();
-            for sample in &item.samples {
-                let shard =
-                    assignment.route_key(&key, sample.timestamp_ms.saturating_mul(1_000_000));
-                by_shard.entry(shard).or_default().push(sample.clone());
-            }
-            if by_shard.len() <= 1 {
-                let shard = by_shard.into_keys().next().unwrap_or_else(|| {
-                    assignment.route_key(&key, now_ms().saturating_mul(1_000_000))
-                });
-                grouped.entry(shard).or_default().push(item);
-                continue;
-            }
-            for (shard, samples) in by_shard {
-                grouped.entry(shard).or_default().push(Series {
-                    labels: item.labels.clone(),
-                    metric_type: item.metric_type,
-                    unit: item.unit.clone(),
-                    description: item.description.clone(),
-                    samples,
-                });
-            }
-        }
-        grouped
-    }
+fn shard_storage(config: &Config, shard: ShardId) -> common::storage::config::SlateDbStorageConfig {
+    let mut storage = config.storage.clone();
+    storage.path = ShardingOptions::shard_path(&config.storage.path, shard);
+    storage
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(i64::MAX)
+async fn warm_storage<S: StorageRead + WarmStorage>(
+    storage: S,
+    namespaces: &[Namespace],
+    (start, end): (i64, i64),
+    include_samples: bool,
+    concurrency: usize,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    for namespace in namespaces {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let buckets = storage
+            .get_buckets_in_range(namespace, Some(start), Some(end))
+            .await?;
+        storage
+            .warm(namespace, buckets, include_samples, concurrency, cancel)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Namespace-aware facade over locally owned storage shards.
 pub struct ShardedMeter {
-    config: Config,
-    options: ShardingOptions,
-    writers: RwLock<BTreeMap<ShardId, Arc<TimeSeriesDb>>>,
-    readers: RwLock<BTreeMap<ShardId, Arc<TimeSeriesDbReader>>>,
-    reader_options: Option<DbReaderOptions>,
-    reader_cache_capacity: u64,
-    io_permits: Arc<Semaphore>,
+    shards: Arc<ShardSet<MeterShard>>,
 }
 
 pub type ShardedTimeseries = ShardedMeter;
 
 impl ShardedMeter {
-    /// Warms recent cache blocks for every open shard and namespace.
-    pub async fn warm_recent(
-        &self,
-        namespaces: &[Namespace],
-        warm_range: Duration,
-        include_samples: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        let concurrency = concurrency
-            .max(1)
-            .min(self.options.io_concurrency_limit() as usize);
-        let permit_count = u32::try_from(concurrency).unwrap_or(u32::MAX);
-        let _warm_permits = tokio::select! {
-            permits = self.io_permits.clone().acquire_many_owned(permit_count) => {
-                permits.expect("shard I/O semaphore must remain open")
-            }
-            () = cancel.cancelled() => return Ok(()),
-        };
-        let end = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-            .unwrap_or(i64::MAX);
-        let start = end.saturating_sub(i64::try_from(warm_range.as_secs()).unwrap_or(i64::MAX));
-
-        let readers = self
-            .readers
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        if !readers.is_empty() {
-            for reader in readers {
-                let storage = reader.storage_read();
-                for namespace in namespaces {
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    let buckets = storage
-                        .get_buckets_in_range(namespace, Some(start), Some(end))
-                        .await?;
-                    storage
-                        .warm(namespace, buckets, include_samples, concurrency, cancel)
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-
-        let writers = self
-            .writers
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for writer in writers {
-            let storage = writer.storage_read();
-            for namespace in namespaces {
-                if cancel.is_cancelled() {
-                    return Ok(());
-                }
-                let buckets = storage
-                    .get_buckets_in_range(namespace, Some(start), Some(end))
-                    .await?;
-                storage
-                    .warm(namespace, buckets, include_samples, concurrency, cancel)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     pub async fn open_writers(
         config: Config,
         options: ShardingOptions,
         owned_shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
-        let mut writers = BTreeMap::new();
-        for shard in owned_shards {
-            let mut shard_config = config.clone();
-            shard_config.storage.path = options.shard_path(&config.storage.path, shard)?;
-            writers.insert(shard, Arc::new(TimeSeriesDb::open(shard_config).await?));
-        }
+        let opener = shard_opener(move |shard| {
+            let mut config = config.clone();
+            config.storage = shard_storage(&config, shard);
+            async move { TimeSeriesDb::open(config).await.map(MeterShard::Writer) }
+        });
         Ok(Self {
-            config,
-            options,
-            io_permits: shard_io_semaphore(options.io_concurrency_limit()),
-            writers: RwLock::new(writers),
-            readers: RwLock::new(BTreeMap::new()),
-            reader_options: None,
-            reader_cache_capacity: 0,
+            shards: Arc::new(
+                ShardSet::open(ShardRole::Writer, options, opener, owned_shards).await?,
+            ),
         })
     }
 
@@ -281,122 +134,68 @@ impl ShardedMeter {
         reader_options: DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
-        let mut readers = BTreeMap::new();
-        for shard in local_shards {
-            let mut storage = config.storage.clone();
-            storage.path = options.shard_path(&config.storage.path, shard)?;
-            readers.insert(
-                shard,
-                Arc::new(
-                    TimeSeriesDbReader::open(storage, reader_options.clone(), cache_capacity)
-                        .await?,
-                ),
+        let opener = shard_opener(move |shard| {
+            let open = TimeSeriesDbReader::open(
+                shard_storage(&config, shard),
+                reader_options.clone(),
+                cache_capacity,
             );
-        }
+            async move { open.await.map(|db| MeterShard::Reader(Box::new(db))) }
+        });
         Ok(Self {
-            config,
-            options,
-            writers: RwLock::new(BTreeMap::new()),
-            io_permits: shard_io_semaphore(options.io_concurrency_limit()),
-            readers: RwLock::new(readers),
-            reader_options: Some(reader_options),
-            reader_cache_capacity: cache_capacity,
+            shards: Arc::new(
+                ShardSet::open(ShardRole::Reader, options, opener, local_shards).await?,
+            ),
         })
     }
 
-    pub fn route(
+    /// The open storage shards, for ownership lifecycle management.
+    pub fn shards(&self) -> &Arc<ShardSet<MeterShard>> {
+        &self.shards
+    }
+
+    /// Warms recent cache blocks for every open shard and namespace.
+    pub async fn warm_recent(
         &self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        labels: &[crate::Label],
-        timestamp_ms: i64,
-    ) -> ShardId {
-        self.options
-            .route(assignment, namespace, labels, timestamp_ms)
-    }
-
-    pub async fn contains_writer_shard(&self, shard: ShardId) -> bool {
-        self.writers.read().await.contains_key(&shard)
-    }
-
-    pub async fn writer_shards(&self) -> Vec<ShardId> {
-        self.writers.read().await.keys().copied().collect()
-    }
-
-    pub async fn reader_shard_count(&self) -> usize {
-        self.readers.read().await.len()
-    }
-
-    pub async fn reader_shards(&self) -> Vec<ShardId> {
-        self.readers.read().await.keys().copied().collect()
-    }
-
-    /// Opens readers for every shard in `assignment`. Shards are never
-    /// removed because routing epochs only grow.
-    pub async fn reconcile_reader_shards(&self, assignment: &ShardMap) -> Result<()> {
-        let reader_options = self.reader_options.as_ref().ok_or_else(|| {
-            Error::InvalidInput("reader reconciliation requires a reader facade".into())
-        })?;
-        let current = self.reader_shards().await;
-        let mut opened = BTreeMap::new();
-        for shard in (0..assignment.shard_count).map(ShardId::new) {
-            if current.contains(&shard) {
-                continue;
-            }
-            let mut storage = self.config.storage.clone();
-            storage.path = self.options.shard_path(&self.config.storage.path, shard)?;
-            opened.insert(
-                shard,
-                Arc::new(
-                    TimeSeriesDbReader::open(
-                        storage,
-                        reader_options.clone(),
-                        self.reader_cache_capacity,
-                    )
-                    .await?,
-                ),
-            );
-        }
-        if !opened.is_empty() {
-            self.readers.write().await.extend(opened);
-        }
-        Ok(())
-    }
-
-    pub async fn open_writer_shard(&self, shard: ShardId) -> Result<()> {
-        if self.contains_writer_shard(shard).await {
-            return Ok(());
-        }
-        let mut config = self.config.clone();
-        config.storage.path = self.options.shard_path(&config.storage.path, shard)?;
-        let database = Arc::new(TimeSeriesDb::open(config).await?);
-        let mut writers = self.writers.write().await;
-        if let Entry::Vacant(entry) = writers.entry(shard) {
-            entry.insert(database);
-            return Ok(());
-        }
-        drop(writers);
-        if let Ok(database) = Arc::try_unwrap(database) {
-            database.close().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn flush_shard(&self, shard: ShardId) -> Result<()> {
-        if let Some(database) = self.writers.read().await.get(&shard).cloned() {
-            database.flush().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn close_writer_shard(&self, shard: ShardId) -> Result<()> {
-        if let Some(database) = self.writers.write().await.remove(&shard) {
-            let database = Arc::try_unwrap(database).map_err(|_| {
-                Error::InvalidInput("shard database still has in-flight references".into())
-            })?;
-            database.close().await?;
-        }
-        Ok(())
+        namespaces: &[Namespace],
+        warm_range: Duration,
+        include_samples: bool,
+        concurrency: usize,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let end = common::time::now_secs();
+        let start = end.saturating_sub(i64::try_from(warm_range.as_secs()).unwrap_or(i64::MAX));
+        self.shards
+            .warm(concurrency, cancel, |shard, concurrency| async move {
+                let range = (start, end);
+                match &*shard {
+                    MeterShard::Writer(db) => {
+                        let storage = db.storage_read();
+                        warm_storage(
+                            storage,
+                            namespaces,
+                            range,
+                            include_samples,
+                            concurrency,
+                            cancel,
+                        )
+                        .await
+                    }
+                    MeterShard::Reader(db) => {
+                        let storage = db.storage_read();
+                        warm_storage(
+                            storage,
+                            namespaces,
+                            range,
+                            include_samples,
+                            concurrency,
+                            cancel,
+                        )
+                        .await
+                    }
+                }
+            })
+            .await
     }
 
     pub async fn write_shard(
@@ -406,37 +205,20 @@ impl ShardedMeter {
         series: Vec<Series>,
         visibility: Visibility,
     ) -> Result<()> {
-        let database = self
-            .writers
-            .read()
-            .await
-            .get(&shard)
-            .cloned()
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("shard {} is not owned by this writer", shard.get()))
-            })?;
-        database
-            .write_with_visibility(namespace, series, visibility)
-            .await
-    }
-
-    pub async fn group(
-        &self,
-        assignment: &ShardMap,
-        namespace: &Namespace,
-        series: Vec<Series>,
-    ) -> Result<BTreeMap<ShardId, Vec<Series>>> {
-        let grouped = self.options.split(assignment, namespace, series);
-        let writers = self.writers.read().await;
-        if let Some(shard) = grouped.keys().find(|shard| !writers.contains_key(shard)) {
-            return Err(Error::InvalidInput(format!(
+        match &*self.shards.require(shard).await? {
+            MeterShard::Writer(db) => {
+                db.write_with_visibility(namespace, series, visibility)
+                    .await
+            }
+            MeterShard::Reader(_) => Err(Error::InvalidInput(format!(
                 "shard {} is not owned by this writer",
                 shard.get()
-            )));
+            ))),
         }
-        Ok(grouped)
     }
 
+    /// Writes to locally opened shards. Every routed shard must be open, and
+    /// nothing is written unless all of them are.
     pub async fn write(
         &self,
         assignment: &ShardMap,
@@ -444,45 +226,23 @@ impl ShardedMeter {
         series: Vec<Series>,
         visibility: Visibility,
     ) -> Result<()> {
-        let writes = self
-            .group(assignment, namespace, series)
-            .await?
-            .into_iter()
-            .map(|(shard, batch)| async move {
-                self.write_shard(namespace, shard, batch, visibility).await
-            });
+        let grouped = crate::routing::split(assignment, namespace, series);
+        for shard in grouped.keys() {
+            self.shards.require(*shard).await?;
+        }
+        let writes = grouped.into_iter().map(|(shard, batch)| async move {
+            self.write_shard(namespace, shard, batch, visibility).await
+        });
         futures::future::try_join_all(writes).await?;
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let writers = self
-            .writers
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        futures::future::try_join_all(writers.iter().map(|writer| writer.flush())).await?;
-        Ok(())
+        self.shards.flush_all().await
     }
 
     pub async fn close(&self) -> Result<()> {
-        let writers = std::mem::take(&mut *self.writers.write().await);
-        for (_, writer) in writers {
-            let writer = Arc::try_unwrap(writer).map_err(|_| {
-                Error::InvalidInput("shard database still has in-flight references".into())
-            })?;
-            writer.close().await?;
-        }
-        let readers = std::mem::take(&mut *self.readers.write().await);
-        for (_, reader) in readers {
-            let reader = Arc::try_unwrap(reader).map_err(|_| {
-                Error::InvalidInput("shard reader still has in-flight references".into())
-            })?;
-            reader.close().await?;
-        }
-        Ok(())
+        self.shards.close_all().await
     }
 
     pub async fn query(
@@ -541,11 +301,11 @@ impl ShardedMeter {
         matchers: &[&str],
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
-        let handles = self.read_handles().await;
+        let handles = self.shards.databases().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
-            let permits = Arc::clone(&self.io_permits);
+            let permits = self.shards.io_permits();
             let range = range.clone();
             pending.push(async move { reader.series(namespace, matchers, range, permits).await });
         }
@@ -568,11 +328,11 @@ impl ShardedMeter {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let handles = self.read_handles().await;
+        let handles = self.shards.databases().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
-            let permits = Arc::clone(&self.io_permits);
+            let permits = self.shards.io_permits();
             let range = range.clone();
             pending.push(async move { reader.labels(namespace, matchers, range, permits).await });
         }
@@ -596,11 +356,11 @@ impl ShardedMeter {
         matchers: Option<&[&str]>,
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let handles = self.read_handles().await;
+        let handles = self.shards.databases().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
-            let permits = Arc::clone(&self.io_permits);
+            let permits = self.shards.io_permits();
             let range = range.clone();
             pending.push(async move {
                 reader
@@ -626,13 +386,13 @@ impl ShardedMeter {
         namespace: &Namespace,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let handles = self.read_handles().await;
+        let handles = self.shards.databases().await;
         let width = handles.len().max(1);
         let mut pending = Vec::with_capacity(handles.len());
         for reader in handles {
-            let permits = Arc::clone(&self.io_permits);
+            let permits = self.shards.io_permits();
             pending.push(async move {
-                let _permit = acquire_io_permit(&permits).await;
+                let _permit = acquire_io_permit(&permits).await?;
                 reader.metadata(namespace, metric).await
             });
         }
@@ -652,83 +412,33 @@ impl ShardedMeter {
         Ok(entries)
     }
 
-    async fn read_handles(&self) -> Vec<ReaderHandle> {
-        let readers = self.readers.read().await;
-        if readers.is_empty() {
-            self.writers
-                .read()
-                .await
-                .values()
-                .cloned()
-                .map(ReaderHandle::Writer)
-                .collect()
-        } else {
-            readers
-                .values()
-                .cloned()
-                .map(ReaderHandle::Reader)
-                .collect()
-        }
-    }
-
     async fn query_source(
         &self,
         namespace: &Namespace,
         ranges: &[(i64, i64)],
         options: &crate::QueryOptions,
     ) -> Result<MultiShardSeriesSource> {
-        let reader_handles = self
-            .readers
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let readers = if reader_handles.is_empty() {
-            let writer_handles = self
-                .writers
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            let width = writer_handles.len().max(1);
-            let mut pending = Vec::with_capacity(writer_handles.len());
-            for db in writer_handles {
-                let permits = Arc::clone(&self.io_permits);
-                pending.push(async move {
-                    let _permit = acquire_io_permit(&permits).await;
-                    db.read_engine(namespace)
+        let databases = self.shards.databases().await;
+        let readers = futures::future::try_join_all(databases.into_iter().map(|shard| {
+            self.shards.with_io(async move {
+                match &*shard {
+                    MeterShard::Writer(db) => db
+                        .read_engine(namespace)
                         .await
                         .make_query_reader_for_ranges(ranges)
                         .await
-                        .map(ShardQueryReader::Writer)
-                });
-            }
-            stream::iter(pending)
-                .buffered(width)
-                .try_collect::<Vec<_>>()
-                .await?
-        } else {
-            let width = reader_handles.len().max(1);
-            let mut pending = Vec::with_capacity(reader_handles.len());
-            for db in reader_handles {
-                let permits = Arc::clone(&self.io_permits);
-                pending.push(async move {
-                    let _permit = acquire_io_permit(&permits).await;
-                    db.make_query_reader_for_ranges(namespace, ranges)
+                        .map(ShardQueryReader::Writer),
+                    MeterShard::Reader(db) => db
+                        .make_query_reader_for_ranges(namespace, ranges)
                         .await
-                        .map(ShardQueryReader::Reader)
-                });
-            }
-            stream::iter(pending)
-                .buffered(width)
-                .try_collect::<Vec<_>>()
-                .await?
-        };
+                        .map(ShardQueryReader::Reader),
+                }
+            })
+        }))
+        .await?;
         Ok(MultiShardSeriesSource::new(
             readers,
-            Arc::clone(&self.io_permits),
+            self.shards.io_permits(),
             QueryLimits::new(options),
         ))
     }
@@ -740,15 +450,8 @@ impl ReaderShardLifecycle for ShardedMeter {
         &self,
         assignment: &ShardMap,
     ) -> std::result::Result<(), sharding::BoxError> {
-        self.reconcile_reader_shards(assignment)
-            .await
-            .map_err(Into::into)
+        self.shards.reconcile(assignment).await.map_err(Into::into)
     }
-}
-
-enum ReaderHandle {
-    Writer(Arc<TimeSeriesDb>),
-    Reader(Arc<TimeSeriesDbReader>),
 }
 
 enum ShardQueryReader {
@@ -859,7 +562,7 @@ impl<R> IoLimitedQueryReader<R> {
         Self { inner, permits }
     }
 
-    async fn acquire(&self) -> OwnedSemaphorePermit {
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
         acquire_io_permit(&self.permits).await
     }
 }
@@ -867,7 +570,7 @@ impl<R> IoLimitedQueryReader<R> {
 #[async_trait]
 impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
     async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.list_buckets().await
     }
 
@@ -876,7 +579,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.forward_index(bucket, series_ids).await
     }
 
@@ -885,7 +588,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         bucket: &TimeBucket,
         terms: &[Label],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.inverted_index(bucket, terms).await
     }
 
@@ -893,12 +596,12 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         &self,
         bucket: &TimeBucket,
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.all_inverted_index(bucket).await
     }
 
     async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.label_values(bucket, label_name).await
     }
 
@@ -910,7 +613,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner
             .samples(bucket, series_id, metric_name, start_ms, end_ms)
             .await
@@ -921,7 +624,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         bucket: &TimeBucket,
         series_id: SeriesId,
     ) -> Result<Option<SeriesSpec>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.forward_index_one(bucket, series_id).await
     }
 
@@ -930,7 +633,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         bucket: &TimeBucket,
         term: &Label,
     ) -> Result<Option<RoaringBitmap>> {
-        let _permit = self.acquire().await;
+        let _permit = self.acquire().await?;
         self.inner.inverted_index_term(bucket, term).await
     }
 }
@@ -1065,7 +768,7 @@ impl SeriesSource for MultiShardSeriesSource {
     }
 }
 
-impl ReaderHandle {
+impl MeterShard {
     async fn series<R: RangeBounds<SystemTime>>(
         &self,
         namespace: &Namespace,
@@ -1097,7 +800,7 @@ impl ReaderHandle {
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
         if matchers.is_none_or(<[&str]>::is_empty) {
-            let _permit = acquire_io_permit(&permits).await;
+            let _permit = acquire_io_permit(&permits).await?;
             return match self {
                 Self::Writer(db) => db.labels(namespace, None, range).await,
                 Self::Reader(db) => db.labels(namespace, None, range).await,
@@ -1128,7 +831,7 @@ impl ReaderHandle {
         permits: Arc<Semaphore>,
     ) -> std::result::Result<Vec<String>, QueryError> {
         if matchers.is_none_or(<[&str]>::is_empty) {
-            let _permit = acquire_io_permit(&permits).await;
+            let _permit = acquire_io_permit(&permits).await?;
             return match self {
                 Self::Writer(db) => db.label_values(namespace, label_name, None, range).await,
                 Self::Reader(db) => db.label_values(namespace, label_name, None, range).await,
@@ -1168,425 +871,4 @@ impl ReaderHandle {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Label;
-    use common::storage::config::{
-        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-    };
-
-    const TEST_TIME_MS: i64 = 1_700_000_060_000;
-
-    async fn test_databases() -> (ShardedMeter, TimeSeriesDb) {
-        let config = |path: &str| Config {
-            storage: SlateDbStorageConfig {
-                path: path.to_string(),
-                object_store: ObjectStoreConfig::InMemory,
-                settings_path: None,
-                block_cache: None,
-                meta_cache: None,
-            },
-            ..Default::default()
-        };
-        let sharded = ShardedMeter::open_writers(
-            config("sharded"),
-            ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
-            [ShardId::new(0), ShardId::new(1)],
-        )
-        .await
-        .unwrap();
-        let unsharded = TimeSeriesDb::open(config("unsharded")).await.unwrap();
-        (sharded, unsharded)
-    }
-
-    fn assignment(shards: u32) -> ShardMap {
-        ShardMap::new(
-            sharding::AssignmentGeneration::new(1),
-            shards,
-            vec![sharding::Assignment::new(
-                sharding::Owner::new("meter-0", 0),
-                sharding::ShardRange::within(0, shards, shards).unwrap(),
-                sharding::AssignmentState::Active,
-            )],
-        )
-        .unwrap()
-    }
-
-    fn scaled(previous: &ShardMap, shards: u32, cutover_ms: i64) -> ShardMap {
-        let mut epochs = previous.epochs.clone();
-        epochs.push(sharding::RoutingEpoch {
-            effective_from_ns: cutover_ms * 1_000_000,
-            routing: sharding::HashRangeMap::bootstrap(shards).unwrap(),
-        });
-        ShardMap::with_epochs(
-            previous.generation.next(),
-            epochs,
-            vec![sharding::Assignment::new(
-                sharding::Owner::new("meter-0", 0),
-                sharding::ShardRange::within(0, shards, shards).unwrap(),
-                sharding::AssignmentState::Active,
-            )],
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn reader_reconciliation_opens_new_shards() {
-        let directory = tempfile::tempdir().unwrap();
-        let config = Config {
-            storage: SlateDbStorageConfig {
-                path: "reader-reconcile".to_owned(),
-                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                    path: directory.path().to_string_lossy().into_owned(),
-                }),
-                settings_path: None,
-                block_cache: None,
-                meta_cache: None,
-            },
-            ..Default::default()
-        };
-        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
-        let writers =
-            ShardedMeter::open_writers(config.clone(), options, [ShardId::new(0), ShardId::new(1)])
-                .await
-                .unwrap();
-        writers.close().await.unwrap();
-
-        let readers = ShardedMeter::open_readers(
-            config,
-            options,
-            [ShardId::new(0)],
-            DbReaderOptions::default(),
-            17,
-        )
-        .await
-        .unwrap();
-        readers
-            .reconcile_reader_shards(&scaled(&assignment(1), 2, TEST_TIME_MS))
-            .await
-            .unwrap();
-        assert_eq!(
-            readers.reader_shards().await,
-            vec![ShardId::new(0), ShardId::new(1)]
-        );
-        assert_eq!(readers.reader_cache_capacity, 17);
-        readers.close().await.unwrap();
-    }
-
-    fn series_on_shard(
-        db: &ShardedMeter,
-        metric: &str,
-        shard: u32,
-        extra_labels: &[(&str, &str)],
-        samples: Vec<Sample>,
-    ) -> Series {
-        let routing = assignment(db.options.shard_count());
-        for candidate in 0..10_000 {
-            let mut labels = extra_labels
-                .iter()
-                .map(|(name, value)| Label::new(*name, *value))
-                .collect::<Vec<_>>();
-            labels.push(Label::new("instance", format!("instance-{candidate}")));
-            let series = Series::new(metric, labels, samples.clone());
-            if db
-                .route(
-                    &routing,
-                    &Namespace::new("global-query-regression").unwrap(),
-                    &series.labels,
-                    TEST_TIME_MS,
-                )
-                .get()
-                == shard
-            {
-                return series;
-            }
-        }
-        panic!("failed to find labels routed to shard {shard}");
-    }
-
-    fn binary_join_series(db: &ShardedMeter) -> (Series, Series) {
-        let routing = assignment(db.options.shard_count());
-        for candidate in 0..10_000 {
-            let instance = format!("join-{candidate}");
-            let left = Series::new(
-                "left_metric",
-                vec![Label::new("instance", &instance)],
-                vec![Sample::new(TEST_TIME_MS, 2.0)],
-            );
-            let right = Series::new(
-                "right_metric",
-                vec![Label::new("instance", &instance)],
-                vec![Sample::new(TEST_TIME_MS, 3.0)],
-            );
-            let namespace = Namespace::new("global-query-regression").unwrap();
-            if db.route(&routing, &namespace, &left.labels, TEST_TIME_MS)
-                != db.route(&routing, &namespace, &right.labels, TEST_TIME_MS)
-            {
-                return (left, right);
-            }
-        }
-        panic!("failed to find binary operands routed to different shards");
-    }
-
-    fn normalized(value: QueryValue) -> Vec<(String, Vec<(i64, u64)>)> {
-        let mut result = value
-            .into_matrix()
-            .into_iter()
-            .map(|sample| {
-                (
-                    format!("{:?}", sample.labels),
-                    sample
-                        .samples
-                        .into_iter()
-                        .map(|(timestamp, value)| (timestamp, value.to_bits()))
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        result.sort();
-        result
-    }
-
-    async fn assert_matches_unsharded(
-        sharded: &ShardedMeter,
-        unsharded: &TimeSeriesDb,
-        query: &str,
-    ) {
-        let time = SystemTime::UNIX_EPOCH + Duration::from_millis((TEST_TIME_MS + 1_000) as u64);
-        let namespace = Namespace::new("global-query-regression").unwrap();
-        let actual = sharded.query(&namespace, query, Some(time)).await.unwrap();
-        let expected = unsharded
-            .query(&namespace, query, Some(time))
-            .await
-            .unwrap();
-        assert_eq!(normalized(actual), normalized(expected), "query: {query}");
-    }
-
-    async fn write_both(sharded: &ShardedMeter, unsharded: &TimeSeriesDb, series: Vec<Series>) {
-        let routing = assignment(sharded.options.shard_count());
-        sharded
-            .write(
-                &routing,
-                &Namespace::new("global-query-regression").unwrap(),
-                series.clone(),
-                Visibility::Written,
-            )
-            .await
-            .unwrap();
-        unsharded
-            .write_with_visibility(
-                &Namespace::new("global-query-regression").unwrap(),
-                series,
-                Visibility::Written,
-            )
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn routing_is_canonical_and_namespace_sensitive() {
-        let options = ShardingOptions::new(64, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
-        let routing = assignment(options.shard_count());
-        let a = Namespace::new("a").unwrap();
-        let b = Namespace::new("b").unwrap();
-        let labels = vec![Label::new("z", "1"), Label::new("a", "2")];
-        let reversed = labels.iter().cloned().rev().collect::<Vec<_>>();
-        assert_eq!(
-            options.route(&routing, &a, &labels, 0),
-            options.route(&routing, &a, &reversed, 0)
-        );
-        assert_ne!(
-            options.route(&routing, &a, &labels, 0),
-            options.route(&routing, &b, &labels, 0)
-        );
-    }
-
-    #[test]
-    fn shard_paths_are_stable() {
-        assert_eq!(
-            ShardingOptions::default()
-                .shard_path("meter", ShardId::new(3))
-                .unwrap(),
-            "meter/shard-0003"
-        );
-        assert!(ShardingOptions::new(0, DEFAULT_IO_CONCURRENCY_LIMIT).is_err());
-        assert!(ShardingOptions::new(DEFAULT_SHARDS, 0).is_err());
-    }
-
-    #[test]
-    fn shard_io_budget_uses_fixed_process_limit() {
-        assert_eq!(shard_io_semaphore(128).available_permits(), 128);
-        assert_eq!(shard_io_semaphore(32).available_permits(), 32);
-    }
-
-    #[test]
-    fn split_writes_samples_straddling_a_cutover_to_both_epochs() {
-        let options = ShardingOptions::new(4, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
-        let namespace = Namespace::new("global-query-regression").unwrap();
-        let cutover = TEST_TIME_MS;
-        let routing = scaled(&assignment(1), 4, cutover);
-        let series = (0..100)
-            .map(|index| {
-                Series::new(
-                    "requests_total",
-                    vec![Label::new("instance", format!("instance-{index}"))],
-                    vec![
-                        Sample::new(cutover - 1_000, 1.0),
-                        Sample::new(cutover + 1_000, 2.0),
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-        let grouped = options.split(&routing, &namespace, series);
-        let before = grouped[&ShardId::new(0)]
-            .iter()
-            .flat_map(|series| &series.samples)
-            .filter(|sample| sample.timestamp_ms < cutover)
-            .count();
-        assert_eq!(before, 100);
-        let after = grouped
-            .values()
-            .flatten()
-            .flat_map(|series| &series.samples)
-            .filter(|sample| sample.timestamp_ms >= cutover)
-            .count();
-        assert_eq!(after, 100);
-        assert!(grouped.len() > 2);
-    }
-
-    #[tokio::test]
-    async fn range_query_merges_a_series_split_across_epochs() {
-        let (sharded, unsharded) = test_databases().await;
-        let cutover = TEST_TIME_MS - 20_000;
-        let routing = scaled(&assignment(1), 2, cutover);
-        let namespace = Namespace::new("global-query-regression").unwrap();
-        let series = (0..20)
-            .map(|index| {
-                Series::new(
-                    "requests_total",
-                    vec![Label::new("instance", format!("instance-{index}"))],
-                    vec![
-                        Sample::new(TEST_TIME_MS - 50_000, 1.0),
-                        Sample::new(TEST_TIME_MS - 10_000, 5.0),
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            sharded
-                .options
-                .split(&routing, &namespace, series.clone())
-                .len()
-                == 2
-        );
-        sharded
-            .write(&routing, &namespace, series.clone(), Visibility::Written)
-            .await
-            .unwrap();
-        unsharded
-            .write_with_visibility(&namespace, series, Visibility::Written)
-            .await
-            .unwrap();
-        assert_matches_unsharded(&sharded, &unsharded, "sum(rate(requests_total[1m]))").await;
-        assert_matches_unsharded(&sharded, &unsharded, "count(requests_total)").await;
-    }
-
-    #[tokio::test]
-    async fn global_sum_matches_unsharded_database() {
-        let (sharded, unsharded) = test_databases().await;
-        let series = vec![
-            series_on_shard(
-                &sharded,
-                "requests_total",
-                0,
-                &[],
-                vec![Sample::new(TEST_TIME_MS, 2.0)],
-            ),
-            series_on_shard(
-                &sharded,
-                "requests_total",
-                1,
-                &[],
-                vec![Sample::new(TEST_TIME_MS, 3.0)],
-            ),
-        ];
-        write_both(&sharded, &unsharded, series).await;
-        assert_matches_unsharded(&sharded, &unsharded, "sum(requests_total)").await;
-    }
-
-    #[tokio::test]
-    async fn grouped_aggregation_matches_unsharded_database() {
-        let (sharded, unsharded) = test_databases().await;
-        let series = vec![
-            series_on_shard(
-                &sharded,
-                "requests_total",
-                0,
-                &[("region", "east")],
-                vec![Sample::new(TEST_TIME_MS, 2.0)],
-            ),
-            series_on_shard(
-                &sharded,
-                "requests_total",
-                1,
-                &[("region", "east")],
-                vec![Sample::new(TEST_TIME_MS, 3.0)],
-            ),
-            series_on_shard(
-                &sharded,
-                "requests_total",
-                1,
-                &[("region", "west")],
-                vec![Sample::new(TEST_TIME_MS, 7.0)],
-            ),
-        ];
-        write_both(&sharded, &unsharded, series).await;
-        let start = SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_millis((TEST_TIME_MS - 1_000) as u64);
-        let end = SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_millis((TEST_TIME_MS + 1_000) as u64);
-        assert_eq!(
-            sharded
-                .label_values(
-                    &Namespace::new("global-query-regression").unwrap(),
-                    "region",
-                    None,
-                    start..=end,
-                )
-                .await
-                .unwrap(),
-            vec!["east", "west"]
-        );
-        assert_matches_unsharded(&sharded, &unsharded, "sum by (region) (requests_total)").await;
-    }
-
-    #[tokio::test]
-    async fn rate_then_sum_matches_unsharded_database() {
-        let (sharded, unsharded) = test_databases().await;
-        let samples = |start, end| {
-            vec![
-                Sample::new(TEST_TIME_MS - 50_000, start),
-                Sample::new(TEST_TIME_MS - 10_000, end),
-            ]
-        };
-        let series = vec![
-            series_on_shard(&sharded, "requests_total", 0, &[], samples(1.0, 5.0)),
-            series_on_shard(&sharded, "requests_total", 1, &[], samples(2.0, 10.0)),
-        ];
-        write_both(&sharded, &unsharded, series).await;
-        assert_matches_unsharded(&sharded, &unsharded, "sum(rate(requests_total[1m]))").await;
-    }
-
-    #[tokio::test]
-    async fn binary_join_across_shards_matches_unsharded_database() {
-        let (sharded, unsharded) = test_databases().await;
-        let (left, right) = binary_join_series(&sharded);
-        write_both(&sharded, &unsharded, vec![left, right]).await;
-        assert_matches_unsharded(
-            &sharded,
-            &unsharded,
-            "left_metric * on(instance) right_metric",
-        )
-        .await;
-    }
-}
+mod tests;

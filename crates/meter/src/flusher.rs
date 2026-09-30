@@ -51,8 +51,8 @@ fn bucket_ttl(bucket: TimeBucket, retention: Option<Duration>) -> Ttl {
     let Some(retention) = retention else {
         return Ttl::Default;
     };
-    let bucket_start_ms = bucket.start as i64 * 60 * 1000;
-    let retention_ms = retention.as_millis() as i64;
+    let bucket_start_ms = i64::from(bucket.start) * 60 * 1000;
+    let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
     Ttl::ExpireAt(bucket_start_ms.saturating_add(retention_ms))
 }
 
@@ -63,6 +63,19 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
     ) -> Result<StorageSnapshot, String> {
+        self.flush(frozen).await.map_err(|error| error.to_string())
+    }
+
+    async fn flush_storage(&self) -> Result<(), String> {
+        self.storage
+            .flush()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl TsdbFlusher {
+    async fn flush(&mut self, frozen: FrozenTsdbDelta) -> crate::Result<StorageSnapshot> {
         // Advance the active-series ring to the current minute and republish
         // the gauge. Done unconditionally (even on empty deltas) so the window
         // continues to slide for idle workloads.
@@ -71,10 +84,10 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 
         if frozen.is_empty() {
             let snap_start = std::time::Instant::now();
-            let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
+            let snapshot = self.storage.snapshot().await;
             ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
                 .record(snap_start.elapsed().as_secs_f64());
-            return snapshot;
+            return Ok(snapshot?);
         }
 
         let new_series_count = frozen.series_dict_delta.len() as u64;
@@ -102,8 +115,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                     *fingerprint,
                     *series_id,
                     ttl,
-                )
-                .map_err(|e| e.to_string())?,
+                )?,
             );
         }
 
@@ -117,8 +129,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                     *entry.key(),
                     entry.value().clone(),
                     ttl,
-                )
-                .map_err(|e| e.to_string())?,
+                )?,
             );
         }
 
@@ -132,8 +143,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                     entry.key().clone(),
                     entry.value().clone(),
                     ttl,
-                )
-                .map_err(|e| e.to_string())?,
+                )?,
             );
         }
 
@@ -169,8 +179,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                     &series_samples.metric_name,
                     series_samples.points,
                     ttl,
-                )
-                .map_err(|e| e.to_string())?,
+                )?,
             );
         }
         let ops_count = ops.len() as u64;
@@ -185,7 +194,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         // Phase 2: SlateDB apply. Time spent here reflects SlateDB write
         // backpressure (memtable full, WAL stall, etc.).
         let apply_start = std::time::Instant::now();
-        let result = self.storage.apply(ops).await.map_err(|e| e.to_string());
+        let result = self.storage.apply(ops).await;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS)
             .record(apply_start.elapsed().as_secs_f64());
 
@@ -207,14 +216,10 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 
         // Phase 3: snapshot refresh.
         let snap_start = std::time::Instant::now();
-        let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
+        let snapshot = self.storage.snapshot().await;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
             .record(snap_start.elapsed().as_secs_f64());
-        snapshot
-    }
-
-    async fn flush_storage(&self) -> Result<(), String> {
-        self.storage.flush().await.map_err(|e| e.to_string())
+        Ok(snapshot?)
     }
 }
 

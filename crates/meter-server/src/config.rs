@@ -1,8 +1,10 @@
-use std::{collections::HashSet, env, fmt, fs, net::SocketAddr, path::Path};
+use std::{collections::HashSet, fs, net::SocketAddr, path::Path};
 
 use common::{CacheWarmerConfig, storage::config::SlateDbStorageConfig};
 use serde::{Deserialize, Serialize};
 
+pub use server_common::auth::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
+pub use server_common::config::{Durability, WriteConfig};
 pub use sharding::server::{ServerMode, StaticOwner};
 
 #[derive(Debug, Clone, Default)]
@@ -16,51 +18,6 @@ impl sharding::server::Product for MeterProduct {
 pub type ShardingConfig = sharding::server::ShardingConfig<MeterProduct>;
 pub type ShardingBackend = sharding::server::ShardingBackend<MeterProduct>;
 pub type KubernetesShardingConfig = sharding::server::KubernetesShardingConfig<MeterProduct>;
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum Secret {
-    Literal { value: String },
-    Env { name: String },
-    File { path: String },
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Secret([REDACTED])")
-    }
-}
-
-impl Secret {
-    pub fn expose(&self) -> Result<String, ConfigError> {
-        let value = match self {
-            Self::Literal { value } => value.clone(),
-            Self::Env { name } => env::var(name).map_err(|_| {
-                ConfigError::Secret(format!("environment variable {name} is unset"))
-            })?,
-            Self::File { path } => fs::read_to_string(path)
-                .map_err(|error| ConfigError::Secret(format!("cannot read {path}: {error}")))?,
-        };
-        let value = value.trim_end_matches(['\r', '\n']).to_owned();
-        if value.is_empty() {
-            return Err(ConfigError::Secret("secret cannot be empty".to_owned()));
-        }
-        Ok(value)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Credential {
-    Basic { username: String, password: Secret },
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Access {
-    pub read: Vec<Credential>,
-    pub write: Vec<Credential>,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -84,81 +41,6 @@ impl Default for ListenerConfig {
             grpc: "0.0.0.0:9090".parse().unwrap(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Durability {
-    #[default]
-    Applied,
-    Written,
-    Durable,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WriteConfig {
-    pub durability: Durability,
-    pub flush_interval_seconds: u64,
-    pub buffer_queue_capacity: usize,
-    pub buffer_flush_interval_milliseconds: u64,
-    pub buffer_size_threshold_bytes: usize,
-    pub remote_concurrency: usize,
-    pub remote_retries: usize,
-}
-
-impl Default for WriteConfig {
-    fn default() -> Self {
-        Self {
-            durability: Durability::Applied,
-            flush_interval_seconds: 10,
-            buffer_queue_capacity: 10_000,
-            buffer_flush_interval_milliseconds: 10_000,
-            buffer_size_threshold_bytes: 64 * 1024 * 1024,
-            remote_concurrency: 16,
-            remote_retries: 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AuthConfig {
-    pub unauthenticated: bool,
-    pub jwt: Option<JwtConfig>,
-    pub global: Access,
-    pub internal: Option<Secret>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct JwtConfig {
-    pub jwks: JwksSource,
-    pub issuer: Option<String>,
-    pub audience: Option<String>,
-    pub refresh_interval_seconds: u64,
-    pub request_timeout_seconds: u64,
-}
-
-impl Default for JwtConfig {
-    fn default() -> Self {
-        Self {
-            jwks: JwksSource::File {
-                path: String::new(),
-            },
-            issuer: None,
-            audience: None,
-            refresh_interval_seconds: 300,
-            request_timeout_seconds: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
-pub enum JwksSource {
-    File { path: String },
-    Url { url: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -209,11 +91,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.write.buffer_queue_capacity == 0
-            || self.write.buffer_flush_interval_milliseconds == 0
-            || self.write.buffer_size_threshold_bytes == 0
-            || self.write.remote_concurrency == 0
-        {
+        if self.write.has_zero_limit() {
             return Err(ConfigError::Validation(
                 "write buffer and concurrency limits must be greater than zero".to_owned(),
             ));
@@ -306,8 +184,6 @@ pub enum ConfigError {
     Yaml(#[source] serde_yaml::Error),
     #[error("invalid configuration: {0}")]
     Validation(String),
-    #[error("cannot resolve secret: {0}")]
-    Secret(String),
 }
 
 #[cfg(test)]
@@ -340,23 +216,6 @@ mod tests {
             ..Config::default()
         };
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn secret_sources_and_redaction() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secret");
-        fs::write(&path, "from-file\n").unwrap();
-        let secret = Secret::File {
-            path: path.display().to_string(),
-        };
-        assert_eq!(secret.expose().unwrap(), "from-file");
-        assert!(!format!("{secret:?}").contains("from-file"));
-        let literal = Secret::Literal {
-            value: "literal".to_owned(),
-        };
-        assert_eq!(literal.expose().unwrap(), "literal");
-        assert!(!format!("{literal:?}").contains("literal"));
     }
 
     #[test]
