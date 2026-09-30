@@ -1,8 +1,8 @@
 apiVersion: v2
 name: meter
 description: Production-oriented Helm chart for Meter
-appVersion: 0.1.6
-version: 0.1.9
+appVersion: 0.1.8
+version: 0.1.10
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
