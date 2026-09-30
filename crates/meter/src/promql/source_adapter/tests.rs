@@ -2,15 +2,18 @@ use super::*;
 
 #[test]
 fn should_parse_single_character_regex_alternation() {
-    assert_eq!(
-        selector_util::parse_limited_regex("a|b").unwrap(),
-        ["a", "b"]
-    );
+    assert_eq!(selector_util::regex_literals("a|b").unwrap(), ["a", "b"]);
 }
 
 #[test]
 fn should_bound_expanded_regex_classes() {
-    assert!(selector_util::parse_limited_regex(r"[\x00-\u{10FFFF}]").is_err());
+    assert!(selector_util::regex_literals(r"[\x00-\u{10FFFF}]").is_none());
+}
+
+#[test]
+fn should_leave_non_literal_regexes_to_enumeration() {
+    assert!(selector_util::regex_literals("foo.*").is_none());
+    assert!(selector_util::regex_literals("(?i)foo").is_none());
 }
 
 #[test]

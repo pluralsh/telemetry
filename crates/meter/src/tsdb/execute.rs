@@ -171,6 +171,7 @@ fn plan_error_to_query_error(e: crate::promql::plan::PlanError) -> QueryError {
         | PlanError::SourceError(_)
         | PlanError::InvalidMatching(_)
         | PlanError::PhysicalPlanFailed(_) => QueryError::Execution(e.to_string()),
+        PlanError::Storage(message) => QueryError::Storage(message),
     }
 }
 
@@ -178,7 +179,7 @@ fn plan_error_to_query_error(e: crate::promql::plan::PlanError) -> QueryError {
 /// [`QueryError`](crate::promql::memory::QueryError) onto the
 /// crate-wide [`QueryError`] for the HTTP / embedded boundary.
 fn execution_error_to_query_error(e: crate::promql::memory::QueryError) -> QueryError {
-    QueryError::Execution(e.to_string())
+    QueryError::from(e)
 }
 
 /// Collapse a [`QueryValue`] into the `Vec<RangeSample>` wire shape.

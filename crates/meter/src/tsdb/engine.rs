@@ -368,6 +368,17 @@ impl QueryReader for TsdbQueryReader {
         mini.forward_index_many(series_ids).await
     }
 
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, roaring::RoaringBitmap)>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.label_postings(label_name).await
+    }
+
     async fn inverted_index_term(
         &self,
         bucket: &TimeBucket,

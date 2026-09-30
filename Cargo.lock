@@ -3149,6 +3149,7 @@ dependencies = [
  "bytes",
  "clap",
  "common",
+ "flate2",
  "futures",
  "http-body-util",
  "kube",

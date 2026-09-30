@@ -17,16 +17,16 @@ it to the routes below.
 | GET | `/read/ns/{namespace}/api/v1/metadata` | Metric metadata |
 | GET | `/read/ns/{namespace}/federate` | Prometheus federation |
 
-Prometheus query parameters and response envelopes are used. PromQL coverage is
-substantial but should be compatibility-tested before relying on uncommon
-functions or edge-case semantics.
+Prometheus query parameters and response envelopes are used. See
+[Prometheus compatibility](prometheus-compatibility.md) for supported PromQL,
+parameters, and the remaining gaps.
 
 ## Write APIs
 
 | Method | Route | Encoding |
 | --- | --- | --- |
 | POST | `/write/ns/{namespace}/api/v1/write` | Prometheus remote-write protobuf/snappy |
-| POST | `/write/ns/{namespace}/v1/metrics` | OTLP metrics protobuf |
+| POST | `/write/ns/{namespace}/v1/metrics` | OTLP metrics, protobuf or JSON (optionally gzip) |
 
 ## Operational and internal APIs
 

@@ -257,7 +257,7 @@
           {
             "name": "time",
             "in": "query",
-            "description": "Evaluation timestamp",
+            "description": "Evaluation timestamp: Unix seconds or RFC 3339",
             "required": false,
             "schema": {
               "type": "string"
@@ -290,6 +290,16 @@
           },
           "404": {
             "description": "Unknown namespace"
+          },
+          "422": {
+            "description": "Query failed during evaluation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       },
@@ -339,6 +349,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Query failed during evaluation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -370,6 +390,7 @@
           {
             "name": "start",
             "in": "query",
+            "description": "Unix seconds or RFC 3339",
             "required": true,
             "schema": {
               "type": "string"
@@ -378,6 +399,7 @@
           {
             "name": "end",
             "in": "query",
+            "description": "Unix seconds or RFC 3339",
             "required": true,
             "schema": {
               "type": "string"
@@ -386,6 +408,7 @@
           {
             "name": "step",
             "in": "query",
+            "description": "Seconds or a Prometheus duration such as `15s`",
             "required": true,
             "schema": {
               "type": "string"
@@ -405,6 +428,16 @@
           },
           "400": {
             "description": "Invalid query",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query failed during evaluation",
             "content": {
               "application/json": {
                 "schema": {
@@ -447,6 +480,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query failed during evaluation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -663,8 +716,13 @@
           }
         ],
         "requestBody": {
-          "description": "OTLP ExportMetricsServiceRequest",
+          "description": "OTLP ExportMetricsServiceRequest as protobuf or OTLP/JSON, optionally with `Content-Encoding: gzip`.",
           "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonBody"
+              }
+            },
             "application/x-protobuf": {
               "schema": {
                 "$ref": "#/components/schemas/BinaryBody"
@@ -733,6 +791,9 @@
             "type": "string"
           }
         }
+      },
+      "JsonBody": {
+        "type": "object"
       }
     }
   },

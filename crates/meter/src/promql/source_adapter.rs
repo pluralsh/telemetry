@@ -7,7 +7,6 @@
 //! in bucket-timestamp order; operators merge across buckets. Selector
 //! matcher logic lives in [`selector_util`].
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -165,7 +164,7 @@ fn async_stream_resolve<R: QueryReader + 'static>(
         let buckets = reader
             .list_buckets()
             .await
-            .map_err(|e| internal_err(e.to_string()))?;
+            .map_err(storage_err)?;
 
         let mut filtered: Vec<TimeBucket> = buckets
             .into_iter()
@@ -216,37 +215,16 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 
     // One batched forward-index read through the index cache, which the
     // storage reader serves with a key-range scan when the ids are dense.
-    let mut unique_ids = candidates.clone();
-    unique_ids.sort_unstable();
-    unique_ids.dedup();
     let slots = index_cache
-        .forward_index_many(reader, &bucket, &unique_ids)
+        .forward_index_many(reader, &bucket, &candidates)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    let specs: HashMap<SeriesId, crate::index::SeriesSpec> = unique_ids
-        .into_iter()
-        .zip(slots)
-        .filter_map(|(sid, slot)| slot.as_ref().as_ref().map(|spec| (sid, spec.clone())))
-        .collect();
-
-    // Apply negative / empty-string matchers using the materialised specs.
-    let needs_filter = selector_util::has_negative_matchers(selector)
-        || selector_util::has_empty_string_matchers(selector);
-    let filtered_ids: Vec<SeriesId> = if needs_filter {
-        selector_util::apply_post_filters_map(&specs, candidates, selector)?
-    } else {
-        candidates
-    };
-
-    if filtered_ids.is_empty() {
-        return Ok(None);
-    }
+        .map_err(storage_err)?;
 
     let bucket_id = encode_bucket(bucket);
-    let mut labels_vec: Vec<Labels> = Vec::with_capacity(filtered_ids.len());
-    let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(filtered_ids.len());
-    for sid in &filtered_ids {
-        let spec = specs.get(sid).ok_or_else(|| {
+    let mut labels_vec: Vec<Labels> = Vec::with_capacity(candidates.len());
+    let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(candidates.len());
+    for (sid, slot) in candidates.iter().zip(&slots) {
+        let spec = slot.as_ref().as_ref().ok_or_else(|| {
             internal_err(format!(
                 "series {} missing from forward index in bucket {:?}",
                 sid, bucket
@@ -360,7 +338,7 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
                 end_ms,
             )
             .await
-            .map_err(|e| internal_err(e.to_string()))?;
+            .map_err(storage_err)?;
         for (&col_idx, samples) in group.iter().zip(fetched) {
             fill_column(&mut block, col_idx, samples);
         }
@@ -435,11 +413,14 @@ fn contiguous_bucket_runs(series: &[ResolvedSeriesRef]) -> Vec<BucketRun> {
 // QueryError bridging
 // ---------------------------------------------------------------------------
 
-/// Free helper (not `impl From`) so both `String` and `Error::to_string()`
-/// flow through one path.
 #[inline]
 fn internal_err(msg: impl Into<String>) -> QueryError {
     QueryError::Internal(msg.into())
+}
+
+#[inline]
+fn storage_err(error: impl std::fmt::Display) -> QueryError {
+    QueryError::Storage(error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -452,16 +433,21 @@ fn internal_err(msg: impl Into<String>) -> QueryError {
 pub(crate) mod selector_util {
     use super::{
         IndexCache, Label, QueryError, QueryReader, SeriesId, TimeBucket, VectorSelector,
-        internal_err,
+        internal_err, storage_err,
     };
-    use crate::index::ForwardIndexLookup;
-    use promql_parser::label::{METRIC_NAME, MatchOp};
+    use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
     use regex_syntax::Parser;
     use regex_syntax::hir::{Class, Hir, HirKind};
-    use std::collections::HashSet;
+    use roaring::RoaringBitmap;
 
-    /// Parses `value1|value2|…` into literal alternatives.
-    pub(super) fn parse_limited_regex(pattern: &str) -> Result<Vec<String>, String> {
+    /// The exact strings a regex matches when it is a literal alternation
+    /// (`value1|value2|…`), letting a matcher fetch those postings directly
+    /// instead of enumerating the label's values. `None` otherwise.
+    pub(super) fn regex_literals(pattern: &str) -> Option<Vec<String>> {
+        parse_limited_regex(pattern).ok()
+    }
+
+    fn parse_limited_regex(pattern: &str) -> Result<Vec<String>, String> {
         let hir = Parser::new()
             .parse(pattern)
             .map_err(|e| format!("invalid regex pattern '{}': {}", pattern, e))?;
@@ -540,253 +526,126 @@ pub(crate) mod selector_util {
         }
     }
 
-    pub(crate) fn has_negative_matchers(selector: &VectorSelector) -> bool {
-        selector
-            .matchers
-            .matchers
-            .iter()
-            .any(|m| matches!(m.op, MatchOp::NotEqual | MatchOp::NotRe(_)))
+    /// How one matcher constrains the series set, following Prometheus'
+    /// postings evaluation: a matcher that rejects the empty string only
+    /// selects series carrying one of its accepted values; one that accepts
+    /// it also selects series without the label, so it is applied by
+    /// removing the series carrying a rejected value.
+    struct MatcherPlan<'a> {
+        label: &'a str,
+        /// Select `values`' series when true; remove them when false.
+        include: bool,
+        values: PlanValues<'a>,
     }
 
-    pub(crate) fn has_empty_string_matchers(selector: &VectorSelector) -> bool {
-        selector
-            .matchers
-            .matchers
-            .iter()
-            .any(|m| matches!(m.op, MatchOp::Equal) && m.value.is_empty())
+    enum PlanValues<'a> {
+        /// These exact values, fetched by term.
+        Literals(Vec<String>),
+        /// Values of the label for which `matcher.is_match` equals the
+        /// plan's `include`, found by enumerating the label.
+        Filter(&'a Matcher),
     }
 
-    /// Mirrors `promql::selector::find_candidates_with_reader` but consults
-    /// the reader directly (no `CachedQueryReader`).
+    fn plan_matcher(m: &Matcher) -> MatcherPlan<'_> {
+        let include = !m.is_match("");
+        let literals = match (&m.op, include) {
+            (MatchOp::Equal, true) | (MatchOp::NotEqual, false) => Some(vec![m.value.clone()]),
+            (MatchOp::Re(_), true) => regex_literals(&m.value),
+            // A rejected alternation value is excluded; "" is never a
+            // stored label value.
+            (MatchOp::NotRe(_), false) => regex_literals(&m.value)
+                .map(|values| values.into_iter().filter(|v| !v.is_empty()).collect()),
+            _ => None,
+        };
+        MatcherPlan {
+            label: &m.name,
+            include,
+            values: literals.map_or(PlanValues::Filter(m), PlanValues::Literals),
+        }
+    }
+
+    /// The series of `selector` within `bucket`, in ascending ID order.
+    ///
+    /// Every matcher — equality, negation, regex, and empty-string — is
+    /// resolved against the inverted index, so no forward-index entry is
+    /// read for a series the selector excludes.
     pub(crate) async fn find_candidates<R: QueryReader + ?Sized>(
         reader: &R,
         index_cache: &IndexCache,
         bucket: &TimeBucket,
         selector: &VectorSelector,
     ) -> Result<Vec<SeriesId>, QueryError> {
-        let mut and_terms: Vec<Label> = Vec::new();
-        let mut or_groups: Vec<Vec<Label>> = Vec::new();
-
-        if let Some(name) = &selector.name {
-            and_terms.push(Label {
-                name: METRIC_NAME.to_string(),
-                value: name.clone(),
-            });
-        }
-
-        for m in &selector.matchers.matchers {
-            match &m.op {
-                MatchOp::Equal if !m.value.is_empty() => and_terms.push(Label {
-                    name: m.name.clone(),
-                    value: m.value.clone(),
-                }),
-                MatchOp::Equal => {}
-                MatchOp::Re(_) => {
-                    let values = parse_limited_regex(&m.value).map_err(internal_err)?;
-                    let or_terms: Vec<Label> = values
-                        .into_iter()
-                        .map(|v| Label {
-                            name: m.name.clone(),
-                            value: v,
-                        })
-                        .collect();
-                    or_groups.push(or_terms);
-                }
-                _ => {}
-            }
-        }
-
-        // No positive terms → either "empty string matcher only" (fall
-        // back to metric-name scan) or "nothing to do".
-        if and_terms.is_empty() && or_groups.is_empty() {
-            if !has_empty_string_matchers(selector) {
-                return Ok(Vec::new());
-            }
-            if let Some(name) = &selector.name {
-                let metric_term = Label {
-                    name: METRIC_NAME.to_string(),
-                    value: name.clone(),
-                };
-                let inv = index_cache
-                    .inverted_index(reader, bucket, std::slice::from_ref(&metric_term))
-                    .await
-                    .map_err(|e| internal_err(e.to_string()))?;
-                let res: Vec<SeriesId> = inv.intersect(vec![metric_term]).iter().collect();
-                return Ok(res);
-            }
+        let name_matcher = selector
+            .name
+            .as_deref()
+            .map(|name| Matcher::new(MatchOp::Equal, METRIC_NAME, name));
+        let plans: Vec<MatcherPlan<'_>> = name_matcher
+            .iter()
+            .chain(&selector.matchers.matchers)
+            .map(plan_matcher)
+            .collect();
+        if !plans.iter().any(|plan| plan.include) {
             return Err(internal_err(
-                "must specify a metric name when using empty label matcher".to_string(),
+                "vector selector must contain at least one non-empty matcher".to_string(),
             ));
         }
 
-        let all_terms: Vec<Label> = or_groups
-            .iter()
-            .flat_map(|t| t.iter().cloned())
-            .chain(and_terms.iter().cloned())
-            .collect();
-        let inv = index_cache
-            .inverted_index(reader, bucket, &all_terms)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-
-        let mut result_set: HashSet<SeriesId> = if !and_terms.is_empty() {
-            inv.intersect(and_terms.clone()).iter().collect()
-        } else {
-            HashSet::new()
-        };
-
-        for or_terms in &or_groups {
-            let mut or_result: HashSet<SeriesId> = HashSet::new();
-            for term in or_terms {
-                let per_term = inv.intersect(vec![term.clone()]);
-                or_result.extend(per_term.iter());
-            }
-            if and_terms.is_empty() && result_set.is_empty() {
-                result_set = or_result;
-            } else {
-                result_set = result_set.intersection(&or_result).cloned().collect();
-            }
+        let sets = futures::future::try_join_all(
+            plans
+                .iter()
+                .map(|plan| plan_postings(reader, index_cache, bucket, plan)),
+        )
+        .await?;
+        let mut included = plans.iter().zip(&sets).filter(|(plan, _)| plan.include);
+        let (_, first) = included.next().expect("checked above");
+        let mut result = first.clone();
+        for (_, set) in included {
+            result &= set;
         }
-
-        let mut v: Vec<SeriesId> = result_set.into_iter().collect();
-        v.sort();
-        Ok(v)
+        for (_, set) in plans.iter().zip(&sets).filter(|(plan, _)| !plan.include) {
+            result -= set;
+        }
+        Ok(result.iter().collect())
     }
 
-    /// Matches the post-filter block in `promql::selector::evaluate_selector_with_reader`.
-    pub(crate) fn apply_post_filters(
-        forward: &dyn ForwardIndexLookup,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Result<Vec<SeriesId>, QueryError> {
-        let mut out = candidates;
-        if has_negative_matchers(selector) {
-            out = apply_negative(forward, out, selector)?;
-        }
-        if has_empty_string_matchers(selector) {
-            out = apply_empty_string(forward, out, selector);
-        }
-        Ok(out)
-    }
-
-    /// HashMap-backed variant of [`apply_post_filters`] for the resolve path.
-    pub(super) fn apply_post_filters_map(
-        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Result<Vec<SeriesId>, QueryError> {
-        let mut out = candidates;
-        if has_negative_matchers(selector) {
-            out = apply_negative_map(specs, out, selector)?;
-        }
-        if has_empty_string_matchers(selector) {
-            out = apply_empty_string_map(specs, out, selector);
-        }
-        Ok(out)
-    }
-
-    fn apply_negative_map(
-        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Result<Vec<SeriesId>, QueryError> {
-        let mut out = candidates;
-        for m in &selector.matchers.matchers {
-            match &m.op {
-                MatchOp::NotEqual => {
-                    out.retain(|id| {
-                        specs
-                            .get(id)
-                            .map(|spec| !has_label(&spec.labels, &m.name, &m.value))
-                            .unwrap_or(false)
-                    });
+    /// Union of the postings of the values `plan` names.
+    async fn plan_postings<R: QueryReader + ?Sized>(
+        reader: &R,
+        index_cache: &IndexCache,
+        bucket: &TimeBucket,
+        plan: &MatcherPlan<'_>,
+    ) -> Result<RoaringBitmap, QueryError> {
+        let mut out = RoaringBitmap::new();
+        match &plan.values {
+            PlanValues::Literals(values) => {
+                let terms: Vec<Label> = values
+                    .iter()
+                    .map(|value| Label::new(plan.label, value.as_str()))
+                    .collect();
+                let postings = futures::future::try_join_all(
+                    terms
+                        .iter()
+                        .map(|term| index_cache.inverted_index_term(reader, bucket, term)),
+                )
+                .await
+                .map_err(storage_err)?;
+                for p in postings.iter().filter_map(|p| p.as_ref().as_ref()) {
+                    out |= p;
                 }
-                MatchOp::NotRe(_) => {
-                    let values = parse_limited_regex(&m.value).map_err(internal_err)?;
-                    out.retain(|id| {
-                        specs
-                            .get(id)
-                            .map(|spec| !values.iter().any(|v| has_label(&spec.labels, &m.name, v)))
-                            .unwrap_or(false)
-                    });
+            }
+            PlanValues::Filter(matcher) => {
+                let all = index_cache
+                    .label_postings(reader, bucket, plan.label)
+                    .await
+                    .map_err(storage_err)?;
+                for (value, p) in all.iter() {
+                    if matcher.is_match(value) == plan.include {
+                        out |= p;
+                    }
                 }
-                _ => {}
             }
         }
         Ok(out)
-    }
-
-    fn apply_empty_string_map(
-        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Vec<SeriesId> {
-        let mut out = candidates;
-        for m in &selector.matchers.matchers {
-            if matches!(m.op, MatchOp::Equal) && m.value.is_empty() {
-                out.retain(|id| {
-                    specs
-                        .get(id)
-                        .map(|spec| !has_label_with_non_empty_value(&spec.labels, &m.name))
-                        .unwrap_or(false)
-                });
-            }
-        }
-        out
-    }
-
-    fn apply_negative(
-        forward: &dyn ForwardIndexLookup,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Result<Vec<SeriesId>, QueryError> {
-        let mut out = candidates;
-        for m in &selector.matchers.matchers {
-            match &m.op {
-                MatchOp::NotEqual => {
-                    out.retain(|id| {
-                        forward
-                            .spec_matches(id, &|spec| !has_label(&spec.labels, &m.name, &m.value))
-                    });
-                }
-                MatchOp::NotRe(_) => {
-                    let values = parse_limited_regex(&m.value).map_err(internal_err)?;
-                    out.retain(|id| {
-                        forward.spec_matches(id, &|spec| {
-                            !values.iter().any(|v| has_label(&spec.labels, &m.name, v))
-                        })
-                    });
-                }
-                _ => {}
-            }
-        }
-        Ok(out)
-    }
-
-    fn apply_empty_string(
-        forward: &dyn ForwardIndexLookup,
-        candidates: Vec<SeriesId>,
-        selector: &VectorSelector,
-    ) -> Vec<SeriesId> {
-        let mut out = candidates;
-        for m in &selector.matchers.matchers {
-            if matches!(m.op, MatchOp::Equal) && m.value.is_empty() {
-                out.retain(|id| {
-                    forward.spec_matches(id, &|spec| {
-                        !has_label_with_non_empty_value(&spec.labels, &m.name)
-                    })
-                });
-            }
-        }
-        out
-    }
-
-    fn has_label(labels: &[Label], name: &str, value: &str) -> bool {
-        labels.iter().any(|l| l.name == name && l.value == value)
-    }
-
-    fn has_label_with_non_empty_value(labels: &[Label], name: &str) -> bool {
-        labels.iter().any(|l| l.name == name && !l.value.is_empty())
     }
 }
 

@@ -15,6 +15,7 @@ pub mod histogram;
 mod index;
 mod minitsdb;
 pub(crate) mod model;
+mod postings_cache;
 mod promql;
 mod query;
 mod reader;
@@ -53,6 +54,7 @@ pub use reader::TimeSeriesDbReader;
 pub use sharded::{MeterShard, ShardedMeter, ShardedTimeseries};
 pub use sharding::ShardingOptions;
 pub use timeseries::{TimeSeriesDb, Visibility};
+pub use util::{parse_duration, parse_timestamp};
 
 /// Persisted SlateDB segment extractor identifier.
 pub const SEGMENT_EXTRACTOR_NAME: &str = storage::segment_extractor::EXTRACTOR_NAME;

@@ -627,5 +627,9 @@ impl OtelConverter {
     }
 }
 
+mod json;
+
+pub use json::decode_metrics_json;
+
 #[cfg(test)]
 mod tests;

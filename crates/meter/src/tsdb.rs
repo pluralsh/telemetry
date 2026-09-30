@@ -20,6 +20,7 @@ use crate::model::{
     Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series, SeriesId,
     TimeBucket,
 };
+use crate::postings_cache::PostingsCache;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::{Storage, StorageRead, StorageSnapshot};
 use crate::tsdb_metrics;
@@ -266,6 +267,10 @@ pub(crate) struct Tsdb {
     /// Rolling HLL ring estimating unique series seen in the last ~15 min.
     /// Updated and published to `tsdb_active_series` by the flusher.
     active_series: Arc<ActiveSeriesTracker>,
+
+    /// Inverted-index postings shared across queries; bucket flushers
+    /// invalidate it as they add series.
+    postings_cache: Arc<PostingsCache>,
 }
 
 impl Tsdb {
@@ -312,6 +317,7 @@ impl Tsdb {
             retention,
             write_buffer,
             active_series,
+            postings_cache: Arc::new(PostingsCache::new(retention)),
         }
     }
 
@@ -346,6 +352,7 @@ impl Tsdb {
                 self.retention,
                 self.active_series.clone(),
                 self.write_buffer.clone(),
+                Some(self.postings_cache.clone()),
             )
             .await?,
         );
@@ -362,6 +369,7 @@ impl Tsdb {
         start_secs: i64,
         end_secs: i64,
     ) -> Result<TsdbQueryReader> {
+        let read_at = self.postings_cache.read_seq();
         let snapshot = self.storage.snapshot().await?;
         let mut buckets = snapshot
             .get_buckets_in_range(&self.namespace, Some(start_secs), Some(end_secs))
@@ -377,7 +385,7 @@ impl Tsdb {
         }
         buckets.sort_by_key(|bucket| bucket.start);
 
-        let readers = self.build_readers(&snapshot, buckets).await;
+        let readers = self.build_readers(&snapshot, read_at, buckets).await;
         Ok(TsdbQueryReader::new(readers))
     }
 
@@ -386,6 +394,7 @@ impl Tsdb {
         &self,
         ranges: &[(i64, i64)],
     ) -> Result<TsdbQueryReader> {
+        let read_at = self.postings_cache.read_seq();
         let snapshot = {
             let _g = crate::promql::trace::Scope::enter("snapshot");
             self.storage.snapshot().await?
@@ -413,21 +422,23 @@ impl Tsdb {
 
         let readers = {
             let _g = crate::promql::trace::Scope::enter("build_readers");
-            self.build_readers(&snapshot, buckets).await
+            self.build_readers(&snapshot, read_at, buckets).await
         };
         Ok(TsdbQueryReader::new(readers))
     }
 
-    /// Build readers for a set of buckets. Uses the ingest cache when
-    /// available, otherwise constructs a reader directly from the snapshot.
+    /// Build a reader over `snapshot` for each bucket. `read_at` is the
+    /// postings-cache sequence read before `snapshot` was taken.
     async fn build_readers(
         &self,
         snapshot: &StorageSnapshot,
+        read_at: u64,
         buckets: Vec<TimeBucket>,
     ) -> Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)> {
         let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
-            let reader = MiniQueryReader::new(self.namespace.clone(), bucket, snapshot.clone());
+            let reader = MiniQueryReader::new(self.namespace.clone(), bucket, snapshot.clone())
+                .with_postings_cache(self.postings_cache.clone(), read_at);
             readers.push((bucket, reader));
         }
         readers
@@ -567,15 +578,11 @@ impl Tsdb {
         &self,
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
-        let snapshot = self
-            .storage
-            .snapshot()
-            .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let snapshot = self.storage.snapshot().await.map_err(QueryError::from)?;
         let buckets = snapshot
             .get_buckets_in_range(&self.namespace, None, None)
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+            .map_err(QueryError::from)?;
         crate::discovery::metadata(
             snapshot,
             &self.namespace,
@@ -584,7 +591,7 @@ impl Tsdb {
             &self.discovery_cache,
         )
         .await
-        .map_err(|error| QueryError::Execution(error.to_string()))
+        .map_err(QueryError::from)
     }
 
     pub(crate) async fn catalog_labels(
@@ -592,18 +599,14 @@ impl Tsdb {
         start_secs: i64,
         end_secs: i64,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let snapshot = self
-            .storage
-            .snapshot()
-            .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let snapshot = self.storage.snapshot().await.map_err(QueryError::from)?;
         let buckets = snapshot
             .get_buckets_in_range(&self.namespace, Some(start_secs), Some(end_secs))
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+            .map_err(QueryError::from)?;
         crate::discovery::names(snapshot, &self.namespace, &buckets, &self.discovery_cache)
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))
+            .map_err(QueryError::from)
     }
 
     pub(crate) async fn catalog_label_values(
@@ -612,15 +615,11 @@ impl Tsdb {
         start_secs: i64,
         end_secs: i64,
     ) -> std::result::Result<Vec<String>, QueryError> {
-        let snapshot = self
-            .storage
-            .snapshot()
-            .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+        let snapshot = self.storage.snapshot().await.map_err(QueryError::from)?;
         let buckets = snapshot
             .get_buckets_in_range(&self.namespace, Some(start_secs), Some(end_secs))
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+            .map_err(QueryError::from)?;
         crate::discovery::values(
             snapshot,
             &self.namespace,
@@ -629,7 +628,7 @@ impl Tsdb {
             &self.discovery_cache,
         )
         .await
-        .map_err(|error| QueryError::Execution(error.to_string()))
+        .map_err(QueryError::from)
     }
 }
 

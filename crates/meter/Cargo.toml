@@ -16,7 +16,7 @@ path = "src/lib.rs"
 default = []
 testing = []
 remote-write = ["dep:prost", "dep:snap"]
-otel = ["dep:opentelemetry-proto", "dep:prost"]
+otel = ["dep:opentelemetry-proto", "dep:prost", "opentelemetry-proto/with-serde"]
 bench-internals = []
 
 [lints]

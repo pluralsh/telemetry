@@ -38,6 +38,10 @@ pub enum PlanError {
     #[error("series source error: {0}")]
     SourceError(String),
 
+    /// A storage read failed while resolving series.
+    #[error("storage error: {0}")]
+    Storage(String),
+
     #[error("invalid vector matching: {0}")]
     InvalidMatching(String),
 

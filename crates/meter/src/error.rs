@@ -124,11 +124,33 @@ pub enum QueryError {
     /// An error occurred during query execution.
     #[error("execution error: {0}")]
     Execution(String),
+
+    /// Reading from storage failed; the query itself may be valid.
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 impl From<Error> for QueryError {
     fn from(err: Error) -> Self {
-        QueryError::Execution(err.to_string())
+        match err {
+            Error::InvalidInput(message) => QueryError::InvalidQuery(message),
+            other => QueryError::Storage(other.to_string()),
+        }
+    }
+}
+
+impl From<StorageError> for QueryError {
+    fn from(err: StorageError) -> Self {
+        Error::from(err).into()
+    }
+}
+
+impl From<crate::promql::memory::QueryError> for QueryError {
+    fn from(err: crate::promql::memory::QueryError) -> Self {
+        match err {
+            crate::promql::memory::QueryError::Storage(message) => QueryError::Storage(message),
+            other => QueryError::Execution(other.to_string()),
+        }
     }
 }
 

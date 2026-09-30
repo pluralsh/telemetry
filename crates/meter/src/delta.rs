@@ -375,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn should_keep_label_sets_with_equal_concatenations_distinct() {
+        // given: both label sets flatten to `__name__m` + `a1b2`
+        let ctx = create_test_context();
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let split = create_test_series("m", vec![("a", "1"), ("b", "2")], create_test_sample());
+        let joined = create_test_series("m", vec![("a", "1b2")], create_test_sample());
+
+        // when
+        delta.apply(vec![split, joined]).unwrap();
+
+        // then
+        assert_eq!(delta.next_series_id, 2);
+        assert_eq!(delta.series_dict_delta.len(), 2);
+    }
+
+    #[test]
     fn should_carry_series_dict_across_freeze_cycles() {
         // given
         let ctx = create_test_context();

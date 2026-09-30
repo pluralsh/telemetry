@@ -38,55 +38,38 @@ pub(crate) async fn find_label_values_in_range<E: TsdbReadEngine + ?Sized>(
 /// Cross-bucket readahead used by the discovery helpers below.
 const DISCOVERY_BUCKET_READAHEAD: usize = 32;
 
-/// Resolve the series matching `selector` within `bucket`, applying any
-/// negative / empty-string post-filters.
+/// Forward-index entries of the series matching `selector` within `bucket`,
+/// read in one batch.
 async fn resolve_selector_in_bucket<R: QueryReader>(
     reader: &R,
     index_cache: &crate::promql::index_cache::IndexCache,
     bucket: TimeBucket,
     selector: &VectorSelector,
-) -> std::result::Result<Vec<(SeriesId, Labels)>, QueryError> {
-    use crate::promql::source_adapter::selector_util;
-
-    let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector)
-        .await
-        .map_err(|e| QueryError::Execution(e.to_string()))?;
+) -> std::result::Result<Vec<crate::promql::index_cache::ForwardSeriesValue>, QueryError> {
+    let candidates = crate::promql::source_adapter::selector_util::find_candidates(
+        reader,
+        index_cache,
+        &bucket,
+        selector,
+    )
+    .await
+    .map_err(QueryError::from)?;
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-
-    let forward = index_cache
-        .forward_index(reader, &bucket, &candidates)
+    index_cache
+        .forward_index_many(reader, &bucket, &candidates)
         .await
-        .map_err(|e| QueryError::Execution(e.to_string()))?;
-
-    let needs_filter = selector_util::has_negative_matchers(selector)
-        || selector_util::has_empty_string_matchers(selector);
-    let final_ids = if needs_filter {
-        selector_util::apply_post_filters(forward.as_ref(), candidates, selector)
-            .map_err(|e| QueryError::Execution(e.to_string()))?
-    } else {
-        candidates
-    };
-
-    let mut out = Vec::with_capacity(final_ids.len());
-    for id in final_ids {
-        if let Some(spec) = forward.get_spec(&id) {
-            let mut labels = spec.labels;
-            labels.sort();
-            out.push((id, Labels::new(labels)));
-        }
-    }
-    Ok(out)
+        .map_err(QueryError::from)
 }
 
 /// Resolves every (bucket, selector) pair concurrently, folding each
-/// resolved series into `sink` as results arrive.
+/// resolved series' (unsorted) labels into `sink` as results arrive.
 async fn resolve_selectors<R: QueryReader>(
     reader: &R,
     buckets: &[TimeBucket],
     selectors: &[VectorSelector],
-    mut sink: impl FnMut(Labels),
+    mut sink: impl FnMut(&[Label]),
 ) -> std::result::Result<(), QueryError> {
     let index_cache = crate::promql::index_cache::IndexCache::new();
     let index_cache = &index_cache;
@@ -100,8 +83,8 @@ async fn resolve_selectors<R: QueryReader>(
         })
         .buffer_unordered(DISCOVERY_BUCKET_READAHEAD);
     while let Some(found) = resolved.try_next().await? {
-        for (_, labels) in found {
-            sink(labels);
+        for spec in found.iter().filter_map(|slot| slot.as_ref().as_ref()) {
+            sink(&spec.labels);
         }
     }
     Ok(())
@@ -126,7 +109,9 @@ pub(crate) async fn discover_series<R: QueryReader>(
     let selectors = parse_selectors(matchers)?;
     let mut unique_series: HashSet<Labels> = HashSet::new();
     resolve_selectors(reader, &buckets, &selectors, |labels| {
-        unique_series.insert(labels);
+        let mut labels = labels.to_vec();
+        labels.sort();
+        unique_series.insert(Labels::new(labels));
     })
     .await?;
 
@@ -151,7 +136,7 @@ pub(crate) async fn discover_labels<R: QueryReader>(
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
             resolve_selectors(reader, &buckets, &selectors, |labels| {
-                for attr in labels.iter() {
+                for attr in labels {
                     if !label_names.contains(&attr.name) {
                         label_names.insert(attr.name.clone());
                     }
@@ -196,10 +181,10 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
             resolve_selectors(reader, &buckets, &selectors, |labels| {
-                if let Some(v) = labels.get(label_name)
-                    && !values.contains(v)
+                if let Some(label) = labels.iter().find(|l| l.name == label_name)
+                    && !values.contains(&label.value)
                 {
-                    values.insert(v.to_string());
+                    values.insert(label.value.clone());
                 }
             })
             .await?;

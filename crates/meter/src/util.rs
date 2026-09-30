@@ -31,9 +31,12 @@ impl Fingerprint for Vec<Label> {
 
 impl Fingerprint for [Label] {
     fn fingerprint(&self) -> u128 {
+        // Length prefixes keep `{a="1", b="2"}` and `{a="1b2"}` distinct.
         let mut hasher = Hasher::new();
         for label in self {
+            hasher.update(&(label.name.len() as u32).to_be_bytes());
             hasher.update(label.name.as_bytes());
+            hasher.update(&(label.value.len() as u32).to_be_bytes());
             hasher.update(label.value.as_bytes());
         }
 
@@ -458,6 +461,20 @@ mod tests {
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid duration"));
+    }
+
+    #[test]
+    fn should_fingerprint_label_boundaries() {
+        use super::Fingerprint;
+        use crate::model::Label;
+
+        let split = vec![Label::new("a", "abb")];
+        let shifted = vec![Label::new("aa", "bb")];
+        let two = vec![Label::new("a", "1"), Label::new("b", "2")];
+        let one = vec![Label::new("a", "1b2")];
+
+        assert_ne!(split.fingerprint(), shifted.fingerprint());
+        assert_ne!(two.fingerprint(), one.fingerprint());
     }
 
     #[test]

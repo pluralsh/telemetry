@@ -26,7 +26,8 @@ type ForwardValue = Arc<dyn ForwardIndexLookup + Send + Sync + 'static>;
 
 /// `Arc<Option<_>>` so "not present in bucket" is also cacheable.
 type InvertedTermValue = Arc<Option<RoaringBitmap>>;
-type ForwardSeriesValue = Arc<Option<SeriesSpec>>;
+pub(crate) type ForwardSeriesValue = Arc<Option<SeriesSpec>>;
+pub(crate) type LabelPostingsValue = Arc<Vec<(String, RoaringBitmap)>>;
 
 /// Per-query cache of inverted and forward index lookups. All methods take
 /// `&self`; interior concurrency via [`DashMap`].
@@ -40,6 +41,7 @@ pub(crate) struct IndexCache {
     forward: DashMap<ForwardKey, ForwardValue>,
     inverted_terms: DashMap<(TimeBucket, Label), InvertedTermValue>,
     forward_series: DashMap<(TimeBucket, SeriesId), ForwardSeriesValue>,
+    label_postings: DashMap<(TimeBucket, String), LabelPostingsValue>,
 }
 
 impl IndexCache {
@@ -49,7 +51,25 @@ impl IndexCache {
             forward: DashMap::new(),
             inverted_terms: DashMap::new(),
             forward_series: DashMap::new(),
+            label_postings: DashMap::new(),
         }
+    }
+
+    /// Every value of `label_name` in `bucket` with its postings. Errors are
+    /// not cached.
+    pub(crate) async fn label_postings<R: QueryReader + ?Sized>(
+        &self,
+        reader: &R,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<LabelPostingsValue> {
+        let key = (*bucket, label_name.to_string());
+        if let Some(hit) = self.label_postings.get(&key) {
+            return Ok(hit.clone());
+        }
+        let value: LabelPostingsValue = Arc::new(reader.label_postings(bucket, label_name).await?);
+        self.label_postings.insert(key, value.clone());
+        Ok(value)
     }
 
     /// `terms` is sorted internally before keying. Errors propagate verbatim

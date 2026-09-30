@@ -212,17 +212,35 @@ where
             .insert(key, entries, is_active_bucket(bucket)))
     })
     .await?;
-    let mut found = Vec::new();
-    for entry in per_bucket.iter().flat_map(|entries| entries.iter()) {
-        if metric.is_some_and(|filter| filter != entry.metric_name) {
-            continue;
+    let found = per_bucket
+        .iter()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| metric.is_none_or(|filter| filter == entry.metric_name))
+        .cloned()
+        .collect();
+    Ok(dedup_metadata(found))
+}
+
+/// Sorts `entries` by metric name and drops exact duplicates, keeping the
+/// first occurrence of each.
+pub(crate) fn dedup_metadata(mut entries: Vec<MetricMetadata>) -> Vec<MetricMetadata> {
+    entries.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
+    // Duplicates share a name, so each entry is only compared within its
+    // name's run; the stable sort keeps the first-seen entry.
+    let mut deduped: Vec<MetricMetadata> = Vec::with_capacity(entries.len());
+    let mut run_start = 0;
+    for entry in entries {
+        if deduped
+            .last()
+            .is_some_and(|last| last.metric_name != entry.metric_name)
+        {
+            run_start = deduped.len();
         }
-        if !found.contains(entry) {
-            found.push(entry.clone());
+        if !deduped[run_start..].contains(&entry) {
+            deduped.push(entry);
         }
     }
-    found.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
-    Ok(found)
+    deduped
 }
 
 fn is_active_bucket(bucket: TimeBucket) -> bool {
@@ -307,6 +325,31 @@ mod tests {
         assert_eq!(
             decode_metadata(&metadata.metric_name, &encoded).unwrap(),
             metadata
+        );
+    }
+
+    #[test]
+    fn should_dedup_metadata_keeping_first_entry_per_name_in_name_order() {
+        let entry = |name: &str, unit: Option<&str>| MetricMetadata {
+            metric_name: name.to_owned(),
+            metric_type: Some(MetricType::Gauge),
+            description: None,
+            unit: unit.map(str::to_owned),
+        };
+        let deduped = dedup_metadata(vec![
+            entry("b", None),
+            entry("a", Some("s")),
+            entry("b", Some("ms")),
+            entry("a", Some("s")),
+            entry("b", None),
+        ]);
+        assert_eq!(
+            deduped,
+            vec![
+                entry("a", Some("s")),
+                entry("b", None),
+                entry("b", Some("ms"))
+            ]
         );
     }
 

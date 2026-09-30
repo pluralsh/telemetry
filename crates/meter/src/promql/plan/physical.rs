@@ -4,9 +4,9 @@
 //! (resolved series rosters, group maps, match tables).
 //!
 //! Leaves call [`SeriesSource::resolve`] to materialise the series list
-//! a selector spans. `Subquery` owns a child-factory closure that
-//! re-plans its inner subtree once per outer step (the inner window
-//! slides, so the child has to be rebuilt).
+//! a selector spans. `Subquery` plans its inner subtree once over the
+//! union of its outer windows and slices each window from that one
+//! evaluation.
 //!
 //! This pass does not mutate the logical plan. Exchange-operator
 //! insertion policy (when to wrap a subtree in `ConcurrentOp`) lives in
@@ -43,7 +43,7 @@ use super::super::operators::instant_fn::InstantFnOp;
 use super::super::operators::label_manip::{LabelManipKind, LabelManipOp};
 use super::super::operators::matrix_selector::MatrixSelectorOp;
 use super::super::operators::rollup::{MatrixWindowSource, RollupOp};
-use super::super::operators::subquery::{ChildFactory, SubqueryOp};
+use super::super::operators::subquery::SubqueryOp;
 use super::super::operators::vector_selector::VectorSelectorOp;
 use super::super::source::{ResolvedSeriesChunk, ResolvedSeriesRef, SeriesSource, TimeRange};
 
@@ -252,6 +252,7 @@ fn static_schema(schema: &SchemaRef) -> Result<&Arc<SeriesSchema>, PlanError> {
 fn map_source_err(err: QueryError) -> PlanError {
     match err {
         QueryError::MemoryLimit { .. } => PlanError::MemoryLimit(err.to_string()),
+        QueryError::Storage(message) => PlanError::Storage(message),
         other => PlanError::SourceError(other.to_string()),
     }
 }
@@ -259,6 +260,7 @@ fn map_source_err(err: QueryError) -> PlanError {
 fn map_construct_err(err: QueryError) -> PlanError {
     match err {
         QueryError::MemoryLimit { .. } => PlanError::MemoryLimit(err.to_string()),
+        QueryError::Storage(message) => PlanError::Storage(message),
         other => PlanError::PhysicalPlanFailed(other.to_string()),
     }
 }

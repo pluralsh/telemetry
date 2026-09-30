@@ -9,16 +9,16 @@
 //!
 //! [`QueryError`] is deliberately isolated from the crate-wide
 //! [`crate::error::QueryError`]: engine errors are a small closed set (memory
-//! limit plus a catch-all `Internal` for storage plumbing), and the wire
-//! boundary maps them to `crate::error::QueryError::Execution`.
+//! limit, storage failures, and a catch-all `Internal`), and the wire
+//! boundary maps storage failures to `crate::error::QueryError::Storage` and
+//! the rest to `crate::error::QueryError::Execution`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The engine's error type. Kept separate from
 /// [`crate::error::QueryError`] so the engine's error surface stays small and
-/// closed; the wire boundary maps these onto
-/// `crate::error::QueryError::Execution`.
+/// closed.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum QueryError {
     #[error(
@@ -32,8 +32,11 @@ pub enum QueryError {
         already_reserved: usize,
     },
 
-    /// Storage-surface error, used by the storage adapter to carry crate-level
-    /// `Error` messages without leaking a storage-specific variant.
+    /// A storage read failed; carries the crate-level `Error` message.
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    /// An evaluation failure or broken engine invariant.
     #[error("internal error: {0}")]
     Internal(String),
 }

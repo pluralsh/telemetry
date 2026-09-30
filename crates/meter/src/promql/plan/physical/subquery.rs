@@ -1,10 +1,7 @@
-//! Subquery lowering: per-outer-step child operator factories.
+//! Subquery lowering: one inner evaluation spanning every outer window.
 
+use super::super::super::operators::subquery::subquery_span;
 use super::*;
-
-// ---------------------------------------------------------------------------
-// Subquery (factory returning a fresh child operator per outer step)
-// ---------------------------------------------------------------------------
 
 /// The range, resolution and time shift of one subquery expression.
 pub(super) struct SubqueryWindow {
@@ -24,150 +21,36 @@ pub(super) async fn build_subquery<S>(
 where
     S: SeriesSource + Send + Sync + 'static,
 {
-    let BuildEnv {
-        source,
-        reservation,
-        ctx,
-    } = env;
     let SubqueryWindow {
         range_ms,
         step_ms,
         offset,
         at,
     } = window;
-    // Resolve the inner subtree's output schema by planning it once over
-    // a representative inner-grid window. Phase-6 may want to replan at
-    // factory call time if the inner plan's series set can vary across
-    // outer steps; the `ChildFactory` shape allows that already.
-    //
-    // For v1 the subquery's output series is assumed plan-time-stable
-    // (matches RFC §"Core Data Model": only `count_values` carries
-    // deferred schemas, and that is rejected under schema-sensitive
-    // parents — which `Rollup` is).
 
-    // Precompute per-outer-step effective evaluation times so the
-    // operator can apply `@` / `offset` uniformly per step without
-    // re-dispatching on the at/offset shape at runtime.
+    // Per-outer-step effective evaluation times, so the operator applies
+    // `@` / `offset` uniformly per step.
     let effective_times: Arc<[i64]> = Arc::from(
         (0..outer_grid.step_count)
             .map(|k| outer_step_window(outer_grid, k, range_ms, offset, at).1)
             .collect::<Vec<_>>(),
     );
 
-    // Build a probe child to snapshot the output schema.
-    let probe_effective = effective_times
-        .first()
-        .copied()
-        .unwrap_or(outer_grid.start_ms);
-    let probe_grid = inner_grid(probe_effective, range_ms, step_ms);
-    // Probe the inner subtree once to snapshot its output schema. Stats
-    // bookkeeping for the probe is intentionally discarded — the factory
-    // will rebuild the subtree (possibly with its own wraps) per outer
-    // step; counting the probe's wrap decisions would double-count.
-    let mut probe_stats = ExchangeStats::default();
-    let probe = build_node(inner.clone(), env, probe_grid, false, &mut probe_stats).await?;
-    // Accumulate the probe's wrap/skip decisions into the caller's stats
-    // for observability. These wrap decisions are informational — the
-    // probe itself is dropped right after schema extraction.
-    stats.concurrent_wrapped = stats
-        .concurrent_wrapped
-        .saturating_add(probe_stats.concurrent_wrapped);
-    stats.concurrent_skipped = stats
-        .concurrent_skipped
-        .saturating_add(probe_stats.concurrent_skipped);
-    let inner_schema = static_schema(&probe.schema().series)?.clone();
-    drop(probe);
+    // One inner evaluation over the union of every outer window. Inner
+    // points are absolute multiples of the step, so each outer window's
+    // points are a subset of this grid.
+    let (span_lo, span_hi) = subquery_span(&effective_times, range_ms);
+    let grid = inner_grid(span_hi, span_hi - span_lo + 1, step_ms);
+    let child = build_node(inner, env, grid, false, stats).await?;
+    static_schema(&child.schema().series)?;
 
-    // Clone captures for the factory closure.
-    let source_arc = source.clone();
-    let ctx_copy = ctx.clone();
-    let reservation_inner = reservation.clone();
-    let inner_plan = inner;
-    let sub_range_ms = range_ms;
-    let factory: ChildFactory = Box::new(move |tr: TimeRange, inner_step_ms: i64| {
-        // Use a blocking task-local poll for the factory's sync-Future
-        // surface: the factory's return type is sync, but the planner
-        // walk is async. Real wiring will replace this with a planner-
-        // cached precomputed tree per unique (range, step); for v1 the
-        // factory just re-invokes the planner synchronously.
-        //
-        // The subquery encodes the outer effective time in `tr` as
-        // `tr.end_ms_exclusive - 1` (inclusive upper bound). Align the
-        // inner grid descending from that point so the inner evaluation
-        // timestamps are `{effective, effective - step, …}` rather than
-        // the raw range-start the old inner-grid builder produced.
-        let effective_t = tr.end_ms_exclusive.saturating_sub(1);
-        let grid = inner_grid(effective_t, sub_range_ms, inner_step_ms);
-        let src = source_arc.clone();
-        // Each child is dropped after its outer step; the scope returns
-        // anything its operators still hold at that point.
-        let res = reservation_inner.scoped();
-        let ctx_cp = ctx_copy.clone();
-        let plan = inner_plan.clone();
-        // Drive the async recursive planner to completion using a
-        // single-threaded runtime. This is a plan-time path, called once
-        // per outer step by `SubqueryOp::windows`; we accept the per-call
-        // runtime spin-up over propagating async through the operator
-        // trait (the trait is sync `poll` and the RFC places subquery
-        // re-planning inside `poll_windows`).
-        // Factory-owned stats scratch: wraps inserted inside the inner
-        // subtree are already reflected in the top-level `ExchangeStats`
-        // via the schema-probe walk above, so we discard them here.
-        let mut factory_stats = ExchangeStats::default();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                // Hand the work back to the existing runtime via
-                // `block_in_place`; callers should already be on a
-                // multi-thread runtime for the outer query.
-                let fut = build_node(
-                    plan,
-                    BuildEnv {
-                        source: &src,
-                        reservation: &res,
-                        ctx: &ctx_cp,
-                    },
-                    grid,
-                    false,
-                    &mut factory_stats,
-                );
-                tokio::task::block_in_place(|| handle.block_on(fut))
-                    .map_err(|e| QueryError::Internal(format!("subquery plan failed: {e}")))
-            }
-            Err(_) => {
-                // No runtime — synthesise a minimal runtime just for the
-                // plan. This path is only hit in sync tests that drive the
-                // plan outside a tokio context.
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| QueryError::Internal(format!("subquery rt build: {e}")))?;
-                let fut = build_node(
-                    plan,
-                    BuildEnv {
-                        source: &src,
-                        reservation: &res,
-                        ctx: &ctx_cp,
-                    },
-                    grid,
-                    false,
-                    &mut factory_stats,
-                );
-                rt.block_on(fut)
-                    .map_err(|e| QueryError::Internal(format!("subquery plan failed: {e}")))
-            }
-        }
-    });
-
-    let sub = SubqueryOp::with_effective_times(
-        factory,
-        inner_schema,
+    Ok(SubqueryOp::with_effective_times(
+        child,
         outer_grid,
         range_ms,
-        step_ms,
         effective_times,
-        reservation.clone(),
-    );
-    Ok(sub)
+        env.reservation.clone(),
+    ))
 }
 
 fn outer_step_window(

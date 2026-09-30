@@ -18,11 +18,13 @@ use crate::active_series::ActiveSeriesTracker;
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
-use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
+use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, Series, SeriesData, SeriesId, TimeBucket};
+use crate::postings_cache::PostingsCache;
 use crate::query::BucketQueryReader;
 use crate::serde::forward_index::ForwardIndexValue;
-use crate::serde::key::{ForwardIndexKey, TimeSeriesKey};
+use crate::serde::inverted_index::InvertedIndexValue;
+use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, TimeSeriesKey};
 use crate::util::Result;
 
 /// Per-bucket query reader over any storage read handle — a
@@ -32,6 +34,9 @@ pub(crate) struct MiniQueryReader<R: StorageRead> {
     namespace: Namespace,
     bucket: TimeBucket,
     snapshot: R,
+    /// Cross-query postings cache, with the sequence read before `snapshot`
+    /// was taken.
+    postings_cache: Option<(Arc<PostingsCache>, u64)>,
 }
 
 impl<R: StorageRead> MiniQueryReader<R> {
@@ -40,7 +45,15 @@ impl<R: StorageRead> MiniQueryReader<R> {
             namespace,
             bucket,
             snapshot: storage,
+            postings_cache: None,
         }
+    }
+
+    /// Serve inverted-index reads through `cache`. `read_at` must be
+    /// [`PostingsCache::read_seq`] as read before `storage` was snapshotted.
+    pub(crate) fn with_postings_cache(mut self, cache: Arc<PostingsCache>, read_at: u64) -> Self {
+        self.postings_cache = Some((cache, read_at));
+        self
     }
 }
 
@@ -50,12 +63,13 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         &self,
         series_ids: &[SeriesId],
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        let forward_index = io_trace_async(IoKindLocal::ForwardIndexFetch, async {
-            self.snapshot
-                .get_forward_index_series(&self.namespace, &self.bucket, series_ids)
-                .await
-        })
-        .await?;
+        let forward_index = ForwardIndex::default();
+        let specs = self.forward_index_many(series_ids).await?;
+        for (&series_id, spec) in series_ids.iter().zip(specs) {
+            if let Some(spec) = spec {
+                forward_index.series.insert(series_id, spec);
+            }
+        }
         Ok(Box::new(forward_index))
     }
 
@@ -118,12 +132,41 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     }
 
     async fn inverted_index_term(&self, term: &Label) -> Result<Option<roaring::RoaringBitmap>> {
-        io_trace_async(
+        if let Some((cache, _)) = &self.postings_cache
+            && let Some(hit) = cache.term(self.bucket, term).await
+        {
+            return Ok(hit.as_ref().clone());
+        }
+        let postings = io_trace_async(
             IoKindLocal::InvertedIndexFetch,
             self.snapshot
                 .get_inverted_index_term(&self.namespace, &self.bucket, term),
         )
-        .await
+        .await?;
+        if let Some((cache, read_at)) = &self.postings_cache {
+            cache
+                .insert_term(self.bucket, term, *read_at, postings.clone())
+                .await;
+        }
+        Ok(postings)
+    }
+
+    async fn label_postings(
+        &self,
+        label_name: &str,
+    ) -> Result<Vec<(String, roaring::RoaringBitmap)>> {
+        if let Some((cache, _)) = &self.postings_cache
+            && let Some(hit) = cache.label(self.bucket, label_name).await
+        {
+            return Ok(hit.as_ref().clone());
+        }
+        let postings = self.scan_label_postings(label_name).await?;
+        if let Some((cache, read_at)) = &self.postings_cache {
+            cache
+                .insert_label(self.bucket, label_name, *read_at, postings.clone())
+                .await;
+        }
+        Ok(postings)
     }
 
     async fn samples(
@@ -244,6 +287,30 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
 }
 
 impl<R: StorageRead> MiniQueryReader<R> {
+    /// One prefix scan over the label's inverted-index keys, which hold
+    /// each value's postings.
+    async fn scan_label_postings(
+        &self,
+        label_name: &str,
+    ) -> Result<Vec<(String, roaring::RoaringBitmap)>> {
+        let kind = IoKindLocal::InvertedIndexFetch;
+        let prefix = InvertedIndexKey::attribute_prefix(&self.namespace, &self.bucket, label_name);
+        let mut iter = io_trace_async(kind, self.snapshot.scan_prefix(prefix)).await?;
+        let mut out = Vec::new();
+        while let Some(record) = io_trace_async(kind, iter.next())
+            .await
+            .map_err(StorageError::from_storage)?
+        {
+            crate::promql::trace::record_bytes(kind, record.value.len() as u64);
+            let key = InvertedIndexKey::decode(record.key.as_ref())?;
+            let postings = InvertedIndexValue::decode(record.value.as_ref())?.postings;
+            if !postings.is_empty() {
+                out.push((key.value, postings));
+            }
+        }
+        Ok(out)
+    }
+
     /// Decode the values of `series_ids` from one scan over keys built by
     /// `key` (which must end in the big-endian series ID), returned in
     /// `series_ids` order. Requested series with no key get `T::default()`.
@@ -345,11 +412,7 @@ impl MiniTsdb {
     /// Create a query reader for read operations.
     pub(crate) fn query_reader(&self) -> MiniQueryReader<StorageSnapshot> {
         let view = self.write_coordinator.view();
-        MiniQueryReader {
-            namespace: self.namespace.clone(),
-            bucket: self.bucket,
-            snapshot: view.snapshot.clone(),
-        }
+        MiniQueryReader::new(self.namespace.clone(), self.bucket, view.snapshot.clone())
     }
 
     pub(crate) async fn load(
@@ -359,6 +422,7 @@ impl MiniTsdb {
         retention: Option<Duration>,
         active_series: Arc<ActiveSeriesTracker>,
         write_buffer: WriteCoordinatorConfig,
+        postings_cache: Option<Arc<PostingsCache>>,
     ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
@@ -381,6 +445,7 @@ impl MiniTsdb {
             storage: storage.clone(),
             retention,
             active_series,
+            postings_cache,
         };
 
         let initial_snapshot: StorageSnapshot = storage
@@ -543,6 +608,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series,
+            postings_cache: None,
         };
 
         let initial_snapshot: StorageSnapshot = storage.snapshot().await.unwrap();

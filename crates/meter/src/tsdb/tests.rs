@@ -707,6 +707,59 @@ async fn find_series_should_dedup_across_buckets() {
 }
 
 #[tokio::test]
+async fn should_see_series_late_written_into_a_cached_bucket() {
+    // given: a queried bucket, so its postings are cached across queries
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage);
+    let host = |value| create_sample("cpu", vec![("host", value)], 4_000_000, 1.0);
+    tsdb.ingest_samples(vec![host("a")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let selectors = ["cpu", r#"cpu{host=~"a|b"}"#, r#"cpu{host=~".+"}"#];
+    for selector in selectors {
+        let found = tsdb.find_series(&[selector], 0, i64::MAX).await.unwrap();
+        assert_eq!(found.len(), 1, "{selector}");
+    }
+
+    // when: a late sample adds a series to that bucket
+    tsdb.ingest_samples(vec![host("b")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    // then: every matcher shape sees it
+    for selector in selectors {
+        let found = tsdb.find_series(&[selector], 0, i64::MAX).await.unwrap();
+        assert_eq!(found.len(), 2, "{selector}");
+    }
+}
+
+#[tokio::test]
+async fn should_serve_repeat_selector_postings_from_the_shared_cache() {
+    // given
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage);
+    let sample = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
+    tsdb.ingest_samples(vec![sample], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let bucket = TimeBucket::round_to_hour(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(4_000_000),
+    )
+    .unwrap();
+
+    // when
+    tsdb.find_series(&[r#"cpu{host=~".+"}"#], 0, i64::MAX)
+        .await
+        .unwrap();
+
+    // then
+    assert!(tsdb.postings_cache.label(bucket, "host").await.is_some());
+    assert!(
+        tsdb.postings_cache
+            .term(bucket, &Label::metric_name("cpu"))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn find_labels_should_return_all_label_names() {
     let tsdb = create_tsdb_with_data().await;
 

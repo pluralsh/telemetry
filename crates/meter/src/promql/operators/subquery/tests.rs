@@ -2,9 +2,7 @@ use super::*;
 use crate::model::{Label, Labels, STALE_NAN};
 use crate::promql::batch::BitSet;
 use crate::promql::operators::rollup::{RollupKind, RollupOp};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 fn noop_waker() -> Waker {
@@ -35,22 +33,6 @@ fn mk_labels(n: usize) -> Arc<SeriesSchema> {
 struct ScriptedChild {
     schema: OperatorSchema,
     queue: Vec<Result<StepBatch, QueryError>>,
-}
-
-impl ScriptedChild {
-    fn new(schema: OperatorSchema, batches: Vec<StepBatch>) -> Self {
-        Self {
-            schema,
-            queue: batches.into_iter().map(Ok).collect(),
-        }
-    }
-
-    fn with_error(schema: OperatorSchema, err: QueryError) -> Self {
-        Self {
-            schema,
-            queue: vec![Err(err)],
-        }
-    }
 }
 
 impl Operator for ScriptedChild {
@@ -97,89 +79,87 @@ fn mk_batch(
     )
 }
 
-/// Build an inner-grid schema + timestamps for `[outer_t - range, outer_t]`
-/// at `inner_step`.
-fn mk_inner_grid(outer_t: i64, range_ms: i64, inner_step_ms: i64) -> (Arc<[i64]>, StepGrid) {
-    // Inner grid: first step strictly > outer_t - range, spaced by
-    // inner_step, up to and including outer_t. Mirrors the production
-    // `[range:step]` semantics.
-    let mut ts = Vec::new();
-    let mut t = outer_t
-        .saturating_sub(range_ms)
-        .saturating_add(inner_step_ms);
-    while t <= outer_t {
-        ts.push(t);
-        t += inner_step_ms;
+/// A child evaluated at `ts`, one batch per inner step in the order
+/// given; `value(t, series)` is the cell at `(t, series)`.
+fn scripted_child(
+    series: &Arc<SeriesSchema>,
+    ts: &[i64],
+    value: impl Fn(i64, usize) -> Option<f64>,
+) -> ScriptedChild {
+    let ts_arc: Arc<[i64]> = Arc::from(ts);
+    let queue = ts
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let values: Vec<Option<f64>> = (0..series.len()).map(|s| value(t, s)).collect();
+            Ok(mk_batch(ts_arc.clone(), i, series.clone(), &values))
+        })
+        .collect();
+    let grid = StepGrid {
+        start_ms: ts.iter().copied().min().unwrap_or(0),
+        end_ms: ts.iter().copied().max().unwrap_or(0),
+        step_ms: 10,
+        step_count: ts.len(),
+    };
+    ScriptedChild {
+        schema: OperatorSchema::new(SchemaRef::Static(series.clone()), grid),
+        queue,
     }
-    let start_ms = ts.first().copied().unwrap_or(outer_t);
-    let end_ms = ts.last().copied().unwrap_or(outer_t);
-    let step_count = ts.len();
-    (
-        Arc::from(ts),
-        StepGrid {
-            start_ms,
-            end_ms,
-            step_ms: inner_step_ms,
-            step_count,
-        },
-    )
 }
 
-// -----------------------------------------------------------------------
-// required tests
-// -----------------------------------------------------------------------
+fn boxed(child: impl Operator + 'static) -> Box<dyn Operator + Send> {
+    Box::new(child)
+}
+
+fn outer(start_ms: i64, step_ms: i64, step_count: usize) -> StepGrid {
+    StepGrid {
+        start_ms,
+        end_ms: start_ms + step_ms * (step_count as i64 - 1),
+        step_ms,
+        step_count,
+    }
+}
+
+fn next_window(op: &mut SubqueryOp) -> MatrixWindowBatch {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match op.windows(&mut cx) {
+        Poll::Ready(Some(Ok(b))) => b,
+        other => panic!("unexpected poll: {other:?}"),
+    }
+}
+
+fn drain_windows(op: &mut SubqueryOp) -> Vec<MatrixWindowBatch> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut out = Vec::new();
+    loop {
+        match op.windows(&mut cx) {
+            Poll::Ready(None) => return out,
+            Poll::Ready(Some(Ok(b))) => out.push(b),
+            Poll::Ready(Some(Err(e))) => panic!("unexpected error: {e:?}"),
+            Poll::Pending => panic!("unexpected Pending"),
+        }
+    }
+}
 
 #[test]
-fn should_regrid_child_onto_inner_step() {
-    // given: outer step at t=100, range=30ms, inner_step=10ms, outer
-    // step=60ms (single outer step here). Window: (70, 100] ⇒ inner
-    // ts should be 80, 90, 100.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+fn should_slice_outer_window_from_inner_samples() {
+    // given: outer step at t=100, range=30 → window (70, 100]; the child
+    // also emits a point at 70, outside every window.
     let series = mk_labels(1);
-    let series_clone = series.clone();
-
-    let factory: ChildFactory = Box::new(move |tr: TimeRange, step_ms: i64| {
-        // assert inner contract
-        assert_eq!(tr.start_ms, 71); // 100 - 30 + 1
-        assert_eq!(tr.end_ms_exclusive, 101); // 100 + 1
-        assert_eq!(step_ms, 10);
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, 10);
-        let mut batches = Vec::new();
-        for (i, &t) in ts_arc.iter().enumerate() {
-            batches.push(mk_batch(
-                ts_arc.clone(),
-                i,
-                series_clone.clone(),
-                &[Some(t as f64)],
-            ));
-        }
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-
+    let child = scripted_child(&series, &[70, 80, 90, 100], |t, _| Some(t as f64));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
     // when
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let batch = match op.windows(&mut cx) {
-        Poll::Ready(Some(Ok(b))) => b,
-        other => panic!("unexpected poll: {other:?}"),
-    };
+    let batch = next_window(&mut op);
 
-    // then: single cell for the outer step contains ts/vs 80, 90, 100.
+    // then
     assert_eq!(batch.step_count(), 1);
     assert_eq!(batch.series_count(), 1);
     let (ts, vs) = batch.cell_samples(0, 0);
@@ -190,93 +170,94 @@ fn should_regrid_child_onto_inner_step() {
 #[test]
 fn should_emit_one_matrix_batch_per_outer_step() {
     // given: outer grid with 3 steps
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 220,
-        step_ms: 60,
-        step_count: 3,
-    };
     let series = mk_labels(1);
-    let series_clone = series.clone();
-
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches: Vec<StepBatch> = ts_arc
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(t as f64)]))
-            .collect();
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-
+    let ts: Vec<i64> = (8..=22).map(|k| k * 10).collect();
+    let child = scripted_child(&series, &ts, |t, _| Some(t as f64));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 3),
         30,
-        10,
+        MemoryReservation::new(1 << 20),
+    );
+
+    // when / then: exactly one batch per outer step
+    assert_eq!(drain_windows(&mut op).len(), 3);
+}
+
+#[test]
+fn should_slice_every_outer_window_from_one_evaluation() {
+    // given: 4 outer steps 60s apart with a 30ms range; one child covers
+    // them all.
+    let series = mk_labels(1);
+    let ts: Vec<i64> = (4..=24).map(|k| k * 10).collect();
+    let child = scripted_child(&series, &ts, |t, _| Some(t as f64));
+    let mut op = SubqueryOp::new(
+        boxed(child),
+        outer(60, 60, 4),
+        30,
         MemoryReservation::new(1 << 20),
     );
 
     // when
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut count = 0;
-    loop {
-        match op.windows(&mut cx) {
-            Poll::Ready(None) => break,
-            Poll::Ready(Some(Ok(_))) => count += 1,
-            Poll::Ready(Some(Err(e))) => panic!("unexpected error: {e:?}"),
-            Poll::Pending => panic!("unexpected Pending"),
-        }
-    }
-    // then: exactly one batch per outer step (3).
-    assert_eq!(count, 3);
+    let windows = drain_windows(&mut op);
+
+    // then: each window holds exactly its own (t - 30, t] points
+    let got: Vec<Vec<i64>> = windows
+        .iter()
+        .map(|b| b.cell_samples(0, 0).0.to_vec())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            vec![40, 50, 60],
+            vec![100, 110, 120],
+            vec![160, 170, 180],
+            vec![220, 230, 240],
+        ]
+    );
 }
 
 #[test]
-fn should_invoke_factory_once_per_outer_step() {
-    // given: outer grid with 4 steps; factory counter increments per call.
-    let outer_grid = StepGrid {
-        start_ms: 60,
-        end_ms: 240,
-        step_ms: 60,
-        step_count: 4,
-    };
+fn should_share_samples_between_overlapping_windows() {
+    // given: range (30) wider than the outer step (10)
     let series = mk_labels(1);
-    let series_clone = series.clone();
-
-    let counter = Arc::new(Mutex::new(0usize));
-    let counter_clone = counter.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        *counter_clone.lock().unwrap() += 1;
-        let (ts_arc, inner_grid) = mk_inner_grid(60, 30, step_ms);
-        let batches: Vec<StepBatch> = ts_arc
-            .iter()
-            .enumerate()
-            .map(|(i, _)| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(1.0)]))
-            .collect();
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-
+    let child = scripted_child(&series, &[80, 90, 100, 110], |t, _| Some(t as f64));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 10, 2),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
-    // when: drive to completion
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    while let Poll::Ready(Some(Ok(_))) = op.windows(&mut cx) {}
+    // when
+    let windows = drain_windows(&mut op);
 
-    // then: factory called once per outer step.
-    assert_eq!(*counter.lock().unwrap(), 4);
+    // then
+    assert_eq!(windows[0].cell_samples(0, 0).0, &[80, 90, 100]);
+    assert_eq!(windows[1].step_range, 1..2);
+    assert_eq!(windows[1].cell_samples(0, 0).0, &[90, 100, 110]);
+}
+
+#[test]
+fn should_order_samples_when_child_emits_steps_out_of_order() {
+    // given: the child's step chunks arrive newest-first
+    let series = mk_labels(1);
+    let child = scripted_child(&series, &[100, 90, 80], |t, _| Some(t as f64));
+    let mut op = SubqueryOp::new(
+        boxed(child),
+        outer(100, 60, 1),
+        30,
+        MemoryReservation::new(1 << 20),
+    );
+
+    // when
+    let batch = next_window(&mut op);
+
+    // then
+    assert_eq!(
+        batch.cell_samples(0, 0),
+        (&[80, 90, 100][..], &[80.0, 90.0, 100.0][..])
+    );
 }
 
 /// Returns `Pending` on its first poll, like a child waiting on storage.
@@ -299,36 +280,17 @@ impl Operator for PendingOnce {
 }
 
 #[test]
-fn should_resume_a_pending_child_instead_of_replanning() {
-    // given: one outer step whose child is pending on its first poll
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+fn should_resume_a_pending_child() {
+    // given: a child pending on its first poll
     let series = mk_labels(1);
-    let series_clone = series.clone();
-    let calls = Arc::new(Mutex::new(0usize));
-    let calls_clone = calls.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        *calls_clone.lock().unwrap() += 1;
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = (0..ts_arc.len())
-            .map(|i| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(i as f64)]))
-            .collect();
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(PendingOnce {
-            inner: ScriptedChild::new(schema, batches),
-            pending: true,
-        }) as Box<dyn Operator + Send>)
-    });
+    let child = PendingOnce {
+        inner: scripted_child(&series, &[80, 90, 100], |t, _| Some((t / 10 - 8) as f64)),
+        pending: true,
+    };
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
     let waker = noop_waker();
@@ -336,111 +298,51 @@ fn should_resume_a_pending_child_instead_of_replanning() {
 
     // when
     assert!(op.windows(&mut cx).is_pending());
-    let batch = match op.windows(&mut cx) {
-        Poll::Ready(Some(Ok(b))) => b,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let batch = next_window(&mut op);
 
-    // then: the same child finished the step
-    assert_eq!(*calls.lock().unwrap(), 1);
+    // then
     assert_eq!(batch.cell_samples(0, 0).1, &[0.0, 1.0, 2.0]);
 }
 
 #[test]
 fn should_pack_samples_into_matrix_window_batch_layout() {
-    // given: 2 series, outer t=100, range=30, inner=10. Inner ts 80, 90, 100.
-    // Series 0: [1.0, 2.0, 3.0]; Series 1: [10.0, 20.0, 30.0].
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: 2 series; series 0 is t/80-ish 1,2,3 and series 1 ten times that
     let series = mk_labels(2);
-    let series_clone = series.clone();
-
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = vec![
-            mk_batch(
-                ts_arc.clone(),
-                0,
-                series_clone.clone(),
-                &[Some(1.0), Some(10.0)],
-            ),
-            mk_batch(
-                ts_arc.clone(),
-                1,
-                series_clone.clone(),
-                &[Some(2.0), Some(20.0)],
-            ),
-            mk_batch(
-                ts_arc.clone(),
-                2,
-                series_clone.clone(),
-                &[Some(3.0), Some(30.0)],
-            ),
-        ];
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
+    let child = scripted_child(&series, &[80, 90, 100], |t, s| {
+        let base = (t / 10 - 7) as f64;
+        Some(if s == 0 { base } else { base * 10.0 })
     });
-
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
     // when
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let batch = match op.windows(&mut cx) {
-        Poll::Ready(Some(Ok(b))) => b,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let batch = next_window(&mut op);
 
-    // then: `cells` length = step_count * series_count = 2; per-cell
-    // indexing yields the right samples.
+    // then: `cells` length = step_count * series_count = 2
     assert_eq!(batch.cells.len(), 2);
-    let (ts0, vs0) = batch.cell_samples(0, 0);
-    assert_eq!(ts0, &[80, 90, 100]);
-    assert_eq!(vs0, &[1.0, 2.0, 3.0]);
-    let (ts1, vs1) = batch.cell_samples(0, 1);
-    assert_eq!(ts1, &[80, 90, 100]);
-    assert_eq!(vs1, &[10.0, 20.0, 30.0]);
+    assert_eq!(
+        batch.cell_samples(0, 0),
+        (&[80, 90, 100][..], &[1.0, 2.0, 3.0][..])
+    );
+    assert_eq!(
+        batch.cell_samples(0, 1),
+        (&[80, 90, 100][..], &[10.0, 20.0, 30.0][..])
+    );
 }
 
 #[test]
 fn should_yield_end_of_stream_when_outer_grid_exhausted() {
     // given: 2 outer steps
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 160,
-        step_ms: 60,
-        step_count: 2,
-    };
     let series = mk_labels(1);
-    let series_clone = series.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = vec![mk_batch(
-            ts_arc.clone(),
-            0,
-            series_clone.clone(),
-            &[Some(1.0)],
-        )];
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
+    let child = scripted_child(&series, &[80], |_, _| Some(1.0));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 2),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
@@ -449,171 +351,92 @@ fn should_yield_end_of_stream_when_outer_grid_exhausted() {
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(op.windows(&mut cx), Poll::Ready(Some(Ok(_)))));
     assert!(matches!(op.windows(&mut cx), Poll::Ready(Some(Ok(_)))));
-    // then: end-of-stream
+    // then: end-of-stream, idempotently
     assert!(matches!(op.windows(&mut cx), Poll::Ready(None)));
-    // idempotent
     assert!(matches!(op.windows(&mut cx), Poll::Ready(None)));
 }
 
 #[test]
 fn should_preserve_series_order_from_child() {
-    // given: 3 series. Inner emits values that encode the series index.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: 3 series whose value encodes the series index
     let series = mk_labels(3);
-    let series_clone = series.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = vec![mk_batch(
-            ts_arc.clone(),
-            0,
-            series_clone.clone(),
-            &[Some(0.0), Some(1.0), Some(2.0)],
-        )];
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-    // Inner step large enough to produce only one inner step inside
-    // the window (80), so the scripted child's single batch stands alone.
+    let child = scripted_child(&series, &[90], |_, s| Some(s as f64));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
-        30,
+        boxed(child),
+        outer(100, 60, 1),
         30,
         MemoryReservation::new(1 << 20),
     );
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let batch = match op.windows(&mut cx) {
-        Poll::Ready(Some(Ok(b))) => b,
-        other => panic!("unexpected: {other:?}"),
-    };
+    // when
+    let batch = next_window(&mut op);
 
-    // then: per-series cells carry the expected value in the right slot.
+    // then
     for s in 0..3 {
-        let (_, vs) = batch.cell_samples(0, s);
-        assert_eq!(vs, &[s as f64], "series {s} value in wrong slot");
+        assert_eq!(
+            batch.cell_samples(0, s).1,
+            &[s as f64],
+            "series {s} value in wrong slot"
+        );
     }
 }
 
 #[test]
 fn should_skip_invalid_cells_in_inner_output() {
-    // given: one series, 3 inner steps; the middle step's cell has
-    // validity=0 and one cell carries STALE_NAN.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: 3 inner steps; the middle is invalid, the last STALE_NAN
     let series = mk_labels(1);
-    let series_clone = series.clone();
     let stale = f64::from_bits(STALE_NAN);
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = vec![
-            mk_batch(ts_arc.clone(), 0, series_clone.clone(), &[Some(1.0)]),
-            mk_batch(ts_arc.clone(), 1, series_clone.clone(), &[None]),
-            mk_batch(ts_arc.clone(), 2, series_clone.clone(), &[Some(stale)]),
-        ];
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
+    let child = scripted_child(&series, &[80, 90, 100], |t, _| match t {
+        80 => Some(1.0),
+        90 => None,
+        _ => Some(stale),
     });
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let batch = match op.windows(&mut cx) {
-        Poll::Ready(Some(Ok(b))) => b,
-        other => panic!("unexpected: {other:?}"),
-    };
+    // when
+    let batch = next_window(&mut op);
 
-    // then: only the single good sample at ts=80 made it through.
-    let (ts, vs) = batch.cell_samples(0, 0);
-    assert_eq!(ts, &[80]);
-    assert_eq!(vs, &[1.0]);
+    // then: only the good sample at ts=80 made it through
+    assert_eq!(batch.cell_samples(0, 0), (&[80][..], &[1.0][..]));
 }
 
 #[test]
 fn should_propagate_error_from_child() {
-    // given: child errors out on first poll.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: child errors out on first poll
     let series = mk_labels(1);
-    let series_clone = series.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (_ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::with_error(
-            schema,
-            QueryError::Internal("boom".into()),
-        )) as Box<dyn Operator + Send>)
-    });
+    let mut child = scripted_child(&series, &[], |_, _| None);
+    child.queue.push(Err(QueryError::Internal("boom".into())));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
-    // then: error propagated verbatim.
+    // then: error propagated verbatim, then end-of-stream
     match op.windows(&mut cx) {
         Poll::Ready(Some(Err(QueryError::Internal(msg)))) => assert_eq!(msg, "boom"),
         other => panic!("expected Internal error, got {other:?}"),
     }
-    // Once errored, subsequent polls return end-of-stream.
     assert!(matches!(op.windows(&mut cx), Poll::Ready(None)));
 }
 
 #[test]
 fn should_respect_memory_reservation() {
-    // given: tiny cap cannot fit even the cell-index allocation.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: a cap too small for the drained inner samples
     let series = mk_labels(4);
-    let series_clone = series.clone();
-    let factory: ChildFactory = Box::new(move |_tr, step_ms| {
-        let (ts_arc, inner_grid) = mk_inner_grid(100, 30, step_ms);
-        let batches = vec![mk_batch(
-            ts_arc.clone(),
-            0,
-            series_clone.clone(),
-            &[Some(1.0); 4],
-        )];
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
+    let child = scripted_child(&series, &[80], |_, _| Some(1.0));
     let mut op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(4),
     );
 
@@ -627,102 +450,60 @@ fn should_respect_memory_reservation() {
 }
 
 #[test]
-fn should_return_static_schema() {
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
-    let series = mk_labels(1);
-    let factory: ChildFactory = Box::new(move |_tr, _step_ms| {
-        // Factory is never invoked in this test (no poll).
-        unreachable!("factory not invoked for schema-only test");
-    });
+fn should_release_inner_samples_on_drop() {
+    // given
+    let reservation = MemoryReservation::new(1 << 20);
+    let series = mk_labels(2);
+    let child = scripted_child(&series, &[80, 90, 100], |_, _| Some(1.0));
+    let mut op = SubqueryOp::new(boxed(child), outer(100, 60, 1), 30, reservation.clone());
+    drop(next_window(&mut op));
+    assert!(reservation.reserved() > 0);
+
+    // when
+    drop(op);
+
+    // then
+    assert_eq!(reservation.reserved(), 0);
+}
+
+#[test]
+fn should_take_static_schema_from_child() {
+    let series = mk_labels(2);
+    let child = scripted_child(&series, &[], |_, _| None);
     let op = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
 
-    // when/then
     let schema = <SubqueryOp as Operator>::schema(&op);
-    assert!(!schema.series.is_deferred());
-    assert!(schema.series.as_static().is_some());
+    assert_eq!(schema.series.as_static().expect("static").len(), 2);
 }
 
 #[test]
 fn should_plug_into_rollup_end_to_end() {
     // given: analog of `rate(expr[3s:1s])` — 2 outer steps, range=30ms,
-    // inner step=10ms. Inner values are a perfect 10/s counter:
-    // at ts t (ms) the value is t/10. Each inner window carries 3
-    // samples spanning the range.
+    // inner step=10ms. Inner values are a perfect 10/s counter: at ts t
+    // (ms) the value is t/10.
     //
     // First outer step (t=100): window (70, 100] → inner ts {80, 90, 100},
     // values {8, 9, 10}. Second outer step (t=130): window (100, 130]
     // → inner ts {110, 120, 130}, values {11, 12, 13}.
     //
-    // Rollup's `rate` extrapolation:
-    //   result = last - first; time_diff = (last_t - first_t)/1000
-    //   duration_to_start = (first_t - window_start)/1000
-    //   duration_to_end = (window_end - last_t)/1000
-    //   range_seconds = range_ms/1000 = 0.03
-    //
-    // Step 1: first=8@80, last=10@100; time_diff = 0.02; avg_interval=0.01;
-    //   duration_to_start = (80 - 70)/1000 = 0.01 (< threshold 0.011 → keep).
-    //   Counter-zero clip: result>0 && first>=0 → duration_to_zero = 8*(0.02/2) = 0.08;
-    //   duration_to_zero >= duration_to_start so no clip applied.
-    //   duration_to_end = 0 → factor_unit = (0.02+0.01+0)/0.02 = 1.5
-    //   rate = 2 * 1.5 / 0.03 = 100/s.
-    //
-    // Step 2: same geometry, result = 2. rate = 100/s.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 130,
-        step_ms: 30,
-        step_count: 2,
-    };
+    // Rollup's `rate` extrapolation per step: first=8@80, last=10@100;
+    // time_diff = 0.02; duration_to_start = 0.01 (< threshold 0.011 →
+    // keep); duration_to_end = 0 → factor = 1.5; rate = 2 * 1.5 / 0.03
+    // = 100/s. Step 2 has the same geometry.
     let series = mk_labels(1);
-    let series_clone = series.clone();
-
-    let call_idx = Rc::new(RefCell::new(0u64));
-    // The factory is `Send` but we want the counter for debugging; keep
-    // it side-effect-free so the callback can stay `Send`.
-    let _ = call_idx;
-
-    let factory: ChildFactory = Box::new(move |tr: TimeRange, step_ms: i64| {
-        // Compute outer_t from the window range: end_ms_exclusive - 1.
-        let outer_t = tr.end_ms_exclusive - 1;
-        let (ts_arc, inner_grid) = mk_inner_grid(outer_t, 30, step_ms);
-        let batches: Vec<StepBatch> = ts_arc
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| {
-                mk_batch(
-                    ts_arc.clone(),
-                    i,
-                    series_clone.clone(),
-                    &[Some((t / 10) as f64)],
-                )
-            })
-            .collect();
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-
+    let ts: Vec<i64> = (8..=13).map(|k| k * 10).collect();
+    let child = scripted_child(&series, &ts, |t, _| Some((t / 10) as f64));
     let subquery = SubqueryOp::new(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 30, 2),
         30,
-        10,
         MemoryReservation::new(1 << 20),
     );
-
-    // Feed subquery directly into RollupOp<SubqueryOp> via WindowStream.
     let mut rollup = RollupOp::new(
         subquery,
         RollupKind::Rate,
@@ -743,7 +524,7 @@ fn should_plug_into_rollup_end_to_end() {
         }
     }
 
-    // then: two step batches, each with rate = 100/s on cell (0, 0).
+    // then: two step batches, each with rate = 100/s on cell (0, 0)
     assert_eq!(batches.len(), 2);
     let a = batches[0].get(0, 0).expect("rate valid");
     let b = batches[1].get(0, 0).expect("rate valid");
@@ -753,51 +534,28 @@ fn should_plug_into_rollup_end_to_end() {
 
 #[test]
 fn should_use_effective_times_for_inner_window() {
-    // given: one outer step with `effective_times[0] = 200` — the
-    // inner window must cover `(200 - range, 200]` even though the
-    // outer step timestamp is `100`. This models an `@ 200` subquery
-    // evaluated at `outer_t = 100`.
-    let outer_grid = StepGrid {
-        start_ms: 100,
-        end_ms: 100,
-        step_ms: 60,
-        step_count: 1,
-    };
+    // given: one outer step at t=100 with `effective_times[0] = 200` —
+    // an `@ 200` subquery. The window must be (170, 200].
     let series = mk_labels(1);
-    let series_clone = series.clone();
-    let received_range: Arc<Mutex<Option<TimeRange>>> = Arc::new(Mutex::new(None));
-    let received_range_clone = received_range.clone();
-
-    let factory: ChildFactory = Box::new(move |tr: TimeRange, step_ms: i64| {
-        *received_range_clone.lock().unwrap() = Some(tr);
-        let (ts_arc, inner_grid) = mk_inner_grid(tr.end_ms_exclusive - 1, 30, step_ms);
-        let batches: Vec<StepBatch> = ts_arc
-            .iter()
-            .enumerate()
-            .map(|(i, _)| mk_batch(ts_arc.clone(), i, series_clone.clone(), &[Some(1.0)]))
-            .collect();
-        let schema = OperatorSchema::new(SchemaRef::Static(series_clone.clone()), inner_grid);
-        Ok(Box::new(ScriptedChild::new(schema, batches)) as Box<dyn Operator + Send>)
-    });
-
+    let child = scripted_child(&series, &[90, 100, 180, 190, 200], |t, _| Some(t as f64));
     let mut op = SubqueryOp::with_effective_times(
-        factory,
-        series,
-        outer_grid,
+        boxed(child),
+        outer(100, 60, 1),
         30,
-        10,
         Arc::from(vec![200i64]),
         MemoryReservation::new(1 << 20),
     );
 
     // when
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let _ = op.windows(&mut cx);
+    let batch = next_window(&mut op);
 
-    // then: inner window covers `(170, 200]` — i.e. `start=171,
-    // end_exclusive=201` — ignoring the outer step timestamp entirely.
-    let tr = received_range.lock().unwrap().expect("factory invoked");
-    assert_eq!(tr.start_ms, 171);
-    assert_eq!(tr.end_ms_exclusive, 201);
+    // then: sliced at the effective time, not the outer step timestamp
+    assert_eq!(batch.cell_samples(0, 0).0, &[180, 190, 200]);
+    assert_eq!(batch.effective_times.as_deref(), Some(&[200i64][..]));
+}
+
+#[test]
+fn should_span_union_of_outer_windows() {
+    assert_eq!(subquery_span(&[100, 160, 220], 30), (71, 220));
+    assert_eq!(subquery_span(&[200, 200], 30), (171, 200));
 }

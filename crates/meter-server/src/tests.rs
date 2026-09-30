@@ -301,6 +301,152 @@ async fn form_posts_preserve_read_auth() {
 }
 
 #[tokio::test]
+async fn gzipped_otlp_json_is_queryable_with_rfc3339_times_and_duration_step() {
+    // given: a spec-shaped OTLP/JSON gauge with string-encoded integers, gzipped
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.shards = 1;
+    config.write.durability = Durability::Written;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+    let body = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [
+      {"name": "otlp_json_gauge", "gauge": {"dataPoints": [
+        {"timeUnixNano": "1700000000000000000", "asInt": "7"}
+      ]}}
+    ]}]}]}"#;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, body).unwrap();
+
+    // when
+    let write = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/write/ns/alpha/v1/metrics")
+                .header(CONTENT_TYPE, "application/json")
+                .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                .body(Body::from(encoder.finish().unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let query = app
+        .clone()
+        .oneshot(
+            HttpRequest::get(
+                "/read/ns/alpha/api/v1/query_range?query=otlp_json_gauge\
+                 &start=2023-11-14T22:13:20Z&end=2023-11-14T22:14:20Z&step=15s",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // then
+    assert_eq!(write.status(), StatusCode::OK);
+    assert_eq!(write.headers()[CONTENT_TYPE], "application/json");
+    assert_eq!(query.status(), StatusCode::OK);
+    let body = query.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let values = json["data"]["result"][0]["values"].as_array().unwrap();
+    assert_eq!(values.len(), 5);
+    assert_eq!(values[0], serde_json::json!([1_700_000_000.0, "7"]));
+    assert_eq!(values[4], serde_json::json!([1_700_000_060.0, "7"]));
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_errors_use_prometheus_status_codes_and_error_types() {
+    // given: two series that label_replace collapses onto one label set
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.shards = 1;
+    config.write.durability = Durability::Written;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+    let body = r#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [
+      {"name": "collide", "gauge": {"dataPoints": [
+        {"timeUnixNano": "1700000000000000000", "asDouble": 1,
+         "attributes": [{"key": "a", "value": {"stringValue": "1"}}]},
+        {"timeUnixNano": "1700000000000000000", "asDouble": 2,
+         "attributes": [{"key": "a", "value": {"stringValue": "2"}}]}
+      ]}}
+    ]}]}]}"#;
+    let write = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/write/ns/alpha/v1/metrics")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::OK);
+
+    for (query, status, error_type) in [
+        ("sum%28", StatusCode::BAD_REQUEST, "bad_data"),
+        (
+            "label_replace(collide,%22a%22,%22x%22,%22a%22,%22.*%22)",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "execution",
+        ),
+    ] {
+        // when
+        let path = format!("/read/ns/alpha/api/v1/query?time=1700000000&query={query}");
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(response.status(), status, "{query}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "error", "{query}");
+        assert_eq!(json["errorType"], error_type, "{query}");
+    }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn otlp_rejects_unknown_content_encoding_in_request_encoding() {
+    let app = router(state(ServerMode::Standalone));
+    let response = app
+        .oneshot(
+            HttpRequest::post("/write/ns/alpha/v1/metrics")
+                .header(CONTENT_TYPE, "application/json")
+                .header(axum::http::header::CONTENT_ENCODING, "br")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+}
+
+#[tokio::test]
+async fn query_apis_reject_unparseable_times_and_steps() {
+    let state = live_standalone_state().await;
+    let app = router(state.clone());
+    for path in [
+        "/read/ns/alpha/api/v1/query?query=1&time=yesterday",
+        "/read/ns/alpha/api/v1/query?query=1&time=inf",
+        "/read/ns/alpha/api/v1/query_range?query=1&start=1&end=2&step=fast",
+        "/read/ns/alpha/api/v1/query_range?query=1&start=1&end=2&step=0s",
+        "/read/ns/alpha/api/v1/series?match%5B%5D=up&start=soon",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn namespace_http_auth_is_secure_by_default_and_explicitly_bypassable() {
     for (unauthenticated, expected) in [(false, StatusCode::UNAUTHORIZED), (true, StatusCode::OK)] {
         let mut config = test_config(ServerMode::Standalone);

@@ -10,6 +10,7 @@ use common::storage::{RecordOp, Ttl};
 use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
+use crate::postings_cache::PostingsCache;
 use crate::storage::{
     StorageSnapshot, Store, insert_forward_index, insert_series_id, merge_inverted_index,
     merge_samples,
@@ -42,6 +43,8 @@ pub(crate) struct TsdbFlusher {
     /// Rolling HLL ring estimating unique series seen in the last ~15 min.
     /// Refreshed on every flush — see `flush_delta`.
     pub(crate) active_series: Arc<ActiveSeriesTracker>,
+    /// Stamped with the bucket once a flush adding series is visible.
+    pub(crate) postings_cache: Option<Arc<PostingsCache>>,
 }
 
 /// Compute the absolute expire-at timestamp (ms since epoch) shared by every
@@ -90,6 +93,7 @@ impl TsdbFlusher {
             return Ok(snapshot?);
         }
 
+        let bucket = frozen.bucket;
         let new_series_count = frozen.series_dict_delta.len() as u64;
         let sample_count: u64 = frozen
             .samples
@@ -218,6 +222,12 @@ impl TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
 
         result?;
+        // Postings only change when a flush adds series.
+        if new_series_count > 0
+            && let Some(cache) = &self.postings_cache
+        {
+            cache.stamp(bucket);
+        }
 
         // Phase 3: snapshot refresh.
         let snap_start = std::time::Instant::now();
@@ -312,6 +322,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -345,6 +356,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -400,6 +412,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -447,6 +460,7 @@ mod tests {
             storage,
             retention: None,
             active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         }
     }
 
@@ -517,6 +531,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -554,6 +569,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let bucket = create_test_bucket();
 
@@ -599,6 +615,7 @@ mod tests {
             storage: storage.clone(),
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),

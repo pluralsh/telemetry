@@ -400,16 +400,9 @@ impl ShardedMeter {
             .buffered(width)
             .try_collect::<Vec<_>>()
             .await?;
-        let mut entries = Vec::new();
-        for shard_entries in results {
-            for entry in shard_entries {
-                if !entries.contains(&entry) {
-                    entries.push(entry);
-                }
-            }
-        }
-        entries.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
-        Ok(entries)
+        Ok(crate::discovery::dedup_metadata(
+            results.into_iter().flatten().collect(),
+        ))
     }
 
     async fn query_source(
@@ -573,6 +566,17 @@ impl QueryReader for ShardQueryReader {
         }
     }
 
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, RoaringBitmap)>> {
+        match self {
+            Self::Writer(reader) => reader.label_postings(bucket, label_name).await,
+            Self::Reader(reader) => reader.label_postings(bucket, label_name).await,
+        }
+    }
+
     async fn inverted_index_term(
         &self,
         bucket: &TimeBucket,
@@ -682,6 +686,15 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
     ) -> Result<Vec<Option<SeriesSpec>>> {
         let _permit = self.acquire().await?;
         self.inner.forward_index_many(bucket, series_ids).await
+    }
+
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, RoaringBitmap)>> {
+        let _permit = self.acquire().await?;
+        self.inner.label_postings(bucket, label_name).await
     }
 
     async fn inverted_index_term(

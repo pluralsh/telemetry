@@ -559,7 +559,7 @@ fn should_align_inner_grid_on_subquery_offset_window() {
 }
 
 #[test]
-fn should_build_subquery_factory_producing_child_per_outer_step() {
+fn should_build_subquery_over_one_inner_evaluation() {
     // given: a subquery `foo[3s:1s]` rolled up via rate()
     let source = Arc::new(MockSource::new(vec![(
         labels_of(&[("__name__", "m")]),

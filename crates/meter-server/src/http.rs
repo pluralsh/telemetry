@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::Read,
     ops::RangeInclusive,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -22,6 +23,7 @@ use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
+use server_common::http::content_type;
 
 use crate::{config::ServerMode, state::AppState};
 
@@ -126,9 +128,10 @@ async fn otlp_http(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match otlp_http_result(&state, namespace, headers, body).await {
+    let json = content_type(&headers) == Some("application/json");
+    match otlp_http_result(&state, namespace, headers, body, json).await {
         Ok(response) => response,
-        Err(error) => error.into_otlp_response(false),
+        Err(error) => error.into_otlp_response(json),
     }
 }
 
@@ -137,16 +140,35 @@ async fn otlp_http_result(
     namespace: String,
     headers: HeaderMap,
     body: Bytes,
+    json: bool,
 ) -> Result<Response, ApiError> {
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
     let id = request_id(&headers, &body);
-    let request = ExportMetricsServiceRequest::decode(body).map_err(ApiError::bad_request)?;
+    let body = decode_content_encoding(&headers, body)?;
+    let request = if json {
+        meter::otel::decode_metrics_json(&body).map_err(ApiError::bad_request)?
+    } else if matches!(
+        content_type(&headers),
+        None | Some(
+            "application/x-protobuf"
+                | "application/protobuf"
+                | "application/octet-stream"
+                | "application/vnd.google.protobuf"
+        )
+    ) {
+        ExportMetricsServiceRequest::decode(body).map_err(ApiError::bad_request)?
+    } else {
+        return Err(ApiError::unsupported_media("unsupported OTLP content type"));
+    };
     let series = OtelConverter::new(OtelConfig::default())
         .convert(&request)
         .map_err(ApiError::bad_request)?;
     state
         .route_write(&namespace, series, state.config.write.durability, id)
         .await?;
+    if json {
+        return Ok(Json(json!({})).into_response());
+    }
     let mut encoded = Vec::new();
     ExportMetricsServiceResponse {
         partial_success: None,
@@ -161,10 +183,38 @@ async fn otlp_http_result(
         .into_response())
 }
 
+/// Upper bound on a decompressed OTLP body, guarding against gzip bombs.
+const MAX_DECODED_OTLP_BYTES: u64 = 64 * 1024 * 1024;
+
+fn decode_content_encoding(headers: &HeaderMap, body: Bytes) -> Result<Bytes, ApiError> {
+    let encoding = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        return Ok(body);
+    }
+    if !encoding.eq_ignore_ascii_case("gzip") {
+        return Err(ApiError::unsupported_media(format!(
+            "unsupported content encoding {encoding:?}"
+        )));
+    }
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body.as_ref())
+        .take(MAX_DECODED_OTLP_BYTES + 1)
+        .read_to_end(&mut decoded)
+        .map_err(ApiError::bad_request)?;
+    if decoded.len() as u64 > MAX_DECODED_OTLP_BYTES {
+        return Err(ApiError::too_large());
+    }
+    Ok(Bytes::from(decoded))
+}
+
 #[derive(Deserialize)]
 struct InstantQuery {
     query: String,
-    time: Option<f64>,
+    time: Option<String>,
 }
 
 async fn query(
@@ -193,23 +243,23 @@ async fn execute_query(
     params: InstantQuery,
 ) -> Result<Response, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
+    let at = params.time.as_deref().map(parse_time).transpose()?;
     let reader = reader(&state, &namespace).await?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
-    let at = params.time.map(system_time);
     let expression = params.query;
     let value = tokio::spawn(async move { reader.query(&namespace, &expression, at).await })
         .await
         .map_err(ApiError::internal)?
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     prom_json(meter::query_value_to_response(Ok(value)))
 }
 
 #[derive(Deserialize)]
 struct RangeQuery {
     query: String,
-    start: f64,
-    end: f64,
-    step: f64,
+    start: String,
+    end: String,
+    step: String,
 }
 
 async fn query_range(
@@ -238,14 +288,16 @@ async fn execute_query_range(
     params: RangeQuery,
 ) -> Result<Response, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
-    if params.step <= 0.0 || params.end < params.start {
+    let start = parse_time(&params.start)?;
+    let end = parse_time(&params.end)?;
+    let step = meter::parse_duration(&params.step).map_err(ApiError::bad_request)?;
+    if step.is_zero() || end < start {
         return Err(ApiError::bad_request("invalid range or step"));
     }
     let reader = reader(&state, &namespace).await?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let expression = params.query;
-    let range = RangeInclusive::new(system_time(params.start), system_time(params.end));
-    let step = Duration::from_secs_f64(params.step);
+    let range = RangeInclusive::new(start, end);
     let values = tokio::spawn(async move {
         reader
             .query_range(&namespace, &expression, range, step)
@@ -253,7 +305,7 @@ async fn execute_query_range(
     })
     .await
     .map_err(ApiError::internal)?
-    .map_err(ApiError::bad_request)?;
+    .map_err(query_error)?;
     prom_json(meter::range_result_to_response(Ok(values)))
 }
 
@@ -261,8 +313,8 @@ async fn execute_query_range(
 struct MatchQuery {
     #[serde(rename = "match[]", default)]
     matches: Vec<String>,
-    start: Option<f64>,
-    end: Option<f64>,
+    start: Option<String>,
+    end: Option<String>,
 }
 
 async fn series(
@@ -297,13 +349,13 @@ async fn execute_series(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let range = time_range(params.start, params.end);
+    let range = time_range(params.start, params.end)?;
     let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
         .series(&meter_namespace, &refs, range)
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     Ok(Json(json!({"status":"success","data":data})))
 }
 
@@ -320,16 +372,17 @@ async fn labels(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let range = time_range(params.start, params.end)?;
     let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
         .labels(
             &meter_namespace,
             (!refs.is_empty()).then_some(refs.as_slice()),
-            time_range(params.start, params.end),
+            range,
         )
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     Ok(Json(json!({"status":"success","data":data})))
 }
 
@@ -346,6 +399,7 @@ async fn label_values(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let range = time_range(params.start, params.end)?;
     let meter_namespace = Namespace::new(&namespace).map_err(ApiError::bad_request)?;
     let data = reader(&state, &namespace)
         .await?
@@ -353,10 +407,10 @@ async fn label_values(
             &meter_namespace,
             &name,
             (!refs.is_empty()).then_some(refs.as_slice()),
-            time_range(params.start, params.end),
+            range,
         )
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     Ok(Json(json!({"status":"success","data":data})))
 }
 
@@ -379,7 +433,7 @@ async fn metadata(
         .await?
         .metadata(&meter_namespace, params.metric.as_deref())
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     let mut data: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for entry in entries {
         let values = data.entry(entry.metric_name).or_default();
@@ -418,7 +472,7 @@ async fn federate(
         let value = tokio::spawn(async move { reader.query(&namespace, &matcher, None).await })
             .await
             .map_err(ApiError::internal)?
-            .map_err(ApiError::bad_request)?;
+            .map_err(query_error)?;
         for sample in value.into_matrix() {
             let metric = format_prometheus_labels(&sample.labels);
             for (timestamp, value) in sample.samples {
@@ -502,15 +556,36 @@ async fn authorize_namespace(
     }
 }
 
-fn system_time(seconds: f64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs_f64(seconds.max(0.0))
+/// Parses a Prometheus API timestamp: Unix seconds (fractional allowed) or
+/// RFC 3339. Times before the epoch clamp to it, so clients sending
+/// Prometheus' minimum-time sentinel still get the full range.
+fn parse_time(value: &str) -> Result<SystemTime, ApiError> {
+    if let Ok(seconds) = value.parse::<f64>() {
+        let since_epoch = Duration::try_from_secs_f64(seconds.max(0.0))
+            .map_err(|_| ApiError::bad_request(format!("invalid timestamp {value:?}")))?;
+        return UNIX_EPOCH
+            .checked_add(since_epoch)
+            .ok_or_else(|| ApiError::bad_request(format!("invalid timestamp {value:?}")));
+    }
+    let time = meter::parse_timestamp(value).map_err(ApiError::bad_request)?;
+    Ok(time.max(UNIX_EPOCH))
 }
 
-fn time_range(start: Option<f64>, end: Option<f64>) -> RangeInclusive<SystemTime> {
-    RangeInclusive::new(
-        start.map(system_time).unwrap_or(UNIX_EPOCH),
-        end.map(system_time).unwrap_or_else(SystemTime::now),
-    )
+fn time_range(
+    start: Option<String>,
+    end: Option<String>,
+) -> Result<RangeInclusive<SystemTime>, ApiError> {
+    Ok(RangeInclusive::new(
+        start
+            .as_deref()
+            .map(parse_time)
+            .transpose()?
+            .unwrap_or(UNIX_EPOCH),
+        end.as_deref()
+            .map(parse_time)
+            .transpose()?
+            .unwrap_or_else(SystemTime::now),
+    ))
 }
 
 /// Query results go through Meter's Prometheus wire encoders so native
@@ -542,6 +617,20 @@ pub(crate) fn meter_error(error: meter::Error) -> ApiError {
         meter::Error::Backpressure => ApiError::too_many_requests(error),
         meter::Error::Storage(_) | meter::Error::Shard(_) => ApiError::unavailable(error),
         meter::Error::Internal(_) => ApiError::internal(error),
+    }
+}
+
+/// Maps query failures onto the status codes and `errorType`s Prometheus uses.
+fn query_error(error: meter::QueryError) -> ApiError {
+    match error {
+        meter::QueryError::InvalidQuery(_) => ApiError::bad_request(error),
+        meter::QueryError::Execution(_) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error).with_error_type("execution")
+        }
+        meter::QueryError::Timeout => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error).with_error_type("timeout")
+        }
+        meter::QueryError::Storage(_) => ApiError::internal(error),
     }
 }
 

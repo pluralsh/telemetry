@@ -16,6 +16,7 @@ use serde_json::json;
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    error_type: Option<&'static str>,
 }
 
 impl ApiError {
@@ -23,7 +24,14 @@ impl ApiError {
         Self {
             status,
             message: message.to_string(),
+            error_type: None,
         }
+    }
+
+    /// Overrides the Prometheus `errorType`, which otherwise follows the status.
+    pub fn with_error_type(mut self, error_type: &'static str) -> Self {
+        self.error_type = Some(error_type);
+        self
     }
 
     pub fn bad_request(error: impl Display) -> Self {
@@ -127,11 +135,12 @@ impl From<sharding::RouteError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let error_type = if self.status.is_server_error() {
-            "server"
-        } else {
-            "bad_data"
-        };
+        let error_type = self.error_type.unwrap_or(match self.status {
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+            status if status.is_server_error() => "internal",
+            _ => "bad_data",
+        });
         let response = (
             self.status,
             Json(json!({"status": "error", "errorType": error_type, "error": self.message})),
@@ -212,7 +221,14 @@ mod tests {
         assert_eq!(client["errorType"], "bad_data");
         assert_eq!(client["error"], "nope");
         let server = body(ApiError::internal("boom").into_response()).await;
-        assert_eq!(server["errorType"], "server");
+        assert_eq!(server["errorType"], "internal");
+        let unavailable = body(ApiError::unavailable("moving").into_response()).await;
+        assert_eq!(unavailable["errorType"], "unavailable");
+        let execution = ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "bad match")
+            .with_error_type("execution")
+            .into_response();
+        assert_eq!(execution.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body(execution).await["errorType"], "execution");
     }
 
     #[tokio::test]

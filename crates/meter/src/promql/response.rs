@@ -15,6 +15,7 @@ pub(crate) fn query_error_response(err: QueryError) -> ErrorResponse {
         QueryError::InvalidQuery(msg) => ErrorResponse::bad_data(msg),
         QueryError::Execution(msg) => ErrorResponse::execution(msg),
         QueryError::Timeout => ErrorResponse::timeout("query timed out"),
+        QueryError::Storage(msg) => ErrorResponse::internal(msg),
     }
 }
 

@@ -104,6 +104,32 @@ pub(crate) trait BucketQueryReader: Send + Sync {
     /// Fetch a single inverted-index posting by term. Returns `None` if
     /// the term isn't present in the bucket. See [`Self::forward_index_one`].
     async fn inverted_index_term(&self, term: &Label) -> Result<Option<RoaringBitmap>>;
+
+    /// Every value of `label_name` in the bucket with its non-empty
+    /// postings, in no particular order. Backs regex and empty-string
+    /// matchers, which must consider all of a label's values.
+    async fn label_postings(&self, label_name: &str) -> Result<Vec<(String, RoaringBitmap)>> {
+        let values = self.label_values(label_name).await?;
+        let terms: Vec<Label> = values
+            .into_iter()
+            .map(|value| Label::new(label_name, value))
+            .collect();
+        let fetches: Vec<_> = terms
+            .iter()
+            .map(|term| self.inverted_index_term(term))
+            .collect();
+        let postings: Vec<_> = stream::iter(fetches)
+            .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(terms
+            .into_iter()
+            .zip(postings)
+            .filter_map(|(term, postings)| {
+                postings.filter(|p| !p.is_empty()).map(|p| (term.value, p))
+            })
+            .collect())
+    }
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -199,6 +225,35 @@ pub(crate) trait QueryReader: Send + Sync {
         bucket: &TimeBucket,
         term: &Label,
     ) -> Result<Option<RoaringBitmap>>;
+
+    /// Every value of `label_name` in `bucket` with its postings. See
+    /// [`BucketQueryReader::label_postings`].
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, RoaringBitmap)>> {
+        let values = self.label_values(bucket, label_name).await?;
+        let terms: Vec<Label> = values
+            .into_iter()
+            .map(|value| Label::new(label_name, value))
+            .collect();
+        let fetches: Vec<_> = terms
+            .iter()
+            .map(|term| self.inverted_index_term(bucket, term))
+            .collect();
+        let postings: Vec<_> = stream::iter(fetches)
+            .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(terms
+            .into_iter()
+            .zip(postings)
+            .filter_map(|(term, postings)| {
+                postings.filter(|p| !p.is_empty()).map(|p| (term.value, p))
+            })
+            .collect())
+    }
 }
 
 /// Per-query caps from [`QueryOptions`] on reads that reach storage. The
@@ -328,6 +383,15 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
     ) -> Result<Option<RoaringBitmap>> {
         let _permit = acquire(&self.limits.metadata).await;
         self.inner.inverted_index_term(bucket, term).await
+    }
+
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, RoaringBitmap)>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.label_postings(bucket, label_name).await
     }
 }
 

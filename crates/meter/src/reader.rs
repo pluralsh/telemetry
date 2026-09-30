@@ -145,6 +145,17 @@ impl QueryReader for ReaderQueryReader {
         mini.forward_index_many(series_ids).await
     }
 
+    async fn label_postings(
+        &self,
+        bucket: &TimeBucket,
+        label_name: &str,
+    ) -> Result<Vec<(String, roaring::RoaringBitmap)>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.label_postings(label_name).await
+    }
+
     async fn inverted_index_term(
         &self,
         bucket: &TimeBucket,
@@ -362,7 +373,7 @@ impl TimeSeriesDbReader {
                 .storage
                 .get_buckets_in_range(namespace, Some(start), Some(end))
                 .await
-                .map_err(|error| QueryError::Execution(error.to_string()))?;
+                .map_err(QueryError::from)?;
             crate::discovery::names(
                 self.storage.clone(),
                 namespace,
@@ -370,7 +381,7 @@ impl TimeSeriesDbReader {
                 &self.discovery_cache,
             )
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))
+            .map_err(QueryError::from)
         } else {
             find_labels_in_range(
                 &ScopedReader {
@@ -404,7 +415,7 @@ impl TimeSeriesDbReader {
                 .storage
                 .get_buckets_in_range(namespace, Some(start), Some(end))
                 .await
-                .map_err(|error| QueryError::Execution(error.to_string()))?;
+                .map_err(QueryError::from)?;
             crate::discovery::values(
                 self.storage.clone(),
                 namespace,
@@ -413,7 +424,7 @@ impl TimeSeriesDbReader {
                 &self.discovery_cache,
             )
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))
+            .map_err(QueryError::from)
         } else {
             find_label_values_in_range(
                 &ScopedReader {
@@ -438,7 +449,7 @@ impl TimeSeriesDbReader {
             .storage
             .get_buckets_in_range(namespace, None, None)
             .await
-            .map_err(|error| QueryError::Execution(error.to_string()))?;
+            .map_err(QueryError::from)?;
         crate::discovery::metadata(
             self.storage.clone(),
             namespace,
@@ -447,7 +458,7 @@ impl TimeSeriesDbReader {
             &self.discovery_cache,
         )
         .await
-        .map_err(|error| QueryError::Execution(error.to_string()))
+        .map_err(QueryError::from)
     }
 }
 

@@ -21,6 +21,9 @@ struct ErrorEnvelope {
 #[schema(value_type = String, format = Binary)]
 struct BinaryBody(String);
 
+#[derive(ToSchema)]
+struct JsonBody {}
+
 #[utoipa::path(
     get,
     path = "/-/healthy",
@@ -55,11 +58,12 @@ fn metrics() {}
     params(
         ("namespace" = String, Path, description = "Configured tenant namespace"),
         ("query" = String, Query, description = "PromQL expression"),
-        ("time" = Option<String>, Query, description = "Evaluation timestamp")
+        ("time" = Option<String>, Query, description = "Evaluation timestamp: Unix seconds or RFC 3339")
     ),
     responses(
         (status = 200, description = "Prometheus instant-query response", body = ApiEnvelope),
         (status = 400, description = "Invalid query", body = ErrorEnvelope),
+        (status = 422, description = "Query failed during evaluation", body = ErrorEnvelope),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Unknown namespace")
     )
@@ -74,7 +78,8 @@ fn query_get() {}
     request_body(content = String, content_type = "application/x-www-form-urlencoded"),
     responses(
         (status = 200, description = "Prometheus instant-query response", body = ApiEnvelope),
-        (status = 400, description = "Invalid query", body = ErrorEnvelope)
+        (status = 400, description = "Invalid query", body = ErrorEnvelope),
+        (status = 422, description = "Query failed during evaluation", body = ErrorEnvelope)
     )
 )]
 fn query_post() {}
@@ -86,13 +91,14 @@ fn query_post() {}
     params(
         ("namespace" = String, Path),
         ("query" = String, Query, description = "PromQL expression"),
-        ("start" = String, Query),
-        ("end" = String, Query),
-        ("step" = String, Query)
+        ("start" = String, Query, description = "Unix seconds or RFC 3339"),
+        ("end" = String, Query, description = "Unix seconds or RFC 3339"),
+        ("step" = String, Query, description = "Seconds or a Prometheus duration such as `15s`")
     ),
     responses(
         (status = 200, description = "Prometheus range-query response", body = ApiEnvelope),
-        (status = 400, description = "Invalid query", body = ErrorEnvelope)
+        (status = 400, description = "Invalid query", body = ErrorEnvelope),
+        (status = 422, description = "Query failed during evaluation", body = ErrorEnvelope)
     )
 )]
 fn query_range_get() {}
@@ -103,7 +109,11 @@ fn query_range_get() {}
     tag = "query",
     params(("namespace" = String, Path)),
     request_body(content = String, content_type = "application/x-www-form-urlencoded"),
-    responses((status = 200, description = "Prometheus range-query response", body = ApiEnvelope))
+    responses(
+        (status = 200, description = "Prometheus range-query response", body = ApiEnvelope),
+        (status = 400, description = "Invalid query", body = ErrorEnvelope),
+        (status = 422, description = "Query failed during evaluation", body = ErrorEnvelope)
+    )
 )]
 fn query_range_post() {}
 
@@ -204,7 +214,13 @@ fn remote_write() {}
     path = "/write/ns/{namespace}/v1/metrics",
     tag = "ingest",
     params(("namespace" = String, Path)),
-    request_body(content = BinaryBody, content_type = "application/x-protobuf", description = "OTLP ExportMetricsServiceRequest"),
+    request_body(
+        content(
+            (BinaryBody = "application/x-protobuf"),
+            (JsonBody = "application/json")
+        ),
+        description = "OTLP ExportMetricsServiceRequest as protobuf or OTLP/JSON, optionally with `Content-Encoding: gzip`."
+    ),
     responses(
         (status = 200, description = "OTLP metrics accepted"),
         (status = 400, description = "Invalid OTLP request", body = ErrorEnvelope)
@@ -236,7 +252,7 @@ fn otlp_metrics() {}
         remote_write,
         otlp_metrics
     ),
-    components(schemas(ApiEnvelope, ErrorEnvelope, BinaryBody)),
+    components(schemas(ApiEnvelope, ErrorEnvelope, BinaryBody, JsonBody)),
     tags(
         (name = "query", description = "PromQL and federation"),
         (name = "metadata", description = "Series and label discovery"),
