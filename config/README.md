@@ -109,6 +109,10 @@ Cache variants are:
   - `submit_queue_size_threshold`: queued bytes before cache entries are dropped. Default
     `1073741824` (1 GiB).
 
+`retention_seconds` is optional Meter retention. Each time bucket's records are written with a
+SlateDB TTL of bucket start plus the retention window, so compaction drops the whole bucket at
+once. Unset (the default) keeps data forever.
+
 `reader_cache_capacity` controls each shard reader's Moka cache of loaded time-bucket query
 readers. The current implementation does not install a weight function, so the unit is entries,
 not bytes. Default `268435456`.
@@ -150,7 +154,7 @@ metadata cache and cannot evict payload blocks from the data cache.
 
 ## `sharding`
 
-- `sharding.virtual_shards`: storage-shard count for standalone and static backends. Default `8`;
+- `sharding.shards`: storage-shard count for standalone and static backends. Default `1`;
   must be greater than zero and remain identical across processes and restarts. Kubernetes derives
   the desired storage-shard count from writer StatefulSet replicas instead.
 - `sharding.io_concurrency_limit`: fixed concurrent storage I/O operations per
@@ -165,7 +169,7 @@ metadata cache and cannot evict payload blocks from the data cache.
 - `owner_id`: this process's owner ID; it must match an `owners[].id`.
 - `owners`: fixed owner list. Every entry requires `id`, numeric `ordinal`, internal gRPC
   `endpoint`, and the half-open range `[start_shard, end_shard)`. Ranges must be nonempty,
-  contiguous, nonoverlapping, start at zero, and exactly cover `virtual_shards`.
+  contiguous, nonoverlapping, start at zero, and exactly cover `shards`.
 
 `kubernetes` discovers writer membership from a StatefulSet, stores assignments in a ShardMap CR,
 and uses Leases for coordinator and shard ownership. The server must be built with the

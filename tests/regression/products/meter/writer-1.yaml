@@ -17,7 +17,7 @@ write:
   remote_concurrency: 8
   remote_retries: 3
 sharding:
-  virtual_shards: 16
+  shards: 16
   backend: static
   owner_id: meter-writer-1
   owners:

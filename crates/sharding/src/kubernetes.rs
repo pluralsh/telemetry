@@ -33,8 +33,8 @@ use tokio::{sync::watch, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AssignmentGeneration, AssignmentStore, BoxError, LeaseBackend, MigrationPhase, Owner,
-    OwnerResolver, ResolvedOwner, ShardId, ShardMap, balanced_contiguous, coordinator_step,
+    AssignmentGeneration, AssignmentStore, BoxError, EpochPolicy, LeaseBackend, Owner,
+    OwnerResolver, ResolvedOwner, ShardId, ShardMap, balanced_contiguous,
 };
 
 const RENEWED_AT_ANNOTATION: &str = "telemetry.plural.sh/renewed-at-unix-ms";
@@ -55,6 +55,7 @@ pub struct KubernetesConfig {
     pub coordinator_lease: String,
     pub shard_lease_prefix: String,
     pub lease_duration: Duration,
+    pub epoch_policy: EpochPolicy,
 }
 
 impl Default for KubernetesConfig {
@@ -70,6 +71,7 @@ impl Default for KubernetesConfig {
             coordinator_lease: "meter-shard-coordinator".to_owned(),
             shard_lease_prefix: "meter-shard".to_owned(),
             lease_duration: Duration::from_secs(15),
+            epoch_policy: EpochPolicy::default(),
         }
     }
 }
@@ -327,15 +329,6 @@ impl KubernetesLeaseSet {
             }
         }
         Ok(())
-    }
-
-    async fn is_released(&self, name: &str) -> Result<bool, KubeError> {
-        Ok(self
-            .api
-            .get_opt(name)
-            .await?
-            .as_ref()
-            .is_none_or(|lease| lease_record(lease).is_none()))
     }
 }
 
@@ -604,7 +597,7 @@ fn apply_assignment_update(tx: &watch::Sender<Option<ShardMap>>, next: ShardMap)
     if current.is_none_or(|generation| next.generation > generation) {
         tracing::info!(
             generation = next.generation.get(),
-            shard_count = next.virtual_shards,
+            shard_count = next.shard_count,
             "applied Kubernetes ShardMap generation"
         );
         tx.send_replace(Some(next));
@@ -778,7 +771,6 @@ pub async fn run_kubernetes_coordinator(
         }
     };
     let election = KubernetesCoordinatorElection::new(client.clone(), &config);
-    let migration_leases = KubernetesLeaseSet::new(client.clone(), &config);
     let coordinator_api: Api<Lease> = Api::namespaced(client.clone(), &config.namespace);
     let coordinator_selector = format!("metadata.name={}", config.coordinator_lease);
     let mut coordinator_events = watcher::watcher(
@@ -885,13 +877,6 @@ pub async fn run_kubernetes_coordinator(
                     }
                 };
                 dirty |= leader && !was_leader;
-                // A draining migration can become eligible for cutover when
-                // the source Lease is released without changing ShardMap.
-                dirty |= leader
-                    && assignments
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|map| map.migration.is_some());
             }
         }
         if !leader || !dirty {
@@ -900,14 +885,7 @@ pub async fn run_kubernetes_coordinator(
         let Some(owners) = owners.as_deref() else {
             continue;
         };
-        match reconcile_assignment(
-            store.as_ref(),
-            &migration_leases,
-            &config.shard_lease_prefix,
-            owners,
-        )
-        .await
-        {
+        match reconcile_assignment(store.as_ref(), config.epoch_policy, owners).await {
             Reconcile::Done => dirty = false,
             Reconcile::Retry => {}
             Reconcile::LostLeadership => leader = false,
@@ -924,8 +902,7 @@ enum Reconcile {
 
 async fn reconcile_assignment(
     store: &KubernetesAssignmentStore,
-    leases: &KubernetesLeaseSet,
-    shard_lease_prefix: &str,
+    policy: EpochPolicy,
     owners: &[Owner],
 ) -> Reconcile {
     let desired_shards = match u32::try_from(owners.len()) {
@@ -945,64 +922,16 @@ async fn reconcile_assignment(
             return Reconcile::Retry;
         }
     };
-    let next = if let Some(current) = current.as_ref() {
-        if desired_shards < current.virtual_shards {
-            tracing::warn!(
-                current = current.virtual_shards,
-                desired = desired_shards,
-                "writer scale-down is not supported"
-            );
-            return Reconcile::Done;
-        }
-        if current.migration.is_some() || desired_shards > current.virtual_shards {
-            let source_lease_released = if let Some(migration) = &current.migration
-                && migration.phase == MigrationPhase::Draining
-            {
-                let lease_name = shard_lease_name(shard_lease_prefix, migration.split.source_shard);
-                match leases.is_released(&lease_name).await {
-                    Ok(released) => released,
-                    Err(error) => {
-                        tracing::warn!(%error, %lease_name, "failed to inspect source shard lease");
-                        return Reconcile::Retry;
-                    }
-                }
-            } else {
-                false
-            };
-            match coordinator_step(current, desired_shards, owners, source_lease_released) {
-                Ok(Some(next)) => next,
-                Ok(None) => return Reconcile::Done,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to advance shard migration");
-                    return Reconcile::Retry;
-                }
-            }
-        } else if membership_changed(Some(current), owners, desired_shards) {
-            match balanced_contiguous(
-                current.generation.next(),
-                desired_shards,
-                owners,
-                Some(current),
-            ) {
-                Ok(next) => next,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to plan shard assignment");
-                    return Reconcile::Retry;
-                }
-            }
-        } else {
-            return Reconcile::Done;
-        }
-    } else {
-        match balanced_contiguous(AssignmentGeneration::new(1), desired_shards, owners, None) {
-            Ok(next) => next,
-            Err(error) => {
-                tracing::warn!(%error, "failed to plan initial shard assignment");
-                return Reconcile::Retry;
-            }
+    let planned = match plan_assignment(current.as_ref(), desired_shards, owners, policy, now_ns())
+    {
+        Ok(Some(next)) => next,
+        Ok(None) => return Reconcile::Done,
+        Err(error) => {
+            tracing::warn!(%error, "failed to plan shard assignment");
+            return Reconcile::Retry;
         }
     };
-    match store.publish(next).await {
+    match store.publish(planned).await {
         Ok(()) => Reconcile::Done,
         Err(error) => {
             tracing::warn!(%error, "failed to publish shard assignment");
@@ -1011,15 +940,62 @@ async fn reconcile_assignment(
     }
 }
 
-pub fn membership_changed(
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+/// Next ShardMap for `owners`, or `None` when the current one already fits.
+///
+/// Scale-up appends a routing epoch that takes effect at the next aligned
+/// cutover; existing data never moves. Scale-down is not supported and keeps
+/// the current map.
+pub fn plan_assignment(
     current: Option<&ShardMap>,
+    desired_shards: u32,
     owners: &[Owner],
-    virtual_shards: u32,
-) -> bool {
+    policy: EpochPolicy,
+    now_ns: i64,
+) -> Result<Option<ShardMap>, BoxError> {
+    let Some(current) = current else {
+        let epochs = ShardMap::initial_epochs(desired_shards)?;
+        return Ok(Some(balanced_contiguous(
+            AssignmentGeneration::new(1),
+            epochs,
+            owners,
+            None,
+        )?));
+    };
+    if desired_shards < current.shard_count {
+        tracing::warn!(
+            current = current.shard_count,
+            desired = desired_shards,
+            "writer scale-down is not supported"
+        );
+        return Ok(None);
+    }
+    if desired_shards == current.shard_count
+        && !membership_changed(Some(current), owners, desired_shards)
+    {
+        return Ok(None);
+    }
+    let epochs = current.epochs_scaled_to(desired_shards, policy, now_ns)?;
+    Ok(Some(balanced_contiguous(
+        current.generation.next(),
+        epochs,
+        owners,
+        Some(current),
+    )?))
+}
+
+pub fn membership_changed(current: Option<&ShardMap>, owners: &[Owner], shard_count: u32) -> bool {
     let Some(current) = current else {
         return true;
     };
-    if current.virtual_shards != virtual_shards {
+    if current.shard_count != shard_count {
         return true;
     }
     let current_owners = current
@@ -1069,7 +1045,10 @@ mod tests {
         let owners = (0..65)
             .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
             .collect::<Vec<_>>();
-        let map = crate::plan_next_split(&assignment(), 65, &owners).unwrap();
+        let map = plan_assignment(Some(&assignment()), 65, &owners, EpochPolicy::default(), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(map.epochs.len(), 2);
         let resource = encode_assignment(
             "assignments",
             "testing",
@@ -1081,6 +1060,36 @@ mod tests {
         .unwrap();
         assert_eq!(decode_assignment(&resource).unwrap(), Some(map));
         assert_eq!(resource.metadata.namespace.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn coordinator_plans_scale_up_epochs_and_ignores_scale_down() {
+        let owners = |count: u32| {
+            (0..count)
+                .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
+                .collect::<Vec<_>>()
+        };
+        let policy = EpochPolicy::default();
+        let initial = plan_assignment(None, 2, &owners(2), policy, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.epochs.len(), 1);
+        assert!(
+            plan_assignment(Some(&initial), 2, &owners(2), policy, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            plan_assignment(Some(&initial), 1, &owners(1), policy, 0)
+                .unwrap()
+                .is_none()
+        );
+        let scaled = plan_assignment(Some(&initial), 3, &owners(3), policy, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scaled.generation, initial.generation.next());
+        assert_eq!(scaled.shard_count, 3);
+        assert_eq!(scaled.epochs[1].effective_from_ns, policy.cutover_after(0));
     }
 
     #[test]

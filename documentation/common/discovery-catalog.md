@@ -5,14 +5,15 @@ metadata discovery. The catalog is a derived index: its records are written in
 the same atomic batch and with the same TTL as the data and query indexes that
 produced them.
 
-Catalog records use routing slot `65535`. Data routing uses only slots
-`0..4096`, so catalog records remain in the product's existing namespace and
-time-partition key space without belonging to a data shard range.
+Catalog records use the reserved record-type byte `0xFF`, directly after the
+product's namespace and time-partition prefix. Product record types are all
+lower, so catalog records stay in the partition's key space and sort after its
+data and index records.
 
 The shared suffix is:
 
 ```text
-catalog slot (u16 BE) | format version (u8 = 1) | record kind | scope | name | typed value
+catalog record type (u8 = 0xFF) | format version (u8 = 1) | record kind | scope | name | typed value
 ```
 
 Scope and name are terminated byte strings. Values are strings, booleans,

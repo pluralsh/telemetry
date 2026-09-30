@@ -11,8 +11,8 @@ retention_seconds: 3600
 page:
   target_size_bytes: 16384
   max_rows: 128
-  max_age_seconds: 1
   rows_per_block: 32
+compaction: { min_age_seconds: 1, finalize_after_seconds: 5, delete_delay_seconds: 30 }
 write: { flush_interval_seconds: 1 }
 cache: { query_entries: 0 }
 auth: { unauthenticated: true }

@@ -11,13 +11,13 @@ use std::sync::{Arc, LazyLock};
 
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::analyzer::DEFAULT_ANALYZER;
-use crate::db::PageBudget;
+use crate::db::{PageBudget, ScanTargets, StreamFilter};
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
     Grouping, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm, LogExpr, MatchOp,
@@ -189,7 +189,14 @@ impl LogDb {
         let query =
             logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
         let plan = ScanPlan::new(request, &query, &options)?;
-        let rows = load_rows(self, namespace, &plan, &PageBudget::new(options.max_pages)).await?;
+        let rows = load_rows(
+            self,
+            namespace,
+            &plan,
+            &PageBudget::new(options.max_pages),
+            None,
+        )
+        .await?;
         plan.evaluate(rows, options)
     }
 }
@@ -199,7 +206,7 @@ struct ScanPlan<'a> {
     request: &'a QueryRequest,
     query: &'a Query,
     scan_start: i64,
-    exact: Vec<Label>,
+    streams: StreamFilter,
     indexed_terms: Option<Vec<String>>,
     limit: usize,
     direction: Direction,
@@ -211,7 +218,7 @@ impl<'a> ScanPlan<'a> {
             request,
             query,
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
-            exact: common_exact_matchers(query),
+            streams: stream_filter(query)?,
             indexed_terms: indexed_match_terms(query),
             limit: options.limit,
             direction: options.direction,
@@ -252,71 +259,89 @@ pub(crate) async fn query_databases(
     validate_request(request, &options)?;
     let query = logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
     let plan = ScanPlan::new(request, &query, &options)?;
-    let scan_start = plan.scan_start;
-    let exact_for_estimate = &plan.exact;
-    let estimate_permits = Arc::clone(&global_permits);
-    let estimates = stream::iter(databases.iter().cloned())
-        .map(move |database| {
-            let permits = Arc::clone(&estimate_permits);
+    let byte_budget = options.max_in_flight_bytes.min(u32::MAX as usize);
+    let permits = Arc::new(Semaphore::new(byte_budget));
+    // Early-stopping queries may read far fewer pages than an estimate would
+    // count, so they skip the metadata pre-walk and share one budget charged
+    // per page actually read.
+    if plan.early_stop_log().is_some() {
+        let shared_budget = PageBudget::new(options.max_pages);
+        let rows = stream::iter(databases.into_iter().map(|database| {
+            let global_permits = Arc::clone(&global_permits);
+            let (plan, shared_budget) = (&plan, &shared_budget);
             async move {
-                let _permit = permits
+                let _global_permit = global_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
+                load_rows(&database, namespace, plan, shared_budget, None).await
+            }
+        }))
+        .buffered(options.max_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+        return plan.evaluate(rows, options);
+    }
+    let targets = stream::iter(databases.iter().cloned())
+        .map(|database| {
+            let global_permits = Arc::clone(&global_permits);
+            let plan = &plan;
+            async move {
+                let _permit = global_permits
                     .acquire_owned()
                     .await
                     .map_err(|_| Error::Query("global query scheduler closed".into()))?;
                 database
-                    .estimate_pages(namespace, scan_start, request.end_ns, exact_for_estimate)
+                    .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
                     .await
             }
         })
         .buffered(options.max_concurrency)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+        .try_collect::<Vec<_>>()
+        .await?;
+    let estimates = targets
+        .iter()
+        .map(|targets| targets.estimate())
+        .collect::<Vec<_>>();
     let total_pages = estimates
         .iter()
         .try_fold(0usize, |total, estimate| total.checked_add(estimate.pages))
         .ok_or_else(|| Error::Query("query page estimate overflow".into()))?;
-    // Early-stopping queries may read far fewer pages than the estimate, so
-    // they share one budget charged per page actually read instead.
-    let early_stop = plan.early_stop_log().is_some();
-    if !early_stop && total_pages > options.max_pages {
+    if total_pages > options.max_pages {
         return Err(Error::Query(format!(
             "query exceeded max_pages ({})",
             options.max_pages
         )));
     }
-    let shared_budget = PageBudget::new(options.max_pages);
-    let byte_budget = options.max_in_flight_bytes.min(u32::MAX as usize);
-    let permits = Arc::new(Semaphore::new(byte_budget));
-    let stored = stream::iter(
-        databases
-            .into_iter()
-            .zip(estimates)
-            .map(|(database, estimate)| {
-                let permits = Arc::clone(&permits);
-                let global_permits = Arc::clone(&global_permits);
-                let plan = &plan;
-                let shared_budget = &shared_budget;
-                async move {
-                    let weight = estimate.compressed_bytes.max(1).min(byte_budget as u64) as u32;
-                    let _permit = permits
-                        .acquire_many_owned(weight)
-                        .await
-                        .map_err(|_| Error::Query("query scheduler closed".into()))?;
-                    let _global_permit = global_permits
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::Query("global query scheduler closed".into()))?;
-                    if early_stop {
-                        load_rows(&database, namespace, plan, shared_budget).await
-                    } else {
-                        load_rows(&database, namespace, plan, &PageBudget::new(estimate.pages))
-                            .await
-                    }
-                }
-            }),
-    )
+    let stored = stream::iter(databases.into_iter().zip(targets).zip(estimates).map(
+        |((database, targets), estimate)| {
+            let permits = Arc::clone(&permits);
+            let global_permits = Arc::clone(&global_permits);
+            let plan = &plan;
+            async move {
+                let weight = estimate.compressed_bytes.max(1).min(byte_budget as u64) as u32;
+                let _permit = permits
+                    .acquire_many_owned(weight)
+                    .await
+                    .map_err(|_| Error::Query("query scheduler closed".into()))?;
+                let _global_permit = global_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
+                load_rows(
+                    &database,
+                    namespace,
+                    plan,
+                    &PageBudget::new(estimate.pages),
+                    Some(targets),
+                )
+                .await
+            }
+        },
+    ))
     .buffered(options.max_concurrency)
     .collect::<Vec<_>>()
     .await
@@ -333,6 +358,7 @@ async fn load_rows(
     namespace: &Namespace,
     plan: &ScanPlan<'_>,
     budget: &PageBudget,
+    targets: Option<ScanTargets>,
 ) -> Result<Vec<Row>> {
     let (start, end) = (plan.scan_start, plan.request.end_ns);
     let mut converter = RowConverter::default();
@@ -342,7 +368,7 @@ async fn load_rows(
             .read_segments(
                 namespace,
                 (start, end),
-                &plan.exact,
+                &plan.streams,
                 budget,
                 plan.direction == Direction::Backward,
                 |segment| {
@@ -355,7 +381,6 @@ async fn load_rows(
                         &rows,
                         plan.request.start_ns,
                         plan.request.end_ns,
-                        Window::Log,
                     )?);
                     Ok(if output.len() >= plan.limit {
                         ControlFlow::Break(())
@@ -369,17 +394,18 @@ async fn load_rows(
         output.truncate(plan.limit);
         return Ok(output);
     }
+    let targets = match targets {
+        Some(targets) => targets,
+        None => {
+            database
+                .scan_targets(namespace, start, end, &plan.streams)
+                .await?
+        }
+    };
     if let Some(terms) = &plan.indexed_terms {
         let index_top_k = direct_index_top_k(plan.query, plan.limit);
         if let Some(rows) = database
-            .read_match_bounded(
-                namespace,
-                start,
-                end,
-                &plan.exact,
-                (terms, index_top_k),
-                budget.limit(),
-            )
+            .read_match_bounded(namespace, &targets, (terms, index_top_k), budget.limit())
             .await?
         {
             return Ok(rows
@@ -389,7 +415,7 @@ async fn load_rows(
         }
     }
     Ok(database
-        .read_bounded(namespace, start, end, &plan.exact, budget)
+        .read_bounded(namespace, targets, budget)
         .await?
         .into_iter()
         .map(|row| converter.convert(row, None))
@@ -476,10 +502,11 @@ fn evaluate(
     indexed: bool,
 ) -> Result<QueryResult> {
     if let Expr::Log(log) = &query.value {
-        let result = eval_log_window(log, &rows, request.start_ns, request.end_ns, Window::Log)?;
+        let result = eval_log_window(log, &rows, request.start_ns, request.end_ns)?;
         return finish_logs(result, &options, indexed);
     }
 
+    let rows = MetricRows::new(query, &rows)?;
     if let Some(step) = request.step_ns {
         let mut series: BTreeMap<Vec<(String, String)>, MatrixSeries> = BTreeMap::new();
         let mut timestamp = request.start_ns;
@@ -605,6 +632,19 @@ fn row_order(a: &Row, b: &Row) -> Ordering {
         .then_with(|| a.metadata.cmp(&b.metadata))
 }
 
+/// Postings narrow streams by the exact matchers every selector shares; the
+/// full selectors then prune the remaining streams by label before page I/O.
+fn stream_filter(query: &Query) -> Result<StreamFilter> {
+    let mut selectors = Vec::new();
+    collect_log_exprs(query, &mut selectors);
+    StreamFilter::new(
+        common_exact_matchers(query),
+        selectors
+            .into_iter()
+            .map(|log| log.selector.value.matchers.as_slice()),
+    )
+}
+
 fn common_exact_matchers(query: &Query) -> Vec<Label> {
     let mut selectors = Vec::new();
     collect_log_exprs(query, &mut selectors);
@@ -721,53 +761,87 @@ fn max_lookback(query: &Query) -> Result<i64> {
     })
 }
 
-fn eval_metric_log(log: &LogExpr, rows: &[Row], start: i64, end: i64) -> Result<Vec<Row>> {
-    eval_log_window(log, rows, start, end, Window::Metric)
+/// Pipeline output of every metric log expression over all loaded rows,
+/// sorted by timestamp. Stages never change timestamps, so each step's range
+/// window is a binary-searched slice rather than a fresh pipeline pass.
+struct MetricRows {
+    by_expr: HashMap<*const LogExpr, Vec<Row>>,
 }
 
-#[derive(Clone, Copy)]
-enum Window {
-    Log,
-    Metric,
+impl MetricRows {
+    fn new(query: &Query, rows: &[Row]) -> Result<Self> {
+        let mut logs = Vec::new();
+        collect_log_exprs(query, &mut logs);
+        let mut by_expr = HashMap::new();
+        for log in logs {
+            let key = log as *const LogExpr;
+            if by_expr.contains_key(&key) {
+                continue;
+            }
+            let mut output = Vec::new();
+            for source in rows {
+                if let Some(row) = pipeline_row(log, source)? {
+                    output.push(row);
+                }
+            }
+            output.sort_by_key(|row| row.timestamp_ns);
+            by_expr.insert(key, output);
+        }
+        Ok(Self { by_expr })
+    }
+
+    /// Rows of `log` in the LogQL range window `(start, end]`, shifted by
+    /// the expression's offset.
+    fn window(&self, log: &LogExpr, start: i64, end: i64) -> Result<&[Row]> {
+        let offset = log_offset(log)?;
+        let (start, end) = (start.saturating_sub(offset), end.saturating_sub(offset));
+        let rows = self
+            .by_expr
+            .get(&(log as *const LogExpr))
+            .ok_or_else(|| Error::Query("metric expression was not prepared".into()))?;
+        let low = rows.partition_point(|row| row.timestamp_ns <= start);
+        let high = rows.partition_point(|row| row.timestamp_ns <= end).max(low);
+        Ok(&rows[low..high])
+    }
 }
 
-fn eval_log_window(
-    log: &LogExpr,
-    rows: &[Row],
-    start: i64,
-    end: i64,
-    window: Window,
-) -> Result<Vec<Row>> {
-    let offset = log
+fn log_offset(log: &LogExpr) -> Result<i64> {
+    Ok(log
         .offset
         .as_ref()
         .map(|value| parse_duration_ns(&value.value))
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(0))
+}
+
+/// Rows of `log` in the log query window `[start, end)`.
+fn eval_log_window(log: &LogExpr, rows: &[Row], start: i64, end: i64) -> Result<Vec<Row>> {
+    let offset = log_offset(log)?;
     let start = start.saturating_sub(offset);
     let end = end.saturating_sub(offset);
     let mut output = Vec::new();
     for source in rows {
-        let outside = match window {
-            Window::Log => source.timestamp_ns < start || source.timestamp_ns >= end,
-            Window::Metric => source.timestamp_ns <= start || source.timestamp_ns > end,
-        };
-        if outside || !selector_matches(log, &source.labels)? {
+        if source.timestamp_ns < start || source.timestamp_ns >= end {
             continue;
         }
-        let mut row = source.clone();
-        let mut keep = true;
-        for stage in &log.stages {
-            if !apply_stage(&mut row, &stage.value)? {
-                keep = false;
-                break;
-            }
-        }
-        if keep {
+        if let Some(row) = pipeline_row(log, source)? {
             output.push(row);
         }
     }
     Ok(output)
+}
+
+fn pipeline_row(log: &LogExpr, source: &Row) -> Result<Option<Row>> {
+    if !selector_matches(log, &source.labels)? {
+        return Ok(None);
+    }
+    let mut row = source.clone();
+    for stage in &log.stages {
+        if !apply_stage(&mut row, &stage.value)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(row))
 }
 
 fn selector_matches(log: &LogExpr, labels: &BTreeMap<String, String>) -> Result<bool> {

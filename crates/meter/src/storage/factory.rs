@@ -166,6 +166,10 @@ mod failing_storage {
             self.inner.scan(range).await
         }
 
+        async fn scan_prefix(&self, prefix: Bytes) -> StorageResult<DbIterator> {
+            self.inner.scan_prefix(prefix).await
+        }
+
         async fn get_buckets_in_range(
             &self,
             namespace: &crate::Namespace,
@@ -189,31 +193,26 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: TimeBucket,
-            slots: std::ops::Range<u16>,
         ) -> crate::util::Result<ForwardIndex> {
-            self.inner.get_forward_index(namespace, bucket, slots).await
+            self.inner.get_forward_index(namespace, bucket).await
         }
 
         async fn get_inverted_index(
             &self,
             namespace: &crate::Namespace,
             bucket: TimeBucket,
-            slots: std::ops::Range<u16>,
         ) -> crate::util::Result<InvertedIndex> {
-            self.inner
-                .get_inverted_index(namespace, bucket, slots)
-                .await
+            self.inner.get_inverted_index(namespace, bucket).await
         }
 
         async fn get_inverted_index_terms(
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            slots: std::ops::Range<u16>,
             terms: &[Label],
         ) -> crate::util::Result<InvertedIndex> {
             self.inner
-                .get_inverted_index_terms(namespace, bucket, slots, terms)
+                .get_inverted_index_terms(namespace, bucket, terms)
                 .await
         }
 
@@ -221,11 +220,10 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            slots: std::ops::Range<u16>,
             term: &Label,
         ) -> crate::util::Result<Option<RoaringBitmap>> {
             self.inner
-                .get_inverted_index_term(namespace, bucket, slots, term)
+                .get_inverted_index_term(namespace, bucket, term)
                 .await
         }
 
@@ -233,11 +231,10 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            slots: std::ops::Range<u16>,
             series_ids: &[SeriesId],
         ) -> crate::util::Result<ForwardIndex> {
             self.inner
-                .get_forward_index_series(namespace, bucket, slots, series_ids)
+                .get_forward_index_series(namespace, bucket, series_ids)
                 .await
         }
 
@@ -245,11 +242,10 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            slots: std::ops::Range<u16>,
             series_id: SeriesId,
         ) -> crate::util::Result<Option<SeriesSpec>> {
             self.inner
-                .get_forward_index_one(namespace, bucket, slots, series_id)
+                .get_forward_index_one(namespace, bucket, series_id)
                 .await
         }
 
@@ -257,14 +253,13 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            routing_slot: u16,
             insert: F,
         ) -> crate::util::Result<u32>
         where
             F: FnMut(SeriesFingerprint, SeriesId) + Send,
         {
             self.inner
-                .load_series_dictionary(namespace, bucket, routing_slot, insert)
+                .load_series_dictionary(namespace, bucket, insert)
                 .await
         }
 
@@ -272,11 +267,10 @@ mod failing_storage {
             &self,
             namespace: &crate::Namespace,
             bucket: &TimeBucket,
-            slots: std::ops::Range<u16>,
             label_name: &str,
         ) -> crate::util::Result<Vec<String>> {
             self.inner
-                .get_label_values(namespace, bucket, slots, label_name)
+                .get_label_values(namespace, bucket, label_name)
                 .await
         }
     }

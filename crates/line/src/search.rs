@@ -392,12 +392,11 @@ pub(crate) async fn term_index_writes(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
-    slot: u16,
     term: String,
     mut postings: Vec<Posting>,
 ) -> Result<Vec<(Bytes, Bytes)>> {
     postings.sort_unstable_by_key(|posting| posting.address);
-    let stats_key = term_stats_key(namespace, segment, slot, &term);
+    let stats_key = term_stats_key(namespace, segment, &term);
     let mut stats = storage
         .get(stats_key.clone())
         .await?
@@ -416,7 +415,7 @@ pub(crate) async fn term_index_writes(
     if let Some(tail_ordinal) = stats.blocks.checked_sub(1) {
         let page = directory_page(tail_ordinal);
         let mut entries = storage
-            .get(term_directory_key(namespace, segment, slot, &term, page))
+            .get(term_directory_key(namespace, segment, &term, page))
             .await?
             .map(|record| decode_directory(&record.value))
             .transpose()?
@@ -428,7 +427,7 @@ pub(crate) async fn term_index_writes(
             && tail.ordinal == tail_ordinal
             && usize::from(tail.postings) < POSTINGS_PER_BLOCK
         {
-            let block_key = term_posting_block_key(namespace, segment, slot, &term, tail_ordinal);
+            let block_key = term_posting_block_key(namespace, segment, &term, tail_ordinal);
             let mut block = storage
                 .get(block_key.clone())
                 .await?
@@ -459,13 +458,13 @@ pub(crate) async fn term_index_writes(
         }
         entries.push(BlockDirectoryEntry::describe(ordinal, chunk)?);
         writes.push((
-            term_posting_block_key(namespace, segment, slot, &term, ordinal),
+            term_posting_block_key(namespace, segment, &term, ordinal),
             encode_postings(chunk)?,
         ));
     }
     for (page, entries) in directories {
         writes.push((
-            term_directory_key(namespace, segment, slot, &term, page),
+            term_directory_key(namespace, segment, &term, page),
             encode_directory(&entries)?,
         ));
     }
@@ -537,7 +536,6 @@ pub(crate) async fn block_max_scores(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
-    slot: u16,
     terms: &[String],
     allowed_pages: &HashSet<(StreamId, u64)>,
     limit: Option<usize>,
@@ -545,10 +543,7 @@ pub(crate) async fn block_max_scores(
     if allowed_pages.is_empty() {
         return Ok(Some(HashMap::new()));
     }
-    let Some(record) = storage
-        .get(field_stats_key(namespace, segment, slot))
-        .await?
-    else {
+    let Some(record) = storage.get(field_stats_key(namespace, segment)).await? else {
         return Ok(None);
     };
     let field = decode_field_stats(&record.value)?;
@@ -559,7 +554,7 @@ pub(crate) async fn block_max_scores(
 
     let stats = futures::future::try_join_all(terms.iter().map(|term| async move {
         storage
-            .get(term_stats_key(namespace, segment, slot, term))
+            .get(term_stats_key(namespace, segment, term))
             .await?
             .map(|record| decode_term_stats(&record.value))
             .transpose()
@@ -580,11 +575,7 @@ pub(crate) async fn block_max_scores(
     if let ([query], Some(limit)) = (queries.as_slice(), limit) {
         return single_term_top_k(
             storage,
-            SearchSegment {
-                namespace,
-                segment,
-                slot,
-            },
+            SearchSegment { namespace, segment },
             query,
             allowed_pages,
             limit,
@@ -597,10 +588,10 @@ pub(crate) async fn block_max_scores(
     queries.sort_by_key(|query| query.stats.documents);
     let mut candidates: HashMap<DocAddress, Vec<Hit>> = HashMap::new();
     for (index, query) in queries.iter().enumerate() {
-        let directory = load_directory(storage, namespace, segment, slot, query).await?;
+        let directory = load_directory(storage, namespace, segment, query).await?;
         let mut blocks = std::pin::pin!(
             futures::stream::iter(directory)
-                .map(|entry| load_block(storage, namespace, segment, slot, query.term, entry))
+                .map(|entry| load_block(storage, namespace, segment, query.term, entry))
                 .buffer_unordered(BLOCK_PREFETCH)
         );
         while let Some(postings) = blocks.try_next().await? {
@@ -644,7 +635,6 @@ pub(crate) async fn block_max_scores(
 struct SearchSegment<'a> {
     namespace: &'a Namespace,
     segment: SegmentId,
-    slot: u16,
 }
 
 async fn single_term_top_k(
@@ -655,8 +645,7 @@ async fn single_term_top_k(
     limit: usize,
     average_length: f32,
 ) -> Result<HashMap<DocAddress, f32>> {
-    let mut directory =
-        load_directory(storage, scope.namespace, scope.segment, scope.slot, query).await?;
+    let mut directory = load_directory(storage, scope.namespace, scope.segment, query).await?;
     // Highest-bound blocks establish the top-k floor early.
     directory.sort_by(|left, right| {
         block_bound(*right, query.idf, average_length)
@@ -669,15 +658,8 @@ async fn single_term_top_k(
     let mut blocks = std::pin::pin!(
         futures::stream::iter(directory)
             .map(|entry| async move {
-                let postings = load_block(
-                    storage,
-                    scope.namespace,
-                    scope.segment,
-                    scope.slot,
-                    query.term,
-                    entry,
-                )
-                .await?;
+                let postings =
+                    load_block(storage, scope.namespace, scope.segment, query.term, entry).await?;
                 Ok::<_, Error>((entry, postings))
             })
             .buffered(BLOCK_PREFETCH)
@@ -716,7 +698,6 @@ async fn load_directory(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
-    slot: u16,
     query: &TermQuery<'_>,
 ) -> Result<Vec<BlockDirectoryEntry>> {
     let pages = (query.stats.blocks as usize).div_ceil(DIRECTORY_ENTRIES);
@@ -725,7 +706,6 @@ async fn load_directory(
             .get(term_directory_key(
                 namespace,
                 segment,
-                slot,
                 query.term,
                 page as u32,
             ))
@@ -749,7 +729,6 @@ async fn load_block(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
-    slot: u16,
     term: &str,
     entry: BlockDirectoryEntry,
 ) -> Result<Vec<Posting>> {
@@ -757,7 +736,6 @@ async fn load_block(
         .get(term_posting_block_key(
             namespace,
             segment,
-            slot,
             term,
             entry.ordinal,
         ))

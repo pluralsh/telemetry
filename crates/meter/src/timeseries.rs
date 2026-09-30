@@ -4,7 +4,6 @@
 //! interacting with OpenData TimeSeries. It exposes write operations for
 //! ingesting time series data.
 
-use std::ops::Range;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -92,19 +91,10 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
-    }
-
-    pub(crate) fn storage_read(&self) -> Storage {
-        (*self.storage).clone()
-    }
-
-    pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
         let storage = Arc::new(
-            Storage::try_new_with_object_store_and_slots(
+            Storage::try_new_with_object_store(
                 &config.storage,
                 common::create_object_store(&config.storage.object_store)?,
-                owned_slots,
             )
             .await?,
         );
@@ -114,6 +104,10 @@ impl TimeSeriesDb {
             retention: config.retention,
             write_buffer: config.write_buffer,
         })
+    }
+
+    pub(crate) fn storage_read(&self) -> Storage {
+        (*self.storage).clone()
     }
 
     async fn tenant(&self, namespace: &Namespace) -> Arc<Tsdb> {

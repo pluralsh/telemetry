@@ -355,7 +355,10 @@ async fn execute_query<R: QueryReader + Send + Sync + 'static>(
     reader: R,
     ctx: crate::promql::plan::LoweringContext,
     is_instant: bool,
+    opts: &QueryOptions,
 ) -> std::result::Result<ExecuteOutcome, QueryError> {
+    let reader =
+        crate::query::LimitedQueryReader::new(reader, crate::query::QueryLimits::new(opts));
     let source = Arc::new(crate::promql::source_adapter::QueryReaderSource::new(
         Arc::new(reader),
     ));
@@ -671,7 +674,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
                 t0.elapsed().as_nanos() as u64,
             );
         }
-        execute_query(query, reader, plan_ctx, /*is_instant=*/ true).await
+        execute_query(query, reader, plan_ctx, /*is_instant=*/ true, opts).await
     }
 
     /// Evaluate a range PromQL query and project the resulting
@@ -763,7 +766,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
                 t0.elapsed().as_nanos() as u64,
             );
         }
-        execute_query(query, reader, plan_ctx, /*is_instant=*/ false).await
+        execute_query(query, reader, plan_ctx, /*is_instant=*/ false, opts).await
     }
 }
 
@@ -997,7 +1000,7 @@ pub(crate) struct Tsdb {
 
     /// TTI cache (15 min idle) for buckets being actively ingested into.
     /// Also used during queries so that unflushed data is visible.
-    ingest_cache: Cache<(TimeBucket, u16), Arc<MiniTsdb>>,
+    ingest_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
     discovery_cache: crate::discovery::MeterDiscoveryCache,
     /// Serializes cache misses so concurrent writes cannot construct two
     /// coordinators for the same bucket.
@@ -1069,19 +1072,16 @@ impl Tsdb {
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) async fn get_or_create_for_ingest_slot(
+    pub(crate) async fn get_or_create_for_ingest(
         &self,
         bucket: TimeBucket,
-        routing_slot: u16,
     ) -> Result<Arc<MiniTsdb>> {
-        let cache_key = (bucket, routing_slot);
-        // Try ingest cache first
-        if let Some(mini) = self.ingest_cache.get(&cache_key).await {
+        if let Some(mini) = self.ingest_cache.get(&bucket).await {
             return Ok(mini);
         }
 
         let _creation = self.bucket_creation.lock().await;
-        if let Some(mini) = self.ingest_cache.get(&cache_key).await {
+        if let Some(mini) = self.ingest_cache.get(&bucket).await {
             return Ok(mini);
         }
 
@@ -1091,7 +1091,6 @@ impl Tsdb {
             MiniTsdb::load(
                 self.namespace.clone(),
                 bucket,
-                routing_slot,
                 self.storage.clone(),
                 self.retention,
                 self.active_series.clone(),
@@ -1099,16 +1098,8 @@ impl Tsdb {
             )
             .await?,
         );
-        self.ingest_cache.insert(cache_key, mini.clone()).await;
+        self.ingest_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn get_or_create_for_ingest(
-        &self,
-        bucket: TimeBucket,
-    ) -> Result<Arc<MiniTsdb>> {
-        self.get_or_create_for_ingest_slot(bucket, 0).await
     }
 
     /// Create a QueryReader for a time range.
@@ -1126,7 +1117,7 @@ impl Tsdb {
             .await?;
         self.ingest_cache.run_pending_tasks().await;
         for (key, _) in self.ingest_cache.iter() {
-            let bucket = key.0;
+            let bucket = *key;
             let bucket_start = i64::from(bucket.start) * 60;
             let bucket_end = bucket_start + i64::from(bucket.size_in_mins()) * 60;
             if bucket_end > start_secs && bucket_start <= end_secs && !buckets.contains(&bucket) {
@@ -1156,7 +1147,7 @@ impl Tsdb {
         };
         self.ingest_cache.run_pending_tasks().await;
         for (key, _) in self.ingest_cache.iter() {
-            let bucket = key.0;
+            let bucket = *key;
             let bucket_start = i64::from(bucket.start) * 60;
             let bucket_end = bucket_start + i64::from(bucket.size_in_mins()) * 60;
             if ranges
@@ -1185,12 +1176,7 @@ impl Tsdb {
     ) -> Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)> {
         let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
-            let reader = MiniQueryReader::new(
-                self.namespace.clone(),
-                bucket,
-                self.storage.owned_slots(),
-                snapshot.clone(),
-            );
+            let reader = MiniQueryReader::new(self.namespace.clone(), bucket, snapshot.clone());
             readers.push((bucket, reader));
         }
         readers
@@ -1263,7 +1249,7 @@ impl Tsdb {
         if !series_list.is_empty() {
             self.discovery_cache.clear();
         }
-        let mut bucket_series_map: HashMap<(TimeBucket, u16), Vec<Series>> = HashMap::new();
+        let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
         // First pass: group all series by bucket
@@ -1278,14 +1264,6 @@ impl Tsdb {
                 description,
                 samples,
             } = series;
-            let routing_slot = crate::routing::routing_slot(&self.namespace, &labels);
-            if !self.storage.owned_slots().contains(&routing_slot) {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "routing slot {routing_slot} is outside opened shard range {:?}",
-                    self.storage.owned_slots()
-                )));
-            }
-
             // Group samples by bucket for this series
             let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
 
@@ -1304,19 +1282,16 @@ impl Tsdb {
                 continue;
             };
             for (bucket, samples) in groups {
-                bucket_series_map
-                    .entry((bucket, routing_slot))
-                    .or_default()
-                    .push(Series {
-                        labels: labels.clone(),
-                        metric_type,
-                        unit: unit.clone(),
-                        description: description.clone(),
-                        samples,
-                    });
+                bucket_series_map.entry(bucket).or_default().push(Series {
+                    labels: labels.clone(),
+                    metric_type,
+                    unit: unit.clone(),
+                    description: description.clone(),
+                    samples,
+                });
             }
             bucket_series_map
-                .entry((last_bucket, routing_slot))
+                .entry(last_bucket)
                 .or_default()
                 .push(Series {
                     labels,
@@ -1330,7 +1305,7 @@ impl Tsdb {
         let buckets_touched = bucket_series_map.len();
 
         // Second pass: ingest all series for each bucket in a single batch
-        for ((bucket, routing_slot), series_list) in bucket_series_map {
+        for (bucket, series_list) in bucket_series_map {
             let series_count = series_list.len();
             let samples_count: usize = series_list.iter().map(|s| s.samples.len()).sum();
 
@@ -1341,10 +1316,7 @@ impl Tsdb {
                 "Ingesting batch into bucket"
             );
 
-            let mini = match self
-                .get_or_create_for_ingest_slot(bucket, routing_slot)
-                .await
-            {
+            let mini = match self.get_or_create_for_ingest(bucket).await {
                 Ok(mini) => mini,
                 Err(err) => {
                     error!("failed to load minitsdb: {:?}: {:?}", bucket, err);
@@ -1999,8 +1971,8 @@ mod tests {
         tsdb.flush().await.unwrap();
 
         // Invalidate buckets 1 & 2 from ingest cache so they'll be loaded from query cache
-        tsdb.ingest_cache.invalidate(&(bucket1, 0)).await;
-        tsdb.ingest_cache.invalidate(&(bucket2, 0)).await;
+        tsdb.ingest_cache.invalidate(&bucket1).await;
+        tsdb.ingest_cache.invalidate(&bucket2).await;
         tsdb.ingest_cache.run_pending_tasks().await;
 
         // Ingest data into buckets 3 & 4 (these stay in ingest cache)

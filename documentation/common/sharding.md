@@ -1,19 +1,20 @@
 # Sharding
 
-All databases map each record into an explicit, versioned 128-bit hash range
-owned by a stable storage shard. Storage shards decouple data placement from
+All databases route each record to a stable storage shard by hashing the
+product's canonical key and looking the hash up in the routing epoch that was
+effective at the record's timestamp. Storage shards decouple data placement from
 the current writer replica count.
 
 ```text
 client write
-    │ hash / storage routing key
+    │ (routing key, record time)
     ▼
-128-bit hash range ─► stable storage shard
+routing epoch at record time ─► 128-bit hash range ─► stable storage shard
     │ assignment generation
     ├── local owner ─► SlateDB write
     └── remote owner ─► internal gRPC ─► SlateDB write
 
-reader ─► opens/fans out across every storage shard
+reader ─► opens every storage shard and merges results
 ```
 
 SlateDB is single-writer/multi-reader, so exactly one writer owns a storage
@@ -22,20 +23,45 @@ retried up to `write.remote_retries`; fan-out is bounded by
 `write.remote_concurrency`.
 
 Routing uses the first 128 bits of BLAKE3 over each product's canonical key.
-The high 12 bits select one of 4,096 fixed routing slots; explicit inclusive
-hash ranges group contiguous slots into storage shards. Meter and Line hash the
-namespace plus canonical labels; Track hashes the namespace plus trace ID. The
-snapshot carries routing and writer-ownership generations together.
-There is no in-cluster shard replication: failover transfers the Lease and
-reopens the same SlateDB data in shared object storage.
+Meter and Line hash the namespace plus canonical labels; Track hashes the
+namespace plus trace ID. Hash ranges are aligned to 4,096 routing slots (the
+high 12 bits of the hash), which caps a deployment at 4,096 storage shards. The
+slot is only a routing granularity: it is not stored in keys.
+
+The default is one storage shard; Kubernetes sharded mode uses the writer
+replica count, which defaults to one. There is no in-cluster shard replication:
+failover transfers the Lease and reopens the same SlateDB data in shared object
+storage.
+
+## Routing epochs
+
+A `ShardMap` holds an ordered list of routing epochs. Each epoch has an
+`effective_from_ns` timestamp and a hash-range map over its shard count. A
+record is routed by the last epoch whose `effective_from_ns` is at or before
+the record's timestamp:
+
+- Meter routes each sample by its timestamp, so a series that straddles a
+  cutover is split into one write per epoch.
+- Line routes each entry by its timestamp.
+- Track routes a trace by its earliest span start time.
+
+The record's identity still selects the shard within an epoch; time only
+selects which epoch applies. Epochs only grow, so every shard referenced by an
+older epoch still exists and remains readable.
+
+Readers open every storage shard `[0, shard_count)` and merge results. Meter
+deduplicates series by fingerprint across shards, Line merges streams with
+equal labels, and Track merges the partial traces returned by each shard a
+trace ID may have been routed to.
 
 ## Backends
 
 - `standalone`: one process owns every shard.
 - `static`: fixed owners declare contiguous half-open ranges. Ranges must
-  exactly cover `[0, virtual_shards)` with no gaps or overlaps.
+  exactly cover `[0, shards)` with no gaps or overlaps.
 - `kubernetes`: StatefulSet pods provide stable identities, a ShardMap CR holds
-  assignment generations, and Leases guard coordinator and shard ownership.
+  routing epochs and assignment generations, and Leases guard coordinator and
+  shard ownership.
 
 In Kubernetes mode, a leader balances contiguous ranges across current
 StatefulSet members. The elected Rust coordinator writes the ShardMap with
@@ -46,56 +72,35 @@ watches accelerate handoff and coordinator failover.
 
 ## Online scale-up
 
-Increasing StatefulSet replicas starts one deterministic split at a time. The
-`ShardMap.spec.migration` field durably records the desired final count, source
-and target shards and owners, moved hash range, target routing map, and phase:
+Increasing writer replicas appends a routing epoch over the larger shard count.
+The new epoch takes effect at the next alignment boundary that is at least the
+lead time in the future (one hour alignment and two minutes lead by default), so
+every writer observes the epoch before any record routes by it and each product
+time partition is written under a single epoch.
 
-1. `preparing`: the source writer verifies that the target can be cloned
-   without taking a data snapshot.
-2. `prepared`: the coordinator marks the source assignment as draining.
-3. `draining`: the source writer stops writes, flushes, closes, and releases
-   its shard Lease.
-4. `cloning`: after observing the release, the source writer creates a named
-   checkpoint from the closed source and an idempotent projected clone.
-5. `ready`: the clone has been verified and is safe to route.
-6. `completing`: the coordinator atomically installs the new routing map and
-   ownership assignment.
-7. The coordinator removes the migration record. If more replicas were added,
-   it plans the next single-shard split.
+New shards start as new, empty SlateDB databases. No data is copied, cloned, or
+drained: records timestamped before the cutover keep routing by the previous
+epoch, so their shard never changes. Late-arriving records are routed by their
+own timestamp and land on the shard that already holds that time range.
 
-Routing and shard count remain unchanged through preparation, draining, and
-cloning. Writes are retried during the short drain/clone window, so no
-acknowledged writes can fall between a clone checkpoint and cutover.
-The source's ingress read lock is held through coordinator acceptance. Taking
-the exclusive drain lock therefore waits for every admitted write, rejects new
-local writes, and orders coordinator flush and durable SlateDB flush before
-close, Lease release, and checkpoint creation.
-Consequently, failed preparation or cloning cannot expose a partial target. All
-transitions increment the assignment generation and use the ShardMap
-`resourceVersion` compare-and-swap. The source-side preparation hook is
-idempotent so a restarted writer can safely retry it. A failed migration keeps
-the old routing live and records its error for operator intervention.
-
-The coordinator will not cut over until the old source Lease is released and
-the projected clone is verified. Readers reconcile their open SlateDB handles
-before publishing each watched routing generation.
+Repeated scale requests before a cutover replace the pending epoch rather than
+stacking epochs. The coordinator then rebalances ownership assignments across
+the StatefulSet, which moves shard Leases but not data.
 
 The product CR's writer replica count is user intent. The operator creates
-additional StatefulSet pods before Rust begins scale-up, but never reduces the
-StatefulSet below the authoritative ShardMap count. Scale-down is intentionally
-blocked and reported through product status until online shard merge is
-implemented.
+additional StatefulSet pods before Rust extends the ShardMap, and reports the
+number of routing epochs through product status. Scale-down is intentionally
+blocked and reported through product status: shards referenced by any epoch
+must stay writable until their data has expired.
 
 ## Rules and tuning
 
-- Kubernetes uses the product CR writer replica count as desired storage-shard
-  count and gates the effective StatefulSet count against ShardMap state.
-  `virtual_shards` remains a standalone/static backend setting.
-- A replica-count increase is a requested storage-shard migration. Until each
-  split completes, the persisted ShardMap remains authoritative.
-- Storage keys encode the 12-bit routing slot inside each existing
-  namespace/time segment, allowing projected clones to select a contiguous
-  slot interval without increasing SlateDB segment count.
+- Kubernetes uses the product CR writer replica count as the desired
+  storage-shard count and gates the effective StatefulSet count against
+  ShardMap state. `sharding.shards` only applies to the standalone and static
+  backends.
+- Retention eventually removes data routed by old epochs. Epochs themselves are
+  retained so every shard stays readable.
 - `io_concurrency_limit` sets a fixed per-pod storage I/O budget. Its default
   is 128, independent of how many storage shards a standalone process or
   reader opens. Kubernetes writers normally own one storage shard per pod.
@@ -103,9 +108,9 @@ implemented.
   `lease_duration_seconds` (defaults 5 and 15).
 - Every forwarding participant must share `auth.internal` when it is enabled.
 
-Database records choose routing boundaries differently: Meter uses time
-buckets, Line uses time segments, and Track uses time segments plus a reserved
-trace-locator segment.
+Database records choose storage partition boundaries differently: Meter uses
+time buckets, Line uses time segments, and Track uses time segments plus a
+reserved trace-locator segment.
 
 For provisional per-writer ingestion envelopes, operational headroom, and
 product-shaped benchmark requirements, see

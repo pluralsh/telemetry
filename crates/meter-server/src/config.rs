@@ -169,6 +169,8 @@ pub struct Config {
     /// Optional prefix for public read and write HTTP APIs, such as `/meter`.
     pub path_prefix: String,
     pub storage: SlateDbStorageConfig,
+    /// Samples older than this may be dropped by compaction. Unset keeps data forever.
+    pub retention_seconds: Option<u64>,
     pub reader_cache_capacity: u64,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
@@ -184,6 +186,7 @@ impl Default for Config {
             listeners: ListenerConfig::default(),
             path_prefix: String::new(),
             storage: SlateDbStorageConfig::default(),
+            retention_seconds: None,
             reader_cache_capacity: 256 * 1024 * 1024,
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
@@ -314,13 +317,12 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
-        assert_eq!(config.sharding.virtual_shards, 8);
+        assert_eq!(config.sharding.shards, 1);
         assert_eq!(config.sharding.io_concurrency_limit, 128);
         assert!(!config.auth.unauthenticated);
         config.validate().unwrap();
         let invalid: Config =
-            serde_yaml::from_str("sharding:\n  virtual_shards: 0\n  backend: standalone\n")
-                .unwrap();
+            serde_yaml::from_str("sharding:\n  shards: 0\n  backend: standalone\n").unwrap();
         assert!(invalid.validate().is_err());
     }
 

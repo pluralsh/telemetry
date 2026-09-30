@@ -21,6 +21,7 @@ futures.workspace = true
 lalrpop-util = "0.23.1"
 linkify = "0.11.0"
 logos = "0.16.1"
+metrics.workspace = true
 regex.workspace = true
 roaring.workspace = true
 serde.workspace = true
@@ -31,6 +32,7 @@ snap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]

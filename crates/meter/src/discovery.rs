@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use common::discovery::{self, DiscoveryCache, DiscoveryValue};
 use common::storage::{Record, StorageError, StorageIterator, StorageResult};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::Namespace;
 use crate::model::{MetricMetadata, MetricType, Temporality, TimeBucket};
@@ -76,6 +77,39 @@ where
         let iter = MeterStorageRead::scan(&self.0, range).await?;
         Ok(Box::new(CatalogIterator(iter)))
     }
+
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: common::BytesRange,
+        _filter_context: Option<slatedb::FilterContext>,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        use std::ops::Bound::Unbounded;
+        if !matches!((&subrange.start, &subrange.end), (Unbounded, Unbounded)) {
+            return self
+                .scan_iter(common::BytesRange::from_prefix_and_subrange(
+                    &prefix, &subrange,
+                ))
+                .await;
+        }
+        let iter = MeterStorageRead::scan_prefix(&self.0, prefix).await?;
+        Ok(Box::new(CatalogIterator(iter)))
+    }
+}
+
+/// Buckets whose catalog records are read concurrently on cache misses.
+const BUCKET_CONCURRENCY: usize = 16;
+
+/// Reads `load` for each bucket concurrently, in bucket order.
+async fn per_bucket<V, F, Fut>(buckets: &[TimeBucket], load: F) -> StorageResult<Vec<V>>
+where
+    F: Fn(TimeBucket) -> Fut,
+    Fut: std::future::Future<Output = StorageResult<V>>,
+{
+    stream::iter(buckets.iter().copied().map(load))
+        .buffered(BUCKET_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 pub(crate) async fn names<T>(
@@ -87,23 +121,25 @@ pub(crate) async fn names<T>(
 where
     T: MeterStorageRead + Clone + Send + Sync + 'static,
 {
-    let storage = CatalogStorage(storage);
-    let mut found = BTreeSet::new();
-    for bucket in buckets {
-        let key = (namespace.clone(), *bucket);
-        let names = if let Some(names) = cache.names.get(&key) {
-            names
-        } else {
-            let names = discovery::names(
-                &storage,
-                &partition_prefix(namespace, *bucket),
-                Some(CATALOG_SCOPE),
-            )
-            .await?;
-            cache.names.insert(key, names, is_active_bucket(*bucket))
-        };
-        found.extend(names.iter().cloned());
-    }
+    let storage = &CatalogStorage(storage);
+    let per_bucket = per_bucket(buckets, |bucket| async move {
+        let key = (namespace.clone(), bucket);
+        if let Some(names) = cache.names.get(&key) {
+            return Ok(names);
+        }
+        let names = discovery::names(
+            storage,
+            &partition_prefix(namespace, bucket),
+            Some(CATALOG_SCOPE),
+        )
+        .await?;
+        Ok(cache.names.insert(key, names, is_active_bucket(bucket)))
+    })
+    .await?;
+    let found = per_bucket
+        .iter()
+        .flat_map(|names| names.iter().cloned())
+        .collect::<BTreeSet<_>>();
     Ok(found.into_iter().collect())
 }
 
@@ -117,30 +153,32 @@ pub(crate) async fn values<T>(
 where
     T: MeterStorageRead + Clone + Send + Sync + 'static,
 {
-    let storage = CatalogStorage(storage);
-    let mut found = BTreeSet::new();
-    for bucket in buckets {
-        let key = (namespace.clone(), *bucket, name.to_owned());
-        let values = if let Some(values) = cache.values.get(&key) {
-            values
-        } else {
-            let mut strings = Vec::new();
-            for value in discovery::values(
-                &storage,
-                &partition_prefix(namespace, *bucket),
-                CATALOG_SCOPE,
-                name,
-            )
-            .await?
-            {
-                if let DiscoveryValue::String(value) = value {
-                    strings.push(value);
-                }
+    let storage = &CatalogStorage(storage);
+    let per_bucket = per_bucket(buckets, |bucket| async move {
+        let key = (namespace.clone(), bucket, name.to_owned());
+        if let Some(values) = cache.values.get(&key) {
+            return Ok(values);
+        }
+        let mut strings = Vec::new();
+        for value in discovery::values(
+            storage,
+            &partition_prefix(namespace, bucket),
+            CATALOG_SCOPE,
+            name,
+        )
+        .await?
+        {
+            if let DiscoveryValue::String(value) = value {
+                strings.push(value);
             }
-            cache.values.insert(key, strings, is_active_bucket(*bucket))
-        };
-        found.extend(values.iter().cloned());
-    }
+        }
+        Ok(cache.values.insert(key, strings, is_active_bucket(bucket)))
+    })
+    .await?;
+    let found = per_bucket
+        .iter()
+        .flat_map(|values| values.iter().cloned())
+        .collect::<BTreeSet<_>>();
     Ok(found.into_iter().collect())
 }
 
@@ -154,33 +192,33 @@ pub(crate) async fn metadata<T>(
 where
     T: MeterStorageRead + Clone + Send + Sync + 'static,
 {
-    let storage = CatalogStorage(storage);
+    let storage = &CatalogStorage(storage);
+    let per_bucket = per_bucket(buckets, |bucket| async move {
+        let key = (namespace.clone(), bucket);
+        if let Some(entries) = cache.metadata.get(&key) {
+            return Ok(entries);
+        }
+        let mut entries = Vec::new();
+        for (name, value) in
+            discovery::metadata(storage, &partition_prefix(namespace, bucket)).await?
+        {
+            entries.push(
+                decode_metadata(&name, &value)
+                    .map_err(|error| StorageError::Internal(error.to_string()))?,
+            );
+        }
+        Ok(cache
+            .metadata
+            .insert(key, entries, is_active_bucket(bucket)))
+    })
+    .await?;
     let mut found = Vec::new();
-    for bucket in buckets {
-        let key = (namespace.clone(), *bucket);
-        let entries = if let Some(entries) = cache.metadata.get(&key) {
-            entries
-        } else {
-            let mut entries = Vec::new();
-            for (name, value) in
-                discovery::metadata(&storage, &partition_prefix(namespace, *bucket)).await?
-            {
-                entries.push(
-                    decode_metadata(&name, &value)
-                        .map_err(|error| StorageError::Internal(error.to_string()))?,
-                );
-            }
-            cache
-                .metadata
-                .insert(key, entries, is_active_bucket(*bucket))
-        };
-        for entry in entries.iter() {
-            if metric.is_some_and(|filter| filter != entry.metric_name) {
-                continue;
-            }
-            if !found.contains(entry) {
-                found.push(entry.clone());
-            }
+    for entry in per_bucket.iter().flat_map(|entries| entries.iter()) {
+        if metric.is_some_and(|filter| filter != entry.metric_name) {
+            continue;
+        }
+        if !found.contains(entry) {
+            found.push(entry.clone());
         }
     }
     found.sort_by(|left, right| left.metric_name.cmp(&right.metric_name));
@@ -277,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_prefix_stops_before_catalog_slot() {
+    fn partition_prefix_stops_before_catalog_record_type() {
         let namespace = Namespace::new("tenant").unwrap();
         let bucket = TimeBucket {
             start: 12_345,

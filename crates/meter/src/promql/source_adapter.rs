@@ -167,10 +167,10 @@ fn async_stream_resolve<R: QueryReader + 'static>(
     time_range: TimeRange,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
     stream::once(async move {
-        let buckets = match reader.list_buckets().await {
-            Ok(bs) => bs,
-            Err(e) => return vec![Err(internal_err(e.to_string()))],
-        };
+        let buckets = reader
+            .list_buckets()
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
 
         let mut filtered: Vec<TimeBucket> = buckets
             .into_iter()
@@ -181,36 +181,29 @@ fn async_stream_resolve<R: QueryReader + 'static>(
         filtered.sort_by_key(|b| b.start);
 
         let selector = Arc::new(selector);
-        let mut fut_stream =
-            stream::iter(
-                filtered.into_iter().map(|bucket| {
-                    let reader = reader.clone();
-                    let index_cache = index_cache.clone();
-                    let selector = selector.clone();
-                    async move {
-                        resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await
-                    }
-                }),
-            )
-            .buffered(METADATA_STAGE_READAHEAD);
-
-        let mut out: Vec<Result<ResolvedSeriesChunk, QueryError>> = Vec::new();
-        while let Some(r) = fut_stream.next().await {
-            match r {
-                Ok(Some(chunk)) => out.push(Ok(chunk)),
-                Ok(None) => {}
-                Err(e) => {
-                    // On error we stop consuming; the remaining in-flight
-                    // buckets are dropped (their futures cancel) when
-                    // `fut_stream` goes out of scope.
-                    out.push(Err(e));
-                    break;
+        Ok::<_, QueryError>(
+            stream::iter(filtered.into_iter().map(move |bucket| {
+                let reader = reader.clone();
+                let index_cache = index_cache.clone();
+                let selector = selector.clone();
+                async move {
+                    resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await
                 }
-            }
-        }
-        out
+            }))
+            .buffered(METADATA_STAGE_READAHEAD),
+        )
     })
-    .flat_map(stream::iter)
+    .try_flatten()
+    .try_filter_map(|chunk| async move { Ok(chunk) })
+    // Nothing follows the first error; dropping the stream cancels the
+    // remaining in-flight buckets.
+    .scan(false, |failed, item| {
+        let emit = (!*failed).then(|| {
+            *failed = item.is_err();
+            item
+        });
+        async move { emit }
+    })
 }
 
 /// `Ok(None)` when no series match. Forward-index entries populate the

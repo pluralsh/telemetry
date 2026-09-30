@@ -251,11 +251,6 @@ spec:
                     type: array
                   page:
                     properties:
-                      maxAgeSeconds:
-                        default: 5
-                        format: int64
-                        minimum: 1
-                        type: integer
                       maxRows:
                         default: 8192
                         format: int64
@@ -9468,7 +9463,7 @@ spec:
                     type: object
                   replicas:
                     description: |-
-                      Replicas defaults to three for sharded writers and two for sharded
+                      Replicas defaults to one for sharded writers and two for sharded
                       readers. Standalone mode uses exactly one writer and no reader.
                     format: int32
                     minimum: 0
@@ -18213,7 +18208,7 @@ spec:
                     type: object
                   replicas:
                     description: |-
-                      Replicas defaults to three for sharded writers and two for sharded
+                      Replicas defaults to one for sharded writers and two for sharded
                       readers. Standalone mode uses exactly one writer and no reader.
                     format: int32
                     minimum: 0
@@ -18398,16 +18393,15 @@ spec:
               effectiveWriterReplicas:
                 format: int32
                 type: integer
-              migrationError:
-                type: string
-              migrationPhase:
-                type: string
               observedGeneration:
                 format: int64
                 type: integer
               readerEndpoint:
                 type: string
               readyWriterReplicas:
+                format: int32
+                type: integer
+              routingEpochs:
                 format: int32
                 type: integer
               shardCount:

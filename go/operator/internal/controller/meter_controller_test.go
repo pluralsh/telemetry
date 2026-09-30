@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"math"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -288,7 +289,10 @@ var _ = Describe("Meter Controller", func() {
 			},
 			Spec: telemetryv1alpha1.ShardMapSpec{
 				Generation: 1, ShardCount: 3,
-				Routing:     telemetryv1alpha1.HashRangeMap{Generation: 1, Assignments: []telemetryv1alpha1.HashRangeAssignment{}},
+				Epochs: []telemetryv1alpha1.RoutingEpoch{{
+					EffectiveFromNs: math.MinInt64,
+					Routing:         telemetryv1alpha1.HashRangeMap{Generation: 1, Assignments: []telemetryv1alpha1.HashRangeAssignment{}},
+				}},
 				Assignments: []telemetryv1alpha1.ShardAssignment{},
 			},
 		}
@@ -312,18 +316,14 @@ var _ = Describe("Meter Controller", func() {
 
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(shardMap), shardMap)).To(Succeed())
 		shardMap.Spec.Generation = 2
-		shardMap.Spec.Migration = &telemetryv1alpha1.ShardMigration{
-			Phase: "cloning", DesiredShardCount: 5,
-			Split: telemetryv1alpha1.ShardSplit{
-				SourceOwner: telemetryv1alpha1.ShardOwner{Ordinal: 1},
-				TargetOwner: telemetryv1alpha1.ShardOwner{Ordinal: 4},
-				MovedRange: telemetryv1alpha1.HashRange{
-					Start: strings.Repeat("0", 32),
-					End:   strings.Repeat("f", 32),
-				},
-			},
-			TargetRouting: telemetryv1alpha1.HashRangeMap{Generation: 2, Assignments: []telemetryv1alpha1.HashRangeAssignment{}},
-		}
+		shardMap.Spec.ShardCount = 5
+		shardMap.Spec.Epochs = append(shardMap.Spec.Epochs, telemetryv1alpha1.RoutingEpoch{
+			EffectiveFromNs: 3_600_000_000_000,
+			Routing: telemetryv1alpha1.HashRangeMap{Generation: 5, Assignments: []telemetryv1alpha1.HashRangeAssignment{{
+				Shard: 0,
+				Range: telemetryv1alpha1.HashRange{Start: strings.Repeat("0", 32), End: strings.Repeat("f", 32)},
+			}}},
+		})
 		Expect(k8sClient.Update(ctx, shardMap)).To(Succeed())
 		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
 		current.Spec.Writer.Replicas = lo.ToPtr(int32(2))
@@ -333,7 +333,8 @@ var _ = Describe("Meter Controller", func() {
 		Expect(k8sClient.Get(ctx, writerKey, writer)).To(Succeed())
 		Expect(*writer.Spec.Replicas).To(Equal(int32(5)))
 		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
-		Expect(current.Status.MigrationPhase).To(Equal("cloning"))
+		Expect(current.Status.RoutingEpochs).NotTo(BeNil())
+		Expect(*current.Status.RoutingEpochs).To(Equal(int32(2)))
 		Expect(current.Status.EffectiveWriterReplicas).To(Equal(int32(5)))
 		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionWriterScalingBlocked).Status).To(Equal(metav1.ConditionTrue))
 		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionReady).Status).To(Equal(metav1.ConditionFalse))

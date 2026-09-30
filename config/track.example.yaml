@@ -40,7 +40,7 @@ write:
   remote_retries: 2
 
 sharding:
-  virtual_shards: 8
+  shards: 1
   io_concurrency_limit: 128
   backend: standalone
 

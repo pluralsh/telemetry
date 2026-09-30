@@ -1,26 +1,22 @@
 use std::collections::HashSet;
 
 use crate::{
-    Assignment, AssignmentGeneration, AssignmentState, HashRangeMap, ModelError, Owner,
-    RoutingError, ShardMap, ShardRange,
+    Assignment, AssignmentGeneration, AssignmentState, ModelError, Owner, RoutingEpoch, ShardMap,
+    ShardRange,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     #[error("at least one owner is required")]
     NoOwners,
-    #[error("{owners} owners cannot receive non-empty ranges from {virtual_shards} shards")]
-    TooManyOwners { owners: usize, virtual_shards: u32 },
+    #[error("{owners} owners cannot receive non-empty ranges from {shard_count} shards")]
+    TooManyOwners { owners: usize, shard_count: u32 },
     #[error("owner ids and ordinals must both be unique")]
     DuplicateOwner,
-    #[error(
-        "changing storage shard count from {current} to {desired} requires a split/backfill/cutover migration"
-    )]
-    ShardCountChangeRequiresMigration { current: u32, desired: u32 },
+    #[error("at least one routing epoch is required")]
+    NoEpochs,
     #[error(transparent)]
     InvalidMap(#[from] ModelError),
-    #[error(transparent)]
-    InvalidRouting(#[from] RoutingError),
 }
 
 #[derive(Clone)]
@@ -29,7 +25,8 @@ struct Candidate {
     extras: Vec<bool>,
 }
 
-/// Plans balanced, contiguous ranges in stable ordinal order.
+/// Plans balanced, contiguous ownership of every shard referenced by `epochs`
+/// in stable ordinal order.
 ///
 /// Every owner receives either `floor(shards / owners)` or one additional
 /// shard. When there is a choice about which owners receive the remainder,
@@ -37,29 +34,23 @@ struct Candidate {
 /// previous map. Ties favor lower StatefulSet ordinals.
 pub fn balanced_contiguous(
     generation: AssignmentGeneration,
-    virtual_shards: u32,
+    epochs: Vec<RoutingEpoch>,
     owners: &[Owner],
     previous: Option<&ShardMap>,
 ) -> Result<ShardMap, PlanError> {
+    let shard_count = epochs
+        .last()
+        .map(RoutingEpoch::shard_count)
+        .ok_or(PlanError::NoEpochs)?;
     if owners.is_empty() {
         return Err(PlanError::NoOwners);
     }
-    if owners.len() > virtual_shards as usize {
+    if owners.len() > shard_count as usize {
         return Err(PlanError::TooManyOwners {
             owners: owners.len(),
-            virtual_shards,
+            shard_count,
         });
     }
-    let routing = match previous {
-        Some(previous) if previous.virtual_shards != virtual_shards => {
-            return Err(PlanError::ShardCountChangeRequiresMigration {
-                current: previous.virtual_shards,
-                desired: virtual_shards,
-            });
-        }
-        Some(previous) => previous.routing.clone(),
-        None => HashRangeMap::bootstrap(virtual_shards)?,
-    };
     let mut owners = owners.to_vec();
     owners.sort_by(|left, right| {
         left.ordinal
@@ -79,8 +70,8 @@ pub fn balanced_contiguous(
     }
 
     let count = owners.len() as u32;
-    let base = virtual_shards / count;
-    let remainder = (virtual_shards % count) as usize;
+    let base = shard_count / count;
+    let remainder = (shard_count % count) as usize;
     let mut choices: Vec<Option<Candidate>> = vec![None; remainder + 1];
     choices[0] = Some(Candidate {
         retained: 0,
@@ -100,8 +91,8 @@ pub fn balanced_contiguous(
                 }
                 let start = index as u32 * base + used as u32;
                 let end = start + base + u32::from(extra);
-                let retained = candidate.retained
-                    + retained_shards(previous, virtual_shards, &owner.id, start, end);
+                let retained =
+                    candidate.retained + retained_shards(previous, &owner.id, start, end);
                 let mut extras = candidate.extras.clone();
                 extras.push(extra);
                 let proposed = Candidate { retained, extras };
@@ -123,24 +114,17 @@ pub fn balanced_contiguous(
         .zip(extras)
         .map(|(owner, extra)| {
             let end = start + base + u32::from(extra);
-            let range = ShardRange::within(start, end, virtual_shards)
-                .expect("planner creates valid ranges");
+            let range =
+                ShardRange::within(start, end, shard_count).expect("planner creates valid ranges");
             start = end;
             Assignment::new(owner, range, AssignmentState::Active)
         })
         .collect();
-    ShardMap::with_routing(generation, virtual_shards, routing, assignments)
-        .map_err(PlanError::from)
+    ShardMap::with_epochs(generation, epochs, assignments).map_err(PlanError::from)
 }
 
-fn retained_shards(
-    previous: Option<&ShardMap>,
-    virtual_shards: u32,
-    owner_id: &str,
-    start: u32,
-    end: u32,
-) -> u32 {
-    let Some(previous) = previous.filter(|map| map.virtual_shards == virtual_shards) else {
+fn retained_shards(previous: Option<&ShardMap>, owner_id: &str, start: u32, end: u32) -> u32 {
+    let Some(previous) = previous else {
         return 0;
     };
     previous
@@ -164,7 +148,7 @@ fn is_better(proposed: &Candidate, current: Option<&Candidate>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ShardId;
+    use crate::{EpochPolicy, ShardId};
 
     fn owners(count: u32) -> Vec<Owner> {
         (0..count)
@@ -172,8 +156,12 @@ mod tests {
             .collect()
     }
 
+    fn epochs(shards: u32) -> Vec<RoutingEpoch> {
+        ShardMap::initial_epochs(shards).unwrap()
+    }
+
     fn movement(previous: &ShardMap, next: &ShardMap) -> u32 {
-        (0..previous.virtual_shards)
+        (0..previous.shard_count)
             .filter(|shard| {
                 previous.owner_of(ShardId::new(*shard)) != next.owner_of(ShardId::new(*shard))
             })
@@ -182,9 +170,15 @@ mod tests {
 
     #[test]
     fn scales_one_to_many_to_one_with_exact_balanced_coverage() {
-        let one = balanced_contiguous(AssignmentGeneration::new(1), 64, &owners(1), None).unwrap();
-        let four =
-            balanced_contiguous(AssignmentGeneration::new(2), 64, &owners(4), Some(&one)).unwrap();
+        let one = balanced_contiguous(AssignmentGeneration::new(1), epochs(64), &owners(1), None)
+            .unwrap();
+        let four = balanced_contiguous(
+            AssignmentGeneration::new(2),
+            epochs(64),
+            &owners(4),
+            Some(&one),
+        )
+        .unwrap();
         assert_eq!(
             four.assignments
                 .iter()
@@ -194,8 +188,13 @@ mod tests {
         );
         assert_eq!(movement(&one, &four), 48);
 
-        let one_again =
-            balanced_contiguous(AssignmentGeneration::new(3), 64, &owners(1), Some(&four)).unwrap();
+        let one_again = balanced_contiguous(
+            AssignmentGeneration::new(3),
+            epochs(64),
+            &owners(1),
+            Some(&four),
+        )
+        .unwrap();
         assert_eq!(one_again.assignments[0].range.len(), 64);
         assert_eq!(movement(&four, &one_again), 48);
     }
@@ -224,9 +223,13 @@ mod tests {
             ],
         )
         .unwrap();
-        let next =
-            balanced_contiguous(AssignmentGeneration::new(2), 8, &owners(3), Some(&previous))
-                .unwrap();
+        let next = balanced_contiguous(
+            AssignmentGeneration::new(2),
+            epochs(8),
+            &owners(3),
+            Some(&previous),
+        )
+        .unwrap();
         assert_eq!(
             next.assignments
                 .iter()
@@ -235,7 +238,6 @@ mod tests {
             vec![2, 3, 3]
         );
         assert_eq!(movement(&previous, &next), 0);
-        assert_eq!(next.assignments.len(), 3);
     }
 
     #[test]
@@ -245,46 +247,26 @@ mod tests {
             Owner::new("meter-0", 0),
             Owner::new("meter-1", 1),
         ];
-        let first =
-            balanced_contiguous(AssignmentGeneration::new(1), 64, &unordered, None).unwrap();
+        let first = balanced_contiguous(AssignmentGeneration::new(1), epochs(64), &unordered, None)
+            .unwrap();
         let second =
-            balanced_contiguous(AssignmentGeneration::new(1), 64, &unordered, None).unwrap();
+            balanced_contiguous(AssignmentGeneration::new(1), epochs(64), &unordered, None)
+                .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.assignments[0].owner.id, "meter-0");
     }
 
     #[test]
-    fn membership_only_rebalance_preserves_routing_and_shard_count_changes_are_rejected() {
-        let initial =
-            balanced_contiguous(AssignmentGeneration::new(1), 4, &owners(1), None).unwrap();
-        let rebalanced =
-            balanced_contiguous(AssignmentGeneration::new(2), 4, &owners(2), Some(&initial))
+    fn scale_up_keeps_existing_owners_and_assigns_new_shard_to_new_owner() {
+        let two =
+            balanced_contiguous(AssignmentGeneration::new(1), epochs(2), &owners(2), None).unwrap();
+        let scaled = two.epochs_scaled_to(3, EpochPolicy::default(), 0).unwrap();
+        let three =
+            balanced_contiguous(AssignmentGeneration::new(2), scaled, &owners(3), Some(&two))
                 .unwrap();
-        assert_eq!(rebalanced.routing, initial.routing);
-
-        assert!(matches!(
-            balanced_contiguous(
-                AssignmentGeneration::new(3),
-                5,
-                &owners(2),
-                Some(&rebalanced)
-            ),
-            Err(PlanError::ShardCountChangeRequiresMigration {
-                current: 4,
-                desired: 5
-            })
-        ));
-        assert!(matches!(
-            balanced_contiguous(
-                AssignmentGeneration::new(3),
-                3,
-                &owners(2),
-                Some(&rebalanced)
-            ),
-            Err(PlanError::ShardCountChangeRequiresMigration {
-                current: 4,
-                desired: 3
-            })
-        ));
+        assert_eq!(three.epochs.len(), 2);
+        assert_eq!(three.epochs[0], two.epochs[0]);
+        assert_eq!(movement(&two, &three), 0);
+        assert_eq!(three.owner_of(ShardId::new(2)).unwrap().id, "meter-2");
     }
 }

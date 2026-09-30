@@ -45,9 +45,12 @@ See [Operator Docs](go/operator/docs/api.md) for full API documentation.
 ## Sharding
 
 Sharding is implemented on top of Kubernetes coordination. A single versioned
-assignment snapshot carries explicit 128-bit hash-range routing plus storage
-shard ownership. Writer scaling only reassigns ownership; changing the storage
-shard count requires an explicit split/backfill/cutover migration.
+assignment snapshot carries time-based routing epochs (each a 128-bit hash-range
+map) plus storage shard ownership. Scaling writers up publishes a new routing
+epoch that cuts over at the next aligned boundary and routes new data to new,
+empty storage shards; existing data stays where it was written and readers merge
+across shards. Scale-down is not supported yet. See
+[Sharding](documentation/common/sharding.md).
 
 We utilize a few k8s api primitives to do this:
 

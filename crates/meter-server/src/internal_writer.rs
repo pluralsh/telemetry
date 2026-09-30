@@ -129,7 +129,7 @@ impl InternalWriter for AppState {
         let meter_namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let options = ShardingOptions::new(
-            assignment.virtual_shards,
+            assignment.shard_count,
             self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -137,7 +137,14 @@ impl InternalWriter for AppState {
         let mut samples = 0;
         for item in request.series {
             let item = from_proto_series(item);
-            if options.route(&assignment.routing, &meter_namespace, &item.labels) != shard {
+            if item.samples.iter().any(|sample| {
+                options.route(
+                    &assignment,
+                    &meter_namespace,
+                    &item.labels,
+                    sample.timestamp_ms,
+                ) != shard
+            }) {
                 return Err(Status::invalid_argument(
                     "misrouted_series: series does not route to requested shard",
                 ));

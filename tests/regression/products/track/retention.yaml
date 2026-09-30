@@ -10,7 +10,7 @@ segment_duration_seconds: 1
 retention_seconds: 3
 page: { target_size_bytes: 4096, max_size_bytes: 1048576, max_traces: 1 }
 write: { durability: durable, remote_concurrency: 2, remote_retries: 1 }
-sharding: { virtual_shards: 2, io_concurrency_limit: 2, backend: standalone }
+sharding: { shards: 2, io_concurrency_limit: 2, backend: standalone }
 auth:
   unauthenticated: false
   jwt:

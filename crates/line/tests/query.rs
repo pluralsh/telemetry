@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use line::{
-    Config, Direction, Field, Fields, Label, Labels, LogBatch, LogDb, LogEntry, Namespace,
-    PageConfig, QueryOptions, QueryRequest, QueryResult,
+    CompactionConfig, Config, Direction, Field, Fields, Label, Labels, LogBatch, LogDb, LogEntry,
+    Namespace, PageConfig, QueryOptions, QueryRequest, QueryResult,
 };
 
 const S: i64 = 1_000_000_000;
@@ -23,8 +23,11 @@ fn config(path: &str) -> Config {
         page: PageConfig {
             target_size_bytes: 1024,
             max_rows: 2,
-            max_age: Duration::from_secs(60),
             rows_per_block: 1,
+        },
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
         },
     }
 }

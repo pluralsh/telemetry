@@ -6,7 +6,6 @@
 //! which always fences the previous writer.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -185,14 +184,7 @@ impl TimeSeriesDbReader {
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
-        Self::open_inner(
-            storage_config,
-            reader_options,
-            cache_capacity,
-            None,
-            0..sharding::ROUTING_SLOT_COUNT,
-        )
-        .await
+        Self::open_inner(storage_config, reader_options, cache_capacity, None).await
     }
 
     /// Opens a read-only view pinned to a specific checkpoint.
@@ -212,7 +204,6 @@ impl TimeSeriesDbReader {
             reader_options,
             cache_capacity,
             Some(checkpoint_id),
-            0..sharding::ROUTING_SLOT_COUNT,
         )
         .await
     }
@@ -222,32 +213,9 @@ impl TimeSeriesDbReader {
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
         checkpoint_id: Option<Uuid>,
-        owned_slots: Range<u16>,
     ) -> Result<Self> {
-        let reader = StorageReader::try_new_with_slots(
-            &storage_config,
-            reader_options,
-            checkpoint_id,
-            owned_slots,
-        )
-        .await?;
+        let reader = StorageReader::try_new(&storage_config, reader_options, checkpoint_id).await?;
         Ok(Self::from_storage_with_capacity(reader, cache_capacity))
-    }
-
-    pub(crate) async fn open_with_slots(
-        storage_config: SlateDbStorageConfig,
-        reader_options: slatedb::config::DbReaderOptions,
-        cache_capacity: u64,
-        owned_slots: Range<u16>,
-    ) -> Result<Self> {
-        Self::open_inner(
-            storage_config,
-            reader_options,
-            cache_capacity,
-            None,
-            owned_slots,
-        )
-        .await
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
@@ -293,12 +261,7 @@ impl TimeSeriesDbReader {
         let namespace = namespace.clone();
         self.query_cache
             .get_with((namespace.clone(), bucket), async move {
-                Arc::new(MiniQueryReader::new(
-                    namespace,
-                    bucket,
-                    storage.owned_slots(),
-                    storage,
-                ))
+                Arc::new(MiniQueryReader::new(namespace, bucket, storage))
             })
             .await
     }

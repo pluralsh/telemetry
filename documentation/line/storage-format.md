@@ -2,30 +2,29 @@
 
 Line stores logs in SlateDB, partitioned by namespace and fixed-duration time
 segment. Each segment remains a SlateDB routing/compaction boundary. Inside a
-segment, records sort first by a 12-bit routing slot derived from the canonical
-`ShardedLine` routing key.
+segment, records sort by record type.
 
 ```text
 Record prefix
-┌───────────┬─────────┬─────────────────┬──────────────────┬──────────────┬─────────────┐
-│ subsystem │ version │    namespace    │   time segment   │ routing slot │ record type │
-│ 0x03      │ 0x02    │ TerminatedBytes │ sortable i64 BE  │ u16 BE       │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────────┴──────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬──────────────────┬─────────────┐
+│ subsystem │ version │    namespace    │   time segment   │ record type │
+│ 0x03      │ 0x03    │ TerminatedBytes │ sortable i64 BE  │ u8          │
+└───────────┴─────────┴─────────────────┴──────────────────┴─────────────┘
 ```
 
-`TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Routing
-slots are in `0..4096`; the unused high four bits of their `u16` encoding are
-zero. Version 2 is a hard format switch: version-1 Line databases are not read
-by this format. In the layouts below, `record prefix` means the complete prefix
+`TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Keys carry
+no routing information: shard selection hashes the canonical `ShardedLine`
+routing key against the routing epoch in effect at each entry's timestamp. The
+SlateDB segment extractor is named `line-log/v3`. Version 3 is a hard format
+switch: version-2 Line databases are not read by this format. In the layouts below, `record prefix` means the complete prefix
 above through the record-type byte.
 
 Each namespace/time-segment partition also contains the shared discovery
-catalog under reserved routing slot `0xffff` and catalog format version `1`.
+catalog under the reserved record type `0xff` and catalog format version `1`.
 Line records every stream-label
 name and string value there with the same TTL and in the same atomic storage
-apply as label postings and pages. The catalog is partition-level rather than
-routing-slot-local, so metadata reads scan one compact prefix per requested
-time segment and union results across physical shards. Existing prerelease
+apply as label postings and pages. Metadata reads scan one compact catalog
+prefix per requested time segment and union results across physical shards. Existing prerelease
 data must be reset and reingested; there is no legacy discovery fallback or
 backfill.
 
@@ -38,6 +37,7 @@ backfill.
 | `0x05` | Page metadata | Pruning and retention metadata |
 | `0x06` | Page payload | Compressed log entries |
 | `0x07` | Next page sequence | Prevents page-key collisions |
+| `0x0c` | Page tombstone | Replaced payload awaiting deletion |
 
 ## Stream and label records
 
@@ -59,10 +59,9 @@ KEY   record prefix │ label name: TerminatedBytes │ label value: raw UTF-8
 VALUE RoaringBitmap<stream_id: u32>
 ```
 
-IDs are local to one `(time segment, routing slot)` pair. The dictionary
+IDs are local to one time segment of one storage shard. The dictionary
 deduplicates complete stream label sets; forward labels reconstruct results;
-postings intersect exact label matchers. Physical shards open an authoritative
-half-open slot range and writes and scans are restricted to that range.
+postings intersect exact label matchers with one lookup per matcher.
 
 ## Page records
 
@@ -71,23 +70,52 @@ PageMetadata (0x05)
 KEY   record prefix │ stream_id: u32 │ first timestamp: sortable i64 │ sequence: u64
 VALUE ┌─────────┬───────┬─────────────────────┬──────────────┬─────────────────┬──────────┬───────────────┐
       │ version │ flags │ expiry ms           │ min ts       │ max − min ts    │ rows     │ payload bytes │
-      │ u8 = 1  │ u8    │ var_u64 if flags&1  │ i64 BE       │ var_u64         │ var_u32  │ var_u32       │
+      │ u8 = 2  │ u8    │ var_u64 if flags&1  │ i64 BE       │ var_u64         │ var_u32  │ var_u32       │
       └─────────┴───────┴─────────────────────┴──────────────┴─────────────────┴──────────┴───────────────┘
+      ┌─────────┬────────────────┬──────────────┬──────────────────────┐
+      │ level   │ written at ms  │ leaf count   │ leaf rows × count    │
+      │ u8      │ var_u64        │ var_u32      │ var_u32 each         │
+      └─────────┴────────────────┴──────────────┴──────────────────────┘
 
 PagePayload (0x06)
-KEY   same page address as PageMetadata
+KEY   same page address as PageMetadata │ level: u8
 VALUE immutable LINE page (layout below)
 
 NextPageSequence (0x07)
 KEY   record prefix │ stream_id: u32
 VALUE next sequence: u64 BE
+
+PageTombstone (0x0c)
+KEY   same address as PagePayload
+VALUE delete-after Unix ms: u64 BE
 ```
 
 The sequence prevents collisions when pages have the same first timestamp.
 Metadata is read first for time and expiry pruning, so it is kept to a few
 dozen bytes; the block directory lives only in the payload. Metadata values
-begin with a version byte (currently 1) and forward-label values with a format
+begin with a version byte (currently 2) and forward-label values with a format
 byte (currently 1); readers reject values with any other leading byte.
+
+### Compaction
+
+Each write-buffer flush writes at least one level-0 page per stream, so
+low-volume streams accumulate many small pages. The writer merges runs of
+`compaction.fan_in` consecutive same-level pages of a stream into one page one
+level higher, and after `compaction.finalize_after_seconds` past a segment's
+end merges whatever small pages remain. A run is merged only when its pages
+are time-ordered without overlap and cover consecutive sequences, and the
+result stays within the page size and row limits.
+
+A merged page keeps the metadata key of the first page it replaces and covers
+the written pages ("leaves") at consecutive sequences from there; the leaf row
+counts map full-text postings, which keep addressing leaves, to merged rows.
+The merge is one atomic write: it replaces the first metadata record, deletes
+the others, writes the new payload under its level, and writes a tombstone
+for every replaced payload. Queries that listed the old metadata can still
+read the old payloads until the tombstone's deadline
+(`compaction.delete_delay_seconds`), after which the writer deletes both. A
+writer that takes over a segment rebuilds its compaction state from page
+metadata and tombstones.
 
 ```text
 LINE page payload
@@ -144,7 +172,8 @@ before allocating new ones, so frequent small writes do not fragment postings
 into one block per write. Queries load directories first, fetch posting blocks
 concurrently, visit the rarest term first, and fetch only blocks whose impact
 bound can still enter a single-term top-k result. Field statistics, term
-statistics, directories, posting blocks, and write deltas are all slot-local.
+statistics, directories, posting blocks, and write deltas are all
+segment-local.
 
 Retention uses both SlateDB TTL and logical expiry in page metadata, so expired
 pages disappear from reads before compaction physically removes them.

@@ -9162,7 +9162,7 @@ spec:
                     type: object
                   replicas:
                     description: |-
-                      Replicas defaults to three for sharded writers and two for sharded
+                      Replicas defaults to one for sharded writers and two for sharded
                       readers. Standalone mode uses exactly one writer and no reader.
                     format: int32
                     minimum: 0

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, KeyValue, any_value},
@@ -275,12 +275,9 @@ fn structural(
     } else {
         BTreeSet::new()
     };
+    let related_index = RelatedIndex::new(relation, right, context);
     for &left_index in base {
-        let related = right
-            .iter()
-            .copied()
-            .filter(|&right_index| relation_matches(relation, left_index, right_index, context))
-            .collect::<Vec<_>>();
+        let related = related_index.related(left_index, context);
         if negate {
             if related.is_empty() {
                 output.insert(left_index);
@@ -297,41 +294,95 @@ fn structural(
     output
 }
 
-fn relation_matches(
-    relation: StructuralOp,
-    left: usize,
-    right: usize,
-    context: &TraceContext<'_>,
-) -> bool {
-    let left_span = context.spans[left].span;
-    let right_span = context.spans[right].span;
-    match relation {
-        StructuralOp::Child => left_span.parent_span_id == right_span.span_id,
-        StructuralOp::Parent => right_span.parent_span_id == left_span.span_id,
-        StructuralOp::Descendant => is_descendant(left, right, context),
-        StructuralOp::Ancestor => is_descendant(right, left, context),
-        StructuralOp::Sibling => {
-            left != right
-                && !left_span.parent_span_id.is_empty()
-                && left_span.parent_span_id == right_span.parent_span_id
+/// The right-hand spans of a structural operator, indexed so each left span
+/// finds its related right spans without scanning the whole right side.
+enum RelatedIndex<'r> {
+    /// Right spans by span id (`Child`) or parent span id (`Parent`, `Sibling`).
+    ById(StructuralOp, HashMap<&'r [u8], Vec<usize>>),
+    /// Right spans (`Descendant`), probed along each left span's ancestors.
+    Set(&'r BTreeSet<usize>),
+    /// Right spans by each of their ancestors (`Ancestor`).
+    ByAncestor(HashMap<usize, Vec<usize>>),
+}
+
+impl<'r> RelatedIndex<'r> {
+    fn new(
+        relation: StructuralOp,
+        right: &'r BTreeSet<usize>,
+        context: &'r TraceContext<'_>,
+    ) -> Self {
+        match relation {
+            StructuralOp::Child | StructuralOp::Parent | StructuralOp::Sibling => {
+                let mut index: HashMap<&[u8], Vec<usize>> = HashMap::new();
+                for &right_index in right {
+                    let span = context.spans[right_index].span;
+                    let key = if relation == StructuralOp::Child {
+                        &span.span_id
+                    } else {
+                        &span.parent_span_id
+                    };
+                    index.entry(key.as_slice()).or_default().push(right_index);
+                }
+                Self::ById(relation, index)
+            }
+            StructuralOp::Descendant => Self::Set(right),
+            _ => {
+                let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
+                for &right_index in right {
+                    for ancestor in ancestors(right_index, context) {
+                        index.entry(ancestor).or_default().push(right_index);
+                    }
+                }
+                Self::ByAncestor(index)
+            }
         }
-        _ => false,
+    }
+
+    fn related(&self, left: usize, context: &TraceContext<'_>) -> Vec<usize> {
+        let span = context.spans[left].span;
+        match self {
+            Self::ById(StructuralOp::Child, index) => index
+                .get(span.parent_span_id.as_slice())
+                .cloned()
+                .unwrap_or_default(),
+            Self::ById(StructuralOp::Parent, index) => index
+                .get(span.span_id.as_slice())
+                .cloned()
+                .unwrap_or_default(),
+            Self::ById(_, index) if !span.parent_span_id.is_empty() => index
+                .get(span.parent_span_id.as_slice())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&right| right != left)
+                .collect(),
+            Self::ById(..) => Vec::new(),
+            Self::Set(right) => {
+                let mut related = ancestors(left, context)
+                    .into_iter()
+                    .filter(|ancestor| right.contains(ancestor))
+                    .collect::<Vec<_>>();
+                related.sort_unstable();
+                related
+            }
+            Self::ByAncestor(index) => index.get(&left).cloned().unwrap_or_default(),
+        }
     }
 }
 
-fn is_descendant(mut child: usize, ancestor: usize, context: &TraceContext<'_>) -> bool {
-    let mut visited = BTreeSet::new();
-    while visited.insert(child) {
-        let parent_id = &context.spans[child].span.parent_span_id;
-        let Some(&parent) = context.by_id.get(parent_id) else {
-            return false;
-        };
-        if parent == ancestor {
-            return true;
+/// Parent chain of `index` through `by_id`, stopping at a missing parent or
+/// a cycle.
+fn ancestors(mut index: usize, context: &TraceContext<'_>) -> Vec<usize> {
+    let mut visited = HashSet::from([index]);
+    let mut chain = Vec::new();
+    while let Some(&parent) = context.by_id.get(&context.spans[index].span.parent_span_id) {
+        chain.push(parent);
+        if !visited.insert(parent) {
+            break;
         }
-        child = parent;
+        index = parent;
     }
-    false
+    chain
 }
 
 fn group_by(

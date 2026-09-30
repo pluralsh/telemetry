@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_LIMIT,
-    DEFAULT_VIRTUAL_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange,
+    DEFAULT_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange,
 };
 
 /// Product-specific defaults for the Kubernetes sharding resources.
@@ -29,7 +29,7 @@ pub enum ServerMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, bound = "P: Product")]
 pub struct ShardingConfig<P: Product> {
-    pub virtual_shards: u32,
+    pub shards: u32,
     pub io_concurrency_limit: u32,
     #[serde(flatten)]
     pub kind: ShardingBackend<P>,
@@ -38,7 +38,7 @@ pub struct ShardingConfig<P: Product> {
 impl<P: Product> Default for ShardingConfig<P> {
     fn default() -> Self {
         Self {
-            virtual_shards: DEFAULT_VIRTUAL_SHARDS,
+            shards: DEFAULT_SHARDS,
             io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
             kind: ShardingBackend::Standalone,
         }
@@ -133,6 +133,7 @@ impl<P: Product> KubernetesShardingConfig<P> {
             coordinator_lease: self.coordinator_lease.clone(),
             shard_lease_prefix: self.shard_lease_prefix.clone(),
             lease_duration: std::time::Duration::from_secs(self.lease_duration_seconds),
+            epoch_policy: crate::EpochPolicy::default(),
         }
     }
 }
@@ -150,8 +151,8 @@ fn is_label_value(value: &str) -> bool {
 
 impl<P: Product> ShardingConfig<P> {
     pub fn validate(&self, mode: ServerMode) -> Result<(), String> {
-        if self.virtual_shards == 0 {
-            return Err("sharding.virtual_shards must be greater than zero".to_owned());
+        if self.shards == 0 {
+            return Err("sharding.shards must be greater than zero".to_owned());
         }
         if self.io_concurrency_limit == 0 {
             return Err("sharding.io_concurrency_limit must be greater than zero".to_owned());
@@ -172,15 +173,13 @@ impl<P: Product> ShardingConfig<P> {
                 ranges.sort_unstable();
                 let mut expected = 0;
                 for (start, end) in ranges {
-                    if start != expected || end <= start || end > self.virtual_shards {
-                        return Err(
-                            "static owners must exactly cover all virtual shards".to_owned()
-                        );
+                    if start != expected || end <= start || end > self.shards {
+                        return Err("static owners must exactly cover all shards".to_owned());
                     }
                     expected = end;
                 }
-                if expected != self.virtual_shards {
-                    return Err("static owners must exactly cover all virtual shards".to_owned());
+                if expected != self.shards {
+                    return Err("static owners must exactly cover all shards".to_owned());
                 }
             }
             ShardingBackend::Kubernetes(settings) => {
@@ -216,7 +215,7 @@ impl<P: Product> ShardingConfig<P> {
                     ordinal: 0,
                     endpoint: grpc.to_string(),
                     start_shard: 0,
-                    end_shard: self.virtual_shards,
+                    end_shard: self.shards,
                 }],
             ),
             ShardingBackend::Static { owner_id, owners } => (owner_id.clone(), owners.clone()),
@@ -233,7 +232,7 @@ impl<P: Product> ShardingConfig<P> {
                         ordinal,
                         endpoint: kubernetes.owner_endpoint(ordinal),
                         start_shard: 0,
-                        end_shard: self.virtual_shards,
+                        end_shard: self.shards,
                     }],
                 )
             }
@@ -243,18 +242,14 @@ impl<P: Product> ShardingConfig<P> {
             .map(|owner| {
                 Ok(Assignment::new(
                     Owner::new(owner.id, owner.ordinal),
-                    ShardRange::within(owner.start_shard, owner.end_shard, self.virtual_shards)?,
+                    ShardRange::within(owner.start_shard, owner.end_shard, self.shards)?,
                     AssignmentState::Active,
                 ))
             })
             .collect::<Result<Vec<_>, ModelError>>()?;
         Ok((
             local,
-            ShardMap::new(
-                AssignmentGeneration::new(1),
-                self.virtual_shards,
-                assignments,
-            )?,
+            ShardMap::new(AssignmentGeneration::new(1), self.shards, assignments)?,
         ))
     }
 
@@ -282,7 +277,7 @@ impl<P: Product> ShardingConfig<P> {
     ) -> Vec<ShardId> {
         match mode {
             ServerMode::Standalone | ServerMode::Reader => {
-                (0..assignment.virtual_shards).map(ShardId::new).collect()
+                (0..assignment.shard_count).map(ShardId::new).collect()
             }
             ServerMode::Writer if matches!(self.kind, ShardingBackend::Kubernetes(_)) => Vec::new(),
             ServerMode::Writer => owned_shards(assignment, local_owner).collect(),
@@ -295,7 +290,7 @@ pub fn owned_shards<'a>(
     assignment: &'a ShardMap,
     owner_id: &'a str,
 ) -> impl Iterator<Item = ShardId> + 'a {
-    (0..assignment.virtual_shards)
+    (0..assignment.shard_count)
         .map(ShardId::new)
         .filter(move |shard| {
             assignment
@@ -316,14 +311,13 @@ mod runtime {
 
     use super::{KubernetesShardingConfig, Product};
     use crate::{
-        AssignmentGeneration, AssignmentStore, BoxError, OwnershipManager, OwnershipManagerConfig,
-        ReaderShardLifecycle, ShardLifecycle, ShardMap, ShardMigrationExecutor,
-        balanced_contiguous,
+        AssignmentStore, BoxError, EpochPolicy, OwnershipManager, OwnershipManagerConfig,
+        ReaderShardLifecycle, ShardLifecycle, ShardMap,
         kubernetes::{
             KubernetesAssignmentStore, KubernetesConfig, KubernetesCoordinatorElection,
-            KubernetesLeaseBackend, StatefulSetMembership, run_kubernetes_coordinator,
+            KubernetesLeaseBackend, StatefulSetMembership, plan_assignment,
+            run_kubernetes_coordinator,
         },
-        run_migration_worker,
     };
 
     /// Cluster handles a Kubernetes-sharded server keeps after startup.
@@ -339,12 +333,16 @@ mod runtime {
     impl KubernetesRuntime {
         /// Loads the published assignment. When none exists yet, competes for
         /// the coordinator lease and publishes a balanced initial assignment.
+        /// `epoch_policy` aligns scale-up cutovers to the product's time
+        /// partitions.
         pub async fn bootstrap<P: Product>(
             settings: &KubernetesShardingConfig<P>,
+            epoch_policy: EpochPolicy,
             cancellation: CancellationToken,
         ) -> Result<(Self, ShardMap), BoxError> {
             let client = kube::Client::try_default().await?;
-            let config = settings.kubernetes_config();
+            let mut config = settings.kubernetes_config();
+            config.epoch_policy = epoch_policy;
             let store =
                 KubernetesAssignmentStore::new(client.clone(), &config, cancellation.clone())
                     .await?;
@@ -364,12 +362,8 @@ mod runtime {
                             "writer replica count exceeds supported shard count",
                         )
                     })?;
-                    let initial = balanced_contiguous(
-                        AssignmentGeneration::new(1),
-                        desired_shards,
-                        &owners,
-                        None,
-                    )?;
+                    let initial = plan_assignment(None, desired_shards, &owners, epoch_policy, 0)?
+                        .expect("an initial assignment is always planned");
                     match store.publish(initial.clone()).await {
                         Ok(()) => break initial,
                         Err(error) => {
@@ -452,16 +446,14 @@ mod runtime {
 
         /// Spawns the shard ownership manager, the assignment watcher that
         /// keeps `assignment` current, and the coordinator loop.
-        pub fn spawn<R, E>(
+        pub fn spawn<R>(
             self,
             lifecycle: Arc<R>,
-            migration_executor: Arc<E>,
             assignment: Arc<RwLock<ShardMap>>,
             cancellation: &CancellationToken,
-        ) -> [JoinHandle<()>; 4]
+        ) -> [JoinHandle<()>; 3]
         where
             R: ShardLifecycle + 'static,
-            E: ShardMigrationExecutor + 'static,
         {
             let product = self.product;
             let manager = OwnershipManager::new(
@@ -498,19 +490,13 @@ mod runtime {
                     }
                 }
             });
-            let migration_task = tokio::spawn(run_migration_worker(
-                Arc::clone(&self.store),
-                migration_executor,
-                self.identity.clone(),
-                cancellation.clone(),
-            ));
             let coordinator_task = tokio::spawn(run_kubernetes_coordinator(
                 self.store,
                 self.config,
                 self.identity,
                 cancellation.clone(),
             ));
-            [manager_task, watcher_task, migration_task, coordinator_task]
+            [manager_task, watcher_task, coordinator_task]
         }
     }
 }
@@ -529,7 +515,7 @@ mod tests {
 
     fn static_config(owners: &[(u32, u32)]) -> ShardingConfig<Demo> {
         ShardingConfig {
-            virtual_shards: 8,
+            shards: 8,
             io_concurrency_limit: 64,
             kind: ShardingBackend::Static {
                 owner_id: "owner-0".to_owned(),
@@ -549,18 +535,18 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_eight_virtual_shards() {
-        assert_eq!(ShardingConfig::<Demo>::default().virtual_shards, 8);
+    fn config_defaults_to_one_shard() {
+        assert_eq!(ShardingConfig::<Demo>::default().shards, 1);
         let parsed: ShardingConfig<Demo> =
             serde_json::from_str(r#"{"backend":"standalone"}"#).unwrap();
-        assert_eq!(parsed.virtual_shards, 8);
+        assert_eq!(parsed.shards, 1);
         assert!(matches!(parsed.kind, ShardingBackend::Standalone));
     }
 
     #[test]
     fn kubernetes_database_must_be_a_label_value() {
         let config = |database: &str| ShardingConfig::<Demo> {
-            virtual_shards: 8,
+            shards: 8,
             io_concurrency_limit: 64,
             kind: ShardingBackend::Kubernetes(KubernetesShardingConfig {
                 database: database.to_owned(),
@@ -595,7 +581,7 @@ mod tests {
     #[test]
     fn deserializes_flattened_backends_with_product_defaults() {
         let config: ShardingConfig<Demo> = serde_json::from_value(serde_json::json!({
-            "virtual_shards": 4,
+            "shards": 4,
             "backend": "kubernetes",
             "namespace": "observability",
         }))

@@ -256,7 +256,7 @@ func Replicas(value any, component Component) *int32 {
 	if value := workloadFor(meter, component).Replicas; value != nil {
 		return value
 	}
-	return lo.ToPtr(lo.Ternary(component == ComponentWriter, int32(3), int32(2)))
+	return lo.ToPtr(lo.Ternary(component == ComponentWriter, int32(1), int32(2)))
 }
 
 func ServiceAccount(value any) *corev1.ServiceAccount {

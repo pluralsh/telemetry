@@ -17,7 +17,7 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDb
 use http_body_util::BodyExt;
 use proto::meter::internal::v1::internal_writer_server::InternalWriter;
 use sharding::{
-    AssignmentGeneration, AssignmentState, BoxError, DEFAULT_VIRTUAL_SHARDS, FakeAssignmentStore,
+    AssignmentGeneration, AssignmentState, BoxError, DEFAULT_SHARDS, FakeAssignmentStore,
     FakeLeaseBackend, OwnershipManager, OwnershipManagerConfig, ShardLifecycle,
 };
 use tokio::sync::{RwLock, Semaphore};
@@ -216,7 +216,7 @@ async fn readiness_tracks_mode_resources_and_supported_routes() {
 
 async fn live_standalone_state() -> AppState {
     let mut config = test_config(ServerMode::Standalone);
-    config.sharding.virtual_shards = 1;
+    config.sharding.shards = 1;
     config.write.flush_interval_seconds = 60;
     AppState::open(config).await.unwrap()
 }
@@ -254,7 +254,7 @@ async fn query_range_and_series_accept_form_posts() {
 #[tokio::test]
 async fn form_posts_preserve_read_auth() {
     let mut config = test_config(ServerMode::Standalone);
-    config.sharding.virtual_shards = 1;
+    config.sharding.shards = 1;
     config.auth.unauthenticated = false;
     config.namespaces[0].auth.read = vec![crate::config::Credential::Basic {
         username: "reader".to_owned(),
@@ -298,7 +298,7 @@ async fn form_posts_preserve_read_auth() {
 async fn namespace_http_auth_is_secure_by_default_and_explicitly_bypassable() {
     for (unauthenticated, expected) in [(false, StatusCode::UNAUTHORIZED), (true, StatusCode::OK)] {
         let mut config = test_config(ServerMode::Standalone);
-        config.sharding.virtual_shards = 1;
+        config.sharding.shards = 1;
         config.auth.unauthenticated = unauthenticated;
         let state = AppState::open(config).await.unwrap();
         let response = router(state.clone())
@@ -324,7 +324,7 @@ async fn malformed_bearer_returns_generic_unauthorized_response() {
     )
     .unwrap();
     let mut config = test_config(ServerMode::Standalone);
-    config.sharding.virtual_shards = 1;
+    config.sharding.shards = 1;
     config.auth.unauthenticated = false;
     config.auth.jwt = Some(crate::config::JwtConfig {
         jwks: crate::config::JwksSource::File {
@@ -478,7 +478,7 @@ async fn metadata_filters_and_federate_renders_complete_labels() {
 async fn periodic_flush_makes_metadata_visible_to_db_reader() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = test_config(ServerMode::Writer);
-    config.sharding.virtual_shards = 1;
+    config.sharding.shards = 1;
     config.write.flush_interval_seconds = 1;
     config.storage = SlateDbStorageConfig {
         path: "meter".to_owned(),
@@ -563,7 +563,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
 #[test]
 fn static_assignment_groups_local_and_remote_owners() {
     let mut config = test_config(ServerMode::Writer);
-    config.sharding.virtual_shards = 4;
+    config.sharding.shards = 4;
     config.sharding.kind = ShardingBackend::Static {
         owner_id: "meter-0".to_owned(),
         owners: vec![
@@ -595,11 +595,23 @@ fn static_assignment_groups_local_and_remote_owners() {
 fn coordinator_uses_replica_count_as_desired_shard_count() {
     let one = vec![Owner::new("meter-0", 0)];
     let two = vec![Owner::new("meter-0", 0), Owner::new("meter-1", 1)];
-    let initial = balanced_contiguous(AssignmentGeneration::new(1), 1, &one, None).unwrap();
+    let initial = balanced_contiguous(
+        AssignmentGeneration::new(1),
+        ShardMap::initial_epochs(1).unwrap(),
+        &one,
+        None,
+    )
+    .unwrap();
     assert!(!membership_changed(Some(&initial), &one, 1));
     assert!(membership_changed(Some(&initial), &two, 2));
 
-    let scaled = balanced_contiguous(AssignmentGeneration::new(2), 2, &two, None).unwrap();
+    let scaled = balanced_contiguous(
+        AssignmentGeneration::new(2),
+        ShardMap::initial_epochs(2).unwrap(),
+        &two,
+        None,
+    )
+    .unwrap();
     assert!(!membership_changed(Some(&scaled), &two, 2));
     assert!(membership_changed(Some(&scaled), &one, 1));
 }
@@ -652,14 +664,14 @@ async fn grpc_retries_are_idempotent() {
         .await
         .unwrap();
     let namespace = Namespace::new("alpha").unwrap();
-    let options = ShardingOptions::new(DEFAULT_VIRTUAL_SHARDS, 4).unwrap();
-    let routing = state.assignment.read().await.routing.clone();
+    let options = ShardingOptions::new(DEFAULT_SHARDS, 4).unwrap();
+    let routing = state.assignment.read().await.clone();
     let mut item = Series::new(
         "idempotent_total",
         vec![Label::new("instance", "a")],
         vec![Sample::new(1_700_000_000_000, 1.0)],
     );
-    let shard = options.route(&routing, &namespace, &item.labels);
+    let shard = options.route(&routing, &namespace, &item.labels, 1_700_000_000_000);
     let request = WriteBatchRequest {
         namespace: Some(ProtoNamespace {
             name: "alpha".to_owned(),
@@ -749,7 +761,7 @@ impl ShardLifecycle for RecordingLifecycle {
 #[tokio::test]
 async fn graceful_drain_flushes_before_close_and_release() {
     let mut config = test_config(ServerMode::Standalone);
-    config.sharding.virtual_shards = 1;
+    config.sharding.shards = 1;
     let (_, map) = assignment_for(&config).unwrap();
     let lifecycle = Arc::new(RecordingLifecycle::default());
     let manager = OwnershipManager::new(

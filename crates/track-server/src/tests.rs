@@ -336,7 +336,7 @@ async fn jaeger_collector_converts_process_span_and_log_data() {
     CollectorService::post_spans(&state, request).await.unwrap();
 
     state.db.flush().await.unwrap();
-    let routing = state.assignment.read().await.routing.clone();
+    let routing = state.assignment.read().await.clone();
     let trace = state
         .db
         .get_trace(

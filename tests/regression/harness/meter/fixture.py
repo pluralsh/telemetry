@@ -1,4 +1,4 @@
-"""Deterministic Meter fixtures and virtual-shard calculations."""
+"""Deterministic Meter fixtures and shard calculations."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import blake3
 
 NAMESPACE = "regression"
-VIRTUAL_SHARDS = 16
+SHARDS = 16
 
 
 @dataclass(frozen=True)
@@ -83,7 +83,7 @@ def fixture_shard(value: Series) -> int:
         hasher.update(b"\0")
         hasher.update(label_value.encode())
     hash_value = int.from_bytes(hasher.digest(length=16), "big")
-    return (hash_value * VIRTUAL_SHARDS) >> 128
+    return (hash_value * SHARDS) >> 128
 
 
 def assert_spans_writer_ranges(value: tuple[Series, ...]) -> None:

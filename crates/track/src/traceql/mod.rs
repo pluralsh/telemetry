@@ -16,7 +16,7 @@ mod validation;
 pub use ast::*;
 pub use error::{ParseError, QueryError, ValidationError};
 pub use execution::{MatchedSpan, TraceQlResult};
-pub use plan::{QueryPlan, plan};
+pub use plan::{PushdownClause, QueryPlan, plan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryOptions {

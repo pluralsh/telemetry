@@ -34,12 +34,11 @@ type writerScalingState struct {
 	effective int32
 	blocked   bool
 	blockedBy string
-	active    bool
 	trusted   bool
 }
 
 func writerReplicaIntent(product any) int32 {
-	return lo.FromPtrOr(resources.Replicas(product, resources.ComponentWriter), int32(3))
+	return lo.FromPtrOr(resources.Replicas(product, resources.ComponentWriter), int32(1))
 }
 
 func shardMapName(product client.Object) string {
@@ -62,11 +61,6 @@ func effectiveWriterReplicas(intent, current int32, shardMap *telemetryv1alpha1.
 		return current, "the authoritative ShardMap is missing or cannot be trusted"
 	}
 	floor := shardMap.Spec.ShardCount
-	if migration := shardMap.Spec.Migration; migration != nil {
-		floor = max(floor, migration.DesiredShardCount)
-		floor = max(floor, migration.Split.SourceOwner.Ordinal+1)
-		floor = max(floor, migration.Split.TargetOwner.Ordinal+1)
-	}
 	for _, assignment := range shardMap.Spec.Assignments {
 		if assignment.State != "released" {
 			floor = max(floor, assignment.Owner.Ordinal+1)
@@ -126,11 +120,7 @@ func loadWriterScalingState(ctx context.Context, c client.Client, product client
 	}
 	state.status.ShardCount = lo.ToPtr(shardMap.Spec.ShardCount)
 	state.status.ShardGeneration = lo.ToPtr(shardMap.Spec.Generation)
-	if migration := shardMap.Spec.Migration; migration != nil {
-		state.active = true
-		state.status.MigrationPhase = migration.Phase
-		state.status.MigrationError = migration.Error
-	}
+	state.status.RoutingEpochs = lo.ToPtr(int32(len(shardMap.Spec.Epochs)))
 	effective, blockedBy := effectiveWriterReplicas(intent, state.effective, shardMap, true)
 	state.effective = effective
 	state.status.EffectiveWriterReplicas = effective
@@ -143,7 +133,7 @@ func synchronizeWriterReplicas(ctx context.Context, c client.Client, product cli
 	if mode != telemetryv1alpha1.ProductModeSharded {
 		return nil
 	}
-	state, err := loadWriterScalingState(ctx, c, product, kind, mode, lo.FromPtrOr(desired.Spec.Replicas, int32(3)))
+	state, err := loadWriterScalingState(ctx, c, product, kind, mode, lo.FromPtrOr(desired.Spec.Replicas, int32(1)))
 	if err != nil {
 		// An uncertain read must never result in a downscale. Returning the
 		// error leaves the current StatefulSet untouched.
@@ -186,7 +176,7 @@ func requestsForShardMap(shardMap *telemetryv1alpha1.ShardMap, kind string) []re
 }
 
 func setWriterScalingConditions(conditions *[]metav1.Condition, generation int64, state writerScalingState) {
-	scaling := state.active || state.status.ShardCount == nil || *state.status.ShardCount != state.intent
+	scaling := state.status.ShardCount == nil || *state.status.ShardCount != state.intent
 	scalingStatus, scalingReason, scalingMessage := metav1.ConditionFalse, reasonScalingConverged, "writer intent and authoritative shard count have converged"
 	if scaling {
 		scalingStatus, scalingReason = metav1.ConditionTrue, reasonScalingInProgress
@@ -211,9 +201,6 @@ func setWriterScalingConditions(conditions *[]metav1.Condition, generation int64
 func shardedReady(state writerScalingState) (bool, string) {
 	if !state.trusted || state.status.ShardCount == nil {
 		return false, "authoritative ShardMap is unavailable"
-	}
-	if state.active {
-		return false, fmt.Sprintf("shard migration is %s", state.status.MigrationPhase)
 	}
 	if state.intent != *state.status.ShardCount {
 		return false, fmt.Sprintf("writer intent %d has not converged to shard count %d", state.intent, *state.status.ShardCount)

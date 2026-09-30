@@ -77,11 +77,24 @@ storage:
 segment_duration_seconds: 3600 # Time partition width; keep stable for a dataset.
 retention_seconds: 2592000 # Optional logical retention; 30 days.
 
+# Each write-buffer flush cuts at least one page per written stream; these
+# limits split larger flushes further.
 page:
   target_size_bytes: 1048576 # Preferred compressed page size; 1 MiB.
   max_rows: 16384 # Maximum rows in a page.
-  max_age_seconds: 1 # Flush age for a partially filled page.
   rows_per_block: 256 # Independently decoded block size.
+
+# Writer-side merging of each stream's small pages after write-buffer flushes.
+compaction:
+  enabled: true
+  fan_in: 4 # Consecutive same-level pages merged into one; at least 2.
+  min_age_seconds: 30 # Age of a flushed page before its first merge.
+  # After a segment ends, merge its remaining small pages regardless of fan_in.
+  finalize_after_seconds: 300
+  # Replaced payloads stay readable this long for in-flight queries and
+  # read replicas; keep it above the longest query and replica lag.
+  delete_delay_seconds: 600
+  max_merges_per_flush: 256
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
@@ -98,13 +111,13 @@ write:
 
 sharding:
   # Storage-shard count fixed when the dataset is created.
-  virtual_shards: 8
+  shards: 1
   # Fixed per-pod storage I/O budget; independent of storage-shard count.
   io_concurrency_limit: 128
   backend: standalone
 
   # Static backend alternative. Ranges are half-open and must exactly cover
-  # [0, virtual_shards); owner_id must match an owners entry.
+  # [0, shards); owner_id must match an owners entry.
   # backend: static
   # owner_id: line-0
   # owners:

@@ -99,13 +99,13 @@ write:
 
 sharding:
   # Storage-shard count fixed when the dataset is created.
-  virtual_shards: 8
+  shards: 1
   # Fixed per-pod storage I/O budget; independent of storage-shard count.
   io_concurrency_limit: 128
   backend: standalone
 
   # Static backend alternative. Ranges are half-open and must exactly cover
-  # [0, virtual_shards); owner_id must match an owners entry.
+  # [0, shards); owner_id must match an owners entry.
   # backend: static
   # owner_id: track-0
   # owners:

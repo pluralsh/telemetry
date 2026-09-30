@@ -4,12 +4,12 @@
 // you may not use this file except in compliance with the License.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,7 +23,9 @@ use common::discovery::{
 use common::storage::{
     PutOptions, PutRecordOp, Record, RecordOp, Storage, StorageRead, Ttl, WriteOptions,
 };
-use common::{StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read};
+use common::{
+    BytesRange, StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read,
+};
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use slatedb::config::DbReaderOptions;
@@ -36,10 +38,11 @@ use crate::codec::{
     PageId, StoredPageMetadata, decode_forward_key, decode_labels, decode_metadata,
     decode_metadata_key, decode_page_sequence, decode_postings, decode_stream_id, dictionary_key,
     encode_labels, encode_metadata, encode_page_sequence, encode_postings, encode_stream_id,
-    field_stats_key, forward_key, forward_range, metadata_key, metadata_range,
+    field_stats_key, forward_key, forward_prefix, metadata_key, metadata_prefix,
     next_page_sequence_key, next_stream_id_key, payload_key, posting_key, segment_for,
     segment_prefix,
 };
+use crate::compaction::{Compactor, WrittenPage};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
@@ -55,6 +58,10 @@ use crate::search::{
 const TERM_INDEX_CONCURRENCY: usize = 32;
 /// Page payloads fetched concurrently within one query segment.
 const PAGE_READ_CONCURRENCY: usize = 16;
+/// Streams whose forward labels and page metadata are read concurrently.
+const STREAM_METADATA_CONCURRENCY: usize = 32;
+/// Segments whose stream metadata is listed concurrently by `scan_targets`.
+const SEGMENT_LIST_CONCURRENCY: usize = 4;
 const WRITE_CHANNEL: &str = "write";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,6 +119,7 @@ pub(crate) struct QueryEstimate {
 struct PageRetention {
     physical_ttl: Ttl,
     expires_at_unix_ms: Option<u64>,
+    written_at_unix_ms: u64,
 }
 
 /// Single-writer/single-node log database over the common SlateDB abstraction.
@@ -119,7 +127,6 @@ pub struct LogDb {
     storage: Arc<dyn StorageRead>,
     writer: Option<Arc<dyn Storage>>,
     segment_ns: i64,
-    owned_slots: Range<u16>,
     write_handle: Option<WriteCoordinatorHandle<LineWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<LineWriteDelta, LineFlusher>>>,
     label_names_cache: DiscoveryCache<(Namespace, SegmentId), Vec<String>>,
@@ -128,7 +135,51 @@ pub struct LogDb {
 
 impl LogDb {
     pub async fn open(config: Config) -> Result<Self> {
-        Self::open_with_slots(config, 0..sharding::ROUTING_SLOT_COUNT).await
+        config.validate()?;
+        let segment_ns = duration_ns(config.segment_duration)?;
+        let semantics = StorageSemantics::new()
+            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
+        let storage = StorageBuilder::new(&config.storage)
+            .await?
+            .with_semantics(semantics)
+            .build()
+            .await?;
+        let storage_read = storage.clone();
+        let direct_writer = Arc::new(DirectWriter {
+            storage: storage_read.clone(),
+            writer: storage.clone(),
+            config: config.clone(),
+        });
+        let compactor = config.compaction.enabled.then(|| {
+            Compactor::new(
+                storage.clone(),
+                config.compaction.clone(),
+                config.page.clone(),
+                segment_ns,
+            )
+        });
+        let mut write_coordinator = WriteCoordinator::new(
+            config.write_buffer.clone(),
+            vec![WRITE_CHANNEL],
+            (),
+            (),
+            LineFlusher {
+                direct_writer,
+                storage: storage.clone(),
+                compactor,
+            },
+        );
+        let write_handle = write_coordinator.handle(WRITE_CHANNEL);
+        write_coordinator.start();
+        Ok(Self {
+            storage: storage_read,
+            writer: Some(storage),
+            segment_ns,
+            write_handle: Some(write_handle),
+            write_coordinator: Mutex::new(Some(write_coordinator)),
+            label_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
+            label_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+        })
     }
 
     /// Warms SlateDB caches for recent log segments in this shard.
@@ -160,63 +211,11 @@ impl LogDb {
         Ok(())
     }
 
-    pub(crate) async fn open_with_slots(config: Config, owned_slots: Range<u16>) -> Result<Self> {
-        config.validate()?;
-        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
-            return Err(Error::Invalid(format!(
-                "invalid owned routing slot range {owned_slots:?}"
-            )));
-        }
-        let segment_ns = duration_ns(config.segment_duration)?;
-        let semantics = StorageSemantics::new()
-            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
-        let storage = StorageBuilder::new(&config.storage)
-            .await?
-            .with_semantics(semantics)
-            .build()
-            .await?;
-        let storage_read = storage.clone();
-        let direct_writer = Arc::new(DirectWriter {
-            storage: storage_read.clone(),
-            writer: storage.clone(),
-            config: config.clone(),
-            owned_slots: owned_slots.clone(),
-        });
-        let mut write_coordinator = WriteCoordinator::new(
-            config.write_buffer.clone(),
-            vec![WRITE_CHANNEL],
-            (),
-            (),
-            LineFlusher {
-                direct_writer,
-                storage: storage.clone(),
-            },
-        );
-        let write_handle = write_coordinator.handle(WRITE_CHANNEL);
-        write_coordinator.start();
-        Ok(Self {
-            storage: storage_read,
-            writer: Some(storage),
-            segment_ns,
-            owned_slots,
-            write_handle: Some(write_handle),
-            write_coordinator: Mutex::new(Some(write_coordinator)),
-            label_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
-            label_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
-        })
-    }
-
-    pub(crate) async fn open_reader_with_slots(
+    pub(crate) async fn open_reader(
         config: Config,
-        owned_slots: Range<u16>,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
         config.validate()?;
-        if owned_slots.start >= owned_slots.end || owned_slots.end > sharding::ROUTING_SLOT_COUNT {
-            return Err(Error::Invalid(format!(
-                "invalid owned routing slot range {owned_slots:?}"
-            )));
-        }
         let segment_ns = duration_ns(config.segment_duration)?;
         let semantics = StorageSemantics::new()
             .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
@@ -231,7 +230,6 @@ impl LogDb {
             storage,
             writer: None,
             segment_ns,
-            owned_slots,
             write_handle: None,
             write_coordinator: Mutex::new(None),
             label_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
@@ -261,21 +259,12 @@ impl LogDb {
         batches: Vec<LogBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
-        let groups = group_by_stream(namespace, batches, self.segment_ns)?;
+        let groups = group_by_stream(batches, self.segment_ns)?;
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
         self.label_names_cache.clear();
         self.label_values_cache.clear();
-        if let Some((_, slot, _)) = groups
-            .keys()
-            .find(|(_, slot, _)| !self.owned_slots.contains(slot))
-        {
-            return Err(Error::Invalid(format!(
-                "routing slot {slot} is outside opened shard range {:?}",
-                self.owned_slots
-            )));
-        }
         let write = LineWrite {
             namespace: namespace.clone(),
             groups,
@@ -316,41 +305,46 @@ struct DirectWriter {
     storage: Arc<dyn StorageRead>,
     writer: Arc<dyn Storage>,
     config: Config,
-    owned_slots: Range<u16>,
 }
 
 impl DirectWriter {
-    async fn write_groups(&self, groups: FrozenLineWriteDelta) -> Result<()> {
+    /// Writes every group atomically and returns the pages it wrote.
+    async fn write_groups(&self, groups: FrozenLineWriteDelta) -> Result<Vec<WrittenPage>> {
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
             expires_at_unix_ms: self.logical_expiry()?,
+            written_at_unix_ms: unix_time_ms()?,
         };
         let mut by_namespace: BTreeMap<Namespace, StreamGroups> = BTreeMap::new();
-        for ((namespace, segment, slot, fingerprint), group) in groups.groups {
+        for ((namespace, segment, fingerprint), group) in groups.groups {
             by_namespace
                 .entry(namespace)
                 .or_default()
-                .insert((segment, slot, fingerprint), group);
+                .insert((segment, fingerprint), group);
         }
         let mut all_ops = Vec::new();
+        let mut written = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
-            for ((segment, slot, fingerprint), (labels, entries)) in groups {
-                if !self.owned_slots.contains(&slot) {
-                    return Err(Error::Invalid(format!(
-                        "routing slot {slot} is outside opened shard range {:?}",
-                        self.owned_slots
-                    )));
-                }
+            for ((segment, fingerprint), (labels, entries)) in groups {
                 let stream_id = self
-                    .resolve_stream_id(&mut write, &namespace, segment, slot, fingerprint, &labels)
+                    .resolve_stream_id(&mut write, &namespace, segment, fingerprint, &labels)
                     .await?;
-                self.add_label_postings(&mut write, &namespace, segment, slot, &labels, stream_id)
+                self.add_label_postings(&mut write, &namespace, segment, &labels, stream_id)
                     .await?;
-                self.append_stream_pages(&mut write, &namespace, segment, slot, stream_id, entries)
+                self.append_stream_pages(&mut write, &namespace, segment, stream_id, entries)
                     .await?;
             }
+            written.extend(write.written.drain(..).map(
+                |(segment, stream_id, page_id, metadata)| WrittenPage {
+                    namespace: namespace.clone(),
+                    segment,
+                    stream_id,
+                    page_id,
+                    metadata,
+                },
+            ));
             let (ops, _) = self.finish_write(write, &namespace).await?;
             all_ops.extend(ops);
         }
@@ -364,7 +358,7 @@ impl DirectWriter {
                 )
                 .await?;
         }
-        Ok(())
+        Ok(written)
     }
 
     /// Returns the stream's existing ID, or allocates the segment's next one,
@@ -374,17 +368,16 @@ impl DirectWriter {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
         fingerprint: StreamFingerprint,
         labels: &Labels,
     ) -> Result<StreamId> {
-        let dictionary = dictionary_key(namespace, segment, slot, fingerprint);
+        let dictionary = dictionary_key(namespace, segment, fingerprint);
         let stream_id = match self.storage.get(dictionary.clone()).await? {
             Some(record) => {
                 let stream_id = decode_stream_id(&record.value)?;
                 let existing = self
                     .storage
-                    .get(forward_key(namespace, segment, slot, stream_id))
+                    .get(forward_key(namespace, segment, stream_id))
                     .await?
                     .ok_or_else(|| Error::Corrupt("dictionary has no forward labels".to_owned()))?;
                 if decode_labels(&existing.value)? != *labels {
@@ -394,14 +387,11 @@ impl DirectWriter {
                 }
                 stream_id
             }
-            None => {
-                self.allocate_stream_id(write, namespace, segment, slot)
-                    .await?
-            }
+            None => self.allocate_stream_id(write, namespace, segment).await?,
         };
         write.put(dictionary, encode_stream_id(stream_id));
         write.put(
-            forward_key(namespace, segment, slot, stream_id),
+            forward_key(namespace, segment, stream_id),
             encode_labels(labels)?,
         );
         Ok(stream_id)
@@ -412,13 +402,12 @@ impl DirectWriter {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
     ) -> Result<StreamId> {
-        let next = match write.next_stream_ids.get(&(segment, slot)) {
+        let next = match write.next_stream_ids.get(&segment) {
             Some(next) => *next,
             None => self
                 .storage
-                .get(next_stream_id_key(namespace, segment, slot))
+                .get(next_stream_id_key(namespace, segment))
                 .await?
                 .map(|record| decode_stream_id(&record.value))
                 .transpose()?
@@ -427,7 +416,7 @@ impl DirectWriter {
         let following = next
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
-        write.next_stream_ids.insert((segment, slot), following);
+        write.next_stream_ids.insert(segment, following);
         Ok(next)
     }
 
@@ -436,17 +425,16 @@ impl DirectWriter {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
         labels: &Labels,
         stream_id: StreamId,
     ) -> Result<()> {
         for label in labels.iter() {
-            let bitmap = match write.postings.entry((segment, slot, label.clone())) {
+            let bitmap = match write.postings.entry((segment, label.clone())) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let bitmap = self
                         .storage
-                        .get(posting_key(namespace, segment, slot, label))
+                        .get(posting_key(namespace, segment, label))
                         .await?
                         .map(|record| decode_postings(&record.value))
                         .transpose()?
@@ -464,11 +452,10 @@ impl DirectWriter {
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
         stream_id: StreamId,
         entries: Vec<LogEntry>,
     ) -> Result<()> {
-        let page_sequence_key = next_page_sequence_key(namespace, segment, slot, stream_id);
+        let page_sequence_key = next_page_sequence_key(namespace, segment, stream_id);
         let mut sequence = self
             .storage
             .get(page_sequence_key.clone())
@@ -477,28 +464,14 @@ impl DirectWriter {
             .transpose()?
             .unwrap_or(0);
         let row_count = entries.len();
-        let mut builder = PageBuilder::new(self.config.page.clone(), Instant::now())?;
+        let mut builder = PageBuilder::new(self.config.page.clone())?;
         for entry in entries {
-            if let Some(completed) = builder.append_with_rows(entry, Instant::now())? {
-                write.add_page(
-                    namespace,
-                    segment,
-                    slot,
-                    stream_id,
-                    &mut sequence,
-                    completed,
-                )?;
+            if let Some(completed) = builder.append_with_rows(entry)? {
+                write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
             }
         }
         if let Some(completed) = builder.finish_with_rows()? {
-            write.add_page(
-                namespace,
-                segment,
-                slot,
-                stream_id,
-                &mut sequence,
-                completed,
-            )?;
+            write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
         }
         write.report.rows += row_count;
         write.put(page_sequence_key, encode_page_sequence(sequence));
@@ -522,23 +495,23 @@ impl DirectWriter {
             ..
         } = write;
         let mut catalogs: BTreeMap<SegmentId, CatalogBatch> = BTreeMap::new();
-        for (segment, _, label) in postings.keys() {
+        for (segment, label) in postings.keys() {
             catalogs.entry(*segment).or_default().insert(
                 "",
                 &label.name,
                 DiscoveryValue::String(label.value.clone()),
             );
         }
-        for ((segment, slot), next) in next_stream_ids {
+        for (segment, next) in next_stream_ids {
             ops.push(put(
-                next_stream_id_key(namespace, segment, slot),
+                next_stream_id_key(namespace, segment),
                 encode_stream_id(next),
                 ttl,
             ));
         }
-        for ((segment, slot, label), bitmap) in postings {
+        for ((segment, label), bitmap) in postings {
             ops.push(put(
-                posting_key(namespace, segment, slot, &label),
+                posting_key(namespace, segment, &label),
                 encode_postings(&bitmap)?,
                 ttl,
             ));
@@ -546,8 +519,8 @@ impl DirectWriter {
         for (segment, catalog) in catalogs {
             ops.extend(catalog.into_ops(&segment_prefix(namespace, segment), ttl));
         }
-        for ((segment, slot), delta) in search_deltas {
-            self.append_search_index_ops(&mut ops, namespace, segment, slot, delta, ttl)
+        for (segment, delta) in search_deltas {
+            self.append_search_index_ops(&mut ops, namespace, segment, delta, ttl)
                 .await?;
         }
         Ok((ops, report))
@@ -558,13 +531,12 @@ impl DirectWriter {
         ops: &mut Vec<RecordOp>,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
         delta: IndexDelta,
         ttl: Ttl,
     ) -> Result<()> {
         let mut field = self
             .storage
-            .get(field_stats_key(namespace, segment, slot))
+            .get(field_stats_key(namespace, segment))
             .await?
             .map(|record| decode_field_stats(&record.value))
             .transpose()?
@@ -578,7 +550,7 @@ impl DirectWriter {
             .checked_add(delta.total_terms)
             .ok_or_else(|| Error::Invalid("segment token count overflow".into()))?;
         ops.push(put(
-            field_stats_key(namespace, segment, slot),
+            field_stats_key(namespace, segment),
             encode_field_stats(field),
             ttl,
         ));
@@ -587,7 +559,7 @@ impl DirectWriter {
         let mut writes = std::pin::pin!(
             futures::stream::iter(delta.postings)
                 .map(|(term, postings)| {
-                    term_index_writes(storage, namespace, segment, slot, term, postings)
+                    term_index_writes(storage, namespace, segment, term, postings)
                 })
                 .buffer_unordered(TERM_INDEX_CONCURRENCY)
         );
@@ -719,19 +691,10 @@ impl LogDb {
         let mut result = BTreeSet::new();
         for segment in self.discovery_segments(start_ns, end_ns)? {
             for selector in &selectors {
-                for (slot, stream_id) in
-                    self.stream_ids(namespace, segment, &selector.exact).await?
-                {
-                    let record = self
-                        .storage
-                        .get(forward_key(namespace, segment, slot, stream_id))
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Corrupt("posting references missing forward labels".into())
-                        })?;
-                    let labels = decode_labels(&record.value)?;
+                let stream_ids = self.stream_ids(namespace, segment, &selector.exact).await?;
+                for (_, labels) in self.stream_labels(namespace, segment, stream_ids).await? {
                     if selector.matches(&labels) {
-                        result.insert(labels);
+                        result.insert(Arc::unwrap_or_clone(labels));
                     }
                 }
             }
@@ -779,184 +742,208 @@ impl LogDb {
         end_ns: i64,
         matchers: &[Label],
     ) -> Result<Vec<LogRow>> {
-        self.read_bounded(
-            namespace,
-            start_ns,
-            end_ns,
-            matchers,
-            &PageBudget::new(usize::MAX),
-        )
-        .await
+        let targets = self
+            .scan_targets(
+                namespace,
+                start_ns,
+                end_ns,
+                &StreamFilter::exact(matchers.to_vec()),
+            )
+            .await?;
+        self.read_bounded(namespace, targets, &PageBudget::new(usize::MAX))
+            .await
     }
 
-    pub(crate) async fn estimate_pages(
+    /// Lists the selected streams and live overlapping pages of every segment
+    /// in `[start_ns, end_ns]`, so the page estimate and the read share one
+    /// metadata walk.
+    pub(crate) async fn scan_targets(
         &self,
         namespace: &Namespace,
         start_ns: i64,
         end_ns: i64,
-        matchers: &[Label],
-    ) -> Result<QueryEstimate> {
+        filter: &StreamFilter,
+    ) -> Result<ScanTargets> {
+        let now_unix_ms = unix_time_ms()?;
+        let segments = futures::stream::iter(self.segment_ids((start_ns, end_ns), false)?)
+            .map(|segment| async move {
+                let streams = self
+                    .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
+                    .await?;
+                Ok::<_, Error>((segment, streams))
+            })
+            .buffered(SEGMENT_LIST_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(ScanTargets {
+            range: (start_ns, end_ns),
+            segments,
+        })
+    }
+
+    /// Segments covering `[start_ns, end_ns]` in scan order.
+    fn segment_ids(&self, (start_ns, end_ns): (i64, i64), reverse: bool) -> Result<Vec<SegmentId>> {
         if end_ns < start_ns {
             return Err(Error::Invalid("end_ns must be >= start_ns".to_owned()));
         }
-        let first_segment = segment_for(start_ns, self.segment_ns);
         let last_segment = segment_for(end_ns, self.segment_ns);
-        let now_unix_ms = unix_time_ms()?;
-        let mut segment = first_segment;
-        let mut estimate = QueryEstimate::default();
-        loop {
-            for (slot, stream_id) in self.stream_ids(namespace, segment, matchers).await? {
-                let mut metadata = self
-                    .storage
-                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
-                    .await?;
-                while let Some(record) = metadata.next().await? {
-                    let page = decode_metadata(&record.value)?;
-                    if page.is_expired_at(now_unix_ms)
-                        || page.max_timestamp_ns < start_ns
-                        || page.min_timestamp_ns > end_ns
-                    {
-                        continue;
-                    }
-                    estimate.pages = estimate.pages.saturating_add(1);
-                    estimate.compressed_bytes = estimate
-                        .compressed_bytes
-                        .saturating_add(u64::from(page.payload_bytes));
-                    estimate.lines = estimate.lines.saturating_add(u64::from(page.row_count));
-                }
-            }
-            if segment == last_segment {
-                break;
-            }
+        let mut segment = segment_for(start_ns, self.segment_ns);
+        let mut segments = vec![segment];
+        while segment != last_segment {
             segment = segment
                 .checked_add(self.segment_ns)
                 .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?;
+            segments.push(segment);
         }
-        Ok(estimate)
+        if reverse {
+            segments.reverse();
+        }
+        Ok(segments)
     }
 
-    /// Reads overlapping pages, charging each to `budget`. This is the
+    /// Reads every target page, charging each to `budget`. This is the
     /// storage primitive used by the query engine to put a hard bound on I/O.
     pub(crate) async fn read_bounded(
         &self,
         namespace: &Namespace,
-        start_ns: i64,
-        end_ns: i64,
-        matchers: &[Label],
+        targets: ScanTargets,
         budget: &PageBudget,
     ) -> Result<Vec<LogRow>> {
         let mut rows = Vec::new();
-        self.read_segments(
-            namespace,
-            (start_ns, end_ns),
-            matchers,
-            budget,
-            false,
-            |segment_rows| {
-                rows.extend(segment_rows);
-                Ok(ControlFlow::Continue(()))
-            },
-        )
-        .await?;
+        let mut consume = |chunk: Vec<LogRow>| {
+            rows.extend(chunk);
+            Ok(ControlFlow::Continue(()))
+        };
+        for (segment, streams) in targets.segments {
+            let _: ControlFlow<()> = self
+                .read_segment_pages(
+                    namespace,
+                    segment,
+                    streams,
+                    targets.range,
+                    budget,
+                    false,
+                    &mut consume,
+                )
+                .await?;
+        }
         Ok(rows)
     }
 
-    /// Reads overlapping pages one time segment at a time, handing each
-    /// segment's rows (in stable storage order) to `consume`. Segments
-    /// partition time, so every row in a later segment is strictly later
-    /// (or, with `reverse`, strictly earlier) than every row already
-    /// consumed; `consume` returns `Break` once no later row can matter.
-    /// Only pages actually read are charged to `budget`.
+    /// Reads overlapping pages in scan order, handing `consume` ascending
+    /// chunks of rows. Every row in a later chunk is strictly later (or, with
+    /// `reverse`, strictly earlier) than every row already consumed, so
+    /// `consume` returns `Break` once no later row can matter. Pages are
+    /// fetched in order of their nearest timestamp and a row is released only
+    /// when no unread page can precede it, so a satisfied consumer stops
+    /// mid-segment. Only pages actually fetched are charged to `budget`.
     pub(crate) async fn read_segments(
         &self,
         namespace: &Namespace,
         (start_ns, end_ns): (i64, i64),
-        matchers: &[Label],
+        filter: &StreamFilter,
         budget: &PageBudget,
         reverse: bool,
         mut consume: impl FnMut(Vec<LogRow>) -> Result<ControlFlow<()>>,
     ) -> Result<()> {
-        if end_ns < start_ns {
-            return Err(Error::Invalid("end_ns must be >= start_ns".to_owned()));
-        }
-        let first_segment = segment_for(start_ns, self.segment_ns);
-        let last_segment = segment_for(end_ns, self.segment_ns);
         let now_unix_ms = unix_time_ms()?;
-        let (mut segment, final_segment, step) = if reverse {
-            (last_segment, first_segment, -self.segment_ns)
-        } else {
-            (first_segment, last_segment, self.segment_ns)
-        };
-
-        loop {
-            let mut pages = Vec::new();
-            for (slot, stream_id) in self.stream_ids(namespace, segment, matchers).await? {
-                let Some(labels_record) = self
-                    .storage
-                    .get(forward_key(namespace, segment, slot, stream_id))
-                    .await?
-                else {
-                    return Err(Error::Corrupt(
-                        "posting references missing forward labels".to_owned(),
-                    ));
-                };
-                let labels = Arc::new(decode_labels(&labels_record.value)?);
-                let fingerprint = labels.fingerprint();
-                let mut metadata = self
-                    .storage
-                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
-                    .await?;
-                while let Some(record) = metadata.next().await? {
-                    let (_, _, page_id) = decode_metadata_key(&record.key)?;
-                    let page_metadata = decode_metadata(&record.value)?;
-                    if page_metadata.is_expired_at(now_unix_ms)
-                        || page_metadata.max_timestamp_ns < start_ns
-                        || page_metadata.min_timestamp_ns > end_ns
-                    {
-                        continue;
-                    }
-                    budget.take()?;
-                    pages.push((slot, stream_id, labels.clone(), fingerprint, page_id));
-                }
-            }
-            let mut decoded = futures::stream::iter(pages)
-                .map(
-                    move |(slot, stream_id, labels, fingerprint, page_id)| async move {
-                        let payload = self
-                            .storage
-                            .get(payload_key(namespace, segment, slot, stream_id, page_id))
-                            .await?
-                            .ok_or_else(|| {
-                                Error::Corrupt("page metadata has no payload".to_owned())
-                            })?;
-                        let entries =
-                            Page::decode(payload.value)?.decode_range(start_ns, end_ns)?;
-                        Ok::<_, Error>((labels, fingerprint, page_id, entries))
-                    },
+        for segment in self.segment_ids((start_ns, end_ns), reverse)? {
+            let streams = self
+                .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
+                .await?;
+            let flow = self
+                .read_segment_pages(
+                    namespace,
+                    segment,
+                    streams,
+                    (start_ns, end_ns),
+                    budget,
+                    reverse,
+                    &mut consume,
                 )
-                .buffered(PAGE_READ_CONCURRENCY);
-            let mut rows = Vec::new();
-            while let Some((labels, fingerprint, page_id, entries)) = decoded.try_next().await? {
-                rows.extend(entries.into_iter().enumerate().map(|(row_index, entry)| {
-                    (
-                        (entry.timestamp_ns, fingerprint, page_id.sequence, row_index),
-                        LogRow {
-                            labels: labels.clone(),
-                            entry,
-                        },
-                    )
-                }));
+                .await?;
+            if flow.is_break() {
+                break;
             }
-            rows.sort_unstable_by_key(|(key, _)| *key);
-            if consume(rows.into_iter().map(|(_, row)| row).collect())?.is_break()
-                || segment == final_segment
-            {
-                return Ok(());
-            }
-            segment = segment
-                .checked_add(step)
-                .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?;
         }
+        Ok(())
+    }
+
+    /// One segment of [`Self::read_segments`].
+    #[allow(clippy::too_many_arguments)]
+    async fn read_segment_pages(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        streams: Vec<SegmentStream>,
+        (start_ns, end_ns): (i64, i64),
+        budget: &PageBudget,
+        reverse: bool,
+        consume: &mut impl FnMut(Vec<LogRow>) -> Result<ControlFlow<()>>,
+    ) -> Result<ControlFlow<()>> {
+        let mut pages = Vec::new();
+        for stream in streams {
+            let fingerprint = stream.labels.fingerprint();
+            for (page_id, metadata) in stream.pages {
+                let bound = if reverse {
+                    metadata.max_timestamp_ns
+                } else {
+                    metadata.min_timestamp_ns
+                };
+                pages.push((
+                    bound,
+                    stream.stream_id,
+                    stream.labels.clone(),
+                    fingerprint,
+                    page_id,
+                    metadata.level,
+                ));
+            }
+        }
+        pages.sort_unstable_by(|a, b| {
+            let bound = if reverse {
+                b.0.cmp(&a.0)
+            } else {
+                a.0.cmp(&b.0)
+            };
+            bound
+                .then(a.1.cmp(&b.1))
+                .then(a.4.sequence.cmp(&b.4.sequence))
+        });
+        let bounds = pages.iter().map(|page| page.0).collect::<Vec<_>>();
+        let mut decoded = futures::stream::iter(pages)
+            .map(
+                move |(_, stream_id, labels, fingerprint, page_id, level)| async move {
+                    budget.take()?;
+                    let payload = self
+                        .storage
+                        .get(payload_key(namespace, segment, stream_id, page_id, level))
+                        .await?
+                        .ok_or_else(|| Error::Corrupt("page metadata has no payload".to_owned()))?;
+                    let entries = Page::decode(payload.value)?.decode_range(start_ns, end_ns)?;
+                    Ok::<_, Error>((labels, fingerprint, page_id, entries))
+                },
+            )
+            .buffered(PAGE_READ_CONCURRENCY);
+        let mut pending = PendingRows::new(reverse);
+        let mut fetched = 0;
+        while let Some((labels, fingerprint, page_id, entries)) = decoded.try_next().await? {
+            fetched += 1;
+            for (row_index, entry) in entries.into_iter().enumerate() {
+                pending.push(
+                    (entry.timestamp_ns, fingerprint, page_id.sequence, row_index),
+                    LogRow {
+                        labels: labels.clone(),
+                        entry,
+                    },
+                );
+            }
+            let ready = pending.release(bounds.get(fetched).copied());
+            if !ready.is_empty() && consume(ready)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Uses the segment-local term index to identify pages and rows before
@@ -965,62 +952,42 @@ impl LogDb {
     pub(crate) async fn read_match_bounded(
         &self,
         namespace: &Namespace,
-        start_ns: i64,
-        end_ns: i64,
-        matchers: &[Label],
+        targets: &ScanTargets,
         match_plan: (&[String], Option<usize>),
         max_pages: usize,
     ) -> Result<Option<Vec<(LogRow, f32)>>> {
         let (terms, top_k) = match_plan;
-        let first_segment = segment_for(start_ns, self.segment_ns);
-        let last_segment = segment_for(end_ns, self.segment_ns);
-        let now_unix_ms = unix_time_ms()?;
-        let mut segment = first_segment;
+        let (start_ns, end_ns) = targets.range;
         let mut rows = Vec::new();
         let mut pages_read = 0usize;
 
-        loop {
-            let stream_ids = self.stream_ids(namespace, segment, matchers).await?;
+        for (segment, streams) in &targets.segments {
+            let segment = *segment;
             let mut candidate_pages = Vec::new();
-            let mut allowed_pages: HashMap<u16, HashSet<(StreamId, u64)>> = HashMap::new();
-            for (slot, stream_id) in stream_ids {
-                let labels_record = self
-                    .storage
-                    .get(forward_key(namespace, segment, slot, stream_id))
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Corrupt("posting references missing forward labels".into())
-                    })?;
-                let labels = Arc::new(decode_labels(&labels_record.value)?);
-                let mut metadata = self
-                    .storage
-                    .scan_iter(metadata_range(namespace, segment, slot, stream_id))
-                    .await?;
-                while let Some(record) = metadata.next().await? {
-                    let (_, _, page_id) = decode_metadata_key(&record.key)?;
-                    let page_metadata = decode_metadata(&record.value)?;
-                    if page_metadata.is_expired_at(now_unix_ms)
-                        || page_metadata.max_timestamp_ns < start_ns
-                        || page_metadata.min_timestamp_ns > end_ns
-                    {
-                        continue;
+            // Postings address written pages; a merged page covers several.
+            let mut leaves: HashMap<(StreamId, u64), (u64, u32)> = HashMap::new();
+            for stream in streams {
+                for (page_id, metadata) in &stream.pages {
+                    for (leaf, first_row) in metadata.leaves(page_id.sequence) {
+                        leaves.insert((stream.stream_id, leaf), (page_id.sequence, first_row));
                     }
-                    allowed_pages
-                        .entry(slot)
-                        .or_default()
-                        .insert((stream_id, page_id.sequence));
-                    candidate_pages.push((slot, stream_id, labels.clone(), page_id));
+                    candidate_pages.push((
+                        stream.stream_id,
+                        stream.labels.clone(),
+                        *page_id,
+                        metadata.level,
+                    ));
                 }
             }
-            let mut by_page: HashMap<(u16, StreamId, u64), HashMap<u32, f32>> = HashMap::new();
-            for (slot, allowed) in &allowed_pages {
+            let allowed_pages = leaves.keys().copied().collect::<HashSet<_>>();
+            let mut by_page: HashMap<(StreamId, u64), HashMap<u32, f32>> = HashMap::new();
+            if !allowed_pages.is_empty() {
                 let Some(scores) = block_max_scores(
                     self.storage.as_ref(),
                     namespace,
                     segment,
-                    *slot,
                     terms,
-                    allowed,
+                    &allowed_pages,
                     top_k,
                 )
                 .await?
@@ -1028,15 +995,16 @@ impl LogDb {
                     return Ok(None);
                 };
                 for (address, score) in scores {
+                    let (sequence, first_row) = leaves[&(address.stream_id, address.page_sequence)];
                     by_page
-                        .entry((*slot, address.stream_id, address.page_sequence))
+                        .entry((address.stream_id, sequence))
                         .or_default()
-                        .insert(address.row_id, score);
+                        .insert(first_row.saturating_add(address.row_id), score);
                 }
             }
 
-            for (slot, stream_id, labels, page_id) in candidate_pages {
-                let Some(page_scores) = by_page.get(&(slot, stream_id, page_id.sequence)) else {
+            for (stream_id, labels, page_id, level) in candidate_pages {
+                let Some(page_scores) = by_page.get(&(stream_id, page_id.sequence)) else {
                     continue;
                 };
                 if pages_read == max_pages {
@@ -1047,7 +1015,7 @@ impl LogDb {
                 pages_read += 1;
                 let payload = self
                     .storage
-                    .get(payload_key(namespace, segment, slot, stream_id, page_id))
+                    .get(payload_key(namespace, segment, stream_id, page_id, level))
                     .await?
                     .ok_or_else(|| Error::Corrupt("page metadata has no payload".to_owned()))?;
                 let page = Page::decode(payload.value)?;
@@ -1067,12 +1035,6 @@ impl LogDb {
                     }
                 }
             }
-            if segment == last_segment {
-                break;
-            }
-            segment = segment
-                .checked_add(self.segment_ns)
-                .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?;
         }
         Ok(Some(rows))
     }
@@ -1111,47 +1073,258 @@ impl LogDb {
         namespace: &Namespace,
         segment: SegmentId,
         matchers: &[Label],
-    ) -> Result<Vec<(u16, StreamId)>> {
+    ) -> Result<Vec<StreamId>> {
         if matchers.is_empty() {
             let mut result = Vec::new();
-            for slot in self.owned_slots.clone() {
-                let mut iterator = self
-                    .storage
-                    .scan_iter(forward_range(namespace, segment, slot))
-                    .await?;
-                while let Some(record) = iterator.next().await? {
-                    result.push(decode_forward_key(&record.key)?);
-                }
+            let mut iterator = self
+                .storage
+                .scan_prefix_iter(
+                    forward_prefix(namespace, segment),
+                    BytesRange::unbounded(),
+                    None,
+                )
+                .await?;
+            while let Some(record) = iterator.next().await? {
+                result.push(decode_forward_key(&record.key)?);
             }
             return Ok(result);
         }
 
-        let mut streams = Vec::new();
-        for slot in self.owned_slots.clone() {
-            let mut result: Option<RoaringBitmap> = None;
-            for matcher in matchers {
-                let Some(record) = self
-                    .storage
-                    .get(posting_key(namespace, segment, slot, matcher))
-                    .await?
-                else {
-                    result = Some(RoaringBitmap::new());
-                    break;
-                };
-                let bitmap = decode_postings(&record.value)?;
-                match &mut result {
-                    Some(result) => *result &= bitmap,
-                    None => result = Some(bitmap),
-                }
+        let records = futures::future::try_join_all(
+            matchers
+                .iter()
+                .map(|matcher| self.storage.get(posting_key(namespace, segment, matcher))),
+        )
+        .await?;
+        let mut result: Option<RoaringBitmap> = None;
+        for record in records {
+            let Some(record) = record else {
+                return Ok(Vec::new());
+            };
+            let bitmap = decode_postings(&record.value)?;
+            match &mut result {
+                Some(result) => *result &= bitmap,
+                None => result = Some(bitmap),
             }
-            streams.extend(
-                result
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|stream_id| (slot, stream_id)),
-            );
         }
-        Ok(streams)
+        Ok(result.unwrap_or_default().iter().collect())
+    }
+
+    /// Fetches forward labels for `stream_ids` concurrently, in input order.
+    async fn stream_labels(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        stream_ids: Vec<StreamId>,
+    ) -> Result<Vec<(StreamId, Arc<Labels>)>> {
+        futures::stream::iter(stream_ids)
+            .map(|stream_id| async move {
+                let record = self
+                    .storage
+                    .get(forward_key(namespace, segment, stream_id))
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corrupt("posting references missing forward labels".to_owned())
+                    })?;
+                Ok::<_, Error>((stream_id, Arc::new(decode_labels(&record.value)?)))
+            })
+            .buffered(STREAM_METADATA_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
+    /// Streams in `segment` selected by `filter`, each with its live pages
+    /// overlapping `[start_ns, end_ns]`. Labels are checked before any page
+    /// metadata is scanned, so non-exact matchers prune streams without I/O.
+    async fn segment_streams(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        filter: &StreamFilter,
+        (start_ns, end_ns): (i64, i64),
+        now_unix_ms: u64,
+    ) -> Result<Vec<SegmentStream>> {
+        let stream_ids = self.stream_ids(namespace, segment, &filter.exact).await?;
+        let labelled = self.stream_labels(namespace, segment, stream_ids).await?;
+        futures::stream::iter(
+            labelled
+                .into_iter()
+                .filter(|(_, labels)| filter.matches(labels)),
+        )
+        .map(|(stream_id, labels)| async move {
+            let mut pages = Vec::new();
+            let mut metadata = self
+                .storage
+                .scan_prefix_iter(
+                    metadata_prefix(namespace, segment, stream_id),
+                    BytesRange::unbounded(),
+                    None,
+                )
+                .await?;
+            while let Some(record) = metadata.next().await? {
+                let (_, page_id) = decode_metadata_key(&record.key)?;
+                let page = decode_metadata(&record.value)?;
+                if page.is_expired_at(now_unix_ms)
+                    || page.max_timestamp_ns < start_ns
+                    || page.min_timestamp_ns > end_ns
+                {
+                    continue;
+                }
+                pages.push((page_id, page));
+            }
+            Ok::<_, Error>(SegmentStream {
+                stream_id,
+                labels,
+                pages,
+            })
+        })
+        .buffered(STREAM_METADATA_CONCURRENCY)
+        .try_collect()
+        .await
+    }
+}
+
+struct SegmentStream {
+    stream_id: StreamId,
+    labels: Arc<Labels>,
+    pages: Vec<(PageId, StoredPageMetadata)>,
+}
+
+/// Output of [`LogDb::scan_targets`].
+pub(crate) struct ScanTargets {
+    range: (i64, i64),
+    segments: Vec<(SegmentId, Vec<SegmentStream>)>,
+}
+
+impl ScanTargets {
+    pub(crate) fn estimate(&self) -> QueryEstimate {
+        let mut estimate = QueryEstimate::default();
+        for page in self
+            .segments
+            .iter()
+            .flat_map(|(_, streams)| streams)
+            .flat_map(|stream| &stream.pages)
+            .map(|(_, page)| page)
+        {
+            estimate.pages = estimate.pages.saturating_add(1);
+            estimate.compressed_bytes = estimate
+                .compressed_bytes
+                .saturating_add(u64::from(page.payload_bytes));
+            estimate.lines = estimate.lines.saturating_add(u64::from(page.row_count));
+        }
+        estimate
+    }
+}
+
+type RowKey = (i64, StreamFingerprint, u64, usize);
+
+/// Decoded rows waiting until no unread page can precede them.
+struct PendingRows {
+    heap: BinaryHeap<PendingRow>,
+    reverse: bool,
+}
+
+struct PendingRow {
+    key: RowKey,
+    reverse: bool,
+    row: LogRow,
+}
+
+impl PartialEq for PendingRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for PendingRow {}
+
+impl PartialOrd for PendingRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingRow {
+    /// `BinaryHeap` pops the greatest row, which must be the next in scan order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let order = self.key.cmp(&other.key);
+        if self.reverse { order } else { order.reverse() }
+    }
+}
+
+impl PendingRows {
+    fn new(reverse: bool) -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            reverse,
+        }
+    }
+
+    fn push(&mut self, key: RowKey, row: LogRow) {
+        self.heap.push(PendingRow {
+            key,
+            reverse: self.reverse,
+            row,
+        });
+    }
+
+    /// Pops rows strictly before `next_bound` (the nearest timestamp any
+    /// unread page may hold) in ascending order; `None` releases everything.
+    fn release(&mut self, next_bound: Option<i64>) -> Vec<LogRow> {
+        let mut ready = Vec::new();
+        while let Some(top) = self.heap.peek() {
+            let timestamp = top.key.0;
+            let safe = match next_bound {
+                None => true,
+                Some(bound) if self.reverse => timestamp > bound,
+                Some(bound) => timestamp < bound,
+            };
+            if !safe {
+                break;
+            }
+            ready.push(self.heap.pop().expect("peeked row").row);
+        }
+        if self.reverse {
+            ready.reverse();
+        }
+        ready
+    }
+}
+
+/// Stream selection for a query: postings intersect `exact`, then a stream is
+/// kept when any selector matches its labels (or when there are none).
+pub(crate) struct StreamFilter {
+    exact: Vec<Label>,
+    selectors: Vec<SeriesSelector>,
+}
+
+impl StreamFilter {
+    pub(crate) fn exact(exact: Vec<Label>) -> Self {
+        Self {
+            exact,
+            selectors: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new<'a>(
+        exact: Vec<Label>,
+        selectors: impl IntoIterator<Item = &'a [crate::logql::Spanned<crate::logql::Matcher>]>,
+    ) -> Result<Self> {
+        Ok(Self {
+            exact,
+            selectors: selectors
+                .into_iter()
+                .map(SeriesSelector::from_matchers)
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn matches(&self, labels: &Labels) -> bool {
+        self.selectors.is_empty()
+            || self
+                .selectors
+                .iter()
+                .any(|selector| selector.matches(labels))
     }
 }
 
@@ -1169,7 +1342,7 @@ enum SeriesMatcher {
 
 impl SeriesSelector {
     fn parse(source: &str) -> Result<Self> {
-        use crate::logql::{Expr, MatchOp};
+        use crate::logql::Expr;
 
         let query = crate::logql::parse(source).map_err(|error| Error::Query(error.to_string()))?;
         let Expr::Log(log) = query.value else {
@@ -1182,13 +1355,18 @@ impl SeriesSelector {
                 "series match[] must contain only a stream selector".into(),
             ));
         }
+        Self::from_matchers(&log.selector.value.matchers)
+    }
+
+    fn from_matchers(source: &[crate::logql::Spanned<crate::logql::Matcher>]) -> Result<Self> {
+        use crate::logql::MatchOp;
+
         let mut exact = Vec::new();
-        let mut matchers = Vec::with_capacity(log.selector.value.matchers.len());
-        for matcher in log.selector.value.matchers {
-            let matcher = matcher.value;
-            let name = matcher.label;
-            let value = matcher.value;
-            match matcher.op {
+        let mut matchers = Vec::with_capacity(source.len());
+        for matcher in source {
+            let name = matcher.value.label.clone();
+            let value = matcher.value.value.clone();
+            match matcher.value.op {
                 MatchOp::Equal => {
                     exact.push(Label::new(&name, &value));
                     matchers.push(SeriesMatcher::Equal(name, value));
@@ -1234,9 +1412,9 @@ fn anchored_regex(pattern: &str) -> Result<regex::Regex> {
     Ok(regex::Regex::new(&format!("^(?:{pattern})$"))?)
 }
 
-type StreamGroups = BTreeMap<(SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+type StreamGroups = BTreeMap<(SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
 type CoordinatedStreamGroups =
-    BTreeMap<(Namespace, SegmentId, u16, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+    BTreeMap<(Namespace, SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
 
 struct LineWrite {
     namespace: Namespace,
@@ -1276,19 +1454,19 @@ impl Delta for LineWriteDelta {
                 .map(|(_, entries)| entries.len())
                 .sum(),
         };
-        for ((segment, slot, fingerprint), (labels, _)) in &write.groups {
+        for ((segment, fingerprint), (labels, _)) in &write.groups {
             if let Some((existing, _)) =
                 self.groups
-                    .get(&(write.namespace.clone(), *segment, *slot, *fingerprint))
+                    .get(&(write.namespace.clone(), *segment, *fingerprint))
                 && existing != labels
             {
                 return Err("stream fingerprint collision across writes".to_owned());
             }
         }
-        for ((segment, slot, fingerprint), (labels, mut entries)) in write.groups {
+        for ((segment, fingerprint), (labels, mut entries)) in write.groups {
             let group = self
                 .groups
-                .entry((write.namespace.clone(), segment, slot, fingerprint))
+                .entry((write.namespace.clone(), segment, fingerprint))
                 .or_insert_with(|| (labels.clone(), Vec::new()));
             group.1.append(&mut entries);
         }
@@ -1330,6 +1508,7 @@ impl Delta for LineWriteDelta {
 struct LineFlusher {
     direct_writer: Arc<DirectWriter>,
     storage: Arc<dyn Storage>,
+    compactor: Option<Compactor>,
 }
 
 #[async_trait]
@@ -1339,10 +1518,15 @@ impl Flusher<LineWriteDelta> for LineFlusher {
         frozen: FrozenLineWriteDelta,
         _epoch_range: &Range<u64>,
     ) -> std::result::Result<(), String> {
-        self.direct_writer
+        let written = self
+            .direct_writer
             .write_groups(frozen)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Some(compactor) = &mut self.compactor {
+            compactor.after_flush(written).await;
+        }
+        Ok(())
     }
 
     async fn flush_storage(&self) -> std::result::Result<(), String> {
@@ -1364,20 +1548,15 @@ fn map_write_error<T>(error: WriteError<T>) -> Error {
     }
 }
 
-/// Groups entries by `(segment, routing slot, stream)`, sorted by timestamp.
-fn group_by_stream(
-    namespace: &Namespace,
-    batches: Vec<LogBatch>,
-    segment_ns: i64,
-) -> Result<StreamGroups> {
+/// Groups entries by `(segment, stream)`, sorted by timestamp.
+fn group_by_stream(batches: Vec<LogBatch>, segment_ns: i64) -> Result<StreamGroups> {
     let mut groups = StreamGroups::new();
     for batch in batches {
         let fingerprint = batch.labels.fingerprint();
-        let slot = crate::routing::routing_slot(namespace, &batch.labels);
         for entry in batch.entries {
             let segment = segment_for(entry.timestamp_ns, segment_ns);
             let group = groups
-                .entry((segment, slot, fingerprint))
+                .entry((segment, fingerprint))
                 .or_insert_with(|| (batch.labels.clone(), Vec::new()));
             if group.0 != batch.labels {
                 return Err(Error::Invalid(
@@ -1399,10 +1578,11 @@ struct PendingWrite {
     ttl: Ttl,
     retention: PageRetention,
     ops: Vec<RecordOp>,
-    /// Next unallocated stream ID for each segment and slot that allocated one.
-    next_stream_ids: HashMap<(SegmentId, u16), StreamId>,
-    postings: HashMap<(SegmentId, u16, Label), RoaringBitmap>,
-    search_deltas: BTreeMap<(SegmentId, u16), IndexDelta>,
+    /// Next unallocated stream ID for each segment that allocated one.
+    next_stream_ids: HashMap<SegmentId, StreamId>,
+    postings: HashMap<(SegmentId, Label), RoaringBitmap>,
+    search_deltas: BTreeMap<SegmentId, IndexDelta>,
+    written: Vec<(SegmentId, StreamId, PageId, StoredPageMetadata)>,
     report: WriteReport,
 }
 
@@ -1415,6 +1595,7 @@ impl PendingWrite {
             next_stream_ids: HashMap::new(),
             postings: HashMap::new(),
             search_deltas: BTreeMap::new(),
+            written: Vec::new(),
             report: WriteReport {
                 streams,
                 ..WriteReport::default()
@@ -1430,32 +1611,28 @@ impl PendingWrite {
         &mut self,
         namespace: &Namespace,
         segment: SegmentId,
-        slot: u16,
         stream_id: StreamId,
         sequence: &mut u64,
         (page, rows): (Page, Vec<LogEntry>),
     ) -> Result<()> {
-        self.search_deltas
-            .entry((segment, slot))
-            .or_default()
-            .add_page(
-                &DEFAULT_ANALYZER,
-                stream_id,
-                *sequence,
-                rows.iter().map(|row| row.line.as_str()),
-            )?;
-        append_page_ops(
+        self.search_deltas.entry(segment).or_default().add_page(
+            &DEFAULT_ANALYZER,
+            stream_id,
+            *sequence,
+            rows.iter().map(|row| row.line.as_str()),
+        )?;
+        let (page_id, metadata) = append_page_ops(
             &mut self.ops,
             namespace,
             PageWriteId {
                 segment,
-                slot,
                 stream_id,
                 sequence: *sequence,
             },
             page,
             self.retention,
         )?;
+        self.written.push((segment, stream_id, page_id, metadata));
         *sequence = sequence
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("stream exhausted page sequences".to_owned()))?;
@@ -1467,7 +1644,6 @@ impl PendingWrite {
 #[derive(Clone, Copy)]
 struct PageWriteId {
     segment: SegmentId,
-    slot: u16,
     stream_id: StreamId,
     sequence: u64,
 }
@@ -1478,7 +1654,7 @@ fn append_page_ops(
     id: PageWriteId,
     page: Page,
     retention: PageRetention,
-) -> Result<()> {
+) -> Result<(PageId, StoredPageMetadata)> {
     let bytes = page.bytes();
     let min_timestamp_ns = page.blocks().first().unwrap().min_timestamp_ns;
     let max_timestamp_ns = page.blocks().last().unwrap().max_timestamp_ns;
@@ -1493,18 +1669,21 @@ fn append_page_ops(
         row_count: page.row_count(),
         payload_bytes: u32::try_from(bytes.len())
             .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
+        level: 0,
+        written_at_unix_ms: retention.written_at_unix_ms,
+        leaf_rows: Vec::new(),
     };
     ops.push(put(
-        metadata_key(namespace, id.segment, id.slot, id.stream_id, page_id),
+        metadata_key(namespace, id.segment, id.stream_id, page_id),
         encode_metadata(&metadata)?,
         retention.physical_ttl,
     ));
     ops.push(put(
-        payload_key(namespace, id.segment, id.slot, id.stream_id, page_id),
+        payload_key(namespace, id.segment, id.stream_id, page_id, 0),
         bytes,
         retention.physical_ttl,
     ));
-    Ok(())
+    Ok((page_id, metadata))
 }
 
 fn put(key: Bytes, value: Bytes, ttl: Ttl) -> RecordOp {
@@ -1536,7 +1715,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::PageConfig;
+    use crate::config::{CompactionConfig, PageConfig};
 
     fn test_config() -> Config {
         Config {
@@ -1552,8 +1731,11 @@ mod tests {
             page: PageConfig {
                 target_size_bytes: 64,
                 max_rows: 2,
-                max_age: Duration::from_secs(60),
                 rows_per_block: 1,
+            },
+            compaction: CompactionConfig {
+                enabled: false,
+                ..CompactionConfig::default()
             },
             write_buffer: Default::default(),
         }
@@ -1701,51 +1883,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_ids_are_local_to_each_segment_slot() {
+    async fn streams_in_a_segment_share_one_id_space() {
         let db = LogDb::open(test_config()).await.unwrap();
-        let namespace = Namespace::new("slot-local").unwrap();
-        let first = labels("api", "prod");
-        let first_slot = crate::routing::routing_slot(&namespace, &first);
-        let second = (0..10_000)
-            .map(|candidate| labels(&format!("worker-{candidate}"), "prod"))
-            .find(|labels| crate::routing::routing_slot(&namespace, labels) != first_slot)
-            .unwrap();
-        let second_slot = crate::routing::routing_slot(&namespace, &second);
+        let namespace = Namespace::new("segment-ids").unwrap();
 
         db.write(
             &namespace,
             vec![
-                LogBatch::new(first, vec![LogEntry::new(1, "first")]),
-                LogBatch::new(second, vec![LogEntry::new(2, "second")]),
+                LogBatch::new(labels("api", "prod"), vec![LogEntry::new(1, "first")]),
+                LogBatch::new(labels("worker", "prod"), vec![LogEntry::new(2, "second")]),
             ],
         )
         .await
         .unwrap();
 
-        let ids = db.stream_ids(&namespace, 0, &[]).await.unwrap();
-        assert!(ids.contains(&(first_slot, 0)));
-        assert!(ids.contains(&(second_slot, 0)));
+        let mut ids = db.stream_ids(&namespace, 0, &[]).await.unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1]);
         assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
         db.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn opened_slot_range_rejects_non_authoritative_writes() {
-        let namespace = Namespace::new("owned-slots").unwrap();
-        let labels = labels("api", "prod");
-        let slot = crate::routing::routing_slot(&namespace, &labels);
-        let owned = if slot == 0 { 1..2 } else { 0..1 };
-        let db = LogDb::open_with_slots(test_config(), owned).await.unwrap();
+    async fn limited_log_queries_stop_within_a_segment() {
+        use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
 
-        let error = db
-            .write(
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("early-stop").unwrap();
+        let entries = (1..=10)
+            .map(|timestamp| LogEntry::new(timestamp, format!("line-{timestamp}")))
+            .collect();
+        db.write(
+            &namespace,
+            vec![LogBatch::new(labels("api", "prod"), entries)],
+        )
+        .await
+        .unwrap();
+        let first = |direction| {
+            let db = &db;
+            let namespace = &namespace;
+            async move {
+                let result = db
+                    .query(
+                        namespace,
+                        &QueryRequest::range(r#"{service="api"}"#, 0, 11, 1),
+                        QueryOptions {
+                            limit: 1,
+                            max_pages: 2,
+                            direction,
+                            ..QueryOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let QueryResult::Streams(streams) = result else {
+                    panic!("expected streams");
+                };
+                streams[0].entries[0].timestamp_ns
+            }
+        };
+
+        // Five two-row pages share one segment; one page answers each query.
+        assert_eq!(first(Direction::Forward).await, 1);
+        assert_eq!(first(Direction::Backward).await, 10);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regex_and_negative_matchers_prune_streams_before_page_reads() {
+        use crate::{QueryOptions, QueryRequest};
+
+        let db = LogDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::new("prune").unwrap();
+        let worker = (1..=10)
+            .map(|timestamp| LogEntry::new(timestamp, "worker"))
+            .collect();
+        db.write(
+            &namespace,
+            vec![
+                LogBatch::new(labels("api", "prod"), vec![LogEntry::new(1, "api")]),
+                LogBatch::new(labels("worker", "prod"), worker),
+            ],
+        )
+        .await
+        .unwrap();
+
+        for query in [
+            r#"count_over_time({service=~"a.i"}[10s])"#,
+            r#"count_over_time({environment="prod", service!="worker"}[10s])"#,
+            r#"count_over_time({environment="prod", service!~"work.*"}[10s])"#,
+        ] {
+            db.query(
                 &namespace,
-                vec![LogBatch::new(labels, vec![LogEntry::new(1, "outside")])],
+                &QueryRequest::instant(query, 10),
+                QueryOptions {
+                    max_pages: 1,
+                    ..QueryOptions::default()
+                },
             )
             .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("outside opened shard range"));
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+        }
         db.close().await.unwrap();
     }
 
@@ -1777,7 +2015,6 @@ mod tests {
         let db = LogDb::open(test_config()).await.unwrap();
         let namespace = Namespace::new("coalesced").unwrap();
         let labels = labels("api", "prod");
-        let slot = crate::routing::routing_slot(&namespace, &labels);
 
         for (timestamp, line) in [(1, "first"), (2, "second")] {
             let report = db
@@ -1801,10 +2038,14 @@ mod tests {
 
         let rows = db.read(&namespace, 0, 3, &[]).await.unwrap();
         assert_eq!(rows.len(), 2);
-        let (_, stream_id) = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+        let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
         let mut pages = db
             .storage
-            .scan_iter(metadata_range(&namespace, 0, slot, stream_id))
+            .scan_prefix_iter(
+                metadata_prefix(&namespace, 0, stream_id),
+                BytesRange::unbounded(),
+                None,
+            )
             .await
             .unwrap();
         let mut page_count = 0;
@@ -1921,12 +2162,7 @@ mod tests {
         }
         let stats = db
             .storage
-            .get(crate::codec::term_stats_key(
-                &namespace,
-                0,
-                crate::routing::routing_slot(&namespace, &labels("search", "prod")),
-                "needle",
-            ))
+            .get(crate::codec::term_stats_key(&namespace, 0, "needle"))
             .await
             .unwrap()
             .unwrap();
@@ -1937,7 +2173,14 @@ mod tests {
         let terms = vec!["needle".to_owned()];
         for top_k in [None, Some(2)] {
             let rows = db
-                .read_match_bounded(&namespace, 0, 10, &[], (&terms, top_k), 10)
+                .read_match_bounded(
+                    &namespace,
+                    &db.scan_targets(&namespace, 0, 10, &StreamFilter::exact(Vec::new()))
+                        .await
+                        .unwrap(),
+                    (&terms, top_k),
+                    10,
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -1967,14 +2210,24 @@ mod tests {
 
         assert!(db.read(&namespace, 0, 2, &[]).await.unwrap().is_empty());
         assert_eq!(
-            db.estimate_pages(&namespace, 0, 2, &[]).await.unwrap(),
+            db.scan_targets(&namespace, 0, 2, &StreamFilter::exact(Vec::new()))
+                .await
+                .unwrap()
+                .estimate(),
             QueryEstimate::default()
         );
         let terms = vec!["needle".to_owned()];
         assert_eq!(
-            db.read_match_bounded(&namespace, 0, 2, &[], (&terms, None), 10)
-                .await
-                .unwrap(),
+            db.read_match_bounded(
+                &namespace,
+                &db.scan_targets(&namespace, 0, 2, &StreamFilter::exact(Vec::new()))
+                    .await
+                    .unwrap(),
+                (&terms, None),
+                10
+            )
+            .await
+            .unwrap(),
             Some(Vec::new())
         );
         db.close().await.unwrap();
@@ -2007,10 +2260,14 @@ mod tests {
         .await
         .unwrap();
 
-        let (slot, stream_id) = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+        let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
         let mut metadata_records = db
             .storage
-            .scan_iter(metadata_range(&namespace, 0, slot, stream_id))
+            .scan_prefix_iter(
+                metadata_prefix(&namespace, 0, stream_id),
+                BytesRange::unbounded(),
+                None,
+            )
             .await
             .unwrap();
         let record = metadata_records.next().await.unwrap().unwrap();
@@ -2041,11 +2298,253 @@ mod tests {
         let terms = vec!["needle".to_owned()];
         assert_eq!(
             reopened
-                .read_match_bounded(&namespace, 0, 2, &[], (&terms, None), 10)
+                .read_match_bounded(
+                    &namespace,
+                    &reopened
+                        .scan_targets(&namespace, 0, 2, &StreamFilter::exact(Vec::new()))
+                        .await
+                        .unwrap(),
+                    (&terms, None),
+                    10
+                )
                 .await
                 .unwrap(),
             Some(Vec::new())
         );
         reopened.close().await.unwrap();
+    }
+
+    const SEGMENT_NS: i64 = 10_000_000_000;
+
+    fn compacting_config() -> Config {
+        Config {
+            page: PageConfig {
+                target_size_bytes: 4096,
+                max_rows: 64,
+                rows_per_block: 4,
+            },
+            compaction: CompactionConfig {
+                enabled: true,
+                fan_in: 2,
+                min_age: Duration::ZERO,
+                finalize_after: Duration::from_secs(3600),
+                delete_delay: Duration::ZERO,
+                max_merges_per_flush: 256,
+            },
+            ..test_config()
+        }
+    }
+
+    fn local_storage(directory: &tempfile::TempDir, path: &str) -> StorageConfig {
+        StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: path.to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        })
+    }
+
+    /// Start of the segment containing now, so it is still open.
+    fn current_segment() -> SegmentId {
+        let now_ns = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        crate::codec::segment_for(now_ns, SEGMENT_NS)
+    }
+
+    async fn count_records(
+        db: &LogDb,
+        namespace: &Namespace,
+        segment: SegmentId,
+        record_type: crate::codec::RecordType,
+    ) -> usize {
+        let mut records = db
+            .storage
+            .scan_prefix_iter(
+                crate::codec::record_type_prefix(namespace, segment, record_type),
+                BytesRange::unbounded(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut count = 0;
+        while records.next().await.unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    async fn write_line(
+        db: &LogDb,
+        namespace: &Namespace,
+        service: &str,
+        timestamp: i64,
+        line: &str,
+    ) {
+        db.write(
+            namespace,
+            vec![LogBatch::new(
+                labels(service, "prod"),
+                vec![LogEntry::new(timestamp, line)],
+            )],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn lines(db: &LogDb, namespace: &Namespace, start: i64, end: i64) -> Vec<String> {
+        db.read(namespace, start, end, &[Label::new("service", "api")])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.entry.line)
+            .collect()
+    }
+
+    async fn match_lines(
+        db: &LogDb,
+        namespace: &Namespace,
+        start: i64,
+        end: i64,
+        max_pages: usize,
+    ) -> Result<Vec<String>> {
+        let terms = vec!["needle".to_owned()];
+        let targets = db
+            .scan_targets(
+                namespace,
+                start,
+                end,
+                &StreamFilter::exact(vec![Label::new("service", "api")]),
+            )
+            .await?;
+        let mut rows = db
+            .read_match_bounded(namespace, &targets, (&terms, None), max_pages)
+            .await?
+            .expect("indexed match");
+        rows.sort_by_key(|(row, _)| row.entry.timestamp_ns);
+        Ok(rows.into_iter().map(|(row, _)| row.entry.line).collect())
+    }
+
+    #[tokio::test]
+    async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
+        use crate::codec::RecordType;
+
+        let db = LogDb::open(compacting_config()).await.unwrap();
+        let namespace = Namespace::new("compaction").unwrap();
+        let segment = current_segment();
+        // Two writes share a timestamp; their order must survive merging.
+        let timestamps = [1, 2, 3, 3, 5, 6, 7, 8].map(|offset| segment + offset);
+        let expected = (0..timestamps.len())
+            .map(|index| format!("needle {index}"))
+            .collect::<Vec<_>>();
+        for (timestamp, line) in timestamps.iter().zip(&expected) {
+            write_line(&db, &namespace, "api", *timestamp, line).await;
+        }
+
+        // Eight level-0 pages fold into one level-3 page within the flushes.
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PageMetadata).await,
+            1
+        );
+        let end = segment + 100;
+        assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+        assert_eq!(
+            match_lines(&db, &namespace, segment, end, 1).await.unwrap(),
+            expected
+        );
+        // Replaced payloads stay readable until a later flush deletes them.
+        assert!(count_records(&db, &namespace, segment, RecordType::PageTombstone).await > 0);
+
+        write_line(&db, &namespace, "worker", segment + 50, "other stream").await;
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+            0
+        );
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PagePayload).await,
+            2
+        );
+        assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settled_segments_merge_below_fan_in() {
+        use crate::codec::RecordType;
+
+        let mut config = compacting_config();
+        config.compaction.fan_in = 4;
+        config.compaction.min_age = Duration::from_secs(3600);
+        config.compaction.finalize_after = Duration::ZERO;
+        let db = LogDb::open(config).await.unwrap();
+        let namespace = Namespace::new("settled").unwrap();
+        let expected = (1..=6)
+            .map(|index| format!("needle {index}"))
+            .collect::<Vec<_>>();
+        for (timestamp, line) in (1..).zip(&expected) {
+            write_line(&db, &namespace, "api", timestamp, line).await;
+        }
+
+        let pages = count_records(&db, &namespace, 0, RecordType::PageMetadata).await;
+        assert!(pages <= 3, "six late writes left {pages} pages");
+        assert_eq!(lines(&db, &namespace, 0, 10).await, expected);
+        assert_eq!(
+            match_lines(&db, &namespace, 0, 10, 3).await.unwrap(),
+            expected
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
+        use crate::codec::RecordType;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage: local_storage(&directory, "compaction-reopen"),
+            ..compacting_config()
+        };
+        let namespace = Namespace::new("reopen").unwrap();
+        let segment = current_segment();
+        let expected = (1..=4)
+            .map(|index| format!("needle {index}"))
+            .collect::<Vec<_>>();
+
+        let db = LogDb::open(config.clone()).await.unwrap();
+        for (offset, line) in (1..).zip(&expected[..2]) {
+            write_line(&db, &namespace, "api", segment + offset, line).await;
+        }
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+            2
+        );
+        db.close().await.unwrap();
+
+        let db = LogDb::open(config).await.unwrap();
+        write_line(&db, &namespace, "api", segment + 3, &expected[2]).await;
+        // Recovery re-queued the tombstones, and the merged page is tracked.
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+            0
+        );
+        write_line(&db, &namespace, "api", segment + 4, &expected[3]).await;
+        assert_eq!(
+            count_records(&db, &namespace, segment, RecordType::PageMetadata).await,
+            1
+        );
+        let end = segment + 100;
+        assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+        assert_eq!(
+            match_lines(&db, &namespace, segment, end, 1).await.unwrap(),
+            expected
+        );
+        db.close().await.unwrap();
     }
 }

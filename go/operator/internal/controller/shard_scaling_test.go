@@ -28,15 +28,11 @@ func TestEffectiveWriterReplicas(t *testing.T) {
 		{name: "downscale stops at shard count", intent: 2, current: 5, shardMap: base, trusted: true, want: 3, wantBlockedBy: true},
 		{name: "missing ShardMap retains current replicas", intent: 2, current: 5, want: 5, wantBlockedBy: true},
 		{
-			name: "active migration retains target ordinal", intent: 2, current: 5, trusted: true, want: 5, wantBlockedBy: true,
+			name: "non-released assignment retains its ordinal", intent: 2, current: 5, trusted: true, want: 5, wantBlockedBy: true,
 			shardMap: &telemetryv1alpha1.ShardMap{Spec: telemetryv1alpha1.ShardMapSpec{
 				ShardCount: 3,
-				Migration: &telemetryv1alpha1.ShardMigration{
-					DesiredShardCount: 5,
-					Split: telemetryv1alpha1.ShardSplit{
-						SourceOwner: telemetryv1alpha1.ShardOwner{Ordinal: 1},
-						TargetOwner: telemetryv1alpha1.ShardOwner{Ordinal: 4},
-					},
+				Assignments: []telemetryv1alpha1.ShardAssignment{
+					{Owner: telemetryv1alpha1.ShardOwner{Ordinal: 4}, State: "draining"},
 				},
 			}},
 		},
@@ -102,7 +98,6 @@ func TestShardedReadyRequiresConvergedShardMap(t *testing.T) {
 		{name: "converged", state: writerScalingState{trusted: true, intent: 3, status: telemetryv1alpha1.WriterScalingStatus{ShardCount: &count}}, ready: true},
 		{name: "missing map", state: writerScalingState{intent: 3}, ready: false},
 		{name: "intent differs", state: writerScalingState{trusted: true, intent: 4, status: telemetryv1alpha1.WriterScalingStatus{ShardCount: &count}}, ready: false},
-		{name: "active migration", state: writerScalingState{trusted: true, intent: 3, active: true, status: telemetryv1alpha1.WriterScalingStatus{ShardCount: &count, MigrationPhase: "cloning"}}, ready: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

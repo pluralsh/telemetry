@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn eval_expr(query: &Query, rows: &[Row], timestamp: i64) -> Result<Value> {
+pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Result<Value> {
     match &query.value {
         Expr::Number(value) => Ok(Value::Scalar(*value)),
         Expr::String(_) => Err(Error::Query("string is not a numeric expression".into())),
@@ -84,7 +84,7 @@ pub(super) fn range_aggregation(
     parameter: Option<f64>,
     log: &LogExpr,
     grouping: Option<&Grouping>,
-    rows: &[Row],
+    rows: &MetricRows,
     timestamp: i64,
 ) -> Result<Value> {
     let range = log
@@ -93,8 +93,8 @@ pub(super) fn range_aggregation(
         .ok_or_else(|| Error::Query("range aggregation requires a range".into()))
         .and_then(|value| parse_duration_ns(&value.value))?;
     // LogQL range windows are left-open and right-closed: (t-range, t].
-    let selected = eval_metric_log(log, rows, timestamp.saturating_sub(range), timestamp)?;
-    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<Row>> = BTreeMap::new();
+    let selected = rows.window(log, timestamp.saturating_sub(range), timestamp)?;
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<&Row>> = BTreeMap::new();
     for row in selected {
         let mut labels = group_labels(&row.labels, grouping);
         if grouping.is_none_or(|grouping| grouping.without)
@@ -168,7 +168,7 @@ pub(super) fn label_aggregation(
     field: &str,
     log: &LogExpr,
     grouping: Option<&Grouping>,
-    rows: &[Row],
+    rows: &MetricRows,
     timestamp: i64,
 ) -> Result<Value> {
     let range = log
@@ -176,10 +176,10 @@ pub(super) fn label_aggregation(
         .as_ref()
         .ok_or_else(|| Error::Query("label aggregation requires a range".into()))
         .and_then(|value| parse_duration_ns(&value.value))?;
-    let selected = eval_metric_log(log, rows, timestamp.saturating_sub(range), timestamp)?;
+    let selected = rows.window(log, timestamp.saturating_sub(range), timestamp)?;
     let mut groups: BTreeMap<BTreeMap<String, String>, BTreeSet<String>> = BTreeMap::new();
     for row in selected {
-        if let Some(value) = lookup(&row, field) {
+        if let Some(value) = lookup(row, field) {
             groups
                 .entry(group_labels(&row.labels, grouping))
                 .or_default()

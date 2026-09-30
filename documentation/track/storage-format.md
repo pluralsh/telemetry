@@ -1,31 +1,33 @@
 # Track storage format
 
-Track stores OTLP traces in SlateDB by namespace, time segment, and 12-bit
-routing slot. The slot is the high 12 bits of BLAKE3 over the canonical
-ShardedTrack routing key: the namespace length as `u32` BE, namespace bytes,
-then the 16-byte trace ID. A write groups traces into bounded slot-local pages
-and atomically publishes page metadata, payload, trace locators, and attribute
-postings.
+Track stores OTLP traces in SlateDB by namespace and time segment. A write
+groups traces into bounded segment-local pages and atomically publishes page
+metadata, payload, trace locators, and attribute postings.
 
 ```text
 Common key scope
-┌───────────┬─────────┬─────────────────┬──────────────────┬──────────────┬─────────────┐
-│ subsystem │ version │    namespace    │     segment      │ routing slot │ record type │
-│ 0x05      │ 0x02    │ TerminatedBytes │ sortable i64 BE  │ u16 BE       │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────────┴──────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬──────────────────┬─────────────┐
+│ subsystem │ version │    namespace    │     segment      │ record type │
+│ 0x05      │ 0x03    │ TerminatedBytes │ sortable i64 BE  │ u8          │
+└───────────┴─────────┴─────────────────┴──────────────────┴─────────────┘
 ```
 
-`TerminatedBytes` escapes embedded delimiters and ends with `0x00`.
+`TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Keys carry
+no routing information: shard selection hashes the canonical ShardedTrack
+routing key (the namespace length as `u32` BE, namespace bytes, then the
+16-byte trace ID) against the routing epoch in effect at the trace's earliest
+span start. The SlateDB segment extractor is named `track-trace/v3`. Version 3
+is a hard format switch: version-2 databases are not read.
 
 Each namespace/time-segment partition also contains the shared discovery
-catalog under reserved routing slot `0xffff` and catalog format version `1`.
+catalog under the reserved record type `0xff` and catalog format version `1`.
 Track records resource- and
 span-scoped attribute names plus typed scalar values there with the same TTL
 and in the same atomic storage apply as page records and attribute postings.
 Tempo tag discovery scans these compact partition prefixes and does not fetch
 trace payloads. A compact set of live segment IDs is stored as typed catalog
 values in the existing locator segment (`i64::MIN`), so unbounded tag requests
-discover partitions without scanning routing slots or trace locators. Results
+discover partitions without scanning trace locators. Results
 are unioned across physical shards. Existing prerelease data must be reset and
 reingested; there is no legacy discovery fallback or backfill.
 
@@ -41,11 +43,11 @@ reingested; there is no legacy discovery fallback or backfill.
 
 ```text
 NextPageSequence (0x01)
-KEY   common scope │ routing slot
+KEY   common scope
 VALUE next sequence: u64 BE
 
 PageMetadata (0x02)
-KEY   common scope │ routing slot │ page sequence: u64 BE
+KEY   common scope │ page sequence: u64 BE
 VALUE ┌─────────┬───────┬────────────────────┬──────────┬──────────────┬─────────┐
       │ version │ flags │ expiry ms          │ min ts   │ max − min ts │ traces  │
       │ u8 = 1  │ u8    │ var_u64 if flags&1 │ var_u64  │ var_u64      │ var_u32 │
@@ -56,7 +58,7 @@ VALUE ┌─────────┬───────┬─────�
       └──────────────────────────────────────────────────────────────┘
 
 PagePayload (0x03)
-KEY   common scope │ routing slot │ page sequence: u64 BE
+KEY   common scope │ page sequence: u64 BE
 VALUE immutable TRAK page (layout below)
 ```
 
@@ -89,24 +91,24 @@ decompresses independently.
 
 ```text
 TraceLocator (0x04, stored in reserved segment i64::MIN)
-KEY   common scope │ routing slot │ trace_id: 16 bytes │ data segment: sortable i64 │ page sequence:u64
+KEY   common scope │ trace_id: 16 bytes │ data segment: sortable i64 │ page sequence:u64
 VALUE ┌─────────┬───────┬────────────────────┬──────────────┬───────────────┬─────────────┐
       │ version │ flags │ expiry ms          │ data segment │ page sequence │ trace index │
       │ u8 = 1  │ u8    │ var_u64 if flags&1 │ i64 BE       │ var_u64       │ var_u32     │
       └─────────┴───────┴────────────────────┴──────────────┴───────────────┴─────────────┘
 
 AttributePosting (0x05)
-KEY   common scope │ routing slot │ scope:u8 │ name:TerminatedBytes │ typed value │ page sequence:u64
+KEY   common scope │ scope:u8 │ name:TerminatedBytes │ typed value │ page sequence:u64
 VALUE ┌─────────────────────────────────────────────┐
       │ count:u32 BE │ trace indexes:u32 BE × count│
       └─────────────────────────────────────────────┘
 ```
 
-The trace-ID locator uses a reserved segment (`i64::MIN`) per namespace while
-retaining the same routing slot as the trace's data pages. Locator keys are
-immutable sequence-suffixed fragments, avoiding a hot read-modify-write record
-while making trace-by-ID a single routing-shard and slot lookup followed by a
-page fetch.
+The trace-ID locator uses a reserved segment (`i64::MIN`) per namespace.
+Locator keys are immutable sequence-suffixed fragments, avoiding a hot
+read-modify-write record while making trace-by-ID a prefix lookup per storage
+shard followed by a page fetch. A trace written across a routing-epoch cutover
+can have locators in more than one shard; readers merge the partial traces.
 
 Attribute keys distinguish resource from span scope and string, boolean,
 integer, and double values. Postings identify candidate traces within one page;
@@ -131,10 +133,6 @@ reject values with any other leading byte.
 
 Retention is recorded on metadata and locators; expired records are ignored.
 Object-store data is authoritative and local caches are disposable.
-Page sequences, metadata, postings, and locators are local to a
-`(segment, routing slot)` pair, and no page contains traces from different
-slots. Each physical shard opens an authoritative half-open slot range; writes,
-point reads, locator scans, posting scans, and metadata scans are restricted to
-that range. The SlateDB segment extractor still ends immediately after the
-existing namespace/segment prefix, so adding the slot does not change segment
-boundaries.
+Page sequences, metadata, and postings are local to one segment of one storage
+shard. The SlateDB segment extractor ends immediately after the
+namespace/segment prefix.

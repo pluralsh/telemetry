@@ -25,8 +25,15 @@ retention_seconds: 2592000
 page:
   target_size_bytes: 1048576
   max_rows: 8192
-  max_age_seconds: 5
   rows_per_block: 256
+
+compaction:
+  enabled: true
+  fan_in: 4
+  min_age_seconds: 30
+  finalize_after_seconds: 300
+  delete_delay_seconds: 600
+  max_merges_per_flush: 256
 
 write:
   durability: applied
@@ -39,7 +46,7 @@ write:
   remote_retries: 2
 
 sharding:
-  virtual_shards: 8
+  shards: 1
   io_concurrency_limit: 128
   backend: standalone
 

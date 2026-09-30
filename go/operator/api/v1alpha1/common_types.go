@@ -33,8 +33,7 @@ type WriterScalingStatus struct {
 	ReadyWriterReplicas     int32  `json:"readyWriterReplicas,omitempty"`
 	ShardCount              *int32 `json:"shardCount,omitempty"`
 	ShardGeneration         *int64 `json:"shardGeneration,omitempty"`
-	MigrationPhase          string `json:"migrationPhase,omitempty"`
-	MigrationError          string `json:"migrationError,omitempty"`
+	RoutingEpochs           *int32 `json:"routingEpochs,omitempty"`
 }
 
 type ObjectStoreType string
@@ -264,7 +263,7 @@ type AuthSpec struct {
 }
 
 type WorkloadSpec struct {
-	// Replicas defaults to three for sharded writers and two for sharded
+	// Replicas defaults to one for sharded writers and two for sharded
 	// readers. Standalone mode uses exactly one writer and no reader.
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`

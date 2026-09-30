@@ -73,6 +73,8 @@ storage:
     capacity: 134217728 # Bytes; 128 MiB.
     shards: 8 # Optional.
 
+retention_seconds: 2592000 # Optional retention; 30 days. Unset keeps data forever.
+
 # Per-shard query-cache capacity, counted in time-bucket entries (not bytes).
 reader_cache_capacity: 268435456
 
@@ -90,13 +92,13 @@ write:
 
 sharding:
   # Storage-shard count fixed when the dataset is created.
-  virtual_shards: 8
+  shards: 1
   # Fixed per-pod storage I/O budget; independent of storage-shard count.
   io_concurrency_limit: 128
   backend: standalone
 
   # Static backend alternative. Ranges are half-open and must exactly cover
-  # [0, virtual_shards); owner_id must match an owners entry.
+  # [0, shards); owner_id must match an owners entry.
   # backend: static
   # owner_id: meter-0
   # owners:

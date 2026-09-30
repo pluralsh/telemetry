@@ -146,14 +146,14 @@ impl InternalWriter for AppState {
             .flatten()
             .collect::<Vec<_>>();
         let options = ShardingOptions::new(
-            assignment.virtual_shards,
+            assignment.shard_count,
             self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
         if batches
             .iter()
             .flat_map(|batch| &batch.traces)
-            .any(|trace| options.route(&assignment.routing, &namespace, trace.trace_id) != shard)
+            .any(|trace| options.route_trace(&assignment, &namespace, trace) != shard)
         {
             return Err(Status::invalid_argument("misrouted_trace"));
         }

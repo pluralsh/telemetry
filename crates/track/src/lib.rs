@@ -29,5 +29,5 @@ pub use traceql::{
     MatchedSpan, QueryOptions, QueryPlan, StaticValue as TraceQlValue, TraceQlResult,
 };
 
-/// Persisted SlateDB segment extractor identifier used by migration preflight.
-pub const SEGMENT_EXTRACTOR_NAME: &str = "track-trace/v2";
+/// Persisted SlateDB segment extractor identifier.
+pub const SEGMENT_EXTRACTOR_NAME: &str = codec::SEGMENT_EXTRACTOR_NAME;

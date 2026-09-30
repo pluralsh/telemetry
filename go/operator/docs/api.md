@@ -284,7 +284,6 @@ _Appears in:_
 
 _Appears in:_
 - [HashRangeAssignment](#hashrangeassignment)
-- [ShardSplit](#shardsplit)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -318,8 +317,7 @@ _Appears in:_
 
 
 _Appears in:_
-- [ShardMapSpec](#shardmapspec)
-- [ShardMigration](#shardmigration)
+- [RoutingEpoch](#routingepoch)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -519,7 +517,6 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `targetSizeBytes` _integer_ |  | 1048576 | Minimum: 1 <br /> |
 | `maxRows` _integer_ |  | 8192 | Minimum: 1 <br /> |
-| `maxAgeSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 | `rowsPerBlock` _integer_ |  | 256 | Minimum: 1 <br /> |
 
 
@@ -835,6 +832,25 @@ _Appears in:_
 
 
 
+#### RoutingEpoch
+
+
+
+RoutingEpoch is the hash routing for records timestamped at or after
+EffectiveFromNs, until the next epoch begins. The first epoch starts at the
+minimum int64 so every timestamp resolves to exactly one epoch.
+
+
+
+_Appears in:_
+- [ShardMapSpec](#shardmapspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `effective_from_ns` _integer_ |  |  |  |
+| `routing` _[HashRangeMap](#hashrangemap)_ |  |  |  |
+
+
 #### ServiceAccountSpec
 
 
@@ -927,30 +943,9 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `generation` _integer_ |  |  | Minimum: 1 <br /> |
-| `shard_count` _integer_ | ShardCount is the current number of physical SlateDB storage shards.<br />Desired count comes from writer StatefulSet replicas. |  | Minimum: 1 <br /> |
-| `routing` _[HashRangeMap](#hashrangemap)_ |  |  |  |
+| `shard_count` _integer_ | ShardCount is the number of physical SlateDB storage shards, equal to<br />the latest epoch's shard count. Desired count comes from writer<br />StatefulSet replicas; it only grows because shards are never merged. |  | Minimum: 1 <br /> |
+| `epochs` _[RoutingEpoch](#routingepoch) array_ | Epochs are ordered by EffectiveFromNs with non-decreasing shard counts.<br />Scale-up appends an epoch at a future aligned cutover. |  | MinItems: 1 <br /> |
 | `assignments` _[ShardAssignment](#shardassignment) array_ |  |  |  |
-| `migration` _[ShardMigration](#shardmigration)_ |  |  |  |
-
-
-#### ShardMigration
-
-
-
-
-
-
-
-_Appears in:_
-- [ShardMapSpec](#shardmapspec)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `phase` _string_ |  |  | Enum: [preparing prepared draining cloning ready completing failed] <br /> |
-| `desired_shard_count` _integer_ |  |  | Minimum: 1 <br /> |
-| `split` _[ShardSplit](#shardsplit)_ |  |  |  |
-| `target_routing` _[HashRangeMap](#hashrangemap)_ |  |  |  |
-| `error` _string_ |  |  |  |
 
 
 #### ShardOwner
@@ -963,7 +958,6 @@ _Appears in:_
 
 _Appears in:_
 - [ShardAssignment](#shardassignment)
-- [ShardSplit](#shardsplit)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -986,26 +980,6 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `start` _integer_ |  |  | Minimum: 0 <br /> |
 | `end` _integer_ |  |  | Minimum: 1 <br /> |
-
-
-#### ShardSplit
-
-
-
-
-
-
-
-_Appears in:_
-- [ShardMigration](#shardmigration)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `source_shard` _integer_ |  |  | Minimum: 0 <br /> |
-| `target_shard` _integer_ |  |  | Minimum: 0 <br /> |
-| `moved_range` _[HashRange](#hashrange)_ |  |  |  |
-| `source_owner` _[ShardOwner](#shardowner)_ |  |  |  |
-| `target_owner` _[ShardOwner](#shardowner)_ |  |  |  |
 
 
 #### ShardingSpec
@@ -1194,7 +1168,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `replicas` _integer_ | Replicas defaults to three for sharded writers and two for sharded<br />readers. Standalone mode uses exactly one writer and no reader. |  | Minimum: 0 <br /> |
+| `replicas` _integer_ | Replicas defaults to one for sharded writers and two for sharded<br />readers. Standalone mode uses exactly one writer and no reader. |  | Minimum: 0 <br /> |
 | `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is merged with podTemplate.spec.nodeSelector. Values here<br />take precedence when the same key is configured in both places. |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations are merged with podTemplate.spec.tolerations. A first-class<br />toleration replaces a podTemplate toleration with the same key, operator,<br />and effect; otherwise it is appended. |  |  |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources configures requests and limits for the datastore container.<br />Values here take precedence over podTemplate container resources. Missing<br />values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit. |  |  |
@@ -1249,7 +1223,6 @@ _Appears in:_
 | `readyWriterReplicas` _integer_ |  |  |  |
 | `shardCount` _integer_ |  |  |  |
 | `shardGeneration` _integer_ |  |  |  |
-| `migrationPhase` _string_ |  |  |  |
-| `migrationError` _string_ |  |  |  |
+| `routingEpochs` _integer_ |  |  |  |
 
 

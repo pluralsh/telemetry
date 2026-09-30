@@ -33,9 +33,6 @@ type LinePageSpec struct {
 	// +kubebuilder:default=8192
 	MaxRows *int64 `json:"maxRows,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=5
-	MaxAgeSeconds *int64 `json:"maxAgeSeconds,omitempty"`
-	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=256
 	RowsPerBlock *int64 `json:"rowsPerBlock,omitempty"`
 }

@@ -99,7 +99,6 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 insert_series_id(
                     &frozen.namespace,
                     frozen.bucket,
-                    frozen.routing_slot,
                     *fingerprint,
                     *series_id,
                     ttl,
@@ -115,7 +114,6 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 insert_forward_index(
                     &frozen.namespace,
                     frozen.bucket,
-                    frozen.routing_slot,
                     *entry.key(),
                     entry.value().clone(),
                     ttl,
@@ -131,7 +129,6 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 merge_inverted_index(
                     &frozen.namespace,
                     frozen.bucket,
-                    frozen.routing_slot,
                     entry.key().clone(),
                     entry.value().clone(),
                     ttl,
@@ -168,7 +165,6 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                 merge_samples(
                     &frozen.namespace,
                     frozen.bucket,
-                    frozen.routing_slot,
                     series_id,
                     &series_samples.metric_name,
                     series_samples.points,
@@ -310,7 +306,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -344,7 +339,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -400,7 +394,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -425,7 +418,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -519,7 +511,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -560,7 +551,6 @@ mod tests {
             let ctx = TsdbContext {
                 namespace: crate::Namespace::default(),
                 bucket,
-                routing_slot: 0,
                 series_dict: Arc::new(HashMap::new()),
                 next_series_id: i as u32,
                 active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -603,7 +593,6 @@ mod tests {
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket: create_test_bucket(),
-            routing_slot: 0,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
@@ -631,7 +620,6 @@ mod tests {
             .load_series_dictionary(
                 &crate::Namespace::default(),
                 &bucket,
-                0,
                 |_fingerprint, _series_id| {
                     count += 1;
                 },

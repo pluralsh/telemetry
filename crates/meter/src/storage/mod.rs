@@ -53,7 +53,6 @@ mod tests {
                 let key = SeriesDictionaryKey {
                     namespace: crate::Namespace::default(),
                     bucket: TimeBucket { start, size: 1 },
-                    routing_slot: 0,
                     series_fingerprint: 0,
                 }
                 .encode();

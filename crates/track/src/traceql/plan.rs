@@ -4,10 +4,16 @@ use super::ast::{
     AttributeScope, BinaryOp, Expr, FieldExpr, Query, SpansetExpr, StaticValue, StructuralOp,
 };
 
+/// Index candidates for one equality: a trace can only match if it holds at
+/// least one of these exactly typed attributes.
+pub type PushdownClause = Vec<AttributeMatcher>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryPlan {
     pub query: Query,
-    pub pushdown: Vec<AttributeMatcher>,
+    /// Every clause must be satisfied, so candidates intersect across clauses
+    /// and union within one.
+    pub pushdown: Vec<PushdownClause>,
 }
 
 pub fn plan(query: Query) -> Result<QueryPlan> {
@@ -16,7 +22,7 @@ pub fn plan(query: Query) -> Result<QueryPlan> {
     Ok(QueryPlan { query, pushdown })
 }
 
-fn collect_spanset(expression: &SpansetExpr, output: &mut Vec<AttributeMatcher>) -> Result<()> {
+fn collect_spanset(expression: &SpansetExpr, output: &mut Vec<PushdownClause>) -> Result<()> {
     match expression {
         SpansetExpr::Filter(expression) => collect_expr(expression, true, output)?,
         SpansetExpr::Binary { lhs, op, rhs } if *op == StructuralOp::And => {
@@ -31,7 +37,7 @@ fn collect_spanset(expression: &SpansetExpr, output: &mut Vec<AttributeMatcher>)
 fn collect_expr(
     expression: &FieldExpr,
     positive: bool,
-    output: &mut Vec<AttributeMatcher>,
+    output: &mut Vec<PushdownClause>,
 ) -> Result<()> {
     match &expression.value {
         Expr::Binary {
@@ -47,10 +53,10 @@ fn collect_expr(
             op: BinaryOp::Equal,
             rhs,
         } if positive => {
-            if let Some(matcher) = matcher(lhs, rhs)? {
-                output.push(matcher);
-            } else if let Some(matcher) = matcher(rhs, lhs)? {
-                output.push(matcher);
+            if let Some(clause) = clause(lhs, rhs)? {
+                output.push(clause);
+            } else if let Some(clause) = clause(rhs, lhs)? {
+                output.push(clause);
             }
         }
         _ => {}
@@ -58,29 +64,70 @@ fn collect_expr(
     Ok(())
 }
 
-fn matcher(attribute: &FieldExpr, value: &FieldExpr) -> Result<Option<AttributeMatcher>> {
+/// Largest magnitude below which every integer converts to a distinct `f64`.
+const EXACT_FLOAT_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+fn clause(attribute: &FieldExpr, value: &FieldExpr) -> Result<Option<PushdownClause>> {
     let Expr::Attribute(attribute) = &attribute.value else {
         return Ok(None);
     };
-    let scope = match attribute.scope {
-        AttributeScope::Resource => IndexScope::Resource,
-        AttributeScope::Span => IndexScope::Span,
-        AttributeScope::Unscoped => return Ok(None),
+    // Unscoped lookups prefer the span attribute and fall back to the
+    // resource, so a match needs the value in at least one of them.
+    let scopes: &[IndexScope] = match attribute.scope {
+        AttributeScope::Resource => &[IndexScope::Resource],
+        AttributeScope::Span => &[IndexScope::Span],
+        AttributeScope::Unscoped => &[IndexScope::Span, IndexScope::Resource],
     };
     let Expr::Static(value) = &value.value else {
         return Ok(None);
     };
-    let value = match value {
-        StaticValue::String(value) => AttributeValue::String(value.clone()),
-        StaticValue::Bool(value) => AttributeValue::Bool(*value),
-        // TraceQL compares integer and floating-point numerics across types.
-        // Track's index is exactly typed, so numeric equality is not a safe
-        // pushdown: either posting alone could exclude an equal value.
-        StaticValue::Int(_) | StaticValue::Float(_) => return Ok(None),
+    let Some(values) = equal_values(value) else {
+        return Ok(None);
+    };
+    let mut clause = Vec::with_capacity(scopes.len() * values.len());
+    for scope in scopes {
+        for value in &values {
+            clause.push(AttributeMatcher::new(
+                *scope,
+                attribute.name.clone(),
+                value.clone(),
+            )?);
+        }
+    }
+    Ok(Some(clause))
+}
+
+/// Every exactly typed stored value that TraceQL equality treats as equal to
+/// `value`, or `None` when that set cannot be enumerated.
+fn equal_values(value: &StaticValue) -> Option<Vec<AttributeValue>> {
+    Some(match value {
+        StaticValue::String(value) => vec![AttributeValue::String(value.clone())],
+        StaticValue::Bool(value) => vec![AttributeValue::Bool(*value)],
+        // Integers equal doubles numerically (so both zero signs); a double
+        // with the same value is unique apart from its sign.
+        StaticValue::Int(value) => {
+            let double = *value as f64;
+            let mut values = vec![AttributeValue::Int(*value), AttributeValue::Double(double)];
+            if *value == 0 {
+                values.push(AttributeValue::Double(-0.0));
+            }
+            values
+        }
+        // Doubles equal doubles bitwise and integers numerically. Beyond 2^53
+        // many integers round to one double, so they cannot be enumerated.
+        StaticValue::Float(value) => {
+            let mut values = vec![AttributeValue::Double(*value)];
+            if value.is_finite() && value.fract() == 0.0 {
+                if value.abs() >= EXACT_FLOAT_INTEGER {
+                    return None;
+                }
+                values.push(AttributeValue::Int(*value as i64));
+            }
+            values
+        }
         StaticValue::Nil
         | StaticValue::Duration(_)
         | StaticValue::Status(_)
-        | StaticValue::Kind(_) => return Ok(None),
-    };
-    AttributeMatcher::new(scope, attribute.name.clone(), value).map(Some)
+        | StaticValue::Kind(_) => return None,
+    })
 }

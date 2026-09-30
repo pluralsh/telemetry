@@ -148,7 +148,7 @@ impl InternalWriter for AppState {
             ));
         }
         let options = ShardingOptions::new(
-            assignment.virtual_shards,
+            assignment.shard_count,
             self.config.sharding.io_concurrency_limit,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -158,10 +158,11 @@ impl InternalWriter for AppState {
             .map(from_proto_batch)
             .collect::<Result<Vec<_>, _>>()
             .map_err(Status::invalid_argument)?;
-        if batches
-            .iter()
-            .any(|batch| options.route(&assignment.routing, &namespace, &batch.labels) != shard)
-        {
+        if batches.iter().any(|batch| {
+            batch.entries.iter().any(|entry| {
+                options.route(&assignment, &namespace, &batch.labels, entry.timestamp_ns) != shard
+            })
+        }) {
             return Err(Status::invalid_argument(
                 "misrouted_batch: stream does not route to requested shard",
             ));
@@ -248,7 +249,7 @@ mod tests {
         AppState::open(Config {
             storage: StorageConfig::InMemory,
             sharding: crate::config::ShardingConfig {
-                virtual_shards: 2,
+                shards: 2,
                 ..Default::default()
             },
             namespaces: vec![NamespaceConfig {
@@ -264,12 +265,21 @@ mod tests {
     fn request(generation: u64, request_id: &str) -> WriteBatchRequest {
         let namespace = Namespace::new("tenant").unwrap();
         let options = ShardingOptions::new(2, 4).unwrap();
-        let routing = sharding::HashRangeMap::bootstrap(2).unwrap();
+        let routing = sharding::ShardMap::new(
+            sharding::AssignmentGeneration::new(1),
+            2,
+            vec![sharding::Assignment::new(
+                sharding::Owner::new("test", 0),
+                sharding::ShardRange::within(0, 2, 2).unwrap(),
+                sharding::AssignmentState::Active,
+            )],
+        )
+        .unwrap();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()
             })
-            .find(|labels| options.route(&routing, &namespace, labels).get() == 1)
+            .find(|labels| options.route(&routing, &namespace, labels, 1).get() == 1)
             .unwrap();
         to_proto_request(
             &namespace,

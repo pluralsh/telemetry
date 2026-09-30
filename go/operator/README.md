@@ -26,7 +26,7 @@ their servers handle the prefix directly.
 
 Each writer or reader workload accepts `replicas`, `nodeSelector`,
 `tolerations`, `podTemplate`, `dataVolume`, and `cacheVolume`. Sharded
-workloads default to three writer replicas and two reader replicas; explicit
+workloads default to one writer replica and two reader replicas; explicit
 non-negative replica counts override those defaults. Standalone mode always
 uses one writer replica and no reader workload. Admission rejects any other
 standalone replica configuration.
@@ -34,13 +34,14 @@ standalone replica configuration.
 In sharded mode, `spec.writer.replicas` remains user intent. Scale-up is applied
 to the writer StatefulSet immediately so the Rust shard coordinator can observe
 the new ordinal and advance the authoritative `<name>-writer-shard-map`.
-Scale-down is held at the ShardMap shard count and any active migration floor.
+Scale-down is held at the ShardMap shard count because every shard referenced
+by a routing epoch must stay writable.
 If that ShardMap is missing or its ownership metadata is uncertain, the
 operator conservatively retains the current StatefulSet replica count. Product
 status exposes effective and ready writer replicas, ShardMap count/generation,
-migration phase/error, and `WriterScaling` / `WriterScalingBlocked`
-conditions. A sharded product is not `Ready` while migration is active or
-until writer intent equals the authoritative shard count.
+and `WriterScaling` / `WriterScalingBlocked` conditions.
+A sharded product is not `Ready` until writer intent equals the authoritative
+shard count.
 
 The operator intentionally does not inject a writer `preStop` drain command.
 The products currently expose health/readiness endpoints and coordinate

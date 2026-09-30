@@ -57,24 +57,12 @@ type HashRangeMap struct {
 	Assignments []HashRangeAssignment `json:"assignments"`
 }
 
-type ShardSplit struct {
-	// +kubebuilder:validation:Minimum=0
-	SourceShard int32 `json:"source_shard"`
-	// +kubebuilder:validation:Minimum=0
-	TargetShard int32      `json:"target_shard"`
-	MovedRange  HashRange  `json:"moved_range"`
-	SourceOwner ShardOwner `json:"source_owner"`
-	TargetOwner ShardOwner `json:"target_owner"`
-}
-
-type ShardMigration struct {
-	// +kubebuilder:validation:Enum=preparing;prepared;draining;cloning;ready;completing;failed
-	Phase string `json:"phase"`
-	// +kubebuilder:validation:Minimum=1
-	DesiredShardCount int32        `json:"desired_shard_count"`
-	Split             ShardSplit   `json:"split"`
-	TargetRouting     HashRangeMap `json:"target_routing"`
-	Error             string       `json:"error,omitempty"`
+// RoutingEpoch is the hash routing for records timestamped at or after
+// EffectiveFromNs, until the next epoch begins. The first epoch starts at the
+// minimum int64 so every timestamp resolves to exactly one epoch.
+type RoutingEpoch struct {
+	EffectiveFromNs int64        `json:"effective_from_ns"`
+	Routing         HashRangeMap `json:"routing"`
 }
 
 // ShardMapSpec is the authoritative routing and writer-ownership snapshot.
@@ -83,13 +71,16 @@ type ShardMigration struct {
 type ShardMapSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Generation int64 `json:"generation"`
-	// ShardCount is the current number of physical SlateDB storage shards.
-	// Desired count comes from writer StatefulSet replicas.
+	// ShardCount is the number of physical SlateDB storage shards, equal to
+	// the latest epoch's shard count. Desired count comes from writer
+	// StatefulSet replicas; it only grows because shards are never merged.
 	// +kubebuilder:validation:Minimum=1
-	ShardCount  int32             `json:"shard_count"`
-	Routing     HashRangeMap      `json:"routing"`
+	ShardCount int32 `json:"shard_count"`
+	// Epochs are ordered by EffectiveFromNs with non-decreasing shard counts.
+	// Scale-up appends an epoch at a future aligned cutover.
+	// +kubebuilder:validation:MinItems=1
+	Epochs      []RoutingEpoch    `json:"epochs"`
 	Assignments []ShardAssignment `json:"assignments"`
-	Migration   *ShardMigration   `json:"migration,omitempty"`
 }
 
 // +kubebuilder:object:root=true

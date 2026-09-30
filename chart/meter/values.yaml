@@ -29,7 +29,7 @@ service:
     publishNotReadyAddresses: false
 
 writer:
-  replicas: 3
+  replicas: 1
   resources:
     requests:
       cpu: 250m

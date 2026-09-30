@@ -48,5 +48,5 @@ pub use reader::TimeSeriesDbReader;
 pub use sharded::{ShardedMeter, ShardedTimeseries, ShardingOptions};
 pub use timeseries::{TimeSeriesDb, Visibility};
 
-/// Persisted SlateDB segment extractor identifier used by migration preflight.
+/// Persisted SlateDB segment extractor identifier.
 pub const SEGMENT_EXTRACTOR_NAME: &str = storage::segment_extractor::EXTRACTOR_NAME;

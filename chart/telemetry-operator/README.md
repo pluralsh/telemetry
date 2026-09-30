@@ -64,18 +64,20 @@ defaults to the chart `appVersion`.
 `spec.image.repository` defaults to the product's `ghcr.io/pluralsh/...`
 repository, and `spec.image.pullPolicy` defaults to `IfNotPresent`.
 
-Sharded resources default to three writer replicas and two reader replicas.
+Sharded resources default to one writer replica and two reader replicas.
 `spec.writer.replicas` and `spec.reader.replicas` override those defaults.
 Standalone resources safely run exactly one writer and no reader; other
 standalone replica values are rejected.
 
 For sharded writers, `spec.writer.replicas` is user intent. Scale-up reaches
-the StatefulSet immediately, while scale-down is blocked below the
-Rust-managed ShardMap's shard count or active migration floor. A missing or
-untrusted ShardMap conservatively preserves the current StatefulSet count.
-Status reports effective/ready writer replicas, ShardMap and migration state,
-and scaling conditions. `Ready` also requires no active migration and writer
-intent equal to the authoritative shard count.
+the StatefulSet immediately, and the Rust coordinator adds a routing epoch that
+sends new data to the new shards from the next aligned cutover; existing data
+never moves. Shards are never merged, so scale-down is blocked below the
+Rust-managed ShardMap's shard count. A missing or untrusted ShardMap
+conservatively preserves the current StatefulSet count. Status reports
+effective/ready writer replicas, ShardMap shard count, generation and routing
+epoch count, and scaling conditions. `Ready` also requires writer intent equal
+to the authoritative shard count.
 
 No automatic `preStop` drain hook is injected: the current products do not
 offer a stable, authenticated, bounded whole-process drain endpoint. Shard

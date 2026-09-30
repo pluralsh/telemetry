@@ -2804,6 +2804,7 @@ dependencies = [
  "lalrpop-util",
  "linkify",
  "logos",
+ "metrics",
  "proptest",
  "regex",
  "roaring",
@@ -2816,6 +2817,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tracing",
  "unicode-segmentation",
 ]
 
@@ -4170,7 +4172,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sharding",
  "slatedb",
  "tempfile",
  "thiserror 2.0.21",

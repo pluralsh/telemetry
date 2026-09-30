@@ -149,18 +149,6 @@ impl HashRange {
         Ok(start..end)
     }
 
-    fn split(self) -> Result<(Self, Self), RoutingError> {
-        let slots = self.slots()?;
-        if slots.end - slots.start < 2 {
-            return Err(RoutingError::UnsplittableRange { range: self });
-        }
-        let midpoint = slots.start + (slots.end - slots.start) / 2;
-        Ok((
-            Self::from_slots(slots.start, midpoint)?,
-            Self::from_slots(midpoint, slots.end)?,
-        ))
-    }
-
     pub const fn size_minus_one(self) -> u128 {
         self.end.0 - self.start.0
     }
@@ -316,77 +304,6 @@ impl HashRangeMap {
             .partition_point(|assignment| assignment.range.end() < value);
         self.assignments[index].shard
     }
-
-    /// Splits exactly one storage shard at its hash-range midpoint.
-    ///
-    /// The existing shard retains the lower half and `new_shard` receives the
-    /// upper half. Every other assignment is preserved byte-for-byte.
-    pub fn split(&self, shard: ShardId, new_shard: ShardId) -> Result<Self, RoutingError> {
-        if self
-            .assignments
-            .iter()
-            .any(|assignment| assignment.shard == new_shard)
-        {
-            return Err(RoutingError::DuplicateShard);
-        }
-
-        let mut assignments = Vec::with_capacity(self.assignments.len() + 1);
-        let mut found = false;
-        for assignment in &self.assignments {
-            if assignment.shard != shard {
-                assignments.push(*assignment);
-                continue;
-            }
-            let (left, right) = assignment.range.split()?;
-            assignments.push(HashRangeAssignment::new(shard, left));
-            assignments.push(HashRangeAssignment::new(new_shard, right));
-            found = true;
-        }
-        if !found {
-            return Err(RoutingError::UnknownShard(shard));
-        }
-        Self::new(self.generation.next(), assignments)
-    }
-
-    /// Grows this routing map to `desired_shards` by repeatedly splitting the
-    /// largest range. Equal-size ranges favor the lowest stable shard id.
-    pub fn grow_to(&self, desired_shards: u32) -> Result<Self, RoutingError> {
-        let current = u32::try_from(self.assignments.len()).expect("shard count fits in u32");
-        if desired_shards < current {
-            return Err(RoutingError::ScaleDownUnsupported {
-                current,
-                desired: desired_shards,
-            });
-        }
-
-        let mut map = self.clone();
-        let mut next_shard = map
-            .assignments
-            .iter()
-            .map(|assignment| assignment.shard.get())
-            .max()
-            .expect("validated routing map is non-empty")
-            .checked_add(1)
-            .ok_or(RoutingError::ShardIdExhausted)?;
-        while map.assignments.len() < desired_shards as usize {
-            let source = map
-                .assignments
-                .iter()
-                .max_by(|left, right| {
-                    left.range
-                        .size_minus_one()
-                        .cmp(&right.range.size_minus_one())
-                        .then_with(|| right.shard.cmp(&left.shard))
-                })
-                .expect("validated routing map is non-empty")
-                .shard;
-            map = map.split(source, ShardId::new(next_shard))?;
-            next_shard = next_shard
-                .checked_add(1)
-                .ok_or(RoutingError::ShardIdExhausted)?;
-        }
-        Ok(map)
-    }
 }
 
 /// Hashes a canonical product routing key into the shared 128-bit space.
@@ -405,8 +322,6 @@ pub enum RoutingError {
     NoRanges,
     #[error("hash range is reversed: {start}..={end}")]
     ReversedRange { start: HashValue, end: HashValue },
-    #[error("hash range {range} contains only one value and cannot be split")]
-    UnsplittableRange { range: HashRange },
     #[error("routing slot range must satisfy 0 <= start < end <= 4096, got {start}..{end}")]
     InvalidSlotRange { start: u16, end: u16 },
     #[error("hash range {range} is not aligned to routing slot boundaries")]
@@ -425,16 +340,8 @@ pub enum RoutingError {
     },
     #[error("hash ranges do not cover the full 128-bit space")]
     IncompleteCoverage,
-    #[error("storage shard {0} does not exist")]
-    UnknownShard(ShardId),
     #[error("a storage shard may own only one hash range")]
     DuplicateShard,
-    #[error(
-        "decreasing storage shard count from {current} to {desired} is unsupported; ranges may only grow by splitting"
-    )]
-    ScaleDownUnsupported { current: u32, desired: u32 },
-    #[error("cannot allocate another storage shard id")]
-    ShardIdExhausted,
 }
 
 #[cfg(test)]
@@ -464,41 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn split_moves_only_the_selected_ranges_upper_half() {
-        let original = HashRangeMap::bootstrap(4).unwrap();
-        let split = original.split(ShardId::new(1), ShardId::new(4)).unwrap();
-
-        assert_eq!(split.generation, original.generation.next());
-        assert_eq!(split.assignments.len(), 5);
-        for assignment in original
-            .assignments
-            .iter()
-            .filter(|assignment| assignment.shard != ShardId::new(1))
-        {
-            assert!(split.assignments.contains(assignment));
-            assert_eq!(split.route(assignment.range.start()), assignment.shard);
-            assert_eq!(split.route(assignment.range.end()), assignment.shard);
-        }
-
-        let old = original.assignments[1].range;
-        let retained = split
-            .assignments
-            .iter()
-            .find(|assignment| assignment.shard == ShardId::new(1))
-            .unwrap()
-            .range;
-        let created = split
-            .assignments
-            .iter()
-            .find(|assignment| assignment.shard == ShardId::new(4))
-            .unwrap()
-            .range;
-        assert_eq!(retained.start(), old.start());
-        assert_eq!(retained.end().get() + 1, created.start().get());
-        assert_eq!(created.end(), old.end());
-    }
-
-    #[test]
     fn serialized_boundaries_are_fixed_width_hex() {
         let map = HashRangeMap::bootstrap(2).unwrap();
         let encoded = serde_json::to_string(&map).unwrap();
@@ -513,48 +385,6 @@ mod tests {
         assert_eq!(HashValue::MAX.routing_slot().get(), ROUTING_SLOT_COUNT - 1);
         let range = HashRange::from_slots(17, 29).unwrap();
         assert_eq!(range.slots().unwrap(), 17..29);
-    }
-
-    #[test]
-    fn growth_is_deterministic_and_only_splits_one_source_per_step() {
-        let original = HashRangeMap::bootstrap(3).unwrap();
-        let first = original.grow_to(4).unwrap();
-        let second = original.grow_to(4).unwrap();
-        assert_eq!(first, second);
-
-        let changed = original
-            .assignments
-            .iter()
-            .filter(|assignment| !first.assignments.contains(assignment))
-            .collect::<Vec<_>>();
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].shard, ShardId::new(0));
-        assert!(matches!(
-            first.grow_to(2),
-            Err(RoutingError::ScaleDownUnsupported {
-                current: 4,
-                desired: 2
-            })
-        ));
-    }
-
-    #[test]
-    fn adding_one_shard_only_remaps_keys_from_the_split_source() {
-        let original = HashRangeMap::bootstrap(4).unwrap();
-        let grown = original.grow_to(5).unwrap();
-        let source = ShardId::new(0);
-        let mut moved = 0;
-        for key in 0_u32..100_000 {
-            let hash = hash_routing_key(&key.to_be_bytes());
-            let before = original.route(hash);
-            let after = grown.route(hash);
-            if before != after {
-                moved += 1;
-                assert_eq!(before, source);
-                assert_eq!(after, ShardId::new(4));
-            }
-        }
-        assert!(moved > 0);
     }
 
     #[test]

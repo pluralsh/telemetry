@@ -16,8 +16,7 @@ use tonic::{Request, metadata::MetadataValue};
 
 #[cfg(feature = "kubernetes")]
 use sharding::{
-    AssignmentGeneration, BoxError, MigrationExecutionError, ShardLifecycle,
-    ShardMigrationExecutor, ShardSplit, server::KubernetesRuntime,
+    AssignmentGeneration, BoxError, EpochPolicy, ShardLifecycle, server::KubernetesRuntime,
 };
 
 use crate::{
@@ -58,7 +57,7 @@ impl AppState {
             #[cfg(feature = "kubernetes")]
             ShardingBackend::Kubernetes(settings) => {
                 let (runtime, assignment) =
-                    KubernetesRuntime::bootstrap(settings, cancellation.clone())
+                    KubernetesRuntime::bootstrap(settings, epoch_policy(), cancellation.clone())
                         .await
                         .map_err(|error| anyhow::anyhow!(error))?;
                 let local = runtime.identity().to_owned();
@@ -71,7 +70,7 @@ impl AppState {
             }
             _ => assignment_for(&config)?,
         };
-        let shard_count = assignment.virtual_shards;
+        let shard_count = assignment.shard_count;
         let options = ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?;
         let meter_config = meter_config(&config);
         let writer_shards = if config.mode == ServerMode::Standalone {
@@ -83,13 +82,7 @@ impl AppState {
         };
         let writers = if config.mode != ServerMode::Reader {
             Some(Arc::new(
-                ShardedMeter::open_writers_with_routing(
-                    meter_config.clone(),
-                    options,
-                    writer_shards,
-                    &assignment.routing,
-                )
-                .await?,
+                ShardedMeter::open_writers(meter_config.clone(), options, writer_shards).await?,
             ))
         } else {
             None
@@ -98,11 +91,10 @@ impl AppState {
             writers.clone()
         } else if config.mode != ServerMode::Writer {
             Some(Arc::new(
-                ShardedMeter::open_readers_with_routing(
+                ShardedMeter::open_readers(
                     meter_config,
                     options,
                     (0..shard_count).map(ShardId::new),
-                    &assignment.routing,
                     slatedb::config::DbReaderOptions {
                         skip_wal_replay: false,
                         ..slatedb::config::DbReaderOptions::default()
@@ -151,14 +143,9 @@ impl AppState {
                         .expect("writer mode must open sharded meter")
                         .clone(),
                     draining_shards: Arc::clone(&state.draining_shards),
-                    assignment: Arc::clone(&state.assignment),
                 });
                 let tasks = runtime.spawn(
                     lifecycle,
-                    Arc::new(MeterMigrationExecutor {
-                        storage: state.config.storage.clone(),
-                        options,
-                    }),
                     Arc::clone(&state.assignment),
                     &state.cancellation,
                 );
@@ -229,14 +216,8 @@ impl AppState {
         match self.config.mode {
             ServerMode::Standalone => self.readers.is_some(),
             ServerMode::Reader => {
-                let expected = self
-                    .assignment
-                    .read()
-                    .await
-                    .routing
-                    .assignments
-                    .iter()
-                    .map(|assignment| assignment.shard)
+                let expected = (0..self.assignment.read().await.shard_count)
+                    .map(ShardId::new)
                     .collect::<Vec<_>>();
                 match &self.readers {
                     Some(readers) => readers.reader_shards().await == expected,
@@ -245,7 +226,7 @@ impl AppState {
             }
             ServerMode::Writer => {
                 let assignment = self.assignment.read().await;
-                let expected = (0..assignment.virtual_shards)
+                let expected = (0..assignment.shard_count)
                     .map(ShardId::new)
                     .filter(|shard| {
                         assignment
@@ -352,18 +333,17 @@ impl AppState {
             Namespace::new(namespace).map_err(|error| ApiError::bad_request(error.to_string()))?;
         let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
-            assignment.virtual_shards,
+            assignment.shard_count,
             self.config.sharding.io_concurrency_limit,
         )
         .map_err(ApiError::internal)?;
         let mut groups: HashMap<(Owner, ShardId), Vec<Series>> = HashMap::new();
-        for item in series {
-            let shard = options.route(&assignment.routing, &meter_namespace, &item.labels);
+        for (shard, batch) in options.split(&assignment, &meter_namespace, series) {
             let owner = assignment
                 .owner_of(shard)
                 .cloned()
                 .ok_or_else(|| ApiError::unavailable("shard has no active owner"))?;
-            groups.entry((owner, shard)).or_default().push(item);
+            groups.insert((owner, shard), batch);
         }
         let results = stream::iter(groups.into_iter().map(|((owner, shard), batch)| {
             let state = self.clone();
@@ -484,86 +464,9 @@ impl AppState {
 }
 
 #[cfg(feature = "kubernetes")]
-struct MeterMigrationExecutor {
-    storage: common::storage::config::SlateDbStorageConfig,
-    options: ShardingOptions,
-}
-
-#[cfg(feature = "kubernetes")]
-impl MeterMigrationExecutor {
-    fn spec(
-        &self,
-        split: &ShardSplit,
-    ) -> Result<common::storage::projected_clone::ProjectedCloneSpec, MigrationExecutionError> {
-        let slots = split
-            .moved_range
-            .slots()
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        Ok(common::storage::projected_clone::ProjectedCloneSpec {
-            source_path: self
-                .options
-                .shard_path(&self.storage.path, split.source_shard)
-                .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?,
-            target_path: self
-                .options
-                .shard_path(&self.storage.path, split.target_shard)
-                .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?,
-            checkpoint_name: format!(
-                "telemetry-migration-{}-{}-{}-{}",
-                split.source_shard.get(),
-                split.target_shard.get(),
-                slots.start,
-                slots.end
-            ),
-            slot_start: slots.start,
-            slot_end: slots.end,
-            segment_extractor_name: meter::SEGMENT_EXTRACTOR_NAME.to_owned(),
-        })
-    }
-
-    fn map_error(
-        error: common::storage::projected_clone::ProjectedCloneError,
-    ) -> MigrationExecutionError {
-        if error.is_fatal() {
-            MigrationExecutionError::fatal(error.to_string())
-        } else {
-            MigrationExecutionError::Retryable(Box::new(error))
-        }
-    }
-}
-
-#[cfg(feature = "kubernetes")]
-#[tonic::async_trait]
-impl ShardMigrationExecutor for MeterMigrationExecutor {
-    async fn preflight_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
-        let object_store =
-            common::create_object_store(&self.storage.object_store).map_err(|error| {
-                MigrationExecutionError::fatal(format!("object store configuration: {error}"))
-            })?;
-        common::storage::projected_clone::preflight_projected_clone(
-            &self.spec(split)?,
-            object_store,
-        )
-        .await
-        .map_err(Self::map_error)
-    }
-
-    async fn clone_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
-        let object_store =
-            common::create_object_store(&self.storage.object_store).map_err(|error| {
-                MigrationExecutionError::fatal(format!("object store configuration: {error}"))
-            })?;
-        common::storage::projected_clone::execute_projected_clone(&self.spec(split)?, object_store)
-            .await
-            .map_err(Self::map_error)
-    }
-}
-
-#[cfg(feature = "kubernetes")]
 struct MeterShardLifecycle {
     writers: Arc<ShardedMeter>,
     draining_shards: Arc<RwLock<HashSet<ShardId>>>,
-    assignment: Arc<RwLock<ShardMap>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -578,20 +481,7 @@ impl ShardLifecycle for MeterShardLifecycle {
             let mut draining = self.draining_shards.write().await;
             draining.remove(&shard);
         }
-        let slots = self
-            .assignment
-            .read()
-            .await
-            .routing
-            .assignments
-            .iter()
-            .find(|assignment| assignment.shard == shard)
-            .ok_or_else(|| format!("missing routing range for shard {}", shard.get()))?
-            .range
-            .slots()?;
-        self.writers
-            .open_writer_shard_with_slots(shard, slots)
-            .await?;
+        self.writers.open_writer_shard(shard).await?;
         Ok(())
     }
 
@@ -615,12 +505,20 @@ pub(crate) fn meter_config(config: &Config) -> meter::Config {
     meter::Config {
         storage: config.storage.clone(),
         flush_interval: Duration::from_secs(config.write.flush_interval_seconds),
-        retention: None,
+        retention: config.retention_seconds.map(Duration::from_secs),
         write_buffer: common::coordinator::WriteCoordinatorConfig {
             queue_capacity: config.write.buffer_queue_capacity,
             flush_interval: Duration::from_millis(config.write.buffer_flush_interval_milliseconds),
             flush_size_threshold: config.write.buffer_size_threshold_bytes,
         },
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+fn epoch_policy() -> EpochPolicy {
+    EpochPolicy {
+        alignment: Duration::from_secs(3600),
+        ..EpochPolicy::default()
     }
 }
 

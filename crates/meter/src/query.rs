@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use roaring::RoaringBitmap;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
-use crate::model::{Label, Sample};
+use crate::model::{Label, QueryOptions, Sample};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
 
@@ -117,6 +120,113 @@ pub(crate) trait QueryReader: Send + Sync {
         bucket: &TimeBucket,
         term: &Label,
     ) -> Result<Option<RoaringBitmap>>;
+}
+
+/// Per-query caps from [`QueryOptions`] on reads that reach storage. The
+/// query-scoped index cache sits above the reader, so cache hits are free.
+#[derive(Clone)]
+pub(crate) struct QueryLimits {
+    metadata: Arc<Semaphore>,
+    samples: Arc<Semaphore>,
+}
+
+impl QueryLimits {
+    pub(crate) fn new(options: &QueryOptions) -> Self {
+        Self {
+            metadata: Arc::new(Semaphore::new(options.metadata_concurrency.max(1))),
+            samples: Arc::new(Semaphore::new(options.sample_concurrency.max(1))),
+        }
+    }
+}
+
+async fn acquire(permits: &Semaphore) -> SemaphorePermit<'_> {
+    permits
+        .acquire()
+        .await
+        .expect("query limit semaphores are never closed")
+}
+
+/// Applies [`QueryLimits`] to every call on the wrapped reader.
+pub(crate) struct LimitedQueryReader<R> {
+    inner: R,
+    limits: QueryLimits,
+}
+
+impl<R> LimitedQueryReader<R> {
+    pub(crate) fn new(inner: R, limits: QueryLimits) -> Self {
+        Self { inner, limits }
+    }
+}
+
+#[async_trait]
+impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
+    async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.list_buckets().await
+    }
+
+    async fn forward_index(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.forward_index(bucket, series_ids).await
+    }
+
+    async fn inverted_index(
+        &self,
+        bucket: &TimeBucket,
+        terms: &[Label],
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.inverted_index(bucket, terms).await
+    }
+
+    async fn all_inverted_index(
+        &self,
+        bucket: &TimeBucket,
+    ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.all_inverted_index(bucket).await
+    }
+
+    async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.label_values(bucket, label_name).await
+    }
+
+    async fn samples(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+        metric_name: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Sample>> {
+        let _permit = acquire(&self.limits.samples).await;
+        self.inner
+            .samples(bucket, series_id, metric_name, start_ms, end_ms)
+            .await
+    }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<SeriesSpec>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.forward_index_one(bucket, series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<RoaringBitmap>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.inverted_index_term(bucket, term).await
+    }
 }
 
 #[cfg(any(test, feature = "bench-internals"))]

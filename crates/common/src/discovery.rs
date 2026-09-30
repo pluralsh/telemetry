@@ -14,8 +14,9 @@ use crate::serde::terminated_bytes;
 use crate::storage::{PutOptions, RecordOp};
 use crate::{BytesRange, PutRecordOp, Record, StorageError, StorageRead, StorageResult, Ttl};
 
-/// Routing-slot sentinel reserved for partition-level catalog records.
-pub const CATALOG_SLOT: u16 = u16::MAX;
+/// Record-type byte reserved for partition-level catalog records. Product
+/// record types directly follow the partition prefix and must stay below it.
+pub const CATALOG_RECORD_TYPE: u8 = u8::MAX;
 /// On-disk format version for every discovery catalog key and value.
 pub const CATALOG_FORMAT_VERSION: u8 = 1;
 
@@ -370,13 +371,13 @@ pub async fn metadata(
 
 /// Key range containing every discovery catalog record for one partition.
 ///
-/// The range is scoped to the catalog sentinel slot and current catalog
+/// The range is scoped to the catalog record type and current catalog
 /// format version, so warming it does not pull product payload records from
 /// the surrounding time partition into the data-block cache.
 pub fn catalog_range(partition_prefix: &[u8]) -> BytesRange {
-    let mut prefix = BytesMut::with_capacity(partition_prefix.len() + 3);
+    let mut prefix = BytesMut::with_capacity(partition_prefix.len() + 2);
     prefix.extend_from_slice(partition_prefix);
-    prefix.put_u16(CATALOG_SLOT);
+    prefix.put_u8(CATALOG_RECORD_TYPE);
     prefix.put_u8(CATALOG_FORMAT_VERSION);
     BytesRange::prefix(prefix.freeze())
 }
@@ -416,9 +417,9 @@ fn metadata_key(partition_prefix: &[u8], name: &str) -> Bytes {
 }
 
 fn record_prefix(partition_prefix: &[u8], record: u8) -> BytesMut {
-    let mut prefix = BytesMut::with_capacity(partition_prefix.len() + 4);
+    let mut prefix = BytesMut::with_capacity(partition_prefix.len() + 3);
     prefix.extend_from_slice(partition_prefix);
-    prefix.put_u16(CATALOG_SLOT);
+    prefix.put_u8(CATALOG_RECORD_TYPE);
     prefix.put_u8(CATALOG_FORMAT_VERSION);
     prefix.put_u8(record);
     prefix
@@ -501,29 +502,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_slot_is_outside_the_routing_space() {
-        let slot = std::hint::black_box(CATALOG_SLOT);
-        assert!(slot > 4095);
-    }
-
-    #[test]
     fn catalog_keys_include_the_independent_format_version() {
         let partition = b"tenant/partition";
         let prefix = record_prefix(partition, NAME_RECORD).freeze();
 
         assert_eq!(
             &prefix[partition.len()..],
-            &[
-                (CATALOG_SLOT >> 8) as u8,
-                CATALOG_SLOT as u8,
-                CATALOG_FORMAT_VERSION,
-                NAME_RECORD,
-            ]
+            &[CATALOG_RECORD_TYPE, CATALOG_FORMAT_VERSION, NAME_RECORD,]
         );
     }
 
     #[test]
-    fn catalog_range_contains_catalog_records_but_not_payload_slots() {
+    fn catalog_range_contains_catalog_records_but_not_payload_records() {
         let partition = b"tenant/partition";
         let range = catalog_range(partition);
         assert!(range.contains(name_key(partition, "", "job").as_ref()));
@@ -532,7 +522,7 @@ mod tests {
         ));
 
         let mut payload = BytesMut::from(partition.as_slice());
-        payload.put_u16(0);
+        payload.put_u8(1);
         payload.put_u8(1);
         assert!(!range.contains(&payload));
     }

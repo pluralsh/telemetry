@@ -18,7 +18,7 @@ data:
     write:
       {{- toYaml .Values.config.write | nindent 6 }}
     sharding:
-      virtual_shards: 1
+      shards: 1
       io_concurrency_limit: {{ .Values.sharding.ioConcurrencyLimit }}
       backend: standalone
     auth:

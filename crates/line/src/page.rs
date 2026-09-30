@@ -3,8 +3,6 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-use std::time::Instant;
-
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
@@ -233,16 +231,15 @@ impl Page {
     }
 }
 
-/// Accumulates ordered rows and cuts immutable pages by size, rows, or age.
+/// Accumulates ordered rows and cuts immutable pages by size or rows.
 pub struct PageBuilder {
     config: PageConfig,
     entries: Vec<LogEntry>,
     estimated_bytes: usize,
-    created_at: Instant,
 }
 
 impl PageBuilder {
-    pub fn new(config: PageConfig, now: Instant) -> Result<Self> {
+    pub fn new(config: PageConfig) -> Result<Self> {
         if config.target_size_bytes == 0 || config.max_rows == 0 || config.rows_per_block == 0 {
             return Err(Error::Invalid("page limits must be positive".to_owned()));
         }
@@ -250,12 +247,11 @@ impl PageBuilder {
             config,
             entries: Vec::new(),
             estimated_bytes: 0,
-            created_at: now,
         })
     }
 
-    pub fn append(&mut self, entry: LogEntry, now: Instant) -> Result<Option<Page>> {
-        Ok(self.append_with_rows(entry, now)?.map(|(page, _)| page))
+    pub fn append(&mut self, entry: LogEntry) -> Result<Option<Page>> {
+        Ok(self.append_with_rows(entry)?.map(|(page, _)| page))
     }
 
     pub fn finish(&mut self) -> Result<Option<Page>> {
@@ -266,7 +262,6 @@ impl PageBuilder {
     pub(crate) fn append_with_rows(
         &mut self,
         entry: LogEntry,
-        now: Instant,
     ) -> Result<Option<(Page, Vec<LogEntry>)>> {
         if self
             .entries
@@ -280,14 +275,12 @@ impl PageBuilder {
         let row_size = estimated_row_size(&entry);
         let should_cut = !self.entries.is_empty()
             && (self.entries.len() >= self.config.max_rows
-                || self.estimated_bytes.saturating_add(row_size) > self.config.target_size_bytes
-                || now.duration_since(self.created_at) >= self.config.max_age);
+                || self.estimated_bytes.saturating_add(row_size) > self.config.target_size_bytes);
         let completed = if should_cut {
             let page = Page::from_entries(&self.entries, self.config.rows_per_block)?;
             let capacity = self.entries.len();
             let rows = std::mem::replace(&mut self.entries, Vec::with_capacity(capacity));
             self.estimated_bytes = 0;
-            self.created_at = now;
             Some((page, rows))
         } else {
             None
@@ -431,8 +424,6 @@ fn read_i64(bytes: &[u8], offset: usize) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use proptest::prelude::*;
 
     use super::*;
@@ -510,32 +501,15 @@ mod tests {
         let config = PageConfig {
             target_size_bytes: 100,
             max_rows: 2,
-            max_age: Duration::from_secs(1),
             rows_per_block: 2,
         };
-        let now = Instant::now();
-        let mut builder = PageBuilder::new(config, now).unwrap();
+        let mut builder = PageBuilder::new(config).unwrap();
+        assert!(builder.append(LogEntry::new(1, "a")).unwrap().is_none());
+        assert!(builder.append(LogEntry::new(2, "b")).unwrap().is_none());
+        assert!(builder.append(LogEntry::new(3, "c")).unwrap().is_some());
         assert!(
             builder
-                .append(LogEntry::new(1, "a"), now)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            builder
-                .append(LogEntry::new(2, "b"), now)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            builder
-                .append(LogEntry::new(3, "c"), now)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            builder
-                .append(LogEntry::new(4, "d"), now + Duration::from_secs(2))
+                .append(LogEntry::new(4, "x".repeat(200)))
                 .unwrap()
                 .is_some()
         );

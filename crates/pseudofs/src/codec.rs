@@ -13,11 +13,11 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
-pub(crate) const KEY_VERSION: u8 = 1;
+pub(crate) const KEY_VERSION: u8 = 2;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::PSEUDOFS;
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "pseudofs/v1";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "pseudofs/v2";
 const SEGMENT_PREFIX_LEN: usize = 2;
-const TENANT_PREFIX_LEN: usize = SEGMENT_PREFIX_LEN + 2 + 1 + 16;
+const TENANT_PREFIX_LEN: usize = SEGMENT_PREFIX_LEN + 1 + 16;
 const DIRECTORY_NAME_OFFSET: usize = TENANT_PREFIX_LEN + 16;
 
 const INODE: u8 = b'i';
@@ -29,7 +29,6 @@ const GARBAGE: u8 = b'x';
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TenantScope {
-    pub(crate) slot: u16,
     pub(crate) root_id: Uuid,
 }
 
@@ -104,31 +103,25 @@ pub(crate) fn upload_key(scope: TenantScope, generation: Uuid) -> Bytes {
     tagged_uuid(scope, UPLOAD, generation)
 }
 
-pub(crate) fn upload_prefix(slot: u16) -> Bytes {
-    slot_record_prefix(slot, UPLOAD)
+pub(crate) fn upload_prefix() -> Bytes {
+    family_prefix(UPLOAD)
 }
 
 pub(crate) fn garbage_key(scope: TenantScope, head: Uuid) -> Bytes {
     tagged_uuid(scope, GARBAGE, head)
 }
 
-pub(crate) fn garbage_prefix(slot: u16) -> Bytes {
-    slot_record_prefix(slot, GARBAGE)
+pub(crate) fn garbage_prefix() -> Bytes {
+    family_prefix(GARBAGE)
 }
 
 pub(crate) fn tenant_scope_from_key(key: &[u8]) -> Result<TenantScope> {
     if key.len() < TENANT_PREFIX_LEN || key[0] != SUBSYSTEM || key[1] != KEY_VERSION {
         return Err(Error::Corrupt("malformed PseudoFS record key".to_owned()));
     }
-    let slot = u16::from_be_bytes(key[2..4].try_into().unwrap());
-    if slot >= sharding::ROUTING_SLOT_COUNT {
-        return Err(Error::Corrupt(format!(
-            "routing slot exceeds 12 bits: {slot}"
-        )));
-    }
-    let root_id = Uuid::from_slice(&key[5..21])
+    let root_id = Uuid::from_slice(&key[SEGMENT_PREFIX_LEN + 1..TENANT_PREFIX_LEN])
         .map_err(|error| Error::Corrupt(format!("invalid tenant root ID: {error}")))?;
-    Ok(TenantScope { slot, root_id })
+    Ok(TenantScope { root_id })
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Bytes> {
@@ -156,41 +149,32 @@ fn tagged_two_uuids(scope: TenantScope, tag: u8, first: Uuid, second: Uuid) -> B
 }
 
 fn record_prefix(scope: TenantScope, tag: u8, suffix_len: usize) -> BytesMut {
-    assert!(scope.slot < sharding::ROUTING_SLOT_COUNT);
     let mut key = BytesMut::with_capacity(TENANT_PREFIX_LEN + suffix_len);
     key.put_u8(SUBSYSTEM);
     key.put_u8(KEY_VERSION);
-    key.put_u16(scope.slot);
     key.put_u8(tag);
     key.extend_from_slice(scope.root_id.as_bytes());
     key
 }
 
-fn slot_record_prefix(slot: u16, tag: u8) -> Bytes {
-    assert!(slot < sharding::ROUTING_SLOT_COUNT);
-    let mut key = BytesMut::with_capacity(5);
-    key.put_u8(SUBSYSTEM);
-    key.put_u8(KEY_VERSION);
-    key.put_u16(slot);
-    key.put_u8(tag);
-    key.freeze()
+fn family_prefix(tag: u8) -> Bytes {
+    Bytes::from(vec![SUBSYSTEM, KEY_VERSION, tag])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scope(slot: u16) -> TenantScope {
+    fn scope(root: u128) -> TenantScope {
         TenantScope {
-            slot,
-            root_id: Uuid::from_u128(1),
+            root_id: Uuid::from_u128(root),
         }
     }
 
     #[test]
     fn directory_entry_round_trip() {
         let parent = Uuid::new_v4();
-        let scope = scope(17);
+        let scope = scope(1);
         let key = directory_entry_key(scope, parent, "notes.txt");
         assert_eq!(directory_entry_name(&key).unwrap(), "notes.txt");
         assert!(key.starts_with(&directory_prefix(scope, parent)));
@@ -200,12 +184,12 @@ mod tests {
     fn chunk_indices_sort_lexicographically() {
         let inode = Uuid::new_v4();
         let generation = Uuid::new_v4();
-        let scope = scope(17);
+        let scope = scope(1);
         assert!(chunk_key(scope, inode, generation, 1) < chunk_key(scope, inode, generation, 2));
     }
 
     #[test]
-    fn routing_slot_immediately_follows_segment_prefix_for_every_record_family() {
+    fn record_family_follows_segment_prefix_and_scope_round_trips() {
         let scope = scope(0x0123);
         let inode = Uuid::new_v4();
         let generation = Uuid::new_v4();
@@ -219,23 +203,17 @@ mod tests {
         ];
         for key in keys {
             assert_eq!(&key[..2], &[SUBSYSTEM, KEY_VERSION]);
-            assert_eq!(
-                u16::from_be_bytes(key[2..4].try_into().unwrap()),
-                scope.slot
-            );
+            assert_eq!(tenant_scope_from_key(&key).unwrap(), scope);
         }
     }
 
     #[test]
-    fn slot_ranges_sort_before_record_family_and_tenant() {
-        let low = scope(17);
-        let high = TenantScope {
-            slot: 18,
-            root_id: Uuid::nil(),
-        };
-        assert!(
-            garbage_key(low, Uuid::from_u128(u128::MAX))
-                < chunk_key(high, Uuid::nil(), Uuid::nil(), 0)
-        );
+    fn family_prefixes_cover_every_tenant() {
+        for root in [0, 1, u128::MAX] {
+            let generation = Uuid::from_u128(7);
+            assert!(upload_key(scope(root), generation).starts_with(&upload_prefix()));
+            assert!(garbage_key(scope(root), generation).starts_with(&garbage_prefix()));
+        }
+        assert!(!chunk_key(scope(1), Uuid::nil(), Uuid::nil(), 0).starts_with(&upload_prefix()));
     }
 }

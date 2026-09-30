@@ -5,6 +5,7 @@
 
 mod analyzer;
 mod codec;
+mod compaction;
 mod config;
 mod db;
 mod error;
@@ -18,7 +19,7 @@ mod sharded;
 
 pub use analyzer::{Analyzer, LogAnalyzer};
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
-pub use config::{Config, PageConfig};
+pub use config::{CompactionConfig, Config, PageConfig};
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};
@@ -29,5 +30,5 @@ pub use query::{
 };
 pub use sharded::{ShardedLine, ShardingOptions};
 
-/// Persisted SlateDB segment extractor identifier used by migration preflight.
-pub const SEGMENT_EXTRACTOR_NAME: &str = "line-log/v2";
+/// Persisted SlateDB segment extractor identifier.
+pub const SEGMENT_EXTRACTOR_NAME: &str = codec::SEGMENT_EXTRACTOR_NAME;

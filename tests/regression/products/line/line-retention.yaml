@@ -9,7 +9,6 @@ retention_seconds: 4
 page:
   target_size_bytes: 4096
   max_rows: 32
-  max_age_seconds: 1
   rows_per_block: 16
 write: { flush_interval_seconds: 1 }
 cache: { query_entries: 0 }

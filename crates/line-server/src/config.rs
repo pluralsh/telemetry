@@ -83,7 +83,6 @@ impl Default for ListenerConfig {
 pub struct PageConfig {
     pub target_size_bytes: usize,
     pub max_rows: usize,
-    pub max_age_seconds: u64,
     pub rows_per_block: usize,
 }
 
@@ -93,8 +92,32 @@ impl Default for PageConfig {
         Self {
             target_size_bytes: page.target_size_bytes,
             max_rows: page.max_rows,
-            max_age_seconds: page.max_age.as_secs(),
             rows_per_block: page.rows_per_block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactionConfig {
+    pub enabled: bool,
+    pub fan_in: usize,
+    pub min_age_seconds: u64,
+    pub finalize_after_seconds: u64,
+    pub delete_delay_seconds: u64,
+    pub max_merges_per_flush: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        let compaction = line::CompactionConfig::default();
+        Self {
+            enabled: compaction.enabled,
+            fan_in: compaction.fan_in,
+            min_age_seconds: compaction.min_age.as_secs(),
+            finalize_after_seconds: compaction.finalize_after.as_secs(),
+            delete_delay_seconds: compaction.delete_delay.as_secs(),
+            max_merges_per_flush: compaction.max_merges_per_flush,
         }
     }
 }
@@ -148,6 +171,7 @@ pub struct Config {
     pub segment_duration_seconds: u64,
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
+    pub compaction: CompactionConfig,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -168,6 +192,7 @@ impl Default for Config {
             segment_duration_seconds: core.segment_duration.as_secs(),
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
+            compaction: CompactionConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
@@ -203,7 +228,6 @@ impl Config {
         if self.segment_duration_seconds == 0
             || self.page.target_size_bytes == 0
             || self.page.max_rows == 0
-            || self.page.max_age_seconds == 0
             || self.page.rows_per_block == 0
             || self.request.max_request_bytes == 0
             || self.request.max_query_entries == 0
@@ -218,6 +242,14 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
+            ));
+        }
+        if self.compaction.enabled
+            && (self.compaction.fan_in < 2 || self.compaction.max_merges_per_flush == 0)
+        {
+            return Err(ConfigError::Validation(
+                "compaction.fan_in must be at least 2 and compaction.max_merges_per_flush positive"
+                    .to_owned(),
             ));
         }
         if self.cache_warmer.enabled && self.cache_warmer.warm_range_seconds == 0 {
@@ -273,8 +305,15 @@ impl Config {
             page: line::PageConfig {
                 target_size_bytes: self.page.target_size_bytes,
                 max_rows: self.page.max_rows,
-                max_age: Duration::from_secs(self.page.max_age_seconds),
                 rows_per_block: self.page.rows_per_block,
+            },
+            compaction: line::CompactionConfig {
+                enabled: self.compaction.enabled,
+                fan_in: self.compaction.fan_in,
+                min_age: Duration::from_secs(self.compaction.min_age_seconds),
+                finalize_after: Duration::from_secs(self.compaction.finalize_after_seconds),
+                delete_delay: Duration::from_secs(self.compaction.delete_delay_seconds),
+                max_merges_per_flush: self.compaction.max_merges_per_flush,
             },
             write_buffer: common::coordinator::WriteCoordinatorConfig {
                 queue_capacity: self.write.buffer_queue_capacity,

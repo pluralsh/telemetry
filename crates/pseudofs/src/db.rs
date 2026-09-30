@@ -728,25 +728,23 @@ impl PseudoFs {
     async fn cleanup_staged_uploads(&self) -> Result<()> {
         let snapshot = self.inner.storage.snapshot().await?;
         let mut ops = Vec::new();
-        for slot in 0..sharding::ROUTING_SLOT_COUNT {
-            let mut iter = snapshot
-                .scan_prefix_iter(upload_prefix(slot), BytesRange::unbounded(), None)
-                .await?;
-            while let Some(record) = iter.next().await? {
-                let scope = tenant_scope_from_key(&record.key)?;
-                let marker: UploadMarker = decode(&record.value)?;
-                for index in 0..marker.chunk_count {
-                    ops.push(RecordOp::Delete(chunk_key(
-                        scope,
-                        marker.inode_id,
-                        marker.generation_id,
-                        index,
-                    )));
-                    self.flush_delete_batch(&mut ops).await?;
-                }
-                ops.push(RecordOp::Delete(record.key));
+        let mut iter = snapshot
+            .scan_prefix_iter(upload_prefix(), BytesRange::unbounded(), None)
+            .await?;
+        while let Some(record) = iter.next().await? {
+            let scope = tenant_scope_from_key(&record.key)?;
+            let marker: UploadMarker = decode(&record.value)?;
+            for index in 0..marker.chunk_count {
+                ops.push(RecordOp::Delete(chunk_key(
+                    scope,
+                    marker.inode_id,
+                    marker.generation_id,
+                    index,
+                )));
                 self.flush_delete_batch(&mut ops).await?;
             }
+            ops.push(RecordOp::Delete(record.key));
+            self.flush_delete_batch(&mut ops).await?;
         }
         if !ops.is_empty() {
             self.inner.storage.apply(ops).await?;
@@ -757,15 +755,13 @@ impl PseudoFs {
 
     async fn cleanup_garbage(&self) -> Result<()> {
         let snapshot = self.inner.storage.snapshot().await?;
-        for slot in 0..sharding::ROUTING_SLOT_COUNT {
-            let mut iter = snapshot
-                .scan_prefix_iter(garbage_prefix(slot), BytesRange::unbounded(), None)
-                .await?;
-            while let Some(record) = iter.next().await? {
-                let scope = tenant_scope_from_key(&record.key)?;
-                let marker = decode::<GarbageMarker>(&record.value)?;
-                self.cleanup_generation_chain(scope, &marker).await?;
-            }
+        let mut iter = snapshot
+            .scan_prefix_iter(garbage_prefix(), BytesRange::unbounded(), None)
+            .await?;
+        while let Some(record) = iter.next().await? {
+            let scope = tenant_scope_from_key(&record.key)?;
+            let marker = decode::<GarbageMarker>(&record.value)?;
+            self.cleanup_generation_chain(scope, &marker).await?;
         }
         Ok(())
     }
@@ -1231,7 +1227,6 @@ fn tenant_root_id(tenant: &str) -> Uuid {
 
 fn tenant_scope(tenant: &str) -> TenantScope {
     TenantScope {
-        slot: crate::routing::routing_slot(tenant),
         root_id: tenant_root_id(tenant),
     }
 }

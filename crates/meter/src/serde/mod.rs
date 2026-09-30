@@ -6,10 +6,10 @@ pub mod timeseries;
 
 use crate::Namespace;
 use crate::model::{BucketSize, BucketStart, TimeBucket};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 
 // Re-export encoding utilities from common
 pub use common::serde::encoding::{
@@ -94,8 +94,8 @@ pub fn decode_fixed_element_array<T: Decode>(
     Ok(items)
 }
 
-/// Slot-aware key format version.
-pub const KEY_VERSION: u8 = 0x02;
+/// Key format version.
+pub const KEY_VERSION: u8 = 0x03;
 
 /// Subsystem byte for timeseries storage (see [`common::serde::subsystem`]).
 pub const SUBSYSTEM: u8 = common::serde::subsystem::TIMESERIES;
@@ -108,30 +108,19 @@ pub(crate) fn write_bucket_prefix(buf: &mut BytesMut, namespace: &Namespace, buc
     buf.put_u8(bucket.size);
 }
 
-pub(crate) fn bucket_slots_range(
-    namespace: &Namespace,
-    bucket: &TimeBucket,
-    slots: Range<u16>,
-) -> BytesRange {
-    assert!(slots.start < slots.end && slots.end <= sharding::ROUTING_SLOT_COUNT);
+/// Range containing every record of one bucket.
+pub(crate) fn bucket_records_range(namespace: &Namespace, bucket: &TimeBucket) -> BytesRange {
     let mut prefix = BytesMut::new();
     write_bucket_prefix(&mut prefix, namespace, bucket);
-    let mut start = prefix.clone();
-    start.put_u16(slots.start);
-    let mut end = prefix;
-    end.put_u16(slots.end);
-    BytesRange::new(
-        Bound::Included(start.freeze()),
-        Bound::Excluded(end.freeze()),
-    )
+    BytesRange::prefix(prefix.freeze())
 }
 
 /// Minimum header length, including the terminated namespace.
-pub const MIN_PREFIX_AND_RECORD_TYPE_LEN: usize = KEY_PREFIX_LEN + 1 + 4 + 1 + 2 + 1;
+pub const MIN_PREFIX_AND_RECORD_TYPE_LEN: usize = KEY_PREFIX_LEN + 1 + 4 + 1 + 1;
 
 /// Record type enumeration for timeseries storage.
 ///
-/// Encoded as the single byte after the routing slot in every bucket-scoped key.
+/// Encoded as the single byte after the bucket header in every bucket-scoped key.
 /// `0x01` is reserved (formerly `BucketList`, now superseded by SlateDB
 /// segments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,49 +152,26 @@ impl RecordType {
 }
 
 /// Writes the bucket-scoped header `[subsystem, version, namespace\0,
-/// time_bucket(4 BE), bucket_size, routing_slot(2 BE), record_type]` to `buf`.
+/// time_bucket(4 BE), bucket_size, record_type]` to `buf`.
 ///
 /// `bucket.size == 0` is reserved and panics.
 pub fn write_record_prefix(
     buf: &mut BytesMut,
     namespace: &Namespace,
     bucket: &TimeBucket,
-    routing_slot: u16,
     record_type: RecordType,
 ) {
-    assert!(bucket.size != 0, "bucket_size 0 is reserved");
-    assert!(
-        routing_slot < sharding::ROUTING_SLOT_COUNT,
-        "routing slot must fit in 12 bits"
-    );
     write_bucket_prefix(buf, namespace, bucket);
-    buf.put_u16(routing_slot);
     buf.put_u8(record_type.id());
 }
 
-/// Range containing all index metadata records for one bucket and routing
-/// slot, while excluding time-series sample records.
-pub(crate) fn bucket_slot_metadata_range(
-    namespace: &Namespace,
-    bucket: &TimeBucket,
-    routing_slot: u16,
-) -> BytesRange {
+/// Range containing all index metadata records for one bucket, while
+/// excluding time-series sample records.
+pub(crate) fn bucket_metadata_range(namespace: &Namespace, bucket: &TimeBucket) -> BytesRange {
     let mut start = BytesMut::new();
-    write_record_prefix(
-        &mut start,
-        namespace,
-        bucket,
-        routing_slot,
-        RecordType::SeriesDictionary,
-    );
+    write_record_prefix(&mut start, namespace, bucket, RecordType::SeriesDictionary);
     let mut end = BytesMut::new();
-    write_record_prefix(
-        &mut end,
-        namespace,
-        bucket,
-        routing_slot,
-        RecordType::TimeSeries,
-    );
+    write_record_prefix(&mut end, namespace, bucket, RecordType::TimeSeries);
     BytesRange::new(
         Bound::Included(start.freeze()),
         Bound::Excluded(end.freeze()),
@@ -217,7 +183,7 @@ pub(crate) fn bucket_slot_metadata_range(
 /// `RecordType`.
 pub fn parse_record_prefix(
     buf: &[u8],
-) -> Result<(Namespace, TimeBucket, u16, RecordType, usize), EncodingError> {
+) -> Result<(Namespace, TimeBucket, RecordType, usize), EncodingError> {
     KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
     if buf.len() < MIN_PREFIX_AND_RECORD_TYPE_LEN {
         return Err(EncodingError {
@@ -235,7 +201,7 @@ pub fn parse_record_prefix(
         message: error.to_string(),
     })?;
     let offset = buf.len() - suffix.len();
-    if suffix.len() < 8 {
+    if suffix.len() < 6 {
         return Err(EncodingError {
             message: "Buffer too short for bucket fields".to_string(),
         });
@@ -247,19 +213,12 @@ pub fn parse_record_prefix(
             message: "bucket_size 0 is reserved".to_string(),
         });
     }
-    let routing_slot = u16::from_be_bytes([suffix[5], suffix[6]]);
-    if routing_slot >= sharding::ROUTING_SLOT_COUNT {
-        return Err(EncodingError {
-            message: format!("routing slot exceeds 12 bits: {routing_slot}"),
-        });
-    }
-    let record_type = RecordType::from_id(suffix[7])?;
+    let record_type = RecordType::from_id(suffix[5])?;
     Ok((
         namespace,
         TimeBucket { start, size },
-        routing_slot,
         record_type,
-        offset + 8,
+        offset + 6,
     ))
 }
 
@@ -274,13 +233,12 @@ pub trait TimeBucketScoped: RecordKey {
     fn namespace(&self) -> &Namespace;
     /// Returns the time bucket for this record
     fn bucket(&self) -> TimeBucket;
-    fn routing_slot(&self) -> u16;
 
     /// Decodes and validates the bucket-scoped header of a key.
     /// Returns the `TimeBucket` when the encoded record type matches
     /// `Self::RECORD_TYPE`.
-    fn decode_bucket_prefix(bytes: &[u8]) -> Result<(Namespace, TimeBucket, u16), EncodingError> {
-        let (namespace, bucket, routing_slot, record_type, _) = parse_record_prefix(bytes)?;
+    fn decode_bucket_prefix(bytes: &[u8]) -> Result<(Namespace, TimeBucket), EncodingError> {
+        let (namespace, bucket, record_type, _) = parse_record_prefix(bytes)?;
         if record_type != Self::RECORD_TYPE {
             return Err(EncodingError {
                 message: format!(
@@ -290,15 +248,14 @@ pub trait TimeBucketScoped: RecordKey {
                 ),
             });
         }
-        Ok((namespace, bucket, routing_slot))
+        Ok((namespace, bucket))
     }
 
-    /// Create a BytesRange that covers all records of this type
-    /// for the given time bucket.
-    fn bucket_range(namespace: &Namespace, bucket: &TimeBucket, routing_slot: u16) -> BytesRange {
+    /// Key prefix shared by all records of this type in the given time bucket.
+    fn bucket_prefix(namespace: &Namespace, bucket: &TimeBucket) -> Bytes {
         let mut buf = BytesMut::new();
-        write_record_prefix(&mut buf, namespace, bucket, routing_slot, Self::RECORD_TYPE);
-        BytesRange::prefix(buf.freeze())
+        write_record_prefix(&mut buf, namespace, bucket, Self::RECORD_TYPE);
+        buf.freeze()
     }
 }
 
@@ -317,14 +274,13 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // when
-        write_record_prefix(&mut buf, &namespace, &bucket, 42, RecordType::TimeSeries);
-        let (decoded_namespace, decoded_bucket, decoded_slot, decoded_type, _) =
+        write_record_prefix(&mut buf, &namespace, &bucket, RecordType::TimeSeries);
+        let (decoded_namespace, decoded_bucket, decoded_type, _) =
             parse_record_prefix(&buf).unwrap();
 
         // then
         assert_eq!(decoded_namespace, namespace);
         assert_eq!(decoded_bucket, bucket);
-        assert_eq!(decoded_slot, 42);
         assert_eq!(decoded_type, RecordType::TimeSeries);
     }
 
@@ -336,7 +292,6 @@ mod tests {
             &mut buf,
             &Namespace::default(),
             &TimeBucket { start: 0, size: 0 },
-            0,
             RecordType::TimeSeries,
         );
     }
@@ -348,7 +303,6 @@ mod tests {
         common::serde::terminated_bytes::serialize(Namespace::default().as_bytes(), &mut buf);
         buf.put_u32(0);
         buf.put_u8(0);
-        buf.put_u16(0);
         buf.put_u8(RecordType::TimeSeries.id());
 
         let err = parse_record_prefix(&buf).unwrap_err();
@@ -364,40 +318,36 @@ mod tests {
     }
 
     #[test]
-    fn bucket_slot_metadata_range_excludes_samples_and_adjacent_slots() {
+    fn bucket_metadata_range_excludes_samples_and_adjacent_buckets() {
         let namespace = Namespace::new("tenant-a").unwrap();
         let bucket = TimeBucket {
             start: 12345,
             size: 1,
         };
-        let range = bucket_slot_metadata_range(&namespace, &bucket, 42);
+        let range = bucket_metadata_range(&namespace, &bucket);
         for record_type in [
             RecordType::SeriesDictionary,
             RecordType::ForwardIndex,
             RecordType::InvertedIndex,
         ] {
             let mut key = BytesMut::new();
-            write_record_prefix(&mut key, &namespace, &bucket, 42, record_type);
+            write_record_prefix(&mut key, &namespace, &bucket, record_type);
             key.put_u8(1);
             assert!(range.contains(&key));
         }
 
         let mut samples = BytesMut::new();
-        write_record_prefix(
-            &mut samples,
-            &namespace,
-            &bucket,
-            42,
-            RecordType::TimeSeries,
-        );
+        write_record_prefix(&mut samples, &namespace, &bucket, RecordType::TimeSeries);
         assert!(!range.contains(&samples));
 
         let mut adjacent = BytesMut::new();
         write_record_prefix(
             &mut adjacent,
             &namespace,
-            &bucket,
-            43,
+            &TimeBucket {
+                start: 12346,
+                size: 1,
+            },
             RecordType::SeriesDictionary,
         );
         assert!(!range.contains(&adjacent));

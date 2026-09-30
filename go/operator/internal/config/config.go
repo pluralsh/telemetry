@@ -248,7 +248,6 @@ func renderLine(input Input) (Result, error) {
 			Page: renderLinePage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
-				MaxAgeSeconds:   int64Value(spec.Page.MaxAgeSeconds, 5),
 				RowsPerBlock:    int64Value(spec.Page.RowsPerBlock, 256),
 			},
 			Write: renderWrite{
@@ -514,9 +513,9 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
 	ioConcurrencyLimit := int32Value(spec.IOConcurrencyLimit, 128)
 	if component == modeStandalone {
-		virtual := int32(1)
+		shards := int32(1)
 		return renderSharding{
-			VirtualShards: &virtual, IOConcurrencyLimit: ioConcurrencyLimit,
+			Shards: &shards, IOConcurrencyLimit: ioConcurrencyLimit,
 			Backend: modeStandalone,
 		}
 	}
@@ -645,7 +644,6 @@ type renderTrackRequest struct {
 type renderLinePage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`
 	MaxRows         int64 `json:"max_rows"`
-	MaxAgeSeconds   int64 `json:"max_age_seconds"`
 	RowsPerBlock    int64 `json:"rows_per_block"`
 }
 type renderLineRequest struct {
@@ -714,7 +712,7 @@ type renderWrite struct {
 	RemoteRetries                   int32  `json:"remote_retries"`
 }
 type renderSharding struct {
-	VirtualShards        *int32 `json:"virtual_shards,omitempty"`
+	Shards               *int32 `json:"shards,omitempty"`
 	IOConcurrencyLimit   int32  `json:"io_concurrency_limit"`
 	Backend              string `json:"backend"`
 	Database             string `json:"database,omitempty"`

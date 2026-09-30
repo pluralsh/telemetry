@@ -256,14 +256,48 @@ fn select_rejects_arbitrary_expression() {
 fn pushdown_extracts_positive_scoped_equalities() {
     let plan = plan(parse(r#"{ resource.region = "west" && span.ok = true }"#).unwrap()).unwrap();
     assert_eq!(plan.pushdown.len(), 2);
-    assert_eq!(plan.pushdown[0].scope, IndexScope::Resource);
-    assert_eq!(plan.pushdown[1].value, AttributeValue::Bool(true));
+    assert_eq!(plan.pushdown[0].len(), 1);
+    assert_eq!(plan.pushdown[0][0].scope, IndexScope::Resource);
+    assert_eq!(plan.pushdown[1][0].value, AttributeValue::Bool(true));
 }
 
 #[test]
-fn pushdown_ignores_unscoped_attributes() {
+fn pushdown_checks_both_scopes_for_unscoped_attributes() {
     let plan = plan(parse(r#"{ .region = "west" }"#).unwrap()).unwrap();
-    assert!(plan.pushdown.is_empty());
+    let scopes = plan.pushdown[0]
+        .iter()
+        .map(|matcher| matcher.scope)
+        .collect::<Vec<_>>();
+    assert_eq!(scopes, vec![IndexScope::Span, IndexScope::Resource]);
+}
+
+#[test]
+fn pushdown_numeric_equality_covers_both_numeric_types() {
+    let values = |source: &str| {
+        plan(parse(source).unwrap()).unwrap().pushdown[0]
+            .iter()
+            .map(|matcher| matcher.value.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        values("{ span.code = 200 }"),
+        vec![AttributeValue::Int(200), AttributeValue::Double(200.0)]
+    );
+    assert_eq!(
+        values("{ span.ratio = 2.0 }"),
+        vec![AttributeValue::Double(2.0), AttributeValue::Int(2)]
+    );
+    assert_eq!(
+        values("{ span.ratio = 2.5 }"),
+        vec![AttributeValue::Double(2.5)]
+    );
+    assert_eq!(values("{ span.zero = 0 }").len(), 3);
+    assert!(
+        plan(parse("{ span.huge = 18446744073709551616.0 }").unwrap())
+            .unwrap()
+            .pushdown
+            .is_empty()
+    );
 }
 
 #[test]
@@ -330,6 +364,35 @@ fn executes_descendant_relationship() {
 fn executes_sibling_relationship() {
     let result = run(r#"{ name = "db.query" } ~ { name = "cache" }"#).unwrap();
     assert_eq!(result.matched_spans.len(), 2);
+}
+
+#[test]
+fn executes_parent_and_ancestor_relationships() {
+    let names = |source: &str| {
+        let mut names = run(source)
+            .map(|result| {
+                result
+                    .matched_spans
+                    .into_iter()
+                    .map(|span| span.name)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(r#"{ name = "root" } < { name = "db.query" }"#),
+        ["db.query", "root"]
+    );
+    assert_eq!(names("{ } << { }"), ["cache", "db.query", "root"]);
+    assert_eq!(names(r#"{ } !>> { name = "root" }"#), ["root"]);
+    assert_eq!(names("{ } !~ { }"), ["root"]);
+    assert_eq!(
+        names(r#"{ name = "cache" } &>> { name = "db.query" }"#),
+        ["cache", "db.query"]
+    );
+    assert!(names(r#"{ name = "cache" } >> { name = "db.query" }"#).is_empty());
 }
 
 #[test]

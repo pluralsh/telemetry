@@ -298,6 +298,7 @@ mod tests {
         assert!(config.validate().is_err());
         config.request.max_candidates = 1;
         config.mode = ServerMode::Writer;
+        config.sharding.shards = 2;
         config.sharding.kind = ShardingBackend::Static {
             owner_id: "a".into(),
             owners: vec![StaticOwner {

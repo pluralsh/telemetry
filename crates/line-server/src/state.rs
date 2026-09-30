@@ -18,8 +18,7 @@ use tonic::{Request, metadata::MetadataValue};
 
 #[cfg(feature = "kubernetes")]
 use sharding::{
-    AssignmentGeneration, BoxError, MigrationExecutionError, ShardLifecycle,
-    ShardMigrationExecutor, ShardSplit, server::KubernetesRuntime,
+    AssignmentGeneration, BoxError, EpochPolicy, ShardLifecycle, server::KubernetesRuntime,
 };
 
 use crate::{
@@ -66,10 +65,13 @@ impl AppState {
         let (local_owner, assignment) = match &config.sharding.kind {
             #[cfg(feature = "kubernetes")]
             ShardingBackend::Kubernetes(settings) => {
-                let (runtime, assignment) =
-                    KubernetesRuntime::bootstrap(settings, cancellation.clone())
-                        .await
-                        .map_err(|error| anyhow::anyhow!(error))?;
+                let (runtime, assignment) = KubernetesRuntime::bootstrap(
+                    settings,
+                    EpochPolicy::default(),
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
                 let local = runtime.identity().to_owned();
                 kubernetes = Some(runtime);
                 (local, assignment)
@@ -80,16 +82,15 @@ impl AppState {
             }
             _ => assignment_for(&config)?,
         };
-        let shard_count = assignment.virtual_shards;
+        let shard_count = assignment.shard_count;
         let shards = config
             .sharding
             .startup_shards(config.mode, &assignment, &local_owner);
         let db = Arc::new(if config.mode == ServerMode::Reader {
-            ShardedLine::open_readers_with_routing(
+            ShardedLine::open_readers(
                 config.line_config(),
                 ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
-                &assignment.routing,
                 slatedb::config::DbReaderOptions {
                     skip_wal_replay: false,
                     ..slatedb::config::DbReaderOptions::default()
@@ -97,11 +98,10 @@ impl AppState {
             )
             .await?
         } else {
-            ShardedLine::open_with_routing(
+            ShardedLine::open(
                 config.line_config(),
                 ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?,
                 shards,
-                &assignment.routing,
             )
             .await?
         });
@@ -142,17 +142,9 @@ impl AppState {
                 let lifecycle = Arc::new(LineShardLifecycle {
                     db: Arc::clone(&state.db),
                     draining_shards: Arc::clone(&state.draining_shards),
-                    assignment: Arc::clone(&state.assignment),
                 });
                 let tasks = runtime.spawn(
                     lifecycle,
-                    Arc::new(LineMigrationExecutor {
-                        config: state.config.line_config(),
-                        options: ShardingOptions::new(
-                            state.assignment.read().await.virtual_shards,
-                            state.config.sharding.io_concurrency_limit,
-                        )?,
-                    }),
                     Arc::clone(&state.assignment),
                     &state.cancellation,
                 );
@@ -170,14 +162,8 @@ impl AppState {
         }
         match self.config.mode {
             ServerMode::Standalone | ServerMode::Reader => {
-                let expected = self
-                    .assignment
-                    .read()
-                    .await
-                    .routing
-                    .assignments
-                    .iter()
-                    .map(|assignment| assignment.shard)
+                let expected = (0..self.assignment.read().await.shard_count)
+                    .map(ShardId::new)
                     .collect::<Vec<_>>();
                 self.db.open_shards().await == expected
             }
@@ -299,18 +285,17 @@ impl AppState {
     ) -> Result<(), ApiError> {
         let assignment = self.assignment.read().await.clone();
         let options = ShardingOptions::new(
-            assignment.virtual_shards,
+            assignment.shard_count,
             self.config.sharding.io_concurrency_limit,
         )
         .map_err(ApiError::internal)?;
         let mut groups: HashMap<(Owner, ShardId), Vec<LogBatch>> = HashMap::new();
-        for batch in batches {
-            let shard = options.route(&assignment.routing, namespace, &batch.labels);
+        for (shard, batches) in options.split(&assignment, namespace, batches) {
             let owner = assignment
                 .owner_of(shard)
                 .cloned()
                 .ok_or_else(|| ApiError::unavailable("shard has no active owner"))?;
-            groups.entry((owner, shard)).or_default().push(batch);
+            groups.insert((owner, shard), batches);
         }
         let results = stream::iter(groups.into_iter().map(|((owner, shard), batches)| {
             let state = self.clone();
@@ -470,105 +455,9 @@ impl AppState {
 }
 
 #[cfg(feature = "kubernetes")]
-struct LineMigrationExecutor {
-    config: line::Config,
-    options: ShardingOptions,
-}
-
-#[cfg(feature = "kubernetes")]
-impl LineMigrationExecutor {
-    fn slate_config(
-        &self,
-    ) -> Result<&common::storage::config::SlateDbStorageConfig, MigrationExecutionError> {
-        match &self.config.storage {
-            common::StorageConfig::SlateDb(config) => Ok(config),
-            common::StorageConfig::InMemory => Err(MigrationExecutionError::fatal(
-                "projected shard migration requires SlateDB storage",
-            )),
-        }
-    }
-
-    fn spec(
-        &self,
-        split: &ShardSplit,
-    ) -> Result<common::storage::projected_clone::ProjectedCloneSpec, MigrationExecutionError> {
-        let slots = split
-            .moved_range
-            .slots()
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        let source = self
-            .options
-            .shard_storage(&self.config, split.source_shard)
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        let target = self
-            .options
-            .shard_storage(&self.config, split.target_shard)
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        let common::StorageConfig::SlateDb(source) = source.storage else {
-            return Err(MigrationExecutionError::fatal(
-                "projected shard migration requires SlateDB storage",
-            ));
-        };
-        let common::StorageConfig::SlateDb(target) = target.storage else {
-            return Err(MigrationExecutionError::fatal(
-                "projected shard migration requires SlateDB storage",
-            ));
-        };
-        Ok(common::storage::projected_clone::ProjectedCloneSpec {
-            source_path: source.path,
-            target_path: target.path,
-            checkpoint_name: format!(
-                "telemetry-migration-{}-{}-{}-{}",
-                split.source_shard.get(),
-                split.target_shard.get(),
-                slots.start,
-                slots.end
-            ),
-            slot_start: slots.start,
-            slot_end: slots.end,
-            segment_extractor_name: line::SEGMENT_EXTRACTOR_NAME.to_owned(),
-        })
-    }
-
-    fn map_error(
-        error: common::storage::projected_clone::ProjectedCloneError,
-    ) -> MigrationExecutionError {
-        if error.is_fatal() {
-            MigrationExecutionError::fatal(error.to_string())
-        } else {
-            MigrationExecutionError::Retryable(Box::new(error))
-        }
-    }
-}
-
-#[cfg(feature = "kubernetes")]
-#[tonic::async_trait]
-impl ShardMigrationExecutor for LineMigrationExecutor {
-    async fn preflight_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
-        let object_store = common::create_object_store(&self.slate_config()?.object_store)
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        common::storage::projected_clone::preflight_projected_clone(
-            &self.spec(split)?,
-            object_store,
-        )
-        .await
-        .map_err(Self::map_error)
-    }
-
-    async fn clone_split(&self, split: &ShardSplit) -> Result<(), MigrationExecutionError> {
-        let object_store = common::create_object_store(&self.slate_config()?.object_store)
-            .map_err(|error| MigrationExecutionError::fatal(error.to_string()))?;
-        common::storage::projected_clone::execute_projected_clone(&self.spec(split)?, object_store)
-            .await
-            .map_err(Self::map_error)
-    }
-}
-
-#[cfg(feature = "kubernetes")]
 struct LineShardLifecycle {
     db: Arc<ShardedLine>,
     draining_shards: Arc<tokio::sync::RwLock<HashSet<ShardId>>>,
-    assignment: Arc<tokio::sync::RwLock<ShardMap>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -579,18 +468,7 @@ impl ShardLifecycle for LineShardLifecycle {
         shard: ShardId,
         _generation: AssignmentGeneration,
     ) -> Result<(), BoxError> {
-        let slots = self
-            .assignment
-            .read()
-            .await
-            .routing
-            .assignments
-            .iter()
-            .find(|assignment| assignment.shard == shard)
-            .ok_or_else(|| format!("missing routing range for shard {}", shard.get()))?
-            .range
-            .slots()?;
-        self.db.open_shard_with_slots(shard, slots).await?;
+        self.db.open_shard(shard).await?;
         self.draining_shards.write().await.remove(&shard);
         Ok(())
     }
@@ -649,7 +527,7 @@ mod tests {
             mode: ServerMode::Writer,
             storage: StorageConfig::InMemory,
             sharding: ShardingConfig {
-                virtual_shards: 2,
+                shards: 2,
                 io_concurrency_limit: 64,
                 kind: ShardingBackend::Static {
                     owner_id: owner_id.into(),
@@ -679,23 +557,35 @@ mod tests {
         }
     }
 
+    fn two_shards() -> ShardMap {
+        ShardMap::new(
+            AssignmentGeneration::new(1),
+            2,
+            vec![Assignment::new(
+                Owner::new("test", 0),
+                ShardRange::within(0, 2, 2).unwrap(),
+                AssignmentState::Active,
+            )],
+        )
+        .unwrap()
+    }
+
     fn batch_on_shard(namespace: &Namespace, shard: u32) -> LogBatch {
         let options = ShardingOptions::new(2, 4).unwrap();
-        let routing = sharding::HashRangeMap::bootstrap(2).unwrap();
+        let routing = two_shards();
         let labels = (0..10_000)
             .map(|candidate| {
                 Labels::new(vec![Label::new("app", format!("api-{candidate}"))]).unwrap()
             })
-            .find(|labels| options.route(&routing, namespace, labels).get() == shard)
+            .find(|labels| options.route(&routing, namespace, labels, 1).get() == shard)
             .unwrap();
         LogBatch::new(labels, vec![LogEntry::new(1, "forwarded")])
     }
 
     fn with_generation(map: &ShardMap, generation: u64) -> ShardMap {
-        ShardMap::with_routing(
+        ShardMap::with_epochs(
             AssignmentGeneration::new(generation),
-            map.virtual_shards,
-            map.routing.clone(),
+            map.epochs.clone(),
             map.assignments.clone(),
         )
         .unwrap()
@@ -732,8 +622,8 @@ mod tests {
         .unwrap();
         let namespace = Namespace::new("tenant").unwrap();
         let batch = batch_on_shard(&namespace, 1);
-        let routing = state.assignment.read().await.routing.clone();
-        let shard = state.db.route(&routing, &namespace, &batch.labels);
+        let routing = state.assignment.read().await.clone();
+        let shard = state.db.route(&routing, &namespace, &batch.labels, 1);
         state.draining_shards.write().await.insert(shard);
 
         assert!(
@@ -759,8 +649,8 @@ mod tests {
         .unwrap();
         let namespace = Namespace::new("tenant").unwrap();
         let batch = batch_on_shard(&namespace, 1);
-        let routing = state.assignment.read().await.routing.clone();
-        let shard = state.db.route(&routing, &namespace, &batch.labels);
+        let routing = state.assignment.read().await.clone();
+        let shard = state.db.route(&routing, &namespace, &batch.labels, 1);
 
         // This is the admission guard held by write_local for the full write.
         let admitted = state.draining_shards.read().await;
@@ -803,18 +693,6 @@ mod tests {
         let lifecycle = LineShardLifecycle {
             db: Arc::clone(&db),
             draining_shards: Arc::clone(&draining),
-            assignment: Arc::new(tokio::sync::RwLock::new(
-                ShardMap::new(
-                    AssignmentGeneration::new(1),
-                    2,
-                    vec![Assignment::new(
-                        Owner::new("test", 0),
-                        ShardRange::within(0, 2, 2).unwrap(),
-                        AssignmentState::Active,
-                    )],
-                )
-                .unwrap(),
-            )),
         };
         let shard = ShardId::new(1);
 

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,21 +27,14 @@ use crate::util::Result;
 pub(crate) struct MiniQueryReader<R: StorageRead> {
     namespace: Namespace,
     bucket: TimeBucket,
-    routing_slots: Range<u16>,
     snapshot: R,
 }
 
 impl<R: StorageRead> MiniQueryReader<R> {
-    pub(crate) fn new(
-        namespace: Namespace,
-        bucket: TimeBucket,
-        routing_slots: Range<u16>,
-        storage: R,
-    ) -> Self {
+    pub(crate) fn new(namespace: Namespace, bucket: TimeBucket, storage: R) -> Self {
         Self {
             namespace,
             bucket,
-            routing_slots,
             snapshot: storage,
         }
     }
@@ -56,12 +48,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let forward_index = io_trace_async(IoKindLocal::ForwardIndexFetch, async {
             self.snapshot
-                .get_forward_index_series(
-                    &self.namespace,
-                    &self.bucket,
-                    self.routing_slots.clone(),
-                    series_ids,
-                )
+                .get_forward_index_series(&self.namespace, &self.bucket, series_ids)
                 .await
         })
         .await?;
@@ -73,11 +60,8 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let forward_index = io_trace_async(
             IoKindLocal::ForwardIndexFetch,
-            self.snapshot.get_forward_index(
-                &self.namespace,
-                self.bucket,
-                self.routing_slots.clone(),
-            ),
+            self.snapshot
+                .get_forward_index(&self.namespace, self.bucket),
         )
         .await?;
         Ok(Box::new(forward_index))
@@ -89,12 +73,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let inverted_index = io_trace_async(IoKindLocal::InvertedIndexFetch, async {
             self.snapshot
-                .get_inverted_index_terms(
-                    &self.namespace,
-                    &self.bucket,
-                    self.routing_slots.clone(),
-                    terms,
-                )
+                .get_inverted_index_terms(&self.namespace, &self.bucket, terms)
                 .await
         })
         .await?;
@@ -106,11 +85,8 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let inverted_index = io_trace_async(
             IoKindLocal::InvertedIndexFetch,
-            self.snapshot.get_inverted_index(
-                &self.namespace,
-                self.bucket,
-                self.routing_slots.clone(),
-            ),
+            self.snapshot
+                .get_inverted_index(&self.namespace, self.bucket),
         )
         .await?;
         Ok(Box::new(inverted_index))
@@ -119,12 +95,8 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
         io_trace_async(
             IoKindLocal::LabelValuesFetch,
-            self.snapshot.get_label_values(
-                &self.namespace,
-                &self.bucket,
-                self.routing_slots.clone(),
-                label_name,
-            ),
+            self.snapshot
+                .get_label_values(&self.namespace, &self.bucket, label_name),
         )
         .await
     }
@@ -135,12 +107,8 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     ) -> Result<Option<crate::index::SeriesSpec>> {
         io_trace_async(
             IoKindLocal::ForwardIndexFetch,
-            self.snapshot.get_forward_index_one(
-                &self.namespace,
-                &self.bucket,
-                self.routing_slots.clone(),
-                series_id,
-            ),
+            self.snapshot
+                .get_forward_index_one(&self.namespace, &self.bucket, series_id),
         )
         .await
     }
@@ -148,12 +116,8 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     async fn inverted_index_term(&self, term: &Label) -> Result<Option<roaring::RoaringBitmap>> {
         io_trace_async(
             IoKindLocal::InvertedIndexFetch,
-            self.snapshot.get_inverted_index_term(
-                &self.namespace,
-                &self.bucket,
-                self.routing_slots.clone(),
-                term,
-            ),
+            self.snapshot
+                .get_inverted_index_term(&self.namespace, &self.bucket, term),
         )
         .await
     }
@@ -168,7 +132,6 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         let storage_key = TimeSeriesKey {
             namespace: self.namespace.clone(),
             bucket: self.bucket,
-            routing_slot: (series_id % u32::from(sharding::ROUTING_SLOT_COUNT)) as u16,
             metric_name: metric_name.to_string(),
             series_id,
         };
@@ -189,11 +152,13 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
                     let iter = TimeSeriesIterator::new(value.as_ref()).ok_or_else(|| {
                         Error::Internal("Invalid timeseries data in storage".into())
                     })?;
+                    // Stored series are sorted by timestamp (encode and merge
+                    // both guarantee it), so decoding stops past `end_ms`.
+                    // PromQL lookback windows exclude `start_ms`.
                     let samples: Vec<Sample> = iter
-                        .filter_map(|r| r.ok())
-                        // Filter by time range: timestamp > start_ms && timestamp <= end_ms
-                        // Following PromQL lookback window semantics with exclusive start
-                        .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+                        .map_while(|r| r.ok())
+                        .take_while(|s| s.timestamp_ms <= end_ms)
+                        .filter(|s| s.timestamp_ms > start_ms)
                         .collect();
                     Ok::<Vec<Sample>, Error>(samples)
                 })?;
@@ -226,7 +191,6 @@ fn io_trace_sync<T>(kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
 pub(crate) struct MiniTsdb {
     namespace: Namespace,
     bucket: TimeBucket,
-    routing_slot: u16,
     write_coordinator: WriteCoordinator<TsdbWriteDelta, TsdbFlusher>,
 }
 
@@ -242,7 +206,6 @@ impl MiniTsdb {
         MiniQueryReader {
             namespace: self.namespace.clone(),
             bucket: self.bucket,
-            routing_slots: self.routing_slot..self.routing_slot + 1,
             snapshot: view.snapshot.clone(),
         }
     }
@@ -250,7 +213,6 @@ impl MiniTsdb {
     pub(crate) async fn load(
         namespace: Namespace,
         bucket: TimeBucket,
-        routing_slot: u16,
         storage: Arc<Storage>,
         retention: Option<Duration>,
         active_series: Arc<ActiveSeriesTracker>,
@@ -260,20 +222,14 @@ impl MiniTsdb {
 
         let mut series_dict = HashMap::new();
         let next_series_id = snapshot
-            .load_series_dictionary(
-                &namespace,
-                &bucket,
-                routing_slot,
-                |fingerprint, series_id| {
-                    series_dict.insert(fingerprint, series_id);
-                },
-            )
+            .load_series_dictionary(&namespace, &bucket, |fingerprint, series_id| {
+                series_dict.insert(fingerprint, series_id);
+            })
             .await?;
 
         let context = TsdbContext {
             namespace: namespace.clone(),
             bucket,
-            routing_slot,
             series_dict: Arc::new(series_dict),
             next_series_id,
             active_series: active_series.clone(),
@@ -302,7 +258,6 @@ impl MiniTsdb {
         Ok(Self {
             namespace,
             bucket,
-            routing_slot,
             write_coordinator,
         })
     }
@@ -426,7 +381,6 @@ mod tests {
             .load_series_dictionary(
                 &crate::Namespace::default(),
                 &bucket,
-                0,
                 |fingerprint, series_id| {
                     series_dict.insert(fingerprint, series_id);
                 },
@@ -438,7 +392,6 @@ mod tests {
         let context = TsdbContext {
             namespace: crate::Namespace::default(),
             bucket,
-            routing_slot: 0,
             series_dict: Arc::new(series_dict),
             next_series_id,
             active_series: active_series.clone(),
@@ -469,7 +422,6 @@ mod tests {
         MiniTsdb {
             namespace: crate::Namespace::default(),
             bucket,
-            routing_slot: 0,
             write_coordinator,
         }
     }

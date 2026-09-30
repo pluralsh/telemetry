@@ -11,7 +11,7 @@ and instance type before setting production limits.
 Start a production writer with 8 vCPU, 32 GiB of memory, and 10 Gbit/s network
 capacity in the same region as its object store. Keep sustained ingestion below
 65% of the measured saturation point so compaction, traffic bursts, shard
-migration, and object-store tail latency have headroom.
+handoff, and object-store tail latency have headroom.
 
 Until native product benchmarks replace these estimates, use the following
 provisional envelope for one writer:
@@ -28,8 +28,9 @@ writer count without testing shared object-store, compactor, and network limits.
 
 Increase writer replicas when any one writer sustains more than 65% of its
 validated byte, CPU, memory, or compaction capacity. Writer replicas are storage
-shards, so an increase performs an online shard split. Scale-down remains
-blocked until online shard merging is implemented.
+shards, so an increase appends a routing epoch: records timestamped after the
+next cutover spread across the larger shard count, while existing data stays on
+its original shards. Scale-down remains blocked.
 
 Scale readers independently from writers. Query concurrency, cache hit rate,
 scan width, and object-store GET latency determine reader count and are not
@@ -95,8 +96,8 @@ round trip; `durable` ingestion does.
 Meter, Line, and Track use the same bounded, per-storage-shard write
 coordinator. A request is validated and merged into a live in-memory delta;
 the coordinator freezes deltas by size, time, or an explicit durability
-barrier. Line coalesces entries by namespace, segment, routing slot, and stream
-fingerprint. Track coalesces traces by namespace, segment, and routing slot.
+barrier. Line coalesces entries by namespace, segment, and stream fingerprint.
+Track coalesces traces by namespace and segment.
 This allows separate client requests to share product page and index work.
 
 The requested durability level controls acknowledgement:
@@ -146,10 +147,10 @@ bytes. Lower `buffer_flush_interval_milliseconds` reduces `applied` latency and
 drain work but also reduces batching. Raise the size threshold only after
 measuring process RSS and flush latency.
 
-During migration, the drain gate waits for already-admitted writes to finish,
-rejects later local writes, then runs `drain → flush → close → lease release`.
-The flush advances buffered writes through durable storage before the source
-checkpoint is cloned, so every acknowledged pre-drain write is included.
+During a shard handoff, the drain gate waits for already-admitted writes to
+finish, rejects later local writes, then runs `drain → flush → close → lease
+release`. The flush advances buffered writes through durable storage before the
+next owner opens the shard, so every acknowledged pre-drain write is included.
 
 ## Product write behavior
 
@@ -196,7 +197,7 @@ traces.
 
 Clients should normally send or coalesce 1–4 MiB per-shard writes with a
 10–50 ms maximum aggregation delay. This is large enough to amortize product
-overhead while bounding memory, tail latency, and migration drain time.
+overhead while bounding memory, tail latency, and handoff drain time.
 
 An OpenData buffer in front of Telemetry can durably absorb bursts and merge
 many small requests before calling a writer. To improve database throughput,
@@ -220,9 +221,10 @@ throughput at the same SlateDB logical-byte ceiling.
 
 Exactly-once buffered ingestion requires care. A single queue sequence that
 fans out to several physical shards cannot be committed atomically without a
-distributed transaction. Prefer fixed buffer partitions based on the same
-4,096 routing slots so each queue sequence targets one physical database, or
-accept at-least-once delivery and make product writes idempotent.
+distributed transaction. Prefer buffer partitions that follow the storage-shard
+hash ranges of the current routing epoch so each queue sequence targets one
+physical database, or accept at-least-once delivery and make product writes
+idempotent.
 
 ## Translating throughput into production units
 
@@ -371,7 +373,8 @@ The minimum workload set is:
 5. `durable` mode as a latency-focused comparison.
 6. Stable-cardinality and high-churn variants.
 7. Concurrent representative reads to detect cache and object-store contention.
-8. A shard split while running at 65% of validated steady-state capacity.
+8. A scale-up across a routing-epoch cutover while running at 65% of validated
+   steady-state capacity.
 
 Publish both the saturation result and the recommended result after applying
 35% operational headroom.

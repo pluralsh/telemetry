@@ -76,6 +76,10 @@ storage:
     # shards: 8 # Optional; absent lets Foyer choose.
   # FoyerHybrid is also valid for metadata and has the same fields shown above.
 
+# Optional retention. Time-bucket records get a SlateDB TTL so compaction drops
+# samples older than this. Unset (default) keeps data forever.
+retention_seconds: 2592000 # 30 days.
+
 # Per-shard Moka query cache limit. Despite the field name and historical
 # default, the current unweighted implementation counts time-bucket entries,
 # not bytes. Default: 268435456.
@@ -104,13 +108,14 @@ write:
   remote_retries: 2
 
 sharding:
-  # Initial/desired storage-shard count; online changes may only increase it.
-  virtual_shards: 8
+  # Storage-shard count for standalone/static backends; keep it fixed for a
+  # dataset. Kubernetes uses writer replicas instead.
+  shards: 1
   io_concurrency_limit: 128 # Concurrent storage I/O operations per pod.
   backend: standalone
 
   # Static split-deployment alternative. Ranges are half-open and must exactly
-  # cover [0, virtual_shards); owner_id must match an owners[].id.
+  # cover [0, shards); owner_id must match an owners[].id.
   # backend: static
   # owner_id: meter-0
   # owners:

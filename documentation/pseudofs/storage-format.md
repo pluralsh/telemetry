@@ -1,8 +1,7 @@
 # PseudoFS storage format
 
-PseudoFS derives a distinct root inode ID and routing slot from each validated
-tenant identifier. The routing slot uses the common 12-bit hash space and is
-identical for every record in that tenant's filesystem. Every inode stores its
+PseudoFS derives a distinct root inode ID from each validated tenant
+identifier. Every inode stores its
 owning tenant, and path traversal verifies that ownership at every step.
 Directory entries are keyed by parent inode plus child name. Paths are resolved
 only by walking from the selected tenant root. Moving a directory changes one
@@ -23,21 +22,19 @@ the upload marker. This prevents partial replacement from becoming visible.
 Every key has the following outer layout:
 
 ```text
-[pseudofs subsystem][version][routing slot:u16 BE][record family][tenant root UUID][suffix]
+[pseudofs subsystem][version = 0x02][record family][tenant root UUID][suffix]
 ```
 
-The persisted `pseudofs/v1` SlateDB segment extractor returns the two-byte
-subsystem/version prefix. The routing slot therefore immediately follows the
-segment prefix, and one projected key range selects all record families and
-tenants in a shard-split interval. Since every record for one tenant uses the
-same slot, a split moves its directories, inodes, generations, chunks, upload
-markers, and garbage markers together.
+The persisted `pseudofs/v2` SlateDB segment extractor returns the two-byte
+subsystem/version prefix. Because the record family follows it directly,
+startup recovery scans all upload markers or all garbage markers with one prefix
+each. Version 2 is a hard format switch: version-1 databases are not read.
 
 Record suffixes use binary UUIDs and, for chunks, a big-endian index. SlateDB
 write batches make directory-entry and inode changes atomic. A process-local
 mutation lock prevents conflicting read-modify-write operations inside the sole
-writer process. PseudoFS remains operationally unsharded; the slot-aware format
-preserves the option to adopt projected shard splits later.
+writer process. PseudoFS is unsharded: it always runs as a single standalone
+SlateDB writer.
 
 Paths are UTF-8 and lexically normalized. Repeated separators and `.` are
 removed. `..` removes one component but is rejected if it would traverse above

@@ -427,8 +427,8 @@ func TestReplicaDefaultsOverridesAndStandaloneSafety(t *testing.T) {
 		&telemetryv1alpha1.Meter{Spec: telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeSharded}},
 		&telemetryv1alpha1.Line{Spec: telemetryv1alpha1.LineSpec{Mode: telemetryv1alpha1.LineModeSharded}},
 	} {
-		if got := *Replicas(value, ComponentWriter); got != 3 {
-			t.Fatalf("%T default writer replicas = %d, want 3", value, got)
+		if got := *Replicas(value, ComponentWriter); got != 1 {
+			t.Fatalf("%T default writer replicas = %d, want 1", value, got)
 		}
 		if got := *Replicas(value, ComponentReader); got != 2 {
 			t.Fatalf("%T default reader replicas = %d, want 2", value, got)
