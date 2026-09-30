@@ -12,12 +12,23 @@ ABS_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True, order=True)
+class NormalizedHistogram:
+    count: float
+    sum: float
+    # (boundary rule, lower, upper, count) as in the Prometheus JSON encoding.
+    buckets: tuple[tuple[int, float, float, float], ...]
+
+
+@dataclass(frozen=True, order=True)
 class NormalizedSeries:
     labels: tuple[tuple[str, str], ...]
     values: tuple[tuple[float, float], ...]
+    histograms: tuple[tuple[float, NormalizedHistogram], ...] = ()
 
 
 def float_close(left: float, right: float) -> bool:
+    if math.isnan(left) or math.isnan(right):
+        return math.isnan(left) and math.isnan(right)
     return math.isclose(
         left,
         right,
@@ -55,8 +66,52 @@ def normalize_query(
             sample = entry.get("value")
             samples = [] if sample is None else [sample]
         values = tuple((float(sample[0]), float(sample[1])) for sample in samples)
-        normalized.append(NormalizedSeries(labels, values))
+        histograms = entry.get("histograms")
+        if histograms is None:
+            histogram = entry.get("histogram")
+            histograms = [] if histogram is None else [histogram]
+        normalized.append(
+            NormalizedSeries(
+                labels,
+                values,
+                tuple(
+                    (float(timestamp), _normalize_histogram(histogram))
+                    for timestamp, histogram in histograms
+                ),
+            )
+        )
     return tuple(sorted(normalized))
+
+
+def _normalize_histogram(value: dict[str, Any]) -> NormalizedHistogram:
+    return NormalizedHistogram(
+        count=float(value["count"]),
+        sum=float(value["sum"]),
+        buckets=tuple(
+            (int(rule), float(lower), float(upper), float(count))
+            for rule, lower, upper, count in value.get("buckets", ())
+        ),
+    )
+
+
+def _assert_histogram_close(
+    name: str,
+    expected: NormalizedHistogram,
+    actual: NormalizedHistogram,
+) -> None:
+    assert float_close(expected.count, actual.count), (
+        f"{name}: histogram counts differ: {expected.count} != {actual.count}"
+    )
+    assert float_close(expected.sum, actual.sum), (
+        f"{name}: histogram sums differ: {expected.sum} != {actual.sum}"
+    )
+    assert len(expected.buckets) == len(actual.buckets), (
+        f"{name}: histogram buckets differ: {expected.buckets} != {actual.buckets}"
+    )
+    for left, right in zip(expected.buckets, actual.buckets, strict=True):
+        assert left[0] == right[0] and all(
+            float_close(a, b) for a, b in zip(left[1:], right[1:], strict=True)
+        ), f"{name}: histogram bucket differs: {left} != {right}"
 
 
 def assert_query_equivalent(
@@ -91,6 +146,20 @@ def assert_query_equivalent(
             assert float_close(left_value, right_value), (
                 f"{name}: values differ: {left_value} != {right_value}"
             )
+        assert len(expected_series.histograms) == len(actual_series.histograms), (
+            f"{name}: histogram sample counts differ for {expected_series.labels}: "
+            f"expected {len(expected_series.histograms)}, "
+            f"got {len(actual_series.histograms)}"
+        )
+        for (left_time, left_histogram), (right_time, right_histogram) in zip(
+            expected_series.histograms,
+            actual_series.histograms,
+            strict=True,
+        ):
+            assert float_close(left_time, right_time), (
+                f"{name}: histogram timestamps differ: {left_time} != {right_time}"
+            )
+            _assert_histogram_close(name, left_histogram, right_histogram)
 
 
 def _sort_json(value: Any) -> Any:

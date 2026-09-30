@@ -19,6 +19,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::histogram::FloatHistogram;
 use crate::model::Labels;
 
 /// The wire shape of the engine — operators produce and consume
@@ -65,7 +66,18 @@ pub struct StepBatch {
     /// [`VectorSelectorOp`]: super::operators::vector_selector::VectorSelectorOp
     /// [`InstantFnKind::Timestamp`]: super::operators::instant_fn::InstantFnKind::Timestamp
     pub source_timestamps: Option<Arc<[i64]>>,
+
+    /// Native histogram cells, laid out like `values`. `None` when no cell
+    /// holds a histogram. A histogram cell keeps its `validity` bit clear,
+    /// so float-only operators see it as absent and drop it — Prometheus'
+    /// behaviour for functions and operators that do not accept histograms.
+    /// Operators that forward or combine histograms must carry this column
+    /// explicitly; [`StepBatch::new`] starts without one.
+    pub histograms: Option<HistogramCells>,
 }
+
+/// Per-cell native histograms; see [`StepBatch::histograms`].
+pub type HistogramCells = Vec<Option<Arc<FloatHistogram>>>;
 
 impl StepBatch {
     pub fn new(
@@ -122,7 +134,36 @@ impl StepBatch {
             values,
             validity,
             source_timestamps: None,
+            histograms: None,
         }
+    }
+
+    /// Attach a histogram column; an all-`None` column is dropped.
+    pub fn with_histograms(mut self, histograms: HistogramCells) -> Self {
+        debug_assert_eq!(histograms.len(), self.values.len());
+        debug_assert!(
+            histograms
+                .iter()
+                .enumerate()
+                .all(|(i, h)| h.is_none() || !self.validity.get(i)),
+            "histogram cells must have their float validity bit clear",
+        );
+        self.histograms = histograms.iter().any(Option::is_some).then_some(histograms);
+        self
+    }
+
+    /// Histogram at linear cell `idx`, if any.
+    #[inline]
+    pub fn histogram(&self, idx: usize) -> Option<&Arc<FloatHistogram>> {
+        self.histograms
+            .as_ref()
+            .and_then(|cells| cells[idx].as_ref())
+    }
+
+    /// Whether linear cell `idx` holds a float or a histogram.
+    #[inline]
+    pub fn is_present(&self, idx: usize) -> bool {
+        self.validity.get(idx) || self.histogram(idx).is_some()
     }
 
     /// Attach per-cell source-sample timestamps. Only

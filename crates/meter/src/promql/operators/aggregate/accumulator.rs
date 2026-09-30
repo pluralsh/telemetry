@@ -1,5 +1,7 @@
 //! Per-group accumulator shared by the streaming reducers.
 
+use crate::util::kahan_inc;
+
 /// Single-pass per-group accumulator. Three overlapping lanes (Kahan sum,
 /// NaN-safe min/max, Welford) are all maintained; the reducer reads its own.
 #[derive(Debug, Clone, Copy)]
@@ -111,20 +113,4 @@ impl Accumulator {
         let n = self.count as f64;
         (self.m2 + self.c_m2) / n
     }
-}
-
-/// Kahan–Neumaier compensated summation step. Matches the implementation
-/// in [`super::rollup`] bit-for-bit so sum / avg across streaming and
-/// range aggregates round identically.
-#[inline(never)]
-fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
-    let t = sum + inc;
-    let new_c = if t.is_infinite() {
-        0.0
-    } else if sum.abs() >= inc.abs() {
-        c + ((sum - t) + inc)
-    } else {
-        c + ((inc - t) + sum)
-    };
-    (t, new_c)
 }

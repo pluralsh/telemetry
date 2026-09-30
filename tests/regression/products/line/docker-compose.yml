@@ -11,6 +11,8 @@ services:
     ports: ["13100:3100"]
 
   line:
+    # CI preloads this tag from a cached buildx build; see regression.yml.
+    image: telemetry-regression/line-server:local
     build:
       context: ../../../..
       dockerfile: crates/line-server/Dockerfile
@@ -25,6 +27,7 @@ services:
 
   line-retention:
     profiles: ["extended"]
+    image: telemetry-regression/line-server:local
     build:
       context: ../../../..
       dockerfile: crates/line-server/Dockerfile

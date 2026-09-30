@@ -5,7 +5,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
-use crate::model::{Label, QueryOptions, Sample};
+use crate::model::{Label, QueryOptions, SeriesData};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
 
@@ -44,15 +44,15 @@ pub(crate) trait BucketQueryReader: Send + Sync {
     /// only values for a single label are needed.
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>>;
 
-    /// Get samples for a series within a time range, merging from all layers.
-    /// Returns samples sorted by timestamp with duplicates removed (head takes priority).
+    /// Get float and histogram samples for a series within `(start_ms, end_ms]`,
+    /// merged from all layers, sorted by timestamp with duplicates removed.
     async fn samples(
         &self,
         series_id: SeriesId,
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>>;
+    ) -> Result<SeriesData>;
 
     /// Fetch a single forward-index entry by series id. Returns `None` if
     /// the series isn't present in the bucket. Intended for callers that
@@ -95,7 +95,8 @@ pub(crate) trait QueryReader: Send + Sync {
     /// Get all unique values for a specific label name within a specific bucket.
     async fn label_values(&self, bucket: &TimeBucket, label_name: &str) -> Result<Vec<String>>;
 
-    /// Get samples for a series within a time range from a specific bucket.
+    /// Get float and histogram samples for a series within `(start_ms, end_ms]`
+    /// from a specific bucket.
     async fn samples(
         &self,
         bucket: &TimeBucket,
@@ -103,7 +104,7 @@ pub(crate) trait QueryReader: Send + Sync {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>>;
+    ) -> Result<SeriesData>;
 
     /// Fetch a single forward-index entry within `bucket`. See
     /// [`BucketQueryReader::forward_index_one`].
@@ -203,7 +204,7 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<SeriesData> {
         let _permit = acquire(&self.limits.samples).await;
         self.inner
             .samples(bucket, series_id, metric_name, start_ms, end_ms)
@@ -233,12 +234,12 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
 pub(crate) mod test_utils {
     use super::*;
     use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
-    use crate::model::{MetricType, TimeBucket};
+    use crate::model::{HistogramSample, MetricType, Sample, TimeBucket};
     use std::collections::HashMap;
 
     /// Type alias for bucket data to reduce complexity
     type BucketData =
-        HashMap<TimeBucket, (ForwardIndex, InvertedIndex, HashMap<SeriesId, Vec<Sample>>)>;
+        HashMap<TimeBucket, (ForwardIndex, InvertedIndex, HashMap<SeriesId, SeriesData>)>;
 
     /// A mock QueryReader for testing that holds data in memory.
     /// Supports both single and multi-bucket scenarios.
@@ -322,20 +323,11 @@ pub(crate) mod test_utils {
             _metric_name: &str,
             start_ms: i64,
             end_ms: i64,
-        ) -> Result<Vec<Sample>> {
+        ) -> Result<SeriesData> {
             if let Some((_, _, samples_map)) = self.bucket_data.get(bucket) {
-                let samples = samples_map
-                    .get(&series_id)
-                    .map(|s| {
-                        s.iter()
-                            .filter(|sample| {
-                                sample.timestamp_ms > start_ms && sample.timestamp_ms <= end_ms
-                            })
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(samples)
+                let mut data = samples_map.get(&series_id).cloned().unwrap_or_default();
+                data.retain_range(start_ms, end_ms);
+                Ok(data)
             } else {
                 Err(crate::error::Error::InvalidInput(format!(
                     "MockQueryReader does not have bucket {:?}",
@@ -395,6 +387,18 @@ pub(crate) mod test_utils {
             self
         }
 
+        /// Like [`Self::add_sample`] for a native histogram sample.
+        pub(crate) fn add_histogram(
+            &mut self,
+            labels: Vec<Label>,
+            metric_type: MetricType,
+            sample: HistogramSample,
+        ) -> &mut Self {
+            self.inner
+                .add_histogram(self.bucket, labels, metric_type, sample);
+            self
+        }
+
         pub(crate) fn build(self) -> MockQueryReader {
             self.inner.build()
         }
@@ -428,6 +432,32 @@ pub(crate) mod test_utils {
             metric_type: MetricType,
             sample: Sample,
         ) -> &mut Self {
+            self.series_data(bucket, labels, metric_type)
+                .floats
+                .push(sample);
+            self
+        }
+
+        /// Like [`Self::add_sample`] for a native histogram sample.
+        pub(crate) fn add_histogram(
+            &mut self,
+            bucket: TimeBucket,
+            labels: Vec<Label>,
+            metric_type: MetricType,
+            sample: HistogramSample,
+        ) -> &mut Self {
+            self.series_data(bucket, labels, metric_type)
+                .histograms
+                .push(sample);
+            self
+        }
+
+        fn series_data(
+            &mut self,
+            bucket: TimeBucket,
+            labels: Vec<Label>,
+            metric_type: MetricType,
+        ) -> &mut SeriesData {
             // Sort labels for consistent fingerprinting
             let mut sorted_attrs = labels.clone();
             // Sort by canonical Label ordering (name, then value) for fingerprinting
@@ -475,10 +505,7 @@ pub(crate) mod test_utils {
                 }
             }
 
-            // Add sample to this bucket
-            samples_map.entry(series_id).or_default().push(sample);
-
-            self
+            samples_map.entry(series_id).or_default()
         }
 
         pub(crate) fn build(self) -> MockQueryReader {

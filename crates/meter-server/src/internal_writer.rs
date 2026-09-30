@@ -1,7 +1,12 @@
-use meter::{Label, Namespace, Sample, Series, routing::route};
+use meter::{
+    Bucket, CounterResetHint, FloatHistogram, HistogramSample, Label, Namespace, Sample, Series,
+    routing::route,
+};
 use proto::meter::internal::v1::{
-    Durability as ProtoDurability, Label as ProtoLabel, Namespace as ProtoNamespace,
-    Sample as ProtoSample, Series as ProtoSeries, WriteBatchRequest, WriteBatchResponse,
+    Durability as ProtoDurability, HistogramSample as ProtoHistogram, Label as ProtoLabel,
+    Namespace as ProtoNamespace, Sample as ProtoSample, Series as ProtoSeries, WriteBatchRequest,
+    WriteBatchResponse,
+    histogram_sample::CounterResetHint as ProtoResetHint,
     internal_writer_server::{InternalWriter, InternalWriterServer},
 };
 use server_common::internal_rpc;
@@ -51,6 +56,11 @@ pub(crate) fn to_proto_request(
                         value: sample.value,
                     })
                     .collect(),
+                histograms: series
+                    .histograms
+                    .into_iter()
+                    .map(to_proto_histogram)
+                    .collect(),
             })
             .collect(),
         metadata: vec![],
@@ -59,8 +69,66 @@ pub(crate) fn to_proto_request(
     }
 }
 
-fn from_proto_series(series: ProtoSeries) -> Series {
-    Series {
+fn to_proto_histogram(sample: HistogramSample) -> ProtoHistogram {
+    let h = sample.histogram;
+    let hint = match h.counter_reset_hint {
+        CounterResetHint::Unknown => ProtoResetHint::Unknown,
+        CounterResetHint::CounterReset => ProtoResetHint::Reset,
+        CounterResetHint::NotCounterReset => ProtoResetHint::NotReset,
+        CounterResetHint::Gauge => ProtoResetHint::Gauge,
+    };
+    ProtoHistogram {
+        timestamp_ms: sample.timestamp_ms,
+        counter_reset_hint: hint as i32,
+        schema: h.schema,
+        zero_threshold: h.zero_threshold,
+        zero_count: h.zero_count,
+        count: h.count,
+        sum: h.sum,
+        positive_indexes: h.positive.iter().map(|b| b.index).collect(),
+        positive_counts: h.positive.iter().map(|b| b.count).collect(),
+        negative_indexes: h.negative.iter().map(|b| b.index).collect(),
+        negative_counts: h.negative.iter().map(|b| b.count).collect(),
+        custom_values: h.custom_values.to_vec(),
+    }
+}
+
+fn from_proto_histogram(sample: ProtoHistogram) -> Result<HistogramSample, String> {
+    let buckets = |indexes: Vec<i32>, counts: Vec<f64>| {
+        if indexes.len() != counts.len() {
+            return Err("histogram bucket indexes and counts differ in length".to_string());
+        }
+        Ok(indexes
+            .into_iter()
+            .zip(counts)
+            .map(|(index, count)| Bucket { index, count })
+            .collect())
+    };
+    let counter_reset_hint = match ProtoResetHint::try_from(sample.counter_reset_hint)
+        .unwrap_or(ProtoResetHint::Unknown)
+    {
+        ProtoResetHint::Unknown => CounterResetHint::Unknown,
+        ProtoResetHint::Reset => CounterResetHint::CounterReset,
+        ProtoResetHint::NotReset => CounterResetHint::NotCounterReset,
+        ProtoResetHint::Gauge => CounterResetHint::Gauge,
+    };
+    let histogram = FloatHistogram {
+        counter_reset_hint,
+        schema: sample.schema,
+        zero_threshold: sample.zero_threshold,
+        zero_count: sample.zero_count,
+        count: sample.count,
+        sum: sample.sum,
+        positive: buckets(sample.positive_indexes, sample.positive_counts)?,
+        negative: buckets(sample.negative_indexes, sample.negative_counts)?,
+        custom_values: sample.custom_values.into(),
+    };
+    histogram.validate()?;
+    Ok(HistogramSample::new(sample.timestamp_ms, histogram))
+}
+
+fn from_proto_series(series: ProtoSeries) -> Result<Series, String> {
+    Ok(Series {
         labels: series
             .labels
             .into_iter()
@@ -74,7 +142,12 @@ fn from_proto_series(series: ProtoSeries) -> Series {
             .into_iter()
             .map(|sample| Sample::new(sample.timestamp_ms, sample.value))
             .collect(),
-    }
+        histograms: series
+            .histograms
+            .into_iter()
+            .map(from_proto_histogram)
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 #[tonic::async_trait]
@@ -114,20 +187,20 @@ impl InternalWriter for AppState {
         let mut series = Vec::with_capacity(request.series.len());
         let mut samples = 0;
         for item in request.series {
-            let item = from_proto_series(item);
-            if item.samples.iter().any(|sample| {
-                route(
-                    &assignment,
-                    &meter_namespace,
-                    &item.labels,
-                    sample.timestamp_ms,
-                ) != shard
+            let item = from_proto_series(item).map_err(Status::invalid_argument)?;
+            let mut timestamps = item
+                .samples
+                .iter()
+                .map(|sample| sample.timestamp_ms)
+                .chain(item.histograms.iter().map(|sample| sample.timestamp_ms));
+            if timestamps.any(|timestamp_ms| {
+                route(&assignment, &meter_namespace, &item.labels, timestamp_ms) != shard
             }) {
                 return Err(Status::invalid_argument(
                     "misrouted_series: series does not route to requested shard",
                 ));
             }
-            samples += item.samples.len();
+            samples += item.samples.len() + item.histograms.len();
             series.push(item);
         }
         let accepted_series = series.len() as u64;

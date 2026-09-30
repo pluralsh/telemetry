@@ -212,6 +212,63 @@ fn should_count_series_per_value_per_step() {
     assert_eq!(b.get(1, c8), Some(1.0));
 }
 
+/// Yields `Pending` before every batch, as a storage-backed child does
+/// while waiting on I/O.
+struct PendingBetweenBatches {
+    inner: MockOp,
+    pending_next: bool,
+}
+
+impl Operator for PendingBetweenBatches {
+    fn schema(&self) -> &OperatorSchema {
+        self.inner.schema()
+    }
+    fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+        self.pending_next = !self.pending_next;
+        if self.pending_next {
+            return Poll::Pending;
+        }
+        self.inner.next(cx)
+    }
+}
+
+#[test]
+fn should_keep_counts_across_pending_child() {
+    // given: two series-tiled batches with a Pending before each
+    let in_schema = mk_input_schema(2);
+    let grid = mk_grid(1);
+    let mut first = mk_batch(in_schema.clone(), 1, 1, vec![6.0], vec![true]);
+    first.series_range = 0..1;
+    let mut second = mk_batch(in_schema.clone(), 1, 1, vec![6.0], vec![true]);
+    second.series_range = 1..2;
+    let child = PendingBetweenBatches {
+        inner: MockOp::new(in_schema, grid, vec![first, second]),
+        pending_next: false,
+    };
+    let mut op = CountValuesOp::new(
+        child,
+        "version",
+        None,
+        Arc::from(vec![Labels::empty()].into_boxed_slice()),
+        MemoryReservation::new(1 << 20),
+    );
+
+    // when
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let out = loop {
+        match op.next(&mut cx) {
+            Poll::Pending => continue,
+            Poll::Ready(Some(r)) => break r.unwrap(),
+            Poll::Ready(None) => panic!("expected one batch"),
+        }
+    };
+
+    // then: both inputs are counted
+    assert_eq!(out.series_count(), 1);
+    assert_eq!(out.get(0, 0), Some(2.0));
+}
+
 #[test]
 fn should_respect_by_grouping() {
     // given: 4 inputs split into two groups.

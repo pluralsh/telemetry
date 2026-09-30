@@ -601,11 +601,35 @@ fn should_set_histogram_series_metric_type_to_counter() {
     }
 }
 
-#[test]
-fn should_convert_exponential_histogram_to_explicit_buckets() {
-    // Exponential histogram with scale=0: base = 2^(2^0) = 2
-    // Positive buckets: offset=0, counts=[1, 2, 3]
-    // Boundaries: [2^0, 2^1, 2^2] = [1, 2, 4]
+fn exp_point(
+    scale: i32,
+    zero_count: u64,
+    positive: Option<Buckets>,
+    negative: Option<Buckets>,
+) -> ExponentialHistogramDataPoint {
+    let side_total = |side: &Option<Buckets>| {
+        side.as_ref()
+            .map_or(0, |b| b.bucket_counts.iter().sum::<u64>())
+    };
+    ExponentialHistogramDataPoint {
+        attributes: vec![],
+        start_time_unix_nano: 0,
+        time_unix_nano: ts_nanos(1000),
+        count: zero_count + side_total(&positive) + side_total(&negative),
+        sum: Some(15.0),
+        scale,
+        zero_count,
+        positive,
+        negative,
+        flags: 0,
+        exemplars: vec![],
+        min: None,
+        max: None,
+        zero_threshold: 1e-9,
+    }
+}
+
+fn convert_exp_points(points: Vec<ExponentialHistogramDataPoint>, temporality: i32) -> Vec<Series> {
     let request = make_request(vec![make_resource_metrics(
         vec![],
         vec![make_scope_metrics(
@@ -613,176 +637,118 @@ fn should_convert_exponential_histogram_to_explicit_buckets() {
             "1.0",
             vec![make_exp_histogram(
                 "request_latency",
+                "s",
                 "",
-                "",
-                vec![ExponentialHistogramDataPoint {
-                    attributes: vec![],
-                    start_time_unix_nano: 0,
-                    time_unix_nano: ts_nanos(1000),
-                    count: 6,
-                    sum: Some(15.0),
-                    scale: 0,
-                    zero_count: 0,
-                    positive: Some(Buckets {
-                        offset: 0,
-                        bucket_counts: vec![1, 2, 3],
-                    }),
-                    negative: None,
-                    flags: 0,
-                    exemplars: vec![],
-                    min: None,
-                    max: None,
-                    zero_threshold: 0.0,
-                }],
-                AggregationTemporality::Cumulative as i32,
+                points,
+                temporality,
             )],
         )],
     )]);
+    build_default(&request)
+}
 
-    let series = build_default(&request);
-
-    // Should decompose into _bucket, _sum, _count just like a regular histogram.
-    let buckets = find_series(&series, "_bucket");
-    assert!(!buckets.is_empty(), "should produce _bucket series");
-
-    let sums = find_series(&series, "_sum");
-    assert_eq!(sums.len(), 1);
-    assert_eq!(sums[0].samples[0].value, 15.0);
-
-    let counts = find_series(&series, "_count");
-    assert_eq!(counts.len(), 1);
-    assert_eq!(counts[0].samples[0].value, 6.0);
+fn bucket(index: i32, count: f64) -> crate::histogram::Bucket {
+    crate::histogram::Bucket { index, count }
 }
 
 #[test]
-fn should_include_zero_count_in_exp_histogram_buckets() {
-    // Exponential histogram with scale=0, zero_count=5, positive=[1, 2, 3]
-    // The zero bucket count should be included in the cumulative counts.
-    // Expected cumulative: bucket at le=2 → 5+1=6, le=4 → 6+2=8, le=8 → 8+3=11 (wait, we
-    // need to think about this more carefully)
-    //
-    // With scale=0: base = 2^(2^0) = 2
-    // Positive bucket boundaries: base^(offset+i+1) with offset=0 → [2, 4, 8]
-    // zero_count = 5 should appear in cumulative counts before positive buckets.
-    // Cumulative: le=2 → 5+1=6, le=4 → 6+2=8, le=8 → 8+3=11
-    // +Inf → dp.count = 11
-    let request = make_request(vec![make_resource_metrics(
-        vec![],
-        vec![make_scope_metrics(
-            "test",
-            "1.0",
-            vec![make_exp_histogram(
-                "request_size",
-                "",
-                "",
-                vec![ExponentialHistogramDataPoint {
-                    attributes: vec![],
-                    start_time_unix_nano: 0,
-                    time_unix_nano: ts_nanos(1000),
-                    count: 11,
-                    sum: Some(30.0),
-                    scale: 0,
-                    zero_count: 5,
-                    positive: Some(Buckets {
-                        offset: 0,
-                        bucket_counts: vec![1, 2, 3],
-                    }),
-                    negative: None,
-                    flags: 0,
-                    exemplars: vec![],
-                    min: None,
-                    max: None,
-                    zero_threshold: 0.0,
-                }],
-                AggregationTemporality::Cumulative as i32,
-            )],
-        )],
-    )]);
+fn should_convert_exponential_histogram_to_native_histogram() {
+    // given: OTLP bucket k covers (2^k, 2^(k+1)] at scale 0
+    let point = exp_point(
+        0,
+        5,
+        Some(Buckets {
+            offset: -1,
+            bucket_counts: vec![1, 0, 3],
+        }),
+        Some(Buckets {
+            offset: 2,
+            bucket_counts: vec![2],
+        }),
+    );
 
-    let series = build_default(&request);
-    let buckets = find_series(&series, "_bucket");
+    // when
+    let series = convert_exp_points(vec![point], AggregationTemporality::Cumulative as i32);
 
-    // First positive bucket should include zero_count in its cumulative.
-    let first_positive = buckets
-        .iter()
-        .find(|s| get_label(s, "le") == Some("2"))
-        .expect("should have le=2 bucket");
+    // then: one native series without classic suffixes
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].name(), "request_latency_seconds");
+    assert!(series[0].samples.is_empty());
+    let h = &series[0].histograms[0];
+    assert_eq!(h.timestamp_ms, 1000);
+    let h = &h.histogram;
+    assert_eq!(h.schema, 0);
+    assert_eq!(h.counter_reset_hint, CounterResetHint::Unknown);
     assert_eq!(
-        first_positive.samples[0].value, 6.0,
-        "first positive bucket should include zero_count (5) + bucket count (1) = 6"
+        (h.count, h.sum, h.zero_count, h.zero_threshold),
+        (11.0, 15.0, 5.0, 1e-9)
     );
-
-    // +Inf should equal dp.count
-    let inf = buckets
-        .iter()
-        .find(|s| get_label(s, "le") == Some("+Inf"))
-        .expect("should have +Inf bucket");
-    assert_eq!(inf.samples[0].value, 11.0);
+    // native bucket k covers (2^(k-1), 2^k], so indexes shift by one
+    assert_eq!(h.positive, vec![bucket(0, 1.0), bucket(2, 3.0)]);
+    assert_eq!(h.negative, vec![bucket(3, 2.0)]);
+    assert!(h.validate().is_ok());
 }
 
 #[test]
-fn should_not_emit_negative_bucket_boundaries_in_exp_histogram() {
-    // Negative buckets cannot be represented as classic Prometheus le-style buckets.
-    // They should be silently skipped (counts still appear in +Inf via dp.count).
-    let request = make_request(vec![make_resource_metrics(
-        vec![],
-        vec![make_scope_metrics(
-            "test",
-            "1.0",
-            vec![make_exp_histogram(
-                "temperature_delta",
-                "",
-                "",
-                vec![ExponentialHistogramDataPoint {
-                    attributes: vec![],
-                    start_time_unix_nano: 0,
-                    time_unix_nano: ts_nanos(1000),
-                    count: 10,
-                    sum: Some(-5.0),
-                    scale: 0,
-                    zero_count: 4,
-                    positive: Some(Buckets {
-                        offset: 0,
-                        bucket_counts: vec![1],
-                    }),
-                    negative: Some(Buckets {
-                        offset: 0,
-                        bucket_counts: vec![2, 3],
-                    }),
-                    flags: 0,
-                    exemplars: vec![],
-                    min: None,
-                    max: None,
-                    zero_threshold: 0.0,
-                }],
-                AggregationTemporality::Cumulative as i32,
-            )],
-        )],
-    )]);
+fn should_default_unset_exponential_zero_threshold_like_prometheus() {
+    // given: OTLP leaves zero_threshold at 0 unless the SDK sets it
+    let mut point = exp_point(0, 2, None, None);
+    point.zero_threshold = 0.0;
 
-    let series = build_default(&request);
-    let buckets = find_series(&series, "_bucket");
+    // when
+    let series = convert_exp_points(vec![point], AggregationTemporality::Cumulative as i32);
 
-    // No negative le values should be emitted.
-    let negative_buckets: Vec<_> = buckets
-        .iter()
-        .filter(|s| {
-            get_label(s, "le")
-                .and_then(|v| v.parse::<f64>().ok())
-                .is_some_and(|v| v < 0.0)
-        })
-        .collect();
-    assert!(
-        negative_buckets.is_empty(),
-        "should not produce buckets with negative le values"
+    // then: the upstream translator's default is used
+    assert_eq!(series[0].histograms[0].histogram.zero_threshold, 1e-128);
+}
+
+#[test]
+fn should_downscale_exponential_histogram_above_max_schema() {
+    // given: scale 10 is two steps finer than schema 8, so four OTLP
+    // buckets merge into each native bucket
+    let point = exp_point(
+        10,
+        0,
+        Some(Buckets {
+            offset: 0,
+            bucket_counts: vec![1, 1, 1, 1, 1],
+        }),
+        None,
     );
 
-    // +Inf still reflects total dp.count (including negative observations).
-    let inf = buckets
-        .iter()
-        .find(|s| get_label(s, "le") == Some("+Inf"))
-        .expect("should have +Inf bucket");
-    assert_eq!(inf.samples[0].value, 10.0);
+    // when
+    let series = convert_exp_points(vec![point], AggregationTemporality::Cumulative as i32);
+
+    // then
+    let h = &series[0].histograms[0].histogram;
+    assert_eq!(h.schema, 8);
+    assert_eq!(h.positive, vec![bucket(1, 4.0), bucket(2, 1.0)]);
+}
+
+#[test]
+fn should_drop_exponential_histogram_below_min_schema() {
+    let point = exp_point(-5, 1, None, None);
+    let series = convert_exp_points(vec![point], AggregationTemporality::Cumulative as i32);
+    assert!(series.is_empty());
+}
+
+#[test]
+fn should_mark_delta_exponential_histogram_as_gauge() {
+    let point = exp_point(0, 1, None, None);
+    let series = convert_exp_points(vec![point], AggregationTemporality::Delta as i32);
+    assert_eq!(
+        series[0].histograms[0].histogram.counter_reset_hint,
+        CounterResetHint::Gauge
+    );
+}
+
+#[test]
+fn should_convert_no_recorded_value_exponential_point_to_stale_marker() {
+    let mut point = exp_point(0, 1, None, None);
+    point.flags = DataPointFlags::NoRecordedValueMask as u32;
+    let series = convert_exp_points(vec![point], AggregationTemporality::Cumulative as i32);
+    assert!(series[0].histograms.is_empty());
+    assert!(crate::model::is_stale_nan(series[0].samples[0].value));
 }
 
 #[test]

@@ -3,8 +3,10 @@ use serde::ser::{SerializeSeq, SerializeStruct, SerializeTuple};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::error::QueryError;
+use crate::histogram::FloatHistogram;
 use crate::model::{self, InstantSample, Labels, QueryValue, RangeSample};
 
 /// Convert a `QueryError` into a Prometheus-style `ErrorResponse`.
@@ -244,16 +246,123 @@ pub(crate) fn metadata_to_response(
 // ---------------------------------------------------------------------------
 
 /// Serializes an `(i64, f64)` sample as the Prometheus JSON tuple
-/// `[timestamp_secs, "value_string"]` with zero heap allocations.
+/// `[timestamp_secs, "value_string"]`.
 struct PromSample(i64, f64);
 
 impl Serialize for PromSample {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut tup = serializer.serialize_tuple(2)?;
         tup.serialize_element(&(self.0 as f64 / 1000.0))?;
-        let mut buf = ryu::Buffer::new();
-        tup.serialize_element(buf.format(self.1))?;
+        tup.serialize_element(&format_float(self.1))?;
         tup.end()
+    }
+}
+
+fn format_float(v: f64) -> String {
+    common::display::prometheus_json_float(v)
+}
+
+fn parse_float(s: &str) -> Result<f64, std::num::ParseFloatError> {
+    match s {
+        "+Inf" => Ok(f64::INFINITY),
+        "-Inf" => Ok(f64::NEG_INFINITY),
+        _ => s.parse(),
+    }
+}
+
+/// Serializes a native histogram sample as Prometheus'
+/// `[timestamp_secs, {"count", "sum", "buckets": [[rule, lower, upper, count]]}]`.
+/// Bucket rule: 0 = `(lower, upper]`, 1 = `[lower, upper)`, 2 = open,
+/// 3 = closed. Empty buckets are omitted.
+struct PromHistogramSample<'a>(i64, &'a FloatHistogram);
+
+impl Serialize for PromHistogramSample<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&(self.0 as f64 / 1000.0))?;
+        tup.serialize_element(&PromHistogram(self.1))?;
+        tup.end()
+    }
+}
+
+struct PromHistogram<'a>(&'a FloatHistogram);
+
+impl Serialize for PromHistogram<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let h = self.0;
+        let buckets: Vec<_> = h
+            .all_buckets()
+            .into_iter()
+            .filter(|b| b.count != 0.0)
+            .collect();
+        let mut s = serializer.serialize_struct("Histogram", 3)?;
+        s.serialize_field("count", &format_float(h.count))?;
+        s.serialize_field("sum", &format_float(h.sum))?;
+        if !buckets.is_empty() {
+            let custom = h.uses_custom_buckets();
+            let wire: Vec<WireBucket> = buckets
+                .iter()
+                .map(|b| {
+                    let (lower_inclusive, upper_inclusive) = if custom {
+                        (b.lower == f64::NEG_INFINITY, true)
+                    } else {
+                        (b.lower <= 0.0, b.upper >= 0.0)
+                    };
+                    let rule = match (lower_inclusive, upper_inclusive) {
+                        (false, true) => 0,
+                        (true, false) => 1,
+                        (false, false) => 2,
+                        (true, true) => 3,
+                    };
+                    WireBucket(rule, b.lower, b.upper, b.count)
+                })
+                .collect();
+            s.serialize_field("buckets", &wire)?;
+        }
+        s.end()
+    }
+}
+
+struct WireBucket(u8, f64, f64, f64);
+
+impl Serialize for WireBucket {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tup = serializer.serialize_tuple(4)?;
+        tup.serialize_element(&self.0)?;
+        tup.serialize_element(&format_float(self.1))?;
+        tup.serialize_element(&format_float(self.2))?;
+        tup.serialize_element(&format_float(self.3))?;
+        tup.end()
+    }
+}
+
+struct PromHistogramSamples<'a>(&'a [(i64, Arc<FloatHistogram>)]);
+
+impl Serialize for PromHistogramSamples<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for (ts_ms, h) in self.0 {
+            seq.serialize_element(&PromHistogramSample(*ts_ms, h))?;
+        }
+        seq.end()
+    }
+}
+
+/// Wire shape of a histogram sample, for deserializing responses. Buckets
+/// are not reconstructed: the round trip keeps only `count` and `sum`.
+#[derive(Deserialize)]
+struct WireHistogram {
+    count: String,
+    sum: String,
+}
+
+impl WireHistogram {
+    fn into_histogram<E: de::Error>(self) -> Result<FloatHistogram, E> {
+        Ok(FloatHistogram {
+            count: parse_float(&self.count).map_err(E::custom)?,
+            sum: parse_float(&self.sum).map_err(E::custom)?,
+            ..FloatHistogram::default()
+        })
     }
 }
 
@@ -415,12 +524,15 @@ impl<'de> Deserialize<'de> for QueryResultValue {
                 let val_str = arr[1]
                     .as_str()
                     .ok_or_else(|| de::Error::custom("expected string"))?;
-                let value: f64 = val_str.parse().map_err(de::Error::custom)?;
+                let value: f64 = parse_float(val_str).map_err(de::Error::custom)?;
                 Ok(QueryResultValue::Scalar(
                     (ts_secs * 1000.0).round() as i64,
                     value,
                 ))
-            } else if arr.first().and_then(|v| v.get("values")).is_some() {
+            } else if arr
+                .first()
+                .is_some_and(|v| v.get("values").is_some() || v.get("histograms").is_some())
+            {
                 // Matrix: array of objects with "values" key
                 let m: Vec<MatrixSeries> =
                     serde_json::from_value(raw).map_err(de::Error::custom)?;
@@ -473,9 +585,16 @@ pub struct MatrixSeries(pub RangeSample);
 
 impl Serialize for MatrixSeries {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("MatrixSeries", 2)?;
-        s.serialize_field("metric", &self.0.labels)?;
-        s.serialize_field("values", &PromSamples(&self.0.samples))?;
+        let series = &self.0;
+        let mut s = serializer.serialize_struct("MatrixSeries", 3)?;
+        s.serialize_field("metric", &series.labels)?;
+        // Prometheus omits `values` for histogram-only series.
+        if !series.samples.is_empty() || series.histograms.is_empty() {
+            s.serialize_field("values", &PromSamples(&series.samples))?;
+        }
+        if !series.histograms.is_empty() {
+            s.serialize_field("histograms", &PromHistogramSamples(&series.histograms))?;
+        }
         s.end()
     }
 }
@@ -485,20 +604,34 @@ impl<'de> Deserialize<'de> for MatrixSeries {
         #[derive(Deserialize)]
         struct Repr {
             metric: Labels,
+            #[serde(default)]
             values: Vec<(f64, String)>,
+            #[serde(default)]
+            histograms: Vec<(f64, WireHistogram)>,
         }
         let repr = Repr::deserialize(deserializer)?;
         let samples = repr
             .values
             .into_iter()
             .map(|(ts_secs, val_str)| {
-                let value: f64 = val_str.parse().unwrap_or(f64::NAN);
+                let value: f64 = parse_float(&val_str).unwrap_or(f64::NAN);
                 ((ts_secs * 1000.0).round() as i64, value)
             })
             .collect();
+        let histograms = repr
+            .histograms
+            .into_iter()
+            .map(|(ts_secs, h)| {
+                Ok((
+                    (ts_secs * 1000.0).round() as i64,
+                    Arc::new(h.into_histogram::<D::Error>()?),
+                ))
+            })
+            .collect::<Result<_, D::Error>>()?;
         Ok(MatrixSeries(RangeSample {
             labels: repr.metric,
             samples,
+            histograms,
         }))
     }
 }
@@ -516,7 +649,12 @@ impl Serialize for VectorSeries {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut s = serializer.serialize_struct("VectorSeries", 2)?;
         s.serialize_field("metric", &self.0.labels)?;
-        s.serialize_field("value", &PromSample(self.0.timestamp_ms, self.0.value))?;
+        match &self.0.histogram {
+            Some(h) => {
+                s.serialize_field("histogram", &PromHistogramSample(self.0.timestamp_ms, h))?
+            }
+            None => s.serialize_field("value", &PromSample(self.0.timestamp_ms, self.0.value))?,
+        }
         s.end()
     }
 }
@@ -535,11 +673,13 @@ impl<'de> Deserialize<'de> for VectorSeries {
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut metric: Option<Labels> = None;
                 let mut value: Option<(f64, String)> = None;
+                let mut histogram: Option<(f64, WireHistogram)> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "metric" => metric = Some(map.next_value()?),
                         "value" => value = Some(map.next_value()?),
+                        "histogram" => histogram = Some(map.next_value()?),
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
                         }
@@ -547,13 +687,22 @@ impl<'de> Deserialize<'de> for VectorSeries {
                 }
 
                 let metric = metric.ok_or_else(|| de::Error::missing_field("metric"))?;
+                if let Some((ts_secs, h)) = histogram {
+                    return Ok(VectorSeries(InstantSample {
+                        labels: metric,
+                        timestamp_ms: (ts_secs * 1000.0).round() as i64,
+                        value: f64::NAN,
+                        histogram: Some(Arc::new(h.into_histogram()?)),
+                    }));
+                }
                 let (ts_secs, val_str) = value.ok_or_else(|| de::Error::missing_field("value"))?;
-                let val: f64 = val_str.parse().map_err(de::Error::custom)?;
+                let val: f64 = parse_float(&val_str).map_err(de::Error::custom)?;
 
                 Ok(VectorSeries(InstantSample {
                     labels: metric,
                     timestamp_ms: (ts_secs * 1000.0).round() as i64,
                     value: val,
+                    histogram: None,
                 }))
             }
         }

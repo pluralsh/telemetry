@@ -136,7 +136,7 @@ impl IndexCache {
 mod tests {
     use super::*;
     use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
-    use crate::model::{MetricType, Sample};
+    use crate::model::MetricType;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -217,8 +217,8 @@ mod tests {
             _metric_name: &str,
             _start_ms: i64,
             _end_ms: i64,
-        ) -> Result<Vec<Sample>> {
-            Ok(vec![])
+        ) -> Result<crate::model::SeriesData> {
+            Ok(Default::default())
         }
 
         async fn forward_index_one(
@@ -312,8 +312,8 @@ mod tests {
             _metric_name: &str,
             _start_ms: i64,
             _end_ms: i64,
-        ) -> Result<Vec<Sample>> {
-            Ok(vec![])
+        ) -> Result<crate::model::SeriesData> {
+            Ok(Default::default())
         }
 
         async fn forward_index_one(

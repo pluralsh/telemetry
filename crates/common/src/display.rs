@@ -72,6 +72,25 @@ pub fn prometheus_float(value: f64) -> String {
     }
 }
 
+/// Formats a sample value the way Prometheus' JSON API does
+/// (`jsonutil.MarshalFloat`): like [`prometheus_float`], except magnitudes below
+/// `1e-6` or at least `1e21` use Go's exponent form (`1e-07`, `1.5e+21`).
+pub fn prometheus_json_float(value: f64) -> String {
+    let abs = value.abs();
+    if !value.is_finite() || abs == 0.0 || (1e-6..1e21).contains(&abs) {
+        return prometheus_float(value);
+    }
+    let formatted = format!("{value:e}");
+    let (mantissa, exponent) = formatted
+        .split_once('e')
+        .expect("LowerExp output contains an exponent");
+    let (sign, digits) = match exponent.strip_prefix('-') {
+        Some(digits) => ('-', digits),
+        None => ('+', exponent),
+    };
+    format!("{mantissa}e{sign}{digits:0>2}")
+}
+
 /// Rewrites `name` into a valid Prometheus label name: every character outside
 /// `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed with `_`.
 pub fn sanitize_label_name(name: &str) -> String {
@@ -155,6 +174,19 @@ mod tests {
         assert_eq!(prometheus_float(f64::NAN), "NaN");
         assert_eq!(prometheus_float(f64::INFINITY), "+Inf");
         assert_eq!(prometheus_float(f64::NEG_INFINITY), "-Inf");
+    }
+
+    #[test]
+    fn should_format_prometheus_json_floats_like_marshal_float() {
+        assert_eq!(prometheus_json_float(4.0), "4");
+        assert_eq!(prometheus_json_float(0.000_001), "0.000001");
+        assert_eq!(prometheus_json_float(1e-7), "1e-07");
+        assert_eq!(prometheus_json_float(-1e-128), "-1e-128");
+        assert_eq!(prometheus_json_float(1.5e21), "1.5e+21");
+        assert_eq!(prometheus_json_float(1e20), "100000000000000000000");
+        assert_eq!(prometheus_json_float(0.0), "0");
+        assert_eq!(prometheus_json_float(f64::NAN), "NaN");
+        assert_eq!(prometheus_json_float(f64::NEG_INFINITY), "-Inf");
     }
 
     #[test]

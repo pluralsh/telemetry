@@ -91,7 +91,11 @@ impl TsdbFlusher {
         }
 
         let new_series_count = frozen.series_dict_delta.len() as u64;
-        let sample_count: u64 = frozen.samples.values().map(|s| s.points.len() as u64).sum();
+        let sample_count: u64 = frozen
+            .samples
+            .values()
+            .map(crate::delta::SeriesSamples::len)
+            .sum::<usize>() as u64;
         let start = std::time::Instant::now();
         let ttl = bucket_ttl(frozen.bucket, self.retention);
 
@@ -178,6 +182,7 @@ impl TsdbFlusher {
                     series_id,
                     &series_samples.metric_name,
                     series_samples.points,
+                    series_samples.histograms,
                     ttl,
                 )?,
             );

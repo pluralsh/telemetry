@@ -6,6 +6,8 @@ from harness.meter.normalize import result_len
 from harness.meter.suite import (
     DISCOVERY_QUERIES,
     INSTANT_QUERIES,
+    NATIVE_INSTANT_QUERIES,
+    NATIVE_RANGE_QUERIES,
     RANGE_QUERIES,
     AuthCase,
     MeterSuite,
@@ -35,7 +37,7 @@ def meter() -> MeterSuite:
     )
     with project:
         # Readers require every writer-created shard manifest to exist.
-        project.execute("up", "--detach", "--build", "meter-reader", timeout=900)
+        project.up("meter-reader")
         wait_http("http://localhost:18082/-/ready")
         suite = MeterSuite.from_env()
         suite.seed()
@@ -77,6 +79,36 @@ def test_instant_promql_matches_prometheus(
     ids=lambda value: value if isinstance(value, str) else None,
 )
 def test_range_promql_matches_prometheus(
+    meter: MeterSuite,
+    name: str,
+    expression: str,
+    ignored_labels: tuple[str, ...],
+) -> None:
+    meter.compare_range(name, expression, ignored_labels)
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    ("name", "expression", "ignored_labels"),
+    NATIVE_INSTANT_QUERIES,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_native_histogram_instant_matches_prometheus(
+    meter: MeterSuite,
+    name: str,
+    expression: str,
+    ignored_labels: tuple[str, ...],
+) -> None:
+    meter.compare_instant(name, expression, ignored_labels)
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    ("name", "expression", "ignored_labels"),
+    NATIVE_RANGE_QUERIES,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_native_histogram_range_matches_prometheus(
     meter: MeterSuite,
     name: str,
     expression: str,

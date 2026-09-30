@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .process import CommandFailed, run, wait_http
+
+
+def build_images_default() -> bool:
+    """CI prebuilds product images with a layer cache and sets
+    `REGRESSION_BUILD=0` so Compose reuses them instead of rebuilding."""
+    return os.getenv("REGRESSION_BUILD", "1") != "0"
 
 
 def docker_available() -> tuple[bool, str]:
@@ -27,6 +34,7 @@ class ComposeProject:
     readiness_urls: tuple[str, ...] = ()
     services: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ()
+    build: bool = field(default_factory=build_images_default)
     _started: bool = field(default=False, init=False)
 
     @property
@@ -46,13 +54,15 @@ class ComposeProject:
     def execute(self, *args: str, timeout: float | None = None) -> str:
         return run((*self.command, *args), cwd=self.file.parent, timeout=timeout).stdout
 
-    def start(self, *, build: bool = True) -> None:
+    def up(self, *services: str) -> None:
         args = ["up", "--detach", "--remove-orphans"]
-        if build:
+        if self.build:
             args.append("--build")
-        args.extend(self.services)
+        self.execute(*args, *services, timeout=900)
+
+    def start(self) -> None:
         try:
-            self.execute(*args, timeout=900)
+            self.up(*self.services)
             self._started = True
             for url in self.readiness_urls:
                 wait_http(url)

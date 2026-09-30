@@ -188,23 +188,7 @@ fn execution_error_to_query_error(e: crate::promql::memory::QueryError) -> Query
 pub(crate) fn query_value_to_range_samples(
     value: QueryValue,
 ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-    match value {
-        QueryValue::Matrix(series) => Ok(series),
-        QueryValue::Scalar {
-            timestamp_ms,
-            value,
-        } => Ok(vec![RangeSample {
-            labels: Labels::empty(),
-            samples: vec![(timestamp_ms, value)],
-        }]),
-        QueryValue::Vector(samples) => Ok(samples
-            .into_iter()
-            .map(|s| RangeSample {
-                labels: s.labels,
-                samples: vec![(s.timestamp_ms, s.value)],
-            })
-            .collect()),
-    }
+    Ok(value.into_matrix())
 }
 
 /// Parse multiple match[] selector strings into VectorSelectors.

@@ -1,0 +1,44 @@
+# Meter-specific native histogram cases not covered by the upstream port.
+
+# A native histogram and classic buckets sharing a name and labelset
+# suppress each other; unrelated classic and native groups both evaluate.
+load 5m
+	mixed{job="a", le="1"}    1
+	mixed{job="a", le="+Inf"} 2
+	mixed{job="a"}            {{schema:0 count:2 sum:1 buckets:[2]}}
+	mixed{job="b"}            {{schema:0 count:4 sum:5 buckets:[1 2 1]}}
+	mixed{job="c", le="1"}    1
+	mixed{job="c", le="+Inf"} 2
+
+eval instant at 1m histogram_quantile(0.5, mixed)
+	{job="b"} 1.414213562373095
+	{job="c"} 1
+
+eval instant at 1m histogram_fraction(0, 2, mixed)
+	{job="b"} 0.75
+	{job="c"} 0.5
+
+# Histogram inspection functions ignore float samples.
+eval instant at 1m histogram_count(mixed)
+	{job="a"} 2
+	{job="b"} 4
+
+eval instant at 1m histogram_avg(mixed{job="b"})
+	{job="b"} 1.25
+
+clear
+
+# Float and histogram samples in one series: the newest sample wins.
+load 5m
+	switching 1 2 {{schema:0 count:3 sum:3 buckets:[3]}} 4
+
+eval instant at 10m switching
+	{__name__="switching"} {{schema:0 count:3 sum:3 buckets:[3]}}
+
+eval instant at 15m switching
+	{__name__="switching"} 4
+
+eval instant at 10m histogram_sum(switching)
+	{} 3
+
+eval instant at 15m histogram_sum(switching)

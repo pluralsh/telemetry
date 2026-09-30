@@ -11,6 +11,7 @@ mod delta;
 mod discovery;
 pub(crate) mod error;
 mod flusher;
+pub mod histogram;
 mod index;
 mod minitsdb;
 pub(crate) mod model;
@@ -38,12 +39,16 @@ pub mod testing;
 pub use common::namespace::{Namespace, NamespaceError};
 pub use config::Config;
 pub use error::{Error, QueryError, Result};
+pub use histogram::{Bucket, CounterResetHint, FloatHistogram};
 pub use model::{
-    InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
-    RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
+    HistogramSample, InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions,
+    QueryValue, RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
 };
 #[cfg(feature = "otel")]
 pub use otel::{OtelConfig, OtelConverter};
+pub use promql::response::{
+    QueryRangeResponse, QueryResponse, query_value_to_response, range_result_to_response,
+};
 pub use reader::TimeSeriesDbReader;
 pub use sharded::{MeterShard, ShardedMeter, ShardedTimeseries};
 pub use sharding::ShardingOptions;

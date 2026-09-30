@@ -78,6 +78,8 @@ pub(super) struct BufferedSide {
     total_series: usize,
     values: Vec<f64>,
     validity: BitSet,
+    /// Allocated on the first absorbed batch carrying histograms.
+    histograms: Option<HistogramCells>,
     pub(super) step_timestamps: Arc<[i64]>,
 }
 
@@ -98,6 +100,7 @@ impl BufferedSide {
             total_series,
             values: vec![f64::NAN; cells],
             validity: BitSet::with_len(cells),
+            histograms: None,
             step_timestamps,
         })
     }
@@ -129,6 +132,43 @@ impl BufferedSide {
                 self.validity.set(out_cell);
             }
         }
+        let Some(cells) = &batch.histograms else {
+            return;
+        };
+        let total = self.step_count * self.total_series;
+        let out = self.histograms.get_or_insert_with(|| vec![None; total]);
+        for step_off in 0..step_count_in {
+            let global_step = batch.step_range.start + step_off;
+            if global_step >= self.step_count {
+                continue;
+            }
+            for s in 0..series_count_in {
+                let global_series = batch.series_range.start + s;
+                if global_series >= self.total_series {
+                    continue;
+                }
+                if let Some(h) = &cells[step_off * series_count_in + s] {
+                    out[global_step * self.total_series + global_series] = Some(h.clone());
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn has_histograms(&self) -> bool {
+        self.histograms.is_some()
+    }
+
+    #[inline]
+    pub(super) fn get_histogram(
+        &self,
+        step: usize,
+        global_series: usize,
+    ) -> Option<&Arc<FloatHistogram>> {
+        if step >= self.step_count || global_series >= self.total_series {
+            return None;
+        }
+        self.histograms.as_ref()?[step * self.total_series + global_series].as_ref()
     }
 
     /// Fetch `(step, global_series)` as `Option<f64>`: `Some(v)` iff the

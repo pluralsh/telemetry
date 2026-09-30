@@ -21,8 +21,7 @@ use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::MiniQueryReader;
 use crate::model::{
-    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, SeriesId,
-    TimeBucket,
+    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, SeriesId, TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::{StorageRead, StorageReader};
@@ -102,7 +101,7 @@ impl QueryReader for ReaderQueryReader {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<crate::model::SeriesData> {
         let mini = self.mini_readers.get(bucket).ok_or_else(|| {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;

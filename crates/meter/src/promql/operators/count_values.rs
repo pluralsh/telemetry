@@ -177,11 +177,23 @@ pub struct CountValuesOp<C: Operator> {
     /// and the `(group, value)` roster has been computed. Exposed via
     /// [`Self::finalized_schema`] after draining.
     finalized: Option<Arc<SeriesSchema>>,
+    /// Counts accumulated from child batches seen so far. Lives on the
+    /// operator so a `Pending` child mid-drain doesn't lose progress.
+    counts: CountState,
     /// Bytes reserved for the intermediate buckets + finalised schema;
     /// released on `Drop`.
     scratch_bytes: usize,
     done: bool,
     errored: bool,
+}
+
+#[derive(Default)]
+struct CountState {
+    buckets: HashMap<BucketKey, BucketCounts>,
+    /// Insertion order of bucket keys: stable emission order, matching the
+    /// engine's "first-seen wins" semantics elsewhere.
+    order: Vec<BucketKey>,
+    step_timestamps: Option<Arc<[i64]>>,
 }
 
 impl<C: Operator> CountValuesOp<C> {
@@ -223,6 +235,7 @@ impl<C: Operator> CountValuesOp<C> {
             reservation,
             schema: OperatorSchema::new(SchemaRef::Deferred, step_grid),
             finalized: None,
+            counts: CountState::default(),
             scratch_bytes: 0,
             done: false,
             errored: false,
@@ -239,26 +252,25 @@ impl<C: Operator> CountValuesOp<C> {
         self.finalized.as_ref()
     }
 
-    /// Drain the child synchronously under the supplied context. Returns
-    /// `Ok(Some(batches))` on full drain, `Ok(None)` on pending, or
-    /// `Err` on upstream error.
-    #[allow(clippy::type_complexity)]
-    fn drain_child(&mut self, cx: &mut Context<'_>) -> Result<Option<Vec<StepBatch>>, QueryError> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(Some(Vec::new()));
-        };
-        let mut batches = Vec::new();
-        loop {
+    /// Drains the child under the supplied context, counting each batch as
+    /// it arrives. Returns `Ok(true)` once the child is exhausted and
+    /// `Ok(false)` on pending.
+    fn drain_child(&mut self, cx: &mut Context<'_>) -> Result<bool, QueryError> {
+        let step_count = self.schema.step_grid.step_count;
+        while let Some(child) = self.child.as_mut() {
             match child.next(cx) {
-                Poll::Pending => return Ok(None),
-                Poll::Ready(None) => {
-                    self.child = None;
-                    return Ok(Some(batches));
-                }
+                Poll::Pending => return Ok(false),
+                Poll::Ready(None) => self.child = None,
                 Poll::Ready(Some(Err(err))) => return Err(err),
-                Poll::Ready(Some(Ok(batch))) => batches.push(batch),
+                Poll::Ready(Some(Ok(batch))) => {
+                    let mut counts = std::mem::take(&mut self.counts);
+                    let counted = self.count_batch(&batch, step_count, &mut counts);
+                    self.counts = counts;
+                    counted?;
+                }
             }
         }
+        Ok(true)
     }
 
     /// Adds one occurrence per valid cell of `batch` to its
@@ -267,9 +279,16 @@ impl<C: Operator> CountValuesOp<C> {
         &mut self,
         batch: &StepBatch,
         step_count: usize,
-        buckets: &mut HashMap<BucketKey, BucketCounts>,
-        bucket_order: &mut Vec<BucketKey>,
+        counts: &mut CountState,
     ) -> Result<(), QueryError> {
+        counts
+            .step_timestamps
+            .get_or_insert_with(|| batch.step_timestamps.clone());
+        let CountState {
+            buckets,
+            order: bucket_order,
+            ..
+        } = counts;
         let in_series_count = batch.series_count();
         for step_off in 0..batch.step_count() {
             let global_step = batch.step_range.start + step_off;
@@ -334,31 +353,21 @@ impl<C: Operator> CountValuesOp<C> {
         }
     }
 
-    /// After the child has been fully drained, build the counts table,
-    /// finalise the schema, and emit the full-grid `StepBatch`.
-    fn finalise(&mut self, batches: Vec<StepBatch>) -> Result<StepBatch, QueryError> {
+    /// After the child has been fully drained, finalise the schema from the
+    /// accumulated counts and emit the full-grid `StepBatch`.
+    fn finalise(&mut self) -> Result<StepBatch, QueryError> {
         let step_count = self.schema.step_grid.step_count;
+        let CountState {
+            buckets,
+            order: bucket_order,
+            step_timestamps,
+        } = std::mem::take(&mut self.counts);
 
-        // The query grid's `step_timestamps: Arc<[i64]>`. Shared by every
-        // input batch; take the first one and reuse it. If the child
-        // produced no batches we synthesise a fresh `Arc<[i64]>` sized to
-        // the grid — output is an empty-roster batch (no series), which
-        // the downstream treats as "no series emitted".
-        let step_timestamps: Arc<[i64]> = batches
-            .first()
-            .map(|b| b.step_timestamps.clone())
-            .unwrap_or_else(|| Arc::from(vec![0i64; step_count].into_boxed_slice()));
-
-        // Bucket every `(group, value_bits)` occurrence per step.
-        let mut buckets: HashMap<BucketKey, BucketCounts> = HashMap::new();
-        // Stable emission order: insertion order of bucket keys. Keeps
-        // tests deterministic and matches "first-seen wins" semantics
-        // found elsewhere in the engine.
-        let mut bucket_order: Vec<BucketKey> = Vec::new();
-
-        for batch in &batches {
-            self.count_batch(batch, step_count, &mut buckets, &mut bucket_order)?;
-        }
+        // Every input batch shares the grid's timestamps. With no input
+        // batches the output has no series, so placeholder timestamps sized
+        // to the grid suffice.
+        let step_timestamps: Arc<[i64]> =
+            step_timestamps.unwrap_or_else(|| Arc::from(vec![0i64; step_count].into_boxed_slice()));
 
         // Build the output roster in insertion order.
         let out_series_count = bucket_order.len();
@@ -453,8 +462,8 @@ impl<C: Operator> Operator for CountValuesOp<C> {
             return Poll::Ready(None);
         }
         match self.drain_child(cx) {
-            Ok(None) => Poll::Pending,
-            Ok(Some(batches)) => match self.finalise(batches) {
+            Ok(false) => Poll::Pending,
+            Ok(true) => match self.finalise() {
                 Ok(batch) => {
                     self.done = true;
                     Poll::Ready(Some(Ok(batch)))

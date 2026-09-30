@@ -15,10 +15,9 @@ use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
+use crate::model::{Label, Series, SeriesData, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
-use crate::serde::timeseries::TimeSeriesIterator;
 use crate::util::Result;
 
 /// Per-bucket query reader over any storage read handle — a
@@ -128,7 +127,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<SeriesData> {
         let storage_key = TimeSeriesKey {
             namespace: self.namespace.clone(),
             bucket: self.bucket,
@@ -149,18 +148,9 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
                 );
                 let raw_len = value.len() as u64;
                 let samples = io_trace_sync(IoKindLocal::Deserialize, || {
-                    let iter = TimeSeriesIterator::new(value.as_ref()).ok_or_else(|| {
-                        Error::Internal("Invalid timeseries data in storage".into())
-                    })?;
-                    // Stored series are sorted by timestamp (encode and merge
-                    // both guarantee it), so decoding stops past `end_ms`.
-                    // PromQL lookback windows exclude `start_ms`.
-                    let samples: Vec<Sample> = iter
-                        .map_while(|r| r.ok())
-                        .take_while(|s| s.timestamp_ms <= end_ms)
-                        .filter(|s| s.timestamp_ms > start_ms)
-                        .collect();
-                    Ok::<Vec<Sample>, Error>(samples)
+                    SeriesData::decode_range(value.as_ref(), start_ms, end_ms).map_err(|e| {
+                        Error::Internal(format!("Invalid timeseries data in storage: {e}"))
+                    })
                 })?;
                 // Deserialize's bytes are the same bytes the fetch returned —
                 // it's decoding that payload. Attribute here so both kinds
@@ -171,7 +161,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
                 );
                 Ok(samples)
             }
-            None => Ok(Vec::new()),
+            None => Ok(SeriesData::default()),
         }
     }
 }

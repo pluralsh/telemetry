@@ -30,7 +30,7 @@ use crate::tsdb::{
 };
 use crate::{
     Config, Error, Label, Labels, MetricMetadata, Namespace, QueryError, QueryValue, RangeSample,
-    Result, Sample, Series, TimeSeriesDb, TimeSeriesDbReader, Visibility,
+    Result, Series, TimeSeriesDb, TimeSeriesDbReader, Visibility,
 };
 
 const SOURCE_BUCKET_BITS: u32 = 40;
@@ -514,7 +514,7 @@ impl QueryReader for ShardQueryReader {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<crate::model::SeriesData> {
         match self {
             Self::Writer(reader) => {
                 reader
@@ -612,7 +612,7 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<crate::model::SeriesData> {
         let _permit = self.acquire().await?;
         self.inner
             .samples(bucket, series_id, metric_name, start_ms, end_ms)

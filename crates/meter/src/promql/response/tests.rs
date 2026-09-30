@@ -14,7 +14,7 @@ fn prom_sample_serializes_as_tuple() {
     let arr = parsed.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0].as_f64().unwrap(), 3900.0);
-    assert_eq!(arr[1].as_str().unwrap(), "42.0");
+    assert_eq!(arr[1].as_str().unwrap(), "42");
 }
 
 #[test]
@@ -70,6 +70,7 @@ fn query_value_vector_response() {
         ]),
         timestamp_ms: 3_900_000,
         value: 1.0,
+        histogram: None,
     }];
     let result = Ok(QueryValue::Vector(samples));
     let resp = query_value_to_response(result);
@@ -79,7 +80,7 @@ fn query_value_vector_response() {
     let json = serde_json::to_value(&resp).unwrap();
     let first = &json["data"]["result"][0];
     assert_eq!(first["value"][0].as_f64().unwrap(), 3900.0);
-    assert_eq!(first["value"][1].as_str().unwrap(), "1.0");
+    assert_eq!(first["value"][1].as_str().unwrap(), "1");
 
     let data = resp.data.unwrap();
     assert_eq!(data.result_type, "vector");
@@ -102,6 +103,7 @@ fn query_value_matrix_response() {
             Label::new("job", "api"),
         ]),
         samples: vec![(1_000_000, 10.0), (2_000_000, 20.0), (3_000_000, 30.0)],
+        histograms: Vec::new(),
     }];
     let result = Ok(QueryValue::Matrix(range_samples));
     let resp = query_value_to_response(result);
@@ -115,9 +117,9 @@ fn query_value_matrix_response() {
     let values = first["values"].as_array().unwrap();
     assert_eq!(values.len(), 3);
     assert_eq!(values[0][0].as_f64().unwrap(), 1000.0);
-    assert_eq!(values[0][1].as_str().unwrap(), "10.0");
+    assert_eq!(values[0][1].as_str().unwrap(), "10");
     assert_eq!(values[2][0].as_f64().unwrap(), 3000.0);
-    assert_eq!(values[2][1].as_str().unwrap(), "30.0");
+    assert_eq!(values[2][1].as_str().unwrap(), "30");
 
     let data = resp.data.unwrap();
     assert_eq!(data.result_type, "matrix");
@@ -156,6 +158,7 @@ fn matrix_series_roundtrip() {
     let ms = MatrixSeries(RangeSample {
         labels: Labels::new(vec![Label::metric_name("cpu")]),
         samples: vec![(1_000, 1.5), (2_000, 2.5)],
+        histograms: Vec::new(),
     });
     let json = serde_json::to_string(&ms).unwrap();
     let parsed: MatrixSeries = serde_json::from_str(&json).unwrap();
@@ -173,6 +176,7 @@ fn vector_series_roundtrip() {
         labels: Labels::new(vec![Label::metric_name("up")]),
         timestamp_ms: 3_900_000,
         value: 42.0,
+        histogram: None,
     });
     let json = serde_json::to_string(&vs).unwrap();
     let parsed: VectorSeries = serde_json::from_str(&json).unwrap();
@@ -217,6 +221,7 @@ fn matrix_roundtrip() {
             result: QueryResultValue::Matrix(vec![MatrixSeries(RangeSample {
                 labels: Labels::new(vec![Label::metric_name("cpu")]),
                 samples: vec![(1_000, 1.5), (2_000, 2.5)],
+                histograms: Vec::new(),
             })]),
         }),
         error: None,
@@ -449,6 +454,7 @@ mod proptests {
                     )]),
                     timestamp_ms: ts,
                     value: i as f64,
+                    histogram: None,
                 })
                 .collect();
             let n = samples.len();
@@ -590,4 +596,123 @@ fn error_responses_omit_data_field() {
     };
     let json = serde_json::to_value(&metadata).unwrap();
     assert!(json.get("data").is_none(), "MetadataResponse: {json}");
+}
+
+// -----------------------------------------------------------------------
+// Native histogram serialization
+// -----------------------------------------------------------------------
+
+fn sample_histogram() -> Arc<FloatHistogram> {
+    use crate::histogram::Bucket;
+    Arc::new(FloatHistogram {
+        schema: 0,
+        zero_threshold: 0.001,
+        zero_count: 1.0,
+        count: 4.0,
+        sum: 3.0,
+        positive: vec![
+            Bucket {
+                index: 1,
+                count: 2.0,
+            },
+            Bucket {
+                index: 2,
+                count: 0.0,
+            },
+        ],
+        negative: vec![Bucket {
+            index: 0,
+            count: 1.0,
+        }],
+        ..FloatHistogram::default()
+    })
+}
+
+#[test]
+fn should_serialize_vector_histogram_sample() {
+    // given
+    let vs = VectorSeries(InstantSample {
+        labels: Labels::new(vec![Label::metric_name("lat")]),
+        timestamp_ms: 2_000,
+        value: f64::NAN,
+        histogram: Some(sample_histogram()),
+    });
+    // when
+    let json = serde_json::to_value(&vs).unwrap();
+    // then: `histogram` replaces `value`; empty buckets are omitted and
+    // negative / zero / positive buckets carry rules 1 / 3 / 0
+    assert!(json.get("value").is_none(), "{json}");
+    assert_eq!(
+        json["histogram"],
+        serde_json::json!([
+            2.0,
+            {
+                "count": "4",
+                "sum": "3",
+                "buckets": [
+                    [1, "-1", "-0.5", "1"],
+                    [3, "-0.001", "0.001", "1"],
+                    [0, "1", "2", "2"],
+                ],
+            },
+        ])
+    );
+    let parsed: VectorSeries = serde_json::from_value(json).unwrap();
+    let h = parsed.0.histogram.expect("histogram round-trips");
+    assert_eq!((h.count, h.sum), (4.0, 3.0));
+}
+
+#[test]
+fn should_serialize_zero_width_zero_bucket_as_closed() {
+    // given: zero threshold 0 makes the zero bucket [-0, 0]
+    let vs = VectorSeries(InstantSample {
+        labels: Labels::new(vec![Label::metric_name("lat")]),
+        timestamp_ms: 2_000,
+        value: f64::NAN,
+        histogram: Some(Arc::new(FloatHistogram {
+            zero_count: 2.0,
+            count: 2.0,
+            ..FloatHistogram::default()
+        })),
+    });
+    // when
+    let json = serde_json::to_value(&vs).unwrap();
+    // then
+    assert_eq!(json["histogram"][1]["buckets"][0][0], 3, "{json}");
+}
+
+#[test]
+fn should_omit_values_for_histogram_only_matrix_series() {
+    // given
+    let ms = MatrixSeries(RangeSample {
+        labels: Labels::new(vec![Label::metric_name("lat")]),
+        samples: Vec::new(),
+        histograms: vec![(1_000, sample_histogram())],
+    });
+    // when
+    let json = serde_json::to_value(&ms).unwrap();
+    // then
+    assert!(json.get("values").is_none(), "{json}");
+    assert_eq!(json["histograms"][0][1]["count"], "4");
+    let parsed: QueryResultValue = serde_json::from_value(serde_json::json!([json])).unwrap();
+    match parsed {
+        QueryResultValue::Matrix(m) => assert_eq!(m[0].0.histograms.len(), 1),
+        other => panic!("expected matrix, got {other:?}"),
+    }
+}
+
+#[test]
+fn should_spell_non_finite_floats_like_prometheus() {
+    // given / when
+    let json = serde_json::to_value(PromSample(0, f64::INFINITY)).unwrap();
+    // then
+    assert_eq!(json[1], "+Inf");
+    assert_eq!(
+        serde_json::to_value(PromSample(0, f64::NEG_INFINITY)).unwrap()[1],
+        "-Inf"
+    );
+    assert_eq!(
+        serde_json::to_value(PromSample(0, f64::NAN)).unwrap()[1],
+        "NaN"
+    );
 }

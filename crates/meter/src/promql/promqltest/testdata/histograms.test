@@ -1,6 +1,7 @@
 # Classic-bucket (`_bucket` / `le`) cases ported from upstream Prometheus
-# `histograms.test`. Native-histogram loads, native-only functions and
-# range evals are dropped because meter stores no native histograms.
+# `histograms.test`. Range evals and `load_with_nhcb` cases (scrape-time
+# conversion of classic buckets to native histograms) are dropped; native
+# histogram coverage lives in `native_histograms.test`.
 
 load 5m
 	testhistogram_bucket{le="0.1", start="positive"}	0+5x10

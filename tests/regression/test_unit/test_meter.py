@@ -1,3 +1,5 @@
+import math
+
 import jwt
 import pytest
 import snappy
@@ -5,10 +7,12 @@ from harness.meter.auth import JWT_KEY_ID, JWT_SECRET, bearer
 from harness.meter.fixture import (
     assert_spans_writer_ranges,
     fixture_shard,
+    native_histogram_fixture,
     regression_fixture,
 )
 from harness.meter.normalize import (
     assert_metadata_equivalent,
+    assert_query_equivalent,
     float_close,
     normalize_query,
 )
@@ -44,12 +48,81 @@ def test_remote_write_is_snappy_protobuf() -> None:
         ]
 
 
+def test_native_histograms_encode_as_delta_spans() -> None:
+    value = native_histogram_fixture(BASE_MS)
+    decoded = decode_remote_write(remote_write_body(value))
+    assert len(decoded.timeseries) == 3
+    for expected, actual in zip(value, decoded.timeseries, strict=True):
+        assert not actual.samples
+        assert len(actual.histograms) == len(expected.histograms)
+        for source, wire in zip(expected.histograms, actual.histograms, strict=True):
+            assert wire.count_int == source.count
+            assert wire.schema == source.schema
+            assert wire.timestamp == source.timestamp_ms
+            assert [(s.offset, s.length) for s in wire.positive_spans] == [
+                (offset, len(counts)) for offset, counts in source.positive
+            ]
+            absolute = [count for _, counts in source.positive for count in counts]
+            running = 0
+            decoded_counts = []
+            for delta in wire.positive_deltas:
+                running += delta
+                decoded_counts.append(running)
+            assert decoded_counts == absolute
+            assert list(wire.custom_values) == list(source.custom_values)
+
+
+def test_native_fixture_resets_instance_b() -> None:
+    by_instance = {
+        dict(item.labels)["instance"]: item
+        for item in native_histogram_fixture(BASE_MS)
+        if dict(item.labels)["__name__"] == "regression_native_seconds"
+    }
+    counts = [histogram.count for histogram in by_instance["b"].histograms]
+    assert counts[6] < counts[5]
+    growing = [histogram.count for histogram in by_instance["a"].histograms]
+    assert growing == sorted(growing)
+
+
+def _histogram_response(buckets: list[list[object]]) -> dict[str, object]:
+    return {
+        "status": "success",
+        "data": {
+            "result": [
+                {
+                    "metric": {"__name__": "h"},
+                    "histogram": [
+                        1.0,
+                        {"count": "3", "sum": "1.5", "buckets": buckets},
+                    ],
+                }
+            ]
+        },
+    }
+
+
+def test_histogram_normalization_and_comparison() -> None:
+    expected = _histogram_response([[0, "1", "2", "3"]])
+    (value,) = normalize_query(expected)
+    assert value.values == ()
+    assert value.histograms[0][1].buckets == ((0, 1.0, 2.0, 3.0),)
+    assert_query_equivalent("same", expected, _histogram_response([[0, "1", "2", "3"]]))
+    with pytest.raises(AssertionError, match="bucket differs"):
+        assert_query_equivalent(
+            "rule", expected, _histogram_response([[3, "1", "2", "3"]])
+        )
+    with pytest.raises(AssertionError, match="buckets differ"):
+        assert_query_equivalent("missing", expected, _histogram_response([]))
+
+
 @pytest.mark.parametrize(
     ("left", "right", "expected"),
     (
         (1.0, 1.0 + 5e-10, True),
         (1.0, 1.0 + 2e-9, False),
         (0.0, 5e-13, True),
+        (math.nan, math.nan, True),
+        (math.nan, 1.0, False),
     ),
 )
 def test_float_tolerance_boundary(left: float, right: float, expected: bool) -> None:

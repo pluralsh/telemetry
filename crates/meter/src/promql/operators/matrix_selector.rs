@@ -40,6 +40,7 @@ use futures::Stream;
 use futures::stream::StreamExt;
 use promql_parser::parser::{AtModifier, Offset};
 
+use crate::histogram::FloatHistogram;
 use crate::model::is_stale_nan;
 use crate::promql::timestamp::Timestamp;
 
@@ -49,6 +50,7 @@ use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
     ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
 };
+use super::vector_selector::histogram_sample_bytes;
 
 // ---------------------------------------------------------------------------
 // Defaults & tile shape (mirrors 3a.1)
@@ -164,6 +166,19 @@ pub struct MatrixWindowBatch {
     /// actually cover `(0, 100s]`, producing a negative rate disjoint
     /// from the data.
     pub effective_times: Option<Arc<[i64]>>,
+
+    /// Native histogram samples per cell, laid out like the float columns.
+    /// `None` when no cell in the batch holds a histogram.
+    pub histograms: Option<WindowHistograms>,
+}
+
+/// Histogram counterpart of [`MatrixWindowBatch`]'s flat float columns.
+#[derive(Debug, Clone, Default)]
+pub struct WindowHistograms {
+    pub timestamps: Vec<i64>,
+    pub values: Vec<Arc<FloatHistogram>>,
+    /// Same length and layout as [`MatrixWindowBatch::cells`].
+    pub cells: Vec<CellIndex>,
 }
 
 impl MatrixWindowBatch {
@@ -199,6 +214,22 @@ impl MatrixWindowBatch {
         let idx = step_off * self.series_count() + series_off;
         let r = self.cells[idx].range();
         (&self.timestamps[r.clone()], &self.values[r])
+    }
+
+    /// Histogram samples for the `(step_off, series_off)` cell; empty when
+    /// the batch carries no histograms.
+    pub fn cell_histograms(
+        &self,
+        step_off: usize,
+        series_off: usize,
+    ) -> (&[i64], &[Arc<FloatHistogram>]) {
+        match &self.histograms {
+            Some(h) => {
+                let r = h.cells[step_off * self.series_count() + series_off].range();
+                (&h.timestamps[r.clone()], &h.values[r])
+            }
+            None => (&[], &[]),
+        }
     }
 }
 
@@ -370,16 +401,27 @@ struct ChunkSamples {
     bytes: usize,
     timestamps: Vec<Vec<i64>>,
     values: Vec<Vec<f64>>,
+    histogram_timestamps: Vec<Vec<i64>>,
+    histograms: Vec<Vec<Arc<FloatHistogram>>>,
 }
 
 impl ChunkSamples {
     fn new(reservation: MemoryReservation, chunk_len: usize) -> Self {
+        fn columns<T>(n: usize) -> Vec<Vec<T>> {
+            (0..n).map(|_| Vec::new()).collect()
+        }
         Self {
             reservation,
             bytes: 0,
-            timestamps: (0..chunk_len).map(|_| Vec::new()).collect(),
-            values: (0..chunk_len).map(|_| Vec::new()).collect(),
+            timestamps: columns(chunk_len),
+            values: columns(chunk_len),
+            histogram_timestamps: columns(chunk_len),
+            histograms: columns(chunk_len),
         }
+    }
+
+    fn has_histograms(&self) -> bool {
+        self.histograms.iter().any(|col| !col.is_empty())
     }
 
     fn absorb(
@@ -391,21 +433,30 @@ impl ChunkSamples {
         for col in batch.samples.timestamps.iter() {
             total_new = total_new.saturating_add(col.len());
         }
-        let bytes = samples_bytes(total_new);
+        let mut bytes = samples_bytes(total_new);
+        for col in batch.samples.histograms.iter() {
+            for h in col {
+                bytes = bytes.saturating_add(histogram_sample_bytes(h));
+            }
+        }
         self.reservation.try_grow(bytes)?;
         self.bytes = self.bytes.saturating_add(bytes);
 
-        for (block_idx, (mut ts_col, mut val_col)) in batch
-            .samples
+        let samples = batch.samples;
+        for (block_idx, (((mut ts_col, mut val_col), mut hts_col), mut h_col)) in samples
             .timestamps
             .into_iter()
-            .zip(batch.samples.values)
+            .zip(samples.values)
+            .zip(samples.histogram_timestamps)
+            .zip(samples.histograms)
             .enumerate()
         {
             let request_idx = batch.series_range.start + block_idx;
             let local_idx = request_to_series[request_idx];
             self.timestamps[local_idx].append(&mut ts_col);
             self.values[local_idx].append(&mut val_col);
+            self.histogram_timestamps[local_idx].append(&mut hts_col);
+            self.histograms[local_idx].append(&mut h_col);
         }
         Ok(())
     }
@@ -517,6 +568,8 @@ enum State<'a> {
         /// Per-series cursor for the current series chunk. `cursors[i]`
         /// tracks chunk-local series `i`.
         cursors: Vec<SeriesCursor>,
+        /// Histogram-column cursors, parallel to `cursors`.
+        hist_cursors: Vec<SeriesCursor>,
         /// Next step chunk's starting index within the full grid.
         next_step_chunk_start: usize,
     },
@@ -680,6 +733,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         chunk_len: usize,
         samples: &ChunkSamples,
         cursors: &mut [SeriesCursor],
+        hist_cursors: &mut [SeriesCursor],
         step_chunk_start: usize,
     ) -> Result<MatrixWindowBatch, QueryError> {
         let grid = &self.schema.step_grid;
@@ -688,6 +742,11 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         let cell_count = step_count * chunk_len;
 
         let mut buffers = WindowBuffers::allocate(&self.reservation, cell_count)?;
+        let mut histograms = samples.has_histograms().then(|| WindowHistograms {
+            timestamps: Vec::new(),
+            values: Vec::new(),
+            cells: vec![CellIndex::EMPTY; cell_count],
+        });
 
         for step_off in 0..step_count {
             let step_idx = step_chunk_start + step_off;
@@ -727,6 +786,20 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     offset: cell_offset,
                     len: in_cell as u32,
                 };
+
+                if let Some(out) = histograms.as_mut() {
+                    let hts = &samples.histogram_timestamps[series_off];
+                    let range = hist_cursors[series_off].advance(hts, window_lo, window_hi);
+                    let offset = out.timestamps.len() as u32;
+                    let len = range.len() as u32;
+                    // Histogram sample bytes were reserved at absorb time;
+                    // cells only clone `Arc`s.
+                    buffers.grow_samples(range.len())?;
+                    out.timestamps.extend_from_slice(&hts[range.clone()]);
+                    out.values
+                        .extend_from_slice(&samples.histograms[series_off][range]);
+                    out.cells[cell_idx] = CellIndex { offset, len };
+                }
             }
         }
 
@@ -747,6 +820,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             values,
             cells,
             effective_times,
+            histograms,
         })
     }
 
@@ -788,11 +862,13 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     }
                     Poll::Ready(Ok(samples)) => {
                         let cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
+                        let hist_cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
                         self.state = State::Emitting {
                             chunk_start,
                             chunk_len,
                             samples: Box::new(samples),
                             cursors,
+                            hist_cursors,
                             next_step_chunk_start: 0,
                         };
                     }
@@ -806,6 +882,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     chunk_len,
                     samples,
                     mut cursors,
+                    mut hist_cursors,
                     next_step_chunk_start,
                 } => {
                     let grid = &self.schema.step_grid;
@@ -824,6 +901,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                         chunk_len,
                         &samples,
                         &mut cursors,
+                        &mut hist_cursors,
                         next_step_chunk_start,
                     ) {
                         Ok(batch) => {
@@ -833,6 +911,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                                 chunk_len,
                                 samples,
                                 cursors,
+                                hist_cursors,
                                 next_step_chunk_start: next_step_chunk_start + step_advance,
                             };
                             return Poll::Ready(Some(Ok(batch)));

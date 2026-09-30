@@ -7,11 +7,22 @@
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{KeyValue, any_value},
-    metrics::v1::{AggregationTemporality, metric, number_data_point},
+    metrics::v1::{
+        AggregationTemporality, DataPointFlags, exponential_histogram_data_point, metric,
+        number_data_point,
+    },
 };
 
 use crate::error::Error;
-use crate::model::{Label, MetricType, Sample, Series, Temporality};
+use crate::histogram::{
+    Bucket, CounterResetHint, FloatHistogram, MAX_EXPONENTIAL_SCHEMA, MIN_EXPONENTIAL_SCHEMA,
+};
+use crate::model::{HistogramSample, Label, MetricType, STALE_NAN, Sample, Series, Temporality};
+
+/// Zero threshold the upstream OTLP translator assigns to exponential
+/// histograms; OTLP's default of 0 would otherwise render a degenerate zero
+/// bucket that disagrees with Prometheus.
+const DEFAULT_OTLP_ZERO_THRESHOLD: f64 = 1e-128;
 
 /// Configuration for [`OtelConverter`].
 #[derive(Debug, Clone)]
@@ -170,6 +181,42 @@ impl SeriesCollector<'_> {
         timestamp_ms: i64,
         value: f64,
     ) {
+        self.push_series(
+            name,
+            metric_type,
+            point_labels,
+            extra_labels,
+            vec![Sample::new(timestamp_ms, value)],
+            Vec::new(),
+        );
+    }
+
+    fn push_histogram(
+        &mut self,
+        name: &str,
+        metric_type: MetricType,
+        point_labels: &[Label],
+        sample: HistogramSample,
+    ) {
+        self.push_series(
+            name,
+            metric_type,
+            point_labels,
+            &[],
+            Vec::new(),
+            vec![sample],
+        );
+    }
+
+    fn push_series(
+        &mut self,
+        name: &str,
+        metric_type: MetricType,
+        point_labels: &[Label],
+        extra_labels: &[Label],
+        samples: Vec<Sample>,
+        histograms: Vec<HistogramSample>,
+    ) {
         let mut labels = Vec::with_capacity(
             1 + self.base_labels.len() + point_labels.len() + extra_labels.len(),
         );
@@ -191,7 +238,8 @@ impl SeriesCollector<'_> {
             } else {
                 Some(self.description.to_string())
             },
-            samples: vec![Sample::new(timestamp_ms, value)],
+            samples,
+            histograms,
         });
     }
 }
@@ -438,12 +486,15 @@ impl OtelConverter {
         }
     }
 
-    /// Convert an OTLP ExponentialHistogram to classic Prometheus `_bucket`/`_sum`/`_count` series.
+    /// Convert an OTLP ExponentialHistogram to a Prometheus native histogram
+    /// series, following the upstream OTLP translator.
     ///
-    /// Only positive buckets and `zero_count` are converted to `le`-style buckets. Negative
-    /// buckets (representing negative measurement values) cannot be expressed as classic
-    /// Prometheus buckets; the OTLP spec maps them to Prometheus Native Histograms instead.
-    /// Negative observations are still reflected in `_count` and the `+Inf` bucket.
+    /// OTLP scale maps to the native schema; scales above
+    /// [`MAX_EXPONENTIAL_SCHEMA`] are downscaled by merging buckets, and
+    /// scales below [`MIN_EXPONENTIAL_SCHEMA`] cannot be represented and are
+    /// dropped. OTLP bucket `k` covers `(base^k, base^(k+1)]` while native
+    /// bucket `k` covers `(base^(k-1), base^k]`, hence the `+ 1` on indexes.
+    /// Delta temporality points become gauge histograms.
     fn convert_exp_histogram(
         &self,
         name: &str,
@@ -452,86 +503,76 @@ impl OtelConverter {
         ctx: &mut SeriesCollector<'_>,
     ) {
         let temp = to_temporality(temporality);
-        let metric_type = MetricType::Histogram { temporality: temp };
-        let base_name = build_metric_name(name, ctx.unit, false);
-        let bucket_name = format!("{}_bucket", base_name);
-        let sum_name = format!("{}_sum", base_name);
-        let count_name = format!("{}_count", base_name);
+        let metric_type = MetricType::ExponentialHistogram { temporality: temp };
+        let metric_name = build_metric_name(name, ctx.unit, false);
 
         for dp in data_points {
             let timestamp_ms = (dp.time_unix_nano / 1_000_000) as i64;
             let point_labels = collect_labels(&dp.attributes);
-
-            // Convert exponential buckets to classic Prometheus le-style buckets.
-            //
-            // Negative buckets (for negative measurement values) are not converted.
-            // The OTLP spec maps ExponentialHistograms to Prometheus Native Histograms
-            // which can represent negative ranges natively; classic le-buckets cannot.
-            // Negative bucket counts are still included in _count and +Inf.
-            let base = 2_f64.powf(2_f64.powi(-dp.scale));
-
-            let mut explicit_bounds = Vec::new();
-            let mut cumulative_counts = Vec::new();
-
-            // Start cumulative from zero_count so that the first positive bucket
-            // includes observations in the zero range.
-            let mut cumulative: u64 = dp.zero_count;
-
-            // Positive buckets.
-            if let Some(ref positive) = dp.positive {
-                let offset = positive.offset;
-                for (i, &count) in positive.bucket_counts.iter().enumerate() {
-                    let boundary = base.powf((offset + i as i32 + 1) as f64);
-                    cumulative += count;
-                    explicit_bounds.push(boundary);
-                    cumulative_counts.push(cumulative);
-                }
-            }
-
-            // Emit bucket series.
-            for (bound, cum_count) in explicit_bounds.iter().zip(cumulative_counts.iter()) {
-                let le_label = [Label::new("le", format_float(*bound))];
+            if dp.flags & DataPointFlags::NoRecordedValueMask as u32 != 0 {
                 ctx.push(
-                    &bucket_name,
-                    metric_type,
-                    &point_labels,
-                    &le_label,
-                    timestamp_ms,
-                    *cum_count as f64,
-                );
-            }
-
-            // +Inf bucket.
-            let inf_label = [Label::new("le", "+Inf")];
-            ctx.push(
-                &bucket_name,
-                metric_type,
-                &point_labels,
-                &inf_label,
-                timestamp_ms,
-                dp.count as f64,
-            );
-
-            // _sum
-            if let Some(sum) = dp.sum {
-                ctx.push(
-                    &sum_name,
+                    &metric_name,
                     metric_type,
                     &point_labels,
                     &[],
                     timestamp_ms,
-                    sum,
+                    f64::from_bits(STALE_NAN),
                 );
+                continue;
             }
-
-            // _count
-            ctx.push(
-                &count_name,
+            if dp.scale < MIN_EXPONENTIAL_SCHEMA {
+                tracing::warn!(
+                    metric = name,
+                    scale = dp.scale,
+                    "dropping exponential histogram point with unsupported scale"
+                );
+                continue;
+            }
+            let scale_down = (dp.scale - MAX_EXPONENTIAL_SCHEMA).max(0) as u32;
+            let buckets = |side: &Option<exponential_histogram_data_point::Buckets>| {
+                let mut out: Vec<Bucket> = Vec::new();
+                let Some(side) = side else {
+                    return out;
+                };
+                for (i, &count) in side.bucket_counts.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    let index = ((side.offset + i as i32) >> scale_down) + 1;
+                    match out.last_mut() {
+                        Some(last) if last.index == index => last.count += count as f64,
+                        _ => out.push(Bucket {
+                            index,
+                            count: count as f64,
+                        }),
+                    }
+                }
+                out
+            };
+            let histogram = FloatHistogram {
+                counter_reset_hint: if temp == Temporality::Delta {
+                    CounterResetHint::Gauge
+                } else {
+                    CounterResetHint::Unknown
+                },
+                schema: dp.scale - scale_down as i32,
+                zero_threshold: if dp.zero_threshold > 0.0 {
+                    dp.zero_threshold
+                } else {
+                    DEFAULT_OTLP_ZERO_THRESHOLD
+                },
+                zero_count: dp.zero_count as f64,
+                count: dp.count as f64,
+                sum: dp.sum.unwrap_or(0.0),
+                positive: buckets(&dp.positive),
+                negative: buckets(&dp.negative),
+                custom_values: Default::default(),
+            };
+            ctx.push_histogram(
+                &metric_name,
                 metric_type,
                 &point_labels,
-                &[],
-                timestamp_ms,
-                dp.count as f64,
+                HistogramSample::new(timestamp_ms, histogram),
             );
         }
     }

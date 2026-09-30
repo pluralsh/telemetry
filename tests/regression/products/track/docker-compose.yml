@@ -9,6 +9,8 @@ x-track-environment: &track-environment
   TRACK_INTERNAL_TOKEN: internal-regression-token
 
 x-track: &track
+  # CI preloads this tag from a cached buildx build; see regression.yml.
+  image: telemetry-regression/track-server:local
   build:
     context: ../../../..
     dockerfile: crates/track-server/Dockerfile
@@ -81,6 +83,7 @@ services:
 
   track-retention:
     profiles: ["extended"]
+    image: telemetry-regression/track-server:local
     build:
       context: ../../../..
       dockerfile: crates/track-server/Dockerfile

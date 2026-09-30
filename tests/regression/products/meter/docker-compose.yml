@@ -9,6 +9,8 @@ x-meter-environment: &meter-environment
   METER_INTERNAL_TOKEN: internal-regression-token
 
 x-meter: &meter
+  # CI preloads this tag from a cached buildx build; see regression.yml.
+  image: telemetry-regression/meter-server:local
   build:
     context: ../../../..
     dockerfile: crates/meter-server/Dockerfile
@@ -19,13 +21,15 @@ x-meter: &meter
 
 services:
   prometheus:
-    image: prom/prometheus:v3.5.0
+    # Native histogram rate extrapolation clips at the zero point from v3.6.
+    image: prom/prometheus:v3.14.0
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --web.enable-remote-write-receiver
       - --web.enable-otlp-receiver
       - --enable-feature=metadata-wal-records
+      - --enable-feature=native-histograms
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus

@@ -458,13 +458,13 @@ fn should_lower_unary_minus() {
 
 #[test]
 fn should_reject_unknown_function() {
-    // given: a native-histogram-only function, not in our lowering table
-    let expr = parse("histogram_count(foo)");
+    // given: a function the parser knows but our lowering table does not
+    let expr = parse("holt_winters(foo[5m], 0.5, 0.5)");
     // when: lowered
     let err = lower(&expr, &ctx()).unwrap_err();
     // then: UnknownFunction
     match err {
-        PlanError::UnknownFunction(name) => assert_eq!(name, "histogram_count"),
+        PlanError::UnknownFunction(name) => assert_eq!(name, "holt_winters"),
         other => panic!("unexpected error: {other:?}"),
     }
 }

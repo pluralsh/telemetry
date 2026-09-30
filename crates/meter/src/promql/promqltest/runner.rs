@@ -156,6 +156,7 @@ mod tests {
                 ("job".to_string(), "test".to_string()),
             ]),
             values: vec![(0, 1.0), (1, 2.0), (2, 3.0)],
+            histograms: Vec::new(),
         }];
 
         // when
@@ -178,6 +179,7 @@ mod tests {
         let series = vec![SeriesLoad {
             labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(0, 10.0), (1, 20.0), (2, 30.0)],
+            histograms: Vec::new(),
         }];
         load_series(&tsdb, Duration::from_secs(60), &series)
             .await
@@ -219,6 +221,7 @@ eval instant at 10m
         let series = vec![SeriesLoad {
             labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(-1, 10.0)], // Negative step
+            histograms: Vec::new(),
         }];
 
         // when

@@ -53,7 +53,7 @@ impl<C: Operator> AbsentOp<C> {
         let series_count = batch.series_count();
         for step_off in 0..batch.step_count() {
             let row = step_off * series_count;
-            if (row..row + series_count).any(|cell| batch.validity.get(cell)) {
+            if (row..row + series_count).any(|cell| batch.is_present(cell)) {
                 self.present.set(batch.step_range.start + step_off);
             }
         }

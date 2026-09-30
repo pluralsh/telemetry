@@ -122,9 +122,40 @@ pub enum InstantFnKind {
     Hour,
     Minute,
     DaysInMonth,
+
+    /// Native-histogram inspection (`histogram_count`, `histogram_sum`,
+    /// `histogram_avg`, `histogram_stddev`, `histogram_stdvar`). Read only
+    /// histogram cells; float cells are dropped.
+    HistogramCount,
+    HistogramSum,
+    HistogramAvg,
+    HistogramStddev,
+    HistogramStdvar,
 }
 
 impl InstantFnKind {
+    fn histogram_stat(&self, h: &crate::histogram::FloatHistogram) -> Option<f64> {
+        match *self {
+            Self::HistogramCount => Some(h.count),
+            Self::HistogramSum => Some(h.sum),
+            Self::HistogramAvg => Some(h.sum / h.count),
+            Self::HistogramStddev => Some(crate::histogram::variance(h).sqrt()),
+            Self::HistogramStdvar => Some(crate::histogram::variance(h)),
+            _ => None,
+        }
+    }
+
+    fn reads_histograms_only(&self) -> bool {
+        matches!(
+            self,
+            Self::HistogramCount
+                | Self::HistogramSum
+                | Self::HistogramAvg
+                | Self::HistogramStddev
+                | Self::HistogramStdvar
+        )
+    }
+
     /// Reduce a single cell's `(value, step_timestamp_ms)` to a scalar.
     ///
     /// `step_timestamp_ms` is the output step timestamp for the cell (in
@@ -196,6 +227,11 @@ impl InstantFnKind {
             Self::DaysInMonth => datetime_from_seconds(v)
                 .map(|dt| days_in_month(dt) as f64)
                 .unwrap_or(f64::NAN),
+            Self::HistogramCount
+            | Self::HistogramSum
+            | Self::HistogramAvg
+            | Self::HistogramStddev
+            | Self::HistogramStdvar => f64::NAN,
         }
     }
 }
@@ -382,6 +418,29 @@ impl<C: Operator> InstantFnOp<C> {
             ));
         }
 
+        if self.kind.reads_histograms_only() {
+            let mut validity = BitSet::with_len(cell_count);
+            if let Some(cells) = &batch.histograms {
+                for (idx, cell) in cells.iter().enumerate() {
+                    if let Some(h) = cell
+                        && let Some(v) = self.kind.histogram_stat(h)
+                    {
+                        out.values[idx] = v;
+                        validity.set(idx);
+                    }
+                }
+            }
+            let values = out.finish();
+            return Ok(StepBatch::new(
+                batch.step_timestamps.clone(),
+                batch.step_range.clone(),
+                batch.series.clone(),
+                batch.series_range.clone(),
+                values,
+                validity,
+            ));
+        }
+
         let series_count = batch.series_count();
         let step_ts = batch.step_timestamps_slice();
 
@@ -405,6 +464,20 @@ impl<C: Operator> InstantFnOp<C> {
             }
         }
 
+        // Only `timestamp()` accepts histogram samples; every other
+        // function drops them, which clearing the column achieves.
+        let mut validity = batch.validity.clone();
+        if let (InstantFnKind::Timestamp, Some(cells)) = (self.kind, &batch.histograms) {
+            for (idx, cell) in cells.iter().enumerate() {
+                if cell.is_some() {
+                    let step_ms = step_ts[idx / series_count.max(1)];
+                    let ts = source_ts.map_or(step_ms, |ts| ts[idx]);
+                    out.values[idx] = self.kind.compute(f64::NAN, ts);
+                    validity.set(idx);
+                }
+            }
+        }
+
         let values = out.finish();
         Ok(StepBatch::new(
             batch.step_timestamps.clone(),
@@ -412,10 +485,10 @@ impl<C: Operator> InstantFnOp<C> {
             batch.series.clone(),
             batch.series_range.clone(),
             values,
-            // Pointer-clone: the function never produces new absences, so
-            // the output validity matches the input bit-for-bit. See the
-            // module-level "Validity policy" note.
-            batch.validity.clone(),
+            // The function never produces new absences, so the output
+            // validity matches the input bit-for-bit (plus histogram cells
+            // for `timestamp()`). See the module-level "Validity policy".
+            validity,
         ))
     }
 }

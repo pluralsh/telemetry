@@ -166,7 +166,7 @@ Meter capacity depends on both samples/s and active-series behavior:
 - Stable series primarily exercise sample encoding and delta merging.
 - New or changed series also create schema and posting records.
 - High churn can become the limit even when sample throughput is moderate.
-- Histograms create more series and samples than simple counters or gauges.
+- Classic histograms create one series per bucket, plus `_sum` and `_count`. Native histograms (remote-write histograms and OTLP exponential histograms) are stored as one series with larger samples.
 
 ### Line
 

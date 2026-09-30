@@ -38,10 +38,11 @@ use futures::Stream;
 use futures::stream::StreamExt;
 use promql_parser::parser::{AtModifier, Offset};
 
+use crate::histogram::FloatHistogram;
 use crate::model::is_stale_nan;
 use crate::promql::timestamp::Timestamp;
 
-use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use super::super::batch::{BitSet, HistogramCells, SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
@@ -154,6 +155,17 @@ fn samples_bytes(n: usize) -> usize {
     n.saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<f64>())
 }
 
+/// Approximate heap footprint of one histogram sample (timestamp, `Arc`
+/// header and the bucket vectors).
+#[inline]
+pub(crate) fn histogram_sample_bytes(h: &FloatHistogram) -> usize {
+    let buckets = h.positive.len() + h.negative.len() + h.custom_values.len();
+    std::mem::size_of::<i64>()
+        + std::mem::size_of::<FloatHistogram>()
+        + 2 * std::mem::size_of::<usize>()
+        + buckets.saturating_mul(std::mem::size_of::<crate::histogram::Bucket>())
+}
+
 // ---------------------------------------------------------------------------
 // Lookback / @ / offset resolution
 // ---------------------------------------------------------------------------
@@ -243,15 +255,22 @@ struct ChunkSamples {
     /// Indexed by chunk-local series offset (0..chunk_len).
     timestamps: Vec<Vec<i64>>,
     values: Vec<Vec<f64>>,
+    histogram_timestamps: Vec<Vec<i64>>,
+    histograms: Vec<Vec<Arc<FloatHistogram>>>,
 }
 
 impl ChunkSamples {
     fn new(reservation: MemoryReservation, chunk_len: usize) -> Self {
+        fn columns<T>(n: usize) -> Vec<Vec<T>> {
+            (0..n).map(|_| Vec::new()).collect()
+        }
         Self {
             reservation,
             bytes: 0,
-            timestamps: (0..chunk_len).map(|_| Vec::new()).collect(),
-            values: (0..chunk_len).map(|_| Vec::new()).collect(),
+            timestamps: columns(chunk_len),
+            values: columns(chunk_len),
+            histogram_timestamps: columns(chunk_len),
+            histograms: columns(chunk_len),
         }
     }
 
@@ -266,15 +285,22 @@ impl ChunkSamples {
         for col in batch.samples.timestamps.iter() {
             total_new = total_new.saturating_add(col.len());
         }
-        let bytes = samples_bytes(total_new);
+        let mut bytes = samples_bytes(total_new);
+        for col in batch.samples.histograms.iter() {
+            for h in col {
+                bytes = bytes.saturating_add(histogram_sample_bytes(h));
+            }
+        }
         self.reservation.try_grow(bytes)?;
         self.bytes = self.bytes.saturating_add(bytes);
 
-        for (block_idx, (mut ts_col, mut val_col)) in batch
-            .samples
+        let samples = batch.samples;
+        for (block_idx, (((mut ts_col, mut val_col), mut hts_col), mut h_col)) in samples
             .timestamps
             .into_iter()
-            .zip(batch.samples.values)
+            .zip(samples.values)
+            .zip(samples.histogram_timestamps)
+            .zip(samples.histograms)
             .enumerate()
         {
             let request_idx = batch.series_range.start + block_idx;
@@ -283,6 +309,8 @@ impl ChunkSamples {
             // SampleBatches (one per bucket for cross-bucket series).
             self.timestamps[local_idx].append(&mut ts_col);
             self.values[local_idx].append(&mut val_col);
+            self.histogram_timestamps[local_idx].append(&mut hts_col);
+            self.histograms[local_idx].append(&mut h_col);
         }
         Ok(())
     }
@@ -483,6 +511,13 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         // This turns the old O(step_count × series × ts.len()) reverse scan
         // into O(step_count × series + Σ ts.len()).
         let mut cursors = vec![0usize; chunk_len];
+        let mut hist_cursors = vec![0usize; chunk_len];
+        let has_histograms = samples.histograms.iter().any(|col| !col.is_empty());
+        let mut histogram_cells: HistogramCells = if has_histograms {
+            vec![None; cell_count]
+        } else {
+            Vec::new()
+        };
 
         for step_off in 0..step_count {
             let step_idx = step_chunk_start + step_off;
@@ -496,33 +531,54 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                 while *cursor < ts.len() && ts[*cursor] <= window_hi {
                     *cursor += 1;
                 }
-                if *cursor == 0 {
-                    continue;
-                }
-                let idx = *cursor - 1;
-                let t = ts[idx];
-                if t <= window_lo {
-                    continue;
-                }
-                let v = vs[idx];
-                if is_stale_nan(v) {
-                    // STALE_NAN terminates the lookback; treat the cell as
-                    // absent. Per-step; the cursor stays put so later steps
-                    // with wider `window_hi` may select a newer sample.
-                    continue;
-                }
+                let float_idx = (*cursor > 0 && ts[*cursor - 1] > window_lo).then(|| *cursor - 1);
+
+                let hist_idx = if has_histograms {
+                    let hts = &samples.histogram_timestamps[series_off];
+                    let hc = &mut hist_cursors[series_off];
+                    while *hc < hts.len() && hts[*hc] <= window_hi {
+                        *hc += 1;
+                    }
+                    (*hc > 0 && hts[*hc - 1] > window_lo).then(|| *hc - 1)
+                } else {
+                    None
+                };
 
                 let cell = step_off * chunk_len + series_off;
-                buffers.values[cell] = v;
-                buffers.validity.set(cell);
-                source_timestamps[cell] = t;
+                // The newest in-window sample of either kind wins; a
+                // histogram wins a timestamp tie, matching storage.
+                match (float_idx, hist_idx) {
+                    (Some(fi), Some(hi))
+                        if samples.histogram_timestamps[series_off][hi] >= ts[fi] =>
+                    {
+                        histogram_cells[cell] = Some(samples.histograms[series_off][hi].clone());
+                        source_timestamps[cell] = samples.histogram_timestamps[series_off][hi];
+                    }
+                    (None, Some(hi)) => {
+                        histogram_cells[cell] = Some(samples.histograms[series_off][hi].clone());
+                        source_timestamps[cell] = samples.histogram_timestamps[series_off][hi];
+                    }
+                    (Some(fi), _) => {
+                        let v = vs[fi];
+                        if is_stale_nan(v) {
+                            // STALE_NAN terminates the lookback; treat the
+                            // cell as absent. Per-step; the cursor stays put
+                            // so later steps may select a newer sample.
+                            continue;
+                        }
+                        buffers.values[cell] = v;
+                        buffers.validity.set(cell);
+                        source_timestamps[cell] = ts[fi];
+                    }
+                    (None, None) => {}
+                }
             }
         }
 
         let (values, validity) = buffers.finish();
         let series_range = chunk_start..(chunk_start + chunk_len);
         let step_range = step_chunk_start..step_chunk_end;
-        Ok(StepBatch::new(
+        let batch = StepBatch::new(
             self.step_timestamps.clone(),
             step_range,
             self.schema.series.clone(),
@@ -530,7 +586,12 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             values,
             validity,
         )
-        .with_source_timestamps(Arc::from(source_timestamps)))
+        .with_source_timestamps(Arc::from(source_timestamps));
+        Ok(if has_histograms {
+            batch.with_histograms(histogram_cells)
+        } else {
+            batch
+        })
     }
 }
 

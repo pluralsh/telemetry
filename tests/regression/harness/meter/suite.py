@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 from .auth import basic, bearer
 from .client import PrometheusClient, Target
-from .fixture import assert_spans_writer_ranges, regression_fixture, series
+from .fixture import (
+    assert_spans_writer_ranges,
+    native_histogram_fixture,
+    regression_fixture,
+    series,
+)
 from .normalize import (
     assert_json_data_equivalent,
     assert_metadata_equivalent,
@@ -16,7 +21,11 @@ from .normalize import (
     ensure_success,
     result_len,
 )
-from .wire import otlp_fixture, remote_write_body
+from .wire import (
+    otlp_exponential_histogram_fixture,
+    otlp_fixture,
+    remote_write_body,
+)
 
 INSTANT_QUERIES = (
     ("instant selector", "regression_gauge", ()),
@@ -37,6 +46,62 @@ RANGE_QUERIES = (
     ("range selector", "regression_gauge", ()),
     ("range aggregate", "sum by (job) (regression_gauge)", ()),
     ("range rate", "rate(regression_counter_total[5m])", ("__name__",)),
+)
+
+OTLP_IGNORED_LABELS = ("otel_scope_name", "otel_scope_version", "job")
+
+NATIVE_INSTANT_QUERIES = (
+    ("native selector", "regression_native_seconds", ()),
+    ("native rate", "rate(regression_native_seconds[5m])", ("__name__",)),
+    ("native increase", "increase(regression_native_seconds[5m])", ("__name__",)),
+    ("native sum", "sum by (job) (rate(regression_native_seconds[5m]))", ()),
+    (
+        "native histogram_count",
+        "histogram_count(rate(regression_native_seconds[5m]))",
+        ("__name__",),
+    ),
+    (
+        "native histogram_sum",
+        "histogram_sum(regression_native_seconds)",
+        ("__name__",),
+    ),
+    (
+        "native histogram_avg",
+        "histogram_avg(rate(regression_native_seconds[5m]))",
+        ("__name__",),
+    ),
+    (
+        "native histogram_quantile",
+        "histogram_quantile(0.9, rate(regression_native_seconds[5m]))",
+        ("__name__",),
+    ),
+    (
+        "native histogram_fraction",
+        "histogram_fraction(0, 2, regression_native_seconds)",
+        (),
+    ),
+    ("custom buckets selector", "regression_nhcb_seconds", ()),
+    (
+        "custom buckets quantile",
+        "histogram_quantile(0.5, rate(regression_nhcb_seconds[5m]))",
+        ("__name__",),
+    ),
+    ("otlp exponential selector", "otlp_regression_latency", OTLP_IGNORED_LABELS),
+    (
+        "otlp exponential quantile",
+        "histogram_quantile(0.5, otlp_regression_latency)",
+        OTLP_IGNORED_LABELS,
+    ),
+)
+
+NATIVE_RANGE_QUERIES = (
+    ("native range selector", "regression_native_seconds", ()),
+    ("native range sum", "sum(rate(regression_native_seconds[5m]))", ()),
+    (
+        "native range quantile",
+        "histogram_quantile(0.9, rate(regression_native_seconds[5m]))",
+        ("__name__",),
+    ),
 )
 
 DISCOVERY_QUERIES = (
@@ -117,6 +182,38 @@ class MeterSuite:
             timeout=60,
             error="Meter reader did not observe durable writer data within 60s",
         )
+        self.seed_native_histograms()
+
+    def seed_native_histograms(self) -> None:
+        body = remote_write_body(native_histogram_fixture(self.base_ms))
+        for name, target in (("Prometheus", self.prometheus), ("Meter", self.writer)):
+            response = self.client.remote_write(
+                target, body, request_id="regression-native"
+            )
+            assert 200 <= response.status < 300, (
+                f"{name} native histogram write failed: "
+                f"{response.status} {response.body!r}"
+            )
+        otlp = otlp_exponential_histogram_fixture(
+            tuple(self.base_ms + index * 60_000 for index in range(5, 10))
+        ).SerializeToString()
+        for name, target, path in (
+            ("Prometheus", self.prometheus, "/api/v1/otlp/v1/metrics"),
+            ("Meter", self.writer, "/v1/metrics"),
+        ):
+            response = self.client.otlp_write(
+                target, otlp, path=path, request_id="regression-otlp-histogram"
+            )
+            assert 200 <= response.status < 300, (
+                f"{name} OTLP histogram write failed: "
+                f"{response.status} {response.body!r}"
+            )
+        for metric in (
+            "regression_native_seconds",
+            "regression_nhcb_seconds",
+            "otlp_regression_latency",
+        ):
+            self.wait_for_metric(metric, timeout=60)
 
     def wait_for_metric(
         self,
@@ -230,7 +327,7 @@ class MeterSuite:
             "OTLP equivalent samples",
             expected,
             actual,
-            ignored_labels=("otel_scope_name", "otel_scope_version", "job"),
+            ignored_labels=OTLP_IGNORED_LABELS,
         )
         metadata_parameters = [("metric", "otlp_regression_temperature")]
         ensure_success(

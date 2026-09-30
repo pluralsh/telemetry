@@ -16,7 +16,6 @@ ARG TARGETARCH
 COPY --from=planner /workspace/recipe.json recipe.json
 COPY crates/proto/proto/ crates/proto/proto/
 COPY crates/line/src/logql/grammar.lalrpop crates/line/src/logql/grammar.lalrpop
-COPY crates/meter/src/promql/promqltest/testdata/ crates/meter/src/promql/promqltest/testdata/
 RUN --mount=type=cache,id=telemetry-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,id=telemetry-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
     cargo chef cook --release --locked --package pseudofs-server --recipe-path recipe.json

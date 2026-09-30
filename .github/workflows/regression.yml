@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   harness-unit:
     name: Harness unit tests
@@ -24,17 +28,39 @@ jobs:
       - run: mise exec -- python -m pytest tests/regression/test_unit
 
   compatibility:
-    name: Live compatibility tests
-    runs-on: ubuntu-latest
+    name: Live compatibility tests (${{ matrix.product }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [line, meter, track]
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+      # Compose's default builder has no persistent cache on hosted runners, so
+      # build through buildx with the GHA layer cache and hand Compose the
+      # loaded image. The publish workflow's amd64 scope holds layers from
+      # the same Dockerfile and seeds the cache when the regression scope is cold.
+      - name: Build ${{ matrix.product }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: crates/${{ matrix.product }}-server/Dockerfile
+          tags: telemetry-regression/${{ matrix.product }}-server:local
+          load: true
+          cache-from: |
+            type=gha,scope=regression-${{ matrix.product }}
+            type=gha,scope=${{ matrix.product }}-amd64
+          cache-to: type=gha,mode=max,scope=regression-${{ matrix.product }}
       - uses: jdx/mise-action@v2
         with:
           cache: true
       - run: mise exec -- python -m pip install -r tests/regression/requirements.txt
       - name: Run Docker compatibility regression
-        run: mise exec -- python -m pytest tests/regression/test_live
+        env:
+          REGRESSION_BUILD: "0"
+        run: mise exec -- python -m pytest tests/regression/test_live/test_${{ matrix.product }}.py
 
   kind:
     name: Kubernetes handoff regression

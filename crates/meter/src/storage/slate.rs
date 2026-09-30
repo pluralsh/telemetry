@@ -44,12 +44,13 @@ use uuid::Uuid;
 
 use crate::Namespace;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
-use crate::model::{Label, Sample, SeriesFingerprint, SeriesId, TimeBucket};
+use crate::model::{
+    HistogramSample, Label, Sample, SeriesData, SeriesFingerprint, SeriesId, TimeBucket,
+};
 use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
-use crate::serde::timeseries::TimeSeriesValue;
 use crate::serde::{TimeBucketScoped, bucket_records_range};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};

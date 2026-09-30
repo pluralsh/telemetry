@@ -78,6 +78,7 @@ pub(crate) fn merge_samples(
     series_id: SeriesId,
     metric_name: &str,
     samples: Vec<Sample>,
+    histograms: Vec<HistogramSample>,
     ttl: Ttl,
 ) -> crate::util::Result<RecordOp> {
     let key = TimeSeriesKey {
@@ -87,7 +88,11 @@ pub(crate) fn merge_samples(
         series_id,
     }
     .encode();
-    let value = TimeSeriesValue { points: samples }.encode()?;
+    let value = SeriesData {
+        floats: samples,
+        histograms,
+    }
+    .encode()?;
     Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
         Record { key, value },
         MergeOptions { ttl },

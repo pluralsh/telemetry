@@ -41,3 +41,19 @@ def test_compose_context_starts_waits_and_always_stops(
     assert any("logs --no-color" in item for item in flattened)
     assert any("down --volumes --remove-orphans" in item for item in flattened)
     assert readiness == ["http://service/ready"]
+
+
+def test_compose_skips_build_when_images_are_prebuilt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[str] = []
+
+    def fake_run(args: tuple[str, ...], **_: object) -> CommandResult:
+        commands.append(" ".join(args))
+        return CommandResult(tuple(args), "", "")
+
+    monkeypatch.setattr(compose_module, "run", fake_run)
+    monkeypatch.setenv("REGRESSION_BUILD", "0")
+    project = ComposeProject(Path("/tmp/product/docker-compose.yml"), "unit")
+    project.up("reader")
+    assert commands[-1].endswith("up --detach --remove-orphans reader")

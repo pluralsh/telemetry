@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::super::batch::{BitSet, SchemaRef, StepBatch};
+use super::super::batch::{BitSet, HistogramCells, SchemaRef, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema};
 
@@ -38,6 +38,8 @@ struct Scratch {
     values: Vec<f64>,
     /// Parallel to [`Self::values`].
     validity: BitSet,
+    /// Allocated on the first upstream batch carrying histograms.
+    histograms: Option<HistogramCells>,
 }
 
 impl Scratch {
@@ -56,6 +58,7 @@ impl Scratch {
             series_count,
             values: vec![f64::NAN; cells],
             validity: BitSet::with_len(cells),
+            histograms: None,
         })
     }
 
@@ -185,6 +188,20 @@ impl<C: Operator> RechunkOp<C> {
                 // starts all-clear).
             }
         }
+        if let Some(cells_in) = &batch.histograms {
+            let total = scratch.step_count * scratch.series_count;
+            let out = scratch.histograms.get_or_insert_with(|| vec![None; total]);
+            for step_off in 0..step_count_in {
+                for series_off in 0..series_count_in {
+                    if let Some(h) = &cells_in[step_off * series_count_in + series_off] {
+                        let out_idx = (step_start + step_off) * scratch.series_count
+                            + series_start
+                            + series_off;
+                        out[out_idx] = Some(h.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Extract a tile from the scratch buffer into a fresh `StepBatch`.
@@ -209,6 +226,8 @@ impl<C: Operator> RechunkOp<C> {
         let cells = out_step_count * out_series_count;
         let mut values = vec![f64::NAN; cells];
         let mut validity = BitSet::with_len(cells);
+        let mut histograms: Option<HistogramCells> =
+            scratch.histograms.as_ref().map(|_| vec![None; cells]);
         for step_off in 0..out_step_count {
             let scratch_step = step_start + step_off;
             for series_off in 0..out_series_count {
@@ -219,16 +238,23 @@ impl<C: Operator> RechunkOp<C> {
                     values[dst] = scratch.values[src];
                     validity.set(dst);
                 }
+                if let (Some(out), Some(all)) = (histograms.as_mut(), &scratch.histograms) {
+                    out[dst] = all[src].clone();
+                }
             }
         }
-        StepBatch::new(
+        let batch = StepBatch::new(
             step_timestamps,
             step_start..step_end,
             series,
             series_start..series_end,
             values,
             validity,
-        )
+        );
+        match histograms {
+            Some(h) => batch.with_histograms(h),
+            None => batch,
+        }
     }
 
     fn matches_target(&self, batch: &StepBatch) -> bool {

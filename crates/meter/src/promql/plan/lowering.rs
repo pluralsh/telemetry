@@ -628,6 +628,11 @@ fn instant_fn_kind_for(
         "rad" => InstantFnKind::Rad,
         "sgn" => InstantFnKind::Sgn,
         "timestamp" => InstantFnKind::Timestamp,
+        "histogram_count" => InstantFnKind::HistogramCount,
+        "histogram_sum" => InstantFnKind::HistogramSum,
+        "histogram_avg" => InstantFnKind::HistogramAvg,
+        "histogram_stddev" => InstantFnKind::HistogramStddev,
+        "histogram_stdvar" => InstantFnKind::HistogramStdvar,
         "year" => {
             if args.len() > 1 {
                 return Err(PlanError::InvalidArgument {

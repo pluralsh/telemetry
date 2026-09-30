@@ -44,9 +44,34 @@ message MetricMetadata {
   string unit = 4;
 }
 
+// A native histogram sample in float form. Bucket indexes and counts are
+// parallel arrays, ascending by index.
+message HistogramSample {
+  enum CounterResetHint {
+    COUNTER_RESET_HINT_UNKNOWN = 0;
+    COUNTER_RESET_HINT_RESET = 1;
+    COUNTER_RESET_HINT_NOT_RESET = 2;
+    COUNTER_RESET_HINT_GAUGE = 3;
+  }
+
+  int64 timestamp_ms = 1;
+  CounterResetHint counter_reset_hint = 2;
+  sint32 schema = 3;
+  double zero_threshold = 4;
+  double zero_count = 5;
+  double count = 6;
+  double sum = 7;
+  repeated sint32 positive_indexes = 8;
+  repeated double positive_counts = 9;
+  repeated sint32 negative_indexes = 10;
+  repeated double negative_counts = 11;
+  repeated double custom_values = 12;
+}
+
 message Series {
   repeated Label labels = 1;
   repeated Sample samples = 2;
+  repeated HistogramSample histograms = 3;
 }
 
 message WriteBatchRequest {

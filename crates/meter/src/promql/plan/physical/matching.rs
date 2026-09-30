@@ -60,36 +60,67 @@ pub(super) fn build_group_map(
     })
 }
 
-/// Result of bucketing an input schema for a classic-histogram function:
-/// each series' group and parsed `le` bound, plus the group labels.
+/// Result of bucketing an input schema for `histogram_quantile` /
+/// `histogram_fraction`: each classic series' group and parsed `le` bound,
+/// each native series' group, plus the group labels.
 pub(super) struct HistogramGroups {
     pub(super) inputs: Vec<Option<BucketSeries>>,
+    pub(super) natives: Vec<Option<NativeSeries>>,
     pub(super) group_labels: Vec<Labels>,
 }
 
 /// Group bucket series by every label except `le` and `__name__`. Series
-/// whose `le` is missing or not a float are dropped, as in Prometheus.
+/// whose `le` is missing or not a float become native inputs grouped by
+/// every label except `__name__`.
 pub(super) fn build_histogram_groups(input: &SeriesSchema) -> HistogramGroups {
-    let grouping = AggregateGrouping::Without(Arc::from(vec!["le".to_string()]));
+    let classic_grouping = AggregateGrouping::Without(Arc::from(vec!["le".to_string()]));
+    let native_grouping = AggregateGrouping::Without(Arc::from(Vec::<String>::new()));
     let mut keys: HashMap<Vec<Label>, u32> = HashMap::new();
     let mut group_labels: Vec<Labels> = Vec::new();
+    let mut group_for = |key: Vec<Label>| {
+        *keys.entry(key).or_insert_with_key(|key| {
+            group_labels.push(Labels::new(key.clone()));
+            (group_labels.len() - 1) as u32
+        })
+    };
+    // Classic signature: full labels minus `le`, metric name included.
+    let mut classic_sigs: HashMap<Vec<Label>, u32> = HashMap::new();
     let mut inputs = Vec::with_capacity(input.len());
+    let mut native_keys = Vec::with_capacity(input.len());
     for idx in 0..input.len() {
         let labels = input.labels(idx as u32);
         let Some(upper_bound) = labels.get("le").and_then(|le| le.parse::<f64>().ok()) else {
             inputs.push(None);
+            let mut key = group_key_labels(labels, &native_grouping);
+            key.sort();
+            native_keys.push(Some(key));
             continue;
         };
-        let mut key = group_key_labels(labels, &grouping);
+        native_keys.push(None);
+        let mut key = group_key_labels(labels, &classic_grouping);
         key.sort();
-        let group = *keys.entry(key).or_insert_with_key(|key| {
-            group_labels.push(Labels::new(key.clone()));
-            (group_labels.len() - 1) as u32
-        });
+        let group = group_for(key);
+        let mut sig: Vec<Label> = labels.iter().filter(|l| l.name != "le").cloned().collect();
+        sig.sort();
+        classic_sigs.insert(sig, group);
         inputs.push(Some(BucketSeries { group, upper_bound }));
     }
+    let natives = native_keys
+        .into_iter()
+        .enumerate()
+        .map(|(idx, key)| {
+            let key = key?;
+            let mut full: Vec<Label> = input.labels(idx as u32).iter().cloned().collect();
+            full.sort();
+            Some(NativeSeries {
+                group: group_for(key),
+                classic_conflict: classic_sigs.get(&full).copied(),
+            })
+        })
+        .collect();
     HistogramGroups {
         inputs,
+        natives,
         group_labels,
     }
 }

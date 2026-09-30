@@ -38,7 +38,7 @@ use super::super::operators::binary::{BinaryOp, BinaryOpKind, ConstScalarOp, Mat
 use super::super::operators::coercion::{ScalarizeOp, TimeScalarOp};
 use super::super::operators::concurrent::ConcurrentOp;
 use super::super::operators::count_values::CountValuesOp;
-use super::super::operators::histogram::{BucketSeries, HistogramOp};
+use super::super::operators::histogram::{BucketSeries, HistogramOp, NativeSeries};
 use super::super::operators::instant_fn::InstantFnOp;
 use super::super::operators::label_manip::{LabelManipKind, LabelManipOp};
 use super::super::operators::matrix_selector::MatrixSelectorOp;
@@ -625,7 +625,8 @@ where
                 &built.inputs,
                 build_group_schema(&built.group_labels),
                 reservation.clone(),
-            );
+            )
+            .with_natives(&built.natives);
             Ok(wrap_op(Box::new(op), "Histogram", ctx))
         }
         LogicalPlan::Absent { labels, child } => {

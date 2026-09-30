@@ -609,7 +609,7 @@
           }
         ],
         "requestBody": {
-          "description": "Snappy-compressed Prometheus WriteRequest",
+          "description": "Snappy-compressed Prometheus remote-write request: `prometheus.WriteRequest` (1.0, default) or `io.prometheus.write.v2.Request` when the content type carries `proto=io.prometheus.write.v2.Request`. Both carry native histograms.",
           "content": {
             "application/x-protobuf": {
               "schema": {
@@ -621,10 +621,20 @@
         },
         "responses": {
           "204": {
-            "description": "Write accepted"
+            "description": "Write accepted; 2.0 requests also receive X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written headers"
           },
           "400": {
             "description": "Invalid remote-write request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported remote-write protobuf message",
             "content": {
               "application/json": {
                 "schema": {

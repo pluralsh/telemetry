@@ -101,6 +101,7 @@ fn build_window(
         values,
         cells: cell_idx,
         effective_times: None,
+        histograms: None,
     }
 }
 
@@ -723,6 +724,7 @@ fn build_window_tile(
         values,
         cells: cell_idx,
         effective_times: None,
+        histograms: None,
     }
 }
 

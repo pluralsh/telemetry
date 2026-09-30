@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use regex::Regex;
 
 use crate::model::{Label, Labels};
-use crate::promql::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use crate::promql::batch::{BitSet, HistogramCells, SchemaRef, SeriesSchema, StepBatch};
 use crate::promql::memory::{MemoryReservation, QueryError};
 use crate::promql::operator::{Operator, OperatorSchema};
 
@@ -238,6 +238,7 @@ impl<C: Operator> LabelManipOp<C> {
         let out_series_count = output_schema.len();
         let cells = step_count.saturating_mul(out_series_count);
         let mut out = OutBuffers::allocate(&self.reservation, cells)?;
+        let mut histograms: Option<HistogramCells> = None;
 
         for batch in &batches {
             let in_series_count = batch.series_count();
@@ -251,7 +252,8 @@ impl<C: Operator> LabelManipOp<C> {
                 let step_base = step_off * in_series_count;
                 for series_off in 0..in_series_count {
                     let cell = step_base + series_off;
-                    if !batch.validity.get(cell) {
+                    let histogram = batch.histogram(cell);
+                    if !batch.validity.get(cell) && histogram.is_none() {
                         continue;
                     }
 
@@ -263,12 +265,21 @@ impl<C: Operator> LabelManipOp<C> {
                         ))
                     })? as usize;
                     let out_cell = global_step * out_series_count + out_series;
-                    if out.validity.get(out_cell) {
+                    let occupied = out.validity.get(out_cell)
+                        || histograms
+                            .as_ref()
+                            .is_some_and(|cells| cells[out_cell].is_some());
+                    if occupied {
                         return Err(QueryError::Internal(
                             "vector cannot contain metrics with the same labelset".to_string(),
                         ));
                     }
 
+                    if let Some(h) = histogram {
+                        histograms.get_or_insert_with(|| vec![None; cells])[out_cell] =
+                            Some(h.clone());
+                        continue;
+                    }
                     out.values[out_cell] = batch.values[cell];
                     out.validity.set(out_cell);
                 }
@@ -287,14 +298,18 @@ impl<C: Operator> LabelManipOp<C> {
                 )
             });
         let (values, validity) = out.finish();
-        Ok(StepBatch::new(
+        let batch = StepBatch::new(
             step_timestamps,
             0..step_count,
             SchemaRef::Static(output_schema),
             0..out_series_count,
             values,
             validity,
-        ))
+        );
+        Ok(match histograms {
+            Some(h) => batch.with_histograms(h),
+            None => batch,
+        })
     }
 }
 

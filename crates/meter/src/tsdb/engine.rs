@@ -324,7 +324,7 @@ impl QueryReader for TsdbQueryReader {
         metric_name: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<crate::model::SeriesData> {
         let mini = self.mini_readers.get(bucket).ok_or_else(|| {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;

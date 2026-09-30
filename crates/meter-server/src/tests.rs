@@ -693,6 +693,7 @@ async fn grpc_retries_are_idempotent() {
                 timestamp_ms: 1_700_000_000_000,
                 value: 1.0,
             }],
+            histograms: vec![],
         }],
         metadata: vec![],
         durability: ProtoDurability::Applied as i32,

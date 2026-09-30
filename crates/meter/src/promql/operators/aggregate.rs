@@ -72,9 +72,10 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use super::super::batch::{BitSet, HistogramCells, SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema};
+use crate::histogram::FloatHistogram;
 
 mod accumulator;
 mod breaker;
@@ -314,6 +315,12 @@ pub struct AggregateOp<C: Operator> {
     /// ordering (step/series tiles interleaved, or split by
     /// `Concurrent`/`Coalesce`).
     accums: Vec<Accumulator>,
+    /// Native histogram lane parallel to [`Self::accums`], allocated on the
+    /// first histogram cell. Only `sum`, `avg`, `count` and `group` accept
+    /// histograms; the other kinds ignore them as Prometheus does.
+    hist_accums: Vec<HistogramAccumulator>,
+    /// Bytes reserved for [`Self::hist_accums`]; released on `Drop`.
+    hist_bytes: usize,
     /// Step timestamps captured from the first child batch. Reused for the
     /// single output batch this operator emits on EOS. Streaming kinds
     /// only; breaker kinds echo the child batch's timestamps directly.
@@ -512,6 +519,8 @@ impl<C: Operator> AggregateOp<C> {
             param_bytes,
             param_loaded: false,
             accums,
+            hist_accums: Vec::new(),
+            hist_bytes: 0,
             streaming_step_timestamps: None,
             heaps,
             sort_bufs,
@@ -584,7 +593,7 @@ impl<C: Operator> AggregateOp<C> {
     /// all funnel into the same buffered grid, and the final aggregate is
     /// associative on insertion order (modulo floating-point rounding,
     /// which the Kahan lane caps).
-    fn absorb_batch_streaming(&mut self, input: &StepBatch) {
+    fn absorb_batch_streaming(&mut self, input: &StepBatch) -> Result<(), QueryError> {
         debug_assert!(!self.kind.is_breaker());
         self.debug_assert_batch_within_input_roster(input);
 
@@ -627,6 +636,36 @@ impl<C: Operator> AggregateOp<C> {
                 self.accums[accum_base + group].absorb(v);
             }
         }
+
+        let accepts_histograms = matches!(
+            self.kind,
+            AggregateKind::Sum | AggregateKind::Avg | AggregateKind::Count | AggregateKind::Group
+        );
+        let Some(cells) = input.histograms.as_ref().filter(|_| accepts_histograms) else {
+            return Ok(());
+        };
+        if self.hist_accums.is_empty() {
+            let len = self.accums.len();
+            let bytes = len.saturating_mul(std::mem::size_of::<HistogramAccumulator>());
+            self.reservation.try_grow(bytes)?;
+            self.hist_bytes = bytes;
+            self.hist_accums = vec![HistogramAccumulator::default(); len];
+        }
+        let combine = matches!(self.kind, AggregateKind::Sum | AggregateKind::Avg);
+        for step_off in 0..step_count_in {
+            let accum_base = (input.step_range.start + step_off) * group_count;
+            for in_series in 0..in_series_count {
+                let Some(h) = &cells[step_off * in_series_count + in_series] else {
+                    continue;
+                };
+                let global_series = input.series_range.start + in_series;
+                let Some(group) = self.group_map.input_to_group[global_series] else {
+                    continue;
+                };
+                self.hist_accums[accum_base + group as usize].absorb(h, combine);
+            }
+        }
+        Ok(())
     }
 
     /// Produce the single output batch covering the full outer grid for
@@ -640,12 +679,40 @@ impl<C: Operator> AggregateOp<C> {
         let out_cells = step_count.saturating_mul(group_count);
 
         let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+        let mut histograms: Option<HistogramCells> = None;
 
         for step in 0..step_count {
             let accum_base = step * group_count;
             let out_base = step * group_count;
             for g in 0..group_count {
                 let accum = &self.accums[accum_base + g];
+                let idx = out_base + g;
+                let hist_count = self.hist_accums.get(accum_base + g).map_or(0, |h| h.count);
+                if hist_count > 0 {
+                    let value = match self.kind {
+                        AggregateKind::Count => Some(accum.count as f64 + hist_count as f64),
+                        AggregateKind::Group => Some(1.0),
+                        // A group mixing floats and histograms has no sum.
+                        _ if accum.count > 0 => None,
+                        _ => {
+                            let hist = &mut self.hist_accums[accum_base + g];
+                            if let Some(mut h) = hist.take_sum() {
+                                if self.kind == AggregateKind::Avg {
+                                    h.div(hist_count as f64);
+                                }
+                                h.compact();
+                                histograms.get_or_insert_with(|| vec![None; out_cells])[idx] =
+                                    Some(Arc::new(h));
+                            }
+                            None
+                        }
+                    };
+                    if let Some(v) = value {
+                        out.values[idx] = v;
+                        out.validity.set(idx);
+                    }
+                    continue;
+                }
                 if accum.count == 0 {
                     continue;
                 }
@@ -666,7 +733,6 @@ impl<C: Operator> AggregateOp<C> {
                         unreachable!("breaker kind routed to streaming finaliser")
                     }
                 };
-                let idx = out_base + g;
                 out.values[idx] = value;
                 out.validity.set(idx);
             }
@@ -682,14 +748,55 @@ impl<C: Operator> AggregateOp<C> {
         });
 
         let (values, validity) = out.finish();
-        Ok(StepBatch::new(
+        let batch = StepBatch::new(
             step_timestamps,
             0..step_count,
             SchemaRef::Static(self.output_schema.clone()),
             0..group_count,
             values,
             validity,
-        ))
+        );
+        Ok(match histograms {
+            Some(cells) => batch.with_histograms(cells),
+            None => batch,
+        })
+    }
+}
+
+/// Per-(step, group) native histogram state for the streaming kinds.
+#[derive(Clone, Default)]
+struct HistogramAccumulator {
+    count: usize,
+    sum: Option<FloatHistogram>,
+    compensation: crate::histogram::Compensation,
+    /// An exponential and a custom-bucket histogram met in this group.
+    incompatible: bool,
+}
+
+impl HistogramAccumulator {
+    fn absorb(&mut self, h: &FloatHistogram, combine: bool) {
+        self.count += 1;
+        if !combine || self.incompatible {
+            return;
+        }
+        match self.sum.as_mut() {
+            None => self.sum = Some(h.clone()),
+            Some(sum) => {
+                if sum.kahan_add(h, &mut self.compensation).is_err() {
+                    self.incompatible = true;
+                    self.sum = None;
+                }
+            }
+        }
+    }
+
+    fn take_sum(&mut self) -> Option<FloatHistogram> {
+        if self.incompatible {
+            return None;
+        }
+        let mut sum = self.sum.take()?;
+        self.compensation.apply(&mut sum);
+        Some(sum)
     }
 }
 
@@ -737,7 +844,10 @@ impl<C: Operator> Operator for AggregateOp<C> {
                 }
                 Poll::Ready(Some(Ok(input))) => {
                     self.saw_any_batch = true;
-                    self.absorb_batch_streaming(&input);
+                    if let Err(err) = self.absorb_batch_streaming(&input) {
+                        self.errored = true;
+                        return Poll::Ready(Some(Err(err)));
+                    }
                 }
             }
         }
@@ -773,6 +883,10 @@ impl<C: Operator> Drop for AggregateOp<C> {
         if self.breaker_grid_bytes > 0 {
             self.reservation.release(self.breaker_grid_bytes);
             self.breaker_grid_bytes = 0;
+        }
+        if self.hist_bytes > 0 {
+            self.reservation.release(self.hist_bytes);
+            self.hist_bytes = 0;
         }
     }
 }

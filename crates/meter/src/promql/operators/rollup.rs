@@ -26,9 +26,10 @@
 //! [`MemoryReservation::try_grow`]; the input window batch is already
 //! accounted for by `MatrixSelectorOp`.
 
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::super::batch::{BitSet, StepBatch};
+use super::super::batch::{BitSet, HistogramCells, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema};
 use super::super::source::SeriesSource;
@@ -294,6 +295,7 @@ impl<W: WindowStream> RollupOp<W> {
         };
 
         let eval_ts = &window.step_timestamps[window.step_range.clone()];
+        let mut histograms: Option<HistogramCells> = None;
         for (step_off, (&window_end, &eval)) in window_end_ts
             .iter()
             .zip(eval_ts)
@@ -304,7 +306,25 @@ impl<W: WindowStream> RollupOp<W> {
             for series_off in 0..series_count {
                 let (ts, vs) = window.cell_samples(step_off, series_off);
                 let out_idx = step_off * series_count + series_off;
-                if let Some(v) = self.kind.compute(window_start, window_end, eval, ts, vs) {
+                let (hts, hs) = window.cell_histograms(step_off, series_off);
+                let result = if hs.is_empty() {
+                    rollup_hist::Outcome::FloatPath
+                } else {
+                    rollup_hist::compute(self.kind, window_start, window_end, ts, vs, hts, hs)
+                };
+                let value = match result {
+                    rollup_hist::Outcome::FloatPath => {
+                        self.kind.compute(window_start, window_end, eval, ts, vs)
+                    }
+                    rollup_hist::Outcome::Float(v) => Some(v),
+                    rollup_hist::Outcome::Histogram(h) => {
+                        histograms.get_or_insert_with(|| vec![None; cell_count])[out_idx] =
+                            Some(Arc::new(h));
+                        None
+                    }
+                    rollup_hist::Outcome::Absent => None,
+                };
+                if let Some(v) = value {
                     out.values[out_idx] = v;
                     out.validity.set(out_idx);
                 }
@@ -312,14 +332,18 @@ impl<W: WindowStream> RollupOp<W> {
         }
 
         let (values, validity) = out.finish();
-        Ok(StepBatch::new(
+        let batch = StepBatch::new(
             window.step_timestamps.clone(),
             window.step_range.clone(),
             window.series.clone(),
             window.series_range.clone(),
             values,
             validity,
-        ))
+        );
+        Ok(match histograms {
+            Some(cells) => batch.with_histograms(cells),
+            None => batch,
+        })
     }
 }
 
@@ -399,22 +423,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> WindowStream for MatrixWindowSource
 // ---------------------------------------------------------------------------
 
 mod rollup_fns {
-    /// Kahan-Neumaier compensated summation step. `#[inline(never)]`
-    /// matches the existing implementation to guard against compiler
-    /// reordering that would change IEEE-754 output (cf. Prometheus
-    /// #16714).
-    #[inline(never)]
-    fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
-        let t = sum + inc;
-        let new_c = if t.is_infinite() {
-            0.0
-        } else if sum.abs() >= inc.abs() {
-            c + ((sum - t) + inc)
-        } else {
-            c + ((inc - t) + sum)
-        };
-        (t, new_c)
-    }
+    use crate::util::kahan_inc;
 
     fn counter_increase_correction(vs: &[f64]) -> f64 {
         let mut correction = 0.0;
@@ -736,6 +745,259 @@ mod rollup_fns {
         }
         let weight = rank - lo as f64;
         sorted[lo] * (1.0 - weight) + sorted[hi] * weight
+    }
+}
+
+/// Range functions over windows holding native histograms, ported from
+/// Prometheus `extrapolatedRate` / `histogramRate` / `instantValue` and the
+/// `*_over_time` family. Only reached when the window has at least one
+/// histogram sample.
+mod rollup_hist {
+    use std::sync::Arc;
+
+    use super::RollupKind;
+    use crate::histogram::{CounterResetHint, FloatHistogram};
+
+    pub(super) enum Outcome {
+        /// The function ignores histograms; use the float reducer.
+        FloatPath,
+        Float(f64),
+        Histogram(FloatHistogram),
+        Absent,
+    }
+
+    pub(super) fn compute(
+        kind: RollupKind,
+        window_start_ms: i64,
+        window_end_ms: i64,
+        ts: &[i64],
+        vs: &[f64],
+        hts: &[i64],
+        hs: &[Arc<FloatHistogram>],
+    ) -> Outcome {
+        use RollupKind::*;
+        match kind {
+            Rate | Increase | Delta => {
+                if !vs.is_empty() {
+                    return Outcome::Absent;
+                }
+                let is_counter = !matches!(kind, Delta);
+                let is_rate = matches!(kind, Rate);
+                extrapolated(window_start_ms, window_end_ms, hts, hs, is_counter, is_rate)
+                    .map_or(Outcome::Absent, Outcome::Histogram)
+            }
+            Irate | Idelta => instant(ts, vs, hts, hs, matches!(kind, Irate)),
+            Resets => Outcome::Float(count_transitions(ts, vs, hts, hs, |prev, cur| {
+                match (prev, cur) {
+                    (Point::Float(a), Point::Float(b)) => b < a,
+                    (Point::Histogram(a), Point::Histogram(b)) => b.detect_reset(a),
+                    _ => true,
+                }
+            })),
+            Changes => Outcome::Float(count_transitions(ts, vs, hts, hs, |prev, cur| {
+                match (prev, cur) {
+                    (Point::Float(a), Point::Float(b)) => a != b && !(a.is_nan() && b.is_nan()),
+                    (Point::Histogram(a), Point::Histogram(b)) => !b.equals(a),
+                    _ => true,
+                }
+            })),
+            SumOverTime | AvgOverTime => {
+                if !vs.is_empty() {
+                    return Outcome::Absent;
+                }
+                let reduced = if matches!(kind, AvgOverTime) {
+                    crate::histogram::kahan_mean(hs.iter().map(|h| &**h))
+                } else {
+                    crate::histogram::kahan_sum(hs.iter().map(|h| &**h))
+                };
+                match reduced {
+                    Ok(Some(h)) => Outcome::Histogram(h),
+                    _ => Outcome::Absent,
+                }
+            }
+            CountOverTime => Outcome::Float((vs.len() + hs.len()) as f64),
+            PresentOverTime => Outcome::Float(1.0),
+            LastOverTime => match (ts.last(), hts.last()) {
+                (Some(&ft), Some(&ht)) if ht < ft => Outcome::FloatPath,
+                _ => Outcome::Histogram((**hs.last().expect("non-empty")).clone()),
+            },
+            MinOverTime | MaxOverTime | StddevOverTime | StdvarOverTime | QuantileOverTime(_)
+            | Deriv | PredictLinear(_) => Outcome::FloatPath,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Point<'a> {
+        Float(f64),
+        Histogram(&'a FloatHistogram),
+    }
+
+    /// Walk floats and histograms merged by timestamp, counting adjacent
+    /// pairs for which `transition` holds.
+    fn count_transitions(
+        ts: &[i64],
+        vs: &[f64],
+        hts: &[i64],
+        hs: &[Arc<FloatHistogram>],
+        transition: impl Fn(Point<'_>, Point<'_>) -> bool,
+    ) -> f64 {
+        let (mut fi, mut hi) = (0usize, 0usize);
+        let mut prev: Option<Point<'_>> = None;
+        let mut count = 0usize;
+        while fi < ts.len() || hi < hts.len() {
+            let cur = if hi >= hts.len() || (fi < ts.len() && ts[fi] < hts[hi]) {
+                fi += 1;
+                Point::Float(vs[fi - 1])
+            } else {
+                hi += 1;
+                Point::Histogram(&hs[hi - 1])
+            };
+            if let Some(p) = prev
+                && transition(p, cur)
+            {
+                count += 1;
+            }
+            prev = Some(cur);
+        }
+        count as f64
+    }
+
+    fn extrapolated(
+        window_start_ms: i64,
+        window_end_ms: i64,
+        hts: &[i64],
+        hs: &[Arc<FloatHistogram>],
+        is_counter: bool,
+        is_rate: bool,
+    ) -> Option<FloatHistogram> {
+        if hs.len() < 2 {
+            return None;
+        }
+        let mut result = histogram_rate(hs, is_counter)?;
+        let n_minus_one = (hs.len() - 1) as f64;
+        let (first_t, last_t) = (hts[0], hts[hts.len() - 1]);
+        let mut duration_to_start = (first_t - window_start_ms) as f64 / 1000.0;
+        let mut duration_to_end = (window_end_ms - last_t) as f64 / 1000.0;
+        let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+        let average_interval = sampled_interval / n_minus_one;
+        let threshold = average_interval * 1.1;
+
+        if duration_to_start >= threshold {
+            duration_to_start = average_interval / 2.0;
+        }
+        if is_counter && result.count > 0.0 && hs[0].count >= 0.0 {
+            let duration_to_zero = sampled_interval * (hs[0].count / result.count);
+            if duration_to_zero < duration_to_start {
+                duration_to_start = duration_to_zero;
+            }
+        }
+        if duration_to_end >= threshold {
+            duration_to_end = average_interval / 2.0;
+        }
+        let mut factor = if sampled_interval != 0.0 {
+            (sampled_interval + duration_to_start + duration_to_end) / sampled_interval
+        } else {
+            1.0
+        };
+        if is_rate {
+            factor /= (window_end_ms - window_start_ms) as f64 / 1000.0;
+        }
+        result.mul(factor);
+        Some(result)
+    }
+
+    fn histogram_rate(hs: &[Arc<FloatHistogram>], is_counter: bool) -> Option<FloatHistogram> {
+        let last = &hs[hs.len() - 1];
+        let reset_base;
+        let mut prev: &FloatHistogram = &hs[0];
+        let mut uses_custom = prev.uses_custom_buckets();
+        // A reset between the first two samples means the first one is
+        // irrelevant, including any bucket-layout incompatibility it has.
+        if is_counter && hs[1].detect_reset(prev) {
+            reset_base = FloatHistogram {
+                schema: hs[1].schema,
+                custom_values: hs[1].custom_values.clone(),
+                ..Default::default()
+            };
+            prev = &reset_base;
+            uses_custom = hs[1].uses_custom_buckets();
+        }
+        if last.uses_custom_buckets() != uses_custom {
+            return None;
+        }
+        let mut min_schema = last.schema.min(prev.schema);
+        if is_counter {
+            for h in &hs[1..hs.len() - 1] {
+                min_schema = min_schema.min(h.schema);
+                if h.uses_custom_buckets() != uses_custom {
+                    return None;
+                }
+            }
+        }
+
+        let mut result = last.copy_to_schema(min_schema);
+        result.sub(prev).ok()?;
+        if is_counter {
+            for h in &hs[1..] {
+                if h.detect_reset(prev) {
+                    result.add(prev).ok()?;
+                }
+                prev = h;
+            }
+        }
+        result.counter_reset_hint = CounterResetHint::Gauge;
+        result.compact();
+        Some(result)
+    }
+
+    fn instant(
+        ts: &[i64],
+        vs: &[f64],
+        hts: &[i64],
+        hs: &[Arc<FloatHistogram>],
+        is_rate: bool,
+    ) -> Outcome {
+        if ts.len() + hts.len() < 2 {
+            return Outcome::Absent;
+        }
+        let mut ss: Vec<(i64, Point<'_>)> = Vec::with_capacity(2);
+        for i in ts.len().saturating_sub(2)..ts.len() {
+            ss.push((ts[i], Point::Float(vs[i])));
+        }
+        for i in hts.len().saturating_sub(2)..hts.len() {
+            let s = (hts[i], Point::Histogram(&hs[i]));
+            match ss.len() {
+                0 => ss.push(s),
+                1 if s.0 < ss[0].0 => ss.insert(0, s),
+                1 => ss.push(s),
+                _ if s.0 < ss[0].0 => {}
+                _ if s.0 > ss[1].0 => {
+                    ss[0] = ss[1];
+                    ss[1] = s;
+                }
+                _ => ss[0] = s,
+            }
+        }
+        let interval_ms = ss[1].0 - ss[0].0;
+        if interval_ms == 0 {
+            return Outcome::Absent;
+        }
+        match (ss[0].1, ss[1].1) {
+            (Point::Float(_), Point::Float(_)) => Outcome::FloatPath,
+            (Point::Histogram(prev), Point::Histogram(cur)) => {
+                let mut result = cur.clone();
+                if (!is_rate || !cur.detect_reset(prev)) && result.sub(prev).is_err() {
+                    return Outcome::Absent;
+                }
+                result.counter_reset_hint = CounterResetHint::Gauge;
+                result.compact();
+                if is_rate {
+                    result.div(interval_ms as f64 / 1000.0);
+                }
+                Outcome::Histogram(result)
+            }
+            _ => Outcome::Absent,
+        }
     }
 }
 

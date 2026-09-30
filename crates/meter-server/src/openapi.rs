@@ -190,10 +190,11 @@ fn federate() {}
     path = "/write/ns/{namespace}/api/v1/write",
     tag = "ingest",
     params(("namespace" = String, Path)),
-    request_body(content = BinaryBody, content_type = "application/x-protobuf", description = "Snappy-compressed Prometheus WriteRequest"),
+    request_body(content = BinaryBody, content_type = "application/x-protobuf", description = "Snappy-compressed Prometheus remote-write request: `prometheus.WriteRequest` (1.0, default) or `io.prometheus.write.v2.Request` when the content type carries `proto=io.prometheus.write.v2.Request`. Both carry native histograms."),
     responses(
-        (status = 204, description = "Write accepted"),
-        (status = 400, description = "Invalid remote-write request", body = ErrorEnvelope)
+        (status = 204, description = "Write accepted; 2.0 requests also receive X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written headers"),
+        (status = 400, description = "Invalid remote-write request", body = ErrorEnvelope),
+        (status = 415, description = "Unsupported remote-write protobuf message", body = ErrorEnvelope)
     )
 )]
 fn remote_write() {}

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use sharding::{ShardId, ShardMap};
 
-use crate::{Label, Namespace, Sample, Series};
+use crate::{Label, Namespace, Series};
 
 /// Canonical Meter routing key used for shard selection.
 pub(crate) fn canonical_routing_key(namespace: &Namespace, labels: &[Label]) -> Vec<u8> {
@@ -51,26 +51,20 @@ pub fn split(
                 .push(item);
             continue;
         }
-        let mut by_shard: BTreeMap<ShardId, Vec<Sample>> = BTreeMap::new();
-        for sample in &item.samples {
-            let shard = assignment.route_key(&key, sample.timestamp_ms.saturating_mul(1_000_000));
-            by_shard.entry(shard).or_default().push(sample.clone());
-        }
-        if by_shard.len() <= 1 {
-            let shard = by_shard.into_keys().next().unwrap_or_else(|| {
-                assignment.route_key(&key, common::time::now_ms().saturating_mul(1_000_000))
-            });
+        if item.sample_count() == 0 {
+            let shard =
+                assignment.route_key(&key, common::time::now_ms().saturating_mul(1_000_000));
             grouped.entry(shard).or_default().push(item);
             continue;
         }
-        for (shard, samples) in by_shard {
-            grouped.entry(shard).or_default().push(Series {
-                labels: item.labels.clone(),
-                metric_type: item.metric_type,
-                unit: item.unit.clone(),
-                description: item.description.clone(),
-                samples,
-            });
+        let partitions = item.partition_by(|timestamp_ms| {
+            Ok::<_, std::convert::Infallible>(
+                assignment.route_key(&key, timestamp_ms.saturating_mul(1_000_000)),
+            )
+        });
+        let Ok(partitions) = partitions;
+        for (shard, series) in partitions {
+            grouped.entry(shard).or_default().push(series);
         }
     }
     grouped

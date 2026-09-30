@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::MetricType;
+use crate::model::Sample;
 use crate::storage::in_memory_storage;
 
 fn create_sample(
@@ -27,6 +28,7 @@ fn create_sample(
             timestamp_ms: timestamp,
             value,
         }],
+        histograms: Vec::new(),
     }
 }
 
@@ -1228,7 +1230,7 @@ mod wiring_tests {
         // when
         let opts = QueryOptions::default();
         let result = tsdb
-            .eval_query("histogram_count(http_requests)", None, &opts)
+            .eval_query("holt_winters(http_requests[5m], 0.5, 0.5)", None, &opts)
             .await;
         // then
         let err = result.unwrap_err();

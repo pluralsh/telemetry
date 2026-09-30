@@ -3120,7 +3120,6 @@ dependencies = [
  "regex-syntax",
  "roaring",
  "rstest",
- "ryu",
  "serde",
  "serde_json",
  "serde_with",

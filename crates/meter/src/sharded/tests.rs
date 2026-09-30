@@ -1,6 +1,6 @@
 use super::*;
-use crate::Label;
 use crate::routing::{route, split};
+use crate::{Label, Sample};
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use sharding::{DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_SHARDS};
 

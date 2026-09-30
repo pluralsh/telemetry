@@ -27,8 +27,9 @@ use super::super::batch::{SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::TimeRange;
-use super::matrix_selector::{CellIndex, MatrixWindowBatch};
+use super::matrix_selector::{CellIndex, MatrixWindowBatch, WindowHistograms};
 use super::rollup::WindowStream;
+use crate::histogram::FloatHistogram;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,7 @@ struct InFlight {
     child: Box<dyn Operator + Send>,
     per_series_ts: Vec<Vec<i64>>,
     per_series_vs: Vec<Vec<f64>>,
+    per_series_hist: Vec<Vec<(i64, Arc<FloatHistogram>)>>,
 }
 
 impl SubqueryOp {
@@ -301,6 +303,7 @@ impl SubqueryOp {
                 child,
                 per_series_ts: vec![Vec::new(); series_count],
                 per_series_vs: vec![Vec::new(); series_count],
+                per_series_hist: vec![Vec::new(); series_count],
             });
         }
         let in_flight = self.in_flight.as_mut().expect("in-flight child");
@@ -319,6 +322,7 @@ impl SubqueryOp {
                         in_flight.inner_window,
                         &mut in_flight.per_series_ts,
                         &mut in_flight.per_series_vs,
+                        &mut in_flight.per_series_hist,
                     ) {
                         return Poll::Ready(Err(err));
                     }
@@ -328,6 +332,7 @@ impl SubqueryOp {
         let InFlight {
             per_series_ts,
             per_series_vs,
+            per_series_hist,
             ..
         } = self.in_flight.take().expect("in-flight child");
 
@@ -356,6 +361,29 @@ impl SubqueryOp {
             };
         }
 
+        let histograms = if per_series_hist.iter().any(|col| !col.is_empty()) {
+            let mut out = WindowHistograms {
+                cells: vec![CellIndex::EMPTY; series_count],
+                ..Default::default()
+            };
+            for (series_off, col) in per_series_hist.into_iter().enumerate() {
+                if let Err(err) = buffers.grow_samples(col.len()) {
+                    return Poll::Ready(Err(err));
+                }
+                out.cells[series_off] = CellIndex {
+                    offset: out.timestamps.len() as u32,
+                    len: col.len() as u32,
+                };
+                for (t, h) in col {
+                    out.timestamps.push(t);
+                    out.values.push(h);
+                }
+            }
+            Some(out)
+        } else {
+            None
+        };
+
         let (timestamps, values, cells) = buffers.finish();
 
         let effective_times = if self.has_effective_shift {
@@ -372,6 +400,7 @@ impl SubqueryOp {
             values,
             cells,
             effective_times,
+            histograms,
         }))
     }
 
@@ -383,6 +412,7 @@ impl SubqueryOp {
         inner_window: TimeRange,
         per_series_ts: &mut [Vec<i64>],
         per_series_vs: &mut [Vec<f64>],
+        per_series_hist: &mut [Vec<(i64, Arc<FloatHistogram>)>],
     ) -> Result<(), QueryError> {
         let step_ts = batch.step_timestamps_slice();
         let series_count = batch.series_count();
@@ -400,6 +430,10 @@ impl SubqueryOp {
                 continue;
             }
             for series_off in 0..series_count {
+                if let Some(h) = batch.histogram(batch.cell_index(step_off, series_off)) {
+                    per_series_hist[series_base + series_off].push((t, h.clone()));
+                    continue;
+                }
                 let Some(v) = batch.get(step_off, series_off) else {
                     continue;
                 };
@@ -450,6 +484,7 @@ impl SubqueryOp {
                 values: Vec::new(),
                 cells: Vec::new(),
                 effective_times: None,
+                histograms: None,
             })));
         }
         let idx = self.next_outer_step;

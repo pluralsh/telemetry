@@ -15,7 +15,7 @@ use futures::Stream;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 
-use crate::model::{Label, Labels, Sample, SeriesId, TimeBucket};
+use crate::model::{Label, Labels, SeriesData, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 
 use super::index_cache::IndexCache;
@@ -368,18 +368,28 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
         .buffered(SAMPLES_PER_RUN_CONCURRENCY)
         .enumerate();
     while let Some((col_idx, samples)) = fetched.next().await {
-        let samples: Vec<Sample> = samples?;
+        let SeriesData { floats, histograms } = samples?;
         let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
-        ts_col.reserve(samples.len());
-        val_col.reserve(samples.len());
+        ts_col.reserve(floats.len());
+        val_col.reserve(floats.len());
         // Preserve stale markers verbatim as STALE_NAN — the
         // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
         // which survives the unmodified `s.value` copy below
         // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
         // contract).
-        for s in samples {
+        for s in floats {
             ts_col.push(s.timestamp_ms);
             val_col.push(s.value);
+        }
+        let (hts_col, h_col) = (
+            &mut block.histogram_timestamps[col_idx],
+            &mut block.histograms[col_idx],
+        );
+        hts_col.reserve(histograms.len());
+        h_col.reserve(histograms.len());
+        for h in histograms {
+            hts_col.push(h.timestamp_ms);
+            h_col.push(Arc::new(h.histogram));
         }
     }
 

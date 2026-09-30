@@ -1,6 +1,7 @@
-use crate::model::{Label, MetricType, Sample, Series, TimeBucket};
+use crate::model::{HistogramSample, Label, MetricType, Sample, Series, TimeBucket};
 use crate::promql::promqltest::dsl::SeriesLoad;
 use crate::tsdb::Tsdb;
+use std::collections::HashMap;
 use std::time::UNIX_EPOCH;
 
 /// Load series data into TSDB
@@ -10,49 +11,44 @@ pub(super) async fn load_series(
     series: &[SeriesLoad],
 ) -> Result<(), String> {
     for s in series {
-        // Collect all samples for this series
-        let mut samples = Vec::new();
-
+        let mut samples = Vec::with_capacity(s.values.len());
         for (step, value) in &s.values {
-            // Validate step index
-            if *step < 0 {
-                return Err(format!("Negative step index not allowed: {}", step));
-            }
-
-            // Safe timestamp calculation with overflow checking
-            let delta = interval
-                .checked_mul(*step as u32)
-                .ok_or_else(|| format!("Timestamp overflow for step {}", step))?;
-
-            let ts = UNIX_EPOCH + delta;
-            let ts_ms = ts
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| format!("Invalid timestamp: {}", e))?
-                .as_millis() as i64;
-
-            samples.push((ts_ms, *value));
+            samples.push((step_timestamp_ms(interval, *step)?, *value));
+        }
+        let mut histograms = Vec::with_capacity(s.histograms.len());
+        for (step, h) in &s.histograms {
+            histograms.push((step_timestamp_ms(interval, *step)?, h.clone()));
         }
 
         // Sort by timestamp and deduplicate (keep last value per timestamp)
         // This matches Prometheus promqltest semantics
         samples.sort_by_key(|(ts, _)| *ts);
         samples.dedup_by_key(|(ts, _)| *ts);
+        histograms.sort_by_key(|(ts, _)| *ts);
+        histograms.dedup_by_key(|(ts, _)| *ts);
 
         // Group by bucket and ingest
-        let mut bucket_samples: std::collections::HashMap<TimeBucket, Vec<Sample>> =
-            std::collections::HashMap::new();
-
+        let mut buckets: HashMap<TimeBucket, (Vec<Sample>, Vec<HistogramSample>)> = HashMap::new();
         for (ts_ms, value) in samples {
-            let ts = UNIX_EPOCH + std::time::Duration::from_millis(ts_ms as u64);
-            let bucket = TimeBucket::round_to_hour(ts).unwrap();
-            bucket_samples
-                .entry(bucket)
+            buckets
+                .entry(bucket_for(ts_ms))
                 .or_default()
+                .0
                 .push(Sample::new(ts_ms, value));
+        }
+        for (ts_ms, histogram) in histograms {
+            buckets
+                .entry(bucket_for(ts_ms))
+                .or_default()
+                .1
+                .push(HistogramSample {
+                    timestamp_ms: ts_ms,
+                    histogram,
+                });
         }
 
         // Ingest each bucket
-        for (bucket, bucket_samples) in bucket_samples {
+        for (bucket, (bucket_samples, bucket_histograms)) in buckets {
             let labels: Vec<Label> = s
                 .labels
                 .iter()
@@ -68,6 +64,7 @@ pub(super) async fn load_series(
                 unit: None,
                 description: None,
                 samples: bucket_samples,
+                histograms: bucket_histograms,
             };
 
             let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
@@ -76,4 +73,19 @@ pub(super) async fn load_series(
     }
     tsdb.flush().await.unwrap();
     Ok(())
+}
+
+fn step_timestamp_ms(interval: std::time::Duration, step: i64) -> Result<i64, String> {
+    if step < 0 {
+        return Err(format!("Negative step index not allowed: {}", step));
+    }
+    let delta = interval
+        .checked_mul(step as u32)
+        .ok_or_else(|| format!("Timestamp overflow for step {}", step))?;
+    Ok(delta.as_millis() as i64)
+}
+
+fn bucket_for(ts_ms: i64) -> TimeBucket {
+    let ts = UNIX_EPOCH + std::time::Duration::from_millis(ts_ms as u64);
+    TimeBucket::round_to_hour(ts).unwrap()
 }

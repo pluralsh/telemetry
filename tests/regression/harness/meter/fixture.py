@@ -16,10 +16,35 @@ class Sample:
     value: float
 
 
+Spans = tuple[tuple[int, tuple[int, ...]], ...]
+"""Sparse buckets as `(offset, absolute counts)` spans, as in remote write."""
+
+CUSTOM_BUCKETS_SCHEMA = -53
+
+
+@dataclass(frozen=True)
+class NativeHistogram:
+    timestamp_ms: int
+    schema: int
+    zero_threshold: float
+    zero_count: int
+    sum: float
+    positive: Spans = ()
+    negative: Spans = ()
+    custom_values: tuple[float, ...] = ()
+
+    @property
+    def count(self) -> int:
+        return self.zero_count + sum(
+            sum(counts) for _, counts in (*self.positive, *self.negative)
+        )
+
+
 @dataclass(frozen=True)
 class Series:
     labels: tuple[tuple[str, str], ...]
     samples: tuple[Sample, ...]
+    histograms: tuple[NativeHistogram, ...] = ()
 
 
 def series(
@@ -30,6 +55,18 @@ def series(
     return Series(
         labels=(("__name__", name), *labels),
         samples=tuple(Sample(timestamp, value) for timestamp, value in samples),
+    )
+
+
+def histogram_series(
+    name: str,
+    labels: tuple[tuple[str, str], ...],
+    histograms: tuple[NativeHistogram, ...],
+) -> Series:
+    return Series(
+        labels=(("__name__", name), *labels),
+        samples=(),
+        histograms=histograms,
     )
 
 
@@ -72,6 +109,71 @@ def regression_fixture(base_ms: int) -> tuple[Series, ...]:
             )
         )
     return tuple(result)
+
+
+def native_histogram_fixture(base_ms: int) -> tuple[Series, ...]:
+    """Cumulative native histograms sharing the float fixture's timestamps.
+
+    Instance `a` grows monotonically at schema 1. Instance `b` uses schema 0
+    with negative buckets and resets at index 6 so `rate` exercises counter
+    reset handling. The custom-bucket series covers schema -53.
+    """
+    times = tuple(base_ms + index * 60_000 for index in range(10))
+    job = (("job", NAMESPACE),)
+
+    def grow(index: int, timestamp: int) -> NativeHistogram:
+        return NativeHistogram(
+            timestamp_ms=timestamp,
+            schema=1,
+            zero_threshold=0.001,
+            zero_count=index,
+            sum=1.5 * index,
+            positive=(
+                (0, (index + 1, 2 * index + 1, 3 * index)),
+                (2, (index, index + 2)),
+            ),
+        )
+
+    def reset(index: int, timestamp: int) -> NativeHistogram:
+        value = index if index < 6 else index - 6
+        return NativeHistogram(
+            timestamp_ms=timestamp,
+            schema=0,
+            zero_threshold=0.001,
+            zero_count=value,
+            sum=1.75 * value,
+            positive=((-1, (2 * value + 1, value)), (3, (value + 1,))),
+            negative=((0, (value,)),),
+        )
+
+    def custom(index: int, timestamp: int) -> NativeHistogram:
+        return NativeHistogram(
+            timestamp_ms=timestamp,
+            schema=CUSTOM_BUCKETS_SCHEMA,
+            zero_threshold=0.0,
+            zero_count=0,
+            sum=0.75 * index,
+            positive=((0, (index, 2 * index, index + 1, index, 1)),),
+            custom_values=(0.1, 0.5, 1.0, 5.0),
+        )
+
+    return (
+        histogram_series(
+            "regression_native_seconds",
+            (("instance", "a"), *job),
+            tuple(grow(index, timestamp) for index, timestamp in enumerate(times)),
+        ),
+        histogram_series(
+            "regression_native_seconds",
+            (("instance", "b"), *job),
+            tuple(reset(index, timestamp) for index, timestamp in enumerate(times)),
+        ),
+        histogram_series(
+            "regression_nhcb_seconds",
+            (("instance", "a"), *job),
+            tuple(custom(index, timestamp) for index, timestamp in enumerate(times)),
+        ),
+    )
 
 
 def fixture_shard(value: Series) -> int:

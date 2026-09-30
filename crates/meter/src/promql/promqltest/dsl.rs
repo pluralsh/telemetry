@@ -1,5 +1,7 @@
-use crate::model::{Label, Labels, RangeSample};
+use crate::histogram::{Bucket, CounterResetHint, FloatHistogram};
+use crate::model::{Label, Labels, RangeSample, STALE_NAN};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -46,6 +48,7 @@ pub enum Command {
 pub struct SeriesLoad {
     pub labels: HashMap<String, String>, // includes __name__
     pub values: Vec<(i64, f64)>,         // (step_index, value)
+    pub histograms: Vec<(i64, FloatHistogram)>,
 }
 
 // ============================================================================
@@ -260,7 +263,7 @@ fn parse_series(line: &str) -> Result<SeriesLoad, String> {
     }
 
     let (metric, labels) = parse_metric(metric_part.trim())?;
-    let values = parse_multiple_value_exprs(&value_parts)?;
+    let (values, histograms) = parse_multiple_value_exprs(&value_parts)?;
 
     let mut all_labels = labels;
     if !metric.is_empty() {
@@ -270,6 +273,7 @@ fn parse_series(line: &str) -> Result<SeriesLoad, String> {
     Ok(SeriesLoad {
         labels: all_labels,
         values,
+        histograms,
     })
 }
 
@@ -310,49 +314,83 @@ fn parse_labels(labels_str: &str, context: &str) -> Result<HashMap<String, Strin
     Ok(labels)
 }
 
-fn parse_multiple_value_exprs(s: &str) -> Result<Vec<(i64, f64)>, String> {
-    let mut all = Vec::new();
+type ParsedValues = (Vec<(i64, f64)>, Vec<(i64, FloatHistogram)>);
+
+fn parse_multiple_value_exprs(s: &str) -> Result<ParsedValues, String> {
+    let mut floats = Vec::new();
+    let mut histograms = Vec::new();
     let mut base_step = 0i64;
 
-    // IMPORTANT (test-driver design decision):
-    //
-    // We treat multiple value expressions as sequential blocks to guarantee
-    // monotonically increasing step indices at parse time.
-    //
-    // Example: "0+10x3 100+20x2" produces steps [0,1,2,3,4,5,6]
-    // (x3 => 4 samples, x2 => 3 samples) instead of [0,1,2,3,0,1,2]
-    //
-    // Why this matters:
-    // 1. Predictable behavior: Test authors see sequential timestamps
-    // 2. Avoids confusion: Overlapping steps would be non-obvious
-    // 3. Safety: Prevents accidental backwards timestamps
-    //
-    // Our runner also sorts/deduplicates before ingestion, so overlaps would
-    // work. But we enforce sequential blocks for clarity and predictability.
-    //
-    // This is a test-driver constraint, not a PromQL semantic requirement.
-    for part in s.split_whitespace() {
-        let values = parse_values(part)?;
-        for (step, value) in values {
-            all.push((step + base_step, value));
-        }
-        base_step = all.len() as i64;
+    // Multiple value expressions are sequential blocks: "0+10x3 100+20x2"
+    // produces steps [0..=6] (x3 => 4 samples, x2 => 3 samples), and `_`
+    // (or `_xN`) occupies steps without producing samples.
+    for token in value_tokens(s)? {
+        base_step += parse_value_token(&token, base_step, &mut floats, &mut histograms)?;
     }
 
-    Ok(all)
+    Ok((floats, histograms))
 }
 
-fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
-    let s = s.trim();
+/// Split a value list on whitespace, keeping `{{ … }}` histogram
+/// descriptors (which contain spaces) inside a single token.
+fn value_tokens(s: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' && chars.peek() == Some(&'{') {
+            chars.next();
+            depth += 1;
+            current.push_str("{{");
+        } else if c == '}' && depth > 0 && chars.peek() == Some(&'}') {
+            chars.next();
+            depth -= 1;
+            current.push_str("}}");
+        } else if c.is_whitespace() && depth == 0 {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if depth != 0 {
+        return Err(format!("Unbalanced {{{{ }}}} in values: {s}"));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
 
-    // Check for expansion syntax: "start+step x count", "start-step x count"
-    // or the "start x count" shorthand for a zero step.
-    // Prometheus promqltest semantics are inclusive:
-    // "0+10x5" => 6 samples: [0, 10, 20, 30, 40, 50].
-    // Example: "0+10x100" => [0, 10, 20, ..., 1000].
-    if let Some((lhs, count_str)) = s.split_once('x')
-        && lhs != "_"
-    {
+/// Parse one value token starting at `base_step`, returning the number of
+/// steps it occupies. Expansions are inclusive, as in Prometheus:
+/// `0+10x5` => 6 samples `[0, 10, …, 50]`, and `{{a}}+{{b}}x2` =>
+/// `a, a+b, a+2b`. `_xN` skips N steps.
+fn parse_value_token(
+    token: &str,
+    base_step: i64,
+    floats: &mut Vec<(i64, f64)>,
+    histograms: &mut Vec<(i64, FloatHistogram)>,
+) -> Result<i64, String> {
+    if token == "_" {
+        return Ok(1);
+    }
+    if let Some(count) = token.strip_prefix("_x") {
+        return count
+            .parse::<i64>()
+            .map_err(|_| format!("Invalid count: {count}"));
+    }
+    if token == "stale" {
+        floats.push((base_step, f64::from_bits(STALE_NAN)));
+        return Ok(1);
+    }
+    if token.starts_with("{{") {
+        return parse_histogram_token(token, base_step, histograms);
+    }
+
+    if let Some((lhs, count_str)) = token.split_once('x') {
         let (start_str, step) = match expansion_split(lhs) {
             Some((start_str, sign, step_str)) => {
                 let step: f64 = step_str
@@ -365,25 +403,140 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
         let start: f64 = start_str
             .parse()
             .map_err(|_| format!("Invalid start value: {}", start_str))?;
-        let count: usize = count_str
+        let count: i64 = count_str
             .parse()
             .map_err(|_| format!("Invalid count: {}", count_str))?;
+        for i in 0..=count {
+            floats.push((base_step + i, start + step * i as f64));
+        }
+        return Ok(count + 1);
+    }
 
-        Ok((0..=count)
-            .map(|i| (i as i64, start + step * i as f64))
-            .collect())
-    } else {
-        // Space-separated individual values
-        s.split_whitespace()
+    let value = token
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid value '{}'", token))?;
+    floats.push((base_step, value));
+    Ok(1)
+}
+
+/// `{{h}}`, `{{h}}xN`, or `{{a}}±{{b}}xN`.
+fn parse_histogram_token(
+    token: &str,
+    base_step: i64,
+    histograms: &mut Vec<(i64, FloatHistogram)>,
+) -> Result<i64, String> {
+    let first_end = token
+        .find("}}")
+        .ok_or_else(|| format!("Unterminated histogram: {token}"))?;
+    let start = parse_histogram_desc(&token[2..first_end])?;
+    let rest = &token[first_end + 2..];
+    if rest.is_empty() {
+        histograms.push((base_step, start));
+        return Ok(1);
+    }
+    if let Some(count) = rest.strip_prefix('x') {
+        let count: i64 = count
+            .parse()
+            .map_err(|_| format!("Invalid count in: {token}"))?;
+        for i in 0..=count {
+            histograms.push((base_step + i, start.clone()));
+        }
+        return Ok(count + 1);
+    }
+    let negate = match rest.as_bytes().first() {
+        Some(b'+') => false,
+        Some(b'-') => true,
+        _ => return Err(format!("Invalid histogram expansion: {token}")),
+    };
+    let rest = &rest[1..];
+    let inner = rest
+        .strip_prefix("{{")
+        .and_then(|r| r.split_once("}}x"))
+        .ok_or_else(|| format!("Invalid histogram expansion: {token}"))?;
+    let increment = parse_histogram_desc(inner.0)?;
+    let count: i64 = inner
+        .1
+        .parse()
+        .map_err(|_| format!("Invalid count in: {token}"))?;
+    let mut current = start;
+    for i in 0..=count {
+        histograms.push((base_step + i, current.clone()));
+        let combined = if negate {
+            current.sub(&increment)
+        } else {
+            current.add(&increment)
+        };
+        combined.map_err(|e| format!("Cannot expand {token}: {e:?}"))?;
+    }
+    Ok(count + 1)
+}
+
+/// Parse the inside of `{{ … }}`: space-separated `key:value` pairs where
+/// list values are bracketed (`buckets:[1 2 1]`). Bucket lists start at
+/// index `offset` / `n_offset`.
+fn parse_histogram_desc(desc: &str) -> Result<FloatHistogram, String> {
+    let mut h = FloatHistogram::default();
+    let (mut buckets, mut n_buckets) = (Vec::new(), Vec::new());
+    let (mut offset, mut n_offset) = (0i32, 0i32);
+    let mut rest = desc.trim();
+    while !rest.is_empty() {
+        let (key, after) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("Invalid histogram field in: {desc}"))?;
+        let key = key.trim();
+        let after = after.trim_start();
+        let (value, remaining) = if let Some(list) = after.strip_prefix('[') {
+            let (inner, remaining) = list
+                .split_once(']')
+                .ok_or_else(|| format!("Unterminated list in: {desc}"))?;
+            (inner, remaining)
+        } else {
+            after.split_once(char::is_whitespace).unwrap_or((after, ""))
+        };
+        rest = remaining.trim_start();
+        let float = |v: &str| v.parse::<f64>().map_err(|_| format!("Invalid {key}: {v}"));
+        let list = |v: &str| {
+            v.split_whitespace()
+                .map(float)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let int = |v: &str| v.parse::<i32>().map_err(|_| format!("Invalid {key}: {v}"));
+        match key {
+            "schema" => h.schema = int(value)?,
+            "sum" => h.sum = float(value)?,
+            "count" => h.count = float(value)?,
+            "z_bucket" => h.zero_count = float(value)?,
+            "z_bucket_w" => h.zero_threshold = float(value)?,
+            "buckets" => buckets = list(value)?,
+            "n_buckets" => n_buckets = list(value)?,
+            "offset" => offset = int(value)?,
+            "n_offset" => n_offset = int(value)?,
+            "custom_values" => h.custom_values = Arc::from(list(value)?),
+            "counter_reset_hint" => {
+                h.counter_reset_hint = match value {
+                    "unknown" => CounterResetHint::Unknown,
+                    "reset" => CounterResetHint::CounterReset,
+                    "not_reset" => CounterResetHint::NotCounterReset,
+                    "gauge" => CounterResetHint::Gauge,
+                    other => return Err(format!("Invalid counter_reset_hint: {other}")),
+                }
+            }
+            other => return Err(format!("Unknown histogram field '{other}' in: {desc}")),
+        }
+    }
+    let to_buckets = |counts: Vec<f64>, offset: i32| -> Vec<Bucket> {
+        counts
+            .into_iter()
             .enumerate()
-            .filter_map(|(i, v)| if v == "_" { None } else { Some((i as i64, v)) })
-            .map(|(i, v)| {
-                v.parse::<f64>()
-                    .map(|f| (i, f))
-                    .map_err(|_| format!("Invalid value '{}'", v))
+            .map(|(i, count)| Bucket {
+                index: offset + i as i32,
+                count,
             })
             .collect()
-    }
+    };
+    h.positive = to_buckets(buckets, offset);
+    h.negative = to_buckets(n_buckets, n_offset);
+    Ok(h)
 }
 
 /// Split `start±step` at the operator, skipping a leading sign and the
@@ -441,9 +594,17 @@ fn parse_expected(line: &str) -> Result<RangeSample, String> {
     }
 
     let (metric_name, label_map) = parse_metric(metric_part.trim())?;
-    let value = value_str
-        .parse::<f64>()
-        .map_err(|_| format!("Invalid value '{}' in expected: {}", value_str, line))?;
+    let (samples, histograms) = if let Some(desc) = value_str
+        .strip_prefix("{{")
+        .and_then(|v| v.strip_suffix("}}"))
+    {
+        (Vec::new(), vec![(0, Arc::new(parse_histogram_desc(desc)?))])
+    } else {
+        let value = value_str
+            .parse::<f64>()
+            .map_err(|_| format!("Invalid value '{}' in expected: {}", value_str, line))?;
+        (vec![(0, value)], Vec::new())
+    };
 
     let mut labels: Vec<Label> = label_map
         .into_iter()
@@ -455,7 +616,8 @@ fn parse_expected(line: &str) -> Result<RangeSample, String> {
     labels.sort();
     Ok(RangeSample {
         labels: Labels::new(labels),
-        samples: vec![(0, value)],
+        samples,
+        histograms,
     })
 }
 
@@ -628,7 +790,7 @@ mod tests {
         let input = "0+10x5";
 
         // when
-        let vals = parse_values(input).unwrap();
+        let (vals, _) = parse_multiple_value_exprs(input).unwrap();
 
         // then
         assert_eq!(
@@ -645,12 +807,84 @@ mod tests {
     }
 
     #[test]
+    fn should_advance_steps_over_blanks() {
+        // given
+        let input = "1 _ 3 _x2 5";
+
+        // when
+        let (vals, _) = parse_multiple_value_exprs(input).unwrap();
+
+        // then
+        assert_eq!(vals, vec![(0, 1.0), (2, 3.0), (5, 5.0)]);
+    }
+
+    #[test]
+    fn should_parse_histogram_descriptor() {
+        // given
+        let input = "{{schema:1 sum:5 count:4 z_bucket:1 z_bucket_w:0.01 buckets:[1 2] offset:-1 n_buckets:[1] counter_reset_hint:gauge}}";
+
+        // when
+        let (floats, hists) = parse_multiple_value_exprs(input).unwrap();
+
+        // then
+        assert!(floats.is_empty());
+        assert_eq!(hists.len(), 1);
+        let (step, h) = &hists[0];
+        assert_eq!(*step, 0);
+        assert_eq!((h.schema, h.sum, h.count), (1, 5.0, 4.0));
+        assert_eq!((h.zero_count, h.zero_threshold), (1.0, 0.01));
+        assert_eq!(
+            h.positive,
+            vec![
+                Bucket {
+                    index: -1,
+                    count: 1.0
+                },
+                Bucket {
+                    index: 0,
+                    count: 2.0
+                }
+            ]
+        );
+        assert_eq!(
+            h.negative,
+            vec![Bucket {
+                index: 0,
+                count: 1.0
+            }]
+        );
+        assert_eq!(h.counter_reset_hint, CounterResetHint::Gauge);
+    }
+
+    #[test]
+    fn should_expand_histogram_series() {
+        // given
+        let input = "{{sum:1 count:1 buckets:[1]}}+{{sum:2 count:2 buckets:[2]}}x2 _ {{count:7}}x1";
+
+        // when
+        let (_, hists) = parse_multiple_value_exprs(input).unwrap();
+
+        // then
+        let got: Vec<(i64, f64, f64)> = hists.iter().map(|(s, h)| (*s, h.count, h.sum)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1.0, 1.0),
+                (1, 3.0, 3.0),
+                (2, 5.0, 5.0),
+                (4, 7.0, 0.0),
+                (5, 7.0, 0.0)
+            ]
+        );
+    }
+
+    #[test]
     fn should_use_absolute_step_indices_for_multiple_expressions() {
         // given
         let input = "0+10x3 100+20x2";
 
         // when
-        let vals = parse_multiple_value_exprs(input).unwrap();
+        let (vals, _) = parse_multiple_value_exprs(input).unwrap();
 
         // then
         assert_eq!(
@@ -673,7 +907,7 @@ mod tests {
         let input = "1 2 invalid 4";
 
         // when
-        let result = parse_values(input);
+        let result = parse_multiple_value_exprs(input);
 
         // then
         assert!(result.is_err());
@@ -686,7 +920,7 @@ mod tests {
         let input = "0+10x3 100+5x3";
 
         // when
-        let vals = parse_multiple_value_exprs(input).unwrap();
+        let (vals, _) = parse_multiple_value_exprs(input).unwrap();
 
         // then
         assert_eq!(
@@ -710,7 +944,7 @@ mod tests {
         let input = "0+10x3 0+20x2"; // Second expression also starts at step 0
 
         // when
-        let vals = parse_multiple_value_exprs(input).unwrap();
+        let (vals, _) = parse_multiple_value_exprs(input).unwrap();
 
         // then - we produce sequential steps [0,1,2,3,4,5,6]
         // not overlapping [0,1,2,3,0,1,2]

@@ -17,7 +17,7 @@ use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
 use crate::model::{
-    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, Series, SeriesId,
+    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series, SeriesId,
     TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
@@ -505,52 +505,15 @@ impl Tsdb {
 
         // First pass: group all series by bucket
         for series in series_list {
-            let series_sample_count = series.samples.len();
-            total_samples += series_sample_count;
-
-            let Series {
-                labels,
-                metric_type,
-                unit,
-                description,
-                samples,
-            } = series;
-            // Group samples by bucket for this series
-            let mut bucket_samples: HashMap<TimeBucket, Vec<Sample>> = HashMap::new();
-
-            for sample in samples {
-                let bucket = TimeBucket::round_to_hour(
-                    std::time::UNIX_EPOCH
-                        + std::time::Duration::from_millis(sample.timestamp_ms as u64),
-                )?;
-                bucket_samples.entry(bucket).or_default().push(sample);
+            total_samples += series.sample_count();
+            let partitions = series.partition_by(|timestamp_ms| {
+                TimeBucket::round_to_hour(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms as u64),
+                )
+            })?;
+            for (bucket, series) in partitions {
+                bucket_series_map.entry(bucket).or_default().push(series);
             }
-
-            // One series per bucket; the last bucket takes the owned fields,
-            // so the common single-bucket series is never cloned.
-            let mut groups: Vec<_> = bucket_samples.into_iter().collect();
-            let Some((last_bucket, last_samples)) = groups.pop() else {
-                continue;
-            };
-            for (bucket, samples) in groups {
-                bucket_series_map.entry(bucket).or_default().push(Series {
-                    labels: labels.clone(),
-                    metric_type,
-                    unit: unit.clone(),
-                    description: description.clone(),
-                    samples,
-                });
-            }
-            bucket_series_map
-                .entry(last_bucket)
-                .or_default()
-                .push(Series {
-                    labels,
-                    metric_type,
-                    unit,
-                    description,
-                    samples: last_samples,
-                });
         }
 
         let buckets_touched = bucket_series_map.len();
@@ -558,7 +521,7 @@ impl Tsdb {
         // Second pass: ingest all series for each bucket in a single batch
         for (bucket, series_list) in bucket_series_map {
             let series_count = series_list.len();
-            let samples_count: usize = series_list.iter().map(|s| s.samples.len()).sum();
+            let samples_count: usize = series_list.iter().map(Series::sample_count).sum();
 
             tracing::debug!(
                 bucket = ?bucket,

@@ -8,7 +8,8 @@ use crate::active_series::ActiveSeriesTracker;
 use crate::error::{Error, Result};
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{
-    Label, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket,
+    HistogramSample, Label, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint,
+    SeriesId, TimeBucket,
 };
 use crate::util::Fingerprint;
 
@@ -17,6 +18,13 @@ use crate::util::Fingerprint;
 pub(crate) struct SeriesSamples {
     pub(crate) metric_name: String,
     pub(crate) points: Vec<Sample>,
+    pub(crate) histograms: Vec<HistogramSample>,
+}
+
+impl SeriesSamples {
+    pub(crate) fn len(&self) -> usize {
+        self.points.len() + self.histograms.len()
+    }
 }
 
 /// State that persists across delta freezes.
@@ -73,7 +81,7 @@ impl TsdbWriteDelta {
             unit,
             description,
             samples,
-            ..
+            histograms,
         } = series;
         labels.sort_by(|a, b| a.name.cmp(&b.name));
         let fingerprint = labels.fingerprint();
@@ -86,39 +94,35 @@ impl TsdbWriteDelta {
         let bucket_start_ms = i64::from(self.bucket.start) * 60 * 1000;
         let bucket_end_ms =
             (i64::from(self.bucket.start) + i64::from(self.bucket.size_in_mins())) * 60 * 1000;
-        // Resolved on the first in-range sample, so a series whose first
-        // sample is rejected is never registered.
-        let mut series_id = None;
-        for sample in samples {
-            if sample.timestamp_ms < bucket_start_ms || sample.timestamp_ms >= bucket_end_ms {
+        // Validated before registration, so a series with a rejected sample
+        // is never registered.
+        let timestamps = samples
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .chain(histograms.iter().map(|h| h.timestamp_ms));
+        for timestamp_ms in timestamps {
+            if timestamp_ms < bucket_start_ms || timestamp_ms >= bucket_end_ms {
                 return Err(Error::InvalidInput(format!(
                     "Sample timestamp {} is outside bucket range [{}, {})",
-                    sample.timestamp_ms, bucket_start_ms, bucket_end_ms
+                    timestamp_ms, bucket_start_ms, bucket_end_ms
                 )));
             }
-            let id = match series_id {
-                Some(id) => id,
-                None => *series_id.insert(self.resolve_series(
-                    &labels,
-                    fingerprint,
-                    &unit,
-                    metric_type,
-                    &description,
-                )?),
-            };
-            self.samples
-                .entry(id)
-                .or_insert_with(|| SeriesSamples {
-                    metric_name: labels
-                        .iter()
-                        .find(|l| l.name == "__name__")
-                        .map(|l| l.value.clone())
-                        .unwrap_or_default(),
-                    points: Vec::new(),
-                })
-                .points
-                .push(sample);
         }
+        if samples.is_empty() && histograms.is_empty() {
+            return Ok(());
+        }
+        let id = self.resolve_series(&labels, fingerprint, &unit, metric_type, &description)?;
+        let entry = self.samples.entry(id).or_insert_with(|| SeriesSamples {
+            metric_name: labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| l.value.clone())
+                .unwrap_or_default(),
+            points: Vec::new(),
+            histograms: Vec::new(),
+        });
+        entry.points.extend(samples);
+        entry.histograms.extend(histograms);
         Ok(())
     }
 
@@ -212,9 +216,22 @@ impl Delta for TsdbWriteDelta {
     }
 
     fn estimate_size(&self) -> usize {
-        // Rough estimate: 16 bytes per sample + index overhead
-        let sample_count: usize = self.samples.values().map(|s| s.points.len()).sum();
-        sample_count * 16
+        // Rough estimate: 16 bytes per float sample, 32 bytes per histogram
+        // bucket + index overhead
+        let sample_bytes: usize = self
+            .samples
+            .values()
+            .map(|s| {
+                s.points.len() * 16
+                    + s.histograms
+                        .iter()
+                        .map(|h| {
+                            64 + 32 * (h.histogram.positive.len() + h.histogram.negative.len())
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        sample_bytes
             + self.forward_index.series.len() * 128
             + self.inverted_index.postings.len() * 64
     }

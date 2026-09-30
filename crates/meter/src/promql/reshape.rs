@@ -28,7 +28,9 @@
 //! than panicking.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::histogram::FloatHistogram;
 use crate::model::{InstantSample, Labels, QueryValue, RangeSample};
 
 use super::batch::{SchemaRef, SeriesSchema, StepBatch};
@@ -96,16 +98,23 @@ pub fn reshape_instant(
                 "reshape_instant saw batch with step_count={step_count}; expected 1",
             )));
         }
-        for (series_off, step_ts, value) in valid_cells(&batch) {
+        for (series_off, step_ts, cell) in present_cells(&batch) {
             let global_idx = (batch.series_range.start + series_off) as u32;
+            let (value, histogram) = match cell {
+                Cell::Float(v) => (v, None),
+                Cell::Histogram(h) => (f64::NAN, Some(h.clone())),
+            };
             samples.push(InstantSample {
                 labels: schema.labels(global_idx).clone(),
                 timestamp_ms: step_ts,
                 value,
+                histogram,
             });
         }
     }
     if let Some(sort) = plan.root_instant_vector_sort {
+        // Prometheus' `sort` / `sort_desc` drop histogram samples.
+        samples.retain(|s| s.histogram.is_none());
         samples.sort_by(|left, right| compare_instant_values(left.value, right.value, sort));
     }
     Ok(QueryValue::Vector(samples))
@@ -142,17 +151,21 @@ pub fn reshape_range(
     // still produces stable `RangeSample`s. `or_insert_with` clones each
     // series' `Labels` exactly once — the first time a valid cell for
     // that series is seen — never per step.
-    let mut per_series: BTreeMap<u32, (Labels, Vec<(i64, f64)>)> = BTreeMap::new();
+    let mut per_series: BTreeMap<u32, RangeSample> = BTreeMap::new();
     for batch in &batches {
         check_batch_shape(batch)?;
         let schema = batch_static_schema(batch)?;
-        for (series_off, step_ts, value) in valid_cells(batch) {
+        for (series_off, step_ts, cell) in present_cells(batch) {
             let global_idx = (batch.series_range.start + series_off) as u32;
-            per_series
-                .entry(global_idx)
-                .or_insert_with(|| (schema.labels(global_idx).clone(), Vec::new()))
-                .1
-                .push((step_ts, value));
+            let series = per_series.entry(global_idx).or_insert_with(|| RangeSample {
+                labels: schema.labels(global_idx).clone(),
+                samples: Vec::new(),
+                histograms: Vec::new(),
+            });
+            match cell {
+                Cell::Float(v) => series.samples.push((step_ts, v)),
+                Cell::Histogram(h) => series.histograms.push((step_ts, h.clone())),
+            }
         }
     }
 
@@ -161,9 +174,10 @@ pub fn reshape_range(
     // ranges across series — sort per series to be safe.
     let out = per_series
         .into_values()
-        .map(|(labels, mut samples)| {
-            samples.sort_by_key(|(ts, _)| *ts);
-            RangeSample { labels, samples }
+        .map(|mut series| {
+            series.samples.sort_by_key(|(ts, _)| *ts);
+            series.histograms.sort_by_key(|(ts, _)| *ts);
+            series
         })
         .collect();
     Ok(QueryValue::Matrix(out))
@@ -185,7 +199,35 @@ fn reshape_scalar_range(batches: &[StepBatch]) -> Result<QueryValue, ReshapeErro
     Ok(QueryValue::Matrix(vec![RangeSample {
         labels: Labels::empty(),
         samples,
+        histograms: Vec::new(),
     }]))
+}
+
+enum Cell<'a> {
+    Float(f64),
+    Histogram(&'a Arc<FloatHistogram>),
+}
+
+/// Like [`valid_cells`], but also yields histogram cells.
+fn present_cells(batch: &StepBatch) -> impl Iterator<Item = (usize, i64, Cell<'_>)> + '_ {
+    let series_count = batch.series_count();
+    batch
+        .step_timestamps_slice()
+        .iter()
+        .take(batch.step_count())
+        .enumerate()
+        .flat_map(move |(step_off, &step_ts)| {
+            (0..series_count).map(move |series_off| (step_off, series_off, step_ts))
+        })
+        .filter_map(move |(step_off, series_off, step_ts)| {
+            let cell = batch.cell_index(step_off, series_off);
+            if batch.validity.get(cell) {
+                return Some((series_off, step_ts, Cell::Float(batch.values[cell])));
+            }
+            batch
+                .histogram(cell)
+                .map(|h| (series_off, step_ts, Cell::Histogram(h)))
+        })
 }
 
 /// Yields `(series_offset, step_timestamp, value)` for every valid cell of
@@ -844,6 +886,7 @@ mod tests {
             values: vec![1.0],
             validity,
             source_timestamps: None,
+            histograms: None,
         };
         let plan = mk_plan(SchemaRef::Static(schema), range_grid(100, 100, 2));
 
@@ -873,6 +916,7 @@ mod tests {
             values: vec![1.0],
             validity,
             source_timestamps: None,
+            histograms: None,
         };
         let plan = mk_plan(SchemaRef::Deferred, instant_grid(100));
 

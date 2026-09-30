@@ -20,6 +20,11 @@ suite keeps those slower checks out of pull-request latency:
 mise exec -- python -m pytest tests/regression/test_live --extended
 ```
 
+Compose builds product images with `--build` by default. Set
+`REGRESSION_BUILD=0` to reuse prebuilt `telemetry-regression/<product>-server:local`
+images instead; CI builds those per product in parallel through buildx with
+the GitHub Actions layer cache.
+
 ## Meter
 
 `products/meter/` owns Prometheus, MinIO, Meter compose/config assets. The
@@ -29,7 +34,11 @@ OTLP protobuf, authentication, HTTP calls, and response normalization. The live
 tests compare PromQL and discovery results against Prometheus using relative
 tolerance `1e-9` with absolute floor `1e-12`, and cover sharding, forwarding,
 the Basic/JWT authorization matrix, OTLP metadata, idempotency, namespace
-isolation, and reader freshness.
+isolation, and reader freshness. Native histograms are written as remote-write
+integer histograms (exponential schemas with a counter reset, and custom
+buckets) and as an OTLP exponential histogram at scale 10, then compared as
+full bucket layouts through selectors, `rate`/`increase`, aggregation, and the
+`histogram_*` functions.
 
 The optional Meter-only entrypoint used by the kind handoff scenario is:
 

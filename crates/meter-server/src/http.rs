@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use common::display::prometheus_float;
-use meter::{Namespace, OtelConfig, OtelConverter, QueryValue, ShardedMeter};
+use meter::{Namespace, OtelConfig, OtelConverter, ShardedMeter, remote_write::Protocol};
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
@@ -74,19 +74,50 @@ async fn remote_write(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    let series = meter::remote_write::parse_remote_write(&body).map_err(ApiError::bad_request)?;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let protocol = Protocol::from_content_type(content_type).ok_or_else(|| {
+        ApiError::unsupported_media(format!(
+            "unsupported remote write content type {:?}",
+            content_type.unwrap_or_default()
+        ))
+    })?;
+    let batch =
+        meter::remote_write::parse_remote_write(&body, protocol).map_err(ApiError::bad_request)?;
+    let (samples, histograms) = (batch.samples, batch.histograms);
     let request_id = request_id(&headers, &body);
     state
         .route_write(
             &namespace,
-            series,
+            batch.series,
             state.config.write.durability,
             request_id,
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(match protocol {
+        Protocol::V1 => StatusCode::NO_CONTENT.into_response(),
+        Protocol::V2 => (
+            StatusCode::NO_CONTENT,
+            [
+                (
+                    "x-prometheus-remote-write-samples-written",
+                    samples.to_string(),
+                ),
+                (
+                    "x-prometheus-remote-write-histograms-written",
+                    histograms.to_string(),
+                ),
+                (
+                    "x-prometheus-remote-write-exemplars-written",
+                    "0".to_string(),
+                ),
+            ],
+        )
+            .into_response(),
+    })
 }
 
 async fn otlp_http(
@@ -170,7 +201,7 @@ async fn execute_query(
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad_request)?;
-    Ok(Json(prom_query(value)))
+    prom_json(meter::query_value_to_response(Ok(value)))
 }
 
 #[derive(Deserialize)]
@@ -223,14 +254,7 @@ async fn execute_query_range(
     .await
     .map_err(ApiError::internal)?
     .map_err(ApiError::bad_request)?;
-    Ok(Json(
-        json!({"status":"success","data":{"resultType":"matrix","result":
-            values.into_iter().map(|sample| json!({
-                "metric": sample.labels,
-                "values": sample.samples.into_iter().map(|(time, value)| json!([time as f64 / 1000.0, value.to_string()])).collect::<Vec<_>>()
-            })).collect::<Vec<_>>()
-        }}),
-    ))
+    prom_json(meter::range_result_to_response(Ok(values)))
 }
 
 #[derive(Default, Deserialize)]
@@ -489,25 +513,12 @@ fn time_range(start: Option<f64>, end: Option<f64>) -> RangeInclusive<SystemTime
     )
 }
 
-fn prom_query(value: QueryValue) -> Value {
-    match value {
-        QueryValue::Scalar {
-            timestamp_ms,
-            value,
-        } => {
-            json!({"status":"success","data":{"resultType":"scalar","result":[timestamp_ms as f64 / 1000.0,value.to_string()]}})
-        }
-        QueryValue::Vector(samples) => {
-            json!({"status":"success","data":{"resultType":"vector","result":
-                samples.into_iter().map(|sample| json!({"metric":sample.labels,"value":[sample.timestamp_ms as f64 / 1000.0,sample.value.to_string()]})).collect::<Vec<_>>()
-            }})
-        }
-        QueryValue::Matrix(samples) => {
-            json!({"status":"success","data":{"resultType":"matrix","result":
-                samples.into_iter().map(|sample| json!({"metric":sample.labels,"values":sample.samples.into_iter().map(|(time,value)| json!([time as f64 / 1000.0,value.to_string()])).collect::<Vec<_>>()})).collect::<Vec<_>>()
-            }})
-        }
-    }
+/// Query results go through Meter's Prometheus wire encoders so native
+/// histograms (`histogram` / `histograms`) and float spellings match upstream.
+fn prom_json(response: impl serde::Serialize) -> Result<Json<Value>, ApiError> {
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 fn request_id(headers: &HeaderMap, body: &[u8]) -> String {

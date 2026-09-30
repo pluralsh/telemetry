@@ -36,7 +36,7 @@ def track() -> tuple[TrackSuite, ComposeProject]:
     with project:
         suite = TrackSuite.create()
         suite.seed()
-        project.execute("up", "--detach", "--build", "track-reader", timeout=900)
+        project.up("track-reader")
         wait_http("http://localhost:13203/-/ready")
         suite.wait_for_reader()
         yield suite, project

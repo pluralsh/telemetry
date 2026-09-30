@@ -1,3 +1,4 @@
+use crate::histogram::{Bucket, FloatHistogram};
 use crate::model::RangeSample;
 
 /// Compare actual results against expected results
@@ -58,17 +59,66 @@ pub(super) fn assert_results(
             }
         }
 
-        let exp_value = exp.samples[0].1;
-        let result_value = result.samples[0].1;
-        if (result_value - exp_value).abs() > 1e-6 {
+        let mismatch = match (exp.histograms.first(), result.histograms.first()) {
+            (Some((_, exp_h)), Some((_, got_h))) => (!histograms_match(exp_h, got_h))
+                .then(|| format!("expected {exp_h:?}, got {got_h:?}")),
+            (Some((_, exp_h)), None) => Some(format!(
+                "expected histogram {exp_h:?}, got float {:?}",
+                result.samples.first().map(|s| s.1)
+            )),
+            (None, Some((_, got_h))) => Some(format!(
+                "expected float {:?}, got histogram {got_h:?}",
+                exp.samples.first().map(|s| s.1)
+            )),
+            (None, None) => {
+                let exp_value = exp.samples[0].1;
+                let result_value = result.samples[0].1;
+                (!floats_match(exp_value, result_value))
+                    .then(|| format!("expected {exp_value}, got {result_value}"))
+            }
+        };
+        if let Some(detail) = mismatch {
             return Err(format!(
-                "{} eval #{} (query: {}): Value mismatch: expected {}, got {}",
-                test_name, eval_num, query, exp_value, result_value
+                "{} eval #{} (query: {}): Value mismatch for {:?}: {}",
+                test_name, eval_num, query, result.labels, detail
             ));
         }
     }
 
     Ok(())
+}
+
+fn floats_match(expected: f64, actual: f64) -> bool {
+    if expected.is_nan() || actual.is_nan() {
+        return expected.is_nan() && actual.is_nan();
+    }
+    if expected == actual {
+        return true;
+    }
+    let diff = (expected - actual).abs();
+    diff <= 1e-6 || diff <= 1e-6 * expected.abs().max(actual.abs())
+}
+
+/// Compare after compacting both sides; counter-reset hints are ignored.
+fn histograms_match(expected: &FloatHistogram, actual: &FloatHistogram) -> bool {
+    let mut expected = expected.clone();
+    let mut actual = actual.clone();
+    expected.compact();
+    actual.compact();
+    let buckets_match = |a: &[Bucket], b: &[Bucket]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(a, b)| a.index == b.index && floats_match(a.count, b.count))
+    };
+    expected.schema == actual.schema
+        && floats_match(expected.zero_threshold, actual.zero_threshold)
+        && floats_match(expected.zero_count, actual.zero_count)
+        && floats_match(expected.count, actual.count)
+        && floats_match(expected.sum, actual.sum)
+        && buckets_match(&expected.positive, &actual.positive)
+        && buckets_match(&expected.negative, &actual.negative)
+        && expected.custom_values == actual.custom_values
 }
 
 #[cfg(test)]
@@ -86,6 +136,7 @@ mod tests {
         RangeSample {
             labels,
             samples: vec![(0, value)],
+            histograms: Vec::new(),
         }
     }
 

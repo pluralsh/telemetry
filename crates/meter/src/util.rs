@@ -129,6 +129,22 @@ pub(crate) fn normalize_str(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Kahan-Neumaier compensated summation step: returns the new `(sum,
+/// compensation)`. `#[inline(never)]` guards against compiler reordering
+/// that would change IEEE-754 output (cf. Prometheus #16714).
+#[inline(never)]
+pub(crate) fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
+    let t = sum + inc;
+    let new_c = if t.is_infinite() {
+        0.0
+    } else if sum.abs() >= inc.abs() {
+        c + ((sum - t) + inc)
+    } else {
+        c + ((inc - t) + sum)
+    };
+    (t, new_c)
+}
+
 /// Convert TimeBucketSize to hours
 pub fn time_bucket_size_hours(size: BucketSize) -> u32 {
     if size == 0 || size > 15 {

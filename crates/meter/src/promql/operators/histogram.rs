@@ -1,19 +1,23 @@
-//! `HistogramOp` implements PromQL's classic-histogram functions —
-//! `histogram_quantile(φ, b)` and `histogram_fraction(lower, upper, b)` —
-//! over `le`-labelled cumulative bucket series.
+//! `HistogramOp` implements PromQL's `histogram_quantile(φ, b)` and
+//! `histogram_fraction(lower, upper, b)` over both `le`-labelled
+//! cumulative bucket series and native histogram samples.
 //!
 //! The planner resolves, per input series, its bucket upper bound (parsed
-//! from `le`) and its output group (labels minus `le` and `__name__`);
-//! series without a parseable `le` are dropped. One group's buckets can
-//! arrive spread across several series-chunked batches, so this is a
-//! pipeline breaker: it buffers the child's cells densely, then evaluates
-//! every `(group, step)` into one full-grid batch.
+//! from `le`) and its output group (labels minus `le` and `__name__`).
+//! Series without a parseable `le` become native inputs, one output group
+//! per labelset minus `__name__`; only their histogram samples count. One
+//! group's buckets can arrive spread across several series-chunked
+//! batches, so this is a pipeline breaker: it buffers the child's cells
+//! densely, then evaluates every `(group, step)` into one full-grid batch.
 //!
-//! Meter stores no native histograms, so only the classic-bucket path
-//! (Prometheus' `BucketQuantile` / `BucketFraction`) exists.
+//! As in Prometheus, a native histogram whose labelset equals a classic
+//! bucket group's (labels minus `le`, name included) at the same step
+//! suppresses both outputs.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+use crate::histogram::FloatHistogram;
 
 use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
@@ -41,6 +45,13 @@ impl HistogramFnKind {
         match *self {
             Self::Quantile(q) => bucket_quantile(q, buckets),
             Self::Fraction { lower, upper } => bucket_fraction(lower, upper, buckets),
+        }
+    }
+
+    pub fn evaluate_native(&self, h: &FloatHistogram) -> f64 {
+        match *self {
+            Self::Quantile(q) => crate::histogram::quantile(q, h),
+            Self::Fraction { lower, upper } => crate::histogram::fraction(lower, upper, h),
         }
     }
 }
@@ -232,6 +243,14 @@ pub struct BucketSeries {
     pub upper_bound: f64,
 }
 
+/// Where one native-histogram input series lands: its output group, and
+/// the classic group whose labels-minus-`le` equal this series' labels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeSeries {
+    pub group: u32,
+    pub classic_conflict: Option<u32>,
+}
+
 /// Evaluates a [`HistogramFnKind`] per `(group, step)`. The output schema
 /// is one series per group, supplied by the planner.
 pub struct HistogramOp<C: Operator> {
@@ -240,11 +259,16 @@ pub struct HistogramOp<C: Operator> {
     /// Input series indices per group, with their bucket bounds.
     members: Vec<Vec<(usize, f64)>>,
     input_series: usize,
+    /// Native inputs in input-series order; `native_slot[series]` indexes it.
+    natives: Vec<NativeSeries>,
+    native_slot: Vec<Option<usize>>,
     reservation: MemoryReservation,
     schema: OperatorSchema,
     /// Dense `[input_series][step]` copy of the child's output, allocated
     /// on first poll.
     buffer: Option<(Vec<f64>, BitSet)>,
+    /// Dense `[native][step]` histogram samples, allocated on first poll.
+    hist_buffer: Vec<Option<Arc<FloatHistogram>>>,
     step_timestamps: Option<Arc<[i64]>>,
     buffer_bytes: usize,
     done: bool,
@@ -271,13 +295,30 @@ impl<C: Operator> HistogramOp<C> {
             kind,
             members,
             input_series: inputs.len(),
+            natives: Vec::new(),
+            native_slot: vec![None; inputs.len()],
             reservation,
             schema: OperatorSchema::new(SchemaRef::Static(output_schema), step_grid),
             buffer: None,
+            hist_buffer: Vec::new(),
             step_timestamps: None,
             buffer_bytes: 0,
             done: false,
         }
+    }
+
+    /// `natives[i]` places input series `i`'s native histogram samples;
+    /// `None` ignores them.
+    pub fn with_natives(mut self, natives: &[Option<NativeSeries>]) -> Self {
+        for (series, native) in natives.iter().enumerate() {
+            if let Some(native) = native
+                && series < self.native_slot.len()
+            {
+                self.native_slot[series] = Some(self.natives.len());
+                self.natives.push(*native);
+            }
+        }
+        self
     }
 
     fn step_count(&self) -> usize {
@@ -288,10 +329,29 @@ impl<C: Operator> HistogramOp<C> {
         let step_count = self.step_count();
         if self.buffer.is_none() {
             let cells = self.input_series.saturating_mul(step_count);
-            let bytes = cell_bytes(cells);
+            let native_cells = self.natives.len().saturating_mul(step_count);
+            let bytes = cell_bytes(cells).saturating_add(
+                native_cells.saturating_mul(std::mem::size_of::<Option<Arc<FloatHistogram>>>()),
+            );
             self.reservation.try_grow(bytes)?;
             self.buffer_bytes = bytes;
             self.buffer = Some((vec![0.0; cells], BitSet::with_len(cells)));
+            self.hist_buffer = vec![None; native_cells];
+        }
+        if let Some(cells) = &batch.histograms {
+            let series_count = batch.series_count();
+            for (cell, h) in cells.iter().enumerate() {
+                let Some(h) = h else { continue };
+                let series = batch.series_range.start + cell % series_count;
+                let Some(native) = self.native_slot.get(series).copied().flatten() else {
+                    continue;
+                };
+                let step = batch.step_range.start + cell / series_count;
+                let bytes = super::vector_selector::histogram_sample_bytes(h);
+                self.reservation.try_grow(bytes)?;
+                self.buffer_bytes += bytes;
+                self.hist_buffer[native * step_count + step] = Some(h.clone());
+            }
         }
         if self.step_timestamps.is_none() {
             self.step_timestamps = Some(batch.step_timestamps.clone());
@@ -344,6 +404,27 @@ impl<C: Operator> HistogramOp<C> {
                 }
             }
         }
+        let classic_validity = out_validity.clone();
+        for (native_idx, native) in self.natives.iter().enumerate() {
+            for step in 0..step_count {
+                let Some(h) = &self.hist_buffer[native_idx * step_count + step] else {
+                    continue;
+                };
+                if let Some(conflict) = native.classic_conflict {
+                    let conflict_cell = step * group_count + conflict as usize;
+                    if classic_validity.get(conflict_cell) {
+                        out_validity.clear(conflict_cell);
+                        continue;
+                    }
+                }
+                let cell = step * group_count + native.group as usize;
+                if out_validity.get(cell) || classic_validity.get(cell) {
+                    continue;
+                }
+                out_values[cell] = self.kind.evaluate_native(h);
+                out_validity.set(cell);
+            }
+        }
         self.release_buffer();
         self.reservation.release(out_bytes);
 
@@ -363,6 +444,7 @@ impl<C: Operator> HistogramOp<C> {
 
     fn release_buffer(&mut self) {
         self.buffer = None;
+        self.hist_buffer = Vec::new();
         if self.buffer_bytes > 0 {
             self.reservation.release(self.buffer_bytes);
             self.buffer_bytes = 0;

@@ -46,6 +46,13 @@ run_test_with_storage() (runner.rs) → execute each command
 - The test DSL parser parses only test commands.
 - PromQL expressions are parsed by the same `promql_parser` crate used by the application.
 - This ensures test evaluation uses identical query parsing logic as production code.
+- Series values follow upstream syntax: floats, `_` / `_xN` gaps, `stale`,
+  `a+bxN` expansions, and native histograms written as
+  `{{schema:0 sum:5 count:4 buckets:[1 2 1] offset:0 n_buckets:[..] n_offset:0
+  z_bucket:0 z_bucket_w:0 custom_values:[..] counter_reset_hint:gauge}}`,
+  optionally expanded with `{{a}}xN` or `{{a}}+{{b}}xN`. Expected histograms
+  use the same form and are compared after compaction, ignoring counter-reset
+  hints.
 
 ## Adding New Tests
 

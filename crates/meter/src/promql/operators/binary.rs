@@ -34,9 +34,10 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::histogram::{CounterResetHint, FloatHistogram};
 use crate::model::Labels;
 
-use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use super::super::batch::{BitSet, HistogramCells, SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 
@@ -417,6 +418,8 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             MatchTable::OneToOne(m) | MatchTable::GroupLeft(m) => (true, m),
             MatchTable::GroupRight(m) => (false, m),
         };
+        let any_histograms = lhs.has_histograms() || rhs.has_histograms();
+        let mut out_hist: Option<HistogramCells> = None;
 
         for (out_row, mapped) in map.iter().enumerate() {
             // For OneToOne / GroupLeft the scan-side is LHS and
@@ -439,6 +442,20 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                 let l_cell = lhs_idx.and_then(|idx| lhs.get(step_off, idx));
                 let r_cell = rhs_idx.and_then(|idx| rhs.get(step_off, idx));
 
+                if any_histograms {
+                    let l_h = lhs_idx.and_then(|idx| lhs.get_histogram(step_off, idx));
+                    let r_h = rhs_idx.and_then(|idx| rhs.get_histogram(step_off, idx));
+                    if l_h.is_some() || r_h.is_some() {
+                        self.write_mixed_cell(
+                            Operand::of(l_cell, l_h),
+                            Operand::of(r_cell, r_h),
+                            &mut out,
+                            &mut out_hist,
+                            out_idx,
+                        );
+                        continue;
+                    }
+                }
                 self.write_cell(
                     class,
                     bool_mod,
@@ -452,13 +469,16 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         }
 
         let (values, validity) = out.finish();
-        Ok(StepBatch::new(
-            lhs.step_timestamps.clone(),
-            0..step_count,
-            SchemaRef::Static(output_schema.clone()),
-            0..out_series_count,
-            values,
-            validity,
+        Ok(attach_histograms(
+            StepBatch::new(
+                lhs.step_timestamps.clone(),
+                0..step_count,
+                SchemaRef::Static(output_schema.clone()),
+                0..out_series_count,
+                values,
+                validity,
+            ),
+            out_hist,
         ))
     }
 
@@ -478,12 +498,22 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         let mut out = OutBuffers::allocate(&self.reservation, cell_count)?;
         let class = self.kind.class();
         let bool_mod = self.kind.bool_modifier();
+        let mut out_hist: Option<HistogramCells> = None;
 
         for step_off in 0..step_count {
             let scalar = scalar.get(vec_batch.step_range.start + step_off, 0);
             for series_off in 0..series_count {
                 let v = cell_of(&vec_batch, step_off, series_off);
                 let out_idx = step_off * series_count + series_off;
+                if let Some(h) = vec_batch.histogram(out_idx) {
+                    let (l, r) = if scalar_on_right {
+                        (Some(Operand::Histogram(h)), scalar.map(Operand::Float))
+                    } else {
+                        (scalar.map(Operand::Float), Some(Operand::Histogram(h)))
+                    };
+                    self.write_mixed_cell(l, r, &mut out, &mut out_hist, out_idx);
+                    continue;
+                }
                 let (l_cell, r_cell) = if scalar_on_right {
                     (v, scalar)
                 } else {
@@ -502,13 +532,16 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         }
 
         let (values, validity) = out.finish();
-        Ok(StepBatch::new(
-            vec_batch.step_timestamps.clone(),
-            vec_batch.step_range.clone(),
-            vec_batch.series.clone(),
-            vec_batch.series_range.clone(),
-            values,
-            validity,
+        Ok(attach_histograms(
+            StepBatch::new(
+                vec_batch.step_timestamps.clone(),
+                vec_batch.step_range.clone(),
+                vec_batch.series.clone(),
+                vec_batch.series_range.clone(),
+                values,
+                validity,
+            ),
+            out_hist,
         ))
     }
 
@@ -629,6 +662,120 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                 }
             }
         }
+    }
+}
+
+impl<L: Operator, R: Operator> BinaryOp<L, R> {
+    /// Slow path for cells where at least one operand is a native
+    /// histogram, following Prometheus `vectorElemBinop`: `h + h`, `h - h`,
+    /// `h * s`, `s * h` and `h / s` produce histograms; `h == h` / `h != h`
+    /// filter on exact equality; every other combination drops the sample
+    /// (or yields `0` under `bool`).
+    fn write_mixed_cell(
+        &self,
+        l: Option<Operand<'_>>,
+        r: Option<Operand<'_>>,
+        out: &mut OutBuffers,
+        out_hist: &mut Option<HistogramCells>,
+        out_idx: usize,
+    ) {
+        let cells = out.values.len();
+        let mut emit_histogram = |h: Arc<FloatHistogram>| {
+            out_hist.get_or_insert_with(|| vec![None; cells])[out_idx] = Some(h);
+        };
+        match self.kind.class() {
+            OpClass::Arith => {
+                let (Some(l), Some(r)) = (l, r) else {
+                    return;
+                };
+                let result = match (self.kind, l, r) {
+                    (BinaryOpKind::Mul, Operand::Float(f), Operand::Histogram(h))
+                    | (BinaryOpKind::Mul, Operand::Histogram(h), Operand::Float(f)) => {
+                        let mut h = (**h).clone();
+                        h.mul(f);
+                        Some(h)
+                    }
+                    (BinaryOpKind::Div, Operand::Histogram(h), Operand::Float(f)) => {
+                        let mut h = (**h).clone();
+                        h.div(f);
+                        Some(h)
+                    }
+                    (BinaryOpKind::Add, Operand::Histogram(a), Operand::Histogram(b)) => {
+                        let mut h = (**a).clone();
+                        h.add(b).ok().map(|_| h)
+                    }
+                    (BinaryOpKind::Sub, Operand::Histogram(a), Operand::Histogram(b)) => {
+                        let mut h = (**a).clone();
+                        h.sub(b).ok().map(|_| {
+                            h.counter_reset_hint = CounterResetHint::Gauge;
+                            h
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(mut h) = result {
+                    h.compact();
+                    emit_histogram(Arc::new(h));
+                }
+            }
+            OpClass::Cmp => {
+                let (Some(l), Some(r)) = (l, r) else {
+                    return;
+                };
+                let keep = match (self.kind, l, r) {
+                    (BinaryOpKind::Eq { .. }, Operand::Histogram(a), Operand::Histogram(b)) => {
+                        a.equals(b)
+                    }
+                    (BinaryOpKind::Ne { .. }, Operand::Histogram(a), Operand::Histogram(b)) => {
+                        !a.equals(b)
+                    }
+                    _ => false,
+                };
+                if self.kind.bool_modifier() {
+                    out.values[out_idx] = if keep { 1.0 } else { 0.0 };
+                    out.validity.set(out_idx);
+                } else if keep && let Operand::Histogram(h) = l {
+                    emit_histogram(h.clone());
+                }
+            }
+            OpClass::Set => {
+                let chosen = match self.kind {
+                    BinaryOpKind::And if r.is_some() => l,
+                    BinaryOpKind::Or => l.or(r),
+                    BinaryOpKind::Unless if r.is_none() => l,
+                    _ => None,
+                };
+                match chosen {
+                    Some(Operand::Float(v)) => {
+                        out.values[out_idx] = v;
+                        out.validity.set(out_idx);
+                    }
+                    Some(Operand::Histogram(h)) => emit_histogram(h.clone()),
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Operand<'a> {
+    Float(f64),
+    Histogram(&'a Arc<FloatHistogram>),
+}
+
+impl<'a> Operand<'a> {
+    fn of(value: Option<f64>, histogram: Option<&'a Arc<FloatHistogram>>) -> Option<Self> {
+        histogram
+            .map(Operand::Histogram)
+            .or(value.map(Operand::Float))
+    }
+}
+
+fn attach_histograms(batch: StepBatch, histograms: Option<HistogramCells>) -> StepBatch {
+    match histograms {
+        Some(cells) => batch.with_histograms(cells),
+        None => batch,
     }
 }
 

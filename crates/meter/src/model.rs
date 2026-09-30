@@ -4,12 +4,14 @@
 //! including labels for series identification, samples for data points, and
 //! series for batched ingestion.
 
+use crate::histogram::FloatHistogram;
 use crate::util::hour_bucket_in_epoch_minutes;
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// Series ID (unique within a time bucket)
@@ -157,6 +159,51 @@ impl Sample {
     }
 }
 
+/// A native histogram observation at a point in time.
+///
+/// A stale native histogram is represented by a float [`STALE_NAN`] sample
+/// instead, which the query engine treats identically.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSample {
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: i64,
+    pub histogram: FloatHistogram,
+}
+
+impl HistogramSample {
+    pub fn new(timestamp_ms: i64, histogram: FloatHistogram) -> Self {
+        Self {
+            timestamp_ms,
+            histogram,
+        }
+    }
+}
+
+/// Float and native histogram samples of one series, each ascending by
+/// timestamp. A timestamp appears in at most one of the two.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SeriesData {
+    pub floats: Vec<Sample>,
+    pub histograms: Vec<HistogramSample>,
+}
+
+impl SeriesData {
+    pub(crate) fn len(&self) -> usize {
+        self.floats.len() + self.histograms.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.floats.is_empty() && self.histograms.is_empty()
+    }
+
+    /// Keeps samples with `start_ms < timestamp <= end_ms`.
+    pub(crate) fn retain_range(&mut self, start_ms: i64, end_ms: i64) {
+        let in_range = |ts: i64| ts > start_ms && ts <= end_ms;
+        self.floats.retain(|s| in_range(s.timestamp_ms));
+        self.histograms.retain(|h| in_range(h.timestamp_ms));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Temporality {
     Cumulative,
@@ -251,8 +298,12 @@ pub struct Series {
     pub description: Option<String>,
 
     // --- Data ---
-    /// One or more samples to write.
+    /// Float samples to write.
     pub samples: Vec<Sample>,
+
+    /// Native histogram samples to write. A timestamp present in both
+    /// `samples` and `histograms` resolves to the histogram.
+    pub histograms: Vec<HistogramSample>,
 }
 
 impl Series {
@@ -279,6 +330,7 @@ impl Series {
             unit: None,
             description: None,
             samples,
+            histograms: Vec::new(),
         }
     }
 
@@ -307,6 +359,73 @@ impl Series {
     pub fn builder(name: impl Into<String>) -> SeriesBuilder {
         SeriesBuilder::new(name)
     }
+
+    /// Total float and histogram samples.
+    pub(crate) fn sample_count(&self) -> usize {
+        self.samples.len() + self.histograms.len()
+    }
+
+    /// Splits the samples into one series per key of their timestamps, each
+    /// sharing this series' labels and metadata. The last group takes the
+    /// owned fields, so the common single-group case is never cloned.
+    pub(crate) fn partition_by<K: Eq + std::hash::Hash, E>(
+        self,
+        mut key: impl FnMut(i64) -> Result<K, E>,
+    ) -> Result<Vec<(K, Series)>, E> {
+        let Series {
+            labels,
+            metric_type,
+            unit,
+            description,
+            samples,
+            histograms,
+        } = self;
+        let mut groups: HashMap<K, (Vec<Sample>, Vec<HistogramSample>)> = HashMap::new();
+        for sample in samples {
+            groups
+                .entry(key(sample.timestamp_ms)?)
+                .or_default()
+                .0
+                .push(sample);
+        }
+        for sample in histograms {
+            groups
+                .entry(key(sample.timestamp_ms)?)
+                .or_default()
+                .1
+                .push(sample);
+        }
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        let Some((last_key, (last_samples, last_histograms))) = groups.pop() else {
+            return Ok(Vec::new());
+        };
+        let mut partitions = Vec::with_capacity(groups.len() + 1);
+        for (key, (samples, histograms)) in groups {
+            partitions.push((
+                key,
+                Series {
+                    labels: labels.clone(),
+                    metric_type,
+                    unit: unit.clone(),
+                    description: description.clone(),
+                    samples,
+                    histograms,
+                },
+            ));
+        }
+        partitions.push((
+            last_key,
+            Series {
+                labels,
+                metric_type,
+                unit,
+                description,
+                samples: last_samples,
+                histograms: last_histograms,
+            },
+        ));
+        Ok(partitions)
+    }
 }
 
 /// Builder for constructing [`Series`] instances.
@@ -320,6 +439,7 @@ pub struct SeriesBuilder {
     unit: Option<String>,
     description: Option<String>,
     samples: Vec<Sample>,
+    histograms: Vec<HistogramSample>,
 }
 
 impl SeriesBuilder {
@@ -330,6 +450,7 @@ impl SeriesBuilder {
             unit: None,
             description: None,
             samples: Vec::new(),
+            histograms: Vec::new(),
         }
     }
 
@@ -379,6 +500,13 @@ impl SeriesBuilder {
         self
     }
 
+    /// Adds a native histogram sample with the given timestamp.
+    pub fn histogram(mut self, timestamp_ms: i64, histogram: FloatHistogram) -> Self {
+        self.histograms
+            .push(HistogramSample::new(timestamp_ms, histogram));
+        self
+    }
+
     /// Builds the series.
     pub fn build(self) -> Series {
         Series {
@@ -387,6 +515,7 @@ impl SeriesBuilder {
             unit: self.unit,
             description: self.description,
             samples: self.samples,
+            histograms: self.histograms,
         }
     }
 }
@@ -532,12 +661,21 @@ impl QueryValue {
             } => vec![RangeSample {
                 labels: Labels::empty(),
                 samples: vec![(timestamp_ms, value)],
+                histograms: Vec::new(),
             }],
             QueryValue::Vector(samples) => samples
                 .into_iter()
-                .map(|s| RangeSample {
-                    labels: s.labels,
-                    samples: vec![(s.timestamp_ms, s.value)],
+                .map(|s| match s.histogram {
+                    Some(h) => RangeSample {
+                        labels: s.labels,
+                        samples: Vec::new(),
+                        histograms: vec![(s.timestamp_ms, h)],
+                    },
+                    None => RangeSample {
+                        labels: s.labels,
+                        samples: vec![(s.timestamp_ms, s.value)],
+                        histograms: Vec::new(),
+                    },
                 })
                 .collect(),
             QueryValue::Matrix(range_samples) => range_samples,
@@ -554,8 +692,10 @@ pub struct InstantSample {
     pub labels: Labels,
     /// Timestamp in milliseconds since Unix epoch.
     pub timestamp_ms: i64,
-    /// The sample value.
+    /// The sample value. Meaningless when `histogram` is set.
     pub value: f64,
+    /// Set when the sample is a native histogram rather than a float.
+    pub histogram: Option<Arc<FloatHistogram>>,
 }
 
 /// A series with values over a time range.
@@ -568,6 +708,9 @@ pub struct RangeSample {
     /// Timestamp-value pairs, ordered by timestamp.
     /// Each tuple is `(timestamp_ms, value)`.
     pub samples: Vec<(i64, f64)>,
+    /// Native histogram samples, ordered by timestamp. A step holds either
+    /// a float or a histogram, never both.
+    pub histograms: Vec<(i64, Arc<FloatHistogram>)>,
 }
 
 /// Metadata for a metric.
@@ -744,11 +887,13 @@ mod tests {
                 labels: Labels::new(vec![Label::metric_name("cpu")]),
                 timestamp_ms: 1000,
                 value: 1.0,
+                histogram: None,
             },
             InstantSample {
                 labels: Labels::new(vec![Label::metric_name("mem")]),
                 timestamp_ms: 2000,
                 value: 2.0,
+                histogram: None,
             },
         ]);
         let result = qv.into_matrix();
@@ -765,10 +910,12 @@ mod tests {
             RangeSample {
                 labels: Labels::new(vec![Label::metric_name("cpu")]),
                 samples: vec![(1000, 1.0), (2000, 2.0)],
+                histograms: Vec::new(),
             },
             RangeSample {
                 labels: Labels::new(vec![Label::metric_name("mem")]),
                 samples: vec![(3000, 3.0)],
+                histograms: Vec::new(),
             },
         ];
         let qv = QueryValue::Matrix(range_samples.clone());

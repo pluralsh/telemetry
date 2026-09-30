@@ -16,6 +16,7 @@ use std::sync::Arc;
 use futures::Stream;
 use promql_parser::parser::VectorSelector;
 
+use crate::histogram::FloatHistogram;
 use crate::model::Labels;
 
 use super::memory::QueryError;
@@ -120,17 +121,28 @@ impl SamplesRequest {
 /// [`crate::model::is_stale_nan`].
 ///
 /// Block index `j` corresponds to `request.series[series_range.start + j]`.
+///
+/// Native histogram samples travel in the parallel `histogram_timestamps` /
+/// `histograms` columns; a timestamp appears in at most one of the float and
+/// histogram columns of a series.
 #[derive(Debug, Clone)]
 pub struct SampleBlock {
     pub timestamps: Vec<Vec<i64>>,
     pub values: Vec<Vec<f64>>,
+    pub histogram_timestamps: Vec<Vec<i64>>,
+    pub histograms: Vec<Vec<Arc<FloatHistogram>>>,
 }
 
 impl SampleBlock {
     pub fn with_series_count(series_count: usize) -> Self {
+        fn columns<T>(series_count: usize) -> Vec<Vec<T>> {
+            (0..series_count).map(|_| Vec::new()).collect()
+        }
         Self {
-            timestamps: (0..series_count).map(|_| Vec::new()).collect(),
-            values: (0..series_count).map(|_| Vec::new()).collect(),
+            timestamps: columns(series_count),
+            values: columns(series_count),
+            histogram_timestamps: columns(series_count),
+            histograms: columns(series_count),
         }
     }
 
