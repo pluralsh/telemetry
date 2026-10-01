@@ -4,6 +4,54 @@ pub(super) fn render_template(template: &str, row: &Row) -> Result<String> {
     render_template_block(template, row)
 }
 
+/// Decodes the body of a Go interpreted string literal, which template
+/// strings use: JSON's escapes plus `\a`, `\v`, `\'`, `\xHH`, octal `\ooo`
+/// and `\UXXXXXXXX`.
+fn go_unquote(body: &str) -> Result<String> {
+    let invalid = || Error::Query(format!("invalid template string {body:?}"));
+    let mut output = Vec::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            let mut buffer = [0; 4];
+            output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+        let escaped = chars.next().ok_or_else(invalid)?;
+        let mut digits = |count: usize, radix: u32| -> Result<u32> {
+            let text: String = chars.by_ref().take(count).collect();
+            if text.len() != count {
+                return Err(invalid());
+            }
+            u32::from_str_radix(&text, radix).map_err(|_| invalid())
+        };
+        match escaped {
+            'a' => output.push(0x07),
+            'b' => output.push(0x08),
+            'f' => output.push(0x0c),
+            'n' => output.push(b'\n'),
+            'r' => output.push(b'\r'),
+            't' => output.push(b'\t'),
+            'v' => output.push(0x0b),
+            '\\' | '"' | '\'' => output.push(escaped as u8),
+            'x' => output.push(digits(2, 16)? as u8),
+            '0'..='7' => {
+                let rest = digits(2, 8)?;
+                let value = escaped.to_digit(8).expect("octal digit") * 64 + rest;
+                output.push(u8::try_from(value).map_err(|_| invalid())?);
+            }
+            'u' | 'U' => {
+                let value = digits(if escaped == 'u' { 4 } else { 8 }, 16)?;
+                let character = char::from_u32(value).ok_or_else(invalid)?;
+                let mut buffer = [0; 4];
+                output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum TemplateValue {
     String(String),
@@ -45,6 +93,125 @@ impl TemplateValue {
             Self::Time(_) => true,
         }
     }
+}
+
+/// Every function a template may call. Anything else is rejected before the
+/// query runs, as Go's template parser does, rather than failing per line.
+const TEMPLATE_FUNCTIONS: &[&str] = &[
+    "Replace",
+    "ToLower",
+    "ToUpper",
+    "Trim",
+    "TrimLeft",
+    "TrimPrefix",
+    "TrimRight",
+    "TrimSpace",
+    "TrimSuffix",
+    "add",
+    "addf",
+    "alignLeft",
+    "alignRight",
+    "b64dec",
+    "b64enc",
+    "bytes",
+    "ceil",
+    "contains",
+    "count",
+    "date",
+    "default",
+    "div",
+    "divf",
+    "duration",
+    "duration_seconds",
+    "float64",
+    "floor",
+    "hasPrefix",
+    "hasSuffix",
+    "indent",
+    "int",
+    "lower",
+    "max",
+    "maxf",
+    "min",
+    "minf",
+    "mod",
+    "mul",
+    "mulf",
+    "nindent",
+    "printf",
+    "regexReplaceAll",
+    "regexReplaceAllLiteral",
+    "repeat",
+    "replace",
+    "round",
+    "sub",
+    "subf",
+    "substr",
+    "title",
+    "toDate",
+    "toDateInZone",
+    "trim",
+    "trimAll",
+    "trimPrefix",
+    "trimSuffix",
+    "trunc",
+    "unixEpoch",
+    "unixEpochMillis",
+    "unixEpochNanos",
+    "unixToTime",
+    "upper",
+    "urldecode",
+    "urlencode",
+];
+
+const TEMPLATE_IDENTIFIERS: &[&str] = &["__line__", "__timestamp__", "now", "true", "false"];
+
+/// Rejects templates that call a function the engine does not implement.
+pub(super) fn check_template(template: &str) -> Result<()> {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let action_start = start + 2;
+        let end = rest[action_start..]
+            .find("}}")
+            .map(|end| action_start + end)
+            .ok_or_else(|| Error::Query("unterminated template action".into()))?;
+        let action = rest[action_start..end].trim();
+        rest = &rest[end + 2..];
+        if action != "else" && action != "end" {
+            check_template_expression(action.strip_prefix("if ").unwrap_or(action))?;
+        }
+    }
+    Ok(())
+}
+
+fn check_template_expression(expression: &str) -> Result<()> {
+    for command in split_top_level(expression, '|')? {
+        let command = command.trim();
+        let tokens = template_tokens(command)?;
+        for token in &tokens {
+            if let TemplateValue::String(token) = token
+                && let Some(inner) = token.strip_prefix("\0expr:")
+            {
+                check_template_expression(inner)?;
+            }
+        }
+        let starts_word = command
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+        let Some(TemplateValue::String(name)) = tokens.first() else {
+            continue;
+        };
+        if starts_word
+            && !TEMPLATE_FUNCTIONS.contains(&name.as_str())
+            && !TEMPLATE_IDENTIFIERS.contains(&name.as_str())
+        {
+            return Err(Error::Query(format!(
+                "template: function {name:?} not defined"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn render_template_block(template: &str, row: &Row) -> Result<String> {
@@ -186,7 +353,7 @@ pub(super) fn template_tokens(command: &str) -> Result<Vec<TemplateValue>> {
                 if bytes[end - 1] != b'"' {
                     return Err(Error::Query("unterminated template string".into()));
                 }
-                (serde_json::from_str(&command[cursor..end])?, end)
+                (go_unquote(&command[cursor + 1..end - 1])?, end)
             }
             b'(' => {
                 let end = paren_end(bytes, cursor + 1)
@@ -290,6 +457,40 @@ pub(super) fn apply_template_function(
     )))
 }
 
+/// Go's `fmt.Sprintf` for the plain verbs `%s %v %d %f %q %%`; flags and
+/// widths are rejected rather than misformatted.
+fn printf(format: &str, arguments: &[TemplateValue]) -> Result<String> {
+    let mut output = String::with_capacity(format.len());
+    let mut arguments = arguments.iter();
+    let mut chars = format.chars();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        let verb = chars
+            .next()
+            .ok_or_else(|| Error::Query("printf format ends with %".into()))?;
+        if verb == '%' {
+            output.push('%');
+            continue;
+        }
+        let argument = arguments
+            .next()
+            .ok_or_else(|| Error::Query(format!("printf %{verb} is missing an argument")))?;
+        match verb {
+            's' | 'v' => output.push_str(&argument.text()),
+            'd' => output.push_str(&format!("{}", argument.number()?.trunc() as i64)),
+            'f' => output.push_str(&format!("{:.6}", argument.number()?)),
+            'q' => output.push_str(&serde_json::to_string(&argument.text())?),
+            _ => {
+                return Err(Error::Query(format!("unsupported printf verb %{verb}")));
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// Go's `strings` functions take the source first; their Sprig counterparts
 /// take it last. Returns `(source, operand)`.
 fn source_and_operand(arguments: &[TemplateValue], source_first: bool) -> (String, String) {
@@ -323,6 +524,9 @@ fn string_function(name: &str, arguments: &[TemplateValue]) -> Result<Option<Tem
                 source.strip_suffix(&affix)
             };
             TemplateValue::String(stripped.unwrap_or(&source).to_owned())
+        }
+        "printf" if !arguments.is_empty() => {
+            TemplateValue::String(printf(&arguments[0].text(), &arguments[1..])?)
         }
         "replace" => {
             require_args(name, arguments, 3)?;
@@ -848,5 +1052,51 @@ mod tests {
     fn rejects_unknown_functions_and_bad_arity() {
         assert!(call("nope", &["x"]).is_err());
         assert!(call("Trim", &["x"]).is_err());
+    }
+
+    #[test]
+    fn declared_functions_are_implemented() {
+        let arguments = vec![TemplateValue::String("1".into()); 4];
+        for name in TEMPLATE_FUNCTIONS {
+            let unknown = (0..=arguments.len()).all(|count| {
+                matches!(
+                    apply_template_function(name, &arguments[..count]),
+                    Err(Error::Query(message)) if message.starts_with("unknown or unsupported")
+                )
+            });
+            assert!(!unknown, "{name} is declared but not implemented");
+        }
+    }
+
+    #[test]
+    fn templates_are_checked_before_rendering() {
+        assert!(check_template("{{ nosuchfunc }}").is_err());
+        assert!(check_template("{{ .a | nosuchfunc }}").is_err());
+        assert!(check_template("{{ upper (nosuchfunc .a) }}").is_err());
+        assert!(
+            check_template(r#"{{ if .a }}{{ printf "%s" .a | upper }}{{ else }}x{{ end }}"#)
+                .is_ok()
+        );
+        assert!(check_template("{{ __line__ }} {{ .a }} {{ 1 }}").is_ok());
+    }
+
+    #[test]
+    fn printf_and_go_escapes() {
+        assert_eq!(
+            go_unquote(r"\x1b[0m\t\u00e9\101").unwrap(),
+            "\x1b[0m\té\x41"
+        );
+        assert_eq!(
+            printf(
+                "%s=%d %q%%",
+                &[
+                    TemplateValue::String("a".into()),
+                    TemplateValue::Number(2.7),
+                    TemplateValue::String("b".into()),
+                ]
+            )
+            .unwrap(),
+            "a=2 \"b\"%"
+        );
     }
 }

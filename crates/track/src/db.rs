@@ -32,9 +32,10 @@ use tokio_util::sync::CancellationToken;
 use crate::codec::{
     LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices,
     decode_locator, decode_locator_trace_id, decode_metadata, decode_posting_sequence,
-    decode_sequence, encode_indices, encode_locator, encode_metadata, encode_sequence, locator_key,
+    decode_posting_value, decode_sequence, encode_indices, encode_locator, encode_metadata,
+    encode_sequence, field_posting_key, field_scan_prefix, field_value_prefix, locator_key,
     locator_namespace_prefix, locator_prefix, metadata_key, metadata_prefix, next_sequence_key,
-    payload_key, posting_key, posting_scan_prefix, segment_for, segment_prefix,
+    payload_key, posting_key, segment_for, segment_prefix,
 };
 
 /// Concurrent storage reads per query stage.
@@ -43,7 +44,7 @@ const READ_CONCURRENCY: usize = 32;
 const MATERIALIZE_BATCH: usize = 256;
 /// Segments whose metadata or postings are scanned concurrently.
 const SEGMENT_SCAN_CONCURRENCY: usize = 8;
-use crate::traceql::PushdownClause;
+use crate::traceql::{IndexField, IndexPredicate, IndexTest, PushdownClause, span_intrinsics};
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Config, Error, Namespace, Page, PageBuilder,
     PageConfig, QueryOptions, Result, SegmentId, Trace, TraceBatch, TraceId, TraceQlResult,

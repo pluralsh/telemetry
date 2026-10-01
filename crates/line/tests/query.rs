@@ -663,7 +663,7 @@ async fn supports_loki_template_functions_and_error_labels() {
         .query(
             &namespace,
             &QueryRequest::range(
-                r#"{app="api"} | logfmt | label_format encoded="{{.user | b64enc}}", bad="{{.value | unknownFunction}}" | __error__ = "TemplateFormatErr""#,
+                r#"{app="api"} | logfmt | label_format encoded="{{.user | b64enc}}", bad="{{div 1 0}}" | __error__ = "TemplateFormatErr""#,
                 0,
                 6 * S,
                 S,
@@ -681,6 +681,21 @@ async fn supports_loki_template_functions_and_error_labels() {
             .iter()
             .any(|label| label.name == "encoded" && label.value == "Ym9i")
     }));
+
+    let error = db
+        .query(
+            &namespace,
+            &QueryRequest::range(
+                r#"{app="api"} | logfmt | label_format bad="{{.value | unknownFunction}}""#,
+                0,
+                6 * S,
+                S,
+            ),
+            forward(10),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknownFunction"), "{error}");
     db.close().await.unwrap();
 }
 

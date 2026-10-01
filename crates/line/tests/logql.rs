@@ -200,7 +200,7 @@ fn parses_pattern_filters_with_loki_or_semantics() {
         panic!("expected pattern filter");
     };
     assert_eq!(first.branches[0].op, LineFilterOp::Pattern);
-    assert_eq!(first.branches[1].op, LineFilterOp::Contains);
+    assert_eq!(first.branches[1].op, LineFilterOp::Pattern);
     let PipelineStage::LineFilter(second) = &log.stages[1].value else {
         panic!("expected negative pattern filter");
     };
@@ -301,7 +301,7 @@ fn feature_matrix_corpus_parses() {
             "line-ip-or",
             r#"{app="api"} |= ip("10.0.0.0/8") or "local""#,
         ),
-        ("pattern-filter", r#"{app="api"} |> "<method> <path>""#),
+        ("pattern-filter", r#"{app="api"} |> "<_> /api/<_>""#),
         (
             "json-expressions",
             r#"{app="api"} | json method, code="status""#,

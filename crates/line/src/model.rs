@@ -46,6 +46,13 @@ impl Labels {
         Ok(Self(labels))
     }
 
+    /// Stream identity ignores empty values: as in Loki, `name=""` on write
+    /// means the label is absent.
+    pub fn without_empty_values(mut self) -> Self {
+        self.0.retain(|label| !label.value.is_empty());
+        self
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Label> {
         self.0.iter()
     }

@@ -216,8 +216,25 @@ impl LogDb {
         budget: &PageBudget,
     ) -> Result<Vec<LogRow>> {
         let mut rows = Vec::new();
-        let mut consume = |chunk: Vec<LogRow>| {
+        self.read_bounded_with(namespace, targets, budget, |chunk| {
             rows.extend(chunk);
+            Ok(())
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// [`Self::read_bounded`], handing each decoded chunk to `consume` so the
+    /// caller keeps only the rows it needs.
+    pub(crate) async fn read_bounded_with(
+        &self,
+        namespace: &Namespace,
+        targets: ScanTargets,
+        budget: &PageBudget,
+        mut consume: impl FnMut(Vec<LogRow>) -> Result<()>,
+    ) -> Result<()> {
+        let mut consume = |chunk: Vec<LogRow>| {
+            consume(chunk)?;
             Ok(ControlFlow::Continue(()))
         };
         for (segment, streams) in targets.segments {
@@ -233,7 +250,7 @@ impl LogDb {
                 )
                 .await?;
         }
-        Ok(rows)
+        Ok(())
     }
 
     /// Reads overlapping pages in scan order, handing `consume` ascending
@@ -384,19 +401,34 @@ impl LogDb {
                         .map(move |(page_id, metadata)| (stream, *page_id, metadata.level))
                 })
                 .collect::<Vec<_>>();
-            for (stream, page_id, level) in pages {
-                let Some(page_scores) = by_page.get(&(stream.stream_id, page_id.sequence)) else {
-                    continue;
-                };
-                if pages_read == max_pages {
-                    return Err(Error::Query(format!(
-                        "query exceeded max_pages ({max_pages})"
-                    )));
+            let pages = pages
+                .into_iter()
+                .filter_map(|(stream, page_id, level)| {
+                    let scores = by_page.get(&(stream.stream_id, page_id.sequence))?;
+                    Some((stream, page_id, level, scores))
+                })
+                .collect::<Vec<_>>();
+            pages_read = pages_read.saturating_add(pages.len());
+            if pages_read > max_pages {
+                return Err(Error::Query(format!(
+                    "query exceeded max_pages ({max_pages})"
+                )));
+            }
+            let mut loaded = Vec::with_capacity(pages.len());
+            for chunk in pages.chunks(PAGE_READ_CONCURRENCY) {
+                let mut reads = Vec::with_capacity(chunk.len());
+                for &(stream, page_id, level, _) in chunk {
+                    reads.push(self.load_page(
+                        namespace,
+                        segment,
+                        stream.stream_id,
+                        page_id,
+                        level,
+                    ));
                 }
-                pages_read += 1;
-                let page = self
-                    .load_page(namespace, segment, stream.stream_id, page_id, level)
-                    .await?;
+                loaded.extend(futures::future::try_join_all(reads).await?);
+            }
+            for ((stream, _, _, page_scores), page) in pages.into_iter().zip(loaded) {
                 let matched = page.decode_rows_where(start_ns, end_ns, |row_id| {
                     page_scores.contains_key(&row_id)
                 })?;

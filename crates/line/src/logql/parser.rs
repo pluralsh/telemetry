@@ -228,6 +228,9 @@ impl Parser<'_> {
     fn parse_range_aggregation(&mut self, start: Span, op: RangeOp) -> Result<Query, ParseError> {
         self.expect_token(Token::LeftParen, "expected `(` after range aggregation")?;
         let parameter = if op == RangeOp::Quantile {
+            if let Some(sign) = self.eat_token(Token::Minus) {
+                return Err(ParseError::new("unexpected -", sign.span));
+            }
             let number = self.parse_signed_number()?;
             self.expect_comma()?;
             Some(number)
@@ -366,6 +369,13 @@ impl Parser<'_> {
             | Token::NotEqual
             | Token::NotRegex
             | Token::NotPattern => PipelineStage::LineFilter(self.parse_line_filter()?),
+            Token::Pipe
+                if self.tokens.get(self.position + 1).map(|token| &token.token)
+                    == Some(&Token::LeftParen) =>
+            {
+                self.next();
+                PipelineStage::LabelFilter(self.parse_label_filter(0)?)
+            }
             Token::Pipe => {
                 self.next();
                 let keyword = self.expect_ident("expected pipeline stage")?;
@@ -413,7 +423,7 @@ impl Parser<'_> {
         }];
         while self.eat_keyword("or").is_some() {
             branches.push(LineFilterBranch {
-                op: LineFilterOp::Contains,
+                op,
                 term: self.parse_line_filter_term()?,
             });
         }
@@ -613,6 +623,12 @@ impl Parser<'_> {
         };
         let value_token = self.next_owned("expected filter value")?;
         let value = match value_token.token {
+            Token::Quoted | Token::RawString if op_token.token == Token::EqualEqual => {
+                return Err(ParseError::new(
+                    "`==` compares numbers; use `=` for strings",
+                    op_token.span,
+                ));
+            }
             Token::Quoted | Token::RawString => FilterValue::String(decode_string(&value_token)?),
             Token::Number => {
                 let mut value = sign.unwrap_or_default().to_owned();
@@ -622,6 +638,12 @@ impl Parser<'_> {
             }
             Token::Quantity => classify_quantity(value_token.text.clone()),
             Token::Ident if value_token.text == "ip" && self.check_token(Token::LeftParen) => {
+                if !matches!(op_token.token, Token::Equal | Token::NotEqual) {
+                    return Err(ParseError::new(
+                        "ip() filters support only `=` and `!=`",
+                        op_token.span,
+                    ));
+                }
                 self.next();
                 let ip = self.parse_string()?;
                 let end = self.expect_token(Token::RightParen, "expected `)` after ip")?;
@@ -747,9 +769,10 @@ impl Parser<'_> {
     }
 
     fn pipeline_is_label_filter(&self) -> bool {
-        self.tokens
-            .get(self.position + 1)
-            .is_some_and(|token| token.token == Token::Ident && !is_named_stage(&token.text))
+        self.tokens.get(self.position + 1).is_some_and(|token| {
+            token.token == Token::LeftParen
+                || (token.token == Token::Ident && !is_named_stage(&token.text))
+        })
     }
 
     fn starts_label_filter_atom(&self) -> bool {

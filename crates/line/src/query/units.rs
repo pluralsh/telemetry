@@ -10,9 +10,12 @@ pub(super) fn parse_duration_ns(source: &str) -> Result<i64> {
     common::time::parse_duration_ns(source).map_err(|error| Error::Query(error.to_string()))
 }
 
+/// Byte sizes as go-humanize parses them for Loki: thousands separators are
+/// allowed and the result is a whole number of bytes.
 pub(super) fn parse_bytes(source: &str) -> Result<f64> {
+    let source = source.replace(',', "");
     let captures = BYTE_SIZE
-        .captures(source)
+        .captures(&source)
         .ok_or_else(|| Error::Query(format!("invalid byte size {source:?}")))?;
     let value: f64 = captures[1]
         .parse()
@@ -28,44 +31,47 @@ pub(super) fn parse_bytes(source: &str) -> Result<f64> {
         "eb" | "eib" => 6,
         _ => return Err(Error::Query(format!("invalid byte size {source:?}"))),
     };
-    Ok(value
+    Ok((value
         * if suffix.to_ascii_lowercase().contains('i') {
             1024f64.powi(power)
         } else {
             1000f64.powi(power)
         })
+    .trunc())
 }
 
-pub(super) fn ip_matches(candidate: &str, expression: &str) -> bool {
-    if let Some((network, prefix)) = expression.split_once('/') {
-        let (Ok(candidate), Ok(network), Ok(prefix)) = (
-            candidate.parse::<IpAddr>(),
-            network.parse::<IpAddr>(),
-            prefix.parse::<u8>(),
-        ) else {
-            return false;
-        };
-        match (candidate, network) {
-            (IpAddr::V4(candidate), IpAddr::V4(network)) if prefix <= 32 => {
-                let mask = if prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - prefix)
-                };
-                u32::from(candidate) & mask == u32::from(network) & mask
-            }
-            (IpAddr::V6(candidate), IpAddr::V6(network)) if prefix <= 128 => {
-                let mask = if prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - prefix)
-                };
-                u128::from(candidate) & mask == u128::from(network) & mask
-            }
-            _ => false,
-        }
-    } else {
-        candidate.parse::<IpAddr>().ok() == expression.parse::<IpAddr>().ok()
-            && candidate.parse::<IpAddr>().is_ok()
+/// Whether `text` holds an address inside the `ip()` pattern anywhere, as
+/// Loki's IP filters scan (e.g. `client 10.0.0.7:80` matches `10.0.0.0/8`).
+pub(super) fn contains_ip(text: &str, pattern: &str) -> bool {
+    let Some(pattern) = IpPattern::parse(pattern) else {
+        return false;
+    };
+    text.split(|character: char| !(character.is_ascii_hexdigit() || ".:".contains(character)))
+        .filter(|candidate| !candidate.is_empty())
+        .any(|candidate| {
+            let address = candidate.parse::<IpAddr>().ok().or_else(|| {
+                // `host:port`, which never parses as IPv6 when it has dots.
+                let (host, _) = candidate.rsplit_once(':')?;
+                host.contains('.').then(|| host.parse().ok()).flatten()
+            });
+            address.is_some_and(|address| pattern.contains(address))
+        })
+}
+
+/// Go's `time.ParseDuration`, which Loki applies to label values: no day or
+/// week units, an optional sign, and a bare `0`.
+pub(super) fn parse_go_duration_ns(source: &str) -> Option<f64> {
+    let (negative, unsigned) = match source.as_bytes().first()? {
+        b'-' => (true, &source[1..]),
+        b'+' => (false, &source[1..]),
+        _ => (false, source),
+    };
+    if unsigned == "0" {
+        return Some(0.0);
     }
+    if unsigned.contains(['d', 'w', 'y']) {
+        return None;
+    }
+    let value = common::time::parse_duration_ns(unsigned).ok()? as f64;
+    Some(if negative { -value } else { value })
 }

@@ -51,6 +51,10 @@ pub(crate) enum Token {
     TraceColon,
     #[token("span:")]
     SpanColon,
+    #[token("instrumentation.")]
+    InstrumentationDot,
+    #[token("instrumentation:")]
+    InstrumentationColon,
     #[token("{")]
     LeftBrace,
     #[token("}")]
@@ -87,7 +91,7 @@ pub(crate) enum Token {
     Caret,
     #[token("!")]
     Not,
-    #[regex(r#""([^"\\\n]|\\.)*""#)]
+    #[regex(r#""([^"\\]|\\.)*""#)]
     Quoted,
     #[regex(r"`[^`]*`")]
     RawString,
@@ -131,16 +135,42 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Lexeme>, ParseError> {
 
 pub(crate) fn decode_string(token: &Lexeme) -> Result<String, ParseError> {
     match token.token {
-        Token::Quoted => serde_json::from_str(&token.text)
+        Token::Quoted => serde_json::from_str(&escape_control_characters(&token.text))
             .map_err(|error| ParseError::new(format!("invalid string: {error}"), token.span)),
         Token::RawString => Ok(token.text[1..token.text.len() - 1].to_owned()),
         _ => Err(ParseError::new("expected string", token.span)),
     }
 }
 
+/// TraceQL allows raw control characters inside quotes; JSON does not.
+fn escape_control_characters(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(character)));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_strings_accept_raw_control_characters() {
+        let tokens = lex("\"a\tb\nc\"").unwrap();
+        assert_eq!(decode_string(&tokens[0]).unwrap(), "a\tb\nc");
+    }
 
     #[test]
     fn lexes_longest_operators() {

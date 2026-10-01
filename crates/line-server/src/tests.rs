@@ -279,7 +279,20 @@ async fn json_push_and_queries_match_loki_shapes() {
         .unwrap();
     let body = response_json(response).await;
     assert_eq!(body["data"]["resultType"], "vector");
-    assert_eq!(body["data"]["result"][0]["value"][1], "2");
+    let mut series = body["data"]["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|sample| (sample["metric"].clone(), sample["value"][1].clone()))
+        .collect::<Vec<_>>();
+    series.sort_by_key(|(metric, _)| metric.to_string());
+    assert_eq!(
+        series,
+        vec![
+            (json!({"app":"api","trace_id":"a"}), json!("1")),
+            (json!({"app":"api","trace_id":"b"}), json!("1")),
+        ]
+    );
     state.shutdown().await.unwrap();
 }
 

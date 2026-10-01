@@ -73,8 +73,21 @@ pub(crate) fn parse_syntax(source: &str) -> Result<Query, ParseError> {
         tokens,
         position: 0,
     };
-    let spanset = parser.parse_spanset(0)?;
     let mut stages = Vec::new();
+    // A pipeline may open with a stage other than a spanset expression; it
+    // then applies to every span of the trace.
+    let spanset = if parser.starts_leading_stage() {
+        stages.push(parser.parse_stage()?);
+        Spanned::new(
+            SpansetExpr::Filter(Spanned::new(
+                Expr::Static(StaticValue::Bool(true)),
+                SourceSpan::new(0, 0),
+            )),
+            SourceSpan::new(0, 0),
+        )
+    } else {
+        parser.parse_spanset(0)?
+    };
     while parser.eat_token(Token::Pipe).is_some() {
         stages.push(parser.parse_stage()?);
     }
@@ -166,7 +179,25 @@ impl Parser<'_> {
         ))
     }
 
+    fn starts_leading_stage(&self) -> bool {
+        self.peek().is_some_and(|token| {
+            token.token == Token::Ident
+                && (matches!(token.text.as_str(), "by" | "select")
+                    || aggregate_op(&token.text).is_some())
+        })
+    }
+
     fn parse_stage(&mut self) -> Result<PipelineStage, ParseError> {
+        if self
+            .peek()
+            .is_some_and(|token| token.token == Token::LeftBrace)
+        {
+            let filter = self.parse_filter()?;
+            let SpansetExpr::Filter(expression) = filter.value else {
+                unreachable!("parse_filter returns a filter");
+            };
+            return Ok(PipelineStage::SpansetFilter(expression));
+        }
         let name = self.expect(Token::Ident, "expected pipeline stage")?;
         match name.text.as_str() {
             "by" => {
@@ -267,7 +298,13 @@ impl Parser<'_> {
             && let Some(op) = aggregate_op(&token.text)
         {
             self.expect(Token::LeftParen, "expected `(` after aggregate")?;
-            let field = if self.eat_token(Token::RightParen).is_some() {
+            let field = if let Some(right) = self.eat_token(Token::RightParen) {
+                if op != AggregateOp::Count {
+                    return Err(ParseError::new(
+                        format!("`{}` requires a field", token.text),
+                        token.span.join(right.span),
+                    ));
+                }
                 None
             } else {
                 let field = self.parse_field_until(&[Token::RightParen])?;
@@ -511,7 +548,7 @@ fn parse_operand(tokens: &[Lexeme], index: usize) -> Result<(FieldExpr, usize), 
     let token = &tokens[index];
     let span = token.span;
     let value = match token.token {
-        Token::Dot | Token::ResourceDot | Token::SpanDot => {
+        Token::Dot | Token::ResourceDot | Token::SpanDot | Token::InstrumentationDot => {
             let name = tokens
                 .get(index + 1)
                 .ok_or_else(|| ParseError::new("expected attribute name", span))?;
@@ -549,6 +586,7 @@ fn parse_operand(tokens: &[Lexeme], index: usize) -> Result<(FieldExpr, usize), 
                 Token::Dot => AttributeScope::Unscoped,
                 Token::ResourceDot => AttributeScope::Resource,
                 Token::SpanDot => AttributeScope::Span,
+                Token::InstrumentationDot => AttributeScope::Instrumentation,
                 _ => unreachable!(),
             };
             return Ok((
@@ -562,7 +600,7 @@ fn parse_operand(tokens: &[Lexeme], index: usize) -> Result<(FieldExpr, usize), 
                 consumed,
             ));
         }
-        Token::TraceColon | Token::SpanColon => {
+        Token::TraceColon | Token::SpanColon | Token::InstrumentationColon => {
             let name = tokens
                 .get(index + 1)
                 .ok_or_else(|| ParseError::new("expected intrinsic name", span))?;
@@ -638,7 +676,7 @@ fn scoped_intrinsic(scope: Token, name: &str) -> Option<Intrinsic> {
         (Token::TraceColon, "id" | "traceID") => Some(Intrinsic::TraceId),
         (Token::TraceColon, "duration" | "traceDuration") => Some(Intrinsic::TraceDuration),
         (Token::TraceColon, "rootName") => Some(Intrinsic::RootName),
-        (Token::TraceColon, "rootService" | "rootServiceName") => Some(Intrinsic::RootServiceName),
+        (Token::TraceColon, "rootService") => Some(Intrinsic::RootServiceName),
         (Token::SpanColon, "id" | "spanID") => Some(Intrinsic::SpanId),
         (Token::SpanColon, "parentID") => Some(Intrinsic::ParentId),
         (Token::SpanColon, "name") => Some(Intrinsic::Name),
@@ -647,6 +685,8 @@ fn scoped_intrinsic(scope: Token, name: &str) -> Option<Intrinsic> {
         (Token::SpanColon, "statusMessage") => Some(Intrinsic::StatusMessage),
         (Token::SpanColon, "kind") => Some(Intrinsic::Kind),
         (Token::SpanColon, "childCount") => Some(Intrinsic::ChildCount),
+        (Token::InstrumentationColon, "name") => Some(Intrinsic::InstrumentationName),
+        (Token::InstrumentationColon, "version") => Some(Intrinsic::InstrumentationVersion),
         _ => None,
     }
 }
@@ -662,6 +702,9 @@ fn bare_intrinsic(name: &str) -> Option<Intrinsic> {
         "rootServiceName" | "rootService" => Some(Intrinsic::RootServiceName),
         "traceDuration" => Some(Intrinsic::TraceDuration),
         "childCount" => Some(Intrinsic::ChildCount),
+        "nestedSetLeft" => Some(Intrinsic::NestedSetLeft),
+        "nestedSetRight" => Some(Intrinsic::NestedSetRight),
+        "nestedSetParent" => Some(Intrinsic::NestedSetParent),
         _ => None,
     }
 }

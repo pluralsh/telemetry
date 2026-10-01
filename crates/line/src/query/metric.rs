@@ -18,8 +18,8 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
             op,
             parameter,
             expr,
-            grouping,
-        } => range_aggregation(*op, *parameter, expr, grouping.as_ref(), rows, timestamp),
+            ..
+        } => range_aggregation(*op, *parameter, expr, rows, timestamp),
         Expr::LabelAggregation {
             field,
             expr,
@@ -83,7 +83,6 @@ pub(super) fn range_aggregation(
     op: RangeOp,
     parameter: Option<f64>,
     log: &LogExpr,
-    grouping: Option<&Grouping>,
     rows: &MetricRows,
     timestamp: i64,
 ) -> Result<Value> {
@@ -92,69 +91,63 @@ pub(super) fn range_aggregation(
         .as_ref()
         .ok_or_else(|| Error::Query("range aggregation requires a range".into()))
         .and_then(|value| parse_duration_ns(&value.value))?;
+    let offset = log_offset(log)?;
     // LogQL range windows are left-open and right-closed: (t-range, t].
-    let selected = rows.window(log, timestamp.saturating_sub(range), timestamp)?;
-    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<&Row>> = BTreeMap::new();
-    for row in selected {
-        let mut labels = group_labels(&row.labels, grouping);
-        if grouping.is_none_or(|grouping| grouping.without)
-            && let Some(label) = log.stages.iter().find_map(|stage| {
-                if let PipelineStage::Unwrap(unwrap) = &stage.value {
-                    Some(&unwrap.label)
-                } else {
-                    None
-                }
-            })
-        {
-            labels.remove(label);
-        }
-        groups.entry(labels).or_default().push(row);
+    let (start, end) = (
+        timestamp.saturating_sub(range).saturating_sub(offset),
+        timestamp.saturating_sub(offset),
+    );
+    let series = rows.range_series(log)?;
+    let window = |timestamps: &[i64]| {
+        let low = timestamps.partition_point(|&at| at <= start);
+        low..timestamps.partition_point(|&at| at <= end).max(low)
+    };
+    // A failing row anywhere in the window fails the query, as the first such
+    // row would before grouping.
+    let first_failure = series.failures.partition_point(|(at, _)| *at <= start);
+    if let Some((at, message)) = series.failures.get(first_failure)
+        && *at <= end
+    {
+        return Err(Error::Query(message.clone()));
     }
-    if groups.is_empty() && op == RangeOp::Absent {
-        return Ok(Value::Vector(vec![Point {
-            labels: selector_equality_labels(log),
-            value: 1.0,
-        }]));
+    if op == RangeOp::Absent {
+        return Ok(Value::Vector(if window(&series.timestamps).is_empty() {
+            vec![Point {
+                labels: selector_equality_labels(log),
+                value: 1.0,
+            }]
+        } else {
+            Vec::new()
+        }));
     }
     let seconds = range as f64 / 1_000_000_000.0;
-    let effective_end = timestamp.saturating_sub(
-        log.offset
-            .as_ref()
-            .map(|value| parse_duration_ns(&value.value))
-            .transpose()?
-            .unwrap_or(0),
-    );
+    let effective_end = end;
     let mut points = Vec::new();
-    for (labels, mut group) in groups {
-        group.sort_by_key(|row| row.timestamp_ns);
-        let values = group
-            .iter()
-            .filter_map(|row| match op {
-                RangeOp::Bytes | RangeOp::BytesRate => Some(row.line.len() as f64),
-                RangeOp::Count | RangeOp::Rate | RangeOp::Absent => Some(1.0),
-                _ => row.value,
-            })
-            .collect::<Vec<_>>();
+    for group in &series.groups {
+        let selected = window(&group.timestamps);
+        let values = &group.values[selected.clone()];
         if values.is_empty() {
             continue;
         }
+        let labels = group.labels.clone();
         let value = match op {
-            RangeOp::Count | RangeOp::Bytes => values.iter().sum(),
-            RangeOp::Rate | RangeOp::BytesRate => values.iter().sum::<f64>() / seconds,
+            RangeOp::Count | RangeOp::Bytes => group.sum(selected),
+            RangeOp::Rate | RangeOp::BytesRate => group.sum(selected) / seconds,
             RangeOp::RateCounter => {
-                let samples = group
+                let samples = group.timestamps[selected]
                     .iter()
-                    .filter_map(|row| row.value.map(|value| (row.timestamp_ns, value)))
+                    .copied()
+                    .zip(values.iter().copied())
                     .collect::<Vec<_>>();
                 extrapolated_counter_rate(&samples, range, effective_end)
             }
             RangeOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
             RangeOp::Sum => values.iter().sum(),
-            RangeOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
-            RangeOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            RangeOp::Stddev => variance(&values).sqrt(),
-            RangeOp::Stdvar => variance(&values),
-            RangeOp::Quantile => quantile(parameter.unwrap_or(0.5), &values),
+            RangeOp::Min => extreme(values, Ordering::Less),
+            RangeOp::Max => extreme(values, Ordering::Greater),
+            RangeOp::Stddev => variance(values).sqrt(),
+            RangeOp::Stdvar => variance(values),
+            RangeOp::Quantile => quantile(parameter.unwrap_or(0.5), values),
             RangeOp::First => values[0],
             RangeOp::Last => *values.last().expect("not empty"),
             RangeOp::Absent => continue,
@@ -162,6 +155,125 @@ pub(super) fn range_aggregation(
         points.push(Point { labels, value });
     }
     Ok(Value::Vector(points))
+}
+
+/// A metric sample carrying `__error__` fails the query unless the pipeline
+/// asked to keep it with `__preserve_error__="true"`.
+fn check_error(row: &Row) -> Result<()> {
+    error_message(row).map_or(Ok(()), |message| Err(Error::Query(message)))
+}
+
+fn error_message(row: &Row) -> Option<String> {
+    match row.labels.get(ERROR_LABEL) {
+        Some(kind) if row.labels.get(PRESERVE_ERROR_LABEL).map(String::as_str) != Some("true") => {
+            let details = row
+                .labels
+                .get(ERROR_DETAILS_LABEL)
+                .map_or("", String::as_str);
+            Some(format!("pipeline error: {kind}: {details}"))
+        }
+        _ => None,
+    }
+}
+
+/// A range aggregation's rows reduced to what every step needs: each row's
+/// group and contributed value are computed once, so a step only
+/// binary-searches its window in each group.
+pub(super) struct RangeSeries {
+    /// Every row's timestamp, ascending.
+    timestamps: Vec<i64>,
+    /// Rows that fail the query when a window contains them, ascending.
+    failures: Vec<(i64, String)>,
+    /// In label order; rows that contribute no value are left out.
+    groups: Vec<RangeGroup>,
+}
+
+struct RangeGroup {
+    labels: BTreeMap<String, String>,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+    /// Running totals for ops whose values are whole numbers (counts and
+    /// byte lengths), where subtraction is exact; empty otherwise.
+    totals: Vec<u64>,
+}
+
+impl RangeGroup {
+    fn sum(&self, window: std::ops::Range<usize>) -> f64 {
+        if self.totals.is_empty() {
+            self.values[window].iter().sum()
+        } else {
+            (self.totals[window.end] - self.totals[window.start]) as f64
+        }
+    }
+}
+
+impl RangeSeries {
+    /// `rows` must be in ascending timestamp order.
+    pub(super) fn new(
+        op: RangeOp,
+        log: &LogExpr,
+        grouping: Option<&Grouping>,
+        rows: &[Row],
+    ) -> Self {
+        let unwrap_label = log.stages.iter().find_map(|stage| match &stage.value {
+            PipelineStage::Unwrap(unwrap) => Some(&unwrap.label),
+            _ => None,
+        });
+        let drop_unwrap_label = grouping.is_none_or(|grouping| grouping.without);
+        let whole = match op {
+            RangeOp::Count | RangeOp::Bytes | RangeOp::BytesRate => true,
+            RangeOp::Rate => unwrap_label.is_none(),
+            _ => false,
+        };
+        let mut failures = Vec::new();
+        let mut groups: BTreeMap<BTreeMap<String, String>, RangeGroup> = BTreeMap::new();
+        for row in rows {
+            // Checked before grouping, which could otherwise hide the label.
+            if let Some(message) = error_message(row) {
+                failures.push((row.timestamp_ns, message));
+            }
+            let value = match op {
+                RangeOp::Bytes | RangeOp::BytesRate => Some(row.line.len() as f64),
+                RangeOp::Rate if unwrap_label.is_some() => row.value,
+                RangeOp::Count | RangeOp::Rate | RangeOp::Absent => Some(1.0),
+                _ => row.value,
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            let mut labels = group_labels(&row.labels, grouping);
+            if row.labels.contains_key(ERROR_LABEL) {
+                labels.extend(
+                    row.labels
+                        .iter()
+                        .filter(|(name, _)| is_error_label(name))
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+            if drop_unwrap_label && let Some(label) = unwrap_label {
+                labels.remove(label);
+            }
+            let group = groups
+                .entry(labels)
+                .or_insert_with_key(|labels| RangeGroup {
+                    labels: labels.clone(),
+                    timestamps: Vec::new(),
+                    values: Vec::new(),
+                    totals: if whole { vec![0] } else { Vec::new() },
+                });
+            group.timestamps.push(row.timestamp_ns);
+            group.values.push(value);
+            if whole {
+                let total = group.totals.last().copied().unwrap_or(0);
+                group.totals.push(total.saturating_add(value as u64));
+            }
+        }
+        Self {
+            timestamps: rows.iter().map(|row| row.timestamp_ns).collect(),
+            failures,
+            groups: groups.into_values().collect(),
+        }
+    }
 }
 
 pub(super) fn label_aggregation(
@@ -179,11 +291,12 @@ pub(super) fn label_aggregation(
     let selected = rows.window(log, timestamp.saturating_sub(range), timestamp)?;
     let mut groups: BTreeMap<BTreeMap<String, String>, BTreeSet<String>> = BTreeMap::new();
     for row in selected {
-        if let Some(value) = lookup(row, field) {
-            groups
-                .entry(group_labels(&row.labels, grouping))
-                .or_default()
-                .insert(value.to_owned());
+        check_error(row)?;
+        if let Some(value) = lookup(row, field).filter(|value| !value.is_empty()) {
+            let mut labels = group_labels(&row.labels, grouping);
+            // The counted field would otherwise split every value into its own series.
+            labels.remove(field);
+            groups.entry(labels).or_default().insert(value.to_owned());
         }
     }
     Ok(Value::Vector(
@@ -226,6 +339,18 @@ pub(super) fn group_labels(
     }
 }
 
+/// A vector aggregation without `by`/`without` aggregates every series into
+/// one, unlike a range aggregation, which then keeps each series' labels.
+fn vector_group_labels(
+    labels: &BTreeMap<String, String>,
+    grouping: Option<&Grouping>,
+) -> BTreeMap<String, String> {
+    match grouping {
+        None => BTreeMap::new(),
+        grouping => group_labels(labels, grouping),
+    }
+}
+
 pub(super) fn vector_aggregation(
     op: VectorOp,
     parameter: Option<f64>,
@@ -245,14 +370,14 @@ pub(super) fn vector_aggregation(
             if op == VectorOp::Sort {
                 points.sort_by(point_value_order);
             } else {
-                points.sort_by(|a, b| point_value_order(b, a));
+                points.sort_by(point_value_order_desc);
             }
             return points;
         }
         let mut groups: BTreeMap<BTreeMap<String, String>, Vec<Point>> = BTreeMap::new();
         for point in points {
             groups
-                .entry(group_labels(&point.labels, grouping))
+                .entry(vector_group_labels(&point.labels, grouping))
                 .or_default()
                 .push(point);
         }
@@ -261,7 +386,7 @@ pub(super) fn vector_aggregation(
             if op == VectorOp::BottomK {
                 points.sort_by(point_value_order);
             } else {
-                points.sort_by(|a, b| point_value_order(b, a));
+                points.sort_by(point_value_order_desc);
             }
             let count = parameter.unwrap_or(0.0).max(0.0) as usize;
             points.truncate(count);
@@ -272,7 +397,7 @@ pub(super) fn vector_aggregation(
     let mut groups: BTreeMap<BTreeMap<String, String>, Vec<f64>> = BTreeMap::new();
     for point in points {
         groups
-            .entry(group_labels(&point.labels, grouping))
+            .entry(vector_group_labels(&point.labels, grouping))
             .or_default()
             .push(point.value);
     }
@@ -282,8 +407,8 @@ pub(super) fn vector_aggregation(
             let value = match op {
                 VectorOp::Sum => values.iter().sum(),
                 VectorOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
-                VectorOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
-                VectorOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                VectorOp::Min => extreme(&values, Ordering::Less),
+                VectorOp::Max => extreme(&values, Ordering::Greater),
                 VectorOp::Count => values.len() as f64,
                 VectorOp::Stddev => variance(&values).sqrt(),
                 VectorOp::Stdvar => variance(&values),
@@ -294,9 +419,31 @@ pub(super) fn vector_aggregation(
         .collect()
 }
 
+/// Prometheus' `min`/`max`: NaN only wins when every value is NaN.
+fn extreme(values: &[f64], wanted: Ordering) -> f64 {
+    values.iter().copied().fold(f64::NAN, |current, value| {
+        if current.is_nan() || value.partial_cmp(&current) == Some(wanted) {
+            value
+        } else {
+            current
+        }
+    })
+}
+
+/// Orders by value with NaN last, as Prometheus sorts in both directions.
 pub(super) fn point_value_order(a: &Point, b: &Point) -> Ordering {
     a.value
-        .total_cmp(&b.value)
+        .is_nan()
+        .cmp(&b.value.is_nan())
+        .then_with(|| a.value.total_cmp(&b.value))
+        .then_with(|| a.labels.cmp(&b.labels))
+}
+
+fn point_value_order_desc(a: &Point, b: &Point) -> Ordering {
+    a.value
+        .is_nan()
+        .cmp(&b.value.is_nan())
+        .then_with(|| b.value.total_cmp(&a.value))
         .then_with(|| a.labels.cmp(&b.labels))
 }
 
@@ -307,16 +454,20 @@ pub(super) fn binary(
     rhs: Value,
 ) -> Result<Value> {
     match (lhs, rhs) {
-        (Value::Scalar(lhs), Value::Scalar(rhs)) => {
-            Ok(Value::Scalar(binary_number(lhs, op, rhs, modifier)?))
-        }
+        // Scalar comparisons always yield 1 or 0, with or without `bool`.
+        (Value::Scalar(lhs), Value::Scalar(rhs)) if is_comparison(op) => Ok(Value::Scalar(
+            f64::from(binary_number(lhs, op, rhs, None)?.is_some()),
+        )),
+        (Value::Scalar(lhs), Value::Scalar(rhs)) => Ok(Value::Scalar(
+            binary_number(lhs, op, rhs, modifier)?.unwrap_or(f64::NAN),
+        )),
         (Value::Vector(points), Value::Scalar(scalar)) => Ok(Value::Vector(
             points
                 .into_iter()
                 .filter_map(|mut point| {
                     binary_number(point.value, op, scalar, modifier)
                         .ok()
-                        .filter(|value| !value.is_nan())
+                        .flatten()
                         .map(|value| {
                             point.value = value;
                             point
@@ -330,9 +481,14 @@ pub(super) fn binary(
                 .filter_map(|mut point| {
                     binary_number(scalar, op, point.value, modifier)
                         .ok()
-                        .filter(|value| !value.is_nan())
+                        .flatten()
                         .map(|value| {
-                            point.value = value;
+                            // A filtering comparison keeps the vector's value.
+                            point.value = if is_comparison(op) && !returns_bool(modifier) {
+                                point.value
+                            } else {
+                                value
+                            };
                             point
                         })
                 })
@@ -376,7 +532,8 @@ pub(super) fn binary_vectors(
             .or_default()
             .push(point);
     }
-    if !group_right && right.values().any(|points| points.len() > 1) {
+    let set_operator = matches!(op, BinaryOp::And | BinaryOp::Unless);
+    if !set_operator && !group_right && right.values().any(|points| points.len() > 1) {
         return Err(Error::Query(
             "found duplicate series on the right hand-side; many-to-many matching not allowed: matching labels must be unique on one side".into(),
         ));
@@ -406,10 +563,9 @@ pub(super) fn binary_vectors(
             ));
         }
         for right in right_points {
-            let value = binary_number(left.value, op, right.value, modifier)?;
-            if value.is_nan() {
+            let Some(value) = binary_number(left.value, op, right.value, modifier)? else {
                 continue;
-            }
+            };
             let mut output = if group_right {
                 right.clone()
             } else {
@@ -418,8 +574,13 @@ pub(super) fn binary_vectors(
             output.value = value;
             if group_right {
                 include_labels(&mut output.labels, &left.labels, matching);
-            } else {
+            } else if group_left {
                 include_labels(&mut output.labels, &right.labels, matching);
+            } else if let Some(matching) = matching {
+                // One-to-one results keep only the matched-on labels.
+                output
+                    .labels
+                    .retain(|name, _| matching.labels.contains(name) == matching.on);
             }
             let signature = output.labels.clone().into_iter().collect::<Vec<_>>();
             if !output_labels.insert(signature) {
@@ -468,12 +629,30 @@ pub(super) fn include_labels(
     }
 }
 
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterOrEqual
+            | BinaryOp::Less
+            | BinaryOp::LessOrEqual
+    )
+}
+
+fn returns_bool(modifier: Option<&BinaryModifier>) -> bool {
+    modifier.is_some_and(|modifier| modifier.return_bool)
+}
+
+/// `None` is a filtering comparison that did not hold; arithmetic results,
+/// NaN included, are always kept.
 pub(super) fn binary_number(
     lhs: f64,
     op: BinaryOp,
     rhs: f64,
     modifier: Option<&BinaryModifier>,
-) -> Result<f64> {
+) -> Result<Option<f64>> {
     let comparison = match op {
         BinaryOp::Equal => Some(lhs == rhs),
         BinaryOp::NotEqual => Some(lhs != rhs),
@@ -484,18 +663,18 @@ pub(super) fn binary_number(
         _ => None,
     };
     if let Some(comparison) = comparison {
-        return Ok(if modifier.is_some_and(|modifier| modifier.return_bool) {
-            f64::from(comparison)
-        } else if comparison {
-            lhs
+        return Ok(if returns_bool(modifier) {
+            Some(f64::from(comparison))
         } else {
-            f64::NAN
+            comparison.then_some(lhs)
         });
     }
-    Ok(match op {
+    Ok(Some(match op {
         BinaryOp::Add => lhs + rhs,
         BinaryOp::Sub => lhs - rhs,
         BinaryOp::Mul => lhs * rhs,
+        // Loki yields NaN rather than ±Inf for a zero divisor.
+        BinaryOp::Div | BinaryOp::Mod if rhs == 0.0 => f64::NAN,
         BinaryOp::Div => lhs / rhs,
         BinaryOp::Mod => lhs % rhs,
         BinaryOp::Pow => lhs.powf(rhs),
@@ -503,7 +682,7 @@ pub(super) fn binary_number(
             return Err(Error::Query("set operators require vectors".into()));
         }
         _ => unreachable!(),
-    })
+    }))
 }
 
 pub(super) fn string_match(op: MatchOp, actual: &str, expected: &str) -> Result<bool> {

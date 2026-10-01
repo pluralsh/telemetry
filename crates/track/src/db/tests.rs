@@ -792,6 +792,162 @@ async fn traceql_query_executes_with_index_pushdown() {
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].matched_spans[0].name, "wanted");
+
+    for query in [
+        r#"{ span.code = 200 || resource."service.name" = "worker" }"#,
+        r#"{ span.code = 200 } || { span.code = 500 }"#,
+    ] {
+        let results = db
+            .query_traceql(&namespace, 0, 10, query, QueryOptions::default())
+            .await
+            .unwrap();
+        let mut names = results
+            .iter()
+            .map(|result| result.matched_spans[0].name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["other", "wanted"], "{query}");
+    }
+    db.close().await.unwrap();
+}
+
+fn intrinsic_traces() -> Vec<Trace> {
+    let mut slow_error = trace(
+        1,
+        1,
+        "GET /api/users",
+        vec![],
+        vec![attr(
+            "path",
+            any_value::Value::StringValue("/api/users".into()),
+        )],
+    );
+    {
+        let span = &mut slow_error.resource_spans[0].scope_spans[0].spans[0];
+        span.end_time_unix_nano = span.start_time_unix_nano + 5_000_000;
+        span.kind = 2;
+        span.status = Some(opentelemetry_proto::tonic::trace::v1::Status {
+            code: 2,
+            ..Default::default()
+        });
+    }
+    let fast_ok = trace(
+        2,
+        2,
+        "POST /health",
+        vec![],
+        vec![attr("code", any_value::Value::IntValue(200))],
+    );
+    vec![slow_error, fast_ok]
+}
+
+#[tokio::test]
+async fn traceql_pushdown_narrows_scans_and_ranges_and_intrinsics() {
+    let db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    db.write(&namespace, vec![TraceBatch::new(intrinsic_traces())])
+        .await
+        .unwrap();
+    for (query, wanted) in [
+        (r#"{ span.path =~ "/api/.*" }"#, "GET /api/users"),
+        ("{ span.path != nil }", "GET /api/users"),
+        ("{ span.code >= 200 }", "POST /health"),
+        ("{ 300 > span.code }", "POST /health"),
+        (r#"{ name = "POST /health" }"#, "POST /health"),
+        (r#"{ name =~ "GET.*" }"#, "GET /api/users"),
+        ("{ status = error }", "GET /api/users"),
+        ("{ status != error }", "POST /health"),
+        ("{ kind = server }", "GET /api/users"),
+        ("{ duration > 1ms }", "GET /api/users"),
+        ("{ duration < 1us }", "POST /health"),
+        (
+            r#"{ status = error || span.code = 500 } && { .path =~ "/api.*" }"#,
+            "GET /api/users",
+        ),
+    ] {
+        // One candidate proves the index, not the evaluator, did the pruning.
+        let results = db
+            .query_traceql(
+                &namespace,
+                0,
+                10,
+                query,
+                QueryOptions {
+                    max_candidate_traces: 1,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+        let names = results
+            .iter()
+            .map(|result| result.matched_spans[0].name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [wanted], "{query}");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn traceql_intrinsic_pushdown_keeps_pages_without_intrinsic_postings() {
+    let db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    let traces = intrinsic_traces();
+    db.write(&namespace, vec![TraceBatch::new(traces.clone())])
+        .await
+        .unwrap();
+
+    // Pages written before intrinsics were indexed have no intrinsic postings.
+    let mut segments = HashSet::new();
+    for trace in &traces {
+        let mut locators = db
+            .storage
+            .scan_prefix_iter(
+                locator_prefix(&namespace, trace.trace_id),
+                BytesRange::unbounded(),
+                None,
+            )
+            .await
+            .unwrap();
+        while let Some(record) = locators.next().await.unwrap() {
+            segments.insert(decode_locator(&record.value).unwrap().segment);
+        }
+    }
+    let mut deletes = Vec::new();
+    for segment in segments {
+        for name in ["name", "status", "kind", "duration"] {
+            let mut postings = db
+                .storage
+                .scan_prefix_iter(
+                    field_scan_prefix(&namespace, segment, IndexField::Intrinsic, name).freeze(),
+                    BytesRange::unbounded(),
+                    None,
+                )
+                .await
+                .unwrap();
+            while let Some(record) = postings.next().await.unwrap() {
+                deletes.push(RecordOp::Delete(record.key));
+            }
+        }
+    }
+    assert!(!deletes.is_empty());
+    db.writer.as_ref().unwrap().apply(deletes).await.unwrap();
+
+    for (query, wanted) in [
+        ("{ status = error }", "GET /api/users"),
+        (r#"{ name = "POST /health" }"#, "POST /health"),
+        ("{ duration > 1ms }", "GET /api/users"),
+    ] {
+        let results = db
+            .query_traceql(&namespace, 0, 10, query, QueryOptions::default())
+            .await
+            .unwrap();
+        let names = results
+            .iter()
+            .map(|result| result.matched_spans[0].name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [wanted], "{query}");
+    }
     db.close().await.unwrap();
 }
 

@@ -288,6 +288,24 @@ fn append_page_ops(
                 .or_default()
                 .push(index as u32);
         }
+        let spans = trace
+            .resource_spans
+            .iter()
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans);
+        for span in spans {
+            for (name, value) in span_intrinsics(span) {
+                postings
+                    .entry(field_posting_key(
+                        namespace,
+                        id.segment,
+                        (IndexField::Intrinsic, name, &value),
+                        id.sequence,
+                    ))
+                    .or_default()
+                    .push(index as u32);
+            }
+        }
     }
     for (key, mut indices) in postings {
         indices.sort_unstable();

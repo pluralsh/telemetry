@@ -6,10 +6,9 @@ pub(super) enum RegexKind {
     /// Matches the whole input, as LogQL label matchers do.
     Anchored,
     Pattern,
-    PatternCaptures,
 }
 
-pub(super) const REGEX_KINDS: usize = 4;
+pub(super) const REGEX_KINDS: usize = 3;
 pub(super) const REGEX_CACHE_CAPACITY: usize = 256;
 
 thread_local! {
@@ -32,8 +31,7 @@ pub(super) fn with_regex<T>(
         let regex = match kind {
             RegexKind::Plain => Regex::new(source)?,
             RegexKind::Anchored => Regex::new(&format!("^(?:{source})$"))?,
-            RegexKind::Pattern => pattern_regex(source, false)?,
-            RegexKind::PatternCaptures => pattern_regex(source, true)?,
+            RegexKind::Pattern => pattern_regex(source)?,
         };
         let result = f(&regex);
         let mut caches = caches.borrow_mut();
@@ -66,7 +64,9 @@ pub(super) fn match_terms(query: &str) -> Rc<[String]> {
     })
 }
 
-pub(super) fn pattern_regex(pattern: &str, captures: bool) -> Result<Regex> {
+/// The anchored regex behind the `|>` / `!>` line filters, where every
+/// `<capture>` matches lazily.
+pub(super) fn pattern_regex(pattern: &str) -> Result<Regex> {
     let mut source = String::new();
     let mut rest = pattern;
     while let Some(start) = rest.find('<') {
@@ -75,12 +75,7 @@ pub(super) fn pattern_regex(pattern: &str, captures: bool) -> Result<Regex> {
         };
         let end = start + relative_end + 1;
         source.push_str(&regex::escape(&rest[..start]));
-        let name = &rest[start + 1..end];
-        if name == "_" || !captures {
-            source.push_str(".*?");
-        } else {
-            source.push_str(&format!("(?P<{name}>.*?)"));
-        }
+        source.push_str(".*?");
         rest = &rest[end + 1..];
     }
     source.push_str(&regex::escape(rest));

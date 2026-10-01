@@ -444,7 +444,8 @@ pub(super) fn map_write_error<T>(error: WriteError<T>) -> Error {
 /// Groups entries by `(segment, stream)`, sorted by timestamp.
 pub(super) fn group_by_stream(batches: Vec<LogBatch>, segment_ns: i64) -> Result<StreamGroups> {
     let mut groups = StreamGroups::new();
-    for batch in batches {
+    for mut batch in batches {
+        batch.labels = batch.labels.without_empty_values();
         let fingerprint = batch.labels.fingerprint();
         for entry in batch.entries {
             let segment = segment_for(entry.timestamp_ns, segment_ns);

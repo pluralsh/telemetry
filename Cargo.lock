@@ -6011,6 +6011,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sharding",
  "slatedb",
  "snap",

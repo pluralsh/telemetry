@@ -62,6 +62,7 @@ pub enum AttributeScope {
     Unscoped,
     Resource,
     Span,
+    Instrumentation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +85,11 @@ pub enum Intrinsic {
     RootServiceName,
     ChildCount,
     TraceDuration,
+    InstrumentationName,
+    InstrumentationVersion,
+    NestedSetLeft,
+    NestedSetRight,
+    NestedSetParent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +192,8 @@ pub enum ScalarExpr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PipelineStage {
+    /// `| { ... }`: keeps the spans of each spanset that match.
+    SpansetFilter(FieldExpr),
     By(FieldExpr),
     Coalesce,
     Select(Vec<FieldExpr>),
@@ -293,6 +301,7 @@ impl fmt::Display for DisplayExpr<'_> {
                     AttributeScope::Unscoped => ".",
                     AttributeScope::Resource => "resource.",
                     AttributeScope::Span => "span.",
+                    AttributeScope::Instrumentation => "instrumentation.",
                 };
                 write!(f, "{prefix}{}", display_attribute_name(&attribute.name))
             }
@@ -358,6 +367,7 @@ impl fmt::Display for DisplaySpanset<'_> {
 impl fmt::Display for PipelineStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SpansetFilter(expr) => write!(f, "{{ {} }}", DisplayExpr(&expr.value, 0)),
             Self::By(expr) => write!(f, "by({})", DisplayExpr(&expr.value, 0)),
             Self::Coalesce => f.write_str("coalesce()"),
             Self::Select(fields) => {
@@ -443,6 +453,11 @@ fn intrinsic_name(value: Intrinsic) -> &'static str {
         Intrinsic::RootServiceName => "trace:rootService",
         Intrinsic::ChildCount => "span:childCount",
         Intrinsic::TraceDuration => "trace:duration",
+        Intrinsic::InstrumentationName => "instrumentation:name",
+        Intrinsic::InstrumentationVersion => "instrumentation:version",
+        Intrinsic::NestedSetLeft => "nestedSetLeft",
+        Intrinsic::NestedSetRight => "nestedSetRight",
+        Intrinsic::NestedSetParent => "nestedSetParent",
     }
 }
 

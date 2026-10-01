@@ -25,7 +25,9 @@ pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> 
             Ok(true)
         }
         PipelineStage::Keep(selections) => {
-            retain_labels(row, |name, value| selected(selections, name, value));
+            retain_labels(row, |name, value| {
+                is_error_label(name) || selected(selections, name, value)
+            });
             Ok(true)
         }
         PipelineStage::Decolorize => {
@@ -55,25 +57,33 @@ fn selected(selections: &[crate::logql::LabelSelection], name: &str, value: &str
     })
 }
 
-/// Copies the stream's shared labels only if something is actually removed.
+/// Applies to structured metadata as well as labels, as `drop`/`keep` do in
+/// Loki. Copies the stream's shared labels only if something is removed.
 fn retain_labels(row: &mut Row, mut keep: impl FnMut(&str, &str) -> bool) {
+    row.metadata.retain(|name, value| keep(name, value));
     if row.labels.iter().all(|(name, value)| keep(name, value)) {
         return;
     }
     Arc::make_mut(&mut row.labels).retain(|name, value| keep(name, value));
 }
 
+/// `or` operands share the first operand's operator: a positive filter keeps
+/// a line matching any operand, a negative one drops it.
 pub(super) fn line_filter(line: &str, filter: &LineFilter) -> Result<bool> {
+    let negative = filter.branches.first().is_some_and(|branch| {
+        matches!(
+            branch.op,
+            LineFilterOp::NotContains | LineFilterOp::NotRegex | LineFilterOp::NotPattern
+        )
+    });
     for branch in &filter.branches {
         let term = match &branch.term {
             LineFilterTerm::String(value) | LineFilterTerm::Ip(value) => value,
         };
         let found = match (&branch.op, &branch.term) {
-            (LineFilterOp::Contains | LineFilterOp::NotContains, LineFilterTerm::Ip(value)) => line
-                .split(|character: char| {
-                    !(character.is_ascii_hexdigit() || ".:/".contains(character))
-                })
-                .any(|candidate| ip_matches(candidate, value)),
+            (LineFilterOp::Contains | LineFilterOp::NotContains, LineFilterTerm::Ip(value)) => {
+                contains_ip(line, value)
+            }
             (LineFilterOp::Contains | LineFilterOp::NotContains, _) => line.contains(term),
             (LineFilterOp::Regex | LineFilterOp::NotRegex, _) => {
                 with_regex(RegexKind::Plain, term, |regex| regex.is_match(line))?
@@ -82,15 +92,11 @@ pub(super) fn line_filter(line: &str, filter: &LineFilter) -> Result<bool> {
                 with_regex(RegexKind::Pattern, term, |regex| regex.is_match(line))?
             }
         };
-        let accepted = match branch.op {
-            LineFilterOp::NotContains | LineFilterOp::NotRegex | LineFilterOp::NotPattern => !found,
-            _ => found,
-        };
-        if accepted {
-            return Ok(true);
+        if found {
+            return Ok(!negative);
         }
     }
-    Ok(false)
+    Ok(negative)
 }
 
 pub(super) fn parse_stage(row: &mut Row, parser: &ParserStage) -> Result<()> {
@@ -113,11 +119,7 @@ pub(super) fn parse_stage(row: &mut Row, parser: &ParserStage) -> Result<()> {
         ParserStage::Regexp(expression) => Ok(with_regex(RegexKind::Plain, expression, |regex| {
             named_captures(regex, &row.line)
         })?),
-        ParserStage::Pattern(pattern) => {
-            Ok(with_regex(RegexKind::PatternCaptures, pattern, |regex| {
-                named_captures(regex, &row.line)
-            })?)
-        }
+        ParserStage::Pattern(pattern) => Ok(pattern_captures(pattern, &row.line)),
         ParserStage::Unpack => unpack(&row.line).map(|(line, labels)| {
             row.line = line;
             labels
@@ -129,10 +131,38 @@ pub(super) fn parse_stage(row: &mut Row, parser: &ParserStage) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            set_error(row, parser_error_name(parser), &error.to_string());
+            let details = match (parser, &error) {
+                // Loki reports jsonparser's message, not a position.
+                (ParserStage::Json { .. } | ParserStage::Unpack, Error::Json(_)) => {
+                    "Malformed JSON error".to_owned()
+                }
+                _ => error.to_string(),
+            };
+            set_error(row, parser_error_name(parser), &details);
             Ok(())
         }
     }
+}
+
+/// Whether a label filter names `__error__`, which asks for parser errors
+/// to be kept in metric results (`__preserve_error__="true"`).
+pub(super) fn filters_on_error(log: &LogExpr) -> bool {
+    fn names_error(filter: &LabelFilterExpr) -> bool {
+        match filter {
+            LabelFilterExpr::And(lhs, rhs) | LabelFilterExpr::Or(lhs, rhs) => {
+                names_error(&lhs.value) || names_error(&rhs.value)
+            }
+            LabelFilterExpr::Predicate(predicate) => predicate.label == ERROR_LABEL,
+        }
+    }
+    log.stages.iter().any(|stage| match &stage.value {
+        PipelineStage::LabelFilter(filter) => names_error(&filter.value),
+        PipelineStage::Unwrap(Unwrap {
+            post_filter: Some(filter),
+            ..
+        }) => names_error(&filter.value),
+        _ => false,
+    })
 }
 
 pub(super) fn parser_error_name(parser: &ParserStage) -> &'static str {
@@ -151,17 +181,49 @@ pub(super) fn merge_parsed(row: &mut Row, labels: BTreeMap<String, String>) {
     }
     let row_labels = Arc::make_mut(&mut row.labels);
     for (mut name, value) in labels {
-        if row_labels.contains_key(&name) {
+        if row_labels.contains_key(&name) || row.metadata.contains_key(&name) {
+            // An empty extraction never displaces a clashing label's `_extracted` copy.
+            if value.is_empty() {
+                continue;
+            }
             name.push_str("_extracted");
         }
         row_labels.insert(name, value);
     }
 }
 
+/// Moves structured metadata into the labels, as Loki does for metric
+/// queries; a name clashing with a stream label gets `_extracted`.
+pub(super) fn promote_metadata(row: &mut Row) {
+    let promoted = row.metadata.keys().any(|name| name != SCORE_METADATA_FIELD);
+    if !promoted {
+        return;
+    }
+    let labels = Arc::make_mut(&mut row.labels);
+    for (mut name, value) in std::mem::take(&mut row.metadata) {
+        if name == SCORE_METADATA_FIELD {
+            row.metadata.insert(name, value);
+            continue;
+        }
+        if labels.contains_key(&name) {
+            name.push_str("_extracted");
+        }
+        labels.insert(name, value);
+    }
+}
+
+/// Labels that report a pipeline error; `keep` and grouping never remove them.
+pub(super) fn is_error_label(name: &str) -> bool {
+    matches!(
+        name,
+        ERROR_LABEL | ERROR_DETAILS_LABEL | PRESERVE_ERROR_LABEL
+    )
+}
+
 pub(super) fn set_error(row: &mut Row, kind: &str, details: &str) {
     let labels = Arc::make_mut(&mut row.labels);
-    labels.insert("__error__".into(), kind.into());
-    labels.insert("__error_details__".into(), details.into());
+    labels.insert(ERROR_LABEL.into(), kind.into());
+    labels.insert(ERROR_DETAILS_LABEL.into(), details.into());
 }
 
 pub(super) fn parse_json(
@@ -194,10 +256,13 @@ pub(super) fn flatten_json(
             } else {
                 sanitize_label_name(&format!("{prefix}_{name}"))
             };
-            if value.is_object() {
-                flatten_json(&name, value, output);
-            } else {
-                output.insert(name, json_string(value));
+            match value {
+                serde_json::Value::Object(_) => flatten_json(&name, value, output),
+                // Loki extracts neither nulls nor arrays.
+                serde_json::Value::Null | serde_json::Value::Array(_) => {}
+                _ => {
+                    output.insert(name, json_string(value));
+                }
             }
         }
     }
@@ -490,12 +555,71 @@ pub(super) fn unpack(line: &str) -> Result<(String, BTreeMap<String, String>)> {
         .unwrap_or(line)
         .to_owned();
     let mut labels = BTreeMap::new();
+    // unpack only promotes string fields.
     for (name, value) in object {
-        if name != "_entry" {
-            labels.insert(sanitize_label_name(name), json_string(value));
+        if let Some(value) = value.as_str()
+            && name != "_entry"
+        {
+            labels.insert(sanitize_label_name(name), value.to_owned());
         }
     }
     Ok((unpacked, labels))
+}
+
+/// Loki's pattern parser, which is lenient unlike the `|>` filter: a leading
+/// literal must match, then each capture runs to the next literal, and a
+/// missing literal ends the match with the capture taking the rest.
+pub(super) fn pattern_captures(pattern: &str, line: &str) -> BTreeMap<String, String> {
+    enum Part<'a> {
+        Literal(&'a str),
+        Capture(&'a str),
+    }
+    let mut parts = Vec::new();
+    let mut rest = pattern;
+    while let Some(start) = rest.find('<') {
+        let Some(end) = rest[start..].find('>').map(|offset| start + offset) else {
+            break;
+        };
+        if start > 0 {
+            parts.push(Part::Literal(&rest[..start]));
+        }
+        parts.push(Part::Capture(&rest[start + 1..end]));
+        rest = &rest[end + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(Part::Literal(rest));
+    }
+
+    let mut labels = BTreeMap::new();
+    let mut input = line;
+    let mut parts = parts.into_iter().peekable();
+    if let Some(Part::Literal(literal)) = parts.peek() {
+        let Some(stripped) = input.strip_prefix(*literal) else {
+            return labels;
+        };
+        input = stripped;
+        parts.next();
+    }
+    if line.is_empty() {
+        return labels;
+    }
+    while let Some(Part::Capture(name)) = parts.next() {
+        let (value, remaining) = match parts.next() {
+            Some(Part::Literal(literal)) => match input.find(literal) {
+                Some(index) => (&input[..index], Some(&input[index + literal.len()..])),
+                None => (input, None),
+            },
+            _ => (input, None),
+        };
+        if name != "_" {
+            labels.insert(name.to_owned(), value.to_owned());
+        }
+        match remaining {
+            Some(remaining) => input = remaining,
+            None => break,
+        }
+    }
+    labels
 }
 
 pub(super) fn named_captures(regex: &Regex, line: &str) -> BTreeMap<String, String> {
@@ -510,18 +634,68 @@ pub(super) fn named_captures(regex: &Regex, line: &str) -> BTreeMap<String, Stri
     labels
 }
 
-pub(super) fn label_filter(row: &Row, expression: &LabelFilterExpr) -> Result<bool> {
+/// Loki's label filter semantics: string matchers see a missing label as
+/// empty; typed filters drop rows missing the label and keep unparsable
+/// values, marked `LabelFilterErr` unless an earlier error is reported;
+/// `ip()` passes any row that already carries an error.
+pub(super) fn label_filter(row: &mut Row, expression: &LabelFilterExpr) -> Result<bool> {
     match expression {
         LabelFilterExpr::And(lhs, rhs) => {
-            Ok(label_filter(row, &lhs.value)? && label_filter(row, &rhs.value)?)
+            // Both sides run, so either can report an error.
+            let lhs = label_filter(row, &lhs.value)?;
+            Ok(label_filter(row, &rhs.value)? && lhs)
         }
         LabelFilterExpr::Or(lhs, rhs) => {
             Ok(label_filter(row, &lhs.value)? || label_filter(row, &rhs.value)?)
         }
         LabelFilterExpr::Predicate(predicate) => {
-            let actual = lookup(row, &predicate.label).unwrap_or("");
+            let typed = matches!(
+                predicate.value,
+                FilterValue::Number(_)
+                    | FilterValue::Bytes(_)
+                    | FilterValue::Duration(_)
+                    | FilterValue::Ip(_)
+            ) && !matches!(predicate.op, ComparisonOp::Regex | ComparisonOp::NotRegex);
+            if !typed {
+                let actual = lookup(row, &predicate.label).unwrap_or("");
+                return compare_filter(actual, predicate.op, &predicate.value);
+            }
+            if matches!(predicate.value, FilterValue::Ip(_)) && row.labels.contains_key(ERROR_LABEL)
+            {
+                return Ok(true);
+            }
+            let Some(actual) = lookup(row, &predicate.label) else {
+                return Ok(false);
+            };
+            if let FilterValue::Ip(pattern) = &predicate.value {
+                return Ok(compare_bool(contains_ip(actual, pattern), predicate.op));
+            }
+            let parsed = match &predicate.value {
+                FilterValue::Number(_) => actual.parse::<f64>().ok(),
+                FilterValue::Bytes(_) => parse_bytes(actual).ok(),
+                _ => parse_go_duration_ns(actual),
+            };
+            if parsed.is_none() {
+                if !row.labels.contains_key(ERROR_LABEL) {
+                    let details = format!(
+                        "cannot parse {:?} as {}",
+                        actual,
+                        filter_kind(&predicate.value)
+                    );
+                    set_error(row, "LabelFilterErr", &details);
+                }
+                return Ok(true);
+            }
             compare_filter(actual, predicate.op, &predicate.value)
         }
+    }
+}
+
+fn filter_kind(value: &FilterValue) -> &'static str {
+    match value {
+        FilterValue::Bytes(_) => "bytes",
+        FilterValue::Duration(_) => "a duration",
+        _ => "a number",
     }
 }
 
@@ -548,12 +722,10 @@ pub(super) fn compare_filter(
         FilterValue::Bytes(value) => parse_bytes(actual)
             .ok()
             .and_then(|actual| actual.partial_cmp(&parse_bytes(value).ok()?)),
-        FilterValue::Duration(value) => parse_duration_ns(actual)
-            .ok()
-            .and_then(|actual| actual.cmp(&parse_duration_ns(value).ok()?).into()),
+        FilterValue::Duration(value) => parse_go_duration_ns(actual)
+            .and_then(|actual| actual.partial_cmp(&(parse_duration_ns(value).ok()? as f64))),
         FilterValue::Ip(value) => {
-            let matched = ip_matches(actual, value);
-            return Ok(compare_bool(matched, op));
+            return Ok(compare_bool(contains_ip(actual, value), op));
         }
         FilterValue::String(value) | FilterValue::Identifier(value) => Some(actual.cmp(value)),
     };
@@ -586,6 +758,12 @@ pub(super) fn compare_ordering(ordering: Ordering, op: ComparisonOp) -> bool {
 
 pub(super) fn label_format(row: &mut Row, assignments: &[FormatAssignment]) {
     for assignment in assignments {
+        // A reported error owns its labels; formatting cannot rewrite them.
+        if matches!(assignment.label.as_str(), ERROR_LABEL | ERROR_DETAILS_LABEL)
+            && row.labels.contains_key(ERROR_LABEL)
+        {
+            continue;
+        }
         let value = if assignment.rename {
             let renamed = if row.labels.contains_key(&assignment.value) {
                 Arc::make_mut(&mut row.labels).remove(&assignment.value)
@@ -604,7 +782,14 @@ pub(super) fn label_format(row: &mut Row, assignments: &[FormatAssignment]) {
                 }
             }
         };
-        Arc::make_mut(&mut row.labels).insert(assignment.label.clone(), value);
+        // An empty value leaves the label absent, as in Loki's label builder.
+        if value.is_empty() {
+            if row.labels.contains_key(&assignment.label) {
+                Arc::make_mut(&mut row.labels).remove(&assignment.label);
+            }
+        } else {
+            Arc::make_mut(&mut row.labels).insert(assignment.label.clone(), value);
+        }
     }
 }
 
@@ -619,19 +804,27 @@ pub(super) fn lookup<'a>(row: &'a Row, name: &str) -> Option<&'a str> {
     }
 }
 
+/// A row without the unwrapped label is dropped; an unconvertible value keeps
+/// the row, marked with `SampleExtractionErr`. `duration()` and
+/// `duration_seconds()` both yield seconds.
 pub(super) fn apply_unwrap(row: &mut Row, unwrap: &Unwrap) -> Result<bool> {
-    let source = lookup(row, &unwrap.label).unwrap_or("").to_owned();
+    let Some(source) = lookup(row, &unwrap.label).map(str::to_owned) else {
+        return Ok(false);
+    };
     let parsed = match unwrap.conversion {
         None => source.parse::<f64>().ok(),
         Some(Conversion::Bytes) => parse_bytes(&source).ok(),
-        Some(Conversion::Duration) => parse_duration_ns(&source).ok().map(|value| value as f64),
-        Some(Conversion::DurationSeconds) => parse_duration_ns(&source)
-            .ok()
-            .map(|value| value as f64 / 1_000_000_000.0),
+        Some(Conversion::Duration | Conversion::DurationSeconds) => {
+            parse_go_duration_ns(&source).map(|value| value / 1_000_000_000.0)
+        }
     };
     match parsed {
         Some(value) => row.value = Some(value),
-        None => set_error(row, "SampleExtractionErr", "unable to convert unwrap value"),
+        None => set_error(
+            row,
+            "SampleExtractionErr",
+            &format!("unable to convert unwrap value {source:?}"),
+        ),
     }
     unwrap
         .post_filter

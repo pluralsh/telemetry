@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use common::display::hex;
 use opentelemetry_proto::tonic::{
-    common::v1::{AnyValue, KeyValue, any_value},
+    common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
     trace::v1::Span,
 };
 use regex::Regex;
@@ -40,6 +40,16 @@ pub struct TraceQlResult {
 struct SpanContext<'a> {
     span: &'a Span,
     resource_attributes: &'a [KeyValue],
+    scope: Option<&'a InstrumentationScope>,
+}
+
+/// Tempo's nested set model bounds for a span; all zero when the span is not
+/// reachable from a root.
+#[derive(Clone, Copy, Default)]
+struct NestedSet {
+    left: i64,
+    right: i64,
+    parent: i64,
 }
 
 struct TraceContext<'a> {
@@ -47,6 +57,7 @@ struct TraceContext<'a> {
     spans: Vec<SpanContext<'a>>,
     by_id: HashMap<Vec<u8>, usize>,
     children: HashMap<Vec<u8>, Vec<usize>>,
+    nested_sets: Vec<NestedSet>,
     root: Option<usize>,
     start_ns: u64,
     end_ns: u64,
@@ -69,6 +80,12 @@ pub(crate) fn execute(
     let mut selected = Vec::new();
     for stage in &query.stages {
         match stage {
+            PipelineStage::SpansetFilter(expression) => {
+                for spanset in &mut spansets {
+                    spanset.retain(|&index| span_matches(expression, index, &context));
+                }
+                spansets.retain(|spanset| !spanset.is_empty());
+            }
             PipelineStage::By(field) => spansets = group_by(spansets, field, &context)?,
             PipelineStage::Coalesce => {
                 let merged = spansets.into_iter().flatten().collect::<BTreeSet<_>>();
@@ -147,6 +164,7 @@ impl<'a> TraceContext<'a> {
                     spans.push(SpanContext {
                         span,
                         resource_attributes: attributes,
+                        scope: scope.scope.as_ref(),
                     });
                     if spans.len() > max_spans {
                         return Err(QueryError::Limit(format!(
@@ -179,16 +197,73 @@ impl<'a> TraceContext<'a> {
             .min_by_key(|(_, span)| (span.span.start_time_unix_nano, &span.span.span_id))
             .map(|(index, _)| index);
         let (start_ns, end_ns) = trace.timestamp_range();
+        let nested_sets = nested_sets(&spans, &children);
         Ok(Self {
             trace,
             spans,
             by_id,
             children,
+            nested_sets,
             root,
             start_ns,
             end_ns,
         })
     }
+}
+
+/// Numbers spans depth first from each root span, assigning `left` on the way
+/// down and `right` on the way up, as Tempo does at ingest.
+fn nested_sets(
+    spans: &[SpanContext<'_>],
+    children: &HashMap<Vec<u8>, Vec<usize>>,
+) -> Vec<NestedSet> {
+    let mut output = vec![NestedSet::default(); spans.len()];
+    let mut visited = vec![false; spans.len()];
+    let mut bound = 1;
+    let children_of = |index: usize| {
+        let span_id = &spans[index].span.span_id;
+        if span_id.is_empty() {
+            &[][..]
+        } else {
+            children.get(span_id).map_or(&[][..], Vec::as_slice)
+        }
+    };
+    for root in 0..spans.len() {
+        if !spans[root].span.parent_span_id.is_empty() || visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        output[root] = NestedSet {
+            left: bound,
+            right: 0,
+            parent: -1,
+        };
+        bound += 1;
+        let mut stack = vec![(root, 0)];
+        while let Some(&(node, next)) = stack.last() {
+            let child = children_of(node)
+                .iter()
+                .enumerate()
+                .skip(next)
+                .find(|&(_, &child)| !visited[child]);
+            if let Some((position, &child)) = child {
+                stack.last_mut().expect("non-empty stack").1 = position + 1;
+                visited[child] = true;
+                output[child] = NestedSet {
+                    left: bound,
+                    right: 0,
+                    parent: output[node].left,
+                };
+                bound += 1;
+                stack.push((child, 0));
+            } else {
+                output[node].right = bound;
+                bound += 1;
+                stack.pop();
+            }
+        }
+    }
+    output
 }
 
 fn eval_spanset(
@@ -198,13 +273,7 @@ fn eval_spanset(
     match expression {
         SpansetExpr::Filter(expression) => {
             let matches = (0..context.spans.len())
-                .filter_map(|index| {
-                    eval_expr(expression, index, context)
-                        .ok()
-                        .and_then(|value| value.as_bool())
-                        .filter(|value| *value)
-                        .map(|_| index)
-                })
+                .filter(|&index| span_matches(expression, index, context))
                 .collect::<Vec<_>>();
             Ok((!matches.is_empty())
                 .then_some(matches)
@@ -245,49 +314,38 @@ fn structural(
             left.union(right).copied().collect()
         };
     }
-    let (base, relation, negate, include_right) = match op {
-        StructuralOp::Child => (left, StructuralOp::Child, false, true),
-        StructuralOp::Parent => (left, StructuralOp::Parent, false, true),
-        StructuralOp::Descendant => (left, StructuralOp::Descendant, false, true),
-        StructuralOp::Ancestor => (left, StructuralOp::Ancestor, false, true),
-        StructuralOp::Sibling => (left, StructuralOp::Sibling, false, true),
-        StructuralOp::NotChild => (left, StructuralOp::Child, true, false),
-        StructuralOp::NotParent => (left, StructuralOp::Parent, true, false),
-        StructuralOp::NotDescendant => (left, StructuralOp::Descendant, true, false),
-        StructuralOp::NotAncestor => (left, StructuralOp::Ancestor, true, false),
-        StructuralOp::NotSibling => (left, StructuralOp::Sibling, true, false),
-        StructuralOp::UnionChild => (left, StructuralOp::Child, false, true),
-        StructuralOp::UnionParent => (left, StructuralOp::Parent, false, true),
-        StructuralOp::UnionDescendant => (left, StructuralOp::Descendant, false, true),
-        StructuralOp::UnionAncestor => (left, StructuralOp::Ancestor, false, true),
-        StructuralOp::UnionSibling => (left, StructuralOp::Sibling, false, true),
+    // Tempo semantics: `{ A } op { B }` yields the B spans related to some A
+    // span (`!` variants: related to none); `&` variants also yield those A
+    // spans.
+    let (relation, negate, union) = match op {
+        StructuralOp::Child => (Relation::Child, false, false),
+        StructuralOp::Parent => (Relation::Parent, false, false),
+        StructuralOp::Descendant => (Relation::Descendant, false, false),
+        StructuralOp::Ancestor => (Relation::Ancestor, false, false),
+        StructuralOp::Sibling => (Relation::Sibling, false, false),
+        StructuralOp::NotChild => (Relation::Child, true, false),
+        StructuralOp::NotParent => (Relation::Parent, true, false),
+        StructuralOp::NotDescendant => (Relation::Descendant, true, false),
+        StructuralOp::NotAncestor => (Relation::Ancestor, true, false),
+        StructuralOp::NotSibling => (Relation::Sibling, true, false),
+        StructuralOp::UnionChild => (Relation::Child, false, true),
+        StructuralOp::UnionParent => (Relation::Parent, false, true),
+        StructuralOp::UnionDescendant => (Relation::Descendant, false, true),
+        StructuralOp::UnionAncestor => (Relation::Ancestor, false, true),
+        StructuralOp::UnionSibling => (Relation::Sibling, false, true),
         StructuralOp::And | StructuralOp::Union => unreachable!(),
     };
-    let union_variant = matches!(
-        op,
-        StructuralOp::UnionChild
-            | StructuralOp::UnionParent
-            | StructuralOp::UnionDescendant
-            | StructuralOp::UnionAncestor
-            | StructuralOp::UnionSibling
-    );
-    let mut output = if union_variant {
-        left.union(right).copied().collect()
-    } else {
-        BTreeSet::new()
-    };
-    let related_index = RelatedIndex::new(relation, right, context);
-    for &left_index in base {
-        let related = related_index.related(left_index, context);
+    let left_index = LeftIndex::new(relation, left, context);
+    let mut output = BTreeSet::new();
+    for &right_index in right {
+        let related = left_index.related(right_index, left, context);
         if negate {
             if related.is_empty() {
-                output.insert(left_index);
+                output.insert(right_index);
             }
-        } else {
-            if !related.is_empty() {
-                output.insert(left_index);
-            }
-            if include_right {
+        } else if !related.is_empty() {
+            output.insert(right_index);
+            if union {
                 output.extend(related);
             }
         }
@@ -295,78 +353,87 @@ fn structural(
     output
 }
 
-/// The right-hand spans of a structural operator, indexed so each left span
-/// finds its related right spans without scanning the whole right side.
-enum RelatedIndex<'r> {
-    /// Right spans by span id (`Child`) or parent span id (`Parent`, `Sibling`).
-    ById(StructuralOp, HashMap<&'r [u8], Vec<usize>>),
-    /// Right spans (`Descendant`), probed along each left span's ancestors.
-    Set(&'r BTreeSet<usize>),
-    /// Right spans by each of their ancestors (`Ancestor`).
-    ByAncestor(HashMap<usize, Vec<usize>>),
+/// How a right-hand span must relate to a left-hand span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Relation {
+    Child,
+    Parent,
+    Descendant,
+    Ancestor,
+    Sibling,
 }
 
-impl<'r> RelatedIndex<'r> {
-    fn new(
-        relation: StructuralOp,
-        right: &'r BTreeSet<usize>,
-        context: &'r TraceContext<'_>,
-    ) -> Self {
-        match relation {
-            StructuralOp::Child | StructuralOp::Parent | StructuralOp::Sibling => {
-                let mut index: HashMap<&[u8], Vec<usize>> = HashMap::new();
-                for &right_index in right {
-                    let span = context.spans[right_index].span;
-                    let key = if relation == StructuralOp::Child {
-                        &span.span_id
-                    } else {
-                        &span.parent_span_id
-                    };
-                    index.entry(key.as_slice()).or_default().push(right_index);
-                }
-                Self::ById(relation, index)
-            }
-            StructuralOp::Descendant => Self::Set(right),
-            _ => {
-                let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
-                for &right_index in right {
-                    for ancestor in ancestors(right_index, context) {
-                        index.entry(ancestor).or_default().push(right_index);
+/// The left-hand spans of a structural operator, indexed so each right span
+/// finds its related left spans without scanning the whole left side.
+struct LeftIndex<'l> {
+    relation: Relation,
+    /// Left spans by parent span id (`Parent`, `Sibling`).
+    by_parent: HashMap<&'l [u8], Vec<usize>>,
+    /// Left spans by each of their ancestors (`Ancestor`).
+    by_ancestor: HashMap<usize, Vec<usize>>,
+}
+
+impl<'l> LeftIndex<'l> {
+    fn new(relation: Relation, left: &BTreeSet<usize>, context: &'l TraceContext<'_>) -> Self {
+        let mut by_parent: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        let mut by_ancestor: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &left_index in left {
+            match relation {
+                Relation::Parent | Relation::Sibling => {
+                    let parent = context.spans[left_index].span.parent_span_id.as_slice();
+                    if !parent.is_empty() {
+                        by_parent.entry(parent).or_default().push(left_index);
                     }
                 }
-                Self::ByAncestor(index)
+                Relation::Ancestor => {
+                    for ancestor in ancestors(left_index, context) {
+                        by_ancestor.entry(ancestor).or_default().push(left_index);
+                    }
+                }
+                Relation::Child | Relation::Descendant => {}
             }
+        }
+        Self {
+            relation,
+            by_parent,
+            by_ancestor,
         }
     }
 
-    fn related(&self, left: usize, context: &TraceContext<'_>) -> Vec<usize> {
-        let span = context.spans[left].span;
-        match self {
-            Self::ById(StructuralOp::Child, index) => index
-                .get(span.parent_span_id.as_slice())
-                .cloned()
-                .unwrap_or_default(),
-            Self::ById(StructuralOp::Parent, index) => index
+    fn related(
+        &self,
+        right: usize,
+        left: &BTreeSet<usize>,
+        context: &TraceContext<'_>,
+    ) -> Vec<usize> {
+        let span = context.spans[right].span;
+        match self.relation {
+            Relation::Child => context
+                .by_id
+                .get(&span.parent_span_id)
+                .copied()
+                .filter(|parent| left.contains(parent))
+                .into_iter()
+                .collect(),
+            Relation::Descendant => ancestors(right, context)
+                .into_iter()
+                .filter(|ancestor| left.contains(ancestor))
+                .collect(),
+            Relation::Parent => self
+                .by_parent
                 .get(span.span_id.as_slice())
                 .cloned()
                 .unwrap_or_default(),
-            Self::ById(_, index) if !span.parent_span_id.is_empty() => index
+            Relation::Sibling if span.parent_span_id.is_empty() => Vec::new(),
+            Relation::Sibling => self
+                .by_parent
                 .get(span.parent_span_id.as_slice())
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|&right| right != left)
+                .filter(|&sibling| sibling != right)
                 .collect(),
-            Self::ById(..) => Vec::new(),
-            Self::Set(right) => {
-                let mut related = ancestors(left, context)
-                    .into_iter()
-                    .filter(|ancestor| right.contains(ancestor))
-                    .collect::<Vec<_>>();
-                related.sort_unstable();
-                related
-            }
-            Self::ByAncestor(index) => index.get(&left).cloned().unwrap_or_default(),
+            Relation::Ancestor => self.by_ancestor.get(&right).cloned().unwrap_or_default(),
         }
     }
 }
@@ -435,6 +502,13 @@ impl EvalValue {
     }
 }
 
+fn span_matches(expression: &FieldExpr, index: usize, context: &TraceContext<'_>) -> bool {
+    eval_expr(expression, index, context)
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 fn eval_expr(
     expression: &FieldExpr,
     index: usize,
@@ -449,6 +523,9 @@ fn eval_expr(
                     lookup_attribute(span.resource_attributes, &attribute.name)
                 }
                 AttributeScope::Span => lookup_attribute(&span.span.attributes, &attribute.name),
+                AttributeScope::Instrumentation => span
+                    .scope
+                    .and_then(|scope| lookup_attribute(&scope.attributes, &attribute.name)),
                 AttributeScope::Unscoped => {
                     lookup_attribute(&span.span.attributes, &attribute.name)
                         .or_else(|| lookup_attribute(span.resource_attributes, &attribute.name))
@@ -571,6 +648,19 @@ fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>
         Intrinsic::TraceDuration => StaticValue::Duration(
             i64::try_from(context.end_ns.saturating_sub(context.start_ns)).unwrap_or(i64::MAX),
         ),
+        Intrinsic::InstrumentationName => StaticValue::String(
+            context.spans[index]
+                .scope
+                .map_or_else(String::new, |scope| scope.name.clone()),
+        ),
+        Intrinsic::InstrumentationVersion => StaticValue::String(
+            context.spans[index]
+                .scope
+                .map_or_else(String::new, |scope| scope.version.clone()),
+        ),
+        Intrinsic::NestedSetLeft => StaticValue::Int(context.nested_sets[index].left),
+        Intrinsic::NestedSetRight => StaticValue::Int(context.nested_sets[index].right),
+        Intrinsic::NestedSetParent => StaticValue::Int(context.nested_sets[index].parent),
     };
     EvalValue::Static(value)
 }
@@ -594,6 +684,27 @@ fn any_value(value: &AnyValue) -> Option<StaticValue> {
         | any_value::Value::KvlistValue(_)
         | any_value::Value::BytesValue(_) => None,
     }
+}
+
+/// Whether an indexed value passes `value op literal`, exactly as a span
+/// holding it would.
+pub(super) fn stored_value_matches(
+    op: BinaryOp,
+    value: &crate::AttributeValue,
+    literal: &StaticValue,
+) -> bool {
+    let value = match value {
+        crate::AttributeValue::String(value) => StaticValue::String(value.clone()),
+        crate::AttributeValue::Bool(value) => StaticValue::Bool(*value),
+        crate::AttributeValue::Int(value) => StaticValue::Int(*value),
+        crate::AttributeValue::Double(value) => StaticValue::Float(*value),
+    };
+    compare(
+        op,
+        &EvalValue::Static(value),
+        &EvalValue::Static(literal.clone()),
+    )
+    .unwrap_or(false)
 }
 
 fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
@@ -660,11 +771,21 @@ fn regex_is_match(pattern: &str, value: &str) -> Option<bool> {
     })
 }
 
+/// Ints, floats, and durations (as nanoseconds) compare numerically, as in
+/// Tempo.
 fn static_equal(left: &StaticValue, right: &StaticValue) -> bool {
     match (left, right) {
         (StaticValue::Float(left), StaticValue::Float(right)) => left.to_bits() == right.to_bits(),
-        (StaticValue::Int(left), StaticValue::Float(right)) => *left as f64 == *right,
-        (StaticValue::Float(left), StaticValue::Int(right)) => *left == *right as f64,
+        (
+            StaticValue::Int(left) | StaticValue::Duration(left),
+            StaticValue::Int(right) | StaticValue::Duration(right),
+        ) => left == right,
+        (StaticValue::Float(_), _) | (_, StaticValue::Float(_)) => {
+            match (as_float(left), as_float(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+        }
         _ => left == right,
     }
 }
@@ -672,12 +793,11 @@ fn static_equal(left: &StaticValue, right: &StaticValue) -> bool {
 fn static_cmp(left: &StaticValue, right: &StaticValue) -> Option<std::cmp::Ordering> {
     match (left, right) {
         (StaticValue::String(left), StaticValue::String(right)) => Some(left.cmp(right)),
-        (StaticValue::Int(left), StaticValue::Int(right)) => Some(left.cmp(right)),
-        (StaticValue::Float(left), StaticValue::Float(right)) => left.partial_cmp(right),
-        (StaticValue::Int(left), StaticValue::Float(right)) => (*left as f64).partial_cmp(right),
-        (StaticValue::Float(left), StaticValue::Int(right)) => left.partial_cmp(&(*right as f64)),
-        (StaticValue::Duration(left), StaticValue::Duration(right)) => Some(left.cmp(right)),
-        _ => None,
+        (
+            StaticValue::Int(left) | StaticValue::Duration(left),
+            StaticValue::Int(right) | StaticValue::Duration(right),
+        ) => Some(left.cmp(right)),
+        _ => as_float(left)?.partial_cmp(&as_float(right)?),
     }
 }
 
@@ -727,7 +847,7 @@ fn arithmetic(op: BinaryOp, left: EvalValue, right: EvalValue) -> Result<EvalVal
 
 fn as_float(value: &StaticValue) -> Option<f64> {
     match value {
-        StaticValue::Int(value) => Some(*value as f64),
+        StaticValue::Int(value) | StaticValue::Duration(value) => Some(*value as f64),
         StaticValue::Float(value) => Some(*value),
         _ => None,
     }

@@ -27,6 +27,7 @@ mod validation;
 
 pub use ast::*;
 pub use error::{ParseError, ValidationError};
+pub(crate) use validation::IpPattern;
 pub use validation::{
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_QUERY_BYTES, ValidationOptions, validate_selector,
 };

@@ -6,9 +6,10 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use common::serde::ensure_consumed;
 use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
-use common::serde::sortable::encode_i64_sortable;
+use common::serde::sortable::{decode_i64_sortable, encode_i64_sortable};
 use common::serde::varint::{var_u32, var_u64};
 
+use crate::traceql::IndexField;
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
 };
@@ -175,14 +176,6 @@ pub(crate) fn posting_key(
     let mut bytes = posting_prefix(namespace, segment, matcher);
     bytes.put_u64(sequence);
     bytes.freeze()
-}
-
-pub(crate) fn posting_scan_prefix(
-    namespace: &Namespace,
-    segment: SegmentId,
-    matcher: &AttributeMatcher,
-) -> Bytes {
-    posting_prefix(namespace, segment, matcher).freeze()
 }
 
 pub(crate) fn decode_posting_sequence(key: &[u8]) -> Result<u64> {
@@ -380,13 +373,50 @@ fn posting_prefix(
     segment: SegmentId,
     matcher: &AttributeMatcher,
 ) -> BytesMut {
+    let field = match matcher.scope {
+        AttributeScope::Resource => IndexField::Resource,
+        AttributeScope::Span => IndexField::Span,
+    };
+    field_value_prefix(namespace, segment, field, &matcher.name, &matcher.value)
+}
+
+/// Postings of every value of one field in a segment.
+pub(crate) fn field_scan_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    field: IndexField,
+    name: &str,
+) -> BytesMut {
     let mut bytes = record_prefix(namespace, segment, RecordType::AttributePosting);
-    bytes.put_u8(match matcher.scope {
-        AttributeScope::Resource => 1,
-        AttributeScope::Span => 2,
+    bytes.put_u8(match field {
+        IndexField::Resource => 1,
+        IndexField::Span => 2,
+        IndexField::Intrinsic => 3,
     });
-    common::serde::terminated_bytes::serialize(matcher.name.as_bytes(), &mut bytes);
-    match &matcher.value {
+    common::serde::terminated_bytes::serialize(name.as_bytes(), &mut bytes);
+    bytes
+}
+
+pub(crate) fn field_posting_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    (field, name, value): (IndexField, &str, &AttributeValue),
+    sequence: u64,
+) -> Bytes {
+    let mut bytes = field_value_prefix(namespace, segment, field, name, value);
+    bytes.put_u64(sequence);
+    bytes.freeze()
+}
+
+pub(crate) fn field_value_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    field: IndexField,
+    name: &str,
+    value: &AttributeValue,
+) -> BytesMut {
+    let mut bytes = field_scan_prefix(namespace, segment, field, name);
+    match value {
         AttributeValue::String(value) => {
             bytes.put_u8(1);
             common::serde::terminated_bytes::serialize(value.as_bytes(), &mut bytes);
@@ -405,6 +435,39 @@ fn posting_prefix(
         }
     }
     bytes
+}
+
+/// The value and page sequence of a posting key found under a
+/// [`field_scan_prefix`] of `prefix_len` bytes.
+pub(crate) fn decode_posting_value(key: &[u8], prefix_len: usize) -> Result<(AttributeValue, u64)> {
+    let corrupt = || Error::Corrupt("invalid attribute posting key".to_owned());
+    let (rest, sequence) = key
+        .get(prefix_len..)
+        .and_then(|rest| rest.split_last_chunk::<8>())
+        .ok_or_else(corrupt)?;
+    let (tag, mut value) = rest.split_first().ok_or_else(corrupt)?;
+    let fixed = |value: &[u8]| -> Result<u64> {
+        Ok(u64::from_be_bytes(value.try_into().map_err(|_| corrupt())?))
+    };
+    let value = match tag {
+        1 => {
+            let bytes = common::serde::terminated_bytes::deserialize(&mut value)
+                .map_err(|error| Error::Corrupt(error.to_string()))?;
+            if !value.is_empty() {
+                return Err(corrupt());
+            }
+            AttributeValue::String(String::from_utf8(bytes.to_vec()).map_err(|_| corrupt())?)
+        }
+        2 => match value {
+            [0] => AttributeValue::Bool(false),
+            [1] => AttributeValue::Bool(true),
+            _ => return Err(corrupt()),
+        },
+        3 => AttributeValue::Int(decode_i64_sortable(fixed(value)?)),
+        4 => AttributeValue::Double(f64::from_bits(fixed(value)?)),
+        _ => return Err(corrupt()),
+    };
+    Ok((value, u64::from_be_bytes(*sequence)))
 }
 
 fn sequence_key(

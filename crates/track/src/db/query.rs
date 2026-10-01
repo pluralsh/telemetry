@@ -33,7 +33,16 @@ impl TraceDb {
         let now = unix_time_ms()?;
         let clauses = matchers
             .iter()
-            .map(|matcher| vec![matcher.clone()])
+            .map(|matcher| {
+                vec![IndexPredicate {
+                    field: match matcher.scope {
+                        AttributeScope::Resource => IndexField::Resource,
+                        AttributeScope::Span => IndexField::Span,
+                    },
+                    name: matcher.name.clone(),
+                    test: IndexTest::Exact(matcher.value.clone()),
+                }]
+            })
             .collect::<Vec<_>>();
         let ordered = self
             .ordered_candidates(namespace, start_ns, end_ns, &clauses, now)
@@ -150,14 +159,28 @@ impl TraceDb {
         }
 
         let segments = &segments;
+        let on_intrinsic =
+            |clause: &PushdownClause| clause.iter().any(|p| p.field == IndexField::Intrinsic);
+        let unindexed = if clauses.iter().any(on_intrinsic) {
+            self.unindexed_intrinsic_traces(namespace, segments, start_ns, end_ns, now)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let unindexed = &unindexed;
         let matched = futures::future::try_join_all(clauses.iter().map(|clause| async move {
-            let alternatives = futures::future::try_join_all(clause.iter().map(|matcher| {
-                self.posting_candidates(namespace, segments, matcher, start_ns, end_ns, now)
+            let alternatives = futures::future::try_join_all(clause.iter().map(|predicate| {
+                self.posting_candidates(namespace, segments, predicate, start_ns, end_ns, now)
             }))
             .await?;
             let mut union = Candidates::default();
             for trace_id in alternatives.into_iter().flat_map(|found| found.order) {
                 union.insert(trace_id);
+            }
+            if on_intrinsic(clause) {
+                for &trace_id in unindexed {
+                    union.insert(trace_id);
+                }
             }
             Ok::<_, Error>(union)
         }))
@@ -170,33 +193,129 @@ impl TraceDb {
         Ok(candidates.order)
     }
 
-    /// Resolves one matcher's postings to trace IDs through page metadata,
-    /// which carries the page directory, so no payload is fetched.
+    /// Traces in range on pages written before span intrinsics were indexed.
+    /// Every span has a status, so a page lacks status postings exactly when
+    /// it predates the intrinsic index.
+    async fn unindexed_intrinsic_traces(
+        &self,
+        namespace: &Namespace,
+        segments: &[SegmentId],
+        start_ns: u64,
+        end_ns: u64,
+        now: u64,
+    ) -> Result<Vec<TraceId>> {
+        let per_segment = stream::iter(segments.iter().copied())
+            .map(|segment| async move {
+                let mut indexed = HashSet::new();
+                let mut postings = self
+                    .storage
+                    .scan_prefix_iter(
+                        field_scan_prefix(
+                            namespace,
+                            segment,
+                            IndexField::Intrinsic,
+                            crate::traceql::INTRINSIC_STATUS,
+                        )
+                        .freeze(),
+                        BytesRange::unbounded(),
+                        None,
+                    )
+                    .await?;
+                while let Some(record) = postings.next().await? {
+                    indexed.insert(decode_posting_sequence(&record.key)?);
+                }
+                let written = self
+                    .storage
+                    .get(next_sequence_key(namespace, segment))
+                    .await?
+                    .map(|record| decode_sequence(&record.value))
+                    .transpose()?
+                    .unwrap_or(0);
+                let unindexed = (0..written).filter(|sequence| !indexed.contains(sequence));
+                let mut pages = stream::iter(unindexed)
+                    .map(|sequence| async move {
+                        self.storage
+                            .get(metadata_key(namespace, segment, sequence))
+                            .await?
+                            .map(|record| decode_metadata(&record.value))
+                            .transpose()
+                    })
+                    .buffered(READ_CONCURRENCY);
+                let mut found = Vec::new();
+                while let Some(metadata) = pages.try_next().await? {
+                    let Some(metadata) = metadata else {
+                        continue;
+                    };
+                    if metadata.is_expired_at(now) || !metadata.overlaps(start_ns, end_ns) {
+                        continue;
+                    }
+                    found.extend(
+                        metadata
+                            .traces
+                            .iter()
+                            .filter(|trace| trace.overlaps(start_ns, end_ns))
+                            .map(|trace| trace.trace_id),
+                    );
+                }
+                Ok::<_, Error>(found)
+            })
+            .buffered(SEGMENT_SCAN_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(per_segment.into_iter().flatten().collect())
+    }
+
+    /// Resolves one predicate's postings to trace IDs through page metadata,
+    /// which carries the page directory, so no payload is fetched. Exact
+    /// predicates read one value's postings; others scan every value of the
+    /// field and keep those the predicate admits.
     async fn posting_candidates(
         &self,
         namespace: &Namespace,
         segments: &[SegmentId],
-        matcher: &AttributeMatcher,
+        predicate: &IndexPredicate,
         start_ns: u64,
         end_ns: u64,
         now: u64,
     ) -> Result<Candidates> {
         let per_segment = stream::iter(segments.iter().copied())
             .map(|segment| async move {
+                let (prefix, exact) = match &predicate.test {
+                    IndexTest::Exact(value) => (
+                        field_value_prefix(
+                            namespace,
+                            segment,
+                            predicate.field,
+                            &predicate.name,
+                            value,
+                        ),
+                        true,
+                    ),
+                    _ => (
+                        field_scan_prefix(namespace, segment, predicate.field, &predicate.name),
+                        false,
+                    ),
+                };
+                let prefix = prefix.freeze();
                 let mut postings = self
                     .storage
-                    .scan_prefix_iter(
-                        posting_scan_prefix(namespace, segment, matcher),
-                        BytesRange::unbounded(),
-                        None,
-                    )
+                    .scan_prefix_iter(prefix.clone(), BytesRange::unbounded(), None)
                     .await?;
-                let mut pages = Vec::new();
+                let mut pages = BTreeMap::<u64, Vec<u32>>::new();
                 while let Some(record) = postings.next().await? {
-                    pages.push((
-                        decode_posting_sequence(&record.key)?,
-                        decode_indices(&record.value)?,
-                    ));
+                    let sequence = if exact {
+                        decode_posting_sequence(&record.key)?
+                    } else {
+                        let (value, sequence) = decode_posting_value(&record.key, prefix.len())?;
+                        if !predicate.admits(&value) {
+                            continue;
+                        }
+                        sequence
+                    };
+                    pages
+                        .entry(sequence)
+                        .or_default()
+                        .extend(decode_indices(&record.value)?);
                 }
                 let mut pages = stream::iter(pages)
                     .map(|(sequence, indices)| async move {
@@ -850,32 +969,40 @@ async fn load_batch(
         .collect())
 }
 
-fn trace_matches(trace: &Trace, matcher: &AttributeMatcher) -> bool {
-    match matcher.scope {
-        AttributeScope::Resource => trace.resource_spans.iter().any(|resource_spans| {
-            resource_spans.resource.as_ref().is_some_and(|resource| {
-                attributes_match(&resource.attributes, &matcher.name, &matcher.value)
-            })
+/// Whether `trace` holds a value the index would have posted for
+/// `predicate`.
+fn trace_matches(trace: &Trace, predicate: &IndexPredicate) -> bool {
+    let spans = || {
+        trace
+            .resource_spans
+            .iter()
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans)
+    };
+    match predicate.field {
+        IndexField::Resource => trace.resource_spans.iter().any(|resource_spans| {
+            resource_spans
+                .resource
+                .as_ref()
+                .is_some_and(|resource| attributes_match(&resource.attributes, predicate))
         }),
-        AttributeScope::Span => trace.resource_spans.iter().any(|resource_spans| {
-            resource_spans.scope_spans.iter().any(|scope_spans| {
-                scope_spans
-                    .spans
-                    .iter()
-                    .any(|span| attributes_match(&span.attributes, &matcher.name, &matcher.value))
-            })
+        IndexField::Span => spans().any(|span| attributes_match(&span.attributes, predicate)),
+        IndexField::Intrinsic => spans().any(|span| {
+            span_intrinsics(span)
+                .iter()
+                .any(|(name, value)| *name == predicate.name && predicate.admits(value))
         }),
     }
 }
 
-fn attributes_match(attributes: &[KeyValue], name: &str, value: &AttributeValue) -> bool {
+fn attributes_match(attributes: &[KeyValue], predicate: &IndexPredicate) -> bool {
     attributes.iter().any(|attribute| {
-        attribute.key == name
+        attribute.key == predicate.name
             && attribute
                 .value
                 .as_ref()
                 .and_then(AttributeValue::from_otlp)
-                .is_some_and(|found| found.exact_eq(value))
+                .is_some_and(|found| predicate.admits(&found))
     })
 }
 

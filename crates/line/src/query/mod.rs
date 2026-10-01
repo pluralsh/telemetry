@@ -20,8 +20,9 @@ use crate::analyzer::DEFAULT_ANALYZER;
 use crate::db::{PageBudget, ScanTargets, StreamFilter};
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
-    Grouping, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm, LogExpr, MatchOp,
-    ParserExpression, ParserStage, PipelineStage, Query, RangeOp, Unwrap, VectorMatching, VectorOp,
+    Grouping, IpPattern, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm, LogExpr,
+    MatchOp, ParserExpression, ParserStage, PipelineStage, Query, RangeOp, Unwrap, VectorMatching,
+    VectorOp,
 };
 use crate::search::{SCORE_METADATA_FIELD, query_terms, source_matches};
 use crate::{Error, Label, Labels, LogDb, LogEntry, Namespace, Result};
@@ -48,6 +49,10 @@ pub enum Direction {
 }
 
 pub const DEFAULT_INSTANT_LOG_LOOKBACK_NS: i64 = 30_000_000_000;
+
+const ERROR_LABEL: &str = "__error__";
+const ERROR_DETAILS_LABEL: &str = "__error_details__";
+const PRESERVE_ERROR_LABEL: &str = "__preserve_error__";
 
 /// A parsed LogQL request. Log bounds are `[start_ns, end_ns)`; metric
 /// evaluations use LogQL's `(evaluation-range, evaluation]` windows.
@@ -197,7 +202,7 @@ impl LogDb {
             None,
         )
         .await?;
-        plan.evaluate(rows, options)
+        plan.evaluate(vec![rows], options)
     }
 }
 
@@ -214,6 +219,21 @@ struct ScanPlan<'a> {
 
 impl<'a> ScanPlan<'a> {
     fn new(request: &'a QueryRequest, query: &'a Query, options: &QueryOptions) -> Result<Self> {
+        let mut logs = Vec::new();
+        collect_log_exprs(query, &mut logs);
+        for log in logs {
+            for stage in &log.stages {
+                match &stage.value {
+                    PipelineStage::LineFormat(template) => check_template(template)?,
+                    PipelineStage::LabelFormat(assignments) => {
+                        for assignment in assignments.iter().filter(|a| !a.rename) {
+                            check_template(&assignment.value)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(Self {
             request,
             query,
@@ -235,13 +255,19 @@ impl<'a> ScanPlan<'a> {
         }
     }
 
-    fn evaluate(&self, rows: Vec<Row>, options: QueryOptions) -> Result<QueryResult> {
-        if self.early_stop_log().is_some() {
-            return finish_logs(rows, &options, false);
+    fn sink(&self) -> Result<PipelineSink<'a>> {
+        PipelineSink::new(self.query, self.request)
+    }
+
+    fn evaluate(&self, sinks: Vec<PipelineSink<'a>>, options: QueryOptions) -> Result<QueryResult> {
+        let mut sinks = sinks.into_iter();
+        let mut rows = sinks.next().map_or_else(|| self.sink(), Ok)?;
+        for other in sinks {
+            rows.extend(other);
         }
         evaluate(
             self.query,
-            rows,
+            rows.finish(),
             self.request,
             options,
             self.indexed_terms.is_some(),
@@ -279,10 +305,7 @@ pub(crate) async fn query_databases(
         }))
         .buffered(options.max_concurrency)
         .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        .await?;
         return plan.evaluate(rows, options);
     }
     let targets = stream::iter(databases.iter().cloned())
@@ -348,24 +371,22 @@ pub(crate) async fn query_databases(
     .collect::<Vec<_>>()
     .await
     .into_iter()
-    .collect::<Result<Vec<_>>>()?
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    .collect::<Result<Vec<_>>>()?;
     plan.evaluate(stored, options)
 }
 
-async fn load_rows(
+/// Reads one database, running the query's pipelines as pages decode.
+async fn load_rows<'a>(
     database: &LogDb,
     namespace: &Namespace,
-    plan: &ScanPlan<'_>,
+    plan: &ScanPlan<'a>,
     budget: &PageBudget,
     targets: Option<ScanTargets>,
-) -> Result<Vec<Row>> {
+) -> Result<PipelineSink<'a>> {
     let (start, end) = (plan.scan_start, plan.request.end_ns);
     let mut converter = RowConverter::default();
-    if let Some(log) = plan.early_stop_log() {
-        let mut output = Vec::new();
+    let mut sink = plan.sink()?;
+    if plan.early_stop_log().is_some() {
         database
             .read_segments(
                 namespace,
@@ -374,17 +395,10 @@ async fn load_rows(
                 budget,
                 plan.direction == Direction::Backward,
                 |segment| {
-                    let rows = segment
-                        .into_iter()
-                        .map(|row| converter.convert(row, None))
-                        .collect::<Vec<_>>();
-                    output.extend(eval_log_window(
-                        log,
-                        &rows,
-                        plan.request.start_ns,
-                        plan.request.end_ns,
-                    )?);
-                    Ok(if output.len() >= plan.limit {
+                    for row in segment {
+                        sink.push(converter.convert(row, None))?;
+                    }
+                    Ok(if sink.kept() >= plan.limit {
                         ControlFlow::Break(())
                     } else {
                         ControlFlow::Continue(())
@@ -392,9 +406,8 @@ async fn load_rows(
                 },
             )
             .await?;
-        sort_logs(&mut output, plan.direction, false);
-        output.truncate(plan.limit);
-        return Ok(output);
+        sink.truncate_logs(plan.direction, plan.limit);
+        return Ok(sink);
     }
     let targets = match targets {
         Some(targets) => targets,
@@ -410,18 +423,21 @@ async fn load_rows(
             .read_match_bounded(namespace, &targets, (terms, index_top_k), budget.limit())
             .await?
         {
-            return Ok(rows
-                .into_iter()
-                .map(|(row, score)| converter.convert(row, Some(score)))
-                .collect());
+            for (row, score) in rows {
+                sink.push(converter.convert(row, Some(score)))?;
+            }
+            return Ok(sink);
         }
     }
-    Ok(database
-        .read_bounded(namespace, targets, budget)
-        .await?
-        .into_iter()
-        .map(|row| converter.convert(row, None))
-        .collect())
+    database
+        .read_bounded_with(namespace, targets, budget, |chunk| {
+            for row in chunk {
+                sink.push(converter.convert(row, None))?;
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(sink)
 }
 
 /// Converts decoded rows, building each stream's label map once.
@@ -496,20 +512,38 @@ fn finish_logs(mut rows: Vec<Row>, options: &QueryOptions, indexed: bool) -> Res
     streams(rows)
 }
 
+/// Instant vectors keep the order `sort`/`sort_desc` gave them.
+fn uses_sort(query: &Query) -> bool {
+    uses_vector_op(query, VectorOp::Sort) || uses_vector_op(query, VectorOp::SortDesc)
+}
+
+fn uses_vector_op(query: &Query, wanted: VectorOp) -> bool {
+    match &query.value {
+        Expr::VectorAggregation { op, expr, .. } => *op == wanted || uses_vector_op(expr, wanted),
+        Expr::Vector(expr) | Expr::LabelReplace { expr, .. } => uses_vector_op(expr, wanted),
+        Expr::Binary { lhs, rhs, .. } => uses_vector_op(lhs, wanted) || uses_vector_op(rhs, wanted),
+        _ => false,
+    }
+}
+
 fn evaluate(
     query: &Query,
-    rows: Vec<Row>,
+    mut rows: MetricRows,
     request: &QueryRequest,
     options: QueryOptions,
     indexed: bool,
 ) -> Result<QueryResult> {
     if let Expr::Log(log) = &query.value {
-        let result = eval_log_window(log, &rows, request.start_ns, request.end_ns)?;
-        return finish_logs(result, &options, indexed);
+        return finish_logs(rows.take(log), &options, indexed);
     }
 
-    let rows = MetricRows::new(query, &rows)?;
     if let Some(step) = request.step_ns {
+        if uses_vector_op(query, VectorOp::ApproxTopK) {
+            return Err(Error::Query(
+                "approx_topk error: count min sketches are only supported on instant queries"
+                    .into(),
+            ));
+        }
         let mut series: BTreeMap<Vec<(String, String)>, MatrixSeries> = BTreeMap::new();
         let mut timestamp = request.start_ns;
         loop {
@@ -544,10 +578,10 @@ fn evaluate(
                     }
                 }
             }
-            if timestamp == request.end_ns {
-                break;
+            match timestamp.checked_add(step) {
+                Some(next) if next <= request.end_ns => timestamp = next,
+                _ => break,
             }
-            timestamp = timestamp.saturating_add(step).min(request.end_ns);
         }
         Ok(QueryResult::Matrix(series.into_values().collect()))
     } else {
@@ -557,7 +591,9 @@ fn evaluate(
                 value,
             })),
             Value::Vector(mut points) => {
-                points.sort_by(|a, b| a.labels.cmp(&b.labels));
+                if !uses_sort(query) {
+                    points.sort_by(|a, b| a.labels.cmp(&b.labels));
+                }
                 Ok(QueryResult::Vector(
                     points
                         .into_iter()
@@ -763,33 +799,164 @@ fn max_lookback(query: &Query) -> Result<i64> {
     })
 }
 
-/// Pipeline output of every metric log expression over all loaded rows,
-/// sorted by timestamp. Stages never change timestamps, so each step's range
-/// window is a binary-searched slice rather than a fresh pipeline pass.
+/// Runs every log expression's pipeline over rows as they are read, so only
+/// rows some pipeline keeps are held.
+struct PipelineSink<'a> {
+    query: &'a Query,
+    logs: Vec<&'a LogExpr>,
+    offsets: Vec<i64>,
+    /// Log queries keep rows in `[start, end)` of the request; metric
+    /// queries keep every row read and promote metadata to labels.
+    log_window: Option<(i64, i64)>,
+    outputs: Vec<Vec<Row>>,
+}
+
+impl<'a> PipelineSink<'a> {
+    fn new(query: &'a Query, request: &QueryRequest) -> Result<Self> {
+        let mut logs = Vec::new();
+        collect_log_exprs(query, &mut logs);
+        let mut seen = std::collections::HashSet::new();
+        logs.retain(|log| seen.insert(*log as *const LogExpr));
+        let offsets = logs
+            .iter()
+            .map(|log| log_offset(log))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            outputs: vec![Vec::new(); logs.len()],
+            log_window: matches!(query.value, Expr::Log(_))
+                .then_some((request.start_ns, request.end_ns)),
+            query,
+            logs,
+            offsets,
+        })
+    }
+
+    fn push(&mut self, source: Row) -> Result<()> {
+        let last = self.logs.len().saturating_sub(1);
+        let mut source = Some(source);
+        for (index, log) in self.logs.iter().enumerate() {
+            let candidate = source.as_ref().expect("the source moves on the last pass");
+            if let Some((start, end)) = self.log_window {
+                let offset = self.offsets[index];
+                let timestamp = candidate.timestamp_ns;
+                if timestamp < start.saturating_sub(offset)
+                    || timestamp >= end.saturating_sub(offset)
+                {
+                    continue;
+                }
+            }
+            if !selector_matches(log, &candidate.labels)? {
+                continue;
+            }
+            let mut row = if index == last {
+                source.take().expect("the source moves on the last pass")
+            } else {
+                candidate.clone()
+            };
+            if self.log_window.is_none() {
+                promote_metadata(&mut row);
+            }
+            if apply_stages(log, &mut row)? {
+                self.outputs[index].push(row);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rows kept for a log query.
+    fn kept(&self) -> usize {
+        self.outputs.first().map_or(0, Vec::len)
+    }
+
+    /// Keeps the first `limit` log rows in `direction`.
+    fn truncate_logs(&mut self, direction: Direction, limit: usize) {
+        if let Some(rows) = self.outputs.first_mut() {
+            sort_logs(rows, direction, false);
+            rows.truncate(limit);
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        for (output, rows) in self.outputs.iter_mut().zip(other.outputs) {
+            output.extend(rows);
+        }
+    }
+
+    fn finish(self) -> MetricRows {
+        let metric = self.log_window.is_none();
+        let mut by_expr: HashMap<usize, Vec<Row>> = self
+            .logs
+            .into_iter()
+            .zip(self.outputs)
+            .map(|(log, mut rows)| {
+                if metric {
+                    rows.sort_by_key(|row| row.timestamp_ns);
+                }
+                (log as *const LogExpr as usize, rows)
+            })
+            .collect();
+        let mut aggregations = Vec::new();
+        collect_range_aggregations(self.query, &mut aggregations);
+        let ranges = aggregations
+            .into_iter()
+            .filter_map(|(op, log, grouping)| {
+                // Each log expression belongs to one aggregation, so its rows
+                // are no longer needed once reduced.
+                let key = log as *const LogExpr as usize;
+                let rows = by_expr.remove(&key)?;
+                Some((key, RangeSeries::new(op, log, grouping, &rows)))
+            })
+            .collect();
+        MetricRows { by_expr, ranges }
+    }
+}
+
+fn collect_range_aggregations<'a>(
+    query: &'a Query,
+    result: &mut Vec<(RangeOp, &'a LogExpr, Option<&'a Grouping>)>,
+) {
+    match &query.value {
+        Expr::RangeAggregation {
+            op, expr, grouping, ..
+        } => result.push((*op, expr, grouping.as_ref())),
+        Expr::Vector(expr) | Expr::LabelReplace { expr, .. } => {
+            collect_range_aggregations(expr, result);
+        }
+        Expr::VectorAggregation { expr, .. } => collect_range_aggregations(expr, result),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_range_aggregations(lhs, result);
+            collect_range_aggregations(rhs, result);
+        }
+        Expr::Log(_) | Expr::LabelAggregation { .. } | Expr::Number(_) | Expr::String(_) => {}
+    }
+}
+
+/// Pipeline output of every log expression, sorted by timestamp for metric
+/// queries. Stages never change timestamps, so each step's range window is a
+/// binary-searched slice rather than a fresh pipeline pass.
 struct MetricRows {
-    by_expr: HashMap<*const LogExpr, Vec<Row>>,
+    by_expr: HashMap<usize, Vec<Row>>,
+    ranges: HashMap<usize, RangeSeries>,
 }
 
 impl MetricRows {
-    fn new(query: &Query, rows: &[Row]) -> Result<Self> {
-        let mut logs = Vec::new();
-        collect_log_exprs(query, &mut logs);
-        let mut by_expr = HashMap::new();
-        for log in logs {
-            let key = log as *const LogExpr;
-            if by_expr.contains_key(&key) {
-                continue;
-            }
-            let mut output = Vec::new();
-            for source in rows {
-                if let Some(row) = pipeline_row(log, source)? {
-                    output.push(row);
-                }
-            }
-            output.sort_by_key(|row| row.timestamp_ns);
-            by_expr.insert(key, output);
-        }
-        Ok(Self { by_expr })
+    fn range_series(&self, log: &LogExpr) -> Result<&RangeSeries> {
+        self.ranges
+            .get(&(log as *const LogExpr as usize))
+            .ok_or_else(|| Error::Query("range aggregation was not prepared".into()))
+    }
+
+    fn rows(&self, log: &LogExpr) -> Result<&[Row]> {
+        self.by_expr
+            .get(&(log as *const LogExpr as usize))
+            .map(Vec::as_slice)
+            .ok_or_else(|| Error::Query("metric expression was not prepared".into()))
+    }
+
+    fn take(&mut self, log: &LogExpr) -> Vec<Row> {
+        self.by_expr
+            .remove(&(log as *const LogExpr as usize))
+            .unwrap_or_default()
     }
 
     /// Rows of `log` in the LogQL range window `(start, end]`, shifted by
@@ -797,10 +964,7 @@ impl MetricRows {
     fn window(&self, log: &LogExpr, start: i64, end: i64) -> Result<&[Row]> {
         let offset = log_offset(log)?;
         let (start, end) = (start.saturating_sub(offset), end.saturating_sub(offset));
-        let rows = self
-            .by_expr
-            .get(&(log as *const LogExpr))
-            .ok_or_else(|| Error::Query("metric expression was not prepared".into()))?;
+        let rows = self.rows(log)?;
         let low = rows.partition_point(|row| row.timestamp_ns <= start);
         let high = rows.partition_point(|row| row.timestamp_ns <= end).max(low);
         Ok(&rows[low..high])
@@ -816,34 +980,20 @@ fn log_offset(log: &LogExpr) -> Result<i64> {
         .unwrap_or(0))
 }
 
-/// Rows of `log` in the log query window `[start, end)`.
-fn eval_log_window(log: &LogExpr, rows: &[Row], start: i64, end: i64) -> Result<Vec<Row>> {
-    let offset = log_offset(log)?;
-    let start = start.saturating_sub(offset);
-    let end = end.saturating_sub(offset);
-    let mut output = Vec::new();
-    for source in rows {
-        if source.timestamp_ns < start || source.timestamp_ns >= end {
-            continue;
-        }
-        if let Some(row) = pipeline_row(log, source)? {
-            output.push(row);
-        }
-    }
-    Ok(output)
-}
-
-fn pipeline_row(log: &LogExpr, source: &Row) -> Result<Option<Row>> {
-    if !selector_matches(log, &source.labels)? {
-        return Ok(None);
-    }
-    let mut row = source.clone();
+fn apply_stages(log: &LogExpr, row: &mut Row) -> Result<bool> {
     for stage in &log.stages {
-        if !apply_stage(&mut row, &stage.value)? {
-            return Ok(None);
+        let parser = matches!(stage.value, PipelineStage::Parser(_))
+            && !row.labels.contains_key(ERROR_LABEL);
+        if !apply_stage(row, &stage.value)? {
+            return Ok(false);
+        }
+        // Loki flags only parser errors, when a filter asks about them, at
+        // parse time so later stages can still `drop` the flag.
+        if parser && row.labels.contains_key(ERROR_LABEL) && filters_on_error(log) {
+            Arc::make_mut(&mut row.labels).insert(PRESERVE_ERROR_LABEL.into(), "true".into());
         }
     }
-    Ok(Some(row))
+    Ok(true)
 }
 
 fn selector_matches(log: &LogExpr, labels: &BTreeMap<String, String>) -> Result<bool> {

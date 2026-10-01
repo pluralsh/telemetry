@@ -2,9 +2,74 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-use std::collections::HashSet;
+use std::{collections::HashSet, net::IpAddr, sync::LazyLock};
 
 use regex::Regex;
+
+static PATTERN_CAPTURE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([A-Za-z_][A-Za-z0-9_]*)>").expect("constant regex"));
+
+/// An `ip()` filter argument: one address, a CIDR block, or an inclusive
+/// `start-end` range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IpPattern {
+    Single(IpAddr),
+    Cidr(IpAddr, u8),
+    Range(IpAddr, IpAddr),
+}
+
+impl IpPattern {
+    pub(crate) fn parse(source: &str) -> Option<Self> {
+        let source = source.trim();
+        if let Some((network, prefix)) = source.split_once('/') {
+            let network: IpAddr = network.parse().ok()?;
+            let prefix: u8 = prefix.parse().ok()?;
+            let bits = if network.is_ipv4() { 32 } else { 128 };
+            return (prefix <= bits).then_some(Self::Cidr(network, prefix));
+        }
+        if let Some((start, end)) = source.split_once('-') {
+            let (start, end): (IpAddr, IpAddr) = (start.parse().ok()?, end.parse().ok()?);
+            return (start.is_ipv4() == end.is_ipv4()).then_some(Self::Range(start, end));
+        }
+        source.parse().ok().map(Self::Single)
+    }
+
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        let number = |address: IpAddr| match address {
+            IpAddr::V4(address) => (false, u128::from(u32::from(address))),
+            IpAddr::V6(address) => (true, u128::from(address)),
+        };
+        let (v6, value) = number(address);
+        match self {
+            Self::Single(expected) => expected == address,
+            Self::Cidr(network, prefix) => {
+                let (network_v6, network) = number(network);
+                let bits = if network_v6 { 128 } else { 32 };
+                let shift = bits - u32::from(prefix);
+                network_v6 == v6
+                    && value.checked_shr(shift).unwrap_or(0)
+                        == network.checked_shr(shift).unwrap_or(0)
+            }
+            Self::Range(start, end) => {
+                let ((start_v6, start), (_, end)) = (number(start), number(end));
+                start_v6 == v6 && (start..=end).contains(&value)
+            }
+        }
+    }
+}
+
+fn validate_ip(pattern: &str, span: Span) -> Result<(), ValidationError> {
+    IpPattern::parse(pattern)
+        .map(|_| ())
+        .ok_or_else(|| ValidationError::new(format!("ip: invalid pattern {pattern:?}"), span))
+}
+
+fn pattern_captures(pattern: &str) -> impl Iterator<Item = &str> {
+    PATTERN_CAPTURE
+        .captures_iter(pattern)
+        .map(|captures| captures.get(1).expect("group").as_str())
+        .filter(|name| *name != "_")
+}
 
 use super::ast::{
     ComparisonOp, Expr, LabelFilterExpr, LineFilterOp, LineFilterTerm, LogExpr, MatchOp,
@@ -61,16 +126,10 @@ fn validate_expr(query: &Query, depth: usize, max_depth: usize) -> Result<(), Va
         }
         Expr::RangeAggregation {
             op,
-            parameter,
+            parameter: _,
             expr,
             grouping,
         } => {
-            if parameter.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
-                return Err(ValidationError::new(
-                    "quantile must be between 0 and 1",
-                    query.span,
-                ));
-            }
             let has_unwrap = expr
                 .stages
                 .iter()
@@ -292,15 +351,59 @@ fn validate_log(log: &LogExpr, max_depth: usize) -> Result<(), ValidationError> 
             }
             PipelineStage::LineFilter(filter) => {
                 for branch in &filter.branches {
-                    if matches!(branch.op, LineFilterOp::Regex | LineFilterOp::NotRegex)
-                        && let LineFilterTerm::String(pattern) = &branch.term
-                    {
-                        validate_regex(pattern, stage.span)?;
+                    let contains = matches!(
+                        branch.op,
+                        LineFilterOp::Contains | LineFilterOp::NotContains
+                    );
+                    match &branch.term {
+                        LineFilterTerm::Ip(_) if !contains => {
+                            return Err(ValidationError::new(
+                                "ip: invalid operation; only |= and != support ip()",
+                                stage.span,
+                            ));
+                        }
+                        LineFilterTerm::Ip(pattern) => validate_ip(pattern, stage.span)?,
+                        LineFilterTerm::String(pattern)
+                            if matches!(
+                                branch.op,
+                                LineFilterOp::Regex | LineFilterOp::NotRegex
+                            ) =>
+                        {
+                            validate_regex(pattern, stage.span)?;
+                        }
+                        LineFilterTerm::String(pattern)
+                            if matches!(
+                                branch.op,
+                                LineFilterOp::Pattern | LineFilterOp::NotPattern
+                            ) && pattern_captures(pattern).next().is_some() =>
+                        {
+                            return Err(ValidationError::new(
+                                "named captures are not allowed in pattern line filters",
+                                stage.span,
+                            ));
+                        }
+                        LineFilterTerm::String(_) => {}
                     }
                 }
             }
             PipelineStage::Parser(ParserStage::Regexp(pattern)) => {
                 validate_regex(pattern, stage.span)?;
+                if Regex::new(pattern)
+                    .is_ok_and(|regex| regex.capture_names().flatten().count() == 0)
+                {
+                    return Err(ValidationError::new(
+                        "regexp parser requires at least one named capture",
+                        stage.span,
+                    ));
+                }
+            }
+            PipelineStage::Parser(ParserStage::Pattern(pattern))
+                if pattern_captures(pattern).next().is_none() =>
+            {
+                return Err(ValidationError::new(
+                    "pattern parser requires at least one named capture",
+                    stage.span,
+                ));
             }
             PipelineStage::Unwrap(unwrap) => {
                 if let Some(filter) = &unwrap.post_filter {
@@ -372,12 +475,24 @@ fn validate_filter_depth(
         }
         LabelFilterExpr::Predicate(predicate) => {
             use super::ast::FilterValue;
+            if predicate.label == "__error__" && !matches!(predicate.value, FilterValue::String(_))
+            {
+                return Err(ValidationError::new(
+                    format!(
+                        "__error__ is a string label and cannot be compared with {}{}{}",
+                        predicate.label, predicate.op, predicate.value
+                    ),
+                    filter.span,
+                ));
+            }
             match (&predicate.value, predicate.op) {
                 (FilterValue::String(pattern), ComparisonOp::Regex | ComparisonOp::NotRegex) => {
                     validate_regex(pattern, filter.span)
                 }
+                (FilterValue::Ip(pattern), ComparisonOp::Equal | ComparisonOp::NotEqual) => {
+                    validate_ip(pattern, filter.span)
+                }
                 (FilterValue::String(_), ComparisonOp::Equal | ComparisonOp::NotEqual)
-                | (FilterValue::Ip(_), ComparisonOp::Equal | ComparisonOp::NotEqual)
                 | (
                     FilterValue::Number(_) | FilterValue::Bytes(_) | FilterValue::Duration(_),
                     ComparisonOp::Equal

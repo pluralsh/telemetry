@@ -39,7 +39,8 @@ pub fn split(
     batches: Vec<LogBatch>,
 ) -> BTreeMap<ShardId, Vec<LogBatch>> {
     let mut grouped: BTreeMap<ShardId, Vec<LogBatch>> = BTreeMap::new();
-    for batch in batches {
+    for mut batch in batches {
+        batch.labels = batch.labels.without_empty_values();
         let key = canonical_routing_key(namespace, &batch.labels);
         if assignment.epochs.len() == 1 {
             grouped

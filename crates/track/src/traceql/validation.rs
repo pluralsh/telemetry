@@ -23,8 +23,10 @@ pub(crate) fn validate(query: &Query) -> Result<(), ValidationError> {
     validate_spanset(&query.spanset.value)?;
     for stage in &query.stages {
         match stage {
+            PipelineStage::SpansetFilter(expression) => validate_filter(expression)?,
             PipelineStage::By(field) => {
                 infer(field)?;
+                require_span_reference(field, "grouping")?;
             }
             PipelineStage::Select(fields) => {
                 for field in fields {
@@ -47,21 +49,56 @@ pub(crate) fn validate(query: &Query) -> Result<(), ValidationError> {
 
 fn validate_spanset(expression: &SpansetExpr) -> Result<(), ValidationError> {
     match expression {
-        SpansetExpr::Filter(expression) => {
-            let found = infer(expression)?;
-            if !matches!(found, ValueType::Bool | ValueType::Dynamic) {
-                return Err(ValidationError::new(
-                    "span filter must evaluate to boolean",
-                    expression.span,
-                ));
-            }
-        }
+        SpansetExpr::Filter(expression) => validate_filter(expression)?,
         SpansetExpr::Binary { lhs, rhs, .. } => {
             validate_spanset(&lhs.value)?;
             validate_spanset(&rhs.value)?;
         }
     }
     Ok(())
+}
+
+fn validate_filter(expression: &FieldExpr) -> Result<(), ValidationError> {
+    let found = infer(expression)?;
+    if !matches!(found, ValueType::Bool | ValueType::Dynamic) {
+        return Err(ValidationError::new(
+            "span filter must evaluate to boolean",
+            expression.span,
+        ));
+    }
+    Ok(())
+}
+
+fn references_span(expression: &FieldExpr) -> bool {
+    match &expression.value {
+        Expr::Attribute(_) | Expr::Intrinsic(_) => true,
+        Expr::Static(_) => false,
+        Expr::Unary { expr, .. } => references_span(expr),
+        Expr::Binary { lhs, rhs, .. } => references_span(lhs) || references_span(rhs),
+    }
+}
+
+fn require_span_reference(expression: &FieldExpr, what: &str) -> Result<(), ValidationError> {
+    if references_span(expression) {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            format!("{what} field expressions must reference the span"),
+            expression.span,
+        ))
+    }
+}
+
+/// Intrinsics and `resource.service.name` always exist, so `= nil` on them
+/// can never match.
+fn never_nil(expression: &FieldExpr) -> bool {
+    match &expression.value {
+        Expr::Intrinsic(_) => true,
+        Expr::Attribute(attribute) => {
+            attribute.scope == super::AttributeScope::Resource && attribute.name == "service.name"
+        }
+        _ => false,
+    }
 }
 
 fn infer(expression: &FieldExpr) -> Result<ValueType, ValidationError> {
@@ -75,11 +112,16 @@ fn infer(expression: &FieldExpr) -> Result<ValueType, ValidationError> {
             | super::Intrinsic::Name
             | super::Intrinsic::StatusMessage
             | super::Intrinsic::RootName
-            | super::Intrinsic::RootServiceName => ValueType::String,
+            | super::Intrinsic::RootServiceName
+            | super::Intrinsic::InstrumentationName
+            | super::Intrinsic::InstrumentationVersion => ValueType::String,
             super::Intrinsic::Duration | super::Intrinsic::TraceDuration => ValueType::Duration,
             super::Intrinsic::Status => ValueType::Status,
             super::Intrinsic::Kind => ValueType::Kind,
-            super::Intrinsic::ChildCount => ValueType::Int,
+            super::Intrinsic::ChildCount
+            | super::Intrinsic::NestedSetLeft
+            | super::Intrinsic::NestedSetRight
+            | super::Intrinsic::NestedSetParent => ValueType::Int,
         }),
         Expr::Unary { op, expr } => {
             let found = infer(expr)?;
@@ -116,6 +158,15 @@ fn infer(expression: &FieldExpr) -> Result<ValueType, ValidationError> {
                     Ok(ValueType::Bool)
                 }
                 BinaryOp::Equal | BinaryOp::NotEqual => {
+                    if *op == BinaryOp::Equal
+                        && ((left == ValueType::Nil && never_nil(rhs))
+                            || (right == ValueType::Nil && never_nil(lhs)))
+                    {
+                        return Err(ValidationError::new(
+                            "intrinsics and resource.service.name cannot be nil",
+                            expression.span,
+                        ));
+                    }
                     if left != ValueType::Dynamic
                         && right != ValueType::Dynamic
                         && left != ValueType::Nil
@@ -208,12 +259,15 @@ fn scalar_type(expression: &ScalarExpr) -> Result<ValueType, ValidationError> {
                     )
                 })?;
                 let found = infer(field)?;
+                require_span_reference(field, "aggregate")?;
                 if numeric(found) {
-                    Ok(if *op == super::AggregateOp::Avg {
-                        ValueType::Float
-                    } else {
-                        found
-                    })
+                    Ok(
+                        if *op == super::AggregateOp::Avg && found != ValueType::Duration {
+                            ValueType::Float
+                        } else {
+                            found
+                        },
+                    )
                 } else {
                     Err(ValidationError::new(
                         "numeric aggregate requires numeric field",
@@ -289,14 +343,12 @@ fn ordered(value: ValueType) -> bool {
     numeric(value) || matches!(value, ValueType::String)
 }
 
+/// Ints, floats, and durations (as nanoseconds) compare with one another.
 fn comparable(left: ValueType, right: ValueType) -> bool {
     left == ValueType::Dynamic
         || right == ValueType::Dynamic
         || left == right
-        || matches!(
-            (left, right),
-            (ValueType::Int, ValueType::Float) | (ValueType::Float, ValueType::Int)
-        )
+        || (numeric(left) && numeric(right))
 }
 
 fn arithmetic_type(left: ValueType, right: ValueType) -> Option<ValueType> {
@@ -306,11 +358,8 @@ fn arithmetic_type(left: ValueType, right: ValueType) -> Option<ValueType> {
     if left == ValueType::Dynamic || right == ValueType::Dynamic {
         return Some(ValueType::Dynamic);
     }
-    if left == ValueType::Duration && right == ValueType::Duration {
-        return Some(ValueType::Duration);
-    }
     if left == ValueType::Duration || right == ValueType::Duration {
-        return None;
+        return Some(ValueType::Duration);
     }
     Some(if left == ValueType::Float || right == ValueType::Float {
         ValueType::Float
