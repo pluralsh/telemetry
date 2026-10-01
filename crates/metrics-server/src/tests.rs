@@ -42,10 +42,12 @@ fn test_config(mode: ServerMode) -> Config {
             NamespaceConfig {
                 name: "alpha".to_owned(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             },
             NamespaceConfig {
                 name: "beta".to_owned(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             },
         ],
         ..Config::default()
@@ -73,6 +75,10 @@ fn state(mode: ServerMode) -> AppState {
         writers: None,
         readers: None,
         completed_requests: Arc::new(Mutex::new(HashSet::new())),
+        ingest: server_common::ingest::IngestPipeline::new(
+            server_common::ingest::Signal::Metrics,
+            Vec::new(),
+        ),
         cancellation: CancellationToken::new(),
         background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         flush_runs: Arc::new(AtomicU64::new(0)),

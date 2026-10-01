@@ -4,6 +4,7 @@ use common::{CacheWarmerConfig, storage::config::StorageConfig};
 use serde::{Deserialize, Serialize};
 pub use server_common::auth::{Access, AuthConfig};
 pub use server_common::config::{Durability, WriteConfig};
+pub use server_common::usage::UsageReportingConfig;
 
 pub use sharding::server::{ServerMode, StaticOwner};
 
@@ -25,6 +26,9 @@ pub struct NamespaceConfig {
     pub name: String,
     #[serde(default)]
     pub auth: Access,
+    /// Console gRPC endpoint that receives this namespace's ingest usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_reporting_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +110,7 @@ pub struct Config {
     pub request: RequestConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
+    pub usage_reporting: UsageReportingConfig,
     pub namespaces: Vec<NamespaceConfig>,
 }
 
@@ -125,9 +130,11 @@ impl Default for Config {
             request: RequestConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             auth: AuthConfig::default(),
+            usage_reporting: UsageReportingConfig::default(),
             namespaces: vec![NamespaceConfig {
                 name: "default".into(),
                 auth: Access::default(),
+                usage_reporting_endpoint: None,
             }],
         }
     }
@@ -199,7 +206,14 @@ impl Config {
             if !names.insert(&namespace.name) {
                 return Err(ConfigError::Validation("duplicate namespace".into()));
             }
+            if let Some(endpoint) = &namespace.usage_reporting_endpoint {
+                server_common::usage::validate_endpoint(endpoint)
+                    .map_err(ConfigError::Validation)?;
+            }
         }
+        self.usage_reporting
+            .validate()
+            .map_err(ConfigError::Validation)?;
         self.sharding
             .validate(self.mode)
             .map_err(ConfigError::Validation)?;

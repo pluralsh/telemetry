@@ -223,6 +223,7 @@ mod tests {
             namespaces: vec![NamespaceConfig {
                 name: "tenant".into(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             }],
             ..Config::default()
         })

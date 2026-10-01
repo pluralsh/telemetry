@@ -48,8 +48,12 @@ pub fn router(state: AppState) -> Router {
             "/read/ns/{namespace}/loki/api/v1/series",
             get(series_get).post(series_post),
         )
-        .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
-        .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs));
+        .merge(
+            Router::new()
+                .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
+                .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs))
+                .route_layer(state.ingest.http_layer()),
+        );
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route("/metrics", get(server_common::runtime::scrape_metrics))

@@ -15,9 +15,12 @@ anyhow.workspace = true
 axum = "0.8.9"
 base64 = "0.23.1"
 blake3.workspace = true
+http-body = "1.0.1"
 jsonwebtoken.workspace = true
+metrics.workspace = true
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 prost.workspace = true
+proto = { path = "../proto" }
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -28,9 +31,12 @@ sharding = { path = "../sharding" }
 subtle = "2.6.1"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
+tower = "0.5.3"
 tracing.workspace = true
 
 [dev-dependencies]
-metrics.workspace = true
 tempfile.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }

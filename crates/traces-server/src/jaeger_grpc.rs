@@ -6,6 +6,7 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 use server_common::auth::{Permission, authorize};
+use server_common::ingest::IngestLayer;
 use tonic::{Request, Response, Status as GrpcStatus};
 
 use crate::{
@@ -90,6 +91,10 @@ impl CollectorService for AppState {
 
 pub fn jaeger_grpc_service(state: AppState) -> CollectorServiceServer<AppState> {
     CollectorServiceServer::new(state)
+}
+
+pub fn jaeger_ingest_layer(state: &AppState) -> IngestLayer<tonic::body::Body> {
+    state.ingest.grpc_layer(tonic::body::Body::new)
 }
 
 fn convert_batch(batch: Batch) -> Result<Vec<ResourceSpans>, &'static str> {

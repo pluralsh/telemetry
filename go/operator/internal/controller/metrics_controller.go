@@ -354,7 +354,7 @@ func (r *MetricsReconciler) resolveConfigInput(ctx context.Context, metrics *tel
 		} else {
 			access.Write = []meterconfig.Credential{credential}
 		}
-		input.Namespaces = append(input.Namespaces, meterconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access})
+		input.Namespaces = append(input.Namespaces, meterconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access, UsageReportingEndpoint: auth.Spec.UsageReportingEndpoint})
 	}
 	if spec := metrics.Spec.Config.Auth.JWT; spec != nil {
 		input.JWT = &meterconfig.JWT{URL: spec.JWKS.URL, Issuer: spec.Issuer, Audience: spec.Audience, RefreshIntervalSeconds: spec.RefreshIntervalSeconds, RequestTimeoutSeconds: spec.RequestTimeoutSeconds}

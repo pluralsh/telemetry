@@ -310,7 +310,7 @@ func (r *TracesReconciler) resolveConfigInput(ctx context.Context, traces *telem
 		} else {
 			access.Write = []productconfig.Credential{credential}
 		}
-		input.Namespaces = append(input.Namespaces, productconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access})
+		input.Namespaces = append(input.Namespaces, productconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access, UsageReportingEndpoint: auth.Spec.UsageReportingEndpoint})
 	}
 	if spec := traces.Spec.Config.Auth.JWT; spec != nil {
 		input.JWT = &productconfig.JWT{URL: spec.JWKS.URL, Issuer: spec.Issuer, Audience: spec.Audience, RefreshIntervalSeconds: spec.RefreshIntervalSeconds, RequestTimeoutSeconds: spec.RequestTimeoutSeconds}

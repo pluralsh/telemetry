@@ -32,6 +32,7 @@ async fn state(mode: ServerMode, unauthenticated: bool) -> AppState {
         namespaces: vec![NamespaceConfig {
             name: "tenant".into(),
             auth: Default::default(),
+            usage_reporting_endpoint: None,
         }],
         ..Config::default()
     };
@@ -49,6 +50,7 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
         namespaces: vec![NamespaceConfig {
             name: "tenant".into(),
             auth: Default::default(),
+            usage_reporting_endpoint: None,
         }],
         ..Config::default()
     };
@@ -405,6 +407,7 @@ async fn enforces_auth_modes_and_request_size() {
         namespaces: vec![NamespaceConfig {
             name: "tenant".into(),
             auth: Default::default(),
+            usage_reporting_endpoint: None,
         }],
         ..Config::default()
     };

@@ -105,6 +105,16 @@ spec:
                 - key
                 type: object
                 x-kubernetes-map-type: atomic
+              usageReportingEndpoint:
+                description: |-
+                  UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or
+                  http://host:port) implementing Plural Console's PluralServer.MeterMetrics.
+                  Ingested bytes for the namespace are buffered and periodically reported
+                  to it. When several NamespaceAuthentications for the same datastore and
+                  namespace set different endpoints, the lexicographically smallest wins.
+                maxLength: 253
+                pattern: ^(http://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$
+                type: string
               username:
                 minLength: 1
                 type: string

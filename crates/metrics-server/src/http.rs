@@ -64,7 +64,8 @@ pub fn router(state: AppState) -> Router {
     if state.config.mode != ServerMode::Reader {
         let write_routes = Router::new()
             .route("/api/v1/write", post(remote_write))
-            .route("/v1/metrics", post(otlp_http));
+            .route("/v1/metrics", post(otlp_http))
+            .route_layer(state.ingest.http_layer());
         app = app.nest(
             &format!("{}/write/ns/{{namespace}}", state.config.path_prefix),
             write_routes,

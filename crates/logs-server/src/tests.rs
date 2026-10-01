@@ -90,10 +90,66 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
     state.shutdown().await.unwrap();
 }
 
+#[derive(Default)]
+struct UsageRecorder(std::sync::Mutex<Vec<(String, u64)>>);
+
+impl server_common::ingest::IngestMiddleware for UsageRecorder {
+    fn record(&self, request: &server_common::ingest::IngestRequest<'_>) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((request.namespace.to_owned(), request.bytes));
+    }
+}
+
+#[tokio::test]
+async fn ingest_layer_records_accepted_pushes_by_wire_bytes() {
+    let mut config = Config {
+        path_prefix: "/logs".to_owned(),
+        storage: StorageConfig::InMemory,
+        namespaces: vec![namespace("tenant")],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    let mut state = AppState::open(config).await.unwrap();
+    let recorder = std::sync::Arc::new(UsageRecorder::default());
+    state.ingest = server_common::ingest::IngestPipeline::new(
+        server_common::ingest::Signal::Logs,
+        vec![recorder.clone()],
+    );
+    let accepted =
+        json!({"streams":[{"stream":{"app":"api"},"values":[["1","hello"]]}]}).to_string();
+    let compressed = gzip(accepted.as_bytes());
+
+    for (body, expected) in [
+        (compressed.clone(), StatusCode::NO_CONTENT),
+        (gzip(b"not json"), StatusCode::BAD_REQUEST),
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/logs/write/ns/tenant/loki/api/v1/push")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        vec![("tenant".to_owned(), compressed.len() as u64)]
+    );
+    state.shutdown().await.unwrap();
+}
+
 fn namespace(name: &str) -> NamespaceConfig {
     NamespaceConfig {
         name: name.to_owned(),
         auth: Access::default(),
+        usage_reporting_endpoint: None,
     }
 }
 
@@ -720,6 +776,7 @@ async fn authorization_is_scoped_only_by_path_namespace() {
             }],
             write: vec![],
         },
+        usage_reporting_endpoint: None,
     };
     let state = authenticated_state(vec![protected, namespace("open")]).await;
     let unauthorized = router(state.clone())

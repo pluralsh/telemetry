@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub use server_common::auth::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
 pub use server_common::config::{Durability, WriteConfig};
+pub use server_common::usage::UsageReportingConfig;
 pub use sharding::server::{ServerMode, StaticOwner};
 
 #[derive(Debug, Clone, Default)]
@@ -25,6 +26,9 @@ pub struct NamespaceConfig {
     pub name: String,
     #[serde(default)]
     pub auth: Access,
+    /// Console gRPC endpoint that receives this namespace's ingest usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_reporting_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +62,7 @@ pub struct Config {
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub auth: AuthConfig,
+    pub usage_reporting: UsageReportingConfig,
     pub namespaces: Vec<NamespaceConfig>,
 }
 
@@ -74,9 +79,11 @@ impl Default for Config {
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             auth: AuthConfig::default(),
+            usage_reporting: UsageReportingConfig::default(),
             namespaces: vec![NamespaceConfig {
                 name: "default".to_owned(),
                 auth: Access::default(),
+                usage_reporting_endpoint: None,
             }],
         }
     }
@@ -168,7 +175,14 @@ impl Config {
                     namespace.name
                 )));
             }
+            if let Some(endpoint) = &namespace.usage_reporting_endpoint {
+                server_common::usage::validate_endpoint(endpoint)
+                    .map_err(ConfigError::Validation)?;
+            }
         }
+        self.usage_reporting
+            .validate()
+            .map_err(ConfigError::Validation)?;
         self.sharding
             .validate(self.mode)
             .map_err(ConfigError::Validation)?;

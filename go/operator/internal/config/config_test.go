@@ -130,6 +130,34 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 	}
 }
 
+func TestRenderUsageReportingEndpoints(t *testing.T) {
+	namespaces := []NamespaceAccess{
+		{Name: testTenantNamespace, KeyPrefix: "tenant-write", UsageReportingEndpoint: "z-console:50051"},
+		{Name: testTenantNamespace, KeyPrefix: "tenant-read", UsageReportingEndpoint: "console:50051"},
+		{Name: "unmetered", KeyPrefix: "unmetered"},
+	}
+	for _, product := range []struct {
+		name  string
+		input Input
+		key   string
+	}{
+		{name: testMetricsProduct, input: Input{Metrics: &telemetryv1alpha1.Metrics{}, Namespaces: namespaces}, key: MetricsKey},
+		{name: testLogsProduct, input: Input{Logs: &telemetryv1alpha1.Logs{}, Namespaces: namespaces}, key: LogsKey},
+		{name: testTracesProduct, input: Input{Traces: &telemetryv1alpha1.Traces{}, Namespaces: namespaces}, key: TracesKey},
+	} {
+		t.Run(product.name, func(t *testing.T) {
+			result, err := Render(product.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rendered := string(result.Data[product.key])
+			if strings.Count(rendered, "usage_reporting_endpoint:") != 1 || !strings.Contains(rendered, "usage_reporting_endpoint: console:50051") {
+				t.Fatalf("expected only the smallest tenant endpoint to render:\n%s", rendered)
+			}
+		})
+	}
+}
+
 func TestRenderTracesShardedConfig(t *testing.T) {
 	traces := &telemetryv1alpha1.Traces{
 		ObjectMeta: metav1.ObjectMeta{Name: testTracesProduct, Namespace: "observability"},

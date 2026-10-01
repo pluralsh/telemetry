@@ -34,3 +34,8 @@ pub mod pseudofs {
         tonic::include_proto!("pseudofs.v1");
     }
 }
+
+/// Plural Console's gRPC contract, used to report ingested usage.
+pub mod plrl {
+    tonic::include_proto!("plrl");
+}

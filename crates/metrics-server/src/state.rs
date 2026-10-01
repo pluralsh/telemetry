@@ -7,6 +7,7 @@ use std::{
 
 use plural_metrics::{Namespace, Series, ShardedMetrics, ShardingOptions, Visibility};
 use proto::metrics::internal::v1::internal_writer_client::InternalWriterClient;
+use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use sharding::{
     AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
@@ -37,6 +38,7 @@ pub struct AppState {
     pub(crate) router: Arc<WriteRouter>,
     pub(crate) channels: Arc<ChannelPool>,
     pub(crate) completed_requests: Arc<Mutex<HashSet<(String, String)>>>,
+    pub(crate) ingest: IngestPipeline,
     pub(crate) cancellation: CancellationToken,
     pub(crate) background_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     pub(crate) flush_runs: Arc<AtomicU64>,
@@ -116,6 +118,17 @@ impl AppState {
                 remote_retries: config.write.remote_retries,
             },
         );
+        let (ingest, ingest_tasks) = IngestPipeline::standard(
+            Signal::Metrics,
+            config.namespaces.iter().map(|namespace| {
+                (
+                    namespace.name.as_str(),
+                    namespace.usage_reporting_endpoint.as_deref(),
+                )
+            }),
+            &config.usage_reporting,
+            &cancellation,
+        )?;
         let state = Self {
             config: Arc::new(config),
             jwt,
@@ -124,8 +137,9 @@ impl AppState {
             router: Arc::new(router),
             channels: Arc::new(ChannelPool::default()),
             completed_requests: Arc::new(Mutex::new(HashSet::new())),
+            ingest,
             cancellation,
-            background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            background_tasks: Arc::new(tokio::sync::Mutex::new(ingest_tasks)),
             flush_runs: Arc::new(AtomicU64::new(0)),
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
         };

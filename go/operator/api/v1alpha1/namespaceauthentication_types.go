@@ -38,6 +38,15 @@ type NamespaceAuthenticationSpec struct {
 	// +kubebuilder:validation:Enum=read;write
 	Permission   string                   `json:"permission"`
 	SecretKeyRef corev1.SecretKeySelector `json:"secretKeyRef"`
+	// UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or
+	// http://host:port) implementing Plural Console's PluralServer.MeterMetrics.
+	// Ingested bytes for the namespace are buffered and periodically reported
+	// to it. When several NamespaceAuthentications for the same datastore and
+	// namespace set different endpoints, the lexicographically smallest wins.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^(http://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$`
+	UsageReportingEndpoint string `json:"usageReportingEndpoint,omitempty"`
 }
 
 // NamespaceAuthenticationStatus defines the observed state of NamespaceAuthentication.

@@ -14,8 +14,8 @@ pub mod jaeger {
 
 pub use http::router;
 pub use internal_writer::grpc_service;
-pub use jaeger_grpc::jaeger_grpc_service;
-pub use otlp_grpc::otlp_grpc_service;
+pub use jaeger_grpc::{jaeger_grpc_service, jaeger_ingest_layer};
+pub use otlp_grpc::{otlp_grpc_service, otlp_ingest_layer};
 pub use state::AppState;
 
 #[cfg(test)]

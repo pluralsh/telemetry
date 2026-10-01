@@ -31,8 +31,12 @@ use crate::{
 
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
-        .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
-        .route("/write/ns/{namespace}/api/v2/spans", post(zipkin))
+        .merge(
+            Router::new()
+                .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
+                .route("/write/ns/{namespace}/api/v2/spans", post(zipkin))
+                .route_layer(state.ingest.http_layer()),
+        )
         .route(
             "/read/ns/{namespace}/api/traces/{trace_id}",
             get(trace_by_id),

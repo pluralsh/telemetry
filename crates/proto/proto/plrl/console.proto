@@ -1,0 +1,151 @@
+// Vendored from github.com/pluralsh/console proto/console.proto; keep in sync.
+syntax = "proto3";
+
+package plrl;
+
+// Configures where the generated code will be placed.
+option go_package = "internal/proto";
+
+message AiConfigRequest {}
+
+message AiConfig {
+  bool enabled = 1;
+
+  OpenAiConfig openai = 2;
+  AnthropicConfig anthropic = 3;
+  VertexAiConfig vertexAi = 4;
+  BedrockConfig bedrock = 5;
+  AzureOpenAiConfig azure = 6;
+  OpenAiConfig openaiCompatible = 7;
+  OpenAiConfig xai = 8;
+}
+
+message OpenAiTokenExchange {
+  optional bool enabled = 1;
+  optional string tokenUrl = 2;
+  optional string clientId = 3;
+  optional string clientSecret = 4;
+}
+
+// OpenAiMethod selects which OpenAI HTTP APIs the Nexus proxy exposes.
+enum OpenAiMethod {
+  OPEN_AI_METHOD_UNSPECIFIED = 0;
+  CHAT = 1;
+  RESPONSES = 2;
+  AUTO = 3;
+}
+
+message OpenAiConfig {
+  optional string apiKey = 1;
+  optional string model = 2;
+  optional string embeddingModel = 3;
+  optional string toolModel = 4;
+  optional string baseUrl = 5;
+  repeated string proxyModels = 6;
+  optional OpenAiTokenExchange tokenExchange = 7;
+  optional OpenAiMethod method = 8;
+}
+
+message AnthropicConfig {
+  optional string baseUrl = 1;
+  optional string apiKey = 2;
+  optional string model = 3;
+  optional string embeddingModel = 4;
+  optional string toolModel = 5;
+  repeated string proxyModels = 6;
+}
+
+message VertexAiConfig {
+  optional string apiKey = 1;
+  optional string model = 2;
+  optional string endpoint = 3;
+  optional string serviceAccountJson = 4;
+  optional string embeddingModel = 5;
+  optional string toolModel = 6;
+  optional string project = 7;
+  optional string location = 8;
+  repeated string proxyModels = 9;
+}
+
+enum BedrockEndpoint {
+  RUNTIME = 0;
+  MANTLE = 1;
+}
+
+message BedrockModelSettings {
+  string modelId = 1;
+  string inferenceProfileArn = 2;
+}
+
+message BedrockConfig {
+  optional string modelId = 1;
+  optional string toolModelId = 2;
+  optional string accessToken = 3;
+  optional string region = 4;
+  optional string embeddingModelId = 5;
+  optional string awsAccessKeyId = 6;
+  optional string awsSecretAccessKey = 7;
+  repeated string proxyModels = 8;
+  map<string, string> deployments = 9;
+  optional BedrockEndpoint endpoint = 10;
+  repeated BedrockModelSettings modelSettings = 11;
+}
+
+message AzureOpenAiConfig {
+  optional string apiVersion = 1;
+  optional string model = 2;
+  optional string endpoint = 4;
+  optional string embeddingModel = 5;
+  optional string toolModel = 6;
+  optional string accessToken = 7;
+  repeated string proxyModels = 8;
+  map<string, string> deployments = 9;
+}
+
+message ProxyAuthenticationRequest {
+  string token = 1;
+}
+
+message ProxyAuthenticationResponse {
+  bool authenticated = 1;
+}
+
+// Fetches the cluster associated with a cluster deploy token.
+message VerifyClusterRequest {
+  string token = 1;
+}
+
+// The cluster identity required by KAS.
+message VerifyClusterResponse {
+  string id = 1;
+  string name = 2;
+}
+
+message ObservabilityConfig {
+  optional string prometheusUsername = 1;
+  optional string prometheusPassword = 2;
+  optional string elasticUsername = 3;
+  optional string elasticPassword = 4;
+  optional string elasticIndex = 5;
+  optional string elasticHost = 6;
+  optional string prometheusHost = 7;
+}
+
+message MeterMetricsRequest {
+  int64 bytes = 1;
+}
+
+message MeterMetricsResponse {
+  bool success = 1;
+}
+
+message ObservabilityConfigRequest {}
+
+// The AI configuration service definition.
+service PluralServer {
+  rpc MeterMetrics (MeterMetricsRequest) returns (MeterMetricsResponse);
+  rpc GetAiConfig (AiConfigRequest) returns (AiConfig);
+  rpc GetObservabilityConfig (ObservabilityConfigRequest) returns (ObservabilityConfig);
+  rpc ProxyAuthentication (ProxyAuthenticationRequest) returns (ProxyAuthenticationResponse);
+  rpc VerifyCluster (VerifyClusterRequest) returns (VerifyClusterResponse);
+}

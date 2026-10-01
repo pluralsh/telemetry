@@ -5210,10 +5210,12 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "common",
+ "http-body",
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
  "prost",
+ "proto",
  "regex",
  "reqwest 0.12.28",
  "rustls",
@@ -5224,7 +5226,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tonic 0.13.1",
+ "tower 0.5.3",
  "tracing",
 ]
 

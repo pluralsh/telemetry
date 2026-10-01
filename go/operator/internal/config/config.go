@@ -41,9 +41,10 @@ type Access struct {
 }
 
 type NamespaceAccess struct {
-	Name      string
-	KeyPrefix string
-	Access    Access
+	Name                   string
+	KeyPrefix              string
+	Access                 Access
+	UsageReportingEndpoint string
 }
 
 type JWT struct {
@@ -91,15 +92,7 @@ func Render(input Input) (Result, error) {
 	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
 	data := map[string][]byte{}
 	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
-	namespaceAccess := map[string]renderAccess{}
-	for _, namespace := range input.Namespaces {
-		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
-		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
-		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
-		current.Read = append(current.Read, rendered.Read...)
-		current.Write = append(current.Write, rendered.Write...)
-		namespaceAccess[namespace.Name] = current
-	}
+	namespaces := renderNamespaces(data, input.Namespaces, input.Metrics.Spec.Config.Namespaces, secretsPath)
 
 	var jwt *renderJWT
 	if input.JWT != nil {
@@ -119,16 +112,6 @@ func Render(input Input) (Result, error) {
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
-
-	names := lo.Uniq(input.Metrics.Spec.Config.Namespaces)
-	if len(names) == 0 {
-		names = []string{defaultNamespace}
-	}
-	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
-	sort.Strings(names)
-	namespaces := lo.Map(names, func(name string, _ int) renderNamespace {
-		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess())}
-	})
 
 	makeConfig := func(mode string) ([]byte, error) {
 		return yaml.Marshal(renderConfig{
@@ -198,15 +181,7 @@ func renderLogs(input Input) (Result, error) {
 	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
 	data := map[string][]byte{}
 	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
-	namespaceAccess := map[string]renderAccess{}
-	for _, namespace := range input.Namespaces {
-		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
-		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
-		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
-		current.Read = append(current.Read, rendered.Read...)
-		current.Write = append(current.Write, rendered.Write...)
-		namespaceAccess[namespace.Name] = current
-	}
+	namespaces := renderNamespaces(data, input.Namespaces, logs.Spec.Config.Namespaces, secretsPath)
 	var jwt *renderJWT
 	if input.JWT != nil {
 		jwt = &renderJWT{
@@ -224,15 +199,6 @@ func renderLogs(input Input) (Result, error) {
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
-	names := lo.Uniq(logs.Spec.Config.Namespaces)
-	if len(names) == 0 {
-		names = []string{defaultNamespace}
-	}
-	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
-	sort.Strings(names)
-	namespaces := lo.Map(names, func(name string, _ int) renderNamespace {
-		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess())}
-	})
 	makeConfig := func(component string) ([]byte, error) {
 		spec := logs.Spec.Config
 		return yaml.Marshal(renderLogsConfig{
@@ -307,14 +273,7 @@ func renderTraces(input Input) (Result, error) {
 	internalTokenPath := lo.CoalesceOrEmpty(input.InternalTokenPath, descriptor.InternalTokenPath)
 	data := map[string][]byte{}
 	global := renderResolvedAccess(data, "global", input.Global, secretsPath)
-	namespaceAccess := map[string]renderAccess{}
-	for _, namespace := range input.Namespaces {
-		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
-		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
-		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
-		current.Read, current.Write = append(current.Read, rendered.Read...), append(current.Write, rendered.Write...)
-		namespaceAccess[namespace.Name] = current
-	}
+	namespaces := renderNamespaces(data, input.Namespaces, traces.Spec.Config.Namespaces, secretsPath)
 	var jwt *renderJWT
 	if input.JWT != nil {
 		jwt = &renderJWT{Issuer: input.JWT.Issuer, Audience: input.JWT.Audience, RefreshIntervalSeconds: int64Value(input.JWT.RefreshIntervalSeconds, 300), RequestTimeoutSeconds: int64Value(input.JWT.RequestTimeoutSeconds, 5)}
@@ -328,15 +287,6 @@ func renderTraces(input Input) (Result, error) {
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
-	names := lo.Uniq(traces.Spec.Config.Namespaces)
-	if len(names) == 0 {
-		names = []string{defaultNamespace}
-	}
-	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
-	sort.Strings(names)
-	namespaces := lo.Map(names, func(name string, _ int) renderNamespace {
-		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess())}
-	})
 	makeConfig := func(component string) ([]byte, error) {
 		spec := traces.Spec.Config
 		return yaml.Marshal(renderTracesConfig{
@@ -758,6 +708,37 @@ type renderAuth struct {
 	Internal        *renderFileSecret `json:"internal,omitempty"`
 }
 type renderNamespace struct {
-	Name string       `json:"name"`
-	Auth renderAccess `json:"auth"`
+	Name                   string       `json:"name"`
+	Auth                   renderAccess `json:"auth"`
+	UsageReportingEndpoint string       `json:"usage_reporting_endpoint,omitempty"`
+}
+
+// renderNamespaces merges NamespaceAuthentication-derived access with the
+// datastore's configured namespace names. Conflicting usage reporting
+// endpoints resolve to the lexicographically smallest so output is stable.
+func renderNamespaces(data map[string][]byte, access []NamespaceAccess, configured []string, secretsPath string) []renderNamespace {
+	namespaceAccess := map[string]renderAccess{}
+	endpoints := map[string]string{}
+	for _, namespace := range access {
+		prefix := lo.CoalesceOrEmpty(namespace.KeyPrefix, namespace.Name)
+		rendered := renderResolvedAccess(data, "namespace-"+prefix, namespace.Access, secretsPath)
+		current := lo.ValueOr(namespaceAccess, namespace.Name, emptyAccess())
+		current.Read = append(current.Read, rendered.Read...)
+		current.Write = append(current.Write, rendered.Write...)
+		namespaceAccess[namespace.Name] = current
+		if endpoint := namespace.UsageReportingEndpoint; endpoint != "" {
+			if existing, found := endpoints[namespace.Name]; !found || endpoint < existing {
+				endpoints[namespace.Name] = endpoint
+			}
+		}
+	}
+	names := lo.Uniq(configured)
+	if len(names) == 0 {
+		names = []string{defaultNamespace}
+	}
+	names = lo.Uniq(append(names, lo.Keys(namespaceAccess)...))
+	sort.Strings(names)
+	return lo.Map(names, func(name string, _ int) renderNamespace {
+		return renderNamespace{Name: name, Auth: lo.ValueOr(namespaceAccess, name, emptyAccess()), UsageReportingEndpoint: endpoints[name]}
+	})
 }

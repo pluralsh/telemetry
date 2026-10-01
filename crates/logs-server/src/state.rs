@@ -12,6 +12,7 @@ use plural_logs::{
 };
 use proto::logs::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
+use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use sharding::{
     AssignmentGeneration, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
@@ -38,6 +39,7 @@ pub struct AppState {
     pub(crate) namespaces: Arc<HashMap<String, NamespaceConfig>>,
     pub(crate) router: Arc<WriteRouter>,
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub(crate) ingest: IngestPipeline,
     channels: Arc<ChannelPool>,
     query_cache: Arc<tokio::sync::Mutex<QueryCache>>,
     dirty: Arc<AtomicBool>,
@@ -121,6 +123,17 @@ impl AppState {
                 remote_retries: config.write.remote_retries,
             },
         );
+        let (ingest, ingest_tasks) = IngestPipeline::standard(
+            Signal::Logs,
+            config.namespaces.iter().map(|namespace| {
+                (
+                    namespace.name.as_str(),
+                    namespace.usage_reporting_endpoint.as_deref(),
+                )
+            }),
+            &config.usage_reporting,
+            &cancellation,
+        )?;
         let state = Self {
             config: Arc::new(config),
             db,
@@ -128,13 +141,14 @@ impl AppState {
             namespaces: Arc::new(namespaces),
             router: Arc::new(router),
             completed_requests: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            ingest,
             channels: Arc::new(ChannelPool::default()),
             query_cache: Arc::new(tokio::sync::Mutex::new(QueryCache::default())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
             cancellation,
-            tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            tasks: Arc::new(tokio::sync::Mutex::new(ingest_tasks)),
         };
         #[cfg(feature = "kubernetes")]
         if let Some(runtime) = kubernetes {
@@ -505,6 +519,7 @@ mod tests {
             namespaces: vec![NamespaceConfig {
                 name: "tenant".into(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             }],
             ..Config::default()
         }
@@ -567,6 +582,7 @@ mod tests {
             namespaces: vec![NamespaceConfig {
                 name: "tenant".into(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             }],
             ..Config::default()
         })
@@ -594,6 +610,7 @@ mod tests {
             namespaces: vec![NamespaceConfig {
                 name: "tenant".into(),
                 auth: Default::default(),
+                usage_reporting_endpoint: None,
             }],
             ..Config::default()
         })

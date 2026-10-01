@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/logs/internal/v1/writer.proto",
                 "proto/traces/internal/v1/writer.proto",
                 "proto/pseudofs/v1/pseudofs.proto",
+                "proto/plrl/console.proto",
             ],
             &["proto"],
         )?;
@@ -24,5 +25,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/logs/internal/v1/writer.proto");
     println!("cargo:rerun-if-changed=proto/traces/internal/v1/writer.proto");
     println!("cargo:rerun-if-changed=proto/pseudofs/v1/pseudofs.proto");
+    println!("cargo:rerun-if-changed=proto/plrl/console.proto");
     Ok(())
 }

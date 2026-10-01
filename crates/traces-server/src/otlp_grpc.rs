@@ -6,6 +6,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use plural_traces::{Namespace, trace_batches};
 use prost::Message;
 use server_common::auth::{Permission, authorize};
+use server_common::ingest::IngestLayer;
 use tonic_otlp::{Request, Response, Status};
 
 use crate::{AppState, config::ServerMode};
@@ -78,4 +79,8 @@ impl TraceService for AppState {
 
 pub fn otlp_grpc_service(state: AppState) -> TraceServiceServer<AppState> {
     TraceServiceServer::new(state)
+}
+
+pub fn otlp_ingest_layer(state: &AppState) -> IngestLayer<tonic_otlp::body::BoxBody> {
+    state.ingest.grpc_layer(tonic_otlp::body::boxed)
 }

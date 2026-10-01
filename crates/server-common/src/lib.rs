@@ -3,8 +3,10 @@
 pub mod auth;
 pub mod config;
 pub mod http;
+pub mod ingest;
 pub mod internal_rpc;
 pub mod runtime;
+pub mod usage;
 
 pub use http::ApiError;
 

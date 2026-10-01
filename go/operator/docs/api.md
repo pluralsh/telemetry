@@ -671,6 +671,7 @@ _Appears in:_
 | `username` _string_ |  |  | MinLength: 1 <br /> |
 | `permission` _string_ |  |  | Enum: [read write] <br /> |
 | `secretKeyRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+| `usageReportingEndpoint` _string_ | UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or<br />http://host:port) implementing Plural Console's PluralServer.MeterMetrics.<br />Ingested bytes for the namespace are buffered and periodically reported<br />to it. When several NamespaceAuthentications for the same datastore and<br />namespace set different endpoints, the lexicographically smallest wins. |  | MaxLength: 253 <br />Pattern: `^(http://)?[A-Za-z0-9.-]+(:[0-9]\{1,5\})?$` <br /> |
 
 
 

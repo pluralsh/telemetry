@@ -310,7 +310,7 @@ func (r *LogsReconciler) resolveConfigInput(ctx context.Context, logs *telemetry
 		} else {
 			access.Write = []productconfig.Credential{credential}
 		}
-		input.Namespaces = append(input.Namespaces, productconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access})
+		input.Namespaces = append(input.Namespaces, productconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access, UsageReportingEndpoint: auth.Spec.UsageReportingEndpoint})
 	}
 	if spec := logs.Spec.Config.Auth.JWT; spec != nil {
 		input.JWT = &productconfig.JWT{URL: spec.JWKS.URL, Issuer: spec.Issuer, Audience: spec.Audience, RefreshIntervalSeconds: spec.RefreshIntervalSeconds, RequestTimeoutSeconds: spec.RequestTimeoutSeconds}
