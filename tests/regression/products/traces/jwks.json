@@ -5,7 +5,7 @@
       "kid": "regression-hs256",
       "alg": "HS256",
       "use": "sig",
-      "k": "dHJhY2stcmVncmVzc2lvbi10ZXN0LW9ubHktaHMyNTYtc2lnbmluZy1rZXk"
+      "k": "dHJhY2VzLXJlZ3Jlc3Npb24tdGVzdC1vbmx5LWhzMjU2LXNpZ25pbmcta2V5"
     }
   ]
 }

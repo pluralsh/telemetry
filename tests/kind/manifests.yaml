@@ -121,7 +121,7 @@ data:
     namespaces:
       - { name: regression, auth: { read: [], write: [] } }
   jwks.json: |
-    {"keys":[{"kty":"oct","kid":"regression-hs256","alg":"HS256","use":"sig","k":"bWV0ZXItcmVncmVzc2lvbi10ZXN0LW9ubHktaHMyNTYtc2lnbmluZy1rZXk"}]}
+    {"keys":[{"kty":"oct","kid":"regression-hs256","alg":"HS256","use":"sig","k":"bWV0cmljcy1yZWdyZXNzaW9uLXRlc3Qtb25seS1oczI1Ni1zaWduaW5nLWtleQ"}]}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -206,7 +206,7 @@ data:
             - { type: basic, username: regression-reader, password: { source: literal, value: regression-read } }
           write: []
   jwks.json: |
-    {"keys":[{"kty":"oct","kid":"regression-hs256","alg":"HS256","use":"sig","k":"bWV0ZXItcmVncmVzc2lvbi10ZXN0LW9ubHktaHMyNTYtc2lnbmluZy1rZXk"}]}
+    {"keys":[{"kty":"oct","kid":"regression-hs256","alg":"HS256","use":"sig","k":"bWV0cmljcy1yZWdyZXNzaW9uLXRlc3Qtb25seS1oczI1Ni1zaWduaW5nLWtleQ"}]}
 ---
 apiVersion: apps/v1
 kind: Deployment

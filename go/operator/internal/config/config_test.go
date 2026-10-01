@@ -21,6 +21,9 @@ const (
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
 	testWarmConcurrency     = "concurrency: 2"
 	testWarmPayloadsConfig  = "include_payloads: false"
+	testMetricsProduct      = "metrics"
+	testLogsProduct         = "logs"
+	testTracesProduct       = "traces"
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
@@ -88,7 +91,7 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 		key   string
 	}{
 		{
-			name: "metrics",
+			name: testMetricsProduct,
 			input: Input{Metrics: &telemetryv1alpha1.Metrics{
 				Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
@@ -97,7 +100,7 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 			key: MetricsKey,
 		},
 		{
-			name: "logs",
+			name: testLogsProduct,
 			input: Input{Logs: &telemetryv1alpha1.Logs{
 				Spec: telemetryv1alpha1.LogsSpec{Config: telemetryv1alpha1.LogsConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
@@ -106,7 +109,7 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 			key: LogsKey,
 		},
 		{
-			name: "traces",
+			name: testTracesProduct,
 			input: Input{Traces: &telemetryv1alpha1.Traces{
 				Spec: telemetryv1alpha1.TracesSpec{Config: telemetryv1alpha1.TracesConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
@@ -129,7 +132,7 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 
 func TestRenderTracesShardedConfig(t *testing.T) {
 	traces := &telemetryv1alpha1.Traces{
-		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: "observability"},
+		ObjectMeta: metav1.ObjectMeta{Name: testTracesProduct, Namespace: "observability"},
 		Spec: telemetryv1alpha1.TracesSpec{
 			Mode:    telemetryv1alpha1.TracesModeSharded,
 			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/traces"},
@@ -221,7 +224,7 @@ func TestRenderShardedRoles(t *testing.T) {
 
 func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 	logs := &telemetryv1alpha1.Logs{
-		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testMetricsNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
 		Spec: telemetryv1alpha1.LogsSpec{
 			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/logs"},
 			Config:  telemetryv1alpha1.LogsConfigSpec{Namespaces: []string{testTenantNamespace}},
@@ -312,7 +315,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 		key   string
 	}{
 		{
-			name: "metrics",
+			name: testMetricsProduct,
 			input: Input{Metrics: &telemetryv1alpha1.Metrics{
 				Spec: telemetryv1alpha1.MetricsSpec{
 					Config: telemetryv1alpha1.MetricsConfigSpec{CacheWarmer: cacheWarmer},
@@ -321,7 +324,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 			key: MetricsKey,
 		},
 		{
-			name: "logs",
+			name: testLogsProduct,
 			input: Input{Logs: &telemetryv1alpha1.Logs{
 				Spec: telemetryv1alpha1.LogsSpec{
 					Config: telemetryv1alpha1.LogsConfigSpec{CacheWarmer: cacheWarmer},
@@ -330,7 +333,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 			key: LogsKey,
 		},
 		{
-			name: "traces",
+			name: testTracesProduct,
 			input: Input{Traces: &telemetryv1alpha1.Traces{
 				Spec: telemetryv1alpha1.TracesSpec{
 					Config: telemetryv1alpha1.TracesConfigSpec{CacheWarmer: cacheWarmer},

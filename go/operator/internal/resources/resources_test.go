@@ -354,7 +354,7 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 		{
 			name: "Metrics",
 			input: StatefulSetInput{Metrics: &telemetryv1alpha1.Metrics{
-				ObjectMeta: metav1.ObjectMeta{Name: "metrics", Namespace: testNamespace},
+				ObjectMeta: metav1.ObjectMeta{Name: containerMetrics, Namespace: testNamespace},
 				Spec: telemetryv1alpha1.MetricsSpec{
 					Version: "1.2.3-rc.1",
 					Image: telemetryv1alpha1.ImageSpec{
@@ -363,11 +363,11 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 						PullPolicy: corev1.PullAlways,
 					},
 					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "metrics", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+						Containers: []corev1.Container{{Name: containerMetrics, Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
 					}}},
 				},
 			}},
-			container: "metrics",
+			container: containerMetrics,
 		},
 		{
 			name: "Logs",
@@ -467,7 +467,7 @@ func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
 		}},
 	}
 	inputs := []StatefulSetInput{
-		{Metrics: &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: "metrics"}, Spec: telemetryv1alpha1.MetricsSpec{Writer: workload}}},
+		{Metrics: &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: containerMetrics}, Spec: telemetryv1alpha1.MetricsSpec{Writer: workload}}},
 		{Logs: &telemetryv1alpha1.Logs{ObjectMeta: metav1.ObjectMeta{Name: testLogsName}, Spec: telemetryv1alpha1.LogsSpec{Writer: workload}}},
 	}
 	for _, input := range inputs {
