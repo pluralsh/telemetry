@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Namespace
-metadata: { name: meter-regression }
+metadata: { name: metrics-regression }
 ---
 apiVersion: v1
 kind: ServiceAccount
-metadata: { name: meter, namespace: meter-regression }
+metadata: { name: metrics, namespace: metrics-regression }
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
-metadata: { name: meter-sharding, namespace: meter-regression }
+metadata: { name: metrics-sharding, namespace: metrics-regression }
 rules:
   - apiGroups: [telemetry.plural.sh]
     resources: [shardmaps]
@@ -22,31 +22,31 @@ rules:
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
-metadata: { name: meter-sharding, namespace: meter-regression }
+metadata: { name: metrics-sharding, namespace: metrics-regression }
 subjects:
-  - { kind: ServiceAccount, name: meter, namespace: meter-regression }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: meter-sharding }
+  - { kind: ServiceAccount, name: metrics, namespace: metrics-regression }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: metrics-sharding }
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: meter-headless, namespace: meter-regression }
+metadata: { name: metrics-headless, namespace: metrics-regression }
 spec:
   clusterIP: None
-  selector: { app: meter-writer }
+  selector: { app: metrics-writer }
   ports:
     - { name: grpc, port: 9090 }
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: meter-writer, namespace: meter-regression }
+metadata: { name: metrics-writer, namespace: metrics-regression }
 spec:
-  selector: { app: meter-writer }
+  selector: { app: metrics-writer }
   ports:
     - { name: http, port: 8080 }
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: minio, namespace: meter-regression }
+metadata: { name: minio, namespace: metrics-regression }
 spec:
   selector: { app: minio }
   ports:
@@ -54,7 +54,7 @@ spec:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: minio, namespace: meter-regression }
+metadata: { name: minio, namespace: metrics-regression }
 spec:
   replicas: 1
   selector: { matchLabels: { app: minio } }
@@ -66,14 +66,14 @@ spec:
           image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
           args: [server, /data]
           env:
-            - { name: MINIO_ROOT_USER, value: meter }
-            - { name: MINIO_ROOT_PASSWORD, value: meter-regression-secret }
+            - { name: MINIO_ROOT_USER, value: metrics }
+            - { name: MINIO_ROOT_PASSWORD, value: metrics-regression-secret }
           ports:
             - { name: s3, containerPort: 9000 }
 ---
 apiVersion: batch/v1
 kind: Job
-metadata: { name: minio-init, namespace: meter-regression }
+metadata: { name: minio-init, namespace: metrics-regression }
 spec:
   template:
     spec:
@@ -82,33 +82,33 @@ spec:
         - name: mc
           image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
           env:
-            - { name: MC_HOST_local, value: "http://meter:meter-regression-secret@minio:9000" }
-          args: [mb, --ignore-existing, local/meter-kind]
+            - { name: MC_HOST_local, value: "http://metrics:metrics-regression-secret@minio:9000" }
+          args: [mb, --ignore-existing, local/metrics-kind]
 ---
 apiVersion: v1
 kind: ConfigMap
-metadata: { name: meter-writer-config, namespace: meter-regression }
+metadata: { name: metrics-writer-config, namespace: metrics-regression }
 data:
-  meter.yaml: |
+  metrics.yaml: |
     mode: writer
     listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
     storage:
       path: kind
       object_store:
-        { type: Aws, region: us-east-1, bucket: meter-kind, endpoint: "http://minio:9000", allow_http: true }
+        { type: Aws, region: us-east-1, bucket: metrics-kind, endpoint: "http://minio:9000", allow_http: true }
       block_cache: { type: FoyerMemory, capacity: 33554432 }
       meta_cache: { type: FoyerMemory, capacity: 8388608 }
     reader_cache_capacity: 33554432
     write: { durability: durable, flush_interval_seconds: 1, remote_concurrency: 8, remote_retries: 3 }
     sharding:
       backend: kubernetes
-      namespace: meter-regression
-      stateful_set: meter
-      headless_service: meter-headless
+      namespace: metrics-regression
+      stateful_set: metrics
+      headless_service: metrics-headless
       owner_port: 9090
-      shard_map: meter-shard-map
-      coordinator_lease: meter-shard-coordinator
-      shard_lease_prefix: meter-shard
+      shard_map: metrics-shard-map
+      coordinator_lease: metrics-shard-coordinator
+      shard_lease_prefix: metrics-shard
       lease_duration_seconds: 10
       renew_interval_seconds: 2
     auth:
@@ -125,26 +125,26 @@ data:
 ---
 apiVersion: apps/v1
 kind: StatefulSet
-metadata: { name: meter, namespace: meter-regression }
+metadata: { name: metrics, namespace: metrics-regression }
 spec:
-  serviceName: meter-headless
+  serviceName: metrics-headless
   replicas: 1
   podManagementPolicy: Parallel
-  selector: { matchLabels: { app: meter-writer } }
+  selector: { matchLabels: { app: metrics-writer } }
   template:
-    metadata: { labels: { app: meter-writer } }
+    metadata: { labels: { app: metrics-writer } }
     spec:
-      serviceAccountName: meter
+      serviceAccountName: metrics
       containers:
-        - name: meter
-          image: meter-regression:local
+        - name: metrics
+          image: metrics-regression:local
           imagePullPolicy: Never
-          args: [--config, /config/meter.yaml]
+          args: [--config, /config/metrics.yaml]
           env:
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
-            - { name: AWS_ACCESS_KEY_ID, value: meter }
-            - { name: AWS_SECRET_ACCESS_KEY, value: meter-regression-secret }
+            - { name: AWS_ACCESS_KEY_ID, value: metrics }
+            - { name: AWS_SECRET_ACCESS_KEY, value: metrics-regression-secret }
             - { name: AWS_DEFAULT_REGION, value: us-east-1 }
             - { name: AWS_ENDPOINT, value: "http://minio:9000" }
             - { name: AWS_ALLOW_HTTP, value: "true" }
@@ -157,39 +157,39 @@ spec:
             - { name: config, mountPath: /config, readOnly: true }
       volumes:
         - name: config
-          configMap: { name: meter-writer-config }
+          configMap: { name: metrics-writer-config }
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: meter-reader, namespace: meter-regression }
+metadata: { name: metrics-reader, namespace: metrics-regression }
 spec:
-  selector: { app: meter-reader }
+  selector: { app: metrics-reader }
   ports:
     - { name: http, port: 8080 }
 ---
 apiVersion: v1
 kind: ConfigMap
-metadata: { name: meter-reader-config, namespace: meter-regression }
+metadata: { name: metrics-reader-config, namespace: metrics-regression }
 data:
-  meter.yaml: |
+  metrics.yaml: |
     mode: reader
     listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
     storage:
       path: kind
       object_store:
-        { type: Aws, region: us-east-1, bucket: meter-kind, endpoint: "http://minio:9000", allow_http: true }
+        { type: Aws, region: us-east-1, bucket: metrics-kind, endpoint: "http://minio:9000", allow_http: true }
       block_cache: { type: FoyerMemory, capacity: 33554432 }
       meta_cache: { type: FoyerMemory, capacity: 8388608 }
     reader_cache_capacity: 33554432
     sharding:
       backend: kubernetes
-      namespace: meter-regression
-      stateful_set: meter
-      headless_service: meter-headless
+      namespace: metrics-regression
+      stateful_set: metrics
+      headless_service: metrics-headless
       owner_port: 9090
-      shard_map: meter-shard-map
-      coordinator_lease: meter-shard-coordinator
-      shard_lease_prefix: meter-shard
+      shard_map: metrics-shard-map
+      coordinator_lease: metrics-shard-coordinator
+      shard_lease_prefix: metrics-shard
       lease_duration_seconds: 10
       renew_interval_seconds: 2
     auth:
@@ -210,23 +210,23 @@ data:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: meter-reader, namespace: meter-regression }
+metadata: { name: metrics-reader, namespace: metrics-regression }
 spec:
   replicas: 1
-  selector: { matchLabels: { app: meter-reader } }
+  selector: { matchLabels: { app: metrics-reader } }
   template:
-    metadata: { labels: { app: meter-reader } }
+    metadata: { labels: { app: metrics-reader } }
     spec:
-      serviceAccountName: meter
+      serviceAccountName: metrics
       containers:
-        - name: meter
-          image: meter-regression:local
+        - name: metrics
+          image: metrics-regression:local
           imagePullPolicy: Never
-          args: [--config, /config/meter.yaml]
+          args: [--config, /config/metrics.yaml]
           env:
-            - { name: POD_NAME, value: meter-reader-0 }
-            - { name: AWS_ACCESS_KEY_ID, value: meter }
-            - { name: AWS_SECRET_ACCESS_KEY, value: meter-regression-secret }
+            - { name: POD_NAME, value: metrics-reader-0 }
+            - { name: AWS_ACCESS_KEY_ID, value: metrics }
+            - { name: AWS_SECRET_ACCESS_KEY, value: metrics-regression-secret }
             - { name: AWS_DEFAULT_REGION, value: us-east-1 }
             - { name: AWS_ENDPOINT, value: "http://minio:9000" }
             - { name: AWS_ALLOW_HTTP, value: "true" }
@@ -238,4 +238,4 @@ spec:
             - { name: config, mountPath: /config, readOnly: true }
       volumes:
         - name: config
-          configMap: { name: meter-reader-config }
+          configMap: { name: metrics-reader-config }

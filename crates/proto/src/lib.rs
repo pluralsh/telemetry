@@ -5,26 +5,26 @@
 
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("telemetry_descriptor");
 
-pub mod meter {
+pub mod metrics {
     pub mod internal {
         pub mod v1 {
-            tonic::include_proto!("meter.internal.v1");
+            tonic::include_proto!("metrics.internal.v1");
         }
     }
 }
 
-pub mod line {
+pub mod logs {
     pub mod internal {
         pub mod v1 {
-            tonic::include_proto!("line.internal.v1");
+            tonic::include_proto!("logs.internal.v1");
         }
     }
 }
 
-pub mod track {
+pub mod traces {
     pub mod internal {
         pub mod v1 {
-            tonic::include_proto!("track.internal.v1");
+            tonic::include_proto!("traces.internal.v1");
         }
     }
 }

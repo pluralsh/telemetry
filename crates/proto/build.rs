@@ -13,16 +13,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos_with_config(
             prost_config,
             &[
-                "proto/meter/internal/v1/writer.proto",
-                "proto/line/internal/v1/writer.proto",
-                "proto/track/internal/v1/writer.proto",
+                "proto/metrics/internal/v1/writer.proto",
+                "proto/logs/internal/v1/writer.proto",
+                "proto/traces/internal/v1/writer.proto",
                 "proto/pseudofs/v1/pseudofs.proto",
             ],
             &["proto"],
         )?;
-    println!("cargo:rerun-if-changed=proto/meter/internal/v1/writer.proto");
-    println!("cargo:rerun-if-changed=proto/line/internal/v1/writer.proto");
-    println!("cargo:rerun-if-changed=proto/track/internal/v1/writer.proto");
+    println!("cargo:rerun-if-changed=proto/metrics/internal/v1/writer.proto");
+    println!("cargo:rerun-if-changed=proto/logs/internal/v1/writer.proto");
+    println!("cargo:rerun-if-changed=proto/traces/internal/v1/writer.proto");
     println!("cargo:rerun-if-changed=proto/pseudofs/v1/pseudofs.proto");
     Ok(())
 }

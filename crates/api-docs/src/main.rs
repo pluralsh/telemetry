@@ -14,19 +14,19 @@ fn main() -> Result<()> {
         .context("api-docs must live under <repository>/crates")?;
     let documents = [
         (
-            "Meter",
-            repository.join("documentation/openapi/meter.json"),
-            meter_server::openapi::document().to_pretty_json()?,
+            "Metrics",
+            repository.join("documentation/openapi/metrics.json"),
+            plural_metrics_server::openapi::document().to_pretty_json()?,
         ),
         (
-            "Line",
-            repository.join("documentation/openapi/line.json"),
-            line_server::openapi::document().to_pretty_json()?,
+            "Logs",
+            repository.join("documentation/openapi/logs.json"),
+            plural_logs_server::openapi::document().to_pretty_json()?,
         ),
         (
-            "Track",
-            repository.join("documentation/openapi/track.json"),
-            track_server::openapi::document().to_pretty_json()?,
+            "Traces",
+            repository.join("documentation/openapi/traces.json"),
+            plural_traces_server::openapi::document().to_pretty_json()?,
         ),
     ];
 

@@ -417,7 +417,7 @@ settings_path: slatedb.toml
             r#"
 type: Azure
 account: telemetry
-container: meter
+container: metrics
 endpoint: http://azurite:10000/telemetry
 allow_http: true
 "#,
@@ -427,7 +427,7 @@ allow_http: true
             azure,
             ObjectStoreConfig::Azure(AzureObjectStoreConfig {
                 account: "telemetry".to_string(),
-                container: "meter".to_string(),
+                container: "metrics".to_string(),
                 endpoint: Some("http://azurite:10000/telemetry".to_string()),
                 allow_http: true,
             })
@@ -436,7 +436,7 @@ allow_http: true
         let gcp: ObjectStoreConfig = serde_yaml::from_str(
             r#"
 type: Gcp
-bucket: meter
+bucket: metrics
 base_url: http://gcs-emulator:4443
 "#,
         )
@@ -444,7 +444,7 @@ base_url: http://gcs-emulator:4443
         assert_eq!(
             gcp,
             ObjectStoreConfig::Gcp(GcpObjectStoreConfig {
-                bucket: "meter".to_string(),
+                bucket: "metrics".to_string(),
                 base_url: Some("http://gcs-emulator:4443".to_string()),
             })
         );

@@ -33,8 +33,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: meter
-            path: chart/meter
+          - name: metrics
+            path: chart/metrics
           - name: pseudofs
             path: chart/pseudofs
           - name: telemetry-operator
@@ -111,10 +111,10 @@ jobs:
           go-version: "^1.21.3"
           cache: false
       - uses: azure/setup-helm@v5
-      - name: Bump Meter chart
+      - name: Bump Metrics chart
         uses: pluralsh/chart-releaser@v0.1.3
         with:
-          path: ./chart/meter
+          path: ./chart/metrics
           release: ${{ github.ref_name }}
       - name: Bump PseudoFS chart
         uses: pluralsh/chart-releaser@v0.1.3
@@ -131,10 +131,10 @@ jobs:
         run: |
           set -euo pipefail
           release="${GITHUB_REF_NAME#v}"
-          meter_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/meter/Chart.yaml)
+          metrics_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/metrics/Chart.yaml)
           pseudofs_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/pseudofs/Chart.yaml)
           operator_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-operator/Chart.yaml)
-          test "$meter_app_version" = "$release"
+          test "$metrics_app_version" = "$release"
           test "$pseudofs_app_version" = "$release"
           test "$operator_app_version" = "$release"
       - name: Create release metadata pull request
@@ -155,8 +155,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: meter
-            path: chart/meter
+          - name: metrics
+            path: chart/metrics
           - name: pseudofs
             path: chart/pseudofs
           - name: telemetry-operator

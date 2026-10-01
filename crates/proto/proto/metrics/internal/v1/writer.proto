@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package metrics.internal.v1;
+
+service InternalWriter {
+  rpc Write(WriteBatchRequest) returns (WriteBatchResponse);
+}
+
+message Namespace {
+  string name = 1;
+}
+
+message ShardAssignment {
+  Namespace namespace = 1;
+  uint64 generation = 2;
+  repeated uint64 shard_ids = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+message Sample {
+  int64 timestamp_ms = 1;
+  double value = 2;
+}
+
+message MetricMetadata {
+  enum MetricType {
+    METRIC_TYPE_UNSPECIFIED = 0;
+    METRIC_TYPE_COUNTER = 1;
+    METRIC_TYPE_GAUGE = 2;
+    METRIC_TYPE_HISTOGRAM = 3;
+    METRIC_TYPE_GAUGE_HISTOGRAM = 4;
+    METRIC_TYPE_SUMMARY = 5;
+    METRIC_TYPE_INFO = 6;
+    METRIC_TYPE_STATE_SET = 7;
+  }
+
+  string metric_family = 1;
+  MetricType type = 2;
+  string help = 3;
+  string unit = 4;
+}
+
+// A native histogram sample in float form. Bucket indexes and counts are
+// parallel arrays, ascending by index.
+message HistogramSample {
+  enum CounterResetHint {
+    COUNTER_RESET_HINT_UNKNOWN = 0;
+    COUNTER_RESET_HINT_RESET = 1;
+    COUNTER_RESET_HINT_NOT_RESET = 2;
+    COUNTER_RESET_HINT_GAUGE = 3;
+  }
+
+  int64 timestamp_ms = 1;
+  CounterResetHint counter_reset_hint = 2;
+  sint32 schema = 3;
+  double zero_threshold = 4;
+  double zero_count = 5;
+  double count = 6;
+  double sum = 7;
+  repeated sint32 positive_indexes = 8;
+  repeated double positive_counts = 9;
+  repeated sint32 negative_indexes = 10;
+  repeated double negative_counts = 11;
+  repeated double custom_values = 12;
+}
+
+message Series {
+  repeated Label labels = 1;
+  repeated Sample samples = 2;
+  repeated HistogramSample histograms = 3;
+}
+
+message WriteBatchRequest {
+  Namespace namespace = 1;
+  uint64 assignment_generation = 2;
+  uint64 shard_id = 3;
+  repeated Series series = 4;
+  repeated MetricMetadata metadata = 5;
+  Durability durability = 6;
+  string request_id = 7;
+}
+
+message WriteBatchResponse {
+  uint64 assignment_generation = 1;
+  uint64 accepted_series = 2;
+  uint64 accepted_samples = 3;
+}
+
+enum Durability {
+  DURABILITY_APPLIED = 0;
+  DURABILITY_WRITTEN = 1;
+  DURABILITY_DURABLE = 2;
+}

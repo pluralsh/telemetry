@@ -413,7 +413,7 @@ mod tests {
     use super::*;
 
     const KID: &str = "test-hs256";
-    const SECRET: &[u8] = b"meter-test-only-hs256-signing-key";
+    const SECRET: &[u8] = b"metrics-test-only-hs256-signing-key";
 
     async fn authenticator(issuer: Option<&str>, audience: Option<&str>) -> JwtAuthenticator {
         let directory = tempfile::tempdir().unwrap();
@@ -600,12 +600,12 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_enforces_configured_issuer_and_audience() {
-        let jwt = authenticator(Some("meter-issuer"), Some("meter-api")).await;
+        let jwt = authenticator(Some("metrics-issuer"), Some("metrics-api")).await;
         for (issuer, audience, expected) in [
-            (Some("meter-issuer"), Some("meter-api"), true),
-            (Some("other"), Some("meter-api"), false),
-            (Some("meter-issuer"), Some("other"), false),
-            (None, Some("meter-api"), false),
+            (Some("metrics-issuer"), Some("metrics-api"), true),
+            (Some("other"), Some("metrics-api"), false),
+            (Some("metrics-issuer"), Some("other"), false),
+            (None, Some("metrics-api"), false),
         ] {
             let value = token(Some(KID), "^tenant$", "read", future(), issuer, audience);
             assert_eq!(

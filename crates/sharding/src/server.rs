@@ -1,4 +1,4 @@
-//! Sharding configuration and startup shared by the Meter, Line, and Track
+//! Sharding configuration and startup shared by the Metrics, Logs, and Traces
 //! servers. Products differ only in the defaults supplied by [`Product`].
 
 use std::{fmt, marker::PhantomData, net::SocketAddr};

@@ -1,17 +1,17 @@
 # Object-store authentication
 
-Object-store credentials are referenced from Secrets in the Meter namespace and
-injected directly into managed Meter containers. They are not written to the
-generated Meter configuration Secret.
+Object-store credentials are referenced from Secrets in the Metrics namespace and
+injected directly into managed Metrics containers. They are not written to the
+generated Metrics configuration Secret.
 
-The operator creates a ServiceAccount named after each Meter. Cloud identity
+The operator creates a ServiceAccount named after each Metrics. Cloud identity
 annotations can be configured declaratively:
 
 ```yaml
 spec:
   serviceAccount:
     annotations:
-      cloud-provider.example/identity: meter
+      cloud-provider.example/identity: metrics
 ```
 
 ## AWS S3
@@ -28,17 +28,17 @@ spec:
         type: Aws
         aws:
           region: us-east-1
-          bucket: meter
+          bucket: metrics
           endpoint: https://s3.example.com
           virtualHostedStyle: false
           accessKeyIDSecretRef:
-            name: meter-s3
+            name: metrics-s3
             key: access-key-id
           secretAccessKeySecretRef:
-            name: meter-s3
+            name: metrics-s3
             key: secret-access-key
           sessionTokenSecretRef:
-            name: meter-s3
+            name: metrics-s3
             key: session-token
 ```
 
@@ -51,10 +51,10 @@ For EKS IRSA, annotate the managed ServiceAccount and omit static credentials:
 spec:
   serviceAccount:
     annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/meter
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/metrics
 ```
 
-EKS Pod Identity uses an external association with the Meter ServiceAccount and
+EKS Pod Identity uses an external association with the Metrics ServiceAccount and
 does not require this annotation.
 
 ## Azure Blob Storage
@@ -70,9 +70,9 @@ spec:
         type: Azure
         azure:
           account: telemetry
-          container: meter
+          container: metrics
           accessKeySecretRef:
-            name: meter-azure
+            name: metrics-azure
             key: account-key
 ```
 
@@ -82,12 +82,12 @@ methods:
 ```yaml
 # Shared access signature
 sasTokenSecretRef:
-  name: meter-azure
+  name: metrics-azure
   key: sas-token
 
 # Static OAuth bearer token
 bearerTokenSecretRef:
-  name: meter-azure
+  name: metrics-azure
   key: bearer-token
 
 # Service principal
@@ -95,7 +95,7 @@ clientSecret:
   clientID: 00000000-0000-0000-0000-000000000000
   tenantID: 00000000-0000-0000-0000-000000000000
   clientSecretKeyRef:
-    name: meter-azure
+    name: metrics-azure
     key: client-secret
 
 # Workload identity; mount the projected token with writer/reader podTemplate
@@ -124,9 +124,9 @@ spec:
       objectStore:
         type: Gcp
         gcp:
-          bucket: meter
+          bucket: metrics
           serviceAccountKeySecretRef:
-            name: meter-gcp
+            name: metrics-gcp
             key: service-account.json
 ```
 
@@ -139,7 +139,7 @@ For the GKE service-account linking flow, set:
 spec:
   serviceAccount:
     annotations:
-      iam.gke.io/gcp-service-account: meter@my-project.iam.gserviceaccount.com
+      iam.gke.io/gcp-service-account: metrics@my-project.iam.gserviceaccount.com
 ```
 
 The underlying Google object-store client obtains GKE workload identity

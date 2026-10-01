@@ -14,15 +14,15 @@ const (
 	componentWriter     = resources.ComponentWriter
 	componentReader     = resources.ComponentReader
 
-	permissionRead  = "read"
-	permissionWrite = "write"
-	dataStoreMeter  = "Meter"
-	dataStoreLine   = "Line"
-	dataStoreTrack  = "Track"
+	permissionRead   = "read"
+	permissionWrite  = "write"
+	dataStoreMetrics = "Metrics"
+	dataStoreLogs    = "Logs"
+	dataStoreTraces  = "Traces"
 
-	namespaceAuthMeterIndex  = "telemetry.plural.sh/namespace-auth-meter"
-	meterSecretIndex         = "telemetry.plural.sh/meter-secret"
-	namespaceAuthSecretIndex = "telemetry.plural.sh/namespace-auth-secret"
+	namespaceAuthMetricsIndex = "telemetry.plural.sh/namespace-auth-metrics"
+	metricsSecretIndex        = "telemetry.plural.sh/metrics-secret"
+	namespaceAuthSecretIndex  = "telemetry.plural.sh/namespace-auth-secret"
 
 	conditionReady = "Ready"
 

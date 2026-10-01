@@ -22,7 +22,7 @@ import (
 )
 
 type DataStoreReference struct {
-	// +kubebuilder:validation:Enum=Meter;Line;Track
+	// +kubebuilder:validation:Enum=Metrics;Logs;Traces
 	Kind string `json:"kind"`
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`

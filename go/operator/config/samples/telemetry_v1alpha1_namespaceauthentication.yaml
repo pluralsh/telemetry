@@ -4,8 +4,8 @@ metadata:
   name: prometheus-reader
 spec:
   dataStoreRef:
-    kind: Meter
-    name: meter-sample
+    kind: Metrics
+    name: metrics-sample
   namespace: default
   username: prometheus
   permission: read
@@ -19,8 +19,8 @@ metadata:
   name: loki-reader
 spec:
   dataStoreRef:
-    kind: Line
-    name: line-sample
+    kind: Logs
+    name: logs-sample
   namespace: default
   username: loki
   permission: read
@@ -34,8 +34,8 @@ metadata:
   name: tempo-reader
 spec:
   dataStoreRef:
-    kind: Track
-    name: track-sample
+    kind: Traces
+    name: traces-sample
   namespace: default
   username: tempo
   permission: read

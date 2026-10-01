@@ -1,0 +1,141 @@
+// Go text/template grammar, after text/template/parse/parse.go.
+use super::ast::{Command, Control, Item, Node, Operand, Pipeline};
+use super::lexer::Tok;
+use super::{TemplateError, chain};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = TemplateError;
+
+    enum Tok {
+        "text" => Tok::Text(<String>),
+        "{{" => Tok::Open,
+        "}}" => Tok::Close,
+        "if" => Tok::If,
+        "else" => Tok::Else,
+        "end" => Tok::End,
+        "range" => Tok::Range,
+        "with" => Tok::With,
+        "define" => Tok::Define,
+        "template" => Tok::Template,
+        "block" => Tok::Block,
+        "break" => Tok::Break,
+        "continue" => Tok::Continue,
+        "nil" => Tok::Nil,
+        "bool" => Tok::Bool(<bool>),
+        "int" => Tok::Int(<i64>),
+        "float" => Tok::Float(<f64>),
+        "string" => Tok::Str(<String>),
+        "field" => Tok::Field(<String>),
+        "chain" => Tok::Chain(<String>),
+        "." => Tok::Dot,
+        "variable" => Tok::Variable(<String>),
+        "ident" => Tok::Ident(<String>),
+        "|" => Tok::Pipe,
+        "(" => Tok::LeftParen,
+        ")" => Tok::RightParen,
+        ":=" => Tok::Declare,
+        "=" => Tok::Assign,
+        "," => Tok::Comma,
+    }
+}
+
+pub Template: Vec<Item> = {
+    => Vec::new(),
+    <mut items:Template> <item:Item> => {
+        items.push(item);
+        items
+    },
+};
+
+Item: Item = {
+    <Node> => Item::Node(<>),
+    <position:@L> "{{" "define" <name:"string"> "}}" <body:List> "{{" "end" "}}" =>
+        Item::Define { name, body, position },
+};
+
+List: Vec<Node> = {
+    => Vec::new(),
+    <mut nodes:List> <node:Node> => {
+        nodes.push(node);
+        nodes
+    },
+};
+
+Node: Node = {
+    <"text"> => Node::Text(<>),
+    "{{" <Pipeline> "}}" => Node::Action(<>),
+    "{{" "if" <pipe:Pipeline> "}}" <list:List> <else_list:IfTail> =>
+        Node::If(Control { pipe, list, else_list }),
+    "{{" "with" <pipe:Pipeline> "}}" <list:List> <else_list:WithTail> =>
+        Node::With(Control { pipe, list, else_list }),
+    "{{" "range" <pipe:Pipeline> "}}" <list:List> <else_list:RangeTail> =>
+        Node::Range(Control { pipe, list, else_list }),
+    <position:@L> "{{" "template" <name:"string"> <pipe:Pipeline?> "}}" =>
+        Node::Template { name, pipe, position },
+    <position:@L> "{{" "block" <name:"string"> <pipe:Pipeline> "}}" <body:List> "{{" "end" "}}" =>
+        Node::Block { name, pipe, body, position },
+    <position:@L> "{{" "break" "}}" => Node::Break(position),
+    <position:@L> "{{" "continue" "}}" => Node::Continue(position),
+};
+
+// `{{else if}}` and `{{else with}}` are sugar for an `else` holding a nested
+// control that shares the outer `{{end}}`.
+IfTail: Vec<Node> = {
+    "{{" "end" "}}" => Vec::new(),
+    "{{" "else" "}}" <List> "{{" "end" "}}",
+    "{{" "else" "if" <pipe:Pipeline> "}}" <list:List> <else_list:IfTail> =>
+        vec![Node::If(Control { pipe, list, else_list })],
+};
+
+WithTail: Vec<Node> = {
+    "{{" "end" "}}" => Vec::new(),
+    "{{" "else" "}}" <List> "{{" "end" "}}",
+    "{{" "else" "with" <pipe:Pipeline> "}}" <list:List> <else_list:WithTail> =>
+        vec![Node::With(Control { pipe, list, else_list })],
+};
+
+RangeTail: Vec<Node> = {
+    "{{" "end" "}}" => Vec::new(),
+    "{{" "else" "}}" <List> "{{" "end" "}}",
+};
+
+Pipeline: Pipeline = {
+    <position:@L> <commands:Commands> => Pipeline::new(position, commands),
+    <position:@L> <name:"variable"> ":=" <commands:Commands> =>
+        Pipeline::new(position, commands).declare(vec![name], false),
+    <position:@L> <name:"variable"> "=" <commands:Commands> =>
+        Pipeline::new(position, commands).declare(vec![name], true),
+    <position:@L> <first:"variable"> "," <second:"variable"> ":=" <commands:Commands> =>
+        Pipeline::new(position, commands).declare(vec![first, second], false),
+    <position:@L> <first:"variable"> "," <second:"variable"> "=" <commands:Commands> =>
+        Pipeline::new(position, commands).declare(vec![first, second], true),
+};
+
+Commands: Vec<Command> = {
+    <Command> => vec![<>],
+    <mut commands:Commands> "|" <command:Command> => {
+        commands.push(command);
+        commands
+    },
+};
+
+Command: Command = <position:@L> <args:Operand+> => Command { position, args };
+
+Operand: Operand = <position:@L> <term:Term> <fields:"chain"*> =>? chain(position, term, fields);
+
+Term: Operand = {
+    "nil" => Operand::Nil,
+    <"bool"> => Operand::Bool(<>),
+    <"int"> => Operand::Int(<>),
+    <"float"> => Operand::Float(<>),
+    <"string"> => Operand::String(<>),
+    "." => Operand::Dot,
+    <"field"> => Operand::Field(vec![<>]),
+    <"variable"> => Operand::Variable(<>, Vec::new()),
+    <position:@L> <name:"ident"> => Operand::Function(name, position),
+    // Parenthesized pipelines cannot declare variables.
+    "(" <position:@L> <commands:Commands> ")" => Operand::Pipe(Box::new(Pipeline::new(position, commands))),
+};

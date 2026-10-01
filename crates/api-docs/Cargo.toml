@@ -12,6 +12,6 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-line-server = { path = "../line-server", default-features = false }
-meter-server = { path = "../meter-server", default-features = false }
-track-server = { path = "../track-server", default-features = false }
+plural-logs-server = { path = "../logs-server", default-features = false }
+plural-metrics-server = { path = "../metrics-server", default-features = false }
+plural-traces-server = { path = "../traces-server", default-features = false }

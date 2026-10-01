@@ -44,8 +44,8 @@ type NamespaceAuthenticationReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications/finalizers,verbs=update
-// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=meters,verbs=get;list;watch
-// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=lines,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=metrics,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=logs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *NamespaceAuthenticationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -73,16 +73,16 @@ func (r *NamespaceAuthenticationReconciler) SetupWithManager(mgr ctrl.Manager) e
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&telemetryv1alpha1.NamespaceAuthentication{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForSecret)).
-		Watches(&telemetryv1alpha1.Meter{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForMeter)).
-		Watches(&telemetryv1alpha1.Line{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForLine)).
-		Watches(&telemetryv1alpha1.Track{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForTrack)).
+		Watches(&telemetryv1alpha1.Metrics{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForMetrics)).
+		Watches(&telemetryv1alpha1.Logs{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForLogs)).
+		Watches(&telemetryv1alpha1.Traces{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForTraces)).
 		Named("namespaceauthentication").
 		Complete(r)
 }
 
 func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *telemetryv1alpha1.NamespaceAuthentication) error {
-	if auth.Spec.DataStoreRef.Kind != dataStoreMeter && auth.Spec.DataStoreRef.Kind != dataStoreLine && auth.Spec.DataStoreRef.Kind != dataStoreTrack {
-		return fmt.Errorf("dataStoreRef.kind must be Meter, Line, or Track")
+	if auth.Spec.DataStoreRef.Kind != dataStoreMetrics && auth.Spec.DataStoreRef.Kind != dataStoreLogs && auth.Spec.DataStoreRef.Kind != dataStoreTraces {
+		return fmt.Errorf("dataStoreRef.kind must be Metrics, Logs, or Traces")
 	}
 	if auth.Spec.DataStoreRef.Name == "" || auth.Spec.Namespace == "" || auth.Spec.Username == "" {
 		return fmt.Errorf("dataStoreRef.name, namespace, and username are required")
@@ -94,16 +94,16 @@ func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *
 		return fmt.Errorf("secretKeyRef.name and secretKeyRef.key are required")
 	}
 	key := types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.DataStoreRef.Name}
-	if auth.Spec.DataStoreRef.Kind == dataStoreMeter {
-		if err := r.Get(ctx, key, &telemetryv1alpha1.Meter{}); err != nil {
-			return fmt.Errorf("referenced Meter is unavailable: %w", err)
+	if auth.Spec.DataStoreRef.Kind == dataStoreMetrics {
+		if err := r.Get(ctx, key, &telemetryv1alpha1.Metrics{}); err != nil {
+			return fmt.Errorf("referenced Metrics is unavailable: %w", err)
 		}
-	} else if auth.Spec.DataStoreRef.Kind == dataStoreLine {
-		if err := r.Get(ctx, key, &telemetryv1alpha1.Line{}); err != nil {
-			return fmt.Errorf("referenced Line is unavailable: %w", err)
+	} else if auth.Spec.DataStoreRef.Kind == dataStoreLogs {
+		if err := r.Get(ctx, key, &telemetryv1alpha1.Logs{}); err != nil {
+			return fmt.Errorf("referenced Logs is unavailable: %w", err)
 		}
-	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Track{}); err != nil {
-		return fmt.Errorf("referenced Track is unavailable: %w", err)
+	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Traces{}); err != nil {
+		return fmt.Errorf("referenced Traces is unavailable: %w", err)
 	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.SecretKeyRef.Name}, secret); err != nil {
@@ -127,16 +127,16 @@ func (r *NamespaceAuthenticationReconciler) authenticationsForSecret(ctx context
 	return requests
 }
 
-func (r *NamespaceAuthenticationReconciler) authenticationsForMeter(ctx context.Context, obj client.Object) []reconcile.Request {
-	return r.authenticationsForDataStore(ctx, obj, dataStoreMeter)
+func (r *NamespaceAuthenticationReconciler) authenticationsForMetrics(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreMetrics)
 }
 
-func (r *NamespaceAuthenticationReconciler) authenticationsForLine(ctx context.Context, obj client.Object) []reconcile.Request {
-	return r.authenticationsForDataStore(ctx, obj, dataStoreLine)
+func (r *NamespaceAuthenticationReconciler) authenticationsForLogs(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreLogs)
 }
 
-func (r *NamespaceAuthenticationReconciler) authenticationsForTrack(ctx context.Context, obj client.Object) []reconcile.Request {
-	return r.authenticationsForDataStore(ctx, obj, dataStoreTrack)
+func (r *NamespaceAuthenticationReconciler) authenticationsForTraces(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreTraces)
 }
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForDataStore(ctx context.Context, obj client.Object, kind string) []reconcile.Request {

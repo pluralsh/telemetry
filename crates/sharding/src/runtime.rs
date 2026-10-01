@@ -553,7 +553,7 @@ mod tests {
         let lifecycle = Arc::new(RecordingLifecycle::default());
         (
             OwnershipManager::new(
-                "meter-0",
+                "metrics-0",
                 OwnershipManagerConfig {
                     renew_interval: Duration::from_millis(10),
                     lease_duration: Duration::from_millis(30),
@@ -572,14 +572,14 @@ mod tests {
         let (mut manager, leases, lifecycle) = manager(None);
         let shard = ShardId::new(0);
         manager
-            .apply_assignment(map(1, "meter-0", AssignmentState::Pending))
+            .apply_assignment(map(1, "metrics-0", AssignmentState::Pending))
             .await
             .unwrap();
         assert!(leases.holder(shard).is_some());
         assert_eq!(lifecycle.events(), vec!["open"]);
 
         manager
-            .apply_assignment(map(2, "meter-0", AssignmentState::Draining))
+            .apply_assignment(map(2, "metrics-0", AssignmentState::Draining))
             .await
             .unwrap();
         assert_eq!(lifecycle.events(), vec!["open", "drain", "flush", "close"]);
@@ -626,7 +626,7 @@ mod tests {
             closed: tokio::sync::Barrier::new(2),
         });
         let mut manager = OwnershipManager::new(
-            "meter-0",
+            "metrics-0",
             OwnershipManagerConfig::default(),
             store,
             Arc::clone(&leases),
@@ -637,7 +637,7 @@ mod tests {
                 AssignmentGeneration::new(generation),
                 2,
                 vec![Assignment::new(
-                    Owner::new("meter-0", 0),
+                    Owner::new("metrics-0", 0),
                     ShardRange::within(0, 2, 2).unwrap(),
                     state,
                 )],
@@ -670,12 +670,12 @@ mod tests {
     async fn rejects_stale_generation() {
         let (mut manager, _, lifecycle) = manager(None);
         manager
-            .apply_assignment(map(2, "meter-0", AssignmentState::Active))
+            .apply_assignment(map(2, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
         assert!(matches!(
             manager
-                .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+                .apply_assignment(map(1, "metrics-0", AssignmentState::Active))
                 .await,
             Err(ManagerError::StaleGeneration { .. })
         ));
@@ -687,17 +687,17 @@ mod tests {
         let (mut manager, leases, lifecycle) = manager(None);
         let shard = ShardId::new(0);
         manager
-            .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+            .apply_assignment(map(1, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
         manager
-            .apply_assignment(map(2, "meter-0", AssignmentState::Active))
+            .apply_assignment(map(2, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
 
         assert_eq!(
             leases.holder(shard),
-            Some(("meter-0".to_owned(), AssignmentGeneration::new(2)))
+            Some(("metrics-0".to_owned(), AssignmentGeneration::new(2)))
         );
         assert_eq!(lifecycle.events(), vec!["open"]);
     }
@@ -708,7 +708,7 @@ mod tests {
         let leases = Arc::new(FlakyLeaseBackend::default());
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let mut manager = OwnershipManager::new(
-            "meter-0",
+            "metrics-0",
             OwnershipManagerConfig {
                 renew_interval: Duration::from_millis(10),
                 lease_duration: Duration::from_secs(1),
@@ -719,7 +719,7 @@ mod tests {
         );
         let shard = ShardId::new(0);
         manager
-            .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+            .apply_assignment(map(1, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
 
@@ -742,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn lease_loss_drains_and_closes_resources() {
-        let initial = map(1, "meter-0", AssignmentState::Active);
+        let initial = map(1, "metrics-0", AssignmentState::Active);
         let shard = ShardId::new(0);
         let (manager, leases, lifecycle) = manager(Some(initial));
         let cancel = CancellationToken::new();
@@ -758,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_drains_owned_ranges() {
-        let initial = map(1, "meter-0", AssignmentState::Active);
+        let initial = map(1, "metrics-0", AssignmentState::Active);
         let (manager, _, lifecycle) = manager(Some(initial));
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -770,13 +770,13 @@ mod tests {
     async fn manager_applies_fake_watch_updates() {
         let store = Arc::new(FakeAssignmentStore::new(Some(map(
             1,
-            "meter-1",
+            "metrics-1",
             AssignmentState::Active,
         ))));
         let leases = Arc::new(FakeLeaseBackend::default());
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let manager = OwnershipManager::new(
-            "meter-0",
+            "metrics-0",
             OwnershipManagerConfig {
                 renew_interval: Duration::from_secs(60),
                 lease_duration: Duration::from_secs(180),
@@ -790,7 +790,7 @@ mod tests {
 
         tokio::task::yield_now().await;
         store
-            .publish(map(2, "meter-0", AssignmentState::Active))
+            .publish(map(2, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
         time::timeout(Duration::from_secs(1), async {
@@ -817,7 +817,7 @@ mod tests {
                 .unwrap()
         );
         manager
-            .apply_assignment(map(1, "meter-0", AssignmentState::Active))
+            .apply_assignment(map(1, "metrics-0", AssignmentState::Active))
             .await
             .unwrap();
         assert!(lifecycle.events().is_empty());
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(lifecycle.events(), vec!["open"]);
         assert_eq!(
             leases.holder(shard),
-            Some(("meter-0".to_owned(), generation))
+            Some(("metrics-0".to_owned(), generation))
         );
     }
 
@@ -840,7 +840,7 @@ mod tests {
         let shard = ShardId::new(0);
         let store = Arc::new(FakeAssignmentStore::new(Some(map(
             1,
-            "meter-0",
+            "metrics-0",
             AssignmentState::Active,
         ))));
         let leases = Arc::new(FakeLeaseBackend::default());
@@ -852,7 +852,7 @@ mod tests {
         );
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let manager = OwnershipManager::new(
-            "meter-0",
+            "metrics-0",
             OwnershipManagerConfig {
                 renew_interval: Duration::from_secs(60),
                 lease_duration: Duration::from_secs(180),

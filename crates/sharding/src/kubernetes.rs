@@ -43,7 +43,7 @@ const LABEL_DOMAIN: &str = "telemetry.plural.sh";
 
 #[derive(Debug, Clone)]
 pub struct KubernetesConfig {
-    /// Product name, e.g. `meter`.
+    /// Product name, e.g. `metrics`.
     pub database_type: String,
     /// Database (custom resource) name.
     pub database: String,
@@ -61,15 +61,15 @@ pub struct KubernetesConfig {
 impl Default for KubernetesConfig {
     fn default() -> Self {
         Self {
-            database_type: "meter".to_owned(),
-            database: "meter".to_owned(),
+            database_type: "metrics".to_owned(),
+            database: "metrics".to_owned(),
             namespace: "default".to_owned(),
-            stateful_set: "meter".to_owned(),
-            headless_service: "meter-headless".to_owned(),
+            stateful_set: "metrics".to_owned(),
+            headless_service: "metrics-headless".to_owned(),
             owner_port: 9090,
-            shard_map: "meter-shard-map".to_owned(),
-            coordinator_lease: "meter-shard-coordinator".to_owned(),
-            shard_lease_prefix: "meter-shard".to_owned(),
+            shard_map: "metrics-shard-map".to_owned(),
+            coordinator_lease: "metrics-shard-coordinator".to_owned(),
+            shard_lease_prefix: "metrics-shard".to_owned(),
             lease_duration: Duration::from_secs(15),
             epoch_policy: EpochPolicy::default(),
         }
@@ -1027,7 +1027,7 @@ mod tests {
             AssignmentGeneration::new(7),
             64,
             vec![Assignment::new(
-                Owner::new("meter-0", 0),
+                Owner::new("metrics-0", 0),
                 ShardRange::within(0, 64, 64).unwrap(),
                 AssignmentState::Active,
             )],
@@ -1036,20 +1036,20 @@ mod tests {
     }
 
     #[test]
-    fn config_uses_stable_meter_dns_defaults() {
+    fn config_uses_stable_metrics_dns_defaults() {
         let config = KubernetesConfig::default();
         let resolver = KubernetesOwnerResolver::new(&config);
         assert_eq!(
-            resolver.endpoint(&Owner::new("meter-0", 0)).unwrap(),
-            "meter-0.meter-headless.default.svc:9090"
+            resolver.endpoint(&Owner::new("metrics-0", 0)).unwrap(),
+            "metrics-0.metrics-headless.default.svc:9090"
         );
-        assert_eq!(config.shard_map, "meter-shard-map");
+        assert_eq!(config.shard_map, "metrics-shard-map");
     }
 
     #[test]
     fn shard_map_resource_round_trips() {
         let owners = (0..65)
-            .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
+            .map(|ordinal| Owner::new(format!("metrics-{ordinal}"), ordinal))
             .collect::<Vec<_>>();
         let map = plan_assignment(Some(&assignment()), 65, &owners, EpochPolicy::default(), 0)
             .unwrap()
@@ -1071,13 +1071,13 @@ mod tests {
     #[test]
     fn maps_from_incompatible_releases_are_treated_as_absent() {
         // A pre-epoch map after the current CRD pruned its `routing` field.
-        let mut resource = DynamicObject::new("line-writer-shard-map", &shard_map_api_resource());
+        let mut resource = DynamicObject::new("logs-writer-shard-map", &shard_map_api_resource());
         resource.data = serde_json::json!({
             "spec": {
                 "generation": 1,
                 "shard_count": 1,
                 "assignments": [{
-                    "owner": { "id": "line-writer-0", "ordinal": 0 },
+                    "owner": { "id": "logs-writer-0", "ordinal": 0 },
                     "range": { "start": 0, "end": 1 },
                     "state": "active"
                 }]
@@ -1091,7 +1091,7 @@ mod tests {
     fn coordinator_plans_scale_up_epochs_and_ignores_scale_down() {
         let owners = |count: u32| {
             (0..count)
-                .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
+                .map(|ordinal| Owner::new(format!("metrics-{ordinal}"), ordinal))
                 .collect::<Vec<_>>()
         };
         let policy = EpochPolicy::default();
@@ -1120,26 +1120,26 @@ mod tests {
     #[test]
     fn lease_decisions_are_generation_aware_and_expiry_aware() {
         let record = LeaseRecord {
-            holder: "meter-0".to_owned(),
+            holder: "metrics-0".to_owned(),
             generation: AssignmentGeneration::new(4),
             renewed_at_ms: 1_000,
             duration_ms: 15_000,
         };
         assert!(!can_acquire(
             Some(&record),
-            "meter-1",
+            "metrics-1",
             AssignmentGeneration::new(5),
             2_000
         ));
         assert!(can_acquire(
             Some(&record),
-            "meter-0",
+            "metrics-0",
             AssignmentGeneration::new(5),
             2_000
         ));
         assert!(can_acquire(
             Some(&record),
-            "meter-1",
+            "metrics-1",
             AssignmentGeneration::new(5),
             16_000
         ));
@@ -1148,8 +1148,8 @@ mod tests {
     #[test]
     fn shard_leases_are_small_and_stably_named() {
         assert_eq!(
-            shard_lease_name("meter-shard", ShardId::new(16)),
-            "meter-shard-0016"
+            shard_lease_name("metrics-shard", ShardId::new(16)),
+            "metrics-shard-0016"
         );
     }
 
@@ -1165,20 +1165,20 @@ mod tests {
     #[test]
     fn leases_are_labeled_by_database_type_and_name_through_release() {
         let config = KubernetesConfig {
-            database_type: "line".to_owned(),
+            database_type: "logs".to_owned(),
             database: "logs".to_owned(),
             ..KubernetesConfig::default()
         };
         assert_eq!(
             config.lease_label(),
-            ("telemetry.plural.sh/line".to_owned(), "logs".to_owned())
+            ("telemetry.plural.sh/logs".to_owned(), "logs".to_owned())
         );
-        assert_eq!(config.lease_selector(), "telemetry.plural.sh/line=logs");
+        assert_eq!(config.lease_selector(), "telemetry.plural.sh/logs=logs");
 
         let labels = BTreeMap::from([config.lease_label()]);
         let active = lease_resource(
-            meta("line-shard-0001", &labels),
-            "line-0",
+            meta("logs-shard-0001", &labels),
+            "logs-0",
             AssignmentGeneration::new(1),
             Duration::from_secs(15),
             1_000,
@@ -1192,26 +1192,26 @@ mod tests {
     fn lease_watch_only_notifies_for_released_shard_leases() {
         let labels = BTreeMap::new();
         let active = lease_resource(
-            meta("meter-shard-0016", &labels),
-            "meter-0",
+            meta("metrics-shard-0016", &labels),
+            "metrics-0",
             AssignmentGeneration::new(1),
             Duration::from_secs(15),
             1_000,
         );
-        assert!(is_shard_lease(&active, "meter-shard-"));
-        assert!(!is_released_shard_lease(&active, "meter-shard-"));
+        assert!(is_shard_lease(&active, "metrics-shard-"));
+        assert!(!is_released_shard_lease(&active, "metrics-shard-"));
 
         let released = released_lease_resource(&active);
-        assert!(is_released_shard_lease(&released, "meter-shard-"));
+        assert!(is_released_shard_lease(&released, "metrics-shard-"));
 
         let coordinator = lease_resource(
-            meta("meter-shard-coordinator", &labels),
-            "meter-0",
+            meta("metrics-shard-coordinator", &labels),
+            "metrics-0",
             AssignmentGeneration::default(),
             Duration::from_secs(15),
             1_000,
         );
-        assert!(!is_shard_lease(&coordinator, "meter-shard-"));
+        assert!(!is_shard_lease(&coordinator, "metrics-shard-"));
     }
 
     #[test]

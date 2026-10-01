@@ -1,4 +1,4 @@
-//! Plumbing shared by the Meter, Line, and Track servers.
+//! Plumbing shared by the Metrics, Logs, and Traces servers.
 
 pub mod auth;
 pub mod config;

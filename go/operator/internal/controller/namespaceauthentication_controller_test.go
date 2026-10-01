@@ -45,17 +45,17 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 		created = nil
 	})
 
-	It("reports valid Meter and Secret references as ready", func() {
-		meter := &telemetryv1alpha1.Meter{
-			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-meter", Namespace: namespace},
-			Spec:       telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeStandalone},
+	It("reports valid Metrics and Secret references as ready", func() {
+		metrics := &telemetryv1alpha1.Metrics{
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-metrics", Namespace: namespace},
+			Spec:       telemetryv1alpha1.MetricsSpec{Mode: telemetryv1alpha1.MetricsModeStandalone},
 		}
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-password", Namespace: namespace},
 			Data:       map[string][]byte{testPasswordKey: []byte("secret")},
 		}
-		auth := namespaceAuthentication("auth-valid", meter.Name, secret.Name)
-		for _, object := range []client.Object{meter, secret, auth} {
+		auth := namespaceAuthentication("auth-valid", metrics.Name, secret.Name)
+		for _, object := range []client.Object{metrics, secret, auth} {
 			Expect(k8sClient.Create(ctx, object)).To(Succeed())
 			created = append(created, object)
 		}
@@ -75,17 +75,17 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 		))
 	})
 
-	It("reports valid Line and Secret references as ready", func() {
-		line := &telemetryv1alpha1.Line{
-			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-line", Namespace: namespace},
+	It("reports valid Logs and Secret references as ready", func() {
+		logs := &telemetryv1alpha1.Logs{
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-logs", Namespace: namespace},
 		}
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-line-password", Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-logs-password", Namespace: namespace},
 			Data:       map[string][]byte{testPasswordKey: []byte("secret")},
 		}
-		auth := namespaceAuthentication("auth-valid-line", line.Name, secret.Name)
-		auth.Spec.DataStoreRef.Kind = dataStoreLine
-		for _, object := range []client.Object{line, secret, auth} {
+		auth := namespaceAuthentication("auth-valid-logs", logs.Name, secret.Name)
+		auth.Spec.DataStoreRef.Kind = dataStoreLogs
+		for _, object := range []client.Object{logs, secret, auth} {
 			Expect(k8sClient.Create(ctx, object)).To(Succeed())
 			created = append(created, object)
 		}
@@ -99,17 +99,17 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 		))
 	})
 
-	It("reports valid Track and Secret references as ready", func() {
-		track := &telemetryv1alpha1.Track{
-			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-track", Namespace: namespace},
+	It("reports valid Traces and Secret references as ready", func() {
+		traces := &telemetryv1alpha1.Traces{
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-traces", Namespace: namespace},
 		}
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-track-password", Namespace: namespace},
+			ObjectMeta: metav1.ObjectMeta{Name: "auth-valid-traces-password", Namespace: namespace},
 			Data:       map[string][]byte{testPasswordKey: []byte("secret")},
 		}
-		auth := namespaceAuthentication("auth-valid-track", track.Name, secret.Name)
-		auth.Spec.DataStoreRef.Kind = dataStoreTrack
-		for _, object := range []client.Object{track, secret, auth} {
+		auth := namespaceAuthentication("auth-valid-traces", traces.Name, secret.Name)
+		auth.Spec.DataStoreRef.Kind = dataStoreTraces
+		for _, object := range []client.Object{traces, secret, auth} {
 			Expect(k8sClient.Create(ctx, object)).To(Succeed())
 			created = append(created, object)
 		}
@@ -124,7 +124,7 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 	})
 
 	It("records invalid references in status without returning a reconcile error", func() {
-		auth := namespaceAuthentication("auth-invalid", "missing-meter", "missing-secret")
+		auth := namespaceAuthentication("auth-invalid", "missing-metrics", "missing-secret")
 		Expect(k8sClient.Create(ctx, auth)).To(Succeed())
 		created = append(created, auth)
 
@@ -138,15 +138,15 @@ var _ = Describe("NamespaceAuthentication Controller", func() {
 		Expect(condition).NotTo(BeNil())
 		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
 		Expect(condition.Reason).To(Equal("Invalid"))
-		Expect(condition.Message).To(ContainSubstring("referenced Meter is unavailable"))
+		Expect(condition.Message).To(ContainSubstring("referenced Metrics is unavailable"))
 	})
 })
 
-func namespaceAuthentication(name, meterName, secretName string) *telemetryv1alpha1.NamespaceAuthentication {
+func namespaceAuthentication(name, metricsName, secretName string) *telemetryv1alpha1.NamespaceAuthentication {
 	return &telemetryv1alpha1.NamespaceAuthentication{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.NamespaceAuthenticationSpec{
-			DataStoreRef: telemetryv1alpha1.DataStoreReference{Kind: "Meter", Name: meterName},
+			DataStoreRef: telemetryv1alpha1.DataStoreReference{Kind: "Metrics", Name: metricsName},
 			Namespace:    testTenantNamespace,
 			Username:     "reader",
 			Permission:   "read",

@@ -1,0 +1,82 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Metrics
+metadata:
+  name: metrics-sample
+spec:
+  mode: Sharded
+  version: 0.1.0
+  image:
+    repository: ghcr.io/pluralsh/metrics
+    pullPolicy: IfNotPresent
+  config:
+    auth:
+      unauthenticated: false
+    storage:
+      path: metrics
+      objectStore:
+        type: Aws
+        aws:
+          region: us-east-1
+          bucket: metrics
+          accessKeyIDSecretRef:
+            name: metrics-s3
+            key: access-key-id
+          secretAccessKeySecretRef:
+            name: metrics-s3
+            key: secret-access-key
+      blockCache:
+        type: FoyerHybrid
+        memoryCapacity: 536870912
+        diskCapacity: 10737418240
+        diskPath: /var/cache/metrics
+      metaCache:
+        type: FoyerMemory
+        capacity: 134217728
+    write:
+      durability: applied
+      flushIntervalSeconds: 10
+      remoteConcurrency: 16
+    namespaces:
+      - default
+  ingress:
+    enabled: true
+    hostname: metrics.example.com
+    ingressClass: nginx
+    pathPrefix: /metrics
+    metadata:
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      labels:
+        app.kubernetes.io/part-of: telemetry
+    tls:
+      enabled: true
+      secretName: metrics-sample-tls
+  writer:
+    replicas: 3
+    nodeSelector:
+      kubernetes.io/os: linux
+    tolerations:
+      - key: telemetry
+        operator: Equal
+        value: dedicated
+        effect: NoSchedule
+    cacheVolume:
+      persistentVolumeClaim:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+    podTemplate:
+      spec:
+        containers:
+          - name: metrics
+            resources:
+              requests:
+                cpu: 250m
+                memory: 512Mi
+  reader:
+    replicas: 2
+    cacheVolume:
+      emptyDir:
+        sizeLimit: 20Gi

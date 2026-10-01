@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v5
-      - run: helm lint chart/meter
+      - run: helm lint chart/metrics
       - run: helm lint chart/pseudofs
       - run: helm lint chart/telemetry-operator
       - name: Verify operator release version rendering

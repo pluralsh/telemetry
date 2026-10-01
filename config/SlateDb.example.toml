@@ -1,4 +1,4 @@
-# SlateDB settings shared by Meter, Line, and Track.
+# SlateDB settings shared by Metrics, Logs, and Traces.
 #
 # Zstd reduces object-store transfer and is well suited to string-heavy
 # discovery catalogs. Use "lz4" instead when lower compression CPU is more

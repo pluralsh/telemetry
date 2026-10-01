@@ -90,15 +90,15 @@ struct CommonArgs {
 #[derive(Subcommand, Clone, Debug)]
 enum ProductArgs {
     /// Loki JSON log ingestion workload.
-    Line(LineArgs),
+    Logs(LogsArgs),
     /// Prometheus remote-write metrics workload.
-    Meter(MeterArgs),
+    Metrics(MetricsArgs),
     /// OTLP/HTTP protobuf trace ingestion workload.
-    Track(TrackArgs),
+    Traces(TracesArgs),
 }
 
 #[derive(Args, Clone, Debug, Serialize)]
-struct LineArgs {
+struct LogsArgs {
     /// Log entries in each HTTP request.
     #[arg(long, default_value_t = 1_600)]
     events_per_request: usize,
@@ -113,7 +113,7 @@ struct LineArgs {
 }
 
 #[derive(Args, Clone, Debug, Serialize)]
-struct MeterArgs {
+struct MetricsArgs {
     /// Samples in each remote-write request.
     #[arg(long, default_value_t = 5_000)]
     events_per_request: usize,
@@ -128,7 +128,7 @@ struct MeterArgs {
 }
 
 #[derive(Args, Clone, Debug, Serialize)]
-struct TrackArgs {
+struct TracesArgs {
     /// Spans in each OTLP request.
     #[arg(long, default_value_t = 2_000)]
     events_per_request: usize,
@@ -145,25 +145,25 @@ struct TrackArgs {
 impl ProductArgs {
     fn name(&self) -> &'static str {
         match self {
-            Self::Line(_) => "line",
-            Self::Meter(_) => "meter",
-            Self::Track(_) => "track",
+            Self::Logs(_) => "logs",
+            Self::Metrics(_) => "metrics",
+            Self::Traces(_) => "traces",
         }
     }
 
     fn event_name(&self) -> &'static str {
         match self {
-            Self::Line(_) => "entries",
-            Self::Meter(_) => "samples",
-            Self::Track(_) => "spans",
+            Self::Logs(_) => "entries",
+            Self::Metrics(_) => "samples",
+            Self::Traces(_) => "spans",
         }
     }
 
     fn events_per_request(&self) -> usize {
         match self {
-            Self::Line(args) => args.events_per_request,
-            Self::Meter(args) => args.events_per_request,
-            Self::Track(args) => args.events_per_request,
+            Self::Logs(args) => args.events_per_request,
+            Self::Metrics(args) => args.events_per_request,
+            Self::Traces(args) => args.events_per_request,
         }
     }
 
@@ -172,22 +172,24 @@ impl ProductArgs {
             bail!("events-per-request must be greater than zero");
         }
         match self {
-            Self::Line(args) => {
+            Self::Logs(args) => {
                 if args.streams_per_request == 0 || args.active_streams == 0 {
-                    bail!("Line stream counts must be greater than zero");
+                    bail!("Logs stream counts must be greater than zero");
                 }
             }
-            Self::Meter(args) => {
+            Self::Metrics(args) => {
                 if args.active_series == 0
                     || !args.churn_percent.is_finite()
                     || !(0.0..=100.0).contains(&args.churn_percent)
                 {
-                    bail!("Meter active-series must be positive and churn-percent must be 0..=100");
+                    bail!(
+                        "Metrics active-series must be positive and churn-percent must be 0..=100"
+                    );
                 }
             }
-            Self::Track(args) => {
+            Self::Traces(args) => {
                 if args.spans_per_trace == 0 {
-                    bail!("Track spans-per-trace must be greater than zero");
+                    bail!("Traces spans-per-trace must be greater than zero");
                 }
             }
         }
@@ -196,9 +198,9 @@ impl ProductArgs {
 
     fn build_payload(&self, request_id: u64, run_id: &str) -> Result<Payload> {
         match self {
-            Self::Line(args) => line_payload(args, request_id, run_id),
-            Self::Meter(args) => meter_payload(args, request_id, run_id),
-            Self::Track(args) => track_payload(args, request_id, run_id),
+            Self::Logs(args) => logs_payload(args, request_id, run_id),
+            Self::Metrics(args) => metrics_payload(args, request_id, run_id),
+            Self::Traces(args) => traces_payload(args, request_id, run_id),
         }
     }
 }
@@ -471,7 +473,7 @@ async fn run_phase(
                 if let Some(encoding) = payload.content_encoding {
                     request = request.header(CONTENT_ENCODING, encoding);
                 }
-                if product.name() == "meter" {
+                if product.name() == "metrics" {
                     request = request.header("x-prometheus-remote-write-version", "0.1.0");
                 }
                 let response = request.send().await;
@@ -518,9 +520,9 @@ fn report(cli: &Cli, run_id: String, elapsed: Duration, stats: &Stats) -> Result
     let histogram = stats.latency_micros.lock().expect("latency lock poisoned");
     let percentile = |quantile| histogram.value_at_quantile(quantile) as f64 / 1_000.0;
     let workload = match &cli.product {
-        ProductArgs::Line(args) => serde_json::to_value(args)?,
-        ProductArgs::Meter(args) => serde_json::to_value(args)?,
-        ProductArgs::Track(args) => serde_json::to_value(args)?,
+        ProductArgs::Logs(args) => serde_json::to_value(args)?,
+        ProductArgs::Metrics(args) => serde_json::to_value(args)?,
+        ProductArgs::Traces(args) => serde_json::to_value(args)?,
     };
     Ok(Report {
         product: cli.product.name().to_owned(),
@@ -570,7 +572,7 @@ struct LokiStream {
     values: Vec<[String; 2]>,
 }
 
-fn line_payload(args: &LineArgs, request_id: u64, run_id: &str) -> Result<Payload> {
+fn logs_payload(args: &LogsArgs, request_id: u64, run_id: &str) -> Result<Payload> {
     let stream_count = args.streams_per_request.min(args.events_per_request);
     let mut streams = Vec::with_capacity(stream_count);
     let now = unix_nanos();
@@ -644,7 +646,7 @@ struct RemoteSample {
     timestamp: i64,
 }
 
-fn meter_payload(args: &MeterArgs, request_id: u64, run_id: &str) -> Result<Payload> {
+fn metrics_payload(args: &MetricsArgs, request_id: u64, run_id: &str) -> Result<Payload> {
     let timestamp = unix_millis();
     let churn_threshold = (args.churn_percent * 100.0).round() as u64;
     let mut timeseries = Vec::with_capacity(args.events_per_request);
@@ -764,7 +766,7 @@ mod any_value {
     }
 }
 
-fn track_payload(args: &TrackArgs, request_id: u64, run_id: &str) -> Result<Payload> {
+fn traces_payload(args: &TracesArgs, request_id: u64, run_id: &str) -> Result<Payload> {
     let now = unix_nanos() as u64;
     let mut spans = Vec::with_capacity(args.events_per_request);
     let padding = "x".repeat(args.attribute_bytes);
@@ -852,8 +854,8 @@ mod tests {
 
     #[test]
     fn payloads_are_nonempty_and_report_expected_encodings() {
-        let line = line_payload(
-            &LineArgs {
+        let line = logs_payload(
+            &LogsArgs {
                 events_per_request: 20,
                 streams_per_request: 4,
                 active_streams: 10,
@@ -865,8 +867,8 @@ mod tests {
         assert_eq!(line.content_type, "application/json");
         assert!(line.body.len() > 10_000);
 
-        let meter = meter_payload(
-            &MeterArgs {
+        let metrics = metrics_payload(
+            &MetricsArgs {
                 events_per_request: 10,
                 active_series: 100,
                 churn_percent: 10.0,
@@ -875,16 +877,16 @@ mod tests {
             "test",
         )
         .unwrap();
-        assert_eq!(meter.content_encoding, Some("snappy"));
+        assert_eq!(metrics.content_encoding, Some("snappy"));
         assert!(
             !snap::raw::Decoder::new()
-                .decompress_vec(&meter.body)
+                .decompress_vec(&metrics.body)
                 .unwrap()
                 .is_empty()
         );
 
-        let track = track_payload(
-            &TrackArgs {
+        let traces = traces_payload(
+            &TracesArgs {
                 events_per_request: 10,
                 spans_per_trace: 5,
                 attribute_bytes: 256,
@@ -893,8 +895,8 @@ mod tests {
             "test",
         )
         .unwrap();
-        assert_eq!(track.content_type, "application/x-protobuf");
-        assert!(track.body.len() > 2_500);
+        assert_eq!(traces.content_type, "application/x-protobuf");
+        assert!(traces.body.len() > 2_500);
     }
 
     #[test]
@@ -915,7 +917,7 @@ mod tests {
         };
         let cli = Cli {
             common,
-            product: ProductArgs::Line(LineArgs {
+            product: ProductArgs::Logs(LogsArgs {
                 events_per_request: 1,
                 streams_per_request: 1,
                 active_streams: 1,

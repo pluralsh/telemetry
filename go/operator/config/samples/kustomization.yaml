@@ -1,8 +1,8 @@
 ## Append samples of your project ##
 resources:
-- telemetry_v1alpha1_meter.yaml
-- telemetry_v1alpha1_line.yaml
-- telemetry_v1alpha1_track.yaml
+- telemetry_v1alpha1_metrics.yaml
+- telemetry_v1alpha1_logs.yaml
+- telemetry_v1alpha1_traces.yaml
 - telemetry_v1alpha1_pseudofs.yaml
 - telemetry_v1alpha1_namespaceauthentication.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

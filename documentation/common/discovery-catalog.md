@@ -1,6 +1,6 @@
 # Discovery catalog
 
-Meter, Line, and Track use the same partition-local catalog for dashboard
+Metrics, Logs, and Traces use the same partition-local catalog for dashboard
 metadata discovery. The catalog is a derived index: its records are written in
 the same atomic batch and with the same TTL as the data and query indexes that
 produced them.
@@ -22,7 +22,7 @@ value records are separate so listing names does not scan high-cardinality
 values. Metric metadata is stored as a small product-specific value keyed by
 metric name. The catalog format version covers the key suffix, typed-value
 encoding, record kinds, and record values for all products; incompatible
-changes increment it independently of Meter, Line, or Track key versions.
+changes increment it independently of Metrics, Logs, or Traces key versions.
 
 Each distinct term is an idempotent key with an empty value. This supports
 incremental writes and partition TTL without read-modify-write operations.

@@ -15,7 +15,7 @@ resources:
   controller: true
   domain: plural.sh
   group: telemetry
-  kind: Meter
+  kind: Metrics
   path: github.com/pluralsh/telemetry/go/operator/api/v1alpha1
   version: v1alpha1
 - api:
@@ -33,7 +33,7 @@ resources:
   controller: true
   domain: plural.sh
   group: telemetry
-  kind: Track
+  kind: Traces
   path: github.com/pluralsh/telemetry/go/operator/api/v1alpha1
   version: v1alpha1
 - api:

@@ -138,9 +138,9 @@ name = "api-docs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "line-server",
- "meter-server",
- "track-server",
+ "plural-logs-server",
+ "plural-metrics-server",
+ "plural-traces-server",
 ]
 
 [[package]]
@@ -2790,80 +2790,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "line"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "blake3",
- "bytes",
- "chrono",
- "common",
- "futures",
- "lalrpop",
- "lalrpop-util",
- "linkify",
- "logos",
- "metrics",
- "proptest",
- "regex",
- "roaring",
- "serde",
- "serde_json",
- "sharding",
- "slatedb",
- "snap",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "line-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.9",
- "base64 0.23.1",
- "bytes",
- "chrono",
- "clap",
- "common",
- "flate2",
- "futures",
- "http-body-util",
- "kube",
- "line",
- "metrics",
- "opentelemetry-proto",
- "prost",
- "proto",
- "serde",
- "serde_html_form",
- "serde_json",
- "serde_yaml",
- "server-common",
- "sharding",
- "slatedb",
- "snap",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic 0.13.1",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "utoipa",
-]
-
-[[package]]
 name = "linkify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3088,94 +3014,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memo-map"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "meter"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "bytes",
- "chrono",
- "common",
- "config",
- "dashmap",
- "dashu-float",
- "fail",
- "futures",
- "metrics",
- "moka",
- "opentelemetry-proto",
- "promql-parser",
- "proptest",
- "prost",
- "regex",
- "regex-syntax",
- "roaring",
- "rstest",
- "serde",
- "serde_json",
- "serde_with",
- "serde_yaml",
- "sharding",
- "slatedb",
- "slatedb-common",
- "snap",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tsz",
- "uuid",
-]
-
-[[package]]
-name = "meter-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.9",
- "base64 0.23.1",
- "blake3",
- "bytes",
- "clap",
- "common",
- "flate2",
- "futures",
- "http-body-util",
- "kube",
- "meter",
- "metrics",
- "opentelemetry-proto",
- "prost",
- "proto",
- "reqwest 0.12.28",
- "serde",
- "serde_html_form",
- "serde_json",
- "serde_urlencoded",
- "serde_yaml",
- "server-common",
- "sharding",
- "slatedb",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tonic 0.13.1",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
- "utoipa",
 ]
 
 [[package]]
@@ -3225,6 +3075,18 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "minijinja"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+dependencies = [
+ "memo-map",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "minimal-lexical"
@@ -3908,6 +3770,233 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "plural-logs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "blake3",
+ "bytes",
+ "chrono",
+ "common",
+ "futures",
+ "lalrpop",
+ "lalrpop-util",
+ "linkify",
+ "logos",
+ "metrics",
+ "minijinja",
+ "proptest",
+ "regex",
+ "roaring",
+ "serde",
+ "serde_json",
+ "sharding",
+ "slatedb",
+ "snap",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "plural-logs-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "common",
+ "flate2",
+ "futures",
+ "http-body-util",
+ "kube",
+ "metrics",
+ "opentelemetry-proto",
+ "plural-logs",
+ "prost",
+ "proto",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "serde_yaml",
+ "server-common",
+ "sharding",
+ "slatedb",
+ "snap",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic 0.13.1",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "utoipa",
+]
+
+[[package]]
+name = "plural-metrics"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "chrono",
+ "common",
+ "config",
+ "dashmap",
+ "dashu-float",
+ "fail",
+ "futures",
+ "metrics",
+ "moka",
+ "opentelemetry-proto",
+ "promql-parser",
+ "proptest",
+ "prost",
+ "regex",
+ "regex-syntax",
+ "roaring",
+ "rstest",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "serde_yaml",
+ "sharding",
+ "slatedb",
+ "slatedb-common",
+ "snap",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tsz",
+ "uuid",
+]
+
+[[package]]
+name = "plural-metrics-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.23.1",
+ "blake3",
+ "bytes",
+ "clap",
+ "common",
+ "flate2",
+ "futures",
+ "http-body-util",
+ "kube",
+ "metrics",
+ "opentelemetry-proto",
+ "plural-metrics",
+ "prost",
+ "proto",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "serde_urlencoded",
+ "serde_yaml",
+ "server-common",
+ "sharding",
+ "slatedb",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tonic 0.13.1",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+]
+
+[[package]]
+name = "plural-traces"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "common",
+ "futures",
+ "lalrpop",
+ "lalrpop-util",
+ "logos",
+ "metrics",
+ "opentelemetry-proto",
+ "proptest",
+ "prost",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sharding",
+ "slatedb",
+ "snap",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "plural-traces-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "base64 0.23.1",
+ "bytes",
+ "clap",
+ "common",
+ "futures",
+ "http-body-util",
+ "kube",
+ "metrics",
+ "opentelemetry-proto",
+ "plural-traces",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "proto",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "server-common",
+ "sharding",
+ "slatedb",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tonic 0.13.1",
+ "tonic-build",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]
@@ -5990,76 +6079,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "track"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "bytes",
- "common",
- "futures",
- "lalrpop",
- "lalrpop-util",
- "logos",
- "metrics",
- "opentelemetry-proto",
- "proptest",
- "prost",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "sharding",
- "slatedb",
- "snap",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "track-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "base64 0.23.1",
- "bytes",
- "clap",
- "common",
- "futures",
- "http-body-util",
- "kube",
- "metrics",
- "opentelemetry-proto",
- "prost",
- "prost-build",
- "prost-types",
- "proto",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "serde_yaml",
- "server-common",
- "sharding",
- "slatedb",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tonic 0.12.3",
- "tonic 0.13.1",
- "tonic-build",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
- "track",
- "ulid",
- "utoipa",
 ]
 
 [[package]]

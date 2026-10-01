@@ -2,9 +2,9 @@
 
 Plural Telemetry provides object-store-backed databases and related services:
 
-- [Meter](meter/): Prometheus-compatible metrics.
-- [Line](line/): Loki-compatible logs.
-- [Track](track/): Tempo-compatible traces.
+- [Metrics](metrics/): Prometheus-compatible metrics.
+- [Logs](logs/): Loki-compatible logs.
+- [Traces](traces/): Tempo-compatible traces.
 - [PseudoFS](pseudofs/): a gRPC virtual filesystem for embedded runtimes.
 
 Each database section describes its storage format, index strategy, public APIs,
@@ -24,9 +24,9 @@ examples live in [`config/`](../config/).
 Each server owns an OpenAPI 3.1 description generated with Utoipa. Regenerate
 the checked-in JSON documents after changing an HTTP route:
 
-- [Meter](openapi/meter.json)
-- [Line](openapi/line.json)
-- [Track](openapi/track.json)
+- [Metrics](openapi/metrics.json)
+- [Logs](openapi/logs.json)
+- [Traces](openapi/traces.json)
 
 ```sh
 cargo run -p api-docs

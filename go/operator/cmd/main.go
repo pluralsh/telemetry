@@ -206,28 +206,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.MeterReconciler{
+	if err := (&controller.MetricsReconciler{
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
 		DefaultProductVersion: defaultProductVersion,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Meter")
+		setupLog.Error(err, "unable to create controller", "controller", "Metrics")
 		os.Exit(1)
 	}
-	if err := (&controller.LineReconciler{
+	if err := (&controller.LogsReconciler{
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
 		DefaultProductVersion: defaultProductVersion,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Line")
+		setupLog.Error(err, "unable to create controller", "controller", "Logs")
 		os.Exit(1)
 	}
-	if err := (&controller.TrackReconciler{
+	if err := (&controller.TracesReconciler{
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
 		DefaultProductVersion: defaultProductVersion,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Track")
+		setupLog.Error(err, "unable to create controller", "controller", "Traces")
 		os.Exit(1)
 	}
 	if err := (&controller.PseudoFSReconciler{

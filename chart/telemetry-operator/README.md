@@ -1,7 +1,7 @@
 # Telemetry Operator Helm chart
 
-This chart installs the Kubebuilder-based Telemetry Operator and its `Meter`,
-`Line`, and `NamespaceAuthentication` CRDs. The operator watches all namespaces and
+This chart installs the Kubebuilder-based Telemetry Operator and its `Metrics`,
+`Logs`, and `NamespaceAuthentication` CRDs. The operator watches all namespaces and
 manages the workloads and credentials declared by those resources.
 
 ## Install
@@ -54,8 +54,8 @@ The current manager implementation only supports cluster-wide watches, so
 `watchClusterWide` must remain `true`. If `rbac.create=false`, provide an
 equivalent ClusterRole/ClusterRoleBinding and leader-election Role/RoleBinding.
 
-## Meter and Line images and scheduling
-For managed `Meter` and `Line` resources, `spec.version` is the canonical
+## Metrics and Logs images and scheduling
+For managed `Metrics` and `Logs` resources, `spec.version` is the canonical
 product image tag. It accepts SemVer 2.0 without a leading `v`, including
 prerelease and build metadata. Deprecated `spec.image.tag` remains an alias
 with the same validation; `spec.version` takes precedence and admission
@@ -93,7 +93,7 @@ Nodes own taints; workloads configure tolerations for those taints.
 
 ## Workload storage
 
-Each Meter or Line writer and reader receives per-replica `ReadWriteOnce` claims by
+Each Metrics or Logs writer and reader receives per-replica `ReadWriteOnce` claims by
 default: 10Gi for `dataVolume` and 20Gi for `cacheVolume`, using the cluster's
 default StorageClass. Override either claim with a Kubernetes-native PVC spec,
 or explicitly opt into ephemeral storage:
@@ -119,33 +119,33 @@ operator patches existing claims and orphan-recreates the StatefulSet so future
 replicas use the new template. Shrinks and other immutable claim changes are
 rejected.
 
-Line defaults to `ghcr.io/pluralsh/line`, HTTP port 3100, and gRPC port 9091.
+Logs defaults to `ghcr.io/pluralsh/logs`, HTTP port 3100, and gRPC port 9091.
 Its ingress routes `/write` to writers and `/read` to readers. The APIs below
 those routing prefixes retain the namespace segment required by the
-Loki-compatible API. Line and Track support `spec.ingress.pathPrefix`; the
+Loki-compatible API. Logs and Traces support `spec.ingress.pathPrefix`; the
 prefix is added before these routes and handled directly by the server.
 
-Managed Meter, Line, and Track namespace HTTP APIs deny anonymous access by default.
+Managed Metrics, Logs, and Traces namespace HTTP APIs deny anonymous access by default.
 Omitting `spec.config.auth.unauthenticated` renders `false`; explicitly set it
 to `true` only for workloads that intentionally allow anonymous reads and
 writes. Health and readiness endpoints remain public.
 
 ## Object-store authentication
 
-Meter supports AWS S3 and S3-compatible endpoints, Azure Blob Storage, and
-Google Cloud Storage. Provider credentials in a `Meter` resource use
+Metrics supports AWS S3 and S3-compatible endpoints, Azure Blob Storage, and
+Google Cloud Storage. Provider credentials in a `Metrics` resource use
 `SecretKeySelector` fields and are injected directly into the managed
 containers, rather than copied into generated configuration. Omit explicit
 credentials to use ambient identity such as AWS IRSA, Azure managed/workload
 identity, or Google application default credentials. Configure cloud identity
-annotations on the Meter-managed ServiceAccount with
+annotations on the Metrics-managed ServiceAccount with
 `spec.serviceAccount.annotations`.
 
 ## Product ingress
 
 Set `spec.ingress.enabled`, `hostname`, and optionally `ingressClass`, metadata,
 and TLS settings to create an Ingress for a product. TLS defaults to the
-`<product-name>-tls` Secret. Set the optional `pathPrefix`, such as `/meter`, when
+`<product-name>-tls` Secret. Set the optional `pathPrefix`, such as `/metrics`, when
 sharing a hostname. The operator routes `{pathPrefix}/write` to writers and
 `{pathPrefix}/read` to readers for every product; both routes target the same
 Service for a standalone product. The server handles the prefix directly, so

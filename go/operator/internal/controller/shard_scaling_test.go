@@ -58,20 +58,20 @@ func TestMissingShardMapScaleUpAndDownscaleConservatism(t *testing.T) {
 	if err := appsv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
 			Mode:   telemetryv1alpha1.ProductModeSharded,
 			Writer: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(5))},
 		},
 	}
 	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName + "-writer", Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName + "-writer", Namespace: testNamespace},
 		Spec:       appsv1.StatefulSetSpec{Replicas: lo.ToPtr(int32(3))},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(meter, sts).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(metrics, sts).Build()
 
-	state, err := loadWriterScalingState(context.Background(), c, meter, dataStoreMeter, telemetryv1alpha1.ProductModeSharded, 5)
+	state, err := loadWriterScalingState(context.Background(), c, metrics, dataStoreMetrics, telemetryv1alpha1.ProductModeSharded, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestMissingShardMapScaleUpAndDownscaleConservatism(t *testing.T) {
 		t.Fatalf("scale-up effective replicas = %d, want 5", state.effective)
 	}
 
-	state, err = loadWriterScalingState(context.Background(), c, meter, dataStoreMeter, telemetryv1alpha1.ProductModeSharded, 2)
+	state, err = loadWriterScalingState(context.Background(), c, metrics, dataStoreMetrics, telemetryv1alpha1.ProductModeSharded, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

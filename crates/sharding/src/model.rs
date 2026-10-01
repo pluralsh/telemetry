@@ -191,8 +191,8 @@ impl RoutingEpoch {
 
 /// When a newly requested routing epoch takes effect.
 ///
-/// Cutovers land on `alignment` boundaries so a product time partition (Meter
-/// bucket, Line/Track segment) is always written under a single epoch, and at
+/// Cutovers land on `alignment` boundaries so a product time partition (Metrics
+/// bucket, Logs/Traces segment) is always written under a single epoch, and at
 /// least `lead_time` in the future so every writer observes the epoch first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochPolicy {
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn requires_exact_assignment_coverage() {
-        let owner = Owner::new("meter-0", 0);
+        let owner = Owner::new("metrics-0", 0);
         let assignment = |start, end| {
             Assignment::new(
                 owner.clone(),
@@ -545,7 +545,7 @@ mod tests {
                 }
             }],
             "assignments": [{
-                "owner": {"id": "meter-0", "ordinal": 0},
+                "owner": {"id": "metrics-0", "ordinal": 0},
                 "range": {"start": 1, "end": 1},
                 "state": "active"
             }]
@@ -559,7 +559,7 @@ mod tests {
             AssignmentGeneration::new(7),
             2,
             vec![Assignment::new(
-                Owner::new("meter-0", 0),
+                Owner::new("metrics-0", 0),
                 ShardRange::within(0, 2, 2).unwrap(),
                 AssignmentState::Active,
             )],
@@ -577,7 +577,7 @@ mod tests {
             AssignmentGeneration::new(1),
             epochs,
             vec![Assignment::new(
-                Owner::new("meter-0", 0),
+                Owner::new("metrics-0", 0),
                 ShardRange::within(0, shards, shards).unwrap(),
                 AssignmentState::Active,
             )],

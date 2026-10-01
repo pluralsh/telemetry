@@ -1,7 +1,7 @@
 # Capacity planning and scaling
 
 This page translates SlateDB's public key/value benchmarks into provisional
-capacity guidance for Meter, Line, and Track. The values below are planning
+capacity guidance for Metrics, Logs, and Traces. The values below are planning
 envelopes, not measured Telemetry service limits or service-level objectives.
 Run the product-shaped benchmarks described below on the intended object store
 and instance type before setting production limits.
@@ -16,10 +16,10 @@ handoff, and object-store tail latency have headroom.
 Until native product benchmarks replace these estimates, use the following
 provisional envelope for one writer:
 
-- Line: 10–30 MiB/s of uncompressed log bodies, approximately 0.8–2.5 TiB/day.
-- Meter: 250,000–500,000 samples/s for stable series; series churn can lower
+- Logs: 10–30 MiB/s of uncompressed log bodies, approximately 0.8–2.5 TiB/day.
+- Metrics: 250,000–500,000 samples/s for stable series; series churn can lower
   this substantially.
-- Track: 20,000–60,000 spans/s when a span averages approximately 500 bytes.
+- Traces: 20,000–60,000 spans/s when a span averages approximately 500 bytes.
 
 These ranges assume batched ingestion, default `applied` durability, limited
 writer-side reads, and an object store in the same region. They are deliberately
@@ -93,11 +93,11 @@ round trip; `durable` ingestion does.
 
 ## Shared write-buffer behavior
 
-Meter, Line, and Track use the same bounded, per-storage-shard write
+Metrics, Logs, and Traces use the same bounded, per-storage-shard write
 coordinator. A request is validated and merged into a live in-memory delta;
 the coordinator freezes deltas by size, time, or an explicit durability
-barrier. Line coalesces entries by namespace, segment, and stream fingerprint.
-Track coalesces traces by namespace and segment.
+barrier. Logs coalesces entries by namespace, segment, and stream fingerprint.
+Traces coalesces traces by namespace and segment.
 This allows separate client requests to share product page and index work.
 
 The requested durability level controls acknowledgement:
@@ -116,7 +116,7 @@ All three products default `write.flush_interval_seconds` to 10 seconds. For
 `applied` and `written` writes, read-only replicas normally observe data within
 roughly 0–10 seconds plus manifest polling and flush latency; size-triggered or
 explicit flushes can make it visible sooner. This durable interval is separate
-from `buffer_flush_interval_milliseconds`, which controls when Line and Track
+from `buffer_flush_interval_milliseconds`, which controls when Logs and Traces
 freeze and apply their live in-memory deltas.
 
 The queue is deliberately bounded. A full queue produces protocol-specific
@@ -154,42 +154,42 @@ next owner opens the shard, so every acknowledged pre-drain write is included.
 
 ## Product write behavior
 
-### Meter
+### Metrics
 
-Meter first combines samples in per-bucket deltas. `written` flushes those
+Metrics first combines samples in per-bucket deltas. `written` flushes those
 deltas into SlateDB's writable state without waiting for object storage, and a
 periodic flush establishes remote durability and reader visibility. Repeated
 samples for stable series reuse schema and posting state.
 
-Meter capacity depends on both samples/s and active-series behavior:
+Metrics capacity depends on both samples/s and active-series behavior:
 
 - Stable series primarily exercise sample encoding and delta merging.
 - New or changed series also create schema and posting records.
 - High churn can become the limit even when sample throughput is moderate.
 - Classic histograms create one series per bucket, plus `_sum` and `_count`. Native histograms (remote-write histograms and OTLP exponential histograms) are stored as one series with larger samples.
 
-### Line
+### Logs
 
-Line turns each frozen delta into coalesced SlateDB `WriteBatch` operations.
+Logs turns each frozen delta into coalesced SlateDB `WriteBatch` operations.
 Default `applied` requests can coalesce across the configured time and size
 window. `written` requests force a coordinator barrier but not an object-store
 flush. The common periodic durable flush makes complete accepted batches
 visible to read-only replicas.
 
-Large batches let Line fill its approximately 1 MiB pages, resolve a stream once
+Large batches let Logs fill its approximately 1 MiB pages, resolve a stream once
 for more entries, and combine posting updates. Small requests increase lock,
 sequence, page, and index work per log byte. Stream cardinality and churn should
 therefore be tested independently from byte throughput.
 
-### Track
+### Traces
 
-Track also coalesces pages, locators, metadata, and posting fragments before
+Traces also coalesces pages, locators, metadata, and posting fragments before
 committing atomic SlateDB `WriteBatch` operations, followed by periodic
 durable flushes that establish reader visibility.
 Trace batches should be large enough to fill approximately 1 MiB pages without
 turning an entire object-store buffer object into one oversized transaction.
 
-Track capacity is sensitive to average span size, spans per trace, attribute
+Traces capacity is sensitive to average span size, spans per trace, attribute
 count, indexed-attribute cardinality, and continuation writes to existing
 traces.
 
@@ -228,7 +228,7 @@ idempotent.
 
 ## Translating throughput into production units
 
-### Line: logs/day and entries/s
+### Logs: logs/day and entries/s
 
 Grafana's [Loki deployment guidance][loki-modes] positions monolithic mode for
 approximately 20 GB/day and simple scalable mode close to 1 TB/day before
@@ -261,7 +261,7 @@ Grafana recommends 5–10 stable labels, reasonably sized lines, and explicit
 tenant rate limits. Benchmark at least 1,000, 10,000, and 100,000 active streams
 because stream churn and posting cardinality can force scaling before bytes/s.
 
-### Meter: samples/s and active series
+### Metrics: samples/s and active series
 
 Grafana's [Mimir capacity guide][mimir-capacity] estimates distributor resources
 at 1 CPU and 1 GiB memory per 25,000 samples/s. It estimates ingester resources
@@ -282,7 +282,7 @@ The provisional single-writer target is 250,000–500,000 samples/s for stable
 series. Compared with Mimir's distributor ratio, that is 10–20 CPU-equivalents
 of protocol ingestion before accounting for Mimir's separate replicated
 ingesters. Telemetry's 8-vCPU/32-GiB starting recommendation is plausible only
-because Meter combines distribution and storage differently; it remains an
+because Metrics combines distribution and storage differently; it remains an
 estimate to validate, not evidence that it is more CPU efficient.
 
 Run separate steady-state, 1% hourly churn, and 10% hourly churn tests. Report
@@ -291,7 +291,7 @@ wire size varies from a few bytes to tens of bytes per sample depending on
 protocol version, labels, and batching, so network bytes/sample is not a stable
 capacity unit by itself.
 
-### Track: spans/s
+### Traces: spans/s
 
 Tempo's [ingestion guidance][tempo-ingestion] uses an approximately 500-byte
 typical span. Its documented 15 MB/s per-distributor default corresponds to
@@ -304,7 +304,7 @@ At the same 500-byte average:
 - 20 MiB/s is approximately 42,000 spans/s.
 - 30 MiB/s is approximately 63,000 spans/s.
 
-The provisional Track target of 20,000–60,000 spans/s per writer therefore
+The provisional Traces target of 20,000–60,000 spans/s per writer therefore
 spans roughly one to two Tempo default distributor admission envelopes. Tempo
 uses separate downstream components and different durability, replication, and
 query architecture, so this comparison is a workload translation rather than a
@@ -336,7 +336,7 @@ pass on S3 Standard and the intended cache configuration.
 ## Required benchmark matrix
 
 Use the opt-in [deployed scalability runner][scalability-runner] to generate
-Line, Meter, and Track traffic. It is a standalone package and is not part of
+Logs, Metrics, and Traces traffic. It is a standalone package and is not part of
 the standard regression suite.
 
 Run each product for at least 30 minutes after warmup, then continue until

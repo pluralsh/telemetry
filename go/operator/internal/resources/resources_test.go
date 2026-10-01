@@ -14,20 +14,20 @@ import (
 )
 
 const (
-	testMeterName       = "example"
-	testLineName        = "logs"
+	testMetricsName     = "example"
+	testLogsName        = "logs"
 	testNamespace       = "test"
-	testObjectStoreName = "meter"
+	testObjectStoreName = "metrics"
 	testTokenSecretName = "token"
 	testDedicatedKey    = "dedicated"
 	testConfigHash      = "hash"
 )
 
 func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace}}
-	statefulSet := mustStatefulSet(t, meter)
-	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:0.1.0" {
-		t.Fatalf("default image = %q, want GHCR Meter image", image)
+	metrics := &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace}}
+	statefulSet := mustStatefulSet(t, metrics)
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/metrics:0.1.0" {
+		t.Fatalf("default image = %q, want GHCR Metrics image", image)
 	}
 	if policy := statefulSet.Spec.Template.Spec.Containers[0].ImagePullPolicy; policy != corev1.PullIfNotPresent {
 		t.Fatalf("default image pull policy = %q, want IfNotPresent", policy)
@@ -62,16 +62,16 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 
 func TestStatefulSetPersistentVolumeClaimRetentionPolicy(t *testing.T) {
 	t.Run("local object stores retain authoritative data", func(t *testing.T) {
-		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
-			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Metrics{
+			ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
 		})
 		assertPVCRetentionPolicy(t, statefulSet, appsv1.RetainPersistentVolumeClaimRetentionPolicyType, appsv1.RetainPersistentVolumeClaimRetentionPolicyType)
 	})
 
 	t.Run("remote object stores delete cache volumes", func(t *testing.T) {
-		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
-			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-			Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Metrics{
+			ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 				Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
 					Type: telemetryv1alpha1.ObjectStoreAWS,
 				}},
@@ -81,10 +81,10 @@ func TestStatefulSetPersistentVolumeClaimRetentionPolicy(t *testing.T) {
 	})
 
 	t.Run("explicit values override each computed default independently", func(t *testing.T) {
-		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Meter{
-			ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-			Spec: telemetryv1alpha1.MeterSpec{
-				Config: telemetryv1alpha1.MeterConfigSpec{
+		statefulSet := mustStatefulSet(t, &telemetryv1alpha1.Metrics{
+			ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.MetricsSpec{
+				Config: telemetryv1alpha1.MetricsConfigSpec{
 					Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
 						Type: telemetryv1alpha1.ObjectStoreGCP,
 					}},
@@ -101,17 +101,17 @@ func TestStatefulSetPersistentVolumeClaimRetentionPolicy(t *testing.T) {
 }
 
 func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{
-			Mode: telemetryv1alpha1.MeterModeSharded,
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Mode: telemetryv1alpha1.MetricsModeSharded,
 			Writer: telemetryv1alpha1.WorkloadSpec{
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
 				},
 				PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name: containerMeter,
+					Name: containerMetrics,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:              resource.MustParse("500m"),
@@ -129,7 +129,7 @@ func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 	}
 
 	writer, err := StatefulSet(StatefulSetInput{
-		Meter: meter, Component: ComponentWriter, ConfigSecretName: volumeConfig,
+		Metrics: metrics, Component: ComponentWriter, ConfigSecretName: volumeConfig,
 		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {
@@ -143,7 +143,7 @@ func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 	assertResourceQuantity(t, writerResources.Limits, corev1.ResourceMemory, "3Gi")
 
 	reader, err := StatefulSet(StatefulSetInput{
-		Meter: meter, Component: ComponentReader, ConfigSecretName: volumeConfig,
+		Metrics: metrics, Component: ComponentReader, ConfigSecretName: volumeConfig,
 		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {
@@ -159,9 +159,9 @@ func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 }
 
 func TestStatefulSetProductVersionPrecedence(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace}}
+	metrics := &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace}}
 	input := StatefulSetInput{
-		Meter: meter, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		Metrics: metrics, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
 		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 		DefaultProductVersion: "1.2.3",
 	}
@@ -169,48 +169,48 @@ func TestStatefulSetProductVersionPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:1.2.3" {
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/metrics:1.2.3" {
 		t.Fatalf("configured default image = %q, want release version", image)
 	}
 
-	meter.Spec.Image.Tag = "2.0.0"
+	metrics.Spec.Image.Tag = "2.0.0"
 	statefulSet, err = StatefulSet(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:2.0.0" {
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/metrics:2.0.0" {
 		t.Fatalf("deprecated image tag image = %q, want explicit tag", image)
 	}
 
-	meter.Spec.Image.Tag = ""
-	meter.Spec.Version = "3.0.0"
+	metrics.Spec.Image.Tag = ""
+	metrics.Spec.Version = "3.0.0"
 	statefulSet, err = StatefulSet(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/meter:3.0.0" {
+	if image := statefulSet.Spec.Template.Spec.Containers[0].Image; image != "ghcr.io/pluralsh/metrics:3.0.0" {
 		t.Fatalf("spec.version image = %q, want canonical explicit version", image)
 	}
 }
 
 func TestServiceAccountIncludesConfiguredAnnotations(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{ServiceAccount: telemetryv1alpha1.ServiceAccountSpec{
-			Annotations: map[string]string{"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/meter"},
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{ServiceAccount: telemetryv1alpha1.ServiceAccountSpec{
+			Annotations: map[string]string{"eks.amazonaws.com/role-arn": "arn:aws:iam::123456789012:role/metrics"},
 		}},
 	}
-	serviceAccount := ServiceAccount(meter)
-	if serviceAccount.Annotations["eks.amazonaws.com/role-arn"] != "arn:aws:iam::123456789012:role/meter" {
+	serviceAccount := ServiceAccount(metrics)
+	if serviceAccount.Annotations["eks.amazonaws.com/role-arn"] != "arn:aws:iam::123456789012:role/metrics" {
 		t.Fatalf("service account annotations = %#v", serviceAccount.Annotations)
 	}
 }
 
 func TestIngressUsesStandaloneServiceAndTLSDefaults(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Ingress: telemetryv1alpha1.IngressSpec{
-			Enabled: true, Hostname: "meter.example.com", IngressClass: "nginx", PathPrefix: "/meter",
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "metrics.example.com", IngressClass: "nginx", PathPrefix: "/metrics",
 			Metadata: telemetryv1alpha1.IngressMetadataSpec{
 				Annotations: map[string]string{"cert-manager.io/cluster-issuer": "letsencrypt"},
 				Labels:      map[string]string{"example.com/exposure": "external"},
@@ -218,7 +218,7 @@ func TestIngressUsesStandaloneServiceAndTLSDefaults(t *testing.T) {
 			TLS: telemetryv1alpha1.IngressTLSSpec{Enabled: true},
 		}},
 	}
-	ingress := Ingress(meter)
+	ingress := Ingress(metrics)
 	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "nginx" {
 		t.Fatalf("ingress class = %#v", ingress.Spec.IngressClassName)
 	}
@@ -226,79 +226,79 @@ func TestIngressUsesStandaloneServiceAndTLSDefaults(t *testing.T) {
 		ingress.Labels["example.com/exposure"] != "external" {
 		t.Fatalf("ingress metadata = %#v/%#v", ingress.Labels, ingress.Annotations)
 	}
-	if len(ingress.Spec.TLS) != 1 || ingress.Spec.TLS[0].SecretName != testMeterName+"-tls" {
+	if len(ingress.Spec.TLS) != 1 || ingress.Spec.TLS[0].SecretName != testMetricsName+"-tls" {
 		t.Fatalf("ingress TLS = %#v", ingress.Spec.TLS)
 	}
 	paths := ingress.Spec.Rules[0].HTTP.Paths
 	if len(paths) != 2 {
 		t.Fatalf("standalone ingress paths = %#v", paths)
 	}
-	assertIngressPath(t, paths, "/meter/write", testMeterName)
-	assertIngressPath(t, paths, "/meter/read", testMeterName)
+	assertIngressPath(t, paths, "/metrics/write", testMetricsName)
+	assertIngressPath(t, paths, "/metrics/read", testMetricsName)
 }
 
 func TestIngressRoutesShardedWritesAndReads(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{
-			Mode:    telemetryv1alpha1.MeterModeSharded,
-			Ingress: telemetryv1alpha1.IngressSpec{Enabled: true, Hostname: "meter.example.com"},
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Mode:    telemetryv1alpha1.MetricsModeSharded,
+			Ingress: telemetryv1alpha1.IngressSpec{Enabled: true, Hostname: "metrics.example.com"},
 		},
 	}
-	paths := Ingress(meter).Spec.Rules[0].HTTP.Paths
+	paths := Ingress(metrics).Spec.Rules[0].HTTP.Paths
 	if len(paths) != 2 {
 		t.Fatalf("sharded ingress paths = %#v", paths)
 	}
-	assertIngressPath(t, paths, "/write", testMeterName+"-writer")
-	assertIngressPath(t, paths, "/read", testMeterName+"-reader")
+	assertIngressPath(t, paths, "/write", testMetricsName+"-writer")
+	assertIngressPath(t, paths, "/read", testMetricsName+"-reader")
 }
 
-func TestLineResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
-	line := &telemetryv1alpha1.Line{
-		ObjectMeta: metav1.ObjectMeta{Name: testLineName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.LineSpec{Ingress: telemetryv1alpha1.IngressSpec{
-			Enabled: true, Hostname: "logs.example.com", PathPrefix: "/line",
+func TestLogsResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
+	logs := &telemetryv1alpha1.Logs{
+		ObjectMeta: metav1.ObjectMeta{Name: testLogsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.LogsSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "logs.example.com", PathPrefix: "/logs",
 		}},
 	}
 	statefulSet, err := StatefulSet(StatefulSetInput{
-		Line: line, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		Logs: logs, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
 		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	container := statefulSet.Spec.Template.Spec.Containers[0]
-	if container.Name != LineDescriptor.Name || container.Image != "ghcr.io/pluralsh/line:0.1.0" {
-		t.Fatalf("unexpected Line container: %#v", container)
+	if container.Name != LogsDescriptor.Name || container.Image != "ghcr.io/pluralsh/logs:0.1.0" {
+		t.Fatalf("unexpected Logs container: %#v", container)
 	}
 	if container.Ports[0].ContainerPort != 3100 || container.Ports[1].ContainerPort != 9091 {
-		t.Fatalf("unexpected Line ports: %#v", container.Ports)
+		t.Fatalf("unexpected Logs ports: %#v", container.Ports)
 	}
 	if !lo.ContainsBy(container.VolumeMounts, func(mount corev1.VolumeMount) bool {
-		return mount.Name == volumeConfig && mount.MountPath == "/etc/line/line.yaml" && mount.SubPath == "line.yaml"
+		return mount.Name == volumeConfig && mount.MountPath == "/etc/logs/logs.yaml" && mount.SubPath == "logs.yaml"
 	}) {
-		t.Fatalf("Line config mount is missing: %#v", container.VolumeMounts)
+		t.Fatalf("Logs config mount is missing: %#v", container.VolumeMounts)
 	}
-	paths := Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/line/write", line.Name)
-	assertIngressPath(t, paths, "/line/read", line.Name)
+	paths := Ingress(logs).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/logs/write", logs.Name)
+	assertIngressPath(t, paths, "/logs/read", logs.Name)
 
-	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
-	paths = Ingress(line).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/line/write", line.Name+"-writer")
-	assertIngressPath(t, paths, "/line/read", line.Name+"-reader")
+	logs.Spec.Mode = telemetryv1alpha1.LogsModeSharded
+	paths = Ingress(logs).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/logs/write", logs.Name+"-writer")
+	assertIngressPath(t, paths, "/logs/read", logs.Name+"-reader")
 }
 
-func TestTrackIngressUsesPathPrefix(t *testing.T) {
-	track := &telemetryv1alpha1.Track{
+func TestTracesIngressUsesPathPrefix(t *testing.T) {
+	traces := &telemetryv1alpha1.Traces{
 		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: testNamespace},
-		Spec: telemetryv1alpha1.TrackSpec{Ingress: telemetryv1alpha1.IngressSpec{
-			Enabled: true, Hostname: "traces.example.com", PathPrefix: "/track",
+		Spec: telemetryv1alpha1.TracesSpec{Ingress: telemetryv1alpha1.IngressSpec{
+			Enabled: true, Hostname: "traces.example.com", PathPrefix: "/traces",
 		}},
 	}
-	paths := Ingress(track).Spec.Rules[0].HTTP.Paths
-	assertIngressPath(t, paths, "/track/write", track.Name)
-	assertIngressPath(t, paths, "/track/read", track.Name)
+	paths := Ingress(traces).Spec.Rules[0].HTTP.Paths
+	assertIngressPath(t, paths, "/traces/write", traces.Name)
+	assertIngressPath(t, paths, "/traces/read", traces.Name)
 }
 
 func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
@@ -352,40 +352,40 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 		container string
 	}{
 		{
-			name: "Meter",
-			input: StatefulSetInput{Meter: &telemetryv1alpha1.Meter{
+			name: "Metrics",
+			input: StatefulSetInput{Metrics: &telemetryv1alpha1.Metrics{
 				ObjectMeta: metav1.ObjectMeta{Name: "metrics", Namespace: testNamespace},
-				Spec: telemetryv1alpha1.MeterSpec{
+				Spec: telemetryv1alpha1.MetricsSpec{
 					Version: "1.2.3-rc.1",
 					Image: telemetryv1alpha1.ImageSpec{
-						Repository: "registry.example.com/observability/meter",
+						Repository: "registry.example.com/observability/metrics",
 						Tag:        "0.9.0",
 						PullPolicy: corev1.PullAlways,
 					},
 					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "meter", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+						Containers: []corev1.Container{{Name: "metrics", Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
 					}}},
 				},
 			}},
-			container: "meter",
+			container: "metrics",
 		},
 		{
-			name: "Line",
-			input: StatefulSetInput{Line: &telemetryv1alpha1.Line{
-				ObjectMeta: metav1.ObjectMeta{Name: testLineName, Namespace: testNamespace},
-				Spec: telemetryv1alpha1.LineSpec{
+			name: "Logs",
+			input: StatefulSetInput{Logs: &telemetryv1alpha1.Logs{
+				ObjectMeta: metav1.ObjectMeta{Name: testLogsName, Namespace: testNamespace},
+				Spec: telemetryv1alpha1.LogsSpec{
 					Version: "2.3.4+build.5",
 					Image: telemetryv1alpha1.ImageSpec{
-						Repository: "registry.example.com/observability/line",
+						Repository: "registry.example.com/observability/logs",
 						Tag:        "0.8.0",
 						PullPolicy: corev1.PullAlways,
 					},
 					Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: LineDescriptor.Name, Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
+						Containers: []corev1.Container{{Name: LogsDescriptor.Name, Image: "ignored:latest", ImagePullPolicy: corev1.PullNever}},
 					}}},
 				},
 			}},
-			container: LineDescriptor.Name,
+			container: LogsDescriptor.Name,
 		},
 	}
 	for _, test := range tests {
@@ -399,7 +399,7 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 				t.Fatal(err)
 			}
 			container := statefulSet.Spec.Template.Spec.Containers[0]
-			product := product(lo.Ternary(test.input.Meter != nil, any(test.input.Meter), any(test.input.Line)))
+			product := product(lo.Ternary(test.input.Metrics != nil, any(test.input.Metrics), any(test.input.Logs)))
 			expected := product.Image.Repository + ":" + product.Version
 			if container.Name != test.container || container.Image != expected || container.ImagePullPolicy != corev1.PullAlways {
 				t.Fatalf("container image settings = %#v, want %s with Always", container, expected)
@@ -409,23 +409,23 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 }
 
 func TestStatefulSetUsesDeprecatedImageTagAlias(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Image: telemetryv1alpha1.ImageSpec{
-			Repository: "registry.example.com/observability/meter",
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Image: telemetryv1alpha1.ImageSpec{
+			Repository: "registry.example.com/observability/metrics",
 			Tag:        "3.2.1",
 		}},
 	}
-	container := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0]
-	if container.Image != "registry.example.com/observability/meter:3.2.1" {
+	container := mustStatefulSet(t, metrics).Spec.Template.Spec.Containers[0]
+	if container.Image != "registry.example.com/observability/metrics:3.2.1" {
 		t.Fatalf("container image = %q, want deprecated tag alias", container.Image)
 	}
 }
 
 func TestReplicaDefaultsOverridesAndStandaloneSafety(t *testing.T) {
 	for _, value := range []any{
-		&telemetryv1alpha1.Meter{Spec: telemetryv1alpha1.MeterSpec{Mode: telemetryv1alpha1.MeterModeSharded}},
-		&telemetryv1alpha1.Line{Spec: telemetryv1alpha1.LineSpec{Mode: telemetryv1alpha1.LineModeSharded}},
+		&telemetryv1alpha1.Metrics{Spec: telemetryv1alpha1.MetricsSpec{Mode: telemetryv1alpha1.MetricsModeSharded}},
+		&telemetryv1alpha1.Logs{Spec: telemetryv1alpha1.LogsSpec{Mode: telemetryv1alpha1.LogsModeSharded}},
 	} {
 		if got := *Replicas(value, ComponentWriter); got != 1 {
 			t.Fatalf("%T default writer replicas = %d, want 1", value, got)
@@ -435,20 +435,20 @@ func TestReplicaDefaultsOverridesAndStandaloneSafety(t *testing.T) {
 		}
 	}
 
-	meter := &telemetryv1alpha1.Meter{Spec: telemetryv1alpha1.MeterSpec{
-		Mode:   telemetryv1alpha1.MeterModeSharded,
+	metrics := &telemetryv1alpha1.Metrics{Spec: telemetryv1alpha1.MetricsSpec{
+		Mode:   telemetryv1alpha1.MetricsModeSharded,
 		Writer: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(4))},
 		Reader: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(5))},
 	}}
-	if got := *Replicas(meter, ComponentWriter); got != 4 {
+	if got := *Replicas(metrics, ComponentWriter); got != 4 {
 		t.Fatalf("writer replica override = %d, want 4", got)
 	}
-	if got := *Replicas(meter, ComponentReader); got != 5 {
+	if got := *Replicas(metrics, ComponentReader); got != 5 {
 		t.Fatalf("reader replica override = %d, want 5", got)
 	}
-	meter.Spec.Mode = telemetryv1alpha1.MeterModeStandalone
-	meter.Spec.Writer.Replicas = lo.ToPtr(int32(9))
-	if got := *Replicas(meter, ComponentStandalone); got != 1 {
+	metrics.Spec.Mode = telemetryv1alpha1.MetricsModeStandalone
+	metrics.Spec.Writer.Replicas = lo.ToPtr(int32(9))
+	if got := *Replicas(metrics, ComponentStandalone); got != 1 {
 		t.Fatalf("standalone replicas = %d, want safe fixed value 1", got)
 	}
 }
@@ -467,8 +467,8 @@ func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
 		}},
 	}
 	inputs := []StatefulSetInput{
-		{Meter: &telemetryv1alpha1.Meter{ObjectMeta: metav1.ObjectMeta{Name: "metrics"}, Spec: telemetryv1alpha1.MeterSpec{Writer: workload}}},
-		{Line: &telemetryv1alpha1.Line{ObjectMeta: metav1.ObjectMeta{Name: testLineName}, Spec: telemetryv1alpha1.LineSpec{Writer: workload}}},
+		{Metrics: &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: "metrics"}, Spec: telemetryv1alpha1.MetricsSpec{Writer: workload}}},
+		{Logs: &telemetryv1alpha1.Logs{ObjectMeta: metav1.ObjectMeta{Name: testLogsName}, Spec: telemetryv1alpha1.LogsSpec{Writer: workload}}},
 	}
 	for _, input := range inputs {
 		input.Component = ComponentStandalone
@@ -493,14 +493,14 @@ func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
 
 func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
 	dataSize, cacheSize := resource.MustParse("1Gi"), resource.MustParse("2Gi")
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Writer: telemetryv1alpha1.WorkloadSpec{
 			DataVolume:  &telemetryv1alpha1.VolumeSpec{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &dataSize}},
 			CacheVolume: &telemetryv1alpha1.VolumeSpec{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &cacheSize}},
 		}},
 	}
-	statefulSet := mustStatefulSet(t, meter)
+	statefulSet := mustStatefulSet(t, metrics)
 	if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
 		t.Fatalf("emptyDir workload unexpectedly has claims: %#v", statefulSet.Spec.VolumeClaimTemplates)
 	}
@@ -509,21 +509,21 @@ func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
 }
 
 func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Status:     telemetryv1alpha1.MeterStatus{ConfigHash: testConfigHash},
-		Spec: telemetryv1alpha1.MeterSpec{Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Status:     telemetryv1alpha1.MetricsStatus{ConfigHash: testConfigHash},
+		Spec: telemetryv1alpha1.MetricsSpec{Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
-				Containers:     []corev1.Container{{Name: containerMeter, Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
+				Containers:     []corev1.Container{{Name: containerMetrics, Env: []corev1.EnvVar{{Name: "CUSTOM", Value: "yes"}}}, {Name: "sidecar"}},
 				InitContainers: []corev1.Container{{Name: "init"}},
 			},
 		}}},
 	}
-	statefulSet := mustStatefulSet(t, meter)
+	statefulSet := mustStatefulSet(t, metrics)
 	template := statefulSet.Spec.Template
 	container := template.Spec.Containers[0]
 	if container.SecurityContext == nil || container.SecurityContext.ReadOnlyRootFilesystem == nil || !*container.SecurityContext.ReadOnlyRootFilesystem {
-		t.Fatal("meter container did not receive secure defaults")
+		t.Fatal("metrics container did not receive secure defaults")
 	}
 	if template.Spec.SecurityContext == nil || template.Spec.SecurityContext.RunAsUser == nil || *template.Spec.SecurityContext.RunAsUser != 10001 {
 		t.Fatal("pod did not receive UID 10001")
@@ -553,9 +553,9 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 }
 
 func TestStatefulSetInjectsObjectStoreCredentialsFromSecrets(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
 				Type: telemetryv1alpha1.ObjectStoreAWS,
 				AWS: &telemetryv1alpha1.AWSObjectStoreSpec{
@@ -567,16 +567,16 @@ func TestStatefulSetInjectsObjectStoreCredentialsFromSecrets(t *testing.T) {
 			}},
 		}},
 	}
-	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	env := mustStatefulSet(t, metrics).Spec.Template.Spec.Containers[0].Env
 	assertSecretEnv(t, env, envAWSAccessKeyID, "s3", "access-key")
 	assertSecretEnv(t, env, envAWSSecretAccessKey, "s3", "secret-key")
 	assertSecretEnv(t, env, envAWSSessionToken, "s3", "session-token")
 }
 
 func TestStatefulSetInjectsAzureClientSecretAuthentication(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
 				Type: telemetryv1alpha1.ObjectStoreAzure,
 				Azure: &telemetryv1alpha1.AzureObjectStoreSpec{
@@ -589,7 +589,7 @@ func TestStatefulSetInjectsAzureClientSecretAuthentication(t *testing.T) {
 			}},
 		}},
 	}
-	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	env := mustStatefulSet(t, metrics).Spec.Template.Spec.Containers[0].Env
 	assertLiteralEnv(t, env, envAzureCredentialType, "client_secret")
 	assertLiteralEnv(t, env, envAzureClientID, "client")
 	assertLiteralEnv(t, env, envAzureTenantID, "tenant")
@@ -597,9 +597,9 @@ func TestStatefulSetInjectsAzureClientSecretAuthentication(t *testing.T) {
 }
 
 func TestStatefulSetInjectsGCPServiceAccount(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 			Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
 				Type: telemetryv1alpha1.ObjectStoreGCP,
 				GCP: &telemetryv1alpha1.GCPObjectStoreSpec{
@@ -611,14 +611,14 @@ func TestStatefulSetInjectsGCPServiceAccount(t *testing.T) {
 			}},
 		}},
 	}
-	env := mustStatefulSet(t, meter).Spec.Template.Spec.Containers[0].Env
+	env := mustStatefulSet(t, metrics).Spec.Template.Spec.Containers[0].Env
 	assertSecretEnv(t, env, envGoogleServiceAccountKey, "gcp", "service-account.json")
 }
 
-func mustStatefulSet(t *testing.T, meter *telemetryv1alpha1.Meter) *appsv1.StatefulSet {
+func mustStatefulSet(t *testing.T, metrics *telemetryv1alpha1.Metrics) *appsv1.StatefulSet {
 	t.Helper()
 	statefulSet, err := StatefulSet(StatefulSetInput{
-		Meter: meter, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		Metrics: metrics, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
 		InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
 	})
 	if err != nil {

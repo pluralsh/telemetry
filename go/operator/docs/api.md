@@ -9,12 +9,12 @@
 Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API group.
 
 ### Resource Types
-- [Line](#line)
-- [Meter](#meter)
+- [Logs](#logs)
+- [Metrics](#metrics)
 - [NamespaceAuthentication](#namespaceauthentication)
 - [PseudoFS](#pseudofs)
 - [ShardMap](#shardmap)
-- [Track](#track)
+- [Traces](#traces)
 
 
 
@@ -67,9 +67,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
-- [MeterConfigSpec](#meterconfigspec)
-- [TrackConfigSpec](#trackconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
+- [MetricsConfigSpec](#metricsconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -207,9 +207,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
-- [MeterConfigSpec](#meterconfigspec)
-- [TrackConfigSpec](#trackconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
+- [MetricsConfigSpec](#metricsconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -233,7 +233,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `kind` _string_ |  |  | Enum: [Meter Line Track] <br /> |
+| `kind` _string_ |  |  | Enum: [Metrics Logs Traces] <br /> |
 | `name` _string_ |  |  | MinLength: 1 <br /> |
 
 
@@ -334,10 +334,10 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
-- [MeterSpec](#meterspec)
+- [LogsSpec](#logsspec)
+- [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
-- [TrackSpec](#trackspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -372,9 +372,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
-- [MeterSpec](#meterspec)
-- [TrackSpec](#trackspec)
+- [LogsSpec](#logsspec)
+- [MetricsSpec](#metricsspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -440,7 +440,7 @@ _Appears in:_
 | `requestTimeoutSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 
 
-#### Line
+#### Logs
 
 
 
@@ -453,12 +453,12 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
-| `kind` _string_ | `Line` | | |
+| `kind` _string_ | `Logs` | | |
 | `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
-| `spec` _[LineSpec](#linespec)_ |  |  |  |
+| `spec` _[LogsSpec](#logsspec)_ |  |  |  |
 
 
-#### LineCacheSpec
+#### LogsCacheSpec
 
 
 
@@ -467,14 +467,14 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `queryEntries` _integer_ |  | 256 | Minimum: 0 <br /> |
 
 
-#### LineConfigSpec
+#### LogsConfigSpec
 
 
 
@@ -483,18 +483,18 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
+- [LogsSpec](#logsspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:line \} |  |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:logs \} |  |
 | `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
 | `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
-| `page` _[LinePageSpec](#linepagespec)_ |  |  |  |
+| `page` _[LogsPageSpec](#logspagespec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
-| `request` _[LineRequestSpec](#linerequestspec)_ |  |  |  |
-| `cache` _[LineCacheSpec](#linecachespec)_ |  |  |  |
+| `request` _[LogsRequestSpec](#logsrequestspec)_ |  |  |  |
+| `cache` _[LogsCacheSpec](#logscachespec)_ |  |  |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
@@ -502,7 +502,7 @@ _Appears in:_
 
 
 
-#### LinePageSpec
+#### LogsPageSpec
 
 
 
@@ -511,7 +511,7 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -520,7 +520,7 @@ _Appears in:_
 | `rowsPerBlock` _integer_ |  | 256 | Minimum: 1 <br /> |
 
 
-#### LineRequestSpec
+#### LogsRequestSpec
 
 
 
@@ -529,7 +529,7 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -541,23 +541,23 @@ _Appears in:_
 | `maxInFlightQueryBytes` _integer_ |  | 134217728 | Minimum: 1 <br /> |
 
 
-#### LineSpec
+#### LogsSpec
 
 
 
-LineSpec defines the desired state of Line.
+LogsSpec defines the desired state of Logs.
 
 
 
 _Appears in:_
-- [Line](#line)
+- [Logs](#logs)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `mode` _[LineMode](#linemode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
-| `version` _string_ | Version is the canonical Line container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
-| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/line \} |  |
-| `config` _[LineConfigSpec](#lineconfigspec)_ |  |  |  |
+| `mode` _[LogsMode](#logsmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the canonical Logs container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/logs \} |  |
+| `config` _[LogsConfigSpec](#logsconfigspec)_ |  |  |  |
 | `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9091 httpPort:3100 type:ClusterIP \} |  |
@@ -567,11 +567,11 @@ _Appears in:_
 
 
 
-#### Meter
+#### Metrics
 
 
 
-Meter is the Schema for the meters API.
+Metrics is the Schema for the metrics API.
 
 
 
@@ -580,12 +580,12 @@ Meter is the Schema for the meters API.
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
-| `kind` _string_ | `Meter` | | |
+| `kind` _string_ | `Metrics` | | |
 | `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
-| `spec` _[MeterSpec](#meterspec)_ |  |  |  |
+| `spec` _[MetricsSpec](#metricsspec)_ |  |  |  |
 
 
-#### MeterConfigSpec
+#### MetricsConfigSpec
 
 
 
@@ -594,11 +594,11 @@ Meter is the Schema for the meters API.
 
 
 _Appears in:_
-- [MeterSpec](#meterspec)
+- [MetricsSpec](#metricsspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:meter \} |  |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:metrics \} |  |
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
@@ -609,23 +609,23 @@ _Appears in:_
 
 
 
-#### MeterSpec
+#### MetricsSpec
 
 
 
-MeterSpec defines the desired state of Meter.
+MetricsSpec defines the desired state of Metrics.
 
 
 
 _Appears in:_
-- [Meter](#meter)
+- [Metrics](#metrics)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `mode` _[MeterMode](#metermode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
-| `version` _string_ | Version is the canonical Meter container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
-| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/meter \} |  |
-| `config` _[MeterConfigSpec](#meterconfigspec)_ |  |  |  |
+| `mode` _[MetricsMode](#metricsmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the canonical Metrics container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/metrics \} |  |
+| `config` _[MetricsConfigSpec](#metricsconfigspec)_ |  |  |  |
 | `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9090 httpPort:8080 type:ClusterIP \} |  |
@@ -860,10 +860,10 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
-- [MeterSpec](#meterspec)
+- [LogsSpec](#logsspec)
+- [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
-- [TrackSpec](#trackspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -879,9 +879,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
-- [MeterSpec](#meterspec)
-- [TrackSpec](#trackspec)
+- [LogsSpec](#logsspec)
+- [MetricsSpec](#metricsspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -991,9 +991,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
-- [MeterConfigSpec](#meterconfigspec)
-- [TrackConfigSpec](#trackconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
+- [MetricsConfigSpec](#metricsconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1011,10 +1011,10 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
-- [MeterConfigSpec](#meterconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
+- [MetricsConfigSpec](#metricsconfigspec)
 - [PseudoFSConfigSpec](#pseudofsconfigspec)
-- [TrackConfigSpec](#trackconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1025,7 +1025,7 @@ _Appears in:_
 | `metaCache` _[CacheSpec](#cachespec)_ |  |  |  |
 
 
-#### Track
+#### Traces
 
 
 
@@ -1038,12 +1038,12 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
-| `kind` _string_ | `Track` | | |
+| `kind` _string_ | `Traces` | | |
 | `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
-| `spec` _[TrackSpec](#trackspec)_ |  |  |  |
+| `spec` _[TracesSpec](#tracesspec)_ |  |  |  |
 
 
-#### TrackConfigSpec
+#### TracesConfigSpec
 
 
 
@@ -1052,17 +1052,17 @@ _Appears in:_
 
 
 _Appears in:_
-- [TrackSpec](#trackspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:track \} |  |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:traces \} |  |
 | `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
 | `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
-| `page` _[TrackPageSpec](#trackpagespec)_ |  |  |  |
+| `page` _[TracesPageSpec](#tracespagespec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
-| `request` _[TrackRequestSpec](#trackrequestspec)_ |  |  |  |
+| `request` _[TracesRequestSpec](#tracesrequestspec)_ |  |  |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
@@ -1070,7 +1070,7 @@ _Appears in:_
 
 
 
-#### TrackPageSpec
+#### TracesPageSpec
 
 
 
@@ -1079,7 +1079,7 @@ _Appears in:_
 
 
 _Appears in:_
-- [TrackConfigSpec](#trackconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1088,7 +1088,7 @@ _Appears in:_
 | `maxTraces` _integer_ |  | 1024 | Minimum: 1 <br /> |
 
 
-#### TrackRequestSpec
+#### TracesRequestSpec
 
 
 
@@ -1097,7 +1097,7 @@ _Appears in:_
 
 
 _Appears in:_
-- [TrackConfigSpec](#trackconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1109,23 +1109,23 @@ _Appears in:_
 | `maxQueryLimit` _integer_ |  | 1000 | Minimum: 1 <br /> |
 
 
-#### TrackSpec
+#### TracesSpec
 
 
 
-TrackSpec defines the desired state of Track.
+TracesSpec defines the desired state of Traces.
 
 
 
 _Appears in:_
-- [Track](#track)
+- [Traces](#traces)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `mode` _[TrackMode](#trackmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
-| `version` _string_ | Version is the canonical Track container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
-| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/track \} |  |
-| `config` _[TrackConfigSpec](#trackconfigspec)_ |  |  |  |
+| `mode` _[TracesMode](#tracesmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the canonical Traces container image tag. It must be SemVer<br />without a leading "v". When omitted, deprecated image.tag is used, then<br />the operator's default version. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/traces \} |  |
+| `config` _[TracesConfigSpec](#tracesconfigspec)_ |  |  |  |
 | `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
 | `service` _[ServiceSpec](#servicespec)_ |  | \{ grpcPort:9092 httpPort:3200 type:ClusterIP \} |  |
@@ -1161,10 +1161,10 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineSpec](#linespec)
-- [MeterSpec](#meterspec)
+- [LogsSpec](#logsspec)
+- [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
-- [TrackSpec](#trackspec)
+- [TracesSpec](#tracesspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1187,9 +1187,9 @@ _Appears in:_
 
 
 _Appears in:_
-- [LineConfigSpec](#lineconfigspec)
-- [MeterConfigSpec](#meterconfigspec)
-- [TrackConfigSpec](#trackconfigspec)
+- [LogsConfigSpec](#logsconfigspec)
+- [MetricsConfigSpec](#metricsconfigspec)
+- [TracesConfigSpec](#tracesconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1213,9 +1213,9 @@ ShardMap was absent or could not be trusted.
 
 
 _Appears in:_
-- [LineStatus](#linestatus)
-- [MeterStatus](#meterstatus)
-- [TrackStatus](#trackstatus)
+- [LogsStatus](#logsstatus)
+- [MetricsStatus](#metricsstatus)
+- [TracesStatus](#tracesstatus)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |

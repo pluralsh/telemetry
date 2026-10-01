@@ -277,7 +277,7 @@ mod tests {
             AssignmentGeneration::new(generation),
             64,
             vec![Assignment::new(
-                Owner::new("meter-0", 0),
+                Owner::new("metrics-0", 0),
                 ShardRange::within(0, 64, 64).unwrap(),
                 AssignmentState::Active,
             )],
@@ -300,8 +300,8 @@ mod tests {
     #[tokio::test]
     async fn static_resolver_is_deterministic() {
         let resolver =
-            StaticOwnerResolver::new([("meter-0".to_owned(), "127.0.0.1:9000".to_owned())]);
-        let resolved = resolver.resolve(&Owner::new("meter-0", 0)).await.unwrap();
+            StaticOwnerResolver::new([("metrics-0".to_owned(), "127.0.0.1:9000".to_owned())]);
+        let resolved = resolver.resolve(&Owner::new("metrics-0", 0)).await.unwrap();
         assert_eq!(resolved.endpoint, "127.0.0.1:9000");
         assert_eq!(
             resolved.socket_addr,

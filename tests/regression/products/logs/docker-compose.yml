@@ -1,0 +1,44 @@
+name: logs-regression
+
+services:
+  loki:
+    # Pin the multi-architecture image index so local and CI oracles are identical.
+    image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
+    command: ["-config.file=/etc/loki/regression.yaml"]
+    volumes:
+      - ./loki.yaml:/etc/loki/regression.yaml:ro
+      - loki-data:/loki
+    ports: ["13100:3100"]
+
+  logs:
+    # CI preloads this tag from a cached buildx build; see regression.yml.
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    # Named volumes are created root-owned; the regression process initializes
+    # them before exercising restart persistence.
+    user: "0:0"
+    command: ["--config", "/app/regression/logs.yaml"]
+    volumes:
+      - ./logs.yaml:/app/regression/logs.yaml:ro
+      - logs-data:/data
+    ports: ["13101:3100"]
+
+  logs-retention:
+    profiles: ["extended"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    user: "0:0"
+    command: ["--config", "/app/regression/logs-retention.yaml"]
+    volumes:
+      - ./logs-retention.yaml:/app/regression/logs-retention.yaml:ro
+      - logs-retention-data:/data
+    ports: ["13102:3100"]
+
+volumes:
+  loki-data:
+  logs-data:
+  logs-retention-data:

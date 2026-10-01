@@ -21,16 +21,16 @@ cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --warmup-seconds 120 \
   --concurrency 32 \
   --target-rate 18000 \
-  --output line-18k.json \
+  --output logs-18k.json \
   --allow-production-write \
-  line
+  logs
 ```
 
 The URL must include the namespace and complete product route:
 
-- Line: `https://.../write/ns/scale/loki/api/v1/push`
-- Meter: `https://.../write/ns/scale/api/v1/write`
-- Track: `https://.../write/ns/scale/v1/traces`
+- Logs: `https://.../write/ns/scale/loki/api/v1/push`
+- Metrics: `https://.../write/ns/scale/api/v1/write`
+- Traces: `https://.../write/ns/scale/v1/traces`
 
 If the deployment requires a bearer token, keep it out of command history:
 
@@ -40,7 +40,7 @@ cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/api/v1/write \
   --bearer-token-env TELEMETRY_SCALE_TOKEN \
   --allow-production-write \
-  meter
+  metrics
 ```
 
 Basic authentication is also read from environment variables:
@@ -53,45 +53,45 @@ cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --basic-username-env TELEMETRY_SCALE_USERNAME \
   --basic-password-env TELEMETRY_SCALE_PASSWORD \
   --allow-production-write \
-  line
+  logs
 ```
 
 Both Basic options are required together and cannot be combined with
 `--bearer-token-env`.
 
-Run `... -- --help` or `... -- <common options> line --help` for every option.
+Run `... -- --help` or `... -- <common options> logs --help` for every option.
 
 ## Workload profiles
 
 Each workload creates a unique run ID in labels and attributes unless
 `--run-id` is supplied:
 
-- `line` sends Loki JSON. Its default 1,600-entry requests use 128 streams per
+- `logs` sends Loki JSON. Its default 1,600-entry requests use 128 streams per
   request, rotate through 10,000 streams, and mix approximately 70% 250-byte,
   25% 1 KiB, and 5% 4 KiB log entries.
-- `meter` sends Snappy-compressed Prometheus remote-write protobuf. Its default
+- `metrics` sends Snappy-compressed Prometheus remote-write protobuf. Its default
   request has 5,000 samples rotating through four million active series.
   `--churn-percent` adds one-use label values to the requested percentage.
-- `track` sends OTLP/HTTP protobuf. Its default request has 2,000 spans, five
+- `traces` sends OTLP/HTTP protobuf. Its default request has 2,000 spans, five
   spans per trace, and a 256-byte payload attribute per span.
 
 Initial single-writer rate checks matching the capacity-planning guide are:
 
 ```shell
-# Line: repeat at 18,000 and 36,000 entries/s
+# Logs: repeat at 18,000 and 36,000 entries/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/loki/api/v1/push \
-  --target-rate 18000 --allow-production-write line
+  --target-rate 18000 --allow-production-write logs
 
-# Meter: repeat at 250,000 and 500,000 samples/s
+# Metrics: repeat at 250,000 and 500,000 samples/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/api/v1/write \
-  --target-rate 250000 --allow-production-write meter
+  --target-rate 250000 --allow-production-write metrics
 
-# Track: repeat at 30,000 and 60,000 spans/s
+# Traces: repeat at 30,000 and 60,000 spans/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/v1/traces \
-  --target-rate 30000 --allow-production-write track
+  --target-rate 30000 --allow-production-write traces
 ```
 
 `--target-rate 0` is closed-loop saturation mode: every worker sends its next

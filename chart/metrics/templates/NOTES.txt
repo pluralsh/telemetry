@@ -1,0 +1,21 @@
+Metrics was installed in {{ .Values.mode }} mode.
+
+{{- if eq .Values.mode "standalone" }}
+HTTP service:
+  {{ include "metrics.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+
+The standalone StatefulSet is intentionally fixed at one replica to prevent
+concurrent ownership of the standalone store.
+{{- else }}
+Writer service:
+  {{ include "metrics.writerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+Reader service:
+  {{ include "metrics.readerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+
+The Kubernetes shard backend tracks writer membership through StatefulSet
+{{ include "metrics.writerName" . }} and resolves writers through headless Service
+{{ include "metrics.headlessName" . }}.
+{{- end }}
+
+Check the rollout:
+  kubectl --namespace {{ .Release.Namespace }} get statefulsets,pods,services

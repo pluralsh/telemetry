@@ -25,10 +25,10 @@ Compose builds product images with `--build` by default. Set
 images instead; CI builds those per product in parallel through buildx with
 the GitHub Actions layer cache.
 
-## Meter
+## Metrics
 
-`products/meter/` owns Prometheus, MinIO, Meter compose/config assets. The
-host-side Python suite uses product-specific modules in `harness/meter/` for
+`products/metrics/` owns Prometheus, MinIO, Metrics compose/config assets. The
+host-side Python suite uses product-specific modules in `harness/metrics/` for
 deterministic fixtures, Prometheus remote-write protobuf and Snappy encoding,
 OTLP protobuf, authentication, HTTP calls, and response normalization. The live
 tests compare PromQL and discovery results against Prometheus using relative
@@ -40,33 +40,33 @@ buckets) and as an OTLP exponential histogram at scale 10, then compared as
 full bucket layouts through selectors, `rate`/`increase`, aggregation, and the
 `histogram_*` functions.
 
-The optional Meter-only entrypoint used by the kind handoff scenario is:
+The optional Metrics-only entrypoint used by the kind handoff scenario is:
 
 ```sh
-PYTHONPATH=tests/regression python -m harness.meter
+PYTHONPATH=tests/regression python -m harness.metrics
 ```
 
-## Line
+## Logs
 
-`products/line/` pins Loki 3.5.5 by multi-architecture digest and builds a local
-single-node Line image. Identical current-time Loki JSON, raw Snappy protobuf,
+`products/logs/` pins Loki 3.5.5 by multi-architecture digest and builds a local
+single-node Logs image. Identical current-time Loki JSON, raw Snappy protobuf,
 and OTLP JSON fixtures are sent to both products. The suite canonicalizes and
-compares Loki log and metric endpoint envelopes, while keeping Line's
-`| match` BM25 extension in Line-only assertions.
+compares Loki log and metric endpoint envelopes, while keeping Logs'
+`| match` BM25 extension in Logs-only assertions.
 
 Coverage includes out-of-order entries, sparse streams, cold/warm BM25,
-periodic visibility, durable restart, and retention expiry. Line's checked-in
+periodic visibility, durable restart, and retention expiry. Logs' checked-in
 configuration publishes accepted writes every one second; the live test polls
 at 100 ms and fails if visibility exceeds three seconds. Restart and retention
-run with `--extended`. Line stores a logical expiry deadline in page metadata,
+run with `--extended`. Logs stores a logical expiry deadline in page metadata,
 so reads stop returning expired pages independently of SlateDB compaction;
 physical TTL remains enabled for eventual reclamation.
 
-## Track
+## Traces
 
-`products/track/` runs Tempo 2.8.2 as the semantic oracle and a two-writer,
-one-reader Track deployment over deterministic local MinIO storage. The Python
-modules in `harness/track/` build typed, deterministic OTLP fixtures, encode
+`products/traces/` runs Tempo 2.8.2 as the semantic oracle and a two-writer,
+one-reader Traces deployment over deterministic local MinIO storage. The Python
+modules in `harness/traces/` build typed, deterministic OTLP fixtures, encode
 OTLP protobuf and Zipkin JSON, exercise OTLP HTTP and gRPC, and normalize only
 ordering and API-envelope differences before comparing traces.
 
@@ -74,13 +74,13 @@ The live suite compares trace-by-ID, search, typed TraceQL predicates, tag
 names and values, and aggregate non-metrics TraceQL behavior. It also covers
 static-shard forwarding, Basic/JWT authorization, namespace isolation, reader
 mode, and Zipkin ingestion. Reader restart and short-retention persistence
-checks run with `--extended`. Track exposes Jaeger collector gRPC on host ports
+checks run with `--extended`. Traces exposes Jaeger collector gRPC on host ports
 `14251` and `14252`; the topology keeps those routes available for collector
 compatibility even though the host harness currently exercises OTLP and Zipkin.
 
-Host ports are Loki `13100`, Line `13101`, retention Line `13102`, Prometheus
-`19090`, Meter writers `18080`/`18081`, Meter reader `18082`, and Meter MinIO
-`19000`. Track uses Tempo `13200`, writers `13201`/`13202`, reader `13203`,
+Host ports are Loki `13100`, Logs `13101`, retention Logs `13102`, Prometheus
+`19090`, Metrics writers `18080`/`18081`, Metrics reader `18082`, and Metrics MinIO
+`19000`. Traces uses Tempo `13200`, writers `13201`/`13202`, reader `13203`,
 retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
 Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`.
 

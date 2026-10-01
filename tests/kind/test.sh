@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CLUSTER="${KIND_CLUSTER_NAME:-meter-regression}"
-NS=meter-regression
+CLUSTER="${KIND_CLUSTER_NAME:-metrics-regression}"
+NS=metrics-regression
 LOG_DIR="$ROOT/tests/kind/logs"
 mkdir -p "$LOG_DIR"
 FORWARD_PIDS=()
@@ -15,8 +15,8 @@ cleanup() {
   fi
   if (( status != 0 )); then
     kubectl -n "$NS" get all,configmap,shardmap,lease -o wide >"$LOG_DIR/resources.log" 2>&1 || true
-    kubectl -n "$NS" logs statefulset/meter --all-containers --prefix >"$LOG_DIR/writers.log" 2>&1 || true
-    kubectl -n "$NS" logs deployment/meter-reader --all-containers --prefix >"$LOG_DIR/reader.log" 2>&1 || true
+    kubectl -n "$NS" logs statefulset/metrics --all-containers --prefix >"$LOG_DIR/writers.log" 2>&1 || true
+    kubectl -n "$NS" logs deployment/metrics-reader --all-containers --prefix >"$LOG_DIR/reader.log" 2>&1 || true
   fi
   if [[ "${KEEP_KIND_CLUSTER:-0}" != 1 ]]; then
     kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
@@ -30,22 +30,22 @@ command -v kubectl >/dev/null
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
-docker build -f "$ROOT/crates/meter-server/Dockerfile" -t meter-regression:local "$ROOT"
-kind load docker-image --name "$CLUSTER" meter-regression:local
+docker build -f "$ROOT/crates/metrics-server/Dockerfile" -t metrics-regression:local "$ROOT"
+kind load docker-image --name "$CLUSTER" metrics-regression:local
 kubectl apply -f "$ROOT/go/operator/config/crd/bases/telemetry.plural.sh_shardmaps.yaml"
 kubectl apply -f "$ROOT/tests/kind/manifests.yaml"
 kubectl -n "$NS" wait --for=condition=complete job/minio-init --timeout=180s
-kubectl -n "$NS" rollout status statefulset/meter --timeout=300s
-kubectl -n "$NS" rollout status deployment/meter-reader --timeout=300s
+kubectl -n "$NS" rollout status statefulset/metrics --timeout=300s
+kubectl -n "$NS" rollout status deployment/metrics-reader --timeout=300s
 
 start_port_forwards() {
   if (( ${#FORWARD_PIDS[@]} > 0 )); then
     kill "${FORWARD_PIDS[@]}" 2>/dev/null || true
     wait "${FORWARD_PIDS[@]}" 2>/dev/null || true
   fi
-  kubectl -n "$NS" port-forward service/meter-writer 28080:8080 >"$LOG_DIR/writer-forward.log" 2>&1 &
+  kubectl -n "$NS" port-forward service/metrics-writer 28080:8080 >"$LOG_DIR/writer-forward.log" 2>&1 &
   FORWARD_PIDS=("$!")
-  kubectl -n "$NS" port-forward service/meter-reader 28082:8080 >"$LOG_DIR/reader-forward.log" 2>&1 &
+  kubectl -n "$NS" port-forward service/metrics-reader 28082:8080 >"$LOG_DIR/reader-forward.log" 2>&1 &
   FORWARD_PIDS+=("$!")
   for _ in {1..60}; do
     if curl -fsS http://127.0.0.1:28080/-/ready >/dev/null \
@@ -58,7 +58,7 @@ start_port_forwards() {
     fi
     sleep 1
   done
-  echo "timed out waiting for local Meter port forwards" >&2
+  echo "timed out waiting for local Metrics port forwards" >&2
   return 1
 }
 
@@ -66,13 +66,13 @@ check_assignment() {
   expected="$1"
   for _ in {1..60}; do
     owners="$(
-      kubectl -n "$NS" get shardmap meter-shard-map \
+      kubectl -n "$NS" get shardmap metrics-shard-map \
         -o jsonpath='{.spec.assignments}' 2>/dev/null \
         | { grep -o '"owner"' || true; } \
         | wc -l \
         | tr -d ' '
     )"
-    leases="$(kubectl -n "$NS" get lease -o name 2>/dev/null | { grep -c 'meter-shard-' || true; })"
+    leases="$(kubectl -n "$NS" get lease -o name 2>/dev/null | { grep -c 'metrics-shard-' || true; })"
     if [[ "$owners" == "$expected" && "$leases" -ge "$expected" ]]; then
       return 0
     fi
@@ -84,26 +84,26 @@ check_assignment() {
 
 BASE_MS=$(( $(date +%s) * 1000 / 60000 * 60000 - 1800000 ))
 
-run_meter_check() {
+run_metrics_check() {
   stage="$1"
   offset_ms="$2"
   start_port_forwards
   (
     cd "$ROOT"
-    REGRESSION_METER_ONLY=1 \
+    REGRESSION_METRICS_ONLY=1 \
       REGRESSION_RUN_ID="kind-$stage-$BASE_MS" \
       REGRESSION_BASE_MS="$((BASE_MS + offset_ms))" \
-      METER_WRITE_URL=http://127.0.0.1:28080/write/ns/regression \
-      METER_READ_URL=http://127.0.0.1:28082/read/ns/regression \
+      METRICS_WRITE_URL=http://127.0.0.1:28080/write/ns/regression \
+      METRICS_READ_URL=http://127.0.0.1:28082/read/ns/regression \
       PYTHONPATH="$ROOT/tests/regression" \
-      "$PYTHON" -m harness.meter
+      "$PYTHON" -m harness.metrics
   )
 }
 
 check_assignment 1
-run_meter_check one-writer 600000
+run_metrics_check one-writer 600000
 
-kubectl -n "$NS" scale statefulset/meter --replicas=2
-kubectl -n "$NS" rollout status statefulset/meter --timeout=300s
+kubectl -n "$NS" scale statefulset/metrics --replicas=2
+kubectl -n "$NS" rollout status statefulset/metrics --timeout=300s
 check_assignment 2
-run_meter_check two-writers 1200000
+run_metrics_check two-writers 1200000

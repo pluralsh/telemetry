@@ -1,0 +1,65 @@
+[package]
+name = "plural-logs-server"
+description = "Production HTTP server for Logs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "plural_logs_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plural-logs-server"
+path = "src/main.rs"
+
+[features]
+default = ["kubernetes"]
+kubernetes = ["sharding/kubernetes", "dep:kube"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = "0.8.9"
+bytes.workspace = true
+chrono.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+common = { path = "../common" }
+flate2 = "1"
+futures.workspace = true
+kube = { workspace = true, optional = true }
+metrics.workspace = true
+opentelemetry-proto = { workspace = true, features = ["logs", "with-serde"] }
+plural-logs = { path = "../logs" }
+prost.workspace = true
+proto = { path = "../proto" }
+serde.workspace = true
+serde_html_form = "0.4.1"
+serde_json.workspace = true
+serde_yaml.workspace = true
+sharding = { path = "../sharding" }
+server-common = { path = "../server-common" }
+slatedb.workspace = true
+snap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber = "0.3.23"
+ulid.workspace = true
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
+
+[dev-dependencies]
+base64 = "0.23.1"
+http-body-util = "0.1.5"
+tempfile.workspace = true
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dependencies.thiserror]
+workspace = true

@@ -43,18 +43,18 @@ jobs:
       fail-fast: false
       matrix:
         product:
-          - name: meter
-            image: ghcr.io/pluralsh/meter
+          - name: metrics
+            image: ghcr.io/pluralsh/metrics
             context: .
-            file: crates/meter-server/Dockerfile
-          - name: line
-            image: ghcr.io/pluralsh/line
+            file: crates/metrics-server/Dockerfile
+          - name: logs
+            image: ghcr.io/pluralsh/logs
             context: .
-            file: crates/line-server/Dockerfile
-          - name: track
-            image: ghcr.io/pluralsh/track
+            file: crates/logs-server/Dockerfile
+          - name: traces
+            image: ghcr.io/pluralsh/traces
             context: .
-            file: crates/track-server/Dockerfile
+            file: crates/traces-server/Dockerfile
           - name: pseudofs
             image: ghcr.io/pluralsh/pseudofs
             context: .
@@ -116,12 +116,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: meter
-            image: ghcr.io/pluralsh/meter
-          - name: line
-            image: ghcr.io/pluralsh/line
-          - name: track
-            image: ghcr.io/pluralsh/track
+          - name: metrics
+            image: ghcr.io/pluralsh/metrics
+          - name: logs
+            image: ghcr.io/pluralsh/logs
+          - name: traces
+            image: ghcr.io/pluralsh/traces
           - name: pseudofs
             image: ghcr.io/pluralsh/pseudofs
           - name: telemetry-operator

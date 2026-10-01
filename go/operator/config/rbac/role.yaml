@@ -80,11 +80,11 @@ rules:
 - apiGroups:
   - telemetry.plural.sh
   resources:
-  - lines
-  - meters
+  - logs
+  - metrics
   - namespaceauthentications
   - pseudofs
-  - tracks
+  - traces
   verbs:
   - create
   - delete
@@ -96,21 +96,21 @@ rules:
 - apiGroups:
   - telemetry.plural.sh
   resources:
-  - lines/finalizers
-  - meters/finalizers
+  - logs/finalizers
+  - metrics/finalizers
   - namespaceauthentications/finalizers
   - pseudofs/finalizers
-  - tracks/finalizers
+  - traces/finalizers
   verbs:
   - update
 - apiGroups:
   - telemetry.plural.sh
   resources:
-  - lines/status
-  - meters/status
+  - logs/status
+  - metrics/status
   - namespaceauthentications/status
   - pseudofs/status
-  - tracks/status
+  - traces/status
   verbs:
   - get
   - patch

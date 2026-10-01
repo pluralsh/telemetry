@@ -168,7 +168,7 @@ mod tests {
 
     fn owners(count: u32) -> Vec<Owner> {
         (0..count)
-            .map(|ordinal| Owner::new(format!("meter-{ordinal}"), ordinal))
+            .map(|ordinal| Owner::new(format!("metrics-{ordinal}"), ordinal))
             .collect()
     }
 
@@ -222,17 +222,17 @@ mod tests {
             8,
             vec![
                 Assignment::new(
-                    Owner::new("meter-0", 0),
+                    Owner::new("metrics-0", 0),
                     ShardRange::within(0, 2, 8).unwrap(),
                     AssignmentState::Active,
                 ),
                 Assignment::new(
-                    Owner::new("meter-1", 1),
+                    Owner::new("metrics-1", 1),
                     ShardRange::within(2, 5, 8).unwrap(),
                     AssignmentState::Active,
                 ),
                 Assignment::new(
-                    Owner::new("meter-2", 2),
+                    Owner::new("metrics-2", 2),
                     ShardRange::within(5, 8, 8).unwrap(),
                     AssignmentState::Active,
                 ),
@@ -259,9 +259,9 @@ mod tests {
     #[test]
     fn output_is_deterministic_and_ordinal_ordered() {
         let unordered = vec![
-            Owner::new("meter-2", 2),
-            Owner::new("meter-0", 0),
-            Owner::new("meter-1", 1),
+            Owner::new("metrics-2", 2),
+            Owner::new("metrics-0", 0),
+            Owner::new("metrics-1", 1),
         ];
         let first = balanced_contiguous(AssignmentGeneration::new(1), epochs(64), &unordered, None)
             .unwrap();
@@ -269,7 +269,7 @@ mod tests {
             balanced_contiguous(AssignmentGeneration::new(1), epochs(64), &unordered, None)
                 .unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.assignments[0].owner.id, "meter-0");
+        assert_eq!(first.assignments[0].owner.id, "metrics-0");
     }
 
     #[test]
@@ -283,6 +283,6 @@ mod tests {
         assert_eq!(three.epochs.len(), 2);
         assert_eq!(three.epochs[0], two.epochs[0]);
         assert_eq!(movement(&two, &three), 0);
-        assert_eq!(three.owner_of(ShardId::new(2)).unwrap().id, "meter-2");
+        assert_eq!(three.owner_of(ShardId::new(2)).unwrap().id, "metrics-2");
     }
 }

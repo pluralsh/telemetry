@@ -1,25 +1,18 @@
 # Plural Telemetry
 
-Plural Telemetry is a Rust implementation of common observability products, in particular modeled after open source stores like prometheus, loki and tempo for the main observability pillars of logs, metrics and traces.
+Plural Telemetry is a Rust re-implementation of common observability products, in particular modeled after open source stores like Prometheus, Loki and Tempo for the main observability pillars of logs, metrics and traces.
 
 All data stores are built with s3 as the backend storage, using the [slatedb](https://slatedb.io/) project as its ultimate WAL + LSM tree implementation
 
-The project breakdown is, following a musical theme:
+The project breakdown is:
 
-1. Meter - Prometheus compatible datastore with built-in OTLP ingest as well as remote write
-2. Line - Loki-compatible log store
-3. Track - Tempo-compatible trace store
+1. Metrics - Prometheus compatible datastore with built-in OTLP ingest as well as remote write
+2. Logs - Loki-compatible log store
+3. Traces - Tempo-compatible trace store
 4. PseudoFS - gRPC virtual filesystem for embedded language runtimes
 
 Storage formats, indexing, APIs, configuration, sharding, and authentication
 are documented in the [technical documentation](documentation/README.md).
-
-Track accepts OTLP over HTTP (`4318`-style namespace routes) and gRPC (`4317`),
-Zipkin JSON, and Jaeger collector gRPC (`14250`). Its Tempo-compatible read API
-includes trace lookup, TraceQL search, and canonical v1/v2 tag discovery. In
-sharded Kubernetes deployments, readers fan out across all storage shards while
-writers acquire stable shard ownership using StatefulSet membership and leases.
-Routing uses versioned explicit 128-bit hash ranges independent of writer count.
 
 We might add other interesting slatedb + rust projects in here as well, but they'll all be datastore focused as a core guiding principle.  Many of these are also inspired or utilize implementations from the [Opendata](https://www.opendata.dev/) project to bootstrap the implementation.
 
@@ -28,7 +21,7 @@ We might add other interesting slatedb + rust projects in here as well, but they
 There are a few things we've explicitly added to enhance slatedb and make these datastores ready for real use:
 
 1. Sharding - slatedb is single writer, multi-reader as a core design constraint.  Since this is observability focused, we want to be able to solve for multi-writer as a core need.  More documentation below.
-2. Multi-tenancy - simple namespace path multi-tenancy allows you to share the same db across overlapping metrics datasets w/o much configuration overhead.
+2. Multi-tenancy - simple namespace path multi-tenancy allows you to share the same db across overlapping metrics datasets with minimal configuration overhead.
 3. Authentication - common limitation of a lot of observability dbs, and pairs with multitenancy. Both basic auth and JWKS-based RSA signed JWT is supported.
 
 ## Deployment
@@ -44,9 +37,51 @@ See [Operator Docs](go/operator/docs/api.md) for full API documentation.
 
 ## Sharding
 
-Sharding is implemented on top of Kubernetes coordination. A single versioned
-assignment snapshot carries time-based routing epochs (each a 128-bit hash-range
-map) plus storage shard ownership. Scaling writers up publishes a new routing
+Sharding is implemented on top of Kubernetes for coordination. Since all telemetry data is ultimately time index, we leverage temporal ordering to implement epoch based sharding, diagrammed below:
+
+```text
+                       record time ──────────────────────────────────────────►
+
+                 epoch 0 (2 shards)          │ epoch 1 (4 shards)
+                 effective_from = t0         │ effective_from = t1 (aligned hour)
+   hash space    ┌────────────────────────┐  │  ┌────────────────────────┐
+   (BLAKE3,      │ shard 0  [0x0.., 0x8..)│  │  │ shard 0  [0x0.., 0x4..)│
+    128-bit)     │                        │  │  ├────────────────────────┤
+                 │                        │  │  │ shard 1  [0x4.., 0x8..)│
+                 ├────────────────────────┤  │  ├────────────────────────┤
+                 │ shard 1  [0x8.., 0xf..]│  │  │ shard 2  [0x8.., 0xc..)│  new, empty
+                 │                        │  │  ├────────────────────────┤  SlateDB dbs
+                 │                        │  │  │ shard 3  [0xc.., 0xf..]│
+                 └────────────────────────┘  │  └────────────────────────┘
+                                             │
+                 old data never moves;       │  late records with t < t1 still
+                 still readable              │  route by epoch 0
+
+  write path
+  ──────────
+  record ─► (namespace + labels | trace ID, timestamp)
+         ─► epoch = last epoch with effective_from <= timestamp
+         ─► shard = epoch.range_for(blake3_128(key))
+         ─► owner of shard (Lease holder)
+              ├── this writer ──────────────► SlateDB put
+              └── another writer ─► gRPC ──► SlateDB put   (retry on stale owner)
+
+  read path
+  ─────────
+  query ─► open shards [0, shard_count) ─► per-shard results ─► merge / dedupe
+
+  scale-up (writer replicas 2 ─► 4)
+  ─────────────────────────────────
+  operator          adds StatefulSet pods writer-2, writer-3
+  coordinator       (Lease-elected) appends epoch 1 to the ShardMap CR via
+                    resourceVersion CAS, effective at the next aligned boundary
+                    at least lead time ahead (default: 1h alignment, 2m lead)
+  writers/readers   watch ShardMap, apply only increasing generations,
+                    acquire Leases for their assigned shards
+  cutover at t1     new records route by epoch 1; no data copied or drained
+```
+
+A single versioned assignment snapshot carries time-based routing epochs (each a 128-bit hash-range map) plus storage shard ownership. Scaling writers up publishes a new routing
 epoch that cuts over at the next aligned boundary and routes new data to new,
 empty storage shards; existing data stays where it was written and readers merge
 across shards. Scale-down is not supported yet. See
@@ -55,14 +90,14 @@ across shards. Scale-down is not supported yet. See
 We utilize a few k8s api primitives to do this:
 
 1. Statefulset durable naming - this allows us to ensure writers have consistent network identities across scaling decisions.
-2. Configmaps for source of truth on shard range assignments.
+2. A ShardMap custom resource as the source of truth for routing epochs and shard range assignments.
 3. Leases for ownership of physical shards.
 
 K8s effectively provides an already CP datastore to manage that minimal configuration, and removes the additional need to provide a zookeeper or etcd store.  It's also a ubiquitous deployment pattern for hosted, third-party software, so effectively allows us to provide that guarantee with no net new dependencies.
 
 ## Installation
 
-Install the telemetry-operator operator, including the `Meter`, `Line`, and
+Install the telemetry-operator operator, including the `Metrics`, `Logs`, and
 `NamespaceAuthentication` CRDs:
 
 ```sh
@@ -72,41 +107,41 @@ helm upgrade --install telemetry-operator oci://ghcr.io/pluralsh/charts/telemetr
   --create-namespace
 ```
 
-Create a `Meter` instance. This example uses S3-compatible object storage, so
-the referenced `meter-s3` Secret must exist in the same namespace:
+Create a `Metrics` instance. This example uses S3-compatible object storage, so
+the referenced `metrics-s3` Secret must exist in the same namespace:
 
 ```yaml
 apiVersion: telemetry.plural.sh/v1alpha1
-kind: Meter
+kind: Metrics
 metadata:
-  name: meter-sample
+  name: metrics-sample
 spec:
   mode: Sharded
   version: 0.1.0
   config:
     storage:
-      path: meter
+      path: metrics
       objectStore:
         type: Aws
         aws:
           region: us-east-1
-          bucket: meter
+          bucket: metrics
           accessKeyIDSecretRef:
-            name: meter-s3
+            name: metrics-s3
             key: access-key-id
           secretAccessKeySecretRef:
-            name: meter-s3
+            name: metrics-s3
             key: secret-access-key
     namespaces:
       - default
   ingress:
     enabled: true
-    hostname: meter.example.com
+    hostname: metrics.example.com
     ingressClass: nginx
-    pathPrefix: /meter
+    pathPrefix: /metrics
     tls:
       enabled: true
-      secretName: meter-sample-tls
+      secretName: metrics-sample-tls
   writer:
     replicas: 3
     dataVolume:
@@ -141,13 +176,13 @@ spec:
             storage: 20Gi
 ```
 
-Create a standalone `Line` instance:
+Create a standalone `Logs` instance:
 
 ```yaml
 apiVersion: telemetry.plural.sh/v1alpha1
-kind: Line
+kind: Logs
 metadata:
-  name: line-sample
+  name: logs-sample
 spec:
   mode: Standalone
   version: 0.1.0
@@ -181,8 +216,8 @@ metadata:
   name: prometheus-reader
 spec:
   dataStoreRef:
-    kind: Meter
-    name: meter-sample
+    kind: Metrics
+    name: metrics-sample
   namespace: default
   username: prometheus
   permission: read
@@ -196,8 +231,8 @@ metadata:
   name: loki-reader
 spec:
   dataStoreRef:
-    kind: Line
-    name: line-sample
+    kind: Logs
+    name: logs-sample
   namespace: default
   username: loki
   permission: read
@@ -208,7 +243,7 @@ spec:
 
 ## Testing Strategy
 
-In addition to robust unit tests, we implement an oracle based testing strategy against reference implementations.  Each of Meter, Line, and Track are tested against their peer, prometheus, loki and mimir. Those test suites will grow in time but include basic query behavior, ingestion logic, and more.
+In addition to robust unit tests, we implement an oracle based testing strategy against reference implementations.  Each of Metrics, Logs, and Traces are tested against their peer, prometheus, loki and mimir. Those test suites will grow in time but include basic query behavior, ingestion logic, and more.
 
 Performance and scalability tests are to be implemented in time.
 

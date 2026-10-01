@@ -1,0 +1,147 @@
+{{- if eq .Values.mode "standalone" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.fullname" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: standalone
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.standaloneHeadlessName" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: standalone
+  {{- with .Values.service.headless.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: {{ .Values.service.headless.publishNotReadyAddresses }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: standalone
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+{{- else }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.writerName" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.readerName" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.readerHeadlessName" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+  {{- with .Values.service.headless.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: {{ .Values.service.headless.publishNotReadyAddresses }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics.headlessName" . }}
+  labels:
+    {{- include "metrics.labels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+  {{- with .Values.service.headless.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: {{ .Values.service.headless.publishNotReadyAddresses }}
+  selector:
+    {{- include "metrics.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: writer
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+{{- end }}

@@ -23,7 +23,7 @@ retried up to `write.remote_retries`; fan-out is bounded by
 `write.remote_concurrency`.
 
 Routing uses the first 128 bits of BLAKE3 over each product's canonical key.
-Meter and Line hash the namespace plus canonical labels; Track hashes the
+Metrics and Logs hash the namespace plus canonical labels; Traces hashes the
 namespace plus trace ID. Hash ranges are aligned to 4,096 routing slots (the
 high 12 bits of the hash), which caps a deployment at 4,096 storage shards. The
 slot is only a routing granularity: it is not stored in keys.
@@ -40,18 +40,18 @@ A `ShardMap` holds an ordered list of routing epochs. Each epoch has an
 record is routed by the last epoch whose `effective_from_ns` is at or before
 the record's timestamp:
 
-- Meter routes each sample by its timestamp, so a series that straddles a
+- Metrics routes each sample by its timestamp, so a series that straddles a
   cutover is split into one write per epoch.
-- Line routes each entry by its timestamp.
-- Track routes a trace by its earliest span start time.
+- Logs routes each entry by its timestamp.
+- Traces routes a trace by its earliest span start time.
 
 The record's identity still selects the shard within an epoch; time only
 selects which epoch applies. Epochs only grow, so every shard referenced by an
 older epoch still exists and remains readable.
 
-Readers open every storage shard `[0, shard_count)` and merge results. Meter
-deduplicates series by fingerprint across shards, Line merges streams with
-equal labels, and Track merges the partial traces returned by each shard a
+Readers open every storage shard `[0, shard_count)` and merge results. Metrics
+deduplicates series by fingerprint across shards, Logs merges streams with
+equal labels, and Traces merges the partial traces returned by each shard a
 trace ID may have been routed to.
 
 ## Backends
@@ -108,8 +108,8 @@ must stay writable until their data has expired.
   `lease_duration_seconds` (defaults 5 and 15).
 - Every forwarding participant must share `auth.internal` when it is enabled.
 
-Database records choose storage partition boundaries differently: Meter uses
-time buckets, Line uses time segments, and Track uses time segments plus a
+Database records choose storage partition boundaries differently: Metrics uses
+time buckets, Logs uses time segments, and Traces uses time segments plus a
 reserved trace-locator segment.
 
 For provisional per-writer ingestion envelopes, operational headroom, and

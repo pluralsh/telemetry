@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package traces.internal.v1;
+
+service InternalWriter {
+  rpc Write(WriteBatchRequest) returns (WriteBatchResponse);
+}
+
+message Namespace {
+  string name = 1;
+}
+
+// An envelope for a complete logical trace. Each entry is an independently
+// prost-encoded opentelemetry.proto.trace.v1.ResourceSpans message.
+message Trace {
+  repeated bytes resource_spans = 1;
+}
+
+message TracePayload {
+  oneof payload {
+    // prost-encoded opentelemetry.proto.trace.v1.ResourceSpans
+    bytes resource_spans = 1;
+    // prost-encoded traces.internal.v1.Trace
+    bytes trace = 2;
+  }
+}
+
+message WriteBatchRequest {
+  Namespace namespace = 1;
+  uint64 assignment_generation = 2;
+  uint64 shard_id = 3;
+  repeated TracePayload traces = 4;
+  Durability durability = 5;
+  string request_id = 6;
+}
+
+message WriteBatchResponse {
+  uint64 assignment_generation = 1;
+  uint64 accepted_traces = 2;
+  uint64 accepted_spans = 3;
+}
+
+enum Durability {
+  DURABILITY_APPLIED = 0;
+  DURABILITY_WRITTEN = 1;
+  DURABILITY_DURABLE = 2;
+}

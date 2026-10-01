@@ -27,19 +27,19 @@ const (
 	ComponentReader     Component = "reader"
 
 	ConfigHashAnnotation   = "telemetry.plural.sh/config-hash"
-	MeterNameAnnotation    = "telemetry.plural.sh/meter-name"
-	LineNameAnnotation     = "telemetry.plural.sh/line-name"
-	TrackNameAnnotation    = "telemetry.plural.sh/track-name"
+	MetricsNameAnnotation  = "telemetry.plural.sh/metrics-name"
+	LogsNameAnnotation     = "telemetry.plural.sh/logs-name"
+	TracesNameAnnotation   = "telemetry.plural.sh/traces-name"
 	PseudoFSNameAnnotation = "telemetry.plural.sh/pseudofs-name"
 	TokenKey               = "internal-token"
-	InternalTokenPath      = "/var/run/secrets/meter/internal-token"
+	InternalTokenPath      = "/var/run/secrets/metrics/internal-token"
 
 	volumeConfig              = "config"
 	volumeSecrets             = "secrets"
 	volumeInternalToken       = "internal-token"
 	volumeData                = "data"
 	volumeCache               = "cache"
-	containerMeter            = "meter"
+	containerMetrics          = "metrics"
 	portHTTP                  = "http"
 	portGRPC                  = "grpc"
 	verbGet                   = "get"
@@ -85,9 +85,9 @@ func (e *VolumeError) Error() string {
 }
 
 type StatefulSetInput struct {
-	Meter                   *telemetryv1alpha1.Meter
-	Line                    *telemetryv1alpha1.Line
-	Track                   *telemetryv1alpha1.Track
+	Metrics                 *telemetryv1alpha1.Metrics
+	Logs                    *telemetryv1alpha1.Logs
+	Traces                  *telemetryv1alpha1.Traces
 	PseudoFS                *telemetryv1alpha1.PseudoFS
 	Component               Component
 	ConfigSecretName        string
@@ -106,26 +106,26 @@ type Descriptor struct {
 }
 
 var (
-	MeterDescriptor = Descriptor{
-		Kind: "Meter", Name: "meter", Image: "ghcr.io/pluralsh/meter", ConfigKey: "meter.yaml",
-		ConfigPath: "/etc/meter/meter.yaml", SecretsPath: "/etc/meter/secrets",
-		DataPath: "/var/lib/meter", CachePath: "/var/cache/meter",
+	MetricsDescriptor = Descriptor{
+		Kind: "Metrics", Name: "metrics", Image: "ghcr.io/pluralsh/metrics", ConfigKey: "metrics.yaml",
+		ConfigPath: "/etc/metrics/metrics.yaml", SecretsPath: "/etc/metrics/secrets",
+		DataPath: "/var/lib/metrics", CachePath: "/var/cache/metrics",
 		InternalTokenPath: InternalTokenPath, HTTPPort: 8080, GRPCPort: 9090,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: MeterNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: MetricsNameAnnotation, SupportsPathPrefix: true,
 	}
-	LineDescriptor = Descriptor{
-		Kind: "Line", Name: "line", Image: "ghcr.io/pluralsh/line", ConfigKey: "line.yaml",
-		ConfigPath: "/etc/line/line.yaml", SecretsPath: "/etc/line/secrets",
-		DataPath: "/var/lib/line", CachePath: "/var/cache/line",
-		InternalTokenPath: "/var/run/secrets/line/internal-token", HTTPPort: 3100, GRPCPort: 9091,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: LineNameAnnotation, SupportsPathPrefix: true,
+	LogsDescriptor = Descriptor{
+		Kind: "Logs", Name: "logs", Image: "ghcr.io/pluralsh/logs", ConfigKey: "logs.yaml",
+		ConfigPath: "/etc/logs/logs.yaml", SecretsPath: "/etc/logs/secrets",
+		DataPath: "/var/lib/logs", CachePath: "/var/cache/logs",
+		InternalTokenPath: "/var/run/secrets/logs/internal-token", HTTPPort: 3100, GRPCPort: 9091,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: LogsNameAnnotation, SupportsPathPrefix: true,
 	}
-	TrackDescriptor = Descriptor{
-		Kind: "Track", Name: "track", Image: "ghcr.io/pluralsh/track", ConfigKey: "track.yaml",
-		ConfigPath: "/etc/track/track.yaml", SecretsPath: "/etc/track/secrets",
-		DataPath: "/var/lib/track", CachePath: "/var/cache/track",
-		InternalTokenPath: "/var/run/secrets/track/internal-token", HTTPPort: 3200, GRPCPort: 9092,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: TrackNameAnnotation, SupportsPathPrefix: true,
+	TracesDescriptor = Descriptor{
+		Kind: "Traces", Name: "traces", Image: "ghcr.io/pluralsh/traces", ConfigKey: "traces.yaml",
+		ConfigPath: "/etc/traces/traces.yaml", SecretsPath: "/etc/traces/secrets",
+		DataPath: "/var/lib/traces", CachePath: "/var/cache/traces",
+		InternalTokenPath: "/var/run/secrets/traces/internal-token", HTTPPort: 3200, GRPCPort: 9092,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: TracesNameAnnotation, SupportsPathPrefix: true,
 	}
 	PseudoFSDescriptor = Descriptor{
 		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",
@@ -149,30 +149,30 @@ type Product struct {
 	ConfigHash         string
 }
 
-func ForMeter(meter *telemetryv1alpha1.Meter) *Product {
+func ForMetrics(metrics *telemetryv1alpha1.Metrics) *Product {
 	return &Product{
-		ObjectMeta: meter.ObjectMeta, Descriptor: MeterDescriptor, Mode: meter.Spec.Mode,
-		Version: meter.Spec.Version, Image: meter.Spec.Image, Storage: meter.Spec.Config.Storage, Writer: meter.Spec.Writer,
-		Reader: meter.Spec.Reader, Service: meter.Spec.Service, Ingress: meter.Spec.Ingress,
-		ServiceAccountSpec: meter.Spec.ServiceAccount, ConfigHash: meter.Status.ConfigHash,
+		ObjectMeta: metrics.ObjectMeta, Descriptor: MetricsDescriptor, Mode: metrics.Spec.Mode,
+		Version: metrics.Spec.Version, Image: metrics.Spec.Image, Storage: metrics.Spec.Config.Storage, Writer: metrics.Spec.Writer,
+		Reader: metrics.Spec.Reader, Service: metrics.Spec.Service, Ingress: metrics.Spec.Ingress,
+		ServiceAccountSpec: metrics.Spec.ServiceAccount, ConfigHash: metrics.Status.ConfigHash,
 	}
 }
 
-func ForLine(line *telemetryv1alpha1.Line) *Product {
+func ForLogs(logs *telemetryv1alpha1.Logs) *Product {
 	return &Product{
-		ObjectMeta: line.ObjectMeta, Descriptor: LineDescriptor, Mode: line.Spec.Mode,
-		Version: line.Spec.Version, Image: line.Spec.Image, Storage: line.Spec.Config.Storage, Writer: line.Spec.Writer,
-		Reader: line.Spec.Reader, Service: line.Spec.Service, Ingress: line.Spec.Ingress,
-		ServiceAccountSpec: line.Spec.ServiceAccount, ConfigHash: line.Status.ConfigHash,
+		ObjectMeta: logs.ObjectMeta, Descriptor: LogsDescriptor, Mode: logs.Spec.Mode,
+		Version: logs.Spec.Version, Image: logs.Spec.Image, Storage: logs.Spec.Config.Storage, Writer: logs.Spec.Writer,
+		Reader: logs.Spec.Reader, Service: logs.Spec.Service, Ingress: logs.Spec.Ingress,
+		ServiceAccountSpec: logs.Spec.ServiceAccount, ConfigHash: logs.Status.ConfigHash,
 	}
 }
 
-func ForTrack(track *telemetryv1alpha1.Track) *Product {
+func ForTraces(traces *telemetryv1alpha1.Traces) *Product {
 	return &Product{
-		ObjectMeta: track.ObjectMeta, Descriptor: TrackDescriptor, Mode: track.Spec.Mode,
-		Version: track.Spec.Version, Image: track.Spec.Image, Storage: track.Spec.Config.Storage, Writer: track.Spec.Writer,
-		Reader: track.Spec.Reader, Service: track.Spec.Service, Ingress: track.Spec.Ingress,
-		ServiceAccountSpec: track.Spec.ServiceAccount, ConfigHash: track.Status.ConfigHash,
+		ObjectMeta: traces.ObjectMeta, Descriptor: TracesDescriptor, Mode: traces.Spec.Mode,
+		Version: traces.Spec.Version, Image: traces.Spec.Image, Storage: traces.Spec.Config.Storage, Writer: traces.Spec.Writer,
+		Reader: traces.Spec.Reader, Service: traces.Spec.Service, Ingress: traces.Spec.Ingress,
+		ServiceAccountSpec: traces.Spec.ServiceAccount, ConfigHash: traces.Status.ConfigHash,
 	}
 }
 
@@ -193,12 +193,12 @@ func product(value any) *Product {
 	switch value := value.(type) {
 	case *Product:
 		return value
-	case *telemetryv1alpha1.Meter:
-		return ForMeter(value)
-	case *telemetryv1alpha1.Line:
-		return ForLine(value)
-	case *telemetryv1alpha1.Track:
-		return ForTrack(value)
+	case *telemetryv1alpha1.Metrics:
+		return ForMetrics(value)
+	case *telemetryv1alpha1.Logs:
+		return ForLogs(value)
+	case *telemetryv1alpha1.Traces:
+		return ForTraces(value)
 	case *telemetryv1alpha1.PseudoFS:
 		return ForPseudoFS(value)
 	default:
@@ -219,11 +219,11 @@ func Components(value any) []Component {
 }
 
 func ComponentName(value any, component Component) string {
-	meter := product(value)
+	metrics := product(value)
 	if component == ComponentStandalone {
-		return meter.Name
+		return metrics.Name
 	}
-	return Name(meter.Name, string(component))
+	return Name(metrics.Name, string(component))
 }
 
 func ConfigKeyFor(value any, component Component) string {
@@ -235,7 +235,7 @@ func ConfigKeyFor(value any, component Component) string {
 }
 
 func ConfigKey(component Component) string {
-	return ConfigKeyFor(&Product{Descriptor: MeterDescriptor}, component)
+	return ConfigKeyFor(&Product{Descriptor: MetricsDescriptor}, component)
 }
 
 func HTTPPort(value any) int32 {
@@ -249,119 +249,119 @@ func GRPCPort(value any) int32 {
 }
 
 func Replicas(value any, component Component) *int32 {
-	meter := product(value)
+	metrics := product(value)
 	if component == ComponentStandalone {
 		return lo.ToPtr(int32(1))
 	}
-	if value := workloadFor(meter, component).Replicas; value != nil {
+	if value := workloadFor(metrics, component).Replicas; value != nil {
 		return value
 	}
 	return lo.ToPtr(lo.Ternary(component == ComponentWriter, int32(1), int32(2)))
 }
 
 func ServiceAccount(value any) *corev1.ServiceAccount {
-	meter := product(value)
+	metrics := product(value)
 	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
-		Name:        meter.Name,
-		Namespace:   meter.Namespace,
-		Labels:      Labels(meter, ComponentNone),
-		Annotations: copyMap(meter.ServiceAccountSpec.Annotations),
+		Name:        metrics.Name,
+		Namespace:   metrics.Namespace,
+		Labels:      Labels(metrics, ComponentNone),
+		Annotations: copyMap(metrics.ServiceAccountSpec.Annotations),
 	}}
 }
 
 func Role(value any) *rbacv1.Role {
-	meter := product(value)
-	name := Name(meter.Name, "sharding")
+	metrics := product(value)
+	name := Name(metrics.Name, "sharding")
 	return &rbacv1.Role{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, ComponentNone)},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, ComponentNone)},
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{"telemetry.plural.sh"}, Resources: []string{"shardmaps"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
 			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch", "delete"}},
-			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(meter, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
+			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(metrics, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
 		},
 	}
 }
 
 func RoleBinding(value any) *rbacv1.RoleBinding {
-	meter := product(value)
-	name := Name(meter.Name, "sharding")
+	metrics := product(value)
+	name := Name(metrics.Name, "sharding")
 	return &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, ComponentNone)},
-		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: meter.Name, Namespace: meter.Namespace}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, ComponentNone)},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: metrics.Name, Namespace: metrics.Namespace}},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
 	}
 }
 
 func Service(value any, component Component, headless bool) *corev1.Service {
-	meter := product(value)
-	name := ComponentName(meter, component)
+	metrics := product(value)
+	name := ComponentName(metrics, component)
 	if headless {
 		name = Name(name, "headless")
 	}
 	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, component)},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, component)},
 		Spec: corev1.ServiceSpec{
-			Selector: SelectorLabels(meter, component),
-			Ports:    []corev1.ServicePort{{Name: portGRPC, Port: GRPCPort(meter), TargetPort: intstr.FromString(portGRPC), Protocol: corev1.ProtocolTCP}},
+			Selector: SelectorLabels(metrics, component),
+			Ports:    []corev1.ServicePort{{Name: portGRPC, Port: GRPCPort(metrics), TargetPort: intstr.FromString(portGRPC), Protocol: corev1.ProtocolTCP}},
 		},
 	}
-	if !meter.Descriptor.GRPCOnly {
-		service.Spec.Ports = append([]corev1.ServicePort{{Name: portHTTP, Port: HTTPPort(meter), TargetPort: intstr.FromString(portHTTP), Protocol: corev1.ProtocolTCP}}, service.Spec.Ports...)
+	if !metrics.Descriptor.GRPCOnly {
+		service.Spec.Ports = append([]corev1.ServicePort{{Name: portHTTP, Port: HTTPPort(metrics), TargetPort: intstr.FromString(portHTTP), Protocol: corev1.ProtocolTCP}}, service.Spec.Ports...)
 	}
 	if headless {
 		service.Spec.Type = corev1.ServiceTypeClusterIP
 		service.Spec.ClusterIP = corev1.ClusterIPNone
 		service.Spec.Ports = service.Spec.Ports[1:]
 	} else {
-		service.Spec.Type = lo.Ternary(meter.Service.Type == "", corev1.ServiceTypeClusterIP, meter.Service.Type)
-		service.Annotations = copyMap(meter.Service.Annotations)
+		service.Spec.Type = lo.Ternary(metrics.Service.Type == "", corev1.ServiceTypeClusterIP, metrics.Service.Type)
+		service.Annotations = copyMap(metrics.Service.Annotations)
 	}
 	return service
 }
 
 func Ingress(value any) *networkingv1.Ingress {
-	meter := product(value)
-	labels := Labels(meter, ComponentNone)
-	maps.Copy(labels, meter.Ingress.Metadata.Labels)
+	metrics := product(value)
+	labels := Labels(metrics, ComponentNone)
+	maps.Copy(labels, metrics.Ingress.Metadata.Labels)
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        meter.Name,
-			Namespace:   meter.Namespace,
+			Name:        metrics.Name,
+			Namespace:   metrics.Namespace,
 			Labels:      labels,
-			Annotations: copyMap(meter.Ingress.Metadata.Annotations),
+			Annotations: copyMap(metrics.Ingress.Metadata.Annotations),
 		},
 		Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{
-			Host: meter.Ingress.Hostname,
+			Host: metrics.Ingress.Hostname,
 			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
-				Paths: ingressPaths(meter),
+				Paths: ingressPaths(metrics),
 			}},
 		}}},
 	}
-	if meter.Ingress.IngressClass != "" {
-		ingress.Spec.IngressClassName = lo.ToPtr(meter.Ingress.IngressClass)
+	if metrics.Ingress.IngressClass != "" {
+		ingress.Spec.IngressClassName = lo.ToPtr(metrics.Ingress.IngressClass)
 	}
-	if meter.Ingress.TLS.Enabled {
+	if metrics.Ingress.TLS.Enabled {
 		ingress.Spec.TLS = []networkingv1.IngressTLS{{
-			Hosts:      []string{meter.Ingress.Hostname},
-			SecretName: lo.CoalesceOrEmpty(meter.Ingress.TLS.SecretName, Name(meter.Name, "tls")),
+			Hosts:      []string{metrics.Ingress.Hostname},
+			SecretName: lo.CoalesceOrEmpty(metrics.Ingress.TLS.SecretName, Name(metrics.Name, "tls")),
 		}}
 	}
 	return ingress
 }
 
-func ingressPaths(meter *Product) []networkingv1.HTTPIngressPath {
-	prefix := meter.Ingress.PathPrefix
-	if !meter.Descriptor.SupportsPathPrefix {
+func ingressPaths(metrics *Product) []networkingv1.HTTPIngressPath {
+	prefix := metrics.Ingress.PathPrefix
+	if !metrics.Descriptor.SupportsPathPrefix {
 		prefix = ""
 	}
-	writerService := ComponentName(meter, ComponentWriter)
-	readerService := ComponentName(meter, ComponentReader)
-	if Mode(meter) == telemetryv1alpha1.ProductModeStandalone {
-		writerService, readerService = meter.Name, meter.Name
+	writerService := ComponentName(metrics, ComponentWriter)
+	readerService := ComponentName(metrics, ComponentReader)
+	if Mode(metrics) == telemetryv1alpha1.ProductModeStandalone {
+		writerService, readerService = metrics.Name, metrics.Name
 	}
 	return []networkingv1.HTTPIngressPath{
-		ingressPath(prefix+meter.Descriptor.WriteRoute, networkingv1.PathTypePrefix, writerService),
-		ingressPath(prefix+meter.Descriptor.ReadRoute, networkingv1.PathTypePrefix, readerService),
+		ingressPath(prefix+metrics.Descriptor.WriteRoute, networkingv1.PathTypePrefix, writerService),
+		ingressPath(prefix+metrics.Descriptor.ReadRoute, networkingv1.PathTypePrefix, readerService),
 	}
 }
 
@@ -377,19 +377,19 @@ func ingressPath(path string, pathType networkingv1.PathType, serviceName string
 }
 
 func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
-	var meter *Product
+	var metrics *Product
 	if input.PseudoFS != nil {
-		meter = ForPseudoFS(input.PseudoFS)
-	} else if input.Line != nil {
-		meter = ForLine(input.Line)
-	} else if input.Track != nil {
-		meter = ForTrack(input.Track)
+		metrics = ForPseudoFS(input.PseudoFS)
+	} else if input.Logs != nil {
+		metrics = ForLogs(input.Logs)
+	} else if input.Traces != nil {
+		metrics = ForTraces(input.Traces)
 	} else {
-		meter = ForMeter(input.Meter)
+		metrics = ForMetrics(input.Metrics)
 	}
 	component := input.Component
-	name := ComponentName(meter, component)
-	workload := workloadFor(meter, component)
+	name := ComponentName(metrics, component)
+	workload := workloadFor(metrics, component)
 	dataVolume := volumeSpec(workload.DataVolume, defaultDataSize)
 	cacheVolume := volumeSpec(workload.CacheVolume, defaultCacheSize)
 	claims := make([]corev1.PersistentVolumeClaim, 0, 2)
@@ -401,8 +401,8 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 			return nil, err
 		}
 		if claim := claimTemplate(item.name, item.spec); claim != nil {
-			claim.Labels = Labels(meter, component)
-			claim.Annotations = map[string]string{meter.Descriptor.NameAnnotation: meter.Name}
+			claim.Labels = Labels(metrics, component)
+			claim.Annotations = map[string]string{metrics.Descriptor.NameAnnotation: metrics.Name}
 			claims = append(claims, *claim)
 		}
 	}
@@ -410,24 +410,24 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	if workload.PodTemplate != nil {
 		template = *workload.PodTemplate
 	}
-	template = podTemplate(meter, input, template, dataVolume, cacheVolume)
+	template = podTemplate(metrics, input, template, dataVolume, cacheVolume)
 	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: meter.Namespace, Labels: Labels(meter, component)},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, component)},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName: lo.Ternary(meter.Descriptor.GRPCOnly, name, Name(name, "headless")), Replicas: Replicas(meter, component),
+			ServiceName: lo.Ternary(metrics.Descriptor.GRPCOnly, name, Name(name, "headless")), Replicas: Replicas(metrics, component),
 			PodManagementPolicy:                  appsv1.ParallelPodManagement,
 			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			Selector:                             &metav1.LabelSelector{MatchLabels: SelectorLabels(meter, component)},
+			Selector:                             &metav1.LabelSelector{MatchLabels: SelectorLabels(metrics, component)},
 			Template:                             template,
 			VolumeClaimTemplates:                 claims,
-			PersistentVolumeClaimRetentionPolicy: persistentVolumeClaimRetentionPolicy(meter, workload),
+			PersistentVolumeClaimRetentionPolicy: persistentVolumeClaimRetentionPolicy(metrics, workload),
 		},
 	}, nil
 }
 
-func persistentVolumeClaimRetentionPolicy(meter *Product, workload telemetryv1alpha1.WorkloadSpec) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
+func persistentVolumeClaimRetentionPolicy(metrics *Product, workload telemetryv1alpha1.WorkloadSpec) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
 	defaultPolicy := appsv1.DeletePersistentVolumeClaimRetentionPolicyType
-	if meter.Storage.ObjectStore.Type == "" || meter.Storage.ObjectStore.Type == telemetryv1alpha1.ObjectStoreLocal {
+	if metrics.Storage.ObjectStore.Type == "" || metrics.Storage.ObjectStore.Type == telemetryv1alpha1.ObjectStoreLocal {
 		defaultPolicy = appsv1.RetainPersistentVolumeClaimRetentionPolicyType
 	}
 	whenDeleted, whenScaled := defaultPolicy, defaultPolicy
@@ -474,71 +474,71 @@ func claimTemplate(name string, spec telemetryv1alpha1.VolumeSpec) *corev1.Persi
 	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: *spec.PersistentVolumeClaim.DeepCopy()}
 }
 
-func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume, cacheVolume telemetryv1alpha1.VolumeSpec) corev1.PodTemplateSpec {
+func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTemplateSpec, dataVolume, cacheVolume telemetryv1alpha1.VolumeSpec) corev1.PodTemplateSpec {
 	component := input.Component
 	template := *user.DeepCopy()
 	if template.Labels == nil {
 		template.Labels = map[string]string{}
 	}
-	for key, value := range SelectorLabels(meter, component) {
+	for key, value := range SelectorLabels(metrics, component) {
 		template.Labels[key] = value
 	}
 	if template.Annotations == nil {
 		template.Annotations = map[string]string{}
 	}
-	template.Annotations[ConfigHashAnnotation] = meter.ConfigHash
+	template.Annotations[ConfigHashAnnotation] = metrics.ConfigHash
 	spec := &template.Spec
-	applyPodDefaults(spec, meter, component)
+	applyPodDefaults(spec, metrics, component)
 
-	meterContainer := corev1.Container{Name: meter.Descriptor.Name}
+	metricsContainer := corev1.Container{Name: metrics.Descriptor.Name}
 	others := make([]corev1.Container, 0, len(spec.Containers))
 	for _, container := range spec.Containers {
-		if container.Name == meter.Descriptor.Name {
-			meterContainer = container
+		if container.Name == metrics.Descriptor.Name {
+			metricsContainer = container
 		} else {
 			others = append(others, container)
 		}
 	}
-	meterContainer.Resources = containerResources(meterContainer.Resources, workloadFor(meter, component).Resources)
-	productVersion := lo.CoalesceOrEmpty(meter.Version, meter.Image.Tag, input.DefaultProductVersion, operatorversion.ProductVersion)
-	meterContainer.Image = lo.CoalesceOrEmpty(meter.Image.Repository, meter.Descriptor.Image) + ":" + productVersion
-	if meter.Image.PullPolicy != "" {
-		meterContainer.ImagePullPolicy = meter.Image.PullPolicy
-	} else if meterContainer.ImagePullPolicy == "" {
-		meterContainer.ImagePullPolicy = corev1.PullIfNotPresent
+	metricsContainer.Resources = containerResources(metricsContainer.Resources, workloadFor(metrics, component).Resources)
+	productVersion := lo.CoalesceOrEmpty(metrics.Version, metrics.Image.Tag, input.DefaultProductVersion, operatorversion.ProductVersion)
+	metricsContainer.Image = lo.CoalesceOrEmpty(metrics.Image.Repository, metrics.Descriptor.Image) + ":" + productVersion
+	if metrics.Image.PullPolicy != "" {
+		metricsContainer.ImagePullPolicy = metrics.Image.PullPolicy
+	} else if metricsContainer.ImagePullPolicy == "" {
+		metricsContainer.ImagePullPolicy = corev1.PullIfNotPresent
 	}
-	meterContainer.Args = []string{"--config", meter.Descriptor.ConfigPath}
-	requiredPorts := []corev1.ContainerPort{{Name: portGRPC, ContainerPort: GRPCPort(meter), Protocol: corev1.ProtocolTCP}}
-	if !meter.Descriptor.GRPCOnly {
-		requiredPorts = append([]corev1.ContainerPort{{Name: portHTTP, ContainerPort: HTTPPort(meter), Protocol: corev1.ProtocolTCP}}, requiredPorts...)
+	metricsContainer.Args = []string{"--config", metrics.Descriptor.ConfigPath}
+	requiredPorts := []corev1.ContainerPort{{Name: portGRPC, ContainerPort: GRPCPort(metrics), Protocol: corev1.ProtocolTCP}}
+	if !metrics.Descriptor.GRPCOnly {
+		requiredPorts = append([]corev1.ContainerPort{{Name: portHTTP, ContainerPort: HTTPPort(metrics), Protocol: corev1.ProtocolTCP}}, requiredPorts...)
 	}
-	meterContainer.Ports = mergeNamed(meterContainer.Ports, func(item corev1.ContainerPort) string { return item.Name }, requiredPorts...)
-	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name },
+	metricsContainer.Ports = mergeNamed(metricsContainer.Ports, func(item corev1.ContainerPort) string { return item.Name }, requiredPorts...)
+	metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name },
 		corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
-	meterContainer.Env = mergeNamed(meterContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(meter)...)
+	metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(metrics)...)
 	requiredMounts := []corev1.VolumeMount{
-		{Name: volumeConfig, MountPath: meter.Descriptor.ConfigPath, SubPath: ConfigKeyFor(meter, component), ReadOnly: true},
-		{Name: volumeData, MountPath: meter.Descriptor.DataPath},
-		{Name: volumeCache, MountPath: meter.Descriptor.CachePath},
+		{Name: volumeConfig, MountPath: metrics.Descriptor.ConfigPath, SubPath: ConfigKeyFor(metrics, component), ReadOnly: true},
+		{Name: volumeData, MountPath: metrics.Descriptor.DataPath},
+		{Name: volumeCache, MountPath: metrics.Descriptor.CachePath},
 	}
-	if !meter.Descriptor.GRPCOnly {
+	if !metrics.Descriptor.GRPCOnly {
 		requiredMounts = append(requiredMounts,
-			corev1.VolumeMount{Name: volumeSecrets, MountPath: meter.Descriptor.SecretsPath, ReadOnly: true},
-			corev1.VolumeMount{Name: volumeInternalToken, MountPath: meter.Descriptor.InternalTokenPath, SubPath: TokenKey, ReadOnly: true})
+			corev1.VolumeMount{Name: volumeSecrets, MountPath: metrics.Descriptor.SecretsPath, ReadOnly: true},
+			corev1.VolumeMount{Name: volumeInternalToken, MountPath: metrics.Descriptor.InternalTokenPath, SubPath: TokenKey, ReadOnly: true})
 	}
-	meterContainer.VolumeMounts = mergeNamed(meterContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name }, requiredMounts...)
-	if meter.Descriptor.GRPCOnly && meterContainer.LivenessProbe == nil {
-		meterContainer.LivenessProbe = grpcProbe(GRPCPort(meter), 10, 10, 2, 3)
-	} else if meterContainer.LivenessProbe == nil {
-		meterContainer.LivenessProbe = httpProbe("/-/healthy", 10, 10, 2, 3)
+	metricsContainer.VolumeMounts = mergeNamed(metricsContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name }, requiredMounts...)
+	if metrics.Descriptor.GRPCOnly && metricsContainer.LivenessProbe == nil {
+		metricsContainer.LivenessProbe = grpcProbe(GRPCPort(metrics), 10, 10, 2, 3)
+	} else if metricsContainer.LivenessProbe == nil {
+		metricsContainer.LivenessProbe = httpProbe("/-/healthy", 10, 10, 2, 3)
 	}
-	if meter.Descriptor.GRPCOnly && meterContainer.ReadinessProbe == nil {
-		meterContainer.ReadinessProbe = grpcProbe(GRPCPort(meter), 2, 5, 2, 6)
-	} else if meterContainer.ReadinessProbe == nil {
-		meterContainer.ReadinessProbe = httpProbe("/-/ready", 2, 5, 2, 6)
+	if metrics.Descriptor.GRPCOnly && metricsContainer.ReadinessProbe == nil {
+		metricsContainer.ReadinessProbe = grpcProbe(GRPCPort(metrics), 2, 5, 2, 6)
+	} else if metricsContainer.ReadinessProbe == nil {
+		metricsContainer.ReadinessProbe = httpProbe("/-/ready", 2, 5, 2, 6)
 	}
-	spec.Containers = append([]corev1.Container{meterContainer}, others...)
+	spec.Containers = append([]corev1.Container{metricsContainer}, others...)
 	for i := range spec.Containers {
 		spec.Containers[i].SecurityContext = secureContainerContext(spec.Containers[i].SecurityContext)
 	}
@@ -550,7 +550,7 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 	}
 
 	required := []corev1.Volume{{Name: volumeConfig, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}}}
-	if !meter.Descriptor.GRPCOnly {
+	if !metrics.Descriptor.GRPCOnly {
 		required = append(required,
 			corev1.Volume{Name: volumeSecrets, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: input.ConfigSecretName}}},
 			corev1.Volume{
@@ -571,15 +571,15 @@ func podTemplate(meter *Product, input StatefulSetInput, user corev1.PodTemplate
 	return template
 }
 
-func applyPodDefaults(spec *corev1.PodSpec, meter *Product, component Component) {
+func applyPodDefaults(spec *corev1.PodSpec, metrics *Product, component Component) {
 	if spec.NodeSelector == nil {
 		spec.NodeSelector = map[string]string{}
 	}
-	maps.Copy(spec.NodeSelector, workloadFor(meter, component).NodeSelector)
-	spec.Tolerations = mergeTolerations(spec.Tolerations, workloadFor(meter, component).Tolerations)
-	spec.ServiceAccountName = meter.Name
+	maps.Copy(spec.NodeSelector, workloadFor(metrics, component).NodeSelector)
+	spec.Tolerations = mergeTolerations(spec.Tolerations, workloadFor(metrics, component).Tolerations)
+	spec.ServiceAccountName = metrics.Name
 	if spec.AutomountServiceAccountToken == nil {
-		spec.AutomountServiceAccountToken = lo.ToPtr(Mode(meter) == telemetryv1alpha1.ProductModeSharded)
+		spec.AutomountServiceAccountToken = lo.ToPtr(Mode(metrics) == telemetryv1alpha1.ProductModeSharded)
 	}
 	if spec.TerminationGracePeriodSeconds == nil {
 		spec.TerminationGracePeriodSeconds = lo.ToPtr(int64(30))
@@ -629,8 +629,8 @@ func containerResources(template, configured corev1.ResourceRequirements) corev1
 	return result
 }
 
-func objectStoreEnv(meter *Product) []corev1.EnvVar {
-	objectStore := meter.Storage.ObjectStore
+func objectStoreEnv(metrics *Product) []corev1.EnvVar {
+	objectStore := metrics.Storage.ObjectStore
 	switch {
 	case objectStore.AWS != nil:
 		return lo.Compact([]corev1.EnvVar{
@@ -771,23 +771,23 @@ func tolerationIdentity(toleration corev1.Toleration) string {
 	return toleration.Key + "\x00" + string(operator) + "\x00" + string(toleration.Effect)
 }
 
-func workloadFor(meter *Product, component Component) telemetryv1alpha1.WorkloadSpec {
+func workloadFor(metrics *Product, component Component) telemetryv1alpha1.WorkloadSpec {
 	if component == ComponentReader {
-		return meter.Reader
+		return metrics.Reader
 	}
-	return meter.Writer
+	return metrics.Writer
 }
 
 func Labels(value any, component Component) map[string]string {
-	meter := product(value)
-	result := SelectorLabels(meter, component)
-	result["app.kubernetes.io/managed-by"] = meter.Descriptor.Name + "-operator"
+	metrics := product(value)
+	result := SelectorLabels(metrics, component)
+	result["app.kubernetes.io/managed-by"] = metrics.Descriptor.Name + "-operator"
 	return result
 }
 
 func SelectorLabels(value any, component Component) map[string]string {
-	meter := product(value)
-	result := map[string]string{"app.kubernetes.io/name": meter.Descriptor.Name, "app.kubernetes.io/instance": Name(meter.Name, "")}
+	metrics := product(value)
+	result := map[string]string{"app.kubernetes.io/name": metrics.Descriptor.Name, "app.kubernetes.io/instance": Name(metrics.Name, "")}
 	if component != ComponentNone {
 		result["app.kubernetes.io/component"] = string(component)
 	}

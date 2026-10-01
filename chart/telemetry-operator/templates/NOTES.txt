@@ -1,12 +1,12 @@
 Telemetry Operator is installed in {{ .Release.Namespace }}.
 
-The Meter and NamespaceAuthentication CRDs were installed from the chart's
+The Metrics and NamespaceAuthentication CRDs were installed from the chart's
 crds/ directory. Verify the controller:
 
   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "telemetry-operator.fullname" . }}
 
 List the managed resources:
 
-  kubectl get meters,namespaceauthentications --all-namespaces
+  kubectl get metrics,namespaceauthentications --all-namespaces
 
 CRDs are retained by Helm when the release is uninstalled.

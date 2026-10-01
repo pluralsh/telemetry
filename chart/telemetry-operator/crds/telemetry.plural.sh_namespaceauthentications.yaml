@@ -63,9 +63,9 @@ spec:
                 properties:
                   kind:
                     enum:
-                    - Meter
-                    - Line
-                    - Track
+                    - Metrics
+                    - Logs
+                    - Traces
                     type: string
                   name:
                     minLength: 1

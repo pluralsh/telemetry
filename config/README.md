@@ -1,18 +1,18 @@
 # Server configuration
 
-`meter-server --config <path>` reads YAML into the configuration below. The default path is
-`config/meter.yaml`. Unknown fields are rejected in the server, listener, write, authentication,
-JWT, and namespace sections. The checked-in [`meter.example.yaml`](meter.example.yaml) is a valid,
+`plural-metrics-server --config <path>` reads YAML into the configuration below. The default path is
+`config/metrics.yaml`. Unknown fields are rejected in the server, listener, write, authentication,
+JWT, and namespace sections. The checked-in [`metrics.example.yaml`](metrics.example.yaml) is a valid,
 commented standalone configuration with alternatives for every tagged variant.
 
-`line-server --config <path>` uses the same shared server, storage, write, sharding, authentication,
+`plural-logs-server --config <path>` uses the same shared server, storage, write, sharding, authentication,
 and namespace conventions for Loki-compatible logs. Start from
-[`line.example.yaml`](line.example.yaml); the container image defaults to
-`/app/config/line.example.yaml`. Line listens on HTTP port `3100` and internal gRPC port `9091` in
+[`logs.example.yaml`](logs.example.yaml); the container image defaults to
+`/app/config/logs.example.yaml`. Logs listens on HTTP port `3100` and internal gRPC port `9091` in
 the example configuration.
 
-`track-server --config <path>` serves Tempo-compatible trace reads and OTLP/Zipkin writes. Start
-from [`track.example.yaml`](track.example.yaml). It listens on HTTP `3200`, internal writer gRPC
+`plural-traces-server --config <path>` serves Tempo-compatible trace reads and OTLP/Zipkin writes. Start
+from [`traces.example.yaml`](traces.example.yaml). It listens on HTTP `3200`, internal writer gRPC
 `9092`, and OTLP TraceService gRPC `4317`. OTLP HTTP is available at
 `/write/ns/{namespace}/v1/traces`; OTLP gRPC takes the namespace from `x-scope-orgid`. Zipkin v2
 JSON is accepted at `/write/ns/{namespace}/api/v2/spans`. Jaeger collector and Thrift transports
@@ -25,15 +25,15 @@ listens on `9093`, enables gRPC health and reflection, and requires a validated 
 on every filesystem request. Tenants are selected dynamically rather than configured as an
 allowlist; PseudoFS intentionally has no sharding or application authentication.
 
-Track reads are rooted at `/read/ns/{namespace}`: trace-by-ID v1/v2, TraceQL `/api/search`,
+Traces reads are rooted at `/read/ns/{namespace}`: trace-by-ID v1/v2, TraceQL `/api/search`,
 v1/v2 tag names and values, and `/api/echo`. TraceQL metrics routes return `501` because metrics
-execution is deliberately outside Track's current scope. JSON is the default trace response;
+execution is deliberately outside Traces' current scope. JSON is the default trace response;
 request a protobuf media type in `Accept` for protobuf. Reader mode disables writes, writer mode
 disables reads, and standalone mode enables both.
 
-Track supports standalone and static shard ownership. The checked-in server reports Kubernetes
-Track sharding as unsupported at startup rather than silently running with incorrect ownership;
-use static ownership for split deployments until the Track Kubernetes lifecycle is added.
+Traces supports standalone and static shard ownership. The checked-in server reports Kubernetes
+Traces sharding as unsupported at startup rather than silently running with incorrect ownership;
+use static ownership for split deployments until the Traces Kubernetes lifecycle is added.
 
 Defaults apply when a field or section is omitted. Fields described as required must be present
 when their containing section or tagged variant is present.
@@ -46,7 +46,7 @@ when their containing section or tagged variant is present.
   routes. Split writer/reader deployments normally use `static` or `kubernetes` sharding.
 - `listeners.http`: HTTP bind socket. Default `0.0.0.0:8080`.
 - `listeners.grpc`: internal writer gRPC bind socket. Default `0.0.0.0:9090`.
-- `path_prefix`: optional prefix for public read and write APIs, such as `/meter`. It must start
+- `path_prefix`: optional prefix for public read and write APIs, such as `/metrics`. It must start
   with `/` and must not end with `/`. The default is empty.
 
 Read APIs are under `{path_prefix}/read/ns/{namespace}` and write APIs are under
@@ -55,17 +55,17 @@ Read APIs are under `{path_prefix}/read/ns/{namespace}` and write APIs are under
 `/federate`. Write routes are `/api/v1/write` (Prometheus remote write) and `/v1/metrics`
 (OTLP/HTTP protobuf).
 `/-/healthy`, `/-/ready`, and `/metrics` are not namespace-prefixed.
-Every Meter, Line, and Track process exposes its internal `metrics` crate recorder at `GET /metrics`
+Every Metrics, Logs, and Traces process exposes its internal `metrics` crate recorder at `GET /metrics`
 using the Prometheus text exposition format. Scrape the product's HTTP service and port directly;
 the endpoint includes cache-warmer, SlateDB, query, ingestion, and process-role metrics.
 
 ## `storage`
 
-Meter always uses SlateDB. If the whole section is omitted, it defaults to `path: data`, an
+Metrics always uses SlateDB. If the whole section is omitted, it defaults to `path: data`, an
 `InMemory` object store, no settings file, and no caches. If `storage` is present, `path` and
 `object_store` are required.
 
-- `storage.path`: object-key prefix for Meter data. Sharded deployments place one multi-namespace
+- `storage.path`: object-key prefix for Metrics data. Sharded deployments place one multi-namespace
   SlateDB below each `shard-NNNN` child; namespace isolation is encoded in database keys. Default
   `data`.
 - `storage.settings_path`: optional path to a SlateDB TOML, JSON, or YAML settings file. If
@@ -109,7 +109,7 @@ Cache variants are:
   - `submit_queue_size_threshold`: queued bytes before cache entries are dropped. Default
     `1073741824` (1 GiB).
 
-`retention_seconds` is optional Meter retention. Each time bucket's records are written with a
+`retention_seconds` is optional Metrics retention. Each time bucket's records are written with a
 SlateDB TTL of bucket start plus the retention window, so compaction drops the whole bucket at
 once. Unset (the default) keeps data forever.
 
@@ -119,7 +119,7 @@ not bytes. Default `268435456`.
 
 ## `cache_warmer`
 
-The opt-in startup cache warmer applies to Meter, Line, and Track readers and standalone servers.
+The opt-in startup cache warmer applies to Metrics, Logs, and Traces readers and standalone servers.
 It runs in the background while health checks remain available; readiness remains false until
 warming finishes. Writer-only processes skip warming. Errors are logged and do not permanently
 block readiness. Warming consumes permits from the same pod-wide storage I/O budget as queries.
@@ -175,15 +175,15 @@ metadata cache and cannot evict payload blocks from the data cache.
 and uses Leases for coordinator and shard ownership. The server must be built with the
 `kubernetes` feature (enabled by default) and have namespace-scoped RBAC. Fields are:
 
-- `database`: database name. Every Lease is labeled `telemetry.plural.sh/meter=<database>`,
-  and lease watches select on that label. Must be a valid label value. Default `meter`.
+- `database`: database name. Every Lease is labeled `telemetry.plural.sh/metrics=<database>`,
+  and lease watches select on that label. Must be a valid label value. Default `metrics`.
 - `namespace`: Kubernetes namespace. Default `default`.
-- `stateful_set`: writer StatefulSet name. Default `meter`.
-- `headless_service`: writer headless Service used for owner DNS. Default `meter-headless`.
+- `stateful_set`: writer StatefulSet name. Default `metrics`.
+- `headless_service`: writer headless Service used for owner DNS. Default `metrics-headless`.
 - `owner_port`: internal gRPC port. Default `9090`.
-- `shard_map`: authoritative ShardMap resource name. Default `meter-shard-map`.
-- `coordinator_lease`: coordinator Lease name. Default `meter-shard-coordinator`.
-- `shard_lease_prefix`: prefix for per-shard Lease names. Default `meter-shard`.
+- `shard_map`: authoritative ShardMap resource name. Default `metrics-shard-map`.
+- `coordinator_lease`: coordinator Lease name. Default `metrics-shard-coordinator`.
+- `shard_lease_prefix`: prefix for per-shard Lease names. Default `metrics-shard`.
 - `lease_duration_seconds`: shard/coordinator lease duration in seconds. Default `15`.
 - `renew_interval_seconds`: shard ownership renewal interval in seconds. Default `5`.
 
@@ -201,8 +201,8 @@ A secret value supports exactly one source:
 
 ```yaml
 { source: literal, value: development-only }
-{ source: env, name: METER_PASSWORD }
-{ source: file, path: /var/run/secrets/meter/password }
+{ source: env, name: METRICS_PASSWORD }
+{ source: file, path: /var/run/secrets/metrics/password }
 ```
 
 `env` reads the named environment variable and `file` reads UTF-8 text from the path. Trailing
@@ -220,7 +220,7 @@ The only configured credential type is HTTP Basic:
 ```yaml
 - type: basic
   username: prometheus
-  password: { source: file, path: /var/run/secrets/meter/password }
+  password: { source: file, path: /var/run/secrets/metrics/password }
 ```
 
 Global and namespace Basic credentials are alternatives, not cumulative requirements. When

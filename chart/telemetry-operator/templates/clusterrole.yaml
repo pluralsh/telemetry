@@ -7,13 +7,13 @@ metadata:
     {{- include "telemetry-operator.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters", "lines", "tracks", "pseudofs", "namespaceauthentications"]
+    resources: ["metrics", "logs", "traces", "pseudofs", "namespaceauthentications"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters/status", "lines/status", "tracks/status", "pseudofs/status", "namespaceauthentications/status"]
+    resources: ["metrics/status", "logs/status", "traces/status", "pseudofs/status", "namespaceauthentications/status"]
     verbs: ["get", "update", "patch"]
   - apiGroups: ["telemetry.plural.sh"]
-    resources: ["meters/finalizers", "lines/finalizers", "tracks/finalizers", "pseudofs/finalizers", "namespaceauthentications/finalizers"]
+    resources: ["metrics/finalizers", "logs/finalizers", "traces/finalizers", "pseudofs/finalizers", "namespaceauthentications/finalizers"]
     verbs: ["update"]
   - apiGroups: ["telemetry.plural.sh"]
     resources: ["shardmaps"]

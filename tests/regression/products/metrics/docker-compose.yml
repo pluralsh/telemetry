@@ -1,0 +1,88 @@
+name: metrics-regression
+
+x-metrics-environment: &metrics-environment
+  AWS_ACCESS_KEY_ID: metrics
+  AWS_SECRET_ACCESS_KEY: metrics-regression-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+  METRICS_INTERNAL_TOKEN: internal-regression-token
+
+x-metrics: &metrics
+  # CI preloads this tag from a cached buildx build; see regression.yml.
+  image: telemetry-regression/plural-metrics-server:local
+  build:
+    context: ../../../..
+    dockerfile: crates/metrics-server/Dockerfile
+  environment: *metrics-environment
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  prometheus:
+    # Native histogram rate extrapolation clips at the zero point from v3.6.
+    image: prom/prometheus:v3.14.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --web.enable-otlp-receiver
+      - --enable-feature=metadata-wal-records
+      - --enable-feature=native-histograms
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["19090:9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: metrics
+      MINIO_ROOT_PASSWORD: metrics-regression-secret
+    volumes: ["minio-data:/data"]
+    ports: ["19000:9000"]
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+    environment:
+      MC_HOST_local: http://metrics:metrics-regression-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_started
+    command: ["mb", "--ignore-existing", "local/metrics-regression"]
+    restart: on-failure
+
+  metrics-writer-0:
+    <<: *metrics
+    command: ["--config", "/app/regression/writer-0.yaml"]
+    volumes:
+      - ./writer-0.yaml:/app/regression/writer-0.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18080:8080"]
+
+  metrics-writer-1:
+    <<: *metrics
+    command: ["--config", "/app/regression/writer-1.yaml"]
+    volumes:
+      - ./writer-1.yaml:/app/regression/writer-1.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18081:8080"]
+
+  metrics-reader:
+    <<: *metrics
+    command: ["--config", "/app/regression/reader.yaml"]
+    volumes:
+      - ./reader.yaml:/app/regression/reader.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18082:8080"]
+
+volumes:
+  prometheus-data:
+  minio-data:

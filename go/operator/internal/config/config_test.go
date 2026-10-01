@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	testMeterName           = "example"
-	testMeterNamespace      = "test"
-	testBucket              = "meter"
+	testMetricsName         = "example"
+	testMetricsNamespace    = "test"
+	testBucket              = "metrics"
 	testTenantNamespace     = "tenant-a"
 	testFlushIntervalConfig = "flush_interval_seconds: 10"
 	testCacheWarmerConfig   = "cache_warmer:"
@@ -24,38 +24,38 @@ const (
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{
-			Config:  telemetryv1alpha1.MeterConfigSpec{Namespaces: []string{"default", "default"}},
-			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/meter"},
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Config:  telemetryv1alpha1.MetricsConfigSpec{Namespaces: []string{"default", "default"}},
+			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/metrics"},
 		},
 	}
 	input := Input{
-		Meter:  meter,
-		Global: Access{Read: []Credential{{Username: "reader", Password: []byte("s3cret")}}},
+		Metrics: metrics,
+		Global:  Access{Read: []Credential{{Username: "reader", Password: []byte("s3cret")}}},
 		Namespaces: []NamespaceAccess{{
 			Name: testTenantNamespace, KeyPrefix: "tenant-auth",
 			Access: Access{Write: []Credential{{Username: "writer", Password: []byte("tenant-secret"), DataKey: "namespace-tenant-auth-password"}}},
 		}},
-		InternalTokenPath: "/var/run/secrets/meter/internal-token",
+		InternalTokenPath: "/var/run/secrets/metrics/internal-token",
 		InternalToken:     []byte("token"),
 	}
 	result, err := Render(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rendered := string(result.Data[MeterKey])
+	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", testFlushIntervalConfig,
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		"shards: 1", "io_concurrency_limit: 128",
-		"type: Local", "path: /var/lib/meter/data",
-		"path_prefix: /meter",
-		"path: /etc/meter/secrets/global-read-0-password",
-		"path: /etc/meter/secrets/namespace-tenant-auth-password",
-		"path: /var/run/secrets/meter/internal-token",
+		"type: Local", "path: /var/lib/metrics/data",
+		"path_prefix: /metrics",
+		"path: /etc/metrics/secrets/global-read-0-password",
+		"path: /etc/metrics/secrets/namespace-tenant-auth-password",
+		"path: /var/run/secrets/metrics/internal-token",
 		"unauthenticated: false",
 	} {
 		if !strings.Contains(rendered, expected) {
@@ -88,31 +88,31 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 		key   string
 	}{
 		{
-			name: "meter",
-			input: Input{Meter: &telemetryv1alpha1.Meter{
-				Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+			name: "metrics",
+			input: Input{Metrics: &telemetryv1alpha1.Metrics{
+				Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
 				}},
 			}},
-			key: MeterKey,
+			key: MetricsKey,
 		},
 		{
-			name: "line",
-			input: Input{Line: &telemetryv1alpha1.Line{
-				Spec: telemetryv1alpha1.LineSpec{Config: telemetryv1alpha1.LineConfigSpec{
+			name: "logs",
+			input: Input{Logs: &telemetryv1alpha1.Logs{
+				Spec: telemetryv1alpha1.LogsSpec{Config: telemetryv1alpha1.LogsConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
 				}},
 			}},
-			key: LineKey,
+			key: LogsKey,
 		},
 		{
-			name: "track",
-			input: Input{Track: &telemetryv1alpha1.Track{
-				Spec: telemetryv1alpha1.TrackSpec{Config: telemetryv1alpha1.TrackConfigSpec{
+			name: "traces",
+			input: Input{Traces: &telemetryv1alpha1.Traces{
+				Spec: telemetryv1alpha1.TracesSpec{Config: telemetryv1alpha1.TracesConfigSpec{
 					Auth: telemetryv1alpha1.AuthSpec{Unauthenticated: true},
 				}},
 			}},
-			key: TrackKey,
+			key: TracesKey,
 		},
 	} {
 		t.Run(product.name, func(t *testing.T) {
@@ -127,27 +127,27 @@ func TestRenderExplicitUnauthenticatedAccess(t *testing.T) {
 	}
 }
 
-func TestRenderTrackShardedConfig(t *testing.T) {
-	track := &telemetryv1alpha1.Track{
+func TestRenderTracesShardedConfig(t *testing.T) {
+	traces := &telemetryv1alpha1.Traces{
 		ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: "observability"},
-		Spec: telemetryv1alpha1.TrackSpec{
-			Mode:    telemetryv1alpha1.TrackModeSharded,
+		Spec: telemetryv1alpha1.TracesSpec{
+			Mode:    telemetryv1alpha1.TracesModeSharded,
 			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/traces"},
 		},
 	}
 	result, err := Render(Input{
-		Track: track, InternalToken: []byte("token"),
+		Traces: traces, InternalToken: []byte("token"),
 		Namespaces: []NamespaceAccess{{
 			Name: testTenantNamespace,
 			Access: Access{Read: []Credential{{
-				Username: "tempo", Password: []byte("tenant-secret"), DataKey: "namespace-track-auth-password",
+				Username: "tempo", Password: []byte("tenant-secret"), DataKey: "namespace-traces-auth-password",
 			}}},
 		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer := string(result.Data[TrackKey])
+	writer := string(result.Data[TracesKey])
 	reader := string(result.Data[ReaderKey])
 	for _, expected := range []string{
 		"mode: writer",
@@ -166,114 +166,114 @@ func TestRenderTrackShardedConfig(t *testing.T) {
 		testWarmConcurrency,
 		testWarmPayloadsConfig,
 		"name: tenant-a",
-		"path: /etc/track/secrets/namespace-track-auth-password",
+		"path: /etc/traces/secrets/namespace-traces-auth-password",
 	} {
 		if !strings.Contains(writer, expected) {
-			t.Errorf("Track writer config missing %q:\n%s", expected, writer)
+			t.Errorf("Traces writer config missing %q:\n%s", expected, writer)
 		}
 	}
 	if !strings.Contains(reader, "mode: reader") {
-		t.Fatalf("Track reader config missing reader mode:\n%s", reader)
+		t.Fatalf("Traces reader config missing reader mode:\n%s", reader)
 	}
 	if strings.Contains(writer, "block_cache:") {
-		t.Fatalf("Track writer unexpectedly contains the default data cache:\n%s", writer)
+		t.Fatalf("Traces writer unexpectedly contains the default data cache:\n%s", writer)
 	}
 	if !strings.Contains(reader, "block_cache:") {
-		t.Fatalf("Track reader is missing the default data cache:\n%s", reader)
+		t.Fatalf("Traces reader is missing the default data cache:\n%s", reader)
 	}
-	if got := string(result.Data["namespace-track-auth-password"]); got != "tenant-secret" {
-		t.Fatalf("resolved Track namespace password = %q", got)
+	if got := string(result.Data["namespace-traces-auth-password"]); got != "tenant-secret" {
+		t.Fatalf("resolved Traces namespace password = %q", got)
 	}
 }
 
 func TestRenderShardedRoles(t *testing.T) {
 	ioConcurrencyLimit := int32(96)
-	meter := &telemetryv1alpha1.Meter{
-		ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
-		Spec: telemetryv1alpha1.MeterSpec{
-			Mode: telemetryv1alpha1.MeterModeSharded,
-			Config: telemetryv1alpha1.MeterConfigSpec{
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Mode: telemetryv1alpha1.MetricsModeSharded,
+			Config: telemetryv1alpha1.MetricsConfigSpec{
 				Sharding: telemetryv1alpha1.ShardingSpec{
 					IOConcurrencyLimit: &ioConcurrencyLimit,
 				},
 			},
 		},
 	}
-	result, err := Render(Input{Meter: meter, InternalToken: []byte("token")})
+	result, err := Render(Input{Metrics: metrics, InternalToken: []byte("token")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(result.Data[MeterKey]), "mode: writer") ||
-		!strings.Contains(string(result.Data[MeterKey]), "backend: kubernetes") ||
-		!strings.Contains(string(result.Data[MeterKey]), "shard_map: example-writer-shard-map") ||
-		!strings.Contains(string(result.Data[MeterKey]), "io_concurrency_limit: 96") ||
-		strings.Contains(string(result.Data[MeterKey]), "shards:") ||
+	if !strings.Contains(string(result.Data[MetricsKey]), "mode: writer") ||
+		!strings.Contains(string(result.Data[MetricsKey]), "backend: kubernetes") ||
+		!strings.Contains(string(result.Data[MetricsKey]), "shard_map: example-writer-shard-map") ||
+		!strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 96") ||
+		strings.Contains(string(result.Data[MetricsKey]), "shards:") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
-		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MeterKey], result.Data[ReaderKey])
+		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MetricsKey], result.Data[ReaderKey])
 	}
-	if strings.Contains(string(result.Data[MeterKey]), "block_cache:") {
-		t.Fatalf("Meter writer unexpectedly contains the default data cache:\n%s", result.Data[MeterKey])
+	if strings.Contains(string(result.Data[MetricsKey]), "block_cache:") {
+		t.Fatalf("Metrics writer unexpectedly contains the default data cache:\n%s", result.Data[MetricsKey])
 	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "block_cache:") {
-		t.Fatalf("Meter reader is missing the default data cache:\n%s", result.Data[ReaderKey])
+		t.Fatalf("Metrics reader is missing the default data cache:\n%s", result.Data[ReaderKey])
 	}
 }
 
-func TestRenderLineStandaloneAndShardedServerConfig(t *testing.T) {
-	line := &telemetryv1alpha1.Line{
-		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testMeterNamespace},
-		Spec: telemetryv1alpha1.LineSpec{
+func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
+	logs := &telemetryv1alpha1.Logs{
+		ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.LogsSpec{
 			Ingress: telemetryv1alpha1.IngressSpec{PathPrefix: "/logs"},
-			Config:  telemetryv1alpha1.LineConfigSpec{Namespaces: []string{testTenantNamespace}},
+			Config:  telemetryv1alpha1.LogsConfigSpec{Namespaces: []string{testTenantNamespace}},
 		},
 	}
-	result, err := Render(Input{Line: line, InternalToken: []byte("token")})
+	result, err := Render(Input{Logs: logs, InternalToken: []byte("token")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	rendered := string(result.Data[LineKey])
+	rendered := string(result.Data[LogsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
-		"type: SlateDb", "path: line", "path: /var/lib/line/data", "disk_path: /var/cache/line",
+		"type: SlateDb", "path: logs", "path: /var/lib/logs/data", "disk_path: /var/cache/logs",
 		"segment_duration_seconds: 3600", testFlushIntervalConfig,
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		"target_size_bytes: 1048576", "max_request_bytes: 10485760",
-		"path: /var/run/secrets/line/internal-token", "name: tenant-a", "path_prefix: /logs",
+		"path: /var/run/secrets/logs/internal-token", "name: tenant-a", "path_prefix: /logs",
 	} {
 		if !strings.Contains(rendered, expected) {
-			t.Errorf("rendered Line config missing %q:\n%s", expected, rendered)
+			t.Errorf("rendered Logs config missing %q:\n%s", expected, rendered)
 		}
 	}
 	for _, invalid := range []string{"reader_cache_capacity:", "visibility_interval_seconds:"} {
 		if strings.Contains(rendered, invalid) {
-			t.Errorf("rendered Line config contains unsupported field %q:\n%s", invalid, rendered)
+			t.Errorf("rendered Logs config contains unsupported field %q:\n%s", invalid, rendered)
 		}
 	}
 
-	line.Spec.Mode = telemetryv1alpha1.LineModeSharded
-	sharded, err := Render(Input{Line: line, InternalToken: []byte("token")})
+	logs.Spec.Mode = telemetryv1alpha1.LogsModeSharded
+	sharded, err := Render(Input{Logs: logs, InternalToken: []byte("token")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, reader := string(sharded.Data[LineKey]), string(sharded.Data[ReaderKey])
+	writer, reader := string(sharded.Data[LogsKey]), string(sharded.Data[ReaderKey])
 	for _, expected := range []string{"mode: writer", "backend: kubernetes", "owner_port: 9091", "stateful_set: logs-writer"} {
 		if !strings.Contains(writer, expected) {
 			t.Errorf("writer config missing %q:\n%s", expected, writer)
 		}
 	}
 	if !strings.Contains(reader, "mode: reader") || !strings.Contains(reader, "backend: kubernetes") {
-		t.Fatalf("unexpected Line reader config:\n%s", reader)
+		t.Fatalf("unexpected Logs reader config:\n%s", reader)
 	}
 	if strings.Contains(writer, "block_cache:") {
-		t.Fatalf("Line writer unexpectedly contains the default data cache:\n%s", writer)
+		t.Fatalf("Logs writer unexpectedly contains the default data cache:\n%s", writer)
 	}
 	if !strings.Contains(reader, "block_cache:") {
-		t.Fatalf("Line reader is missing the default data cache:\n%s", reader)
+		t.Fatalf("Logs reader is missing the default data cache:\n%s", reader)
 	}
 }
 
 func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
-	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MeterDescriptor, modeWriter)
+	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeWriter)
 	if defaultWriter.BlockCache != nil {
 		t.Fatal("writer storage contains the default data cache")
 	}
@@ -284,11 +284,11 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	spec := telemetryv1alpha1.StorageSpec{
 		BlockCache: &telemetryv1alpha1.CacheSpec{Type: telemetryv1alpha1.CacheFoyerHybrid},
 	}
-	writer := renderStorageConfigForMode(spec, resources.MeterDescriptor, modeWriter)
+	writer := renderStorageConfigForMode(spec, resources.MetricsDescriptor, modeWriter)
 	if writer.BlockCache == nil {
 		t.Fatal("writer discarded an explicitly configured data cache")
 	}
-	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MeterDescriptor, modeStandalone)
+	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone)
 	if standalone.BlockCache == nil {
 		t.Fatal("standalone storage is missing the default data cache")
 	}
@@ -312,31 +312,31 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 		key   string
 	}{
 		{
-			name: "meter",
-			input: Input{Meter: &telemetryv1alpha1.Meter{
-				Spec: telemetryv1alpha1.MeterSpec{
-					Config: telemetryv1alpha1.MeterConfigSpec{CacheWarmer: cacheWarmer},
+			name: "metrics",
+			input: Input{Metrics: &telemetryv1alpha1.Metrics{
+				Spec: telemetryv1alpha1.MetricsSpec{
+					Config: telemetryv1alpha1.MetricsConfigSpec{CacheWarmer: cacheWarmer},
 				},
 			}},
-			key: MeterKey,
+			key: MetricsKey,
 		},
 		{
-			name: "line",
-			input: Input{Line: &telemetryv1alpha1.Line{
-				Spec: telemetryv1alpha1.LineSpec{
-					Config: telemetryv1alpha1.LineConfigSpec{CacheWarmer: cacheWarmer},
+			name: "logs",
+			input: Input{Logs: &telemetryv1alpha1.Logs{
+				Spec: telemetryv1alpha1.LogsSpec{
+					Config: telemetryv1alpha1.LogsConfigSpec{CacheWarmer: cacheWarmer},
 				},
 			}},
-			key: LineKey,
+			key: LogsKey,
 		},
 		{
-			name: "track",
-			input: Input{Track: &telemetryv1alpha1.Track{
-				Spec: telemetryv1alpha1.TrackSpec{
-					Config: telemetryv1alpha1.TrackConfigSpec{CacheWarmer: cacheWarmer},
+			name: "traces",
+			input: Input{Traces: &telemetryv1alpha1.Traces{
+				Spec: telemetryv1alpha1.TracesSpec{
+					Config: telemetryv1alpha1.TracesConfigSpec{CacheWarmer: cacheWarmer},
 				},
 			}},
-			key: TrackKey,
+			key: TracesKey,
 		},
 	}
 	for _, product := range products {
@@ -366,7 +366,7 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 	chunkSize, maxFileSize := int64(2097152), int64(2147483648)
 	maxAppendGenerations, maxUnaryFileSize := int64(32), int64(4194304)
 	pseudofs := &telemetryv1alpha1.PseudoFS{
-		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testMeterNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testMetricsNamespace},
 		Spec: telemetryv1alpha1.PseudoFSSpec{
 			Config: telemetryv1alpha1.PseudoFSConfigSpec{
 				ChunkSizeBytes: &chunkSize, MaxFileSizeBytes: &maxFileSize,
@@ -423,7 +423,7 @@ func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
 					AllowHTTP: true, VirtualHostedStyle: true,
 				},
 			},
-			expected: []string{"type: Aws", "region: us-east-1", "bucket: meter", "endpoint: http://minio:9000", "allow_http: true", "virtual_hosted_style: true"},
+			expected: []string{"type: Aws", "region: us-east-1", "bucket: metrics", "endpoint: http://minio:9000", "allow_http: true", "virtual_hosted_style: true"},
 		},
 		{
 			name: "azure",
@@ -433,7 +433,7 @@ func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
 					Account: "telemetry", Container: testBucket, Endpoint: "http://azurite:10000/telemetry", AllowHTTP: true,
 				},
 			},
-			expected: []string{"type: Azure", "account: telemetry", "container: meter", "endpoint: http://azurite:10000/telemetry", "allow_http: true"},
+			expected: []string{"type: Azure", "account: telemetry", "container: metrics", "endpoint: http://azurite:10000/telemetry", "allow_http: true"},
 		},
 		{
 			name: "gcp",
@@ -441,23 +441,23 @@ func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
 				Type: telemetryv1alpha1.ObjectStoreGCP,
 				GCP:  &telemetryv1alpha1.GCPObjectStoreSpec{Bucket: testBucket, BaseURL: "http://gcs:4443"},
 			},
-			expected: []string{"type: Gcp", "bucket: meter", "base_url: http://gcs:4443"},
+			expected: []string{"type: Gcp", "bucket: metrics", "base_url: http://gcs:4443"},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			meter := &telemetryv1alpha1.Meter{
-				ObjectMeta: metav1.ObjectMeta{Name: testMeterName, Namespace: testMeterNamespace},
-				Spec: telemetryv1alpha1.MeterSpec{Config: telemetryv1alpha1.MeterConfigSpec{
+			metrics := &telemetryv1alpha1.Metrics{
+				ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+				Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{
 					Storage: telemetryv1alpha1.StorageSpec{ObjectStore: test.objectStore},
 				}},
 			}
-			result, err := Render(Input{Meter: meter, InternalToken: []byte("token")})
+			result, err := Render(Input{Metrics: metrics, InternalToken: []byte("token")})
 			if err != nil {
 				t.Fatal(err)
 			}
-			rendered := string(result.Data[MeterKey])
+			rendered := string(result.Data[MetricsKey])
 			for _, expected := range test.expected {
 				if !strings.Contains(rendered, expected) {
 					t.Errorf("rendered config missing %q:\n%s", expected, rendered)

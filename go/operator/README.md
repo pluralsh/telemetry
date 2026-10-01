@@ -1,7 +1,7 @@
 # Telemetry Operator
 
 ## Description
-The Telemetry Operator manages `Meter` metric stores, `Line` log stores, `Track`
+The Telemetry Operator manages `Metrics` metric stores, `Logs` log stores, `Traces`
 trace stores, and their `NamespaceAuthentication` credentials. It renders product configuration, creates
 internal credentials, and reconciles the Services, StatefulSets, and
 namespace-scoped RBAC required by standalone or sharded deployments.
@@ -15,7 +15,7 @@ fields to different values. When neither is set, the operator uses the
 `--default-product-version` value supplied at startup. Release builds default
 that flag to their own version.
 `spec.image.repository` defaults to
-`ghcr.io/pluralsh/meter`, `ghcr.io/pluralsh/line`, or `ghcr.io/pluralsh/track`, and
+`ghcr.io/pluralsh/metrics`, `ghcr.io/pluralsh/logs`, or `ghcr.io/pluralsh/traces`, and
 `spec.image.pullPolicy` defaults to `IfNotPresent`. These first-class image
 settings override image values in the product container inside `podTemplate`.
 
@@ -68,7 +68,7 @@ including optional `sizeLimit`. Persistent claims are mounted through fixed
 shrinking or changing immutable claim properties is rejected without deleting
 existing PVCs.
 
-The operator creates one ServiceAccount per Meter, Line, or Track and assigns it to every
+The operator creates one ServiceAccount per Metrics, Logs, or Traces and assigns it to every
 managed workload. Use `spec.serviceAccount.annotations` for cloud identity
 integrations such as AWS IRSA, Azure workload identity, or GKE workload
 identity.
@@ -79,10 +79,10 @@ identity.
 spec:
   ingress:
     enabled: true
-    hostname: meter.example.com
+    hostname: metrics.example.com
     ingressClass: nginx
     # Optional when sharing a hostname with another application.
-    pathPrefix: /meter
+    pathPrefix: /metrics
     metadata:
       annotations:
         cert-manager.io/cluster-issuer: letsencrypt
@@ -90,8 +90,8 @@ spec:
         app.kubernetes.io/part-of: telemetry
     tls:
       enabled: true
-      # Defaults to <meter-name>-tls when omitted.
-      secretName: meter-tls
+      # Defaults to <metrics-name>-tls when omitted.
+      secretName: metrics-tls
 ```
 
 The operator routes `{pathPrefix}/write` to the writer Service and
@@ -145,23 +145,23 @@ apply the resources:
 
 ```sh
 kubectl create secret generic prometheus-basic-auth --from-literal=password=change-me
-kubectl create secret generic meter-s3 \
+kubectl create secret generic metrics-s3 \
   --from-literal=access-key-id=change-me \
   --from-literal=secret-access-key=change-me
 kubectl apply -k config/samples/
 ```
 
-Meter object stores support AWS S3 (including custom S3-compatible endpoints),
+Metrics object stores support AWS S3 (including custom S3-compatible endpoints),
 Azure Blob Storage, and Google Cloud Storage. Static credentials are always
-referenced from Kubernetes Secrets and injected directly into Meter containers;
-they are not copied into the generated Meter configuration. Credential
+referenced from Kubernetes Secrets and injected directly into Metrics containers;
+they are not copied into the generated Metrics configuration. Credential
 references can be omitted to use ambient cloud identity such as AWS IRSA, Azure
 managed/workload identity, or Google application default credentials. See the
 [CRD API reference](docs/api.md) for each provider's endpoint and authentication
 fields and the [object-store authentication guide](docs/object-store-authentication.md)
 for complete examples.
 
-Meter, Line, and Track namespace HTTP APIs are authenticated by default. Omitted
+Metrics, Logs, and Traces namespace HTTP APIs are authenticated by default. Omitted
 `spec.config.auth.unauthenticated` renders `false`; set it to `true` only when
 anonymous reads and writes are intentional. Health and readiness remain public.
 
