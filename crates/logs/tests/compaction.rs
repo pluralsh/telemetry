@@ -18,6 +18,7 @@ fn config(path: &str, enabled: bool) -> Config {
             meta_cache: None,
         }),
         segment_duration: Duration::from_secs(10),
+        discovery_rollup: Some(Duration::from_secs(20)),
         retention: None,
         write_buffer: Default::default(),
         page: PageConfig {

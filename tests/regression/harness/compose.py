@@ -85,10 +85,18 @@ class ComposeProject:
             else:
                 print(output)
 
+    def save_logs(self, path: Path) -> None:
+        try:
+            path.write_text(self.execute("logs", "--no-color", "--timestamps", timeout=120))
+        except Exception as error:
+            print(f"could not save compose logs to {path}: {error}")
+
     def stop(self) -> None:
         if not self._started:
             return
         try:
+            if logs := os.getenv("REGRESSION_COMPOSE_LOGS"):
+                self.save_logs(Path(logs))
             self.execute("down", "--volumes", "--remove-orphans", timeout=180)
         finally:
             self._started = False

@@ -147,7 +147,7 @@ impl ShardedTraces {
                     .await?,
             );
         }
-        Ok(crate::db::merge_traces(parts).pop())
+        Ok(crate::db::merge_traces(parts)?.pop())
     }
 
     pub async fn search(
@@ -166,7 +166,7 @@ impl ShardedTraces {
         let multiple_shards = per_shard.len() > 1;
         let mut results = per_shard.into_iter().flatten().collect::<Vec<_>>();
         if multiple_shards {
-            results = crate::db::merge_traces(results);
+            results = crate::db::merge_traces(results)?;
         }
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         Ok(results)

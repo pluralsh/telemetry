@@ -20,6 +20,9 @@ pub struct EvalInstantCmd {
     pub query: String,
     pub expected: Vec<RangeSample>,
     pub expect_ordered: bool,
+    /// `expect fail [msg:<text>]`: the query must error, and the error must
+    /// contain `<text>` when given.
+    pub expect_fail: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,7 @@ impl Parser {
 
         let mut expected = Vec::new();
         let mut expect_ordered = false;
+        let mut expect_fail = None;
 
         // Collect indented expected result lines
         while *i < lines.len() {
@@ -169,10 +173,16 @@ impl Parser {
                 continue;
             }
 
-            // We only implement ordering for now; other directives remain no-ops.
+            // Only ordering and failure are implemented; other directives remain no-ops.
             if trimmed.starts_with("expect ") {
                 if trimmed == "expect ordered" {
                     expect_ordered = true;
+                } else if let Some(rest) = trimmed.strip_prefix("expect fail") {
+                    let msg = rest
+                        .trim()
+                        .strip_prefix("msg:")
+                        .map(|m| m.trim().to_string());
+                    expect_fail = Some(msg);
                 }
                 *i += 1;
                 continue;
@@ -187,6 +197,7 @@ impl Parser {
             query,
             expected,
             expect_ordered,
+            expect_fail,
         })))
     }
 

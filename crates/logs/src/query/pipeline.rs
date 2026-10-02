@@ -89,7 +89,7 @@ pub(super) fn line_filter(line: &str, filter: &LineFilter) -> Result<bool> {
                 with_regex(RegexKind::Plain, term, |regex| regex.is_match(line))?
             }
             (LineFilterOp::Pattern | LineFilterOp::NotPattern, _) => {
-                with_regex(RegexKind::Pattern, term, |regex| regex.is_match(line))?
+                pattern_line_matches(term, line)
             }
         };
         if found {
@@ -566,6 +566,72 @@ pub(super) fn unpack(line: &str) -> Result<(String, BTreeMap<String, String>)> {
     Ok((unpacked, labels))
 }
 
+enum PatternPart<'a> {
+    Literal(&'a str),
+    Capture,
+}
+
+/// Splits a pattern as Loki's lexer does: only `<identifier>` is a capture,
+/// any other `<` is literal text.
+fn pattern_parts(pattern: &str) -> impl Iterator<Item = PatternPart<'_>> {
+    let mut rest = pattern;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(length) = capture_length(rest) {
+            rest = &rest[length..];
+            return Some(PatternPart::Capture);
+        }
+        let end = rest
+            .match_indices('<')
+            .map(|(index, _)| index)
+            .find(|&index| index > 0 && capture_length(&rest[index..]).is_some())
+            .unwrap_or(rest.len());
+        let literal = &rest[..end];
+        rest = &rest[end..];
+        Some(PatternPart::Literal(literal))
+    })
+}
+
+fn capture_length(input: &str) -> Option<usize> {
+    let body = input.strip_prefix('<')?;
+    let end = body.find('>')?;
+    let mut name = body[..end].chars();
+    let first = name.next()?;
+    ((first.is_ascii_alphabetic() || first == '_')
+        && name.all(|char| char.is_ascii_alphanumeric() || char == '_'))
+    .then_some(end + 2)
+}
+
+/// Loki's `|>` matcher (`pattern.Matcher.Test`): each literal binds to its
+/// first occurrence without backtracking, captures must be non-empty, and a
+/// trailing literal must end the line while a trailing capture must not.
+pub(super) fn pattern_line_matches(pattern: &str, line: &str) -> bool {
+    let mut offset = 0;
+    let mut ends_on_capture = None;
+    for (index, part) in pattern_parts(pattern).enumerate() {
+        match part {
+            PatternPart::Capture => ends_on_capture = Some(true),
+            PatternPart::Literal(literal) => {
+                ends_on_capture = Some(false);
+                let Some(found) = line[offset..].find(literal) else {
+                    return false;
+                };
+                if index != 0 && found == 0 {
+                    return false;
+                }
+                offset += found + literal.len();
+            }
+        }
+    }
+    match ends_on_capture {
+        None => line.is_empty(),
+        Some(_) if line.is_empty() => false,
+        Some(ends_on_capture) => ends_on_capture == (offset != line.len()),
+    }
+}
+
 /// Loki's pattern parser, which is lenient unlike the `|>` filter: a leading
 /// literal must match, then each capture runs to the next literal, and a
 /// missing literal ends the match with the capture taking the rest.
@@ -708,9 +774,12 @@ pub(super) fn compare_filter(
         let (FilterValue::String(expected) | FilterValue::Identifier(expected)) = expected else {
             return Ok(false);
         };
-        let matched = with_regex(RegexKind::Anchored, expected, |regex| {
-            regex.is_match(actual)
-        })?;
+        let matched = match label_regex_filter(expected) {
+            Some(filter) => filter.matches(actual),
+            None => with_regex(RegexKind::Anchored, expected, |regex| {
+                regex.is_match(actual)
+            })?,
+        };
         return Ok(if op == ComparisonOp::Regex {
             matched
         } else {

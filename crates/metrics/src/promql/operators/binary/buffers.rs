@@ -75,7 +75,7 @@ pub(super) struct BufferedSide {
     reservation: MemoryReservation,
     bytes: usize,
     pub(super) step_count: usize,
-    total_series: usize,
+    pub(super) total_series: usize,
     values: Vec<f64>,
     validity: BitSet,
     /// Allocated on the first absorbed batch carrying histograms.

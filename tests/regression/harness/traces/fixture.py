@@ -21,6 +21,8 @@ from opentelemetry.proto.trace.v1.trace_pb2 import (
     Status,
 )
 
+SHARDS = 2
+"""Storage shards in the regression configs: one per writer."""
 TRACE_IDS = (
     "11111111111111111111111111111111",
     "22222222222222222222222222222222",
@@ -134,13 +136,12 @@ def fixture_shard(trace_id: str, namespace: str = "regression") -> int:
         + namespace_bytes
         + bytes.fromhex(trace_id)
     ).digest()
-    return (int.from_bytes(digest[:16], "big") * 16) >> 128
+    return (int.from_bytes(digest[:16], "big") * SHARDS) >> 128
 
 
 def assert_spans_writer_ranges(trace_ids: tuple[str, ...] = TRACE_IDS) -> None:
     shards = {fixture_shard(trace_id) for trace_id in trace_ids}
-    assert any(shard < 8 for shard in shards)
-    assert any(shard >= 8 for shard in shards)
+    assert shards == {0, 1}
 
 
 def zipkin_fixture(base_ns: int) -> list[dict[str, object]]:

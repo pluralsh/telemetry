@@ -32,7 +32,7 @@ def test_fixture_is_deterministic_and_spans_writer_ranges() -> None:
     assert value == regression_fixture(BASE_MS)
     assert len(value) == 8
     assert_spans_writer_ranges(value)
-    assert {fixture_shard(item) < 8 for item in value} == {False, True}
+    assert {fixture_shard(item) for item in value} == {0, 1}
 
 
 def test_remote_write_is_snappy_protobuf() -> None:

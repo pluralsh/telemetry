@@ -694,9 +694,9 @@ fn should_build_nested_aggregate_of_rollup() {
 }
 
 #[test]
-fn should_reject_count_values_under_schema_sensitive_parent() {
-    // given: `sum by (label) (count_values("v", m))` — the Aggregate parent
-    // needs a static-schema child.
+fn should_plan_count_values_under_schema_sensitive_parent() {
+    // given: `sum(count_values("v", m))` — the Aggregate parent needs a
+    // static-schema child.
     let source = Arc::new(MockSource::new(vec![(
         labels_of(&[("__name__", "m")]),
         vec![(0, 1.0)],
@@ -721,14 +721,14 @@ fn should_reject_count_values_under_schema_sensitive_parent() {
     let reservation = MemoryReservation::new(1 << 20);
     let rt = mk_rt();
     // when
-    let err = rt
+    let plan = rt
         .block_on(build(plan, &source, &reservation, &ctx))
-        .unwrap_err();
-    // then: explicit InvalidMatching rejecting the deferred child
-    match err {
-        PlanError::InvalidMatching(_) => {}
-        other => panic!("unexpected error: {other:?}"),
-    }
+        .expect("count_values is materialised for its parent");
+    // then: one group summing the single count_values series
+    assert_eq!(
+        plan.output_schema.as_static().expect("static schema").len(),
+        1
+    );
 }
 
 #[test]

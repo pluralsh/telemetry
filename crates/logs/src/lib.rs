@@ -1,7 +1,8 @@
 //! Logs' single-node log storage core.
 //!
-//! Logs stores immutable compressed pages and namespace/time-segment-scoped
-//! indexes in SlateDB and evaluates LogQL locally over bounded page scans.
+//! Logs stores immutable multi-stream objects of compressed row blocks and
+//! namespace/time-segment-scoped indexes in SlateDB and evaluates LogQL
+//! locally over bounded block reads.
 
 mod analyzer;
 mod codec;
@@ -11,7 +12,7 @@ mod db;
 mod error;
 pub mod logql;
 mod model;
-mod page;
+mod object;
 mod query;
 pub mod routing;
 mod search;
@@ -23,7 +24,6 @@ pub use config::{CompactionConfig, Config, PageConfig};
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};
-pub use page::{BlockMetadata, Page, PageBuilder};
 pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,
     QueryRequest, QueryResult, Sample, VectorSample,

@@ -5,10 +5,9 @@ pub(super) enum RegexKind {
     Plain,
     /// Matches the whole input, as LogQL label matchers do.
     Anchored,
-    Pattern,
 }
 
-pub(super) const REGEX_KINDS: usize = 3;
+pub(super) const REGEX_KINDS: usize = 2;
 pub(super) const REGEX_CACHE_CAPACITY: usize = 256;
 
 thread_local! {
@@ -31,7 +30,6 @@ pub(super) fn with_regex<T>(
         let regex = match kind {
             RegexKind::Plain => Regex::new(source)?,
             RegexKind::Anchored => Regex::new(&format!("^(?:{source})$"))?,
-            RegexKind::Pattern => pattern_regex(source)?,
         };
         let result = f(&regex);
         let mut caches = caches.borrow_mut();
@@ -41,6 +39,26 @@ pub(super) fn with_regex<T>(
         }
         cache.insert(source.to_owned(), regex);
         Ok(result)
+    })
+}
+
+thread_local! {
+    static LABEL_REGEX_CACHE: RefCell<HashMap<String, Option<Rc<LabelRegexFilter>>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(super) fn label_regex_filter(source: &str) -> Option<Rc<LabelRegexFilter>> {
+    LABEL_REGEX_CACHE.with(|cache| {
+        if let Some(filter) = cache.borrow().get(source) {
+            return filter.clone();
+        }
+        let filter = simplify_label_regex(source).map(Rc::new);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(source.to_owned(), filter.clone());
+        filter
     })
 }
 
@@ -62,22 +80,4 @@ pub(super) fn match_terms(query: &str) -> Rc<[String]> {
         cache.insert(query.to_owned(), Rc::clone(&terms));
         terms
     })
-}
-
-/// The anchored regex behind the `|>` / `!>` line filters, where every
-/// `<capture>` matches lazily.
-pub(super) fn pattern_regex(pattern: &str) -> Result<Regex> {
-    let mut source = String::new();
-    let mut rest = pattern;
-    while let Some(start) = rest.find('<') {
-        let Some(relative_end) = rest[start + 1..].find('>') else {
-            break;
-        };
-        let end = start + relative_end + 1;
-        source.push_str(&regex::escape(&rest[..start]));
-        source.push_str(".*?");
-        rest = &rest[end + 1..];
-    }
-    source.push_str(&regex::escape(rest));
-    Regex::new(&format!("(?s)^{source}$")).map_err(Into::into)
 }

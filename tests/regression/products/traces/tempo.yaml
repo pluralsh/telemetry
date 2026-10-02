@@ -27,12 +27,16 @@ ingester:
 
 compactor:
   compaction:
-    block_retention: 1h
+    # Long differential fuzz runs query data from the start of the run.
+    block_retention: 24h
 
 storage:
   trace:
     backend: local
     wal:
       path: /var/tempo/wal
+      # Fuzz data is backdated across its window; with the 2m default, older
+      # spans do not widen block time ranges and time-ranged search skips them.
+      ingestion_time_range_slack: 24h
     local:
       path: /var/tempo/blocks

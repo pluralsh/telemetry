@@ -77,21 +77,23 @@ storage:
 segment_duration_seconds: 3600 # Time partition width; keep stable for a dataset.
 retention_seconds: 2592000 # Optional logical retention; 30 days.
 
-# Each write-buffer flush cuts at least one page per written stream; these
-# limits split larger flushes further.
+# Each write-buffer flush packs every written stream of a segment into
+# multi-stream objects; these limits cut larger flushes into several objects.
 page:
-  target_size_bytes: 1048576 # Preferred compressed page size; 1 MiB.
-  max_rows: 16384 # Maximum rows in a page.
-  rows_per_block: 256 # Independently decoded block size.
+  target_size_bytes: 1048576 # Preferred object size; 1 MiB.
+  max_rows: 16384 # Maximum rows in an object.
+  rows_per_block: 256 # Rows per independently decoded single-stream block.
 
-# Writer-side merging of each stream's small pages after write-buffer flushes.
+# Writer-side merging of each segment's small objects after write-buffer flushes.
 compaction:
   enabled: true
-  fan_in: 4 # Consecutive same-level pages merged into one; at least 2.
-  min_age_seconds: 30 # Age of a flushed page before its first merge.
-  # After a segment ends, merge its remaining small pages regardless of fan_in.
+  # Adjacent same-level objects merged into one; at least 2. Fewer merge when
+  # the next would push the result past the page limits.
+  fan_in: 8
+  min_age_seconds: 30 # Age of a flushed object before its first merge.
+  # After a segment ends, merge its remaining small objects regardless of fan_in.
   finalize_after_seconds: 300
-  # Replaced payloads stay readable this long for in-flight queries and
+  # Replaced objects stay readable this long for in-flight queries and
   # read replicas; keep it above the longest query and replica lag.
   delete_delay_seconds: 600
   max_merges_per_flush: 256
@@ -148,13 +150,10 @@ sharding:
 request:
   max_request_bytes: 10485760 # Maximum ingestion body; 10 MiB.
   max_query_entries: 5000 # Maximum log entries returned.
-  max_query_pages: 10000 # Maximum pages scanned by one query.
+  max_query_pages: 10000 # Maximum read units (object block ranges) per query.
   max_structured_metadata_fields: 128 # Per-entry metadata field limit.
   query_concurrency: 16 # Concurrent query work.
   max_in_flight_query_bytes: 134217728 # Query memory budget; 128 MiB.
-
-cache:
-  query_entries: 256 # Serialized query responses; 0 disables the cache.
 
 auth:
   unauthenticated: false # Require credentials for namespace APIs.

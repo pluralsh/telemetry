@@ -1,0 +1,62 @@
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_server_max_recv_msg_size: 33554432
+
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  filesystem:
+    directory: /loki/chunks
+
+# Results caching would serve stale answers once later rounds backfill older
+# timestamps, which the fuzzer does deliberately.
+query_range:
+  cache_results: false
+  # Sharding rewrites avg_over_time(... | unwrap x) by (...) into
+  # sum_over_time / count_over_time with the unwrap stripped from the count,
+  # so lines missing the label deflate the average. Compare against the
+  # engine's own semantics instead.
+  parallelise_shardable_queries: false
+
+limits_config:
+  allow_structured_metadata: true
+  discover_log_levels: false
+  discover_service_name: []
+  reject_old_samples: false
+  unordered_writes: true
+  # Generated rounds are bursty and high-cardinality; the oracle must accept
+  # everything the implementation accepts or every later query diverges.
+  ingestion_rate_mb: 512
+  ingestion_burst_size_mb: 1024
+  per_stream_rate_limit: 512MB
+  per_stream_rate_limit_burst: 1GB
+  max_global_streams_per_user: 0
+  max_streams_per_user: 0
+  # A burst past the desired stream rate otherwise splits the stream into
+  # `__stream_shard__` series that only the oracle reports.
+  shard_streams:
+    enabled: false
+  max_query_series: 100000
+  max_entries_limit_per_query: 5000
+  max_cache_freshness_per_query: 24h
+
+analytics:
+  reporting_enabled: false

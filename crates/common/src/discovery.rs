@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ struct CacheEntry<V> {
 /// partitions use a short TTL so newly written terms become visible.
 pub struct DiscoveryCache<K, V> {
     entries: Mutex<HashMap<K, CacheEntry<V>>>,
+    generation: AtomicU64,
     capacity: usize,
     active_ttl: Duration,
 }
@@ -46,9 +48,16 @@ where
     pub fn new(capacity: usize, active_ttl: Duration) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
             capacity: capacity.max(1),
             active_ttl,
         }
+    }
+
+    /// Token taken before a storage read whose result is later passed to
+    /// [`Self::insert_since`].
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn get(&self, key: &K) -> Option<Arc<V>> {
@@ -70,9 +79,19 @@ where
     }
 
     pub fn insert(&self, key: K, value: V, active: bool) -> Arc<V> {
+        let generation = self.generation();
+        self.insert_since(generation, key, value, active)
+    }
+
+    /// Caches `value` only if nothing was invalidated since `generation`
+    /// was taken, so a read that raced a write cannot pin stale results.
+    pub fn insert_since(&self, generation: u64, key: K, value: V, active: bool) -> Arc<V> {
         let now = Instant::now();
         let value = Arc::new(value);
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.generation.load(Ordering::Acquire) != generation {
+            return value;
+        }
         entries.retain(|_, entry| entry.expires_at.is_none_or(|expiry| expiry > now));
         if entries.len() >= self.capacity
             && let Some(oldest) = entries.keys().next().cloned()
@@ -90,10 +109,24 @@ where
     }
 
     pub fn clear(&self) {
+        self.invalidate(|_| true);
+    }
+
+    /// Drops every entry whose key matches `stale` and fences reads still in
+    /// flight, which would otherwise re-cache the pre-write state forever.
+    pub fn invalidate(&self, mut stale: impl FnMut(&K) -> bool) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        entries.retain(|key, _| !stale(key));
+    }
+
+    /// Drops every entry whose key matches `stale` without fencing in-flight
+    /// reads. Only for active partitions, whose entries expire on their own.
+    pub fn evict(&self, mut stale: impl FnMut(&K) -> bool) {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+            .retain(|key, _| !stale(key));
     }
 }
 
@@ -555,5 +588,26 @@ mod tests {
 
         assert_eq!(cache.get(&"closed").unwrap().as_slice(), &["stable"]);
         assert!(cache.get(&"active").is_none());
+    }
+
+    #[test]
+    fn discovery_cache_invalidates_selected_keys_and_fences_inflight_reads() {
+        let cache = DiscoveryCache::new(8, Duration::from_secs(60));
+        cache.insert("a", 1, false);
+        cache.insert("b", 2, false);
+
+        let before = cache.generation();
+        cache.invalidate(|key| *key == "a");
+        assert!(cache.get(&"a").is_none());
+        assert_eq!(*cache.get(&"b").unwrap(), 2);
+
+        assert_eq!(*cache.insert_since(before, "a", 3, false), 3);
+        assert!(cache.get(&"a").is_none());
+
+        let after = cache.generation();
+        cache.evict(|key| *key == "b");
+        assert!(cache.get(&"b").is_none());
+        cache.insert_since(after, "a", 4, false);
+        assert_eq!(*cache.get(&"a").unwrap(), 4);
     }
 }

@@ -13,6 +13,10 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, Storage
 pub struct Config {
     pub storage: StorageConfig,
     pub segment_duration: Duration,
+    /// Period of the discovery rollup, which answers label and series
+    /// requests for whole periods without walking their segments. A whole
+    /// multiple of `segment_duration`; `None` disables it.
+    pub discovery_rollup: Option<Duration>,
     pub retention: Option<Duration>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
@@ -60,6 +64,7 @@ impl Default for Config {
                 meta_cache: None,
             }),
             segment_duration: Duration::from_secs(60 * 60),
+            discovery_rollup: Some(Duration::from_secs(24 * 60 * 60)),
             retention: None,
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
@@ -82,7 +87,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            fan_in: 4,
+            fan_in: 8,
             min_age: Duration::from_secs(30),
             finalize_after: Duration::from_secs(5 * 60),
             delete_delay: Duration::from_secs(10 * 60),
@@ -96,6 +101,13 @@ impl Config {
         if self.segment_duration.is_zero() {
             return Err(crate::Error::Invalid(
                 "segment_duration must be positive".to_owned(),
+            ));
+        }
+        if let Some(rollup) = self.discovery_rollup
+            && (rollup.is_zero() || rollup.as_nanos() % self.segment_duration.as_nanos() != 0)
+        {
+            return Err(crate::Error::Invalid(
+                "discovery_rollup must be a whole multiple of segment_duration".to_owned(),
             ));
         }
         if self.page.target_size_bytes == 0

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -41,18 +41,11 @@ pub struct AppState {
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(crate) ingest: IngestPipeline,
     channels: Arc<ChannelPool>,
-    query_cache: Arc<tokio::sync::Mutex<QueryCache>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     cache_warmed: Arc<AtomicBool>,
     cancellation: CancellationToken,
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
-}
-
-#[derive(Default)]
-struct QueryCache {
-    values: HashMap<String, serde_json::Value>,
-    order: VecDeque<String>,
 }
 
 impl AppState {
@@ -143,7 +136,6 @@ impl AppState {
             completed_requests: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             ingest,
             channels: Arc::new(ChannelPool::default()),
-            query_cache: Arc::new(tokio::sync::Mutex::new(QueryCache::default())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
@@ -269,36 +261,6 @@ impl AppState {
         self.dirty.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn cached_query(&self, key: &str) -> Option<serde_json::Value> {
-        if self.config.retention_seconds.is_some() {
-            return None;
-        }
-        self.query_cache.lock().await.values.get(key).cloned()
-    }
-
-    pub(crate) async fn cache_query(&self, key: String, value: serde_json::Value) {
-        let capacity = self.config.cache.query_entries;
-        if capacity == 0 || self.config.retention_seconds.is_some() {
-            return;
-        }
-        let mut cache = self.query_cache.lock().await;
-        if !cache.values.contains_key(&key) {
-            cache.order.push_back(key.clone());
-        }
-        cache.values.insert(key, value);
-        while cache.values.len() > capacity {
-            if let Some(oldest) = cache.order.pop_front() {
-                cache.values.remove(&oldest);
-            }
-        }
-    }
-
-    pub(crate) async fn invalidate_queries(&self) {
-        let mut cache = self.query_cache.lock().await;
-        cache.values.clear();
-        cache.order.clear();
-    }
-
     pub(crate) async fn route_write(
         &self,
         namespace: &Namespace,
@@ -335,7 +297,6 @@ impl AppState {
             .write_with_durability(namespace, batches, durability)
             .await?;
         self.mark_dirty();
-        self.invalidate_queries().await;
         Ok(())
     }
 
@@ -437,14 +398,12 @@ impl AppState {
                 tokio::select! {
                     () = state.cancellation.cancelled() => break,
                     _ = interval.tick() => {
-                        if state.dirty.swap(false, Ordering::AcqRel) {
-                            if let Err(error) = state.db.flush().await {
-                                state.ready.store(false, Ordering::Release);
-                                state.dirty.store(true, Ordering::Release);
-                                tracing::error!(%error, "Logs durable flush failed");
-                            } else {
-                                state.invalidate_queries().await;
-                            }
+                        if state.dirty.swap(false, Ordering::AcqRel)
+                            && let Err(error) = state.db.flush().await
+                        {
+                            state.ready.store(false, Ordering::Release);
+                            state.dirty.store(true, Ordering::Release);
+                            tracing::error!(%error, "Logs durable flush failed");
                         }
                     }
                 }
@@ -556,23 +515,6 @@ mod tests {
             map.assignments.clone(),
         )
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn retention_disables_response_cache_that_could_resurrect_rows() {
-        let state = AppState::open(Config {
-            storage: StorageConfig::InMemory,
-            retention_seconds: Some(60),
-            ..Config::default()
-        })
-        .await
-        .unwrap();
-        state
-            .cache_query("query".into(), serde_json::json!({"cached": true}))
-            .await;
-        assert_eq!(state.cached_query("query").await, None);
-        assert!(state.query_cache.lock().await.values.is_empty());
-        state.shutdown().await.unwrap();
     }
 
     #[tokio::test]

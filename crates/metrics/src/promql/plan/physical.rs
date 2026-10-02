@@ -13,11 +13,9 @@
 //! [`super::parallelism`].
 //!
 //! [`CountValuesOp`] publishes [`SchemaRef::Deferred`] because its
-//! output labels depend on sample values. The planner rejects
-//! compositions that sink a `Deferred` child under a parent that needs a
-//! `Static` schema at plan time (aggregate, binary, rollup, instant-fn,
-//! ...) with [`PlanError::InvalidMatching`]. Only root-positioned
-//! `CountValues` is supported in v1.
+//! output labels depend on sample values. It already buffers its whole
+//! input, so the planner runs it to completion while planning and hands
+//! parents its concrete schema (see [`materialize`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,7 +32,9 @@ use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::operators::absent::AbsentOp;
 use super::super::operators::aggregate::{AggregateKind, AggregateOp, GroupMap};
-use super::super::operators::binary::{BinaryOp, BinaryOpKind, ConstScalarOp, MatchTable};
+use super::super::operators::binary::{
+    BinaryOp, BinaryOpKind, ConstScalarOp, MatchTable, PartnerGroups, SetMatch,
+};
 use super::super::operators::coercion::{ScalarizeOp, TimeScalarOp};
 use super::super::operators::concurrent::ConcurrentOp;
 use super::super::operators::count_values::CountValuesOp;
@@ -713,8 +713,15 @@ where
             let lhs_schema = static_schema(&lhs_op.schema().series)?.clone();
             let rhs_schema = static_schema(&rhs_op.schema().series)?.clone();
             let include_name = preserves_metric_name(op);
-            let built =
-                build_match_table(&lhs_schema, &rhs_schema, matching.as_ref(), include_name)?;
+            let built = match op {
+                BinaryOpKind::And | BinaryOpKind::Or | BinaryOpKind::Unless => build_set_match(
+                    &lhs_schema,
+                    &rhs_schema,
+                    matching.as_ref(),
+                    op == BinaryOpKind::Or,
+                ),
+                _ => build_match_table(&lhs_schema, &rhs_schema, matching.as_ref(), include_name)?,
+            };
             let op_box = BinaryOp::<BoxedOp, BoxedOp>::new_vector_vector(
                 BoxedOp(lhs_op),
                 BoxedOp(rhs_op),
@@ -722,7 +729,8 @@ where
                 built.table,
                 built.output_schema,
                 reservation.clone(),
-            );
+            )
+            .with_partner_groups(built.partners);
             Ok(wrap_op(Box::new(op_box), "Binary", ctx))
         }
     }
@@ -817,7 +825,44 @@ where
         group_labels_arc,
         reservation.clone(),
     );
-    Ok(wrap_op(Box::new(op), "CountValues", ctx))
+    materialize(wrap_op(Box::new(op), "CountValues", ctx)).await
+}
+
+/// Runs a [`SchemaRef::Deferred`] operator to completion so its parent can
+/// plan against the series it produced, then replays its batches.
+async fn materialize(
+    mut op: Box<dyn Operator + Send>,
+) -> Result<Box<dyn Operator + Send>, PlanError> {
+    let step_grid = op.schema().step_grid;
+    let mut batches = Vec::new();
+    while let Some(batch) = std::future::poll_fn(|cx| op.next(cx)).await {
+        batches.push(batch.map_err(map_source_err)?);
+    }
+    let series = batches
+        .first()
+        .map_or_else(SchemaRef::empty_static, |batch| batch.series.clone());
+    Ok(Box::new(Materialized {
+        schema: OperatorSchema::new(series, step_grid),
+        batches: batches.into_iter(),
+    }))
+}
+
+struct Materialized {
+    schema: OperatorSchema,
+    batches: std::vec::IntoIter<super::super::batch::StepBatch>,
+}
+
+impl Operator for Materialized {
+    fn schema(&self) -> &OperatorSchema {
+        &self.schema
+    }
+
+    fn next(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<super::super::batch::StepBatch, QueryError>>> {
+        std::task::Poll::Ready(self.batches.next().map(Ok))
+    }
 }
 
 fn is_trivial_grouping(grouping: &AggregateGrouping) -> bool {

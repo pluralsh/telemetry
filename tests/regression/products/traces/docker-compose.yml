@@ -21,11 +21,16 @@ x-traces: &traces
 
 services:
   tempo:
-    image: grafana/tempo:2.8.2
+    # The fuzzer overrides this with a release that has Tempo's empty-LHS
+    # structural operator semantics (2.9+); see harness/fuzz/traces.py.
+    image: ${TEMPO_IMAGE:-grafana/tempo:2.8.2}
     command: ["-config.file=/etc/tempo/regression.yaml"]
     volumes:
-      - ./tempo.yaml:/etc/tempo/regression.yaml:ro
+      - ./${TEMPO_CONFIG:-tempo.yaml}:/etc/tempo/regression.yaml:ro
       - tempo-data:/var/tempo
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
     ports:
       - "13200:3200"
       - "14319:4317"
@@ -48,14 +53,14 @@ services:
     depends_on:
       minio:
         condition: service_started
-    command: ["mb", "--ignore-existing", "local/traces-regression"]
+    command: ["mb", "--ignore-existing", "local/traces-regression", "local/tempo-regression"]
     restart: on-failure
 
   traces-writer-0:
     <<: *traces
     command: ["--config", "/app/regression/writer-0.yaml"]
     volumes:
-      - ./writer-0.yaml:/app/regression/writer-0.yaml:ro
+      - ./${TRACES_CONFIG_DIR:-.}/writer-0.yaml:/app/regression/writer-0.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "13201:3200"
@@ -66,7 +71,7 @@ services:
     <<: *traces
     command: ["--config", "/app/regression/writer-1.yaml"]
     volumes:
-      - ./writer-1.yaml:/app/regression/writer-1.yaml:ro
+      - ./${TRACES_CONFIG_DIR:-.}/writer-1.yaml:/app/regression/writer-1.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "13202:3200"
@@ -77,7 +82,7 @@ services:
     <<: *traces
     command: ["--config", "/app/regression/reader.yaml"]
     volumes:
-      - ./reader.yaml:/app/regression/reader.yaml:ro
+      - ./${TRACES_CONFIG_DIR:-.}/reader.yaml:/app/regression/reader.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["13203:3200"]
 

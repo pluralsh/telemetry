@@ -3790,7 +3790,9 @@ dependencies = [
  "metrics",
  "minijinja",
  "proptest",
+ "rayon",
  "regex",
+ "regex-syntax",
  "roaring",
  "serde",
  "serde_json",
@@ -3802,6 +3804,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "twox-hash",
  "unicode-segmentation",
 ]
 

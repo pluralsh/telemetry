@@ -7,7 +7,8 @@ from dataclasses import dataclass
 import blake3
 
 NAMESPACE = "regression"
-SHARDS = 16
+SHARDS = 2
+"""Storage shards in the regression configs: one per writer."""
 
 
 @dataclass(frozen=True)
@@ -241,7 +242,7 @@ def fixture_shard(value: Series) -> int:
 
 def assert_spans_writer_ranges(value: tuple[Series, ...]) -> None:
     shards = {fixture_shard(item) for item in value}
-    assert any(shard < 8 for shard in shards)
-    assert any(shard >= 8 for shard in shards), (
+    assert 0 in shards
+    assert 1 in shards, (
         "posting to writer-0 must exercise forwarding to writer-1"
     )

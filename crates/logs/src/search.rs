@@ -36,10 +36,12 @@ const VALUE_FORMAT: u8 = 1;
 /// to this many reads once the block-max bound terminates it.
 const BLOCK_PREFETCH: usize = 16;
 
+/// A row of the `leaf` object's run of `stream_id`, which stays valid when
+/// merges move the row into another object.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DocAddress {
     pub(crate) stream_id: StreamId,
-    pub(crate) page_sequence: u64,
+    pub(crate) leaf: u64,
     pub(crate) row_id: u32,
 }
 
@@ -98,16 +100,17 @@ pub(crate) struct IndexDelta {
 }
 
 impl IndexDelta {
-    pub(crate) fn add_page<'a>(
+    /// Indexes the rows of `stream_id`'s run in the written object `leaf`.
+    pub(crate) fn add_run<'a>(
         &mut self,
         analyzer: &dyn Analyzer,
         stream_id: StreamId,
-        page_sequence: u64,
+        leaf: u64,
         lines: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
         for (row, line) in lines.into_iter().enumerate() {
             let row_id = u32::try_from(row)
-                .map_err(|_| Error::Invalid("page row id exceeds u32".to_owned()))?;
+                .map_err(|_| Error::Invalid("run row id exceeds u32".to_owned()))?;
             let frequencies = token_frequencies(analyzer, line);
             let length = frequencies
                 .values()
@@ -125,7 +128,7 @@ impl IndexDelta {
                 self.postings.entry(term).or_default().push(Posting {
                     address: DocAddress {
                         stream_id,
-                        page_sequence,
+                        leaf,
                         row_id,
                     },
                     frequency,
@@ -257,15 +260,15 @@ pub(crate) fn decode_directory(value: &[u8]) -> Result<Vec<BlockDirectoryEntry>>
 }
 
 /// Postings must be strictly ordered by address. Each address is encoded
-/// relative to its predecessor: a stream delta, then either an absolute page
-/// sequence and row (new stream) or a page delta, then either an absolute row
-/// (new page) or a row delta.
+/// relative to its predecessor: a stream delta, then either an absolute leaf
+/// and row (new stream) or a leaf delta, then either an absolute row (new
+/// leaf) or a row delta.
 pub(crate) fn encode_postings(postings: &[Posting]) -> Result<Bytes> {
     let mut buf = value_buffer(5 + postings.len() * 6);
     var_u32::serialize(count_u32(postings.len())?, &mut buf);
     let mut previous = DocAddress {
         stream_id: 0,
-        page_sequence: 0,
+        leaf: 0,
         row_id: 0,
     };
     for (index, posting) in postings.iter().enumerate() {
@@ -278,12 +281,12 @@ pub(crate) fn encode_postings(postings: &[Posting]) -> Result<Bytes> {
         let stream_delta = address.stream_id - previous.stream_id;
         var_u32::serialize(stream_delta, &mut buf);
         if stream_delta != 0 {
-            var_u64::serialize(address.page_sequence, &mut buf);
+            var_u64::serialize(address.leaf, &mut buf);
             var_u32::serialize(address.row_id, &mut buf);
         } else {
-            let page_delta = address.page_sequence - previous.page_sequence;
-            var_u64::serialize(page_delta, &mut buf);
-            let row = if page_delta == 0 {
+            let leaf_delta = address.leaf - previous.leaf;
+            var_u64::serialize(leaf_delta, &mut buf);
+            let row = if leaf_delta == 0 {
                 address.row_id - previous.row_id
             } else {
                 address.row_id
@@ -303,7 +306,7 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
     let mut postings = Vec::with_capacity(count);
     let mut address = DocAddress {
         stream_id: 0,
-        page_sequence: 0,
+        leaf: 0,
         row_id: 0,
     };
     let overflow = || Error::Corrupt("posting address overflow".into());
@@ -314,16 +317,13 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
                 .stream_id
                 .checked_add(stream_delta)
                 .ok_or_else(overflow)?;
-            address.page_sequence = var_u64::deserialize(&mut buf)?;
+            address.leaf = var_u64::deserialize(&mut buf)?;
             address.row_id = var_u32::deserialize(&mut buf)?;
         } else {
-            let page_delta = var_u64::deserialize(&mut buf)?;
+            let leaf_delta = var_u64::deserialize(&mut buf)?;
             let row = var_u32::deserialize(&mut buf)?;
-            if page_delta != 0 {
-                address.page_sequence = address
-                    .page_sequence
-                    .checked_add(page_delta)
-                    .ok_or_else(overflow)?;
+            if leaf_delta != 0 {
+                address.leaf = address.leaf.checked_add(leaf_delta).ok_or_else(overflow)?;
                 address.row_id = row;
             } else {
                 address.row_id = address.row_id.checked_add(row).ok_or_else(overflow)?;
@@ -522,10 +522,10 @@ pub(crate) async fn block_max_scores(
     namespace: &Namespace,
     segment: SegmentId,
     terms: &[String],
-    allowed_pages: &HashSet<(StreamId, u64)>,
+    allowed_leaves: &HashSet<(StreamId, u64)>,
     limit: Option<usize>,
 ) -> Result<Option<HashMap<DocAddress, f32>>> {
-    if allowed_pages.is_empty() {
+    if allowed_leaves.is_empty() {
         return Ok(Some(HashMap::new()));
     }
     let Some(record) = storage.get(field_stats_key(namespace, segment)).await? else {
@@ -562,7 +562,7 @@ pub(crate) async fn block_max_scores(
             storage,
             SearchSegment { namespace, segment },
             query,
-            allowed_pages,
+            allowed_leaves,
             limit,
             average_length,
         )
@@ -581,8 +581,8 @@ pub(crate) async fn block_max_scores(
         );
         while let Some(postings) = blocks.try_next().await? {
             for posting in postings {
-                let page = (posting.address.stream_id, posting.address.page_sequence);
-                if allowed_pages.contains(&page) {
+                let leaf = (posting.address.stream_id, posting.address.leaf);
+                if allowed_leaves.contains(&leaf) {
                     let hit = Hit {
                         frequency: posting.frequency,
                         length: posting.length,
@@ -636,7 +636,7 @@ async fn single_term_top_k(
     storage: &dyn StorageRead,
     scope: SearchSegment<'_>,
     query: &TermQuery<'_>,
-    allowed_pages: &HashSet<(StreamId, u64)>,
+    allowed_leaves: &HashSet<(StreamId, u64)>,
     limit: usize,
     average_length: f32,
 ) -> Result<HashMap<DocAddress, f32>> {
@@ -667,8 +667,7 @@ async fn single_term_top_k(
             break;
         }
         for posting in postings {
-            if !allowed_pages.contains(&(posting.address.stream_id, posting.address.page_sequence))
-            {
+            if !allowed_leaves.contains(&(posting.address.stream_id, posting.address.leaf)) {
                 continue;
             }
             let score = hit_score(
@@ -798,7 +797,7 @@ mod tests {
         Posting {
             address: DocAddress {
                 stream_id: (document / 10_000) as u32,
-                page_sequence: document / 100,
+                leaf: document / 100,
                 row_id: (document % 100) as u32,
             },
             frequency,
@@ -808,9 +807,9 @@ mod tests {
 
     fn address_strategy() -> impl Strategy<Value = DocAddress> {
         (0u32..8, prop_oneof![0u64..4, any::<u64>()], any::<u32>()).prop_map(
-            |(stream_id, page_sequence, row_id)| DocAddress {
+            |(stream_id, leaf, row_id)| DocAddress {
                 stream_id,
-                page_sequence,
+                leaf,
                 row_id,
             },
         )

@@ -171,6 +171,8 @@ impl Drop for OutBuffers {
 /// same output labels.
 pub struct LabelManipOp<C: Operator> {
     child: Option<C>,
+    /// Kept across `Pending` polls until the child is exhausted.
+    drained: Vec<StepBatch>,
     input_to_output: Arc<[u32]>,
     schema: OperatorSchema,
     reservation: MemoryReservation,
@@ -199,6 +201,7 @@ impl<C: Operator> LabelManipOp<C> {
 
         Self {
             child: Some(child),
+            drained: Vec::new(),
             input_to_output,
             schema: OperatorSchema::new(SchemaRef::Static(output_schema), step_grid),
             reservation,
@@ -209,19 +212,18 @@ impl<C: Operator> LabelManipOp<C> {
 
     fn drain_child(&mut self, cx: &mut Context<'_>) -> Result<Option<Vec<StepBatch>>, QueryError> {
         let Some(child) = self.child.as_mut() else {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(std::mem::take(&mut self.drained)));
         };
 
-        let mut batches = Vec::new();
         loop {
             match child.next(cx) {
                 Poll::Pending => return Ok(None),
                 Poll::Ready(None) => {
                     self.child = None;
-                    return Ok(Some(batches));
+                    return Ok(Some(std::mem::take(&mut self.drained)));
                 }
                 Poll::Ready(Some(Err(err))) => return Err(err),
-                Poll::Ready(Some(Ok(batch))) => batches.push(batch),
+                Poll::Ready(Some(Ok(batch))) => self.drained.push(batch),
             }
         }
     }
@@ -586,6 +588,72 @@ mod tests {
             values,
             bits,
         )
+    }
+
+    /// Returns `Pending` before every batch, like a selector waiting on
+    /// storage between tiles.
+    struct PendingBetweenBatches {
+        inner: MockOp,
+        ready: bool,
+    }
+
+    impl Operator for PendingBetweenBatches {
+        fn schema(&self) -> &OperatorSchema {
+            self.inner.schema()
+        }
+
+        fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+            self.ready = !self.ready;
+            if self.ready {
+                return Poll::Pending;
+            }
+            self.inner.next(cx)
+        }
+    }
+
+    #[test]
+    fn should_keep_batches_drained_before_a_pending_child() {
+        // given: two step tiles with the child pending before each
+        let input_schema = mk_schema(vec![mk_labels(&[("__name__", "m"), ("src", "a")])]);
+        let output_schema = mk_schema(vec![mk_labels(&[("__name__", "m"), ("dst", "a")])]);
+        let grid = mk_grid(2);
+        let timestamps: Arc<[i64]> = Arc::from(vec![0, 10].into_boxed_slice());
+        let tile = |step: usize, value: f64| {
+            let mut validity = BitSet::with_len(1);
+            validity.set(0);
+            StepBatch::new(
+                timestamps.clone(),
+                step..step + 1,
+                SchemaRef::Static(input_schema.clone()),
+                0..1,
+                vec![value],
+                validity,
+            )
+        };
+        let child = PendingBetweenBatches {
+            inner: MockOp::new(input_schema.clone(), grid, vec![tile(0, 1.0), tile(1, 2.0)]),
+            ready: false,
+        };
+        let mut op = LabelManipOp::new(
+            child,
+            Arc::from(vec![0u32]),
+            output_schema,
+            MemoryReservation::new(1 << 20),
+        );
+
+        // when
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let batch = loop {
+            match op.next(&mut cx) {
+                Poll::Pending => continue,
+                Poll::Ready(result) => break result.unwrap().unwrap(),
+            }
+        };
+
+        // then
+        assert_eq!(batch.get(0, 0), Some(1.0));
+        assert_eq!(batch.get(1, 0), Some(2.0));
     }
 
     #[test]

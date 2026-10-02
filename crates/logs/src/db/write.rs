@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-//! Write path: page encoding, the write-coordinator delta and its flusher.
+//! Write path: object encoding, the write-coordinator delta and its flusher.
 
 use super::*;
 
@@ -11,17 +11,60 @@ pub(super) struct DirectWriter {
     pub(super) storage: Arc<dyn StorageRead>,
     pub(super) writer: Arc<dyn Storage>,
     pub(super) config: Config,
+    /// Discovery rollup period, a whole multiple of the segment duration.
+    pub(super) rollup_ns: Option<i64>,
+    pub(super) rollup_ids: RollupIds,
+}
+
+type RollupKey = (Namespace, SegmentId, StreamFingerprint);
+
+/// Rollup stream IDs this writer has persisted, with when, so later writes
+/// of the stream skip the rollup dictionary read. An entry is trusted only
+/// while the dictionary record it was written with is still live.
+#[derive(Default)]
+pub(super) struct RollupIds(std::sync::Mutex<HashMap<RollupKey, (StreamId, u64)>>);
+
+/// Bounds [`RollupIds`]; it is emptied when full.
+const ROLLUP_ID_CACHE_ENTRIES: usize = 262_144;
+
+impl RollupIds {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<RollupKey, (StreamId, u64)>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The ID persisted for `key`, if its dictionary record is still live.
+    fn get(&self, key: &RollupKey, ttl: Ttl, now_unix_ms: u64) -> Option<StreamId> {
+        let &(id, written_at) = self.entries().get(key)?;
+        let live = match ttl {
+            Ttl::ExpireAfter(ttl_ms) => now_unix_ms.saturating_sub(written_at) < ttl_ms,
+            _ => true,
+        };
+        live.then_some(id)
+    }
+
+    fn record(&self, ids: impl IntoIterator<Item = (RollupKey, StreamId)>, written_at: u64) {
+        let mut entries = self.entries();
+        for (key, id) in ids {
+            if entries.len() >= ROLLUP_ID_CACHE_ENTRIES {
+                entries.clear();
+            }
+            entries.insert(key, (id, written_at));
+        }
+    }
 }
 
 impl DirectWriter {
-    /// Writes every group atomically and returns the pages it wrote.
-    async fn write_groups(&self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenPage>> {
+    /// Writes every group atomically and returns the objects it wrote.
+    async fn write_groups(&self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenObject>> {
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
             expires_at_unix_ms: self.logical_expiry()?,
             written_at_unix_ms: unix_time_ms()?,
         };
+        let mut rollup_ids = Vec::new();
         let mut by_namespace: BTreeMap<Namespace, StreamGroups> = BTreeMap::new();
         for ((namespace, segment, fingerprint), group) in groups.groups {
             by_namespace
@@ -33,24 +76,50 @@ impl DirectWriter {
         let mut written = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
+            let mut runs: BTreeMap<SegmentId, Vec<(StreamId, Vec<LogEntry>)>> = BTreeMap::new();
             for ((segment, fingerprint), (labels, entries)) in groups {
                 let stream_id = self
                     .resolve_stream_id(&mut write, &namespace, segment, fingerprint, &labels)
                     .await?;
-                self.add_label_postings(&mut write, &namespace, segment, &labels, stream_id)
+                self.add_postings(&mut write.postings, segment, &labels, stream_id, |label| {
+                    posting_key(&namespace, segment, label)
+                })
+                .await?;
+                if let Some(rollup_ns) = self.rollup_ns {
+                    let period = segment_for(segment, rollup_ns);
+                    let rollup_id = self
+                        .resolve_rollup_id(&mut write, &namespace, period, fingerprint, &labels)
+                        .await?;
+                    self.add_postings(
+                        &mut write.rollup_postings,
+                        period,
+                        &labels,
+                        rollup_id,
+                        |label| rollup_posting_key(&namespace, period, label),
+                    )
                     .await?;
-                self.append_stream_pages(&mut write, &namespace, segment, stream_id, entries)
+                }
+                write.report.rows += entries.len();
+                runs.entry(segment).or_default().push((stream_id, entries));
+            }
+            for (segment, mut streams) in runs {
+                streams.sort_unstable_by_key(|(stream_id, _)| *stream_id);
+                self.append_segment_objects(&mut write, &namespace, segment, streams)
                     .await?;
             }
-            written.extend(write.written.drain(..).map(
-                |(segment, stream_id, page_id, metadata)| WrittenPage {
+            rollup_ids.extend(
+                write.rollup_ids.drain().map(|((period, fingerprint), id)| {
+                    ((namespace.clone(), period, fingerprint), id)
+                }),
+            );
+            written.extend(write.written.drain(..).map(|(segment, object, stored)| {
+                WrittenObject {
                     namespace: namespace.clone(),
                     segment,
-                    stream_id,
-                    page_id,
-                    metadata,
-                },
-            ));
+                    object,
+                    stored,
+                }
+            }));
             let (ops, _) = self.finish_write(write, &namespace).await?;
             all_ops.extend(ops);
         }
@@ -64,7 +133,64 @@ impl DirectWriter {
                 )
                 .await?;
         }
+        self.rollup_ids
+            .record(rollup_ids, retention.written_at_unix_ms);
         Ok(written)
+    }
+
+    /// The stream's period-local rollup ID, allocating the period's next one
+    /// if it has none, and rewrites its rollup dictionary and forward-label
+    /// records to refresh their TTLs.
+    async fn resolve_rollup_id(
+        &self,
+        write: &mut PendingWrite,
+        namespace: &Namespace,
+        period: SegmentId,
+        fingerprint: StreamFingerprint,
+        labels: &Labels,
+    ) -> Result<StreamId> {
+        if let Some(id) = write.rollup_ids.get(&(period, fingerprint)) {
+            return Ok(*id);
+        }
+        // Loaded for every written period, so the counter is rewritten with
+        // the records it guards and never expires before them.
+        if let Entry::Vacant(entry) = write.rollup_next_ids.entry(period) {
+            let next = self
+                .storage
+                .get(rollup_next_stream_id_key(namespace, period))
+                .await?
+                .map(|record| decode_stream_id(&record.value))
+                .transpose()?
+                .unwrap_or(0);
+            entry.insert(next);
+        }
+        let dictionary = rollup_dictionary_key(namespace, period, fingerprint);
+        let cached = self.rollup_ids.get(
+            &(namespace.clone(), period, fingerprint),
+            write.ttl,
+            unix_time_ms()?,
+        );
+        let id = match cached {
+            Some(id) => id,
+            None => match self.storage.get(dictionary.clone()).await? {
+                Some(record) => decode_stream_id(&record.value)?,
+                None => {
+                    let next = write.rollup_next_ids[&period];
+                    let following = next.checked_add(1).ok_or_else(|| {
+                        Error::Invalid("rollup period exhausted stream IDs".to_owned())
+                    })?;
+                    write.rollup_next_ids.insert(period, following);
+                    next
+                }
+            },
+        };
+        write.rollup_ids.insert((period, fingerprint), id);
+        write.put(dictionary, encode_stream_id(id));
+        write.put(
+            rollup_forward_key(namespace, period, id),
+            encode_labels(labels)?,
+        );
+        Ok(id)
     }
 
     /// Returns the stream's existing ID, or allocates the segment's next one,
@@ -126,21 +252,23 @@ impl DirectWriter {
         Ok(next)
     }
 
-    async fn add_label_postings(
+    /// Adds `id` to the `scope` posting of every label, loading each posting
+    /// from `key` the first time this write touches it.
+    async fn add_postings(
         &self,
-        write: &mut PendingWrite,
-        namespace: &Namespace,
-        segment: SegmentId,
+        postings: &mut HashMap<(SegmentId, Label), RoaringBitmap>,
+        scope: SegmentId,
         labels: &Labels,
-        stream_id: StreamId,
+        id: StreamId,
+        key: impl Fn(&Label) -> Bytes,
     ) -> Result<()> {
         for label in labels.iter() {
-            let bitmap = match write.postings.entry((segment, label.clone())) {
+            let bitmap = match postings.entry((scope, label.clone())) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let bitmap = self
                         .storage
-                        .get(posting_key(namespace, segment, label))
+                        .get(key(label))
                         .await?
                         .map(|record| decode_postings(&record.value))
                         .transpose()?
@@ -148,39 +276,39 @@ impl DirectWriter {
                     entry.insert(bitmap)
                 }
             };
-            bitmap.insert(stream_id);
+            bitmap.insert(id);
         }
         Ok(())
     }
 
-    async fn append_stream_pages(
+    /// Packs one segment's streams, in stream order, into level-0 objects.
+    async fn append_segment_objects(
         &self,
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
-        stream_id: StreamId,
-        entries: Vec<LogEntry>,
+        streams: Vec<(StreamId, Vec<LogEntry>)>,
     ) -> Result<()> {
-        let page_sequence_key = next_page_sequence_key(namespace, segment, stream_id);
-        let mut sequence = self
+        let next_key = next_object_id_key(namespace, segment);
+        let mut next = self
             .storage
-            .get(page_sequence_key.clone())
+            .get(next_key.clone())
             .await?
-            .map(|record| decode_page_sequence(&record.value))
+            .map(|record| decode_object_id(&record.value))
             .transpose()?
             .unwrap_or(0);
-        let row_count = entries.len();
-        let mut builder = PageBuilder::new(self.config.page.clone())?;
-        for entry in entries {
-            if let Some(completed) = builder.append_with_rows(entry)? {
-                write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
-            }
+        let mut builder = ObjectBuilder::new(self.config.page.clone())?;
+        for (stream_id, entries) in streams {
+            builder.push_run(stream_id, entries)?;
         }
-        if let Some(completed) = builder.finish_with_rows()? {
-            write.add_page(namespace, segment, stream_id, &mut sequence, completed)?;
+        for built in builder.finish() {
+            let object = ObjectRef { id: next, level: 0 };
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid("segment exhausted object IDs".to_owned()))?;
+            write.add_object(namespace, segment, object, built)?;
         }
-        write.report.rows += row_count;
-        write.put(page_sequence_key, encode_page_sequence(sequence));
+        write.put(next_key, encode_object_id(next));
         Ok(())
     }
 
@@ -196,6 +324,8 @@ impl DirectWriter {
             mut ops,
             next_stream_ids,
             postings,
+            rollup_next_ids,
+            rollup_postings,
             search_deltas,
             report,
             ..
@@ -207,6 +337,31 @@ impl DirectWriter {
                 &label.name,
                 DiscoveryValue::String(label.value.clone()),
             );
+        }
+        let mut rollup_catalogs: BTreeMap<SegmentId, CatalogBatch> = BTreeMap::new();
+        for (period, label) in rollup_postings.keys() {
+            rollup_catalogs.entry(*period).or_default().insert(
+                "",
+                &label.name,
+                DiscoveryValue::String(label.value.clone()),
+            );
+        }
+        for (period, next) in rollup_next_ids {
+            ops.push(RecordOp::put_with_ttl(
+                rollup_next_stream_id_key(namespace, period),
+                encode_stream_id(next),
+                ttl,
+            ));
+        }
+        for ((period, label), bitmap) in rollup_postings {
+            ops.push(RecordOp::put_with_ttl(
+                rollup_posting_key(namespace, period, &label),
+                encode_postings(&bitmap)?,
+                ttl,
+            ));
+        }
+        for (period, catalog) in rollup_catalogs {
+            ops.extend(catalog.into_ops(&rollup_prefix(namespace, period), ttl));
         }
         for (segment, next) in next_stream_ids {
             ops.push(RecordOp::put_with_ttl(
@@ -475,8 +630,13 @@ struct PendingWrite {
     /// Next unallocated stream ID for each segment that allocated one.
     next_stream_ids: HashMap<SegmentId, StreamId>,
     postings: HashMap<(SegmentId, Label), RoaringBitmap>,
+    /// Rollup IDs resolved by this write, keyed by period.
+    rollup_ids: HashMap<(SegmentId, StreamFingerprint), StreamId>,
+    /// Next unallocated rollup ID of every period this write touches.
+    rollup_next_ids: HashMap<SegmentId, StreamId>,
+    rollup_postings: HashMap<(SegmentId, Label), RoaringBitmap>,
     search_deltas: BTreeMap<SegmentId, IndexDelta>,
-    written: Vec<(SegmentId, StreamId, PageId, StoredPageMetadata)>,
+    written: Vec<(SegmentId, ObjectRef, StoredObject)>,
     report: WriteReport,
 }
 
@@ -488,6 +648,9 @@ impl PendingWrite {
             ops: Vec::new(),
             next_stream_ids: HashMap::new(),
             postings: HashMap::new(),
+            rollup_ids: HashMap::new(),
+            rollup_next_ids: HashMap::new(),
+            rollup_postings: HashMap::new(),
             search_deltas: BTreeMap::new(),
             written: Vec::new(),
             report: WriteReport {
@@ -501,84 +664,39 @@ impl PendingWrite {
         self.ops.push(RecordOp::put_with_ttl(key, value, self.ttl));
     }
 
-    fn add_page(
+    fn add_object(
         &mut self,
         namespace: &Namespace,
         segment: SegmentId,
-        stream_id: StreamId,
-        sequence: &mut u64,
-        (page, rows): (Page, Vec<LogEntry>),
+        object: ObjectRef,
+        built: BuiltObject,
     ) -> Result<()> {
-        self.search_deltas.entry(segment).or_default().add_page(
-            &DEFAULT_ANALYZER,
-            stream_id,
-            *sequence,
-            rows.iter().map(|row| row.line.as_str()),
-        )?;
-        let (page_id, metadata) = append_page_ops(
+        let delta = self.search_deltas.entry(segment).or_default();
+        for run in &built.runs {
+            delta.add_run(
+                &DEFAULT_ANALYZER,
+                run.stream_id,
+                object.id,
+                run.entries.iter().map(|entry| entry.line.as_str()),
+            )?;
+        }
+        let stored = object_records(
             &mut self.ops,
-            namespace,
-            PageWriteId {
+            ObjectLocation {
+                namespace,
                 segment,
-                stream_id,
-                sequence: *sequence,
+                object,
             },
-            page,
-            self.retention,
+            built,
+            ObjectProperties {
+                expires_at_unix_ms: self.retention.expires_at_unix_ms,
+                written_at_unix_ms: self.retention.written_at_unix_ms,
+                span: 1,
+                ttl: self.retention.physical_ttl,
+            },
         )?;
-        self.written.push((segment, stream_id, page_id, metadata));
-        *sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("stream exhausted page sequences".to_owned()))?;
+        self.written.push((segment, object, stored));
         self.report.pages += 1;
         Ok(())
     }
-}
-
-#[derive(Clone, Copy)]
-struct PageWriteId {
-    segment: SegmentId,
-    stream_id: StreamId,
-    sequence: u64,
-}
-
-fn append_page_ops(
-    ops: &mut Vec<RecordOp>,
-    namespace: &Namespace,
-    id: PageWriteId,
-    page: Page,
-    retention: PageRetention,
-) -> Result<(PageId, StoredPageMetadata)> {
-    let bytes = page.bytes();
-    let (Some(first), Some(last)) = (page.blocks().first(), page.blocks().last()) else {
-        return Err(Error::Invalid("cannot write an empty page".to_owned()));
-    };
-    let min_timestamp_ns = first.min_timestamp_ns;
-    let max_timestamp_ns = last.max_timestamp_ns;
-    let page_id = PageId {
-        timestamp_ns: min_timestamp_ns,
-        sequence: id.sequence,
-    };
-    let metadata = StoredPageMetadata {
-        expires_at_unix_ms: retention.expires_at_unix_ms,
-        min_timestamp_ns,
-        max_timestamp_ns,
-        row_count: page.row_count(),
-        payload_bytes: u32::try_from(bytes.len())
-            .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
-        level: 0,
-        written_at_unix_ms: retention.written_at_unix_ms,
-        leaf_rows: Vec::new(),
-    };
-    ops.push(RecordOp::put_with_ttl(
-        metadata_key(namespace, id.segment, id.stream_id, page_id),
-        encode_metadata(&metadata)?,
-        retention.physical_ttl,
-    ));
-    ops.push(RecordOp::put_with_ttl(
-        payload_key(namespace, id.segment, id.stream_id, page_id, 0),
-        bytes,
-        retention.physical_ttl,
-    ));
-    Ok((page_id, metadata))
 }

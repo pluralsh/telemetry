@@ -10,6 +10,7 @@ use common::storage::config::{
 };
 
 use super::*;
+use crate::codec::{decode_run, encode_run, segment_run_prefix, stream_run_prefix};
 use crate::config::{CompactionConfig, PageConfig};
 
 fn test_config() -> Config {
@@ -22,6 +23,7 @@ fn test_config() -> Config {
             meta_cache: None,
         }),
         segment_duration: Duration::from_secs(10),
+        discovery_rollup: Some(Duration::from_secs(20)),
         retention: Some(Duration::from_secs(60)),
         page: PageConfig {
             target_size_bytes: 64,
@@ -174,6 +176,120 @@ async fn discovers_stream_labels_and_series_across_segments() {
         .await
         .unwrap();
     assert_eq!(series, vec![labels("api", "prod")]);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn discovery_unions_many_segments_and_overlapping_selectors() {
+    let db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::new("discovery-many").unwrap();
+    let segment = 10_000_000_000_i64;
+    let batches = (0..40)
+        .map(|index| {
+            let environment = if index % 2 == 0 { "prod" } else { "staging" };
+            LogBatch::new(
+                labels(&format!("svc-{:02}", index % 7), environment),
+                vec![LogEntry::new(index * segment + 1, "line")],
+            )
+        })
+        .collect::<Vec<_>>();
+    db.write(&namespace, batches).await.unwrap();
+    let end = 40 * segment;
+
+    let values = db
+        .label_values(&namespace, "service", 0, end)
+        .await
+        .unwrap();
+    assert_eq!(
+        values,
+        (0..7)
+            .map(|index| format!("svc-{index:02}"))
+            .collect::<Vec<_>>()
+    );
+    let series = db
+        .series(
+            &namespace,
+            &[
+                r#"{environment="prod"}"#.to_owned(),
+                r#"{environment="prod",service="svc-01"}"#.to_owned(),
+                r#"{service=~"svc-0[01]"}"#.to_owned(),
+            ],
+            0,
+            end,
+        )
+        .await
+        .unwrap();
+    let mut expected = (0..40)
+        .filter_map(|index: i64| {
+            let service = format!("svc-{:02}", index % 7);
+            let environment = if index % 2 == 0 { "prod" } else { "staging" };
+            (environment == "prod" || index % 7 <= 1).then(|| labels(&service, environment))
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(series, expected);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cached_closed_segments_observe_late_writes() {
+    let db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::new("late").unwrap();
+    let other = Namespace::new("late-other").unwrap();
+    let selector = [r#"{environment="prod"}"#.to_owned()];
+    for ns in [&namespace, &other] {
+        db.write(
+            ns,
+            vec![LogBatch::new(
+                labels("api", "prod"),
+                vec![LogEntry::new(1, "a")],
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.label_values(&namespace, "service", 0, 5).await.unwrap(),
+        vec!["api"]
+    );
+    assert_eq!(
+        db.series(&namespace, &selector, 0, 5).await.unwrap(),
+        vec![labels("api", "prod")]
+    );
+    db.label_values(&other, "service", 0, 5).await.unwrap();
+    let series_key = (
+        namespace.clone(),
+        Partition::Segment(0),
+        vec![Label::new("environment", "prod")],
+    );
+    assert!(db.caches.series.get(&series_key).is_some());
+    let other_key = (other.clone(), Partition::Segment(0), "service".to_owned());
+    assert!(db.caches.label_values.get(&other_key).is_some());
+
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("worker", "prod"),
+            vec![LogEntry::new(2, "b")],
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(db.caches.series.get(&series_key).is_none());
+    assert!(db.caches.label_values.get(&other_key).is_some());
+    assert_eq!(
+        db.label_names(&namespace, 0, 5).await.unwrap(),
+        vec!["environment", "service"]
+    );
+    assert_eq!(
+        db.label_values(&namespace, "service", 0, 5).await.unwrap(),
+        vec!["api", "worker"]
+    );
+    assert_eq!(
+        db.series(&namespace, &selector, 0, 5).await.unwrap(),
+        vec![labels("api", "prod"), labels("worker", "prod")]
+    );
     db.close().await.unwrap();
 }
 
@@ -334,20 +450,20 @@ async fn applied_writes_coalesce_before_flush() {
     let rows = db.read(&namespace, 0, 3, &[]).await.unwrap();
     assert_eq!(rows.len(), 2);
     let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
-    let mut pages = db
+    let mut runs = db
         .storage
         .scan_prefix_iter(
-            metadata_prefix(&namespace, 0, stream_id),
+            stream_run_prefix(&namespace, 0, stream_id),
             BytesRange::unbounded(),
             None,
         )
         .await
         .unwrap();
-    let mut page_count = 0;
-    while pages.next().await.unwrap().is_some() {
-        page_count += 1;
+    let mut run_count = 0;
+    while runs.next().await.unwrap().is_some() {
+        run_count += 1;
     }
-    assert_eq!(page_count, 1);
+    assert_eq!(run_count, 1);
     db.close().await.unwrap();
 }
 
@@ -556,24 +672,24 @@ async fn persisted_logical_expiry_survives_reopen_without_physical_ttl() {
     .unwrap();
 
     let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
-    let mut metadata_records = db
+    let mut run_records = db
         .storage
         .scan_prefix_iter(
-            metadata_prefix(&namespace, 0, stream_id),
+            stream_run_prefix(&namespace, 0, stream_id),
             BytesRange::unbounded(),
             None,
         )
         .await
         .unwrap();
-    let record = metadata_records.next().await.unwrap().unwrap();
-    let mut metadata = decode_metadata(&record.value).unwrap();
-    metadata.expires_at_unix_ms = Some(0);
+    let record = run_records.next().await.unwrap().unwrap();
+    let mut run = decode_run(&record.value).unwrap();
+    run.expires_at_unix_ms = Some(0);
     db.writer
         .as_ref()
         .unwrap()
         .apply(vec![RecordOp::put_with_ttl(
             record.key,
-            encode_metadata(&metadata).unwrap(),
+            encode_run(&run).unwrap(),
             Ttl::NoExpiry,
         )])
         .await
@@ -731,9 +847,9 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
         write_line(&db, &namespace, "api", *timestamp, line).await;
     }
 
-    // Eight level-0 pages fold into one level-3 page within the flushes.
+    // Eight level-0 objects fold into one level-3 object within the flushes.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PageMetadata).await,
+        count_records(&db, &namespace, segment, RecordType::Run).await,
         1
     );
     let end = segment + 100;
@@ -742,17 +858,22 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
         match_lines(&db, &namespace, segment, end, 1).await.unwrap(),
         expected
     );
-    // Replaced payloads stay readable until a later flush deletes them.
-    assert!(count_records(&db, &namespace, segment, RecordType::PageTombstone).await > 0);
+    // Replaced objects stay readable until a later flush deletes them.
+    assert!(count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await > 0);
 
     write_line(&db, &namespace, "worker", segment + 50, "other stream").await;
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
         0
     );
+    // The merged object and the worker's object; replaced blocks are gone.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PagePayload).await,
+        count_records(&db, &namespace, segment, RecordType::ObjectDirectory).await,
         2
+    );
+    assert_eq!(
+        count_records(&db, &namespace, segment, RecordType::ObjectBlock).await,
+        3
     );
     assert_eq!(lines(&db, &namespace, segment, end).await, expected);
     db.close().await.unwrap();
@@ -775,13 +896,49 @@ async fn settled_segments_merge_below_fan_in() {
         write_line(&db, &namespace, "api", timestamp, line).await;
     }
 
-    let pages = count_records(&db, &namespace, 0, RecordType::PageMetadata).await;
-    assert!(pages <= 3, "six late writes left {pages} pages");
+    let runs = count_records(&db, &namespace, 0, RecordType::Run).await;
+    assert!(runs <= 3, "six late writes left {runs} runs");
     assert_eq!(lines(&db, &namespace, 0, 10).await, expected);
     assert_eq!(
         match_lines(&db, &namespace, 0, 10, 3).await.unwrap(),
         expected
     );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_segments_merge_runs_the_page_limits_cut_short() {
+    use crate::codec::RecordType;
+
+    let mut config = compacting_config();
+    config.compaction.fan_in = 8;
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("cut-short").unwrap();
+    let segment = current_segment();
+    // Twenty-row objects are small, but only three fit within `max_rows`.
+    let expected = (0..80)
+        .map(|index| format!("needle {index}"))
+        .collect::<Vec<_>>();
+    for (batch, lines) in (0..).zip(expected.chunks(20)) {
+        let entries = (0..)
+            .zip(lines)
+            .map(|(offset, line)| LogEntry::new(segment + batch * 20 + offset, line))
+            .collect();
+        db.write(
+            &namespace,
+            vec![LogBatch::new(labels("api", "prod"), entries)],
+        )
+        .await
+        .unwrap();
+    }
+
+    // The first three merge once the fourth cannot join them.
+    assert_eq!(
+        count_records(&db, &namespace, segment, RecordType::Run).await,
+        2
+    );
+    let end = segment + 100;
+    assert_eq!(lines(&db, &namespace, segment, end).await, expected);
     db.close().await.unwrap();
 }
 
@@ -805,21 +962,21 @@ async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
         write_line(&db, &namespace, "api", segment + offset, line).await;
     }
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
         2
     );
     db.close().await.unwrap();
 
     let db = LogDb::open(config).await.unwrap();
     write_line(&db, &namespace, "api", segment + 3, &expected[2]).await;
-    // Recovery re-queued the tombstones, and the merged page is tracked.
+    // Recovery re-queued the tombstones, and the merged object is tracked.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PageTombstone).await,
+        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
         0
     );
     write_line(&db, &namespace, "api", segment + 4, &expected[3]).await;
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::PageMetadata).await,
+        count_records(&db, &namespace, segment, RecordType::Run).await,
         1
     );
     let end = segment + 100;
@@ -829,4 +986,503 @@ async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
         expected
     );
     db.close().await.unwrap();
+}
+
+/// Counts gets and prefix scans whose key or prefix falls under each watched
+/// prefix.
+struct CountingStorage {
+    inner: Arc<dyn StorageRead>,
+    watched: Vec<Bytes>,
+    gets: Vec<std::sync::atomic::AtomicUsize>,
+    scans: Vec<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingStorage {
+    fn record(&self, counts: &[std::sync::atomic::AtomicUsize], key: &[u8]) {
+        for (prefix, count) in self.watched.iter().zip(counts) {
+            if key.starts_with(prefix) {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn take(&self) -> Vec<(usize, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.gets
+            .iter()
+            .zip(&self.scans)
+            .map(|(gets, scans)| (gets.swap(0, Relaxed), scans.swap(0, Relaxed)))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageRead for CountingStorage {
+    async fn get(
+        &self,
+        key: Bytes,
+    ) -> common::storage::StorageResult<Option<common::storage::Record>> {
+        self.record(&self.gets, &key);
+        self.inner.get(key).await
+    }
+
+    async fn scan_iter(
+        &self,
+        range: BytesRange,
+    ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
+    {
+        self.inner.scan_iter(range).await
+    }
+
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<slatedb::FilterContext>,
+    ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
+    {
+        self.record(&self.scans, &prefix);
+        self.inner
+            .scan_prefix_iter(prefix, subrange, filter_context)
+            .await
+    }
+}
+
+fn count_reads(db: &mut LogDb, watched: Vec<Bytes>) -> Arc<CountingStorage> {
+    let counting = Arc::new(CountingStorage {
+        inner: Arc::clone(&db.storage),
+        gets: watched.iter().map(|_| Default::default()).collect(),
+        scans: watched.iter().map(|_| Default::default()).collect(),
+        watched,
+    });
+    db.storage = counting.clone();
+    counting
+}
+
+/// Forty streams in one segment, alternating environments, so `prod`
+/// selects every other stream ID.
+async fn write_forty_streams(db: &LogDb, namespace: &Namespace) {
+    let batches = (0..40)
+        .map(|index| {
+            let environment = if index % 2 == 0 { "prod" } else { "staging" };
+            LogBatch::new(
+                labels(&format!("s{index:02}"), environment),
+                vec![
+                    LogEntry::new(1_000 + index, format!("line {index}")),
+                    LogEntry::new(2_000 + index, format!("again {index}")),
+                ],
+            )
+        })
+        .collect();
+    db.write(namespace, batches).await.unwrap();
+}
+
+#[tokio::test]
+async fn span_scans_and_point_reads_select_the_same_rows() {
+    let mut db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    write_forty_streams(&db, &namespace).await;
+    let selectors = [
+        vec![],
+        vec![Label::new("environment", "prod")],
+        vec![Label::new("environment", "staging")],
+        vec![Label::new("service", "s07")],
+        vec![
+            Label::new("service", "s08"),
+            Label::new("environment", "prod"),
+        ],
+        vec![
+            Label::new("service", "s08"),
+            Label::new("environment", "staging"),
+        ],
+    ];
+    for matchers in &selectors {
+        let mut by_path = Vec::new();
+        for min_streams in [usize::MAX, 1] {
+            db.span_scan_min_streams = min_streams;
+            let rows = db.read(&namespace, 0, 5_000, matchers).await.unwrap();
+            by_path.push(
+                rows.into_iter()
+                    .map(|row| (row.entry.timestamp_ns, row.entry.line, row.labels))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(!by_path[0].is_empty() || matchers.len() == 2);
+        assert_eq!(by_path[0], by_path[1], "{matchers:?}");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn many_selected_streams_cost_two_scans_per_segment() {
+    let mut db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    write_forty_streams(&db, &namespace).await;
+    let counting = count_reads(
+        &mut db,
+        vec![
+            forward_prefix(&namespace, 0),
+            segment_run_prefix(&namespace, 0),
+        ],
+    );
+    let prod = [Label::new("environment", "prod")];
+
+    let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
+    assert_eq!(rows.len(), 40);
+    // (forward gets, forward scans), (run gets, run scans)
+    assert_eq!(counting.take(), vec![(0, 1), (0, 1)]);
+    let rows = db.read(&namespace, 0, 5_000, &[]).await.unwrap();
+    assert_eq!(rows.len(), 80);
+    assert_eq!(counting.take(), vec![(0, 1), (0, 1)]);
+
+    db.span_scan_min_streams = usize::MAX;
+    let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
+    assert_eq!(rows.len(), 40);
+    assert_eq!(counting.take(), vec![(20, 0), (0, 20)]);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn streams_flushed_together_are_read_with_one_object_scan() {
+    use crate::codec::{RecordType, record_type_prefix};
+
+    let mut config = test_config();
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_rows: 1_024,
+        rows_per_block: 1,
+    };
+    let mut db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::default();
+    write_forty_streams(&db, &namespace).await;
+    assert_eq!(
+        count_records(&db, &namespace, 0, RecordType::ObjectDirectory).await,
+        1
+    );
+    let counting = count_reads(
+        &mut db,
+        vec![record_type_prefix(&namespace, 0, RecordType::ObjectBlock)],
+    );
+    let ascending = |rows: &[LogRow]| {
+        rows.windows(2)
+            .all(|pair| pair[0].entry.timestamp_ns <= pair[1].entry.timestamp_ns)
+    };
+
+    let rows = db.read(&namespace, 0, 5_000, &[]).await.unwrap();
+    assert_eq!(rows.len(), 80);
+    assert!(ascending(&rows));
+    assert_eq!(counting.take(), vec![(0, 1)]);
+    // Half the streams: runs separated by few unselected blocks share a scan.
+    let prod = [Label::new("environment", "prod")];
+    let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
+    assert_eq!(rows.len(), 40);
+    assert!(ascending(&rows));
+    let [(gets, scans)] = counting.take()[..] else {
+        unreachable!()
+    };
+    assert_eq!(gets, 0);
+    assert!(scans < 5, "20 streams took {scans} scans");
+    let one = [Label::new("service", "s07")];
+    let rows = db.read(&namespace, 1_500, 5_000, &one).await.unwrap();
+    assert_eq!(
+        rows.into_iter()
+            .map(|row| row.entry.line)
+            .collect::<Vec<_>>(),
+        ["again 7"]
+    );
+    assert_eq!(counting.take(), vec![(0, 1)]);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cross_stream_merges_keep_write_order_for_out_of_order_rows() {
+    use crate::codec::RecordType;
+
+    let db = LogDb::open(compacting_config()).await.unwrap();
+    let namespace = Namespace::new("cross-stream").unwrap();
+    let segment = current_segment();
+    // Rows arrive out of order across flushes, two at one timestamp.
+    let offsets = [8, 3, 5, 5];
+    for (index, offset) in offsets.iter().enumerate() {
+        db.write(
+            &namespace,
+            vec![
+                LogBatch::new(
+                    labels("api", "prod"),
+                    vec![LogEntry::new(
+                        segment + offset,
+                        format!("needle api {index}"),
+                    )],
+                ),
+                LogBatch::new(
+                    labels("worker", "prod"),
+                    vec![LogEntry::new(
+                        segment + offset,
+                        format!("needle worker {index}"),
+                    )],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    // Four two-stream objects fold into one holding a run per stream.
+    assert_eq!(
+        count_records(&db, &namespace, segment, RecordType::Run).await,
+        2
+    );
+    let expected = [
+        "needle api 1",
+        "needle api 2",
+        "needle api 3",
+        "needle api 0",
+    ];
+    let end = segment + 100;
+    assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+    assert_eq!(
+        match_lines(&db, &namespace, segment, end, 1).await.unwrap(),
+        expected
+    );
+    // Reverse scans hand over ascending chunks, latest chunk first.
+    let mut chunks = Vec::new();
+    db.read_segments(
+        &namespace,
+        (segment, end),
+        &StreamFilter::exact(vec![Label::new("service", "api")]),
+        &PageBudget::new(usize::MAX),
+        true,
+        |rows| {
+            chunks.push(
+                rows.into_iter()
+                    .map(|row| row.entry.line)
+                    .collect::<Vec<_>>(),
+            );
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        chunks.into_iter().rev().flatten().collect::<Vec<_>>(),
+        expected
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_satisfied_read_selects_at_most_one_segment_ahead() {
+    let mut db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    let segment_ns = db.segment_ns;
+    let segments = (0..6).map(|index| index * segment_ns).collect::<Vec<_>>();
+    for &segment in &segments {
+        write_line(&db, &namespace, "api", segment + 1, "line").await;
+    }
+    let counting = count_reads(
+        &mut db,
+        segments
+            .iter()
+            .map(|&segment| segment_run_prefix(&namespace, segment))
+            .collect(),
+    );
+    db.read_segments(
+        &namespace,
+        (0, segments[5] + segment_ns - 1),
+        &StreamFilter::exact(Vec::new()),
+        &PageBudget::new(usize::MAX),
+        false,
+        |_| Ok(ControlFlow::Break(())),
+    )
+    .await
+    .unwrap();
+    let scans = counting
+        .take()
+        .into_iter()
+        .map(|(_, scans)| scans)
+        .collect::<Vec<_>>();
+    assert_eq!(scans[0], 1);
+    assert!(scans[1] <= 1);
+    assert_eq!(scans[2..], [0, 0, 0, 0]);
+    db.close().await.unwrap();
+}
+
+/// Deterministic xorshift, so failures reproduce from the seed.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, bound: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % bound
+    }
+
+    fn pick<'a>(&mut self, values: &[&'a str]) -> &'a str {
+        values[self.below(values.len() as u64) as usize]
+    }
+}
+
+fn random_batches(rng: &mut Rng, span_ns: i64) -> Vec<LogBatch> {
+    (0..1 + rng.below(6))
+        .map(|_| {
+            let mut pairs = vec![
+                Label::new("service", rng.pick(&["api", "cart", "auth", "billing"])),
+                Label::new("environment", rng.pick(&["prod", "dev"])),
+            ];
+            if rng.below(3) == 0 {
+                pairs.push(Label::new("zone", rng.pick(&["a", "b", "c"])));
+            }
+            let entries = (0..1 + rng.below(4))
+                .map(|index| {
+                    LogEntry::new(rng.below(span_ns as u64) as i64, format!("line {index}"))
+                })
+                .collect();
+            LogBatch::new(Labels::new(pairs).unwrap(), entries)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn rollups_answer_discovery_exactly_like_segments() {
+    let segment_ns = 10 * 1_000_000_000;
+    let span_ns = 8 * segment_ns;
+    let selectors = [
+        r#"{environment="prod"}"#,
+        r#"{service="api", environment="dev"}"#,
+        r#"{service=~"a.*"}"#,
+        r#"{zone="b"}"#,
+        r#"{service="cart", zone!="a"}"#,
+    ]
+    .map(str::to_owned);
+    for seed in [1, 7, 42, 1_234, 99_991] {
+        let rolled = LogDb::open(test_config()).await.unwrap();
+        let plain = LogDb::open(Config {
+            discovery_rollup: None,
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        assert!(rolled.rollup_ns.is_some() && plain.rollup_ns.is_none());
+        let namespace = Namespace::default();
+        let mut rng = Rng(seed);
+        // Reads between writes fill the caches, so later writes into closed
+        // segments and periods also exercise invalidation.
+        for _ in 0..6 {
+            let batches = random_batches(&mut rng, span_ns);
+            for db in [&rolled, &plain] {
+                db.write(&namespace, batches.clone()).await.unwrap();
+            }
+            for _ in 0..8 {
+                let start = rng.below(span_ns as u64) as i64;
+                let end = start + rng.below((span_ns - start) as u64 + 1) as i64;
+                let names = plain.label_names(&namespace, start, end).await.unwrap();
+                assert_eq!(
+                    rolled.label_names(&namespace, start, end).await.unwrap(),
+                    names,
+                    "seed {seed} [{start}, {end}]"
+                );
+                for name in names.iter().map(String::as_str).chain(["missing"]) {
+                    assert_eq!(
+                        rolled
+                            .label_values(&namespace, name, start, end)
+                            .await
+                            .unwrap(),
+                        plain
+                            .label_values(&namespace, name, start, end)
+                            .await
+                            .unwrap(),
+                        "seed {seed} {name} [{start}, {end}]"
+                    );
+                }
+                for selector in &selectors {
+                    let selector = std::slice::from_ref(selector);
+                    assert_eq!(
+                        rolled
+                            .series(&namespace, selector, start, end)
+                            .await
+                            .unwrap(),
+                        plain
+                            .series(&namespace, selector, start, end)
+                            .await
+                            .unwrap(),
+                        "seed {seed} {selector:?} [{start}, {end}]"
+                    );
+                }
+            }
+        }
+        rolled.close().await.unwrap();
+        plain.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn whole_periods_are_read_from_the_rollup() {
+    let db = LogDb::open(test_config()).await.unwrap();
+    let second = 1_000_000_000;
+    // Periods are 20s over 10s segments. Discovery reads whole touched
+    // segments, so a range covers a period once it touches all its segments.
+    assert_eq!(
+        db.discovery_partitions(0, 40 * second - 1).unwrap(),
+        vec![Partition::Rollup(0), Partition::Rollup(20 * second)]
+    );
+    assert_eq!(
+        db.discovery_partitions(5 * second, 45 * second).unwrap(),
+        vec![
+            Partition::Rollup(0),
+            Partition::Rollup(20 * second),
+            Partition::Segment(40 * second),
+        ]
+    );
+    assert_eq!(
+        db.discovery_partitions(10 * second, 29 * second).unwrap(),
+        vec![
+            Partition::Segment(10 * second),
+            Partition::Segment(20 * second)
+        ]
+    );
+    assert_eq!(
+        db.discovery_partitions(-20 * second, -1).unwrap(),
+        vec![Partition::Rollup(-20 * second)]
+    );
+
+    // A late write into a cached closed period is visible afterwards.
+    let namespace = Namespace::default();
+    write_line(&db, &namespace, "api", second, "early").await;
+    let whole = (0, 20 * second - 1);
+    assert_eq!(
+        db.label_values(&namespace, "service", whole.0, whole.1)
+            .await
+            .unwrap(),
+        vec!["api"]
+    );
+    assert!(
+        db.caches
+            .label_values
+            .get(&(
+                namespace.clone(),
+                Partition::Rollup(0),
+                "service".to_owned()
+            ))
+            .is_some()
+    );
+    write_line(&db, &namespace, "worker", 15 * second, "late").await;
+    assert_eq!(
+        db.label_values(&namespace, "service", whole.0, whole.1)
+            .await
+            .unwrap(),
+        vec!["api", "worker"]
+    );
+    db.close().await.unwrap();
+}
+
+#[test]
+fn rollups_must_align_with_segments() {
+    let config = |rollup| Config {
+        discovery_rollup: rollup,
+        ..test_config()
+    };
+    assert!(config(Some(Duration::from_secs(30))).validate().is_ok());
+    assert!(config(None).validate().is_ok());
+    assert!(config(Some(Duration::from_secs(25))).validate().is_err());
+    assert!(config(Some(Duration::ZERO)).validate().is_err());
 }

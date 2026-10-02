@@ -305,11 +305,9 @@ fn attribute_comparison(
             }
             None => IndexTest::Compare(op, literal.clone()),
         },
-        // A missing attribute is `!=` every value but nil.
-        (BinaryOp::NotEqual, StaticValue::Nil) => IndexTest::Compare(op, StaticValue::Nil),
-        (BinaryOp::NotEqual, _) => return Ok(None),
         (
-            BinaryOp::Regex
+            BinaryOp::NotEqual
+            | BinaryOp::Regex
             | BinaryOp::NotRegex
             | BinaryOp::Less
             | BinaryOp::LessEqual

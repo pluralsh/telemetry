@@ -17,12 +17,12 @@ write:
   remote_concurrency: 8
   remote_retries: 3
 sharding:
-  shards: 16
+  shards: 2
   backend: static
   owner_id: metrics-writer-0
   owners:
-    - { id: metrics-writer-0, ordinal: 0, endpoint: "metrics-writer-0:9090", start_shard: 0, end_shard: 8 }
-    - { id: metrics-writer-1, ordinal: 1, endpoint: "metrics-writer-1:9090", start_shard: 8, end_shard: 16 }
+    - { id: metrics-writer-0, ordinal: 0, endpoint: "metrics-writer-0:9090", start_shard: 0, end_shard: 1 }
+    - { id: metrics-writer-1, ordinal: 1, endpoint: "metrics-writer-1:9090", start_shard: 1, end_shard: 2 }
 auth:
   internal: { source: env, name: METRICS_INTERNAL_TOKEN }
   jwt:

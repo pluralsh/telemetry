@@ -56,8 +56,55 @@ services:
     depends_on:
       minio:
         condition: service_started
-    command: ["mb", "--ignore-existing", "local/metrics-regression"]
+    command: ["mb", "--ignore-existing", "local/metrics-regression", "local/mimir-regression"]
     restart: on-failure
+
+  # Object-store-backed oracle sharing MinIO with Metrics. The `MIMIR_*`
+  # variables default to Mimir's stock read path (recent data from ingester
+  # memory); the fuzz harness overrides them to force store-gateway reads.
+  mimir:
+    image: grafana/mimir:3.2.1
+    profiles: ["mimir"]
+    command:
+      - -target=all
+      - -auth.multitenancy-enabled=false
+      - -log.level=warn
+      - -server.http-listen-port=8080
+      - -common.storage.backend=s3
+      - -common.storage.s3.endpoint=minio:9000
+      - -common.storage.s3.insecure=true
+      - -common.storage.s3.access-key-id=metrics
+      - -common.storage.s3.secret-access-key=metrics-regression-secret
+      - -common.storage.s3.bucket-name=mimir-regression
+      - -blocks-storage.storage-prefix=blocks
+      - -ruler-storage.storage-prefix=ruler
+      - -alertmanager-storage.storage-prefix=alertmanager
+      - -blocks-storage.tsdb.dir=/data/tsdb
+      - -blocks-storage.bucket-store.sync-dir=/data/tsdb-sync
+      - -compactor.data-dir=/data/compactor
+      - -ingester.ring.instance-addr=127.0.0.1
+      - -ingester.ring.replication-factor=1
+      - -ingester.ring.min-ready-duration=0s
+      - -ingester.ring.final-sleep=0s
+      - -store-gateway.sharding-ring.replication-factor=1
+      - -store-gateway.sharding-ring.instance-addr=127.0.0.1
+      - -compactor.ring.instance-addr=127.0.0.1
+      - -distributor.ingestion-rate-limit=1000000000
+      - -distributor.ingestion-burst-size=1000000000
+      - -ingester.max-global-series-per-user=0
+      # Rounds rewrite up to 30m of history after earlier rounds were flushed.
+      - -ingester.out-of-order-time-window=2h
+      - -querier.query-engine=${MIMIR_QUERY_ENGINE:-mimir}
+      - -querier.query-ingesters-within=${MIMIR_QUERY_INGESTERS_WITHIN:-13h}
+      - -querier.query-store-after=${MIMIR_QUERY_STORE_AFTER:-12h}
+      - -blocks-storage.bucket-store.ignore-blocks-within=${MIMIR_IGNORE_BLOCKS_WITHIN:-10h}
+      - -blocks-storage.bucket-store.sync-interval=5s
+      - -compactor.cleanup-interval=5s
+    volumes: ["mimir-data:/data"]
+    ports: ["19009:8080"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
 
   metrics-writer-0:
     <<: *metrics
@@ -86,3 +133,4 @@ services:
 volumes:
   prometheus-data:
   minio-data:
+  mimir-data:

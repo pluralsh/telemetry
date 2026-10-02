@@ -458,22 +458,6 @@ _Appears in:_
 | `spec` _[LogsSpec](#logsspec)_ |  |  |  |
 
 
-#### LogsCacheSpec
-
-
-
-
-
-
-
-_Appears in:_
-- [LogsConfigSpec](#logsconfigspec)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `queryEntries` _integer_ |  | 256 | Minimum: 0 <br /> |
-
-
 #### LogsConfigSpec
 
 
@@ -494,7 +478,6 @@ _Appears in:_
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `request` _[LogsRequestSpec](#logsrequestspec)_ |  |  |  |
-| `cache` _[LogsCacheSpec](#logscachespec)_ |  |  |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |

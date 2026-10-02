@@ -234,7 +234,6 @@ func renderLogs(input Input) (Result, error) {
 				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
 				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 134217728),
 			},
-			Cache:       renderLogsQueryCache{QueryEntries: int64Value(spec.Cache.QueryEntries, 256)},
 			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
 			Auth:        renderAuth{Unauthenticated: logs.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:  namespaces,
@@ -545,7 +544,6 @@ type renderLogsConfig struct {
 	Write                  renderWrite          `json:"write"`
 	Sharding               renderSharding       `json:"sharding"`
 	Request                renderLogsRequest    `json:"request"`
-	Cache                  renderLogsQueryCache `json:"cache"`
 	CacheWarmer            renderCacheWarmer    `json:"cache_warmer"`
 	Auth                   renderAuth           `json:"auth"`
 	Namespaces             []renderNamespace    `json:"namespaces"`
@@ -603,9 +601,6 @@ type renderLogsRequest struct {
 	MaxStructuredMetadataFields int64 `json:"max_structured_metadata_fields"`
 	QueryConcurrency            int32 `json:"query_concurrency"`
 	MaxInFlightQueryBytes       int64 `json:"max_in_flight_query_bytes"`
-}
-type renderLogsQueryCache struct {
-	QueryEntries int64 `json:"query_entries"`
 }
 type renderCacheWarmer struct {
 	Enabled          bool  `json:"enabled"`

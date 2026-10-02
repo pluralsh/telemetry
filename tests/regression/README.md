@@ -84,6 +84,106 @@ Host ports are Loki `13100`, Logs `13101`, retention Logs `13102`, Prometheus
 retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
 Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`.
 
+## Differential fuzzing
+
+`harness/fuzz/` is a time-boxed differential fuzzer that runs alongside the
+regression suites. A shared runner, recorder, and transport drive one module per
+product: `logs.py` compares LogQL against Loki, `metrics.py` compares PromQL
+against Prometheus, and `traces.py` compares TraceQL and the search, trace,
+and tag APIs against Tempo. Each round loads a freshly randomized dataset into
+both sides, waits until the round's sentinel data is visible on both, then runs
+a randomized batch of queries over the accumulated data. Datasets vary in
+shape: wide and deep cardinality, bursts, sparse data, out-of-order timestamps,
+odd Unicode and escaping, NaN and ±Inf, broken and native histograms, and
+clock-skewed or fan-out traces. Queries are generated recursively, so the
+fuzzer can surface degenerate behaviour in ingestion as well as in queries.
+
+Fuzzing is opt-in and too heavy for pull requests. `.github/workflows/fuzz.yml`
+runs it nightly per product with a 30 minute budget, and it can also be started
+manually with a different duration, seed, product list, or logs backend. To run
+it locally:
+
+```sh
+# pytest wrapper (skipped without --fuzz)
+FUZZ_DURATION=5m mise exec -- python -m pytest \
+  tests/regression/test_fuzz/test_fuzz_logs.py --fuzz -s
+# direct entrypoint; exits 1 when the run fails
+FUZZ_DURATION=5m PYTHONPATH=tests/regression \
+  mise exec -- python -m harness.fuzz metrics
+```
+
+`FUZZ_DURATION` (default `30m`; accepts forms like `90s` or `1h30m`) limits the
+fuzzing loop only, not stack startup or image builds. When the budget runs
+out, the round in progress stops early and a short reserve is kept for writing
+the report, so larger fuzzes only need a longer duration. A failing run can be
+reproduced with `FUZZ_SEED`: data and queries for every round are derived from
+the seed, although wall-clock time still shifts the data windows.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FUZZ_SEED` | random | Seed for data and query generation |
+| `FUZZ_SCALE` | `1` | Multiplier on data volume per round |
+| `FUZZ_WINDOW` | 20m / 30m / 10m | Time span covered by each round's data |
+| `FUZZ_QUERIES_PER_ROUND` | `40-160` | Queries per round, as a fixed count or a range |
+| `FUZZ_MAX_ROUNDS`, `FUZZ_MAX_CASES` | `0` (unlimited) | Hard caps in addition to the duration |
+| `FUZZ_REQUEST_TIMEOUT` | `30s` | Per-request timeout; implementation timeouts fail the run |
+| `FUZZ_VISIBILITY_TIMEOUT` | `90s` | How long to wait for a round's data to become visible |
+| `FUZZ_LATENCY_RATIO`, `FUZZ_LATENCY_FLOOR_MS` | `10`, `250` | A case is a latency outlier when the implementation is more than this many times slower than the oracle and the gap exceeds this many ms |
+| `FUZZ_RECHECK` | `1` | Re-run mismatches once against both sides to detect flaky oracles |
+| `FUZZ_FAIL_ON` | `mismatch,impl_error,impl_timeout,unstable_impl,ingest` | Outcomes that fail the run |
+| `FUZZ_OUTPUT_DIR` | `target/fuzz/<product>-<run id>` | Report location |
+| `FUZZ_RECORD_DATA` | `1` | Store each round's generated dataset (gzip) |
+| `FUZZ_LOGS_STORAGE` | `s3` | Logs implementation backend: `s3` (MinIO) or `local` |
+| `FUZZ_LOGS_CONFIG` | `regression` | Logs implementation config (S3 storage only): `regression` (60s segments, 16 KiB/128-row pages, 2m discovery rollups, fast compaction, to exercise segment, page and rollup boundaries) or `production` (crate defaults: 1h segments, 1 MiB pages, 24h rollups) |
+| `FUZZ_LOGS_DUPLICATE_RATE` | `0.02` | Fraction of log entries re-sent with an identical timestamp and line |
+| `FUZZ_TRACES_DUPLICATE_RATE` | `0` | Fraction of spans re-sent in a later request. Opt-in: Tempo returns the copies until it compacts the trace, while Traces deduplicates them at query time |
+| `FUZZ_TRACES_ORACLE` | `tempo` | Traces oracle: `tempo` (local-disk blocks; with the default frontend settings recent data is served from ingester memory) or `tempo-s3` (blocks in the shared MinIO, search and tag lookups read only flushed blocks, ingesters drop flushed blocks after 15s; the like-for-like object-store comparison) |
+| `FUZZ_TRACES_CONFIG` | `regression` | Traces implementation configs: `regression` (60s segments, two-trace pages, IO concurrency 2, to exercise page and segment boundaries) or `production` (crate defaults: 1h segments, 1 MiB/4 MiB pages of up to 1024 traces, IO concurrency 128) |
+| `FUZZ_LOGS_UNALIGNED_RATE` | `0.5` | Fraction of LogQL metric range queries sent unaligned to their step, exercising frontend step alignment |
+| `TEMPO_IMAGE` | `grafana/tempo:2.10.8` | Tempo oracle for traces fuzzing; the live regression suite keeps `2.8.2`, which returns nothing for negated structural operators when the left side matches no spans |
+| `FUZZ_METRICS_ORACLE` | `prometheus` | Metrics oracle: `prometheus` (local-disk TSDB), `mimir` (Mimir 3.2.1 on the shared MinIO, stock read path serving recent data from ingester memory), or `mimir-blocks` (flushes each round to MinIO and reads only through the store-gateway, the like-for-like object-store comparison; adds ~30s of visibility wait per round). `MIMIR_QUERY_ENGINE=prometheus` swaps Mimir's default MQE engine for the Prometheus engine |
+| `FUZZ_METRICS_STRICT_NAME` | `0` | Compare `__name__` even where Prometheus drops it after functions (Metrics keeps it; the live suite ignores this too) |
+
+Each run writes `summary.md` and `summary.json`, which contain per-family
+outcome counts, oracle and implementation latency percentiles, latency ratios,
+and the failure reasons. The output directory also holds `cases.jsonl` (one
+line per query, with both latencies), `ingest.jsonl`, `rounds.jsonl`,
+`artifacts/` (full request and both responses for each non-matching case or
+latency outlier), and `data/` (generated datasets). Cases where both sides hit
+a result limit, or where either side fails a recheck against itself, are
+counted separately and do not count as mismatches.
+
+By default the fuzzer starts dedicated Compose stacks: project `logs-fuzz`
+(Loki on `13110`, S3-backed Logs over MinIO on `13111`, local-disk Logs on
+`13101`), `metrics-fuzz`, and `traces-fuzz`, which reuse the regression ports
+listed above. To fuzz deployed or S3-backed environments, set
+`FUZZ_STACK=external` and point each role at an endpoint:
+
+```sh
+FUZZ_STACK=external \
+FUZZ_METRICS_ORACLE_READ_URL=https://prometheus.example \
+FUZZ_METRICS_ORACLE_WRITE_URL=https://prometheus.example \
+FUZZ_METRICS_IMPL_WRITE_URL=https://metrics.example/write/ns/fuzz \
+FUZZ_METRICS_IMPL_WRITE_AUTHORIZATION="Bearer $TOKEN" \
+FUZZ_METRICS_IMPL_READ_URL=https://metrics.example/read/ns/fuzz \
+FUZZ_METRICS_IMPL_READ_HEADERS='{"X-Extra": "1"}' \
+FUZZ_DURATION=2h PYTHONPATH=tests/regression python -m harness.fuzz metrics
+```
+
+The roles are `ORACLE_READ`, `ORACLE_WRITE`, `IMPL_READ`, and `IMPL_WRITE`.
+Each accepts `_URL`, `_AUTHORIZATION` (set it to an empty value to drop the
+default credential), and `_HEADERS` (a JSON object). All generated data carries
+a `fuzz_run` label or a `fuzz.run` resource attribute, and every data query is
+scoped to it, so a shared long-lived stack can be fuzzed repeatedly. Metadata
+endpoints that cannot be scoped (log label names and values, trace tag names
+and values) only run when `FUZZ_ISOLATED=1`, which is the default for Compose
+stacks. External oracles need the same write paths as the local ones:
+Prometheus must run with `--web.enable-remote-write-receiver`, and Loki must
+have `reject_old_samples: false` and ingestion limits as permissive as
+`products/logs/loki-fuzz.yaml`.
+
+## Kubernetes
+
 The optional Kubernetes scenario is not part of normal Cargo tests:
 
 ```sh

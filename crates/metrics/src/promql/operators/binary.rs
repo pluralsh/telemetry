@@ -31,6 +31,7 @@
 //! `/` and `%` follow IEEE 754 (v1's evaluator incorrectly coerced
 //! division-by-zero to NaN; engine matches `promqltest` goldens).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -129,6 +130,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             shape: BinaryShape::VectorVector {
                 match_table,
                 output_schema,
+                partners: Arc::default(),
             },
             reservation,
             schema,
@@ -145,6 +147,15 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             done: false,
             errored: false,
         }
+    }
+
+    /// Attach the partner-side candidates for match keys shared by several
+    /// series. Only meaningful for the vector/vector shape.
+    pub fn with_partner_groups(mut self, groups: PartnerGroups) -> Self {
+        if let BinaryShape::VectorVector { partners, .. } = &mut self.shape {
+            *partners = Arc::new(groups);
+        }
+        self
     }
 
     /// Construct a vector/scalar binary op. The LHS is the vector side;
@@ -402,6 +413,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         rhs: BufferedSide,
         match_table: &MatchTable,
         output_schema: &Arc<SeriesSchema>,
+        partners: &PartnerGroups,
     ) -> Result<StepBatch, QueryError> {
         let step_count = lhs.step_count;
         let out_series_count = match_table.len();
@@ -410,34 +422,70 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         let class = self.kind.class();
         let bool_mod = self.kind.bool_modifier();
 
-        // Resolve the (lhs_idx, rhs_idx) lookup per output row once, then
-        // loop over steps on the inside. For GroupRight, the map index is
-        // RHS-indexed and the "many" side is RHS; for OneToOne and
-        // GroupLeft it's LHS-indexed.
+        // For GroupRight the map index is RHS-indexed and the "many" side is
+        // RHS; for OneToOne and GroupLeft it's LHS-indexed. Steps are the
+        // outer loop to follow the buffers' step-major layout and so shared
+        // match keys can be resolved once per step.
         let (scan_is_lhs, map) = match match_table {
             MatchTable::OneToOne(m) | MatchTable::GroupLeft(m) => (true, m),
             MatchTable::GroupRight(m) => (false, m),
+            MatchTable::Set(set) => return self.apply_set(lhs, rhs, set, output_schema, out),
         };
         let any_histograms = lhs.has_histograms() || rhs.has_histograms();
         let mut out_hist: Option<HistogramCells> = None;
+        let (scan, partner) = if scan_is_lhs {
+            (&lhs, &rhs)
+        } else {
+            (&rhs, &lhs)
+        };
+        let shared = SharedKeys::new(
+            map,
+            partners,
+            matches!(match_table, MatchTable::OneToOne(_)),
+        );
+        let mut chosen = vec![NO_SERIES; shared.groups.len()];
+        let mut matched_at = vec![usize::MAX; shared.many_count];
 
-        for (out_row, mapped) in map.iter().enumerate() {
-            // For OneToOne / GroupLeft the scan-side is LHS and
-            // `out_row` IS the lhs *global* series index. For
-            // GroupRight the scan-side is RHS and `out_row` IS the rhs
-            // global series index. `map[out_row]` may be None (no match
-            // found at planning time).
-            let (lhs_idx, rhs_idx) = if scan_is_lhs {
-                let lhs_idx = out_row;
-                let rhs_idx = mapped.map(|g| g as usize);
-                (Some(lhs_idx), rhs_idx)
-            } else {
-                let rhs_idx = out_row;
-                let lhs_idx = mapped.map(|g| g as usize);
-                (lhs_idx, Some(rhs_idx))
-            };
-
-            for step_off in 0..step_count {
+        for step_off in 0..step_count {
+            if !shared.groups.is_empty() {
+                resolve_partner_groups(
+                    scan,
+                    partner,
+                    &shared.groups,
+                    scan_is_lhs,
+                    step_off,
+                    &mut chosen,
+                )?;
+            }
+            for (out_row, mapped) in map.iter().enumerate() {
+                // `out_row` is the scan side's global series index;
+                // `map[out_row]` names the first partner series for the
+                // row's match key, or None when no partner shares it.
+                let partner_idx = match shared.row_group.get(out_row) {
+                    Some(&g) if g != NO_SERIES => Some(chosen[g as usize])
+                        .filter(|&j| j != NO_SERIES)
+                        .map(|j| j as usize),
+                    _ => mapped.map(|g| g as usize),
+                };
+                if let Some(&key) = shared.row_many.get(out_row)
+                    && key != NO_SERIES
+                    && partner_idx.is_some_and(|j| present(partner, step_off, j))
+                    && present(scan, step_off, out_row)
+                {
+                    if matched_at[key as usize] == step_off {
+                        return Err(QueryError::Internal(
+                            "multiple matches for labels: many-to-one matching must be explicit \
+                             (group_left/group_right)"
+                                .to_string(),
+                        ));
+                    }
+                    matched_at[key as usize] = step_off;
+                }
+                let (lhs_idx, rhs_idx) = if scan_is_lhs {
+                    (Some(out_row), partner_idx)
+                } else {
+                    (partner_idx, Some(out_row))
+                };
                 let out_idx = step_off * out_series_count + out_row;
                 let l_cell = lhs_idx.and_then(|idx| lhs.get(step_off, idx));
                 let r_cell = rhs_idx.and_then(|idx| rhs.get(step_off, idx));
@@ -465,6 +513,86 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                     &mut out.validity,
                     out_idx,
                 );
+            }
+        }
+
+        let (values, validity) = out.finish();
+        Ok(attach_histograms(
+            StepBatch::new(
+                lhs.step_timestamps.clone(),
+                0..step_count,
+                SchemaRef::Static(output_schema.clone()),
+                0..out_series_count,
+                values,
+                validity,
+            ),
+            out_hist,
+        ))
+    }
+
+    /// Set-operator loop, following Prometheus `VectorAnd` / `VectorOr` /
+    /// `VectorUnless`: each step first collects the signatures present on
+    /// both sides, then keeps LHS samples by signature membership and, for
+    /// `or`, adds RHS samples whose signature has no LHS sample.
+    fn apply_set(
+        &self,
+        lhs: BufferedSide,
+        rhs: BufferedSide,
+        set: &SetMatch,
+        output_schema: &Arc<SeriesSchema>,
+        mut out: OutBuffers,
+    ) -> Result<StepBatch, QueryError> {
+        let step_count = lhs.step_count;
+        let out_series_count = set.rows.len();
+        let present = |side: &BufferedSide, step: usize, idx: usize| {
+            side.get(step, idx).is_some() || side.get_histogram(step, idx).is_some()
+        };
+        let mut lhs_present = vec![false; set.key_count];
+        let mut rhs_present = vec![false; set.key_count];
+        let mut out_hist: Option<HistogramCells> = None;
+
+        for step in 0..step_count {
+            lhs_present.fill(false);
+            rhs_present.fill(false);
+            for (i, &key) in set.lhs_keys.iter().enumerate() {
+                if present(&lhs, step, i) {
+                    lhs_present[key as usize] = true;
+                }
+            }
+            for (j, &key) in set.rhs_keys.iter().enumerate() {
+                if present(&rhs, step, j) {
+                    rhs_present[key as usize] = true;
+                }
+            }
+            for (row, &(l, r)) in set.rows.iter().enumerate() {
+                let l = l.map(|i| i as usize).filter(|&i| present(&lhs, step, i));
+                let chosen = match self.kind {
+                    BinaryOpKind::And => l
+                        .filter(|&i| rhs_present[set.lhs_keys[i] as usize])
+                        .map(|i| (&lhs, i)),
+                    BinaryOpKind::Unless => l
+                        .filter(|&i| !rhs_present[set.lhs_keys[i] as usize])
+                        .map(|i| (&lhs, i)),
+                    BinaryOpKind::Or => l.map(|i| (&lhs, i)).or_else(|| {
+                        r.map(|j| j as usize)
+                            .filter(|&j| {
+                                present(&rhs, step, j) && !lhs_present[set.rhs_keys[j] as usize]
+                            })
+                            .map(|j| (&rhs, j))
+                    }),
+                    _ => unreachable!("set match tables are only built for set operators"),
+                };
+                let Some((side, idx)) = chosen else {
+                    continue;
+                };
+                let out_idx = step * out_series_count + row;
+                if let Some(h) = side.get_histogram(step, idx) {
+                    out_hist.get_or_insert_with(|| vec![None; out.values.len()])[out_idx] =
+                        Some(h.clone());
+                } else if let Some(v) = side.get(step, idx) {
+                    out.values[out_idx] = v;
+                    out.validity.set(out_idx);
+                }
             }
         }
 
@@ -528,6 +656,15 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                     &mut out.validity,
                     out_idx,
                 );
+                // A filtering comparison keeps the vector sample even when
+                // the scalar is on the left (`3 < v` yields v's values).
+                if !scalar_on_right
+                    && matches!(class, OpClass::Cmp)
+                    && !bool_mod
+                    && let Some(v) = v
+                {
+                    out.values[out_idx] = v;
+                }
             }
         }
 
@@ -779,6 +916,102 @@ fn attach_histograms(batch: StepBatch, histograms: Option<HistogramCells>) -> St
     }
 }
 
+fn present(side: &BufferedSide, step: usize, idx: usize) -> bool {
+    side.get(step, idx).is_some() || side.get_histogram(step, idx).is_some()
+}
+
+const NO_SERIES: u32 = u32::MAX;
+
+/// Dense per-row lookups for match keys with more than one series, built
+/// once per evaluation so the step loop touches only flat vectors.
+struct SharedKeys<'a> {
+    /// Candidates of each partner group with several series.
+    groups: Vec<&'a [u32]>,
+    /// Per output row, its index into `groups`, or [`NO_SERIES`]. Empty when
+    /// no group exists.
+    row_group: Vec<u32>,
+    /// Per output row of a one-to-one match, a dense id for match keys
+    /// shared by several rows, or [`NO_SERIES`]. Empty when none is shared.
+    row_many: Vec<u32>,
+    many_count: usize,
+}
+
+impl<'a> SharedKeys<'a> {
+    fn new(map: &[Option<u32>], partners: &'a PartnerGroups, one_to_one: bool) -> Self {
+        let mut group_of = HashMap::with_capacity(partners.len());
+        let mut groups = Vec::with_capacity(partners.len());
+        for (&first, candidates) in partners {
+            group_of.insert(first, groups.len() as u32);
+            groups.push(&**candidates);
+        }
+        let row_group = if groups.is_empty() {
+            Vec::new()
+        } else {
+            let lookup = |p: &Option<u32>| p.and_then(|p| group_of.get(&p).copied());
+            map.iter().map(|p| lookup(p).unwrap_or(NO_SERIES)).collect()
+        };
+
+        let mut many_of = HashMap::new();
+        if one_to_one {
+            let mut seen = HashSet::new();
+            for &p in map.iter().flatten() {
+                if !seen.insert(p) {
+                    let next = many_of.len() as u32;
+                    many_of.entry(p).or_insert(next);
+                }
+            }
+        }
+        let row_many = if many_of.is_empty() {
+            Vec::new()
+        } else {
+            let lookup = |p: &Option<u32>| p.and_then(|p| many_of.get(&p).copied());
+            map.iter().map(|p| lookup(p).unwrap_or(NO_SERIES)).collect()
+        };
+        Self {
+            groups,
+            row_group,
+            row_many,
+            many_count: many_of.len(),
+        }
+    }
+}
+
+/// Picks, for one step, the candidate in each partner group with a sample.
+/// Mirrors Prometheus, which rejects a step where the "one" side has two
+/// samples for the same match group even if nothing on the other side
+/// matches it, unless either side has no samples at all at that step.
+fn resolve_partner_groups(
+    scan: &BufferedSide,
+    partner: &BufferedSide,
+    groups: &[&[u32]],
+    partner_is_rhs: bool,
+    step: usize,
+    chosen: &mut [u32],
+) -> Result<(), QueryError> {
+    let any_present = |side: &BufferedSide| (0..side.total_series).any(|i| present(side, step, i));
+    let mut sides_present = None;
+    for (slot, candidates) in chosen.iter_mut().zip(groups) {
+        *slot = NO_SERIES;
+        for &j in candidates.iter() {
+            if !present(partner, step, j as usize) {
+                continue;
+            }
+            if *slot != NO_SERIES
+                && *sides_present.get_or_insert_with(|| any_present(scan) && any_present(partner))
+            {
+                let side = if partner_is_rhs { "right" } else { "left" };
+                return Err(QueryError::Internal(format!(
+                    "found duplicate series for the match group on the {side} hand-side \
+                     of the operation;many-to-many matching not allowed: matching labels \
+                     must be unique on one side"
+                )));
+            }
+            *slot = j;
+        }
+    }
+    Ok(())
+}
+
 /// Read a cell as `Option<f64>`: `Some(value)` iff validity bit set.
 #[inline]
 fn cell_of(batch: &StepBatch, step_off: usize, series_off: usize) -> Option<f64> {
@@ -839,11 +1072,12 @@ impl<L: Operator, R: Operator> Operator for BinaryOp<L, R> {
                 return Poll::Ready(None);
             }
 
-            let (match_table, output_schema) = match &self.shape {
+            let (match_table, output_schema, partners) = match &self.shape {
                 BinaryShape::VectorVector {
                     match_table,
                     output_schema,
-                } => (match_table.clone(), output_schema.clone()),
+                    partners,
+                } => (match_table.clone(), output_schema.clone(), partners.clone()),
                 _ => unreachable!(),
             };
             let lhs_side = self.vv_lhs.take();
@@ -857,7 +1091,8 @@ impl<L: Operator, R: Operator> Operator for BinaryOp<L, R> {
                     ))));
                 }
             };
-            return match self.apply_vv(lhs_side, rhs_side, &match_table, &output_schema) {
+            return match self.apply_vv(lhs_side, rhs_side, &match_table, &output_schema, &partners)
+            {
                 Ok(batch) => Poll::Ready(Some(Ok(batch))),
                 Err(err) => {
                     self.errored = true;

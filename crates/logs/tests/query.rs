@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
@@ -18,6 +19,7 @@ fn config(path: &str) -> Config {
             meta_cache: None,
         }),
         segment_duration: Duration::from_secs(10),
+        discovery_rollup: Some(Duration::from_secs(20)),
         retention: None,
         write_buffer: Default::default(),
         page: PageConfig {
@@ -890,6 +892,65 @@ async fn extrapolates_counter_resets_and_rejects_many_to_many_matches() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn first_and_last_over_time_break_timestamp_ties_by_loki_stream_hash() {
+    let db = LogDb::open(config("query-stream-hash-ties")).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let stream = |app: &str, region: &str, pod: &str| {
+        Labels::new(
+            [
+                ("app", app),
+                ("env", "prod"),
+                ("fuzz_run", "20261002T031128Z-af6a39d9"),
+                ("job", "fuzz"),
+                ("pod", pod),
+                ("region", region),
+            ]
+            .into_iter()
+            .map(|(name, value)| Label::new(name, value))
+            .collect(),
+        )
+        .unwrap()
+    };
+    // From a fuzz run: Loki's labels hash puts billing-964 before checkout-105.
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(
+                stream("checkout", "us-east-1", "checkout-105"),
+                vec![LogEntry::new(4 * S, r#"{"level":"warn","latency_ms":7.6}"#)],
+            ),
+            LogBatch::new(
+                stream("billing", "us-west-2", "billing-964"),
+                vec![LogEntry::new(
+                    4 * S,
+                    r#"{"level":"warn","latency_ms":76.0}"#,
+                )],
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    for (operation, expected) in [("first_over_time", 76.0), ("last_over_time", 7.6)] {
+        let query =
+            format!(r#"{operation}({{job="fuzz"}} | json | unwrap latency_ms [10s]) by (level)"#);
+        let result = db
+            .query(
+                &namespace,
+                &QueryRequest::instant(&query, 5 * S),
+                forward(10),
+            )
+            .await
+            .unwrap();
+        let QueryResult::Vector(vector) = result else {
+            panic!("expected vector");
+        };
+        assert_eq!(vector.len(), 1, "{operation}");
+        assert_eq!(vector[0].sample.value, expected, "{operation}");
+    }
+    db.close().await.unwrap();
+}
+
 #[test]
 fn parser_exposes_only_current_loki_vector_operators() {
     assert!(plural_logs::logql::parse(r#"topk(1, count_over_time({app="api"}[1m]))"#).is_ok());
@@ -900,4 +961,697 @@ fn parser_exposes_only_current_loki_vector_operators() {
     assert!(
         plural_logs::logql::parse(r#"limit_ratio(0.5, count_over_time({app="api"}[1m]))"#).is_err()
     );
+}
+
+async fn fuzz_regression_database(path: &str) -> (LogDb, Namespace) {
+    let db = LogDb::open(config(path)).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(
+                Labels::new(vec![Label::new("app", "api")]).unwrap(),
+                vec![
+                    LogEntry::new(S, "needle"),
+                    LogEntry::new(2 * S, "a needle"),
+                    LogEntry::new(3 * S, "a needle b"),
+                    LogEntry::new(4 * S, "needle b"),
+                ],
+            ),
+            LogBatch::new(
+                Labels::new(vec![Label::new("app", "api"), Label::new("tier", "gold")]).unwrap(),
+                vec![LogEntry::new(S, "not json")],
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    (db, namespace)
+}
+
+fn stream_lines(result: QueryResult) -> Vec<String> {
+    let QueryResult::Streams(streams) = result else {
+        panic!("expected streams");
+    };
+    streams
+        .into_iter()
+        .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
+        .collect()
+}
+
+#[tokio::test]
+async fn empty_equality_matcher_selects_streams_without_the_label() {
+    let (db, namespace) = fuzz_regression_database("query-empty-matcher").await;
+    let lines = stream_lines(
+        db.query(
+            &namespace,
+            &QueryRequest::range(r#"{app="api", tier=""}"#, 0, 10 * S, S),
+            forward(10),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(!lines.contains(&"not json".to_owned()));
+
+    let result = db
+        .query(
+            &namespace,
+            &QueryRequest::instant(
+                r#"absent_over_time({app="api", tier="", env="x"}[5s])"#,
+                10 * S,
+            ),
+            forward(10),
+        )
+        .await
+        .unwrap();
+    let QueryResult::Vector(vector) = result else {
+        panic!("expected vector");
+    };
+    let names = vector[0]
+        .labels
+        .iter()
+        .map(|label| label.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["app", "env"]);
+
+    // Another matcher on a label, even after its equality, drops it.
+    let result = db
+        .query(
+            &namespace,
+            &QueryRequest::instant(
+                r#"absent_over_time({app="api", env=~"x.*", env="x", region="a", region="b"}[5s])"#,
+                10 * S,
+            ),
+            forward(10),
+        )
+        .await
+        .unwrap();
+    let QueryResult::Vector(vector) = result else {
+        panic!("expected vector");
+    };
+    let names = vector[0]
+        .labels
+        .iter()
+        .map(|label| label.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["app"]);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pattern_line_filter_requires_non_empty_captures() {
+    let (db, namespace) = fuzz_regression_database("query-pattern-filter").await;
+    let matching = |query: &'static str| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            stream_lines(
+                db.query(
+                    namespace,
+                    &QueryRequest::range(query, 0, 10 * S, S),
+                    forward(10),
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    assert_eq!(
+        matching(r#"{app="api", tier=""} |> "<_>needle<_>""#).await,
+        ["a needle b"]
+    );
+    assert_eq!(
+        matching(r#"{app="api", tier=""} |> "<_>needle""#).await,
+        ["a needle"]
+    );
+    assert_eq!(
+        matching(r#"{app="api", tier=""} |> "needle<_>""#).await,
+        ["a needle b", "needle b"]
+    );
+    assert_eq!(
+        matching(r#"{app="api", tier=""} !> "<_>needle<_>""#).await,
+        ["needle", "a needle", "needle b"]
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn absent_over_time_ignores_parser_errors() {
+    let (db, namespace) = fuzz_regression_database("query-absent-errors").await;
+    let result = db
+        .query(
+            &namespace,
+            &QueryRequest::range(
+                r#"absent_over_time({tier="gold"} | json [2s])"#,
+                0,
+                6 * S,
+                S,
+            ),
+            forward(10),
+        )
+        .await
+        .unwrap();
+    let QueryResult::Matrix(matrix) = result else {
+        panic!("expected matrix");
+    };
+    let present = matrix[0]
+        .samples
+        .iter()
+        .map(|sample| sample.timestamp_ns / S)
+        .collect::<Vec<_>>();
+    assert_eq!(present, [0, 3, 4, 5, 6]);
+    db.close().await.unwrap();
+}
+
+#[test]
+fn frontend_alignment_rounds_metric_range_queries_out_to_the_step() {
+    let aligned = QueryRequest::range(
+        r#"count_over_time({app="api"}[1m])"#,
+        61 * S,
+        119 * S,
+        60 * S,
+    )
+    .frontend_step_aligned();
+    assert_eq!((aligned.start_ns, aligned.end_ns), (60 * S, 120 * S));
+
+    let logs =
+        QueryRequest::range(r#"{app="api"}"#, 61 * S, 119 * S, 60 * S).frontend_step_aligned();
+    assert_eq!((logs.start_ns, logs.end_ns), (61 * S, 119 * S));
+}
+
+#[tokio::test]
+async fn identical_entries_in_a_stream_are_deduplicated_like_loki() {
+    let db = LogDb::open(config("query-dedupe")).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let labels = || Labels::new(vec![Label::new("app", "api")]).unwrap();
+    for _ in 0..2 {
+        db.write(
+            &namespace,
+            vec![LogBatch::new(
+                labels(),
+                vec![
+                    LogEntry::new(S, "status=200 a"),
+                    LogEntry::new(S, "status=200 b"),
+                    LogEntry::new(2 * S, "status=500 a"),
+                ],
+            )],
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+    }
+
+    let lines = |query: &'static str| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            stream_lines(
+                db.query(
+                    namespace,
+                    &QueryRequest::range(query, 0, 10 * S, S),
+                    forward(100),
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+    assert_eq!(
+        lines(r#"{app="api"}"#).await,
+        ["status=200 a", "status=200 b", "status=500 a"]
+    );
+    assert_eq!(
+        lines(r#"{app="api"} | regexp "status=(?P<status>\\d+)" | line_format "{{.status}}""#)
+            .await,
+        ["200", "500"]
+    );
+
+    let count = |query: &'static str| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            let result = db
+                .query(
+                    namespace,
+                    &QueryRequest::instant(query, 10 * S),
+                    forward(100),
+                )
+                .await
+                .unwrap();
+            let QueryResult::Vector(vector) = result else {
+                panic!("expected vector");
+            };
+            vector[0].sample.value
+        }
+    };
+    assert_eq!(
+        count(r#"sum(count_over_time({app="api"}[10s]))"#).await,
+        3.0
+    );
+    // Samples dedupe on the stored line, so formatting does not merge them.
+    assert_eq!(
+        count(r#"sum(count_over_time({app="api"} | line_format "x" [10s]))"#).await,
+        3.0
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn parsers_are_skipped_when_samples_keep_no_labels() {
+    let db = LogDb::open(config("query-parser-hints")).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            Labels::new(vec![Label::new("app", "api")]).unwrap(),
+            vec![
+                LogEntry::new(S, "status=200"),
+                LogEntry::new(2 * S, r#"{"status":500}"#),
+            ],
+        )],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+
+    let query = |query: &'static str| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            db.query(
+                namespace,
+                &QueryRequest::instant(query, 10 * S),
+                forward(100),
+            )
+            .await
+        }
+    };
+    // Like Loki, a `sum` without grouping needs no labels, so the strict
+    // parser never runs and never flags the JSON line.
+    let Ok(QueryResult::Vector(vector)) =
+        query(r#"sum(count_over_time({app="api"} | logfmt --strict [10s]))"#).await
+    else {
+        panic!("expected vector");
+    };
+    assert_eq!(vector[0].sample.value, 2.0);
+    // Grouping or filtering on a label needs the parser, and its error.
+    assert!(
+        query(r#"sum by (status) (count_over_time({app="api"} | logfmt --strict [10s]))"#)
+            .await
+            .is_err()
+    );
+    assert!(
+        query(r#"sum(count_over_time({app="api"} | logfmt --strict | status != "x" [10s]))"#)
+            .await
+            .is_err()
+    );
+    // Counts never see the line, so Loki drops a `line_format` no later
+    // parser or line filter reads, and with it the reason to parse.
+    let Ok(QueryResult::Vector(vector)) =
+        query(r#"sum(count_over_time({app="api"} | json | line_format "{{.status}}" [10s]))"#)
+            .await
+    else {
+        panic!("expected vector");
+    };
+    assert_eq!(vector[0].sample.value, 2.0);
+    let Ok(QueryResult::Vector(vector)) = query(
+        r#"sum(count_over_time({app="api"} | logfmt | line_format "s{{.status}}" |= "s200" [10s]))"#,
+    )
+    .await
+    else {
+        panic!("expected vector");
+    };
+    assert_eq!(vector[0].sample.value, 1.0);
+    // Byte counts read the line, so the format stays.
+    let Ok(QueryResult::Vector(vector)) =
+        query(r#"sum(bytes_over_time({app="api"} | logfmt | line_format "{{.status}}" [10s]))"#)
+            .await
+    else {
+        panic!("expected vector");
+    };
+    assert_eq!(vector[0].sample.value, 3.0);
+    db.close().await.unwrap();
+}
+
+async fn per_line_series_database(path: &str) -> (LogDb, Namespace) {
+    let db = LogDb::open(config(path)).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let entries = |app: &str| {
+        (1..=8i64)
+            .map(|second| {
+                let level = if second % 3 == 0 { "error" } else { "info" };
+                LogEntry::new(
+                    second * S,
+                    format!("level={level} user={app}{second} bytes={}", second * 10),
+                )
+            })
+            .collect()
+    };
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(labels("api", "prod"), entries("a")),
+            LogBatch::new(labels("worker", "prod"), entries("w")),
+        ],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    (db, namespace)
+}
+
+async fn matrix(db: &LogDb, namespace: &Namespace, query: &str) -> Vec<plural_logs::MatrixSeries> {
+    let result = db
+        .query(
+            namespace,
+            &QueryRequest::range(query, 0, 10 * S, S),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    let QueryResult::Matrix(matrix) = result else {
+        panic!("expected matrix for {query}");
+    };
+    matrix
+}
+
+#[tokio::test]
+async fn sum_grouping_pushed_into_range_aggregations_keeps_results() {
+    let (db, namespace) = per_line_series_database("query-sum-pushdown").await;
+    // `* 1` keeps the range aggregation from being the sum's direct operand,
+    // so it is evaluated with a series per parsed label set.
+    for (pushed, per_line) in [
+        (
+            r#"sum by (level) (count_over_time({env="prod"} | logfmt [3s]))"#,
+            r#"sum by (level) (count_over_time({env="prod"} | logfmt [3s]) * 1)"#,
+        ),
+        (
+            r#"sum without (user, bytes) (rate({env="prod"} | logfmt [3s]))"#,
+            r#"sum without (user, bytes) (rate({env="prod"} | logfmt [3s]) * 1)"#,
+        ),
+        (
+            r#"sum(sum_over_time({env="prod"} | logfmt | unwrap bytes [4s]))"#,
+            r#"sum(sum_over_time({env="prod"} | logfmt | unwrap bytes [4s]) * 1)"#,
+        ),
+        (
+            r#"sum by (app) (bytes_over_time({env="prod"} | logfmt [2s]))"#,
+            r#"sum by (app) (bytes_over_time({env="prod"} | logfmt [2s]) * 1)"#,
+        ),
+    ] {
+        let expected = matrix(&db, &namespace, per_line).await;
+        assert!(!expected.is_empty(), "{per_line}");
+        assert_eq!(matrix(&db, &namespace, pushed).await, expected, "{pushed}");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn binary_matching_holds_at_every_step() {
+    let (db, namespace) = per_line_series_database("query-binary-steps").await;
+    // Every parsed line is its own series on both sides.
+    let ratio = matrix(
+        &db,
+        &namespace,
+        r#"count_over_time({env="prod"} | logfmt [3s]) / count_over_time({env="prod"} | logfmt [3s])"#,
+    )
+    .await;
+    assert_eq!(ratio.len(), 16);
+    for series in &ratio {
+        assert_eq!(series.samples.len(), 3, "{:?}", series.labels);
+        assert!(series.samples.iter().all(|sample| sample.value == 1.0));
+    }
+    // Aggregated operands get fresh labels at every step.
+    let difference = matrix(
+        &db,
+        &namespace,
+        r#"sum by (level) (count_over_time({env="prod"} | logfmt [3s])) - on (level) sum by (level) (count_over_time({env="prod"} | logfmt [3s]) * 2)"#,
+    )
+    .await;
+    let counts = matrix(
+        &db,
+        &namespace,
+        r#"sum by (level) (count_over_time({env="prod"} | logfmt [3s]))"#,
+    )
+    .await;
+    assert_eq!(difference.len(), 2);
+    for (difference, count) in difference.iter().zip(&counts) {
+        assert_eq!(difference.labels, count.labels);
+        let negated = count
+            .samples
+            .iter()
+            .map(|sample| (sample.timestamp_ns, -sample.value))
+            .collect::<Vec<_>>();
+        let actual = difference
+            .samples
+            .iter()
+            .map(|sample| (sample.timestamp_ns, sample.value))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, negated);
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pipelines_spread_across_batches_keep_results_and_order() {
+    let db = LogDb::open(config("query-parallel-pipelines"))
+        .await
+        .unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let entries = || {
+        (0..6000i64)
+            .map(|index| {
+                let level = if index % 3 == 0 { "error" } else { "info" };
+                LogEntry::new(index * 1_000_000, format!("level={level} bytes={index}"))
+            })
+            .collect()
+    };
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(labels("api", "prod"), entries()),
+            LogBatch::new(labels("worker", "prod"), entries()),
+        ],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    let vector = |query: &'static str| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            let result = db
+                .query(
+                    namespace,
+                    &QueryRequest::instant(query, 7 * S),
+                    QueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            let QueryResult::Vector(samples) = result else {
+                panic!("expected vector for {query}");
+            };
+            samples
+                .into_iter()
+                .map(|sample| {
+                    let labels = sample
+                        .labels
+                        .iter()
+                        .map(|label| format!("{}={}", label.name, label.value))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (labels, sample.sample.value)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        vector(r#"sum by (level) (count_over_time({env="prod"} | logfmt [10s]))"#).await,
+        [
+            ("level=error".to_owned(), 4000.0),
+            ("level=info".to_owned(), 8000.0)
+        ]
+    );
+    assert_eq!(
+        vector(
+            r#"sum(sum_over_time({env="prod"} | logfmt | level="error" | unwrap bytes [10s])) + sum(count_over_time({app="api"} |= "level=info" [10s]))"#
+        )
+        .await,
+        [(String::new(), 11_998_000.0)]
+    );
+    let result = db
+        .query(
+            &namespace,
+            &QueryRequest::range(r#"{app="api"} |= "level=error""#, 0, 7 * S, S),
+            forward(3000),
+        )
+        .await
+        .unwrap();
+    let QueryResult::Streams(streams) = result else {
+        panic!("expected streams");
+    };
+    let timestamps = streams[0]
+        .entries
+        .iter()
+        .map(|entry| entry.timestamp_ns)
+        .collect::<Vec<_>>();
+    let errors = (0..2000i64)
+        .map(|index| index * 3_000_000)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, errors);
+    // Unindexed log queries stop reading at their limit; these read past the
+    // rows run inline into batched ones.
+    for (direction, limit, expected) in [
+        (Direction::Forward, 1500, errors[..1500].to_vec()),
+        (
+            Direction::Backward,
+            1500,
+            errors[500..].iter().rev().copied().collect(),
+        ),
+        (Direction::Forward, 3000, errors.clone()),
+    ] {
+        let mut options = forward(limit);
+        options.direction = direction;
+        let result = db
+            .query(
+                &namespace,
+                &QueryRequest::range(r#"{app="api"} | logfmt | level="error""#, 0, 7 * S, S),
+                options,
+            )
+            .await
+            .unwrap();
+        let QueryResult::Streams(streams) = result else {
+            panic!("expected streams");
+        };
+        // `bytes` differs per line, so each kept line is its own stream.
+        let mut timestamps = streams
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+            .collect::<Vec<_>>();
+        timestamps.sort_unstable();
+        if direction == Direction::Backward {
+            timestamps.reverse();
+        }
+        assert_eq!(timestamps, expected, "{direction:?} limit {limit}");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn label_replace_rewrites_every_step_of_per_line_series() {
+    let (db, namespace) = per_line_series_database("query-label-replace-steps").await;
+    let base = r#"count_over_time({env="prod"} | logfmt [3s])"#;
+    let counts = matrix(&db, &namespace, base).await;
+    assert_eq!(counts.len(), 16);
+    let rewritten = |series: &plural_logs::MatrixSeries, copied: Option<&str>| {
+        let mut labels = series
+            .labels
+            .iter()
+            .map(|label| (label.name.clone(), label.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(copied) = copied {
+            labels.insert("copied".to_owned(), copied.to_owned());
+        }
+        labels
+    };
+    let as_map = |series: &plural_logs::MatrixSeries| rewritten(series, None);
+    for (query, copy) in [
+        (
+            format!(r#"label_replace({base}, "copied", "$1", "app", "(.*)")"#),
+            Some("app"),
+        ),
+        (
+            format!(r#"label_replace({base}, "copied", "x", "app", "nomatch")"#),
+            None,
+        ),
+        (
+            format!(
+                r#"label_replace(label_replace({base}, "copied", "$1", "app", "(.*)"), "copied", "$1-again", "copied", "(.*)")"#
+            ),
+            Some("again"),
+        ),
+    ] {
+        let actual = matrix(&db, &namespace, &query).await;
+        assert_eq!(actual.len(), counts.len(), "{query}");
+        let expected = counts
+            .iter()
+            .map(|series| {
+                let app = series
+                    .labels
+                    .iter()
+                    .find(|label| label.name == "app")
+                    .map(|label| label.value.clone())
+                    .unwrap();
+                let copied = match copy {
+                    Some("app") => Some(app),
+                    Some(_) => Some(format!("{app}-again")),
+                    None => None,
+                };
+                (rewritten(series, copied.as_deref()), series.samples.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let actual = actual
+            .iter()
+            .map(|series| (as_map(series), series.samples.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected, "{query}");
+    }
+    db.close().await.unwrap();
+}
+
+/// Times fine-stepped range aggregations over parsed, high-cardinality
+/// rows, where nearly every row is its own series. Run with
+/// `cargo test --release --test query -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn profile_fine_stepped_unwrap_ranges() {
+    let mut config = config("query-profile-unwrap");
+    config.segment_duration = Duration::from_secs(3600);
+    config.discovery_rollup = None;
+    config.page = PageConfig::default();
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let apps = ["api", "auth", "gateway", "worker"];
+    for (index, app) in apps.iter().enumerate() {
+        let entries = (0..1_500i64)
+            .map(|row| {
+                LogEntry::new(
+                    (row * 4 + index as i64) * S / 5,
+                    format!(
+                        r#"{{"msg":"request {row}","user":"u{}","latency_ms":{},"ctx":{{"attempt":{}}}}}"#,
+                        row % 97,
+                        row % 503,
+                        row % 5
+                    ),
+                )
+            })
+            .collect();
+        db.write(
+            &namespace,
+            vec![LogBatch::new(labels(app, "prod"), entries)],
+        )
+        .await
+        .unwrap();
+    }
+    for query in [
+        r#"label_replace(sum by (app) (sum_over_time({env="prod"} | json | unwrap ctx_attempt [2m])), "copied", "$1", "app", "(.*)")"#,
+        r#"sum(sum_over_time({env="prod"} | json | unwrap latency_ms | __error__="" [10m]))"#,
+        r#"min_over_time({env="prod"} | json | unwrap latency_ms [5m])"#,
+        r#"count_over_time({env="prod"} | json [5m])"#,
+    ] {
+        let started = std::time::Instant::now();
+        let result = db
+            .query(
+                &namespace,
+                &QueryRequest::range(query, 0, 1_200 * S, S),
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        let QueryResult::Matrix(matrix) = result else {
+            panic!("expected matrix");
+        };
+        println!(
+            "{:>8.1} ms  {:>5} series  {query}",
+            started.elapsed().as_secs_f64() * 1e3,
+            matrix.len()
+        );
+    }
+    db.close().await.unwrap();
 }

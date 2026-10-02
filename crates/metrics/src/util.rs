@@ -65,19 +65,28 @@ pub fn parse_timestamp(s: &str) -> Result<SystemTime> {
                     secs
                 )));
             }
-            Duration::try_from_secs_f64(secs)
-                .map_err(|e| Error::InvalidInput(format!("Invalid timestamp: {}", e)))
-                .and_then(|duration| {
-                    SystemTime::UNIX_EPOCH.checked_add(duration).ok_or_else(|| {
-                        Error::InvalidInput("Invalid timestamp: overflow".to_string())
-                    })
-                })
+            unix_seconds(secs).ok_or_else(|| {
+                Error::InvalidInput(format!("Invalid timestamp: {s:?} is out of range"))
+            })
         }
         Err(e) => Err(Error::InvalidInput(format!(
             "Could not parse timestamp '{}': not RFC3339 or float ({})",
             s, e
         ))),
     }
+}
+
+/// Converts non-negative float Unix seconds to a time rounded to the
+/// millisecond, as Prometheus' API does: `1790872400.162` is not exactly
+/// representable, and keeping the float error would evaluate 1ms early.
+pub fn unix_seconds(secs: f64) -> Option<SystemTime> {
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let whole = secs.trunc();
+    let millis = ((secs - whole) * 1000.0).round();
+    let duration = Duration::try_from_secs_f64(whole).ok()? + Duration::from_millis(millis as u64);
+    SystemTime::UNIX_EPOCH.checked_add(duration)
 }
 
 /// Parse a timestamp and return Unix timestamp in seconds (i64).
@@ -146,6 +155,33 @@ pub(crate) fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
         c + ((inc - t) + sum)
     };
     (t, new_c)
+}
+
+/// Prometheus' `quantile`: sorts `values` in place with NaN first and
+/// always interpolates between `floor(rank)` and the next index, so an
+/// infinite endpoint with zero weight still yields NaN (`Inf * 0`).
+pub(crate) fn quantile_in_place(q: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() || q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    values.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.total_cmp(b),
+    });
+    let last = values.len() - 1;
+    let rank = q * last as f64;
+    let lower = rank.floor() as usize;
+    let upper = (lower + 1).min(last);
+    let weight = rank - rank.floor();
+    values[lower] * (1.0 - weight) + values[upper] * weight
 }
 
 /// Convert TimeBucketSize to hours
@@ -312,7 +348,7 @@ mod tests {
     fn should_parse_unix_timestamp_as_float() {
         // given
         let timestamp_str = "1234567.56";
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs_f64(1234567.56);
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(1_234_567_560);
 
         // when
         let result = parse_timestamp(timestamp_str);
@@ -320,6 +356,17 @@ mod tests {
         // then
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn should_round_unix_timestamp_to_the_millisecond() {
+        // 1790872400.162 is stored as 1790872400.16199994..., which a plain
+        // conversion would evaluate a millisecond early.
+        let result = parse_timestamp("1790872400.162").unwrap();
+        assert_eq!(
+            result,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_872_400_162)
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! `quantile_over_time`, `present_over_time`, `deriv`, `predict_linear`.
 //!
 //! Extrapolation for `rate` / `increase` / `delta` is ported verbatim
-//! from v1's `counter_increase_correction` + `extrapolated_rate`.
+//! from Prometheus' `extrapolatedRate`.
 //!
 //! Only the output `StepBatch` buffers route through
 //! [`MemoryReservation::try_grow`]; the input window batch is already
@@ -425,35 +425,38 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> WindowStream for MatrixWindowSource
 mod rollup_fns {
     use crate::util::kahan_inc;
 
-    fn counter_increase_correction(vs: &[f64]) -> f64 {
-        let mut correction = 0.0;
+    /// Folds each reset into `result` in sample order, like Prometheus:
+    /// summing the corrections first rounds differently once values span
+    /// many orders of magnitude.
+    fn add_counter_resets(mut result: f64, vs: &[f64]) -> f64 {
         let mut prev = vs[0];
         for &v in &vs[1..] {
             if v < prev {
-                correction += prev;
+                result += prev;
             }
             prev = v;
         }
-        correction
+        result
     }
 
-    /// Shared core of rate/increase/delta. Returns the extrapolation
-    /// factor, the (possibly reset-corrected) raw delta, and the time
-    /// difference in seconds between first and last sample.
-    ///
-    /// Kind == `IsCounter` toggles counter-reset correction.
+    /// Kind == `Counter` toggles counter-reset correction.
     enum DeltaKind {
         Counter, // rate / increase
         Gauge,   // delta
     }
 
+    /// Shared core of rate/increase/delta, in Prometheus' operation order:
+    /// the extrapolation factor (divided by the range for `rate`) is
+    /// applied in one multiplication, so results near `f64::MAX` stay
+    /// finite where Prometheus' do.
     fn compute_delta(
         window_start_ms: i64,
         window_end_ms: i64,
         ts: &[i64],
         vs: &[f64],
         kind: DeltaKind,
-    ) -> Option<(f64, f64)> {
+        is_rate: bool,
+    ) -> Option<f64> {
         // caller guarantees ts.len() >= 2 via RollupKind::min_samples
         let n = ts.len();
         let range_seconds = (window_end_ms - window_start_ms) as f64 / 1000.0;
@@ -469,7 +472,7 @@ mod rollup_fns {
 
         let mut result = last_v - first_v;
         if matches!(kind, DeltaKind::Counter) {
-            result += counter_increase_correction(vs);
+            result = add_counter_resets(result, vs);
         }
 
         let num_minus_one = (n - 1) as f64;
@@ -487,7 +490,7 @@ mod rollup_fns {
         if matches!(kind, DeltaKind::Counter) {
             let mut duration_to_zero = duration_to_start;
             if result > 0.0 && first_v >= 0.0 {
-                duration_to_zero = first_v * (time_diff_seconds / result);
+                duration_to_zero = time_diff_seconds * (first_v / result);
             }
             if duration_to_zero < duration_to_start {
                 duration_to_start = duration_to_zero;
@@ -498,11 +501,15 @@ mod rollup_fns {
             duration_to_end = avg_interval / 2.0;
         }
 
-        // `rate`: factor divides by range_seconds → result is per-second.
-        // `increase`/`delta`: no division by range_seconds.
-        let factor_unit =
+        let mut factor =
             (time_diff_seconds + duration_to_start + duration_to_end) / time_diff_seconds;
-        Some((result * factor_unit, range_seconds))
+        if is_rate {
+            if range_seconds <= 0.0 {
+                return None;
+            }
+            factor /= range_seconds;
+        }
+        Some(result * factor)
     }
 
     pub(super) fn extrapolated_rate(
@@ -511,12 +518,14 @@ mod rollup_fns {
         ts: &[i64],
         vs: &[f64],
     ) -> Option<f64> {
-        let (scaled, range_seconds) =
-            compute_delta(window_start_ms, window_end_ms, ts, vs, DeltaKind::Counter)?;
-        if range_seconds <= 0.0 {
-            return None;
-        }
-        Some(scaled / range_seconds)
+        compute_delta(
+            window_start_ms,
+            window_end_ms,
+            ts,
+            vs,
+            DeltaKind::Counter,
+            true,
+        )
     }
 
     pub(super) fn extrapolated_increase(
@@ -525,10 +534,14 @@ mod rollup_fns {
         ts: &[i64],
         vs: &[f64],
     ) -> Option<f64> {
-        // increase = rate * range_seconds — i.e. the `scaled` result
-        // before dividing by range.
-        compute_delta(window_start_ms, window_end_ms, ts, vs, DeltaKind::Counter)
-            .map(|(scaled, _)| scaled)
+        compute_delta(
+            window_start_ms,
+            window_end_ms,
+            ts,
+            vs,
+            DeltaKind::Counter,
+            false,
+        )
     }
 
     pub(super) fn extrapolated_delta(
@@ -537,8 +550,14 @@ mod rollup_fns {
         ts: &[i64],
         vs: &[f64],
     ) -> Option<f64> {
-        compute_delta(window_start_ms, window_end_ms, ts, vs, DeltaKind::Gauge)
-            .map(|(scaled, _)| scaled)
+        compute_delta(
+            window_start_ms,
+            window_end_ms,
+            ts,
+            vs,
+            DeltaKind::Gauge,
+            false,
+        )
     }
 
     pub(super) fn irate(ts: &[i64], vs: &[f64]) -> Option<f64> {
@@ -717,34 +736,7 @@ mod rollup_fns {
     /// - empty ⇒ caller filtered via `min_samples`; returns `NaN` here
     ///   as a guard but is unreachable in normal flow.
     pub(super) fn quantile(q: f64, vs: &[f64]) -> f64 {
-        if vs.is_empty() {
-            return f64::NAN;
-        }
-        if q.is_nan() {
-            return f64::NAN;
-        }
-        if q < 0.0 {
-            return f64::NEG_INFINITY;
-        }
-        if q > 1.0 {
-            return f64::INFINITY;
-        }
-        let mut sorted: Vec<f64> = vs.to_vec();
-        // `total_cmp` handles NaN deterministically, sorting NaN to the
-        // end. Prometheus does the same via Go's sort.Float64s.
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let n = sorted.len();
-        if n == 1 {
-            return sorted[0];
-        }
-        let rank = q * (n - 1) as f64;
-        let lo = rank.floor() as usize;
-        let hi = rank.ceil() as usize;
-        if lo == hi {
-            return sorted[lo];
-        }
-        let weight = rank - lo as f64;
-        sorted[lo] * (1.0 - weight) + sorted[hi] * weight
+        crate::util::quantile_in_place(q, &mut vs.to_vec())
     }
 }
 

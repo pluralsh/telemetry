@@ -25,6 +25,11 @@ pub(super) struct Accumulator {
     c_mean: f64,
     m2: f64,
     c_m2: f64,
+    /// Prometheus' `avg`: the direct Kahan mean until the running sum would
+    /// overflow, then an incremental mean seeded from the sum so far.
+    avg_incremental: bool,
+    avg_mean: f64,
+    c_avg_mean: f64,
 }
 
 impl Accumulator {
@@ -41,6 +46,9 @@ impl Accumulator {
             c_mean: 0.0,
             m2: 0.0,
             c_m2: 0.0,
+            avg_incremental: false,
+            avg_mean: 0.0,
+            c_avg_mean: 0.0,
         }
     }
 
@@ -53,9 +61,20 @@ impl Accumulator {
     #[inline]
     pub(super) fn absorb(&mut self, v: f64) {
         self.count = self.count.saturating_add(1);
+        let n = self.count as f64;
 
         // Kahan sum lane.
         let (new_sum, new_c) = kahan_inc(v, self.sum, self.c_sum);
+        if self.count > 1 && !self.avg_incremental && new_sum.is_infinite() {
+            self.avg_incremental = true;
+            self.avg_mean = self.sum / (n - 1.0);
+            self.c_avg_mean = self.c_sum / (n - 1.0);
+        }
+        if self.avg_incremental {
+            let q = (n - 1.0) / n;
+            (self.avg_mean, self.c_avg_mean) =
+                kahan_inc(v / n, q * self.avg_mean, q * self.c_avg_mean);
+        }
         self.sum = new_sum;
         self.c_sum = new_c;
 
@@ -78,7 +97,6 @@ impl Accumulator {
         }
 
         // Welford lane with Kahan compensation on both mean and M2.
-        let n = self.count as f64;
         let delta = v - (self.mean + self.c_mean);
         let (new_mean, new_c_mean) = kahan_inc(delta / n, self.mean, self.c_mean);
         self.mean = new_mean;
@@ -100,11 +118,12 @@ impl Accumulator {
 
     #[inline]
     pub(super) fn avg_value(&self) -> f64 {
-        // Mean via Welford is numerically robust. For groups where the
-        // Kahan sum hasn't overflowed, sum/count and mean agree to
-        // within the compensation term; we emit the Welford mean for
-        // the overflow-resistance the task spec mandates.
-        self.mean + self.c_mean
+        if self.avg_incremental {
+            self.avg_mean + self.c_avg_mean
+        } else {
+            let n = self.count as f64;
+            self.sum / n + self.c_sum / n
+        }
     }
 
     #[inline]

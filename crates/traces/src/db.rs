@@ -30,12 +30,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceLocator, decode_indices,
-    decode_locator, decode_locator_trace_id, decode_metadata, decode_posting_sequence,
-    decode_posting_value, decode_sequence, encode_indices, encode_locator, encode_metadata,
-    encode_sequence, field_posting_key, field_scan_prefix, field_value_prefix, locator_key,
-    locator_namespace_prefix, locator_prefix, metadata_key, metadata_prefix, next_sequence_key,
-    payload_key, posting_key, segment_for, segment_prefix,
+    LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceHead, TraceLocator,
+    continuation_key, continuation_prefix, decode_head, decode_head_trace_id, decode_indices,
+    decode_locator, decode_marker, decode_metadata, decode_metadata_sequence,
+    decode_posting_sequence, decode_posting_value, decode_sequence, encode_head, encode_indices,
+    encode_locator, encode_metadata, encode_sequence, field_posting_key, field_scan_prefix,
+    field_value_prefix, head_key, head_namespace_prefix, marker_key, marker_prefix, marker_value,
+    metadata_key, metadata_prefix, next_sequence_key, payload_key, posting_key, segment_for,
+    segment_prefix,
 };
 
 /// Concurrent storage reads per query stage.
@@ -60,6 +62,9 @@ const WRITE_CHANNEL: &str = "write";
 const TRACES_FLUSH_PAGES: &str = "traces_flush_pages";
 const PARTITION_SCOPE: &str = "partition";
 const PARTITION_NAME: &str = "segment";
+/// `"<segment>:<last segment>"` for partitions holding traces that end after
+/// their start segment, so searches can reach them from later windows.
+const PARTITION_EXTENT_NAME: &str = "extent";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
@@ -144,6 +149,7 @@ impl TraceDb {
             storage: storage.clone(),
             page_config: config.page.clone(),
             retention: config.retention,
+            segment_ns,
         };
         let mut write_coordinator = WriteCoordinator::new(
             config.write_buffer.clone(),

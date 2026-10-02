@@ -209,14 +209,6 @@ spec:
                           HTTP APIs.
                         type: boolean
                     type: object
-                  cache:
-                    properties:
-                      queryEntries:
-                        default: 256
-                        format: int64
-                        minimum: 0
-                        type: integer
-                    type: object
                   cacheWarmer:
                     properties:
                       concurrency:

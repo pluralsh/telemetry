@@ -37,9 +37,17 @@ pub(super) fn assert_results(
     // `expect ordered` for order-sensitive checks (e.g. topk/bottomk).
     let mut results_sorted = results.to_vec();
     let mut expected_sorted = expected.to_vec();
+    // Expectations may omit `__name__`, so it can't take part in the order.
     if !expect_ordered {
-        results_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
-        expected_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let key = |s: &RangeSample| {
+            s.labels
+                .iter()
+                .filter(|l| l.name != "__name__")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        results_sorted.sort_by_cached_key(key);
+        expected_sorted.sort_by_cached_key(key);
     }
 
     for (i, exp) in expected_sorted.iter().enumerate() {

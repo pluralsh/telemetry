@@ -329,6 +329,7 @@ fn pushdown_scans_values_for_regex_ranges_and_existence() {
         "{ span.code >= 500 }",
         "{ 500 <= span.code }",
         "{ span.code != nil }",
+        "{ span.code != 500 }",
     ] {
         assert!(
             matches!(single_test(source), IndexTest::Compare(..)),
@@ -349,11 +350,7 @@ fn pushdown_scans_values_for_regex_ranges_and_existence() {
 
 #[test]
 fn pushdown_skips_predicates_that_match_missing_attributes() {
-    for source in [
-        "{ span.a != 1 }",
-        "{ span.a = nil }",
-        "{ instrumentation.a = 1 }",
-    ] {
+    for source in ["{ span.a = nil }", "{ instrumentation.a = 1 }"] {
         assert!(
             plan(parse(source).unwrap()).unwrap().pushdown.is_empty(),
             "{source}"
@@ -446,17 +443,11 @@ fn pushdown_unions_disjunction_sides() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["a", "b"]);
     assert!(
-        plan(parse(r#"{ span.a = 1 || span.b != 2 }"#).unwrap())
+        plan(parse(r#"{ span.a = 1 || span.b = nil }"#).unwrap())
             .unwrap()
             .pushdown
             .is_empty()
     );
-}
-
-#[test]
-fn pushdown_ignores_negative_match() {
-    let plan = plan(parse(r#"{ span.a != 1 }"#).unwrap()).unwrap();
-    assert!(plan.pushdown.is_empty());
 }
 
 #[test]
@@ -472,6 +463,14 @@ fn execution_preserves_typed_distinction() {
     let integer = run("{ span.typed = 7 }").unwrap();
     assert_eq!(string.matched_spans[0].name, "root");
     assert_eq!(integer.matched_spans[0].name, "db.query");
+}
+
+#[test]
+fn comparisons_against_missing_attributes_only_match_nil() {
+    assert_eq!(names("{ span.http.status != 500 }"), ["root"]);
+    assert_eq!(names(r#"{ span.db.system !~ "my.*" }"#), ["db.query"]);
+    assert_eq!(names("{ span.http.status = nil }"), ["cache", "db.query"]);
+    assert_eq!(names("{ span.http.status != nil }"), ["root"]);
 }
 
 #[test]
@@ -629,7 +628,7 @@ fn pushdown_covers_structural_operands_and_stage_filters() {
     assert_eq!(count(r#"{ span.a = 1 } &~ { span.b = 2 }"#), 2);
     assert_eq!(count(r#"{ span.a = 1 } !> { span.b = 2 }"#), 1);
     assert_eq!(count(r#"{ span.a = 1 } || { span.b = 2 }"#), 1);
-    assert_eq!(count(r#"{ span.a = 1 } || { span.b != 2 }"#), 0);
+    assert_eq!(count(r#"{ span.a = 1 } || { span.b = nil }"#), 0);
     assert_eq!(count(r#"{ } | count() > 1 | { span.b = 2 }"#), 1);
 }
 

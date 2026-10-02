@@ -27,7 +27,7 @@ def test_fixture_is_deterministic_typed_and_spans_writer_ranges() -> None:
     assert protobuf_body(left.request) == protobuf_body(right.request)
     assert left.trace_ids == TRACE_IDS
     assert_spans_writer_ranges()
-    assert {fixture_shard(value) < 8 for value in TRACE_IDS} == {False, True}
+    assert {fixture_shard(value) for value in TRACE_IDS} == {0, 1}
     spans = left.request.resource_spans[2].scope_spans[0].spans
     attributes = {value.key: value.value for value in spans[0].attributes}
     assert attributes["http.status_code"].int_value == 500

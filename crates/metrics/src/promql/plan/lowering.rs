@@ -42,6 +42,10 @@ use super::plan_types::{
     MatchingAxis, Offset,
 };
 
+/// Prometheus' default `evaluation_interval`, which `[range:]` subqueries
+/// step at.
+const DEFAULT_SUBQUERY_STEP_MS: i64 = 60_000;
+
 // ---------------------------------------------------------------------------
 // LoweringContext
 // ---------------------------------------------------------------------------
@@ -136,14 +140,14 @@ pub fn lower(expr: &parser::Expr, ctx: &LoweringContext) -> Result<LogicalPlan, 
         parser::Expr::VectorSelector(vs) => Ok(LogicalPlan::VectorSelector {
             selector: vs.clone(),
             offset: offset_from_parser(vs.offset.as_ref()),
-            at: at_from_parser(vs.at.as_ref())?,
+            at: at_from_parser(vs.at.as_ref(), ctx)?,
             lookback_ms: Some(ctx.lookback_delta_ms),
         }),
         parser::Expr::MatrixSelector(ms) => Ok(LogicalPlan::MatrixSelector {
             selector: ms.vs.clone(),
             range_ms: ms.range.as_millis() as i64,
             offset: offset_from_parser(ms.vs.offset.as_ref()),
-            at: at_from_parser(ms.vs.at.as_ref())?,
+            at: at_from_parser(ms.vs.at.as_ref(), ctx)?,
         }),
         parser::Expr::NumberLiteral(n) => Ok(LogicalPlan::Scalar(n.val)),
         parser::Expr::StringLiteral(_) => Err(PlanError::InvalidTopLevelString),
@@ -164,26 +168,17 @@ pub fn lower(expr: &parser::Expr, ctx: &LoweringContext) -> Result<LogicalPlan, 
         parser::Expr::Aggregate(agg) => lower_aggregate(agg, ctx),
         parser::Expr::Binary(b) => lower_binary(b, ctx),
         parser::Expr::Subquery(sq) => {
-            // `step: Option<Duration>` — `None` means "use the global
-            // evaluation interval". For v1 that global interval is
-            // `ctx.step_ms` for range queries; instant queries default to
-            // 1000ms (same as Prometheus' `-query.default-step`).
-            let step_ms = match sq.step {
-                Some(s) => s.as_millis() as i64,
-                None => {
-                    if ctx.is_instant() {
-                        1000
-                    } else {
-                        ctx.step_ms
-                    }
-                }
-            };
+            // `[range:]` steps at Prometheus' global evaluation interval,
+            // whatever the query's own step.
+            let step_ms = sq
+                .step
+                .map_or(DEFAULT_SUBQUERY_STEP_MS, |s| s.as_millis() as i64);
             Ok(LogicalPlan::Subquery {
                 child: Box::new(lower(&sq.expr, ctx)?),
                 range_ms: sq.range.as_millis() as i64,
                 step_ms,
                 offset: offset_from_parser(sq.offset.as_ref()),
-                at: at_from_parser(sq.at.as_ref())?,
+                at: at_from_parser(sq.at.as_ref(), ctx)?,
             })
         }
         parser::Expr::Extension(_) => Err(PlanError::UnsupportedFeature(
@@ -203,13 +198,23 @@ fn offset_from_parser(parser_offset: Option<&parser::Offset>) -> Offset {
     }
 }
 
-fn at_from_parser(parser_at: Option<&parser::AtModifier>) -> Result<Option<AtModifier>, PlanError> {
-    match parser_at {
-        None => Ok(None),
-        Some(at) => AtModifier::try_from(at)
-            .map(Some)
-            .map_err(|msg| PlanError::UnsupportedFeature(msg.to_string())),
-    }
+/// `start()` and `end()` name the top-level query's range wherever they appear,
+/// so they are pinned here rather than read off the grid an operator runs on,
+/// which inside a subquery is the subquery's own.
+fn at_from_parser(
+    parser_at: Option<&parser::AtModifier>,
+    ctx: &LoweringContext,
+) -> Result<Option<AtModifier>, PlanError> {
+    let Some(at) = parser_at else {
+        return Ok(None);
+    };
+    let at =
+        AtModifier::try_from(at).map_err(|msg| PlanError::UnsupportedFeature(msg.to_string()))?;
+    Ok(Some(match at {
+        AtModifier::Start => AtModifier::Value(ctx.start_ms),
+        AtModifier::End => AtModifier::Value(ctx.end_ms),
+        AtModifier::Value(_) => at,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -460,8 +465,12 @@ fn absent_labels(arg: &parser::Expr) -> Labels {
         parser::Expr::MatrixSelector(ms) => &ms.vs,
         _ => return Labels::empty(),
     };
+    // Prometheus' `createLabelsForAbsentFunction`: the first `=` matcher
+    // sets a label, any other matcher on that name deletes it afterwards,
+    // and an empty value never becomes a label.
     let mut labels: Vec<Label> = Vec::new();
     let mut set: HashSet<&str> = HashSet::new();
+    let mut removed: HashSet<&str> = HashSet::new();
     for matcher in &selector.matchers.matchers {
         if matcher.name == "__name__" {
             continue;
@@ -469,9 +478,10 @@ fn absent_labels(arg: &parser::Expr) -> Labels {
         if matches!(matcher.op, MatchOp::Equal) && set.insert(&matcher.name) {
             labels.push(Label::new(&matcher.name, &matcher.value));
         } else {
-            labels.retain(|label| label.name != matcher.name);
+            removed.insert(&matcher.name);
         }
     }
+    labels.retain(|label| !label.value.is_empty() && !removed.contains(label.name.as_str()));
     labels.sort();
     Labels::new(labels)
 }

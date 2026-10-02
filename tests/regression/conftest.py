@@ -14,11 +14,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         help="run slower retention and restart regression scenarios",
     )
+    parser.addoption(
+        "--fuzz",
+        action="store_true",
+        help="run long differential fuzz sessions (see FUZZ_* variables)",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "docker: requires a working Docker daemon")
     config.addinivalue_line("markers", "extended: slower durability/lifecycle coverage")
+    config.addinivalue_line("markers", "fuzz: long-running differential fuzz session")
 
 
 def pytest_collection_modifyitems(
@@ -29,8 +35,11 @@ def pytest_collection_modifyitems(
     extended_skip = pytest.mark.skip(
         reason="pass --extended to run lifecycle scenarios"
     )
+    fuzz_skip = pytest.mark.skip(reason="pass --fuzz to run differential fuzzing")
     for item in items:
         if "docker" in item.keywords and not available:
             item.add_marker(docker_skip)
         if "extended" in item.keywords and not config.getoption("--extended"):
             item.add_marker(extended_skip)
+        if "fuzz" in item.keywords and not config.getoption("--fuzz"):
+            item.add_marker(fuzz_skip)

@@ -3,7 +3,7 @@ use std::{
     io::Read,
     ops::RangeInclusive,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -564,10 +564,7 @@ async fn authorize_namespace(
 /// Prometheus' minimum-time sentinel still get the full range.
 fn parse_time(value: &str) -> Result<SystemTime, ApiError> {
     if let Ok(seconds) = value.parse::<f64>() {
-        let since_epoch = Duration::try_from_secs_f64(seconds.max(0.0))
-            .map_err(|_| ApiError::bad_request(format!("invalid timestamp {value:?}")))?;
-        return UNIX_EPOCH
-            .checked_add(since_epoch)
+        return plural_metrics::unix_seconds(seconds.max(0.0))
             .ok_or_else(|| ApiError::bad_request(format!("invalid timestamp {value:?}")));
     }
     let time = plural_metrics::parse_timestamp(value).map_err(ApiError::bad_request)?;

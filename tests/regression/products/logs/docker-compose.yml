@@ -38,7 +38,60 @@ services:
       - logs-retention-data:/data
     ports: ["13102:3100"]
 
+  # Differential fuzzing (tests/regression/test_fuzz): a dedicated oracle with
+  # raised ingest limits and an S3-backed Logs over local MinIO.
+  loki-fuzz:
+    profiles: ["fuzz"]
+    image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
+    command: ["-config.file=/etc/loki/fuzz.yaml"]
+    volumes:
+      - ./loki-fuzz.yaml:/etc/loki/fuzz.yaml:ro
+      - loki-fuzz-data:/loki
+    ports: ["13110:3100"]
+
+  minio:
+    profiles: ["fuzz"]
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: logs
+      MINIO_ROOT_PASSWORD: logs-fuzz-secret
+    volumes: ["minio-data:/data"]
+
+  minio-init:
+    profiles: ["fuzz"]
+    image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+    environment:
+      MC_HOST_local: http://logs:logs-fuzz-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_started
+    command: ["mb", "--ignore-existing", "local/logs-fuzz"]
+    restart: on-failure
+
+  logs-s3:
+    profiles: ["fuzz"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: logs
+      AWS_SECRET_ACCESS_KEY: logs-fuzz-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    command: ["--config", "/app/regression/logs-s3.yaml"]
+    volumes:
+      - ./${LOGS_CONFIG_DIR:-.}/logs-s3.yaml:/app/regression/logs-s3.yaml:ro
+    ports: ["13111:3100"]
+
 volumes:
   loki-data:
   logs-data:
   logs-retention-data:
+  loki-fuzz-data:
+  minio-data:

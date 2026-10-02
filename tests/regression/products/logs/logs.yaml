@@ -14,7 +14,6 @@ page:
   rows_per_block: 32
 compaction: { min_age_seconds: 1, finalize_after_seconds: 5, delete_delay_seconds: 30 }
 write: { flush_interval_seconds: 1 }
-cache: { query_entries: 0 }
 auth: { unauthenticated: true }
 namespaces:
   - name: regression

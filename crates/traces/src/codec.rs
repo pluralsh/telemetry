@@ -14,11 +14,11 @@ use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
 };
 
-pub(crate) const KEY_VERSION: u8 = 3;
+pub(crate) const KEY_VERSION: u8 = 4;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v3";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v4";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
 /// Leading byte of page metadata and locator values.
@@ -27,8 +27,8 @@ const HAS_EXPIRY: u8 = 1;
 
 /// Locator records deliberately live in one fixed routing segment per
 /// namespace. This makes trace-by-ID a single-shard lookup after data pages are
-/// time-sharded. The tradeoff is concentrated locator traffic; immutable
-/// sequence-suffixed fragments avoid a hot read/modify/write key.
+/// time-sharded. Each trace has one [`TraceHead`] point record; only traces
+/// stored on several pages also have per-page continuation records.
 pub(crate) const LOCATOR_SEGMENT: SegmentId = i64::MIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,8 +37,10 @@ enum RecordType {
     NextPageSequence = 1,
     PageMetadata = 2,
     PagePayload = 3,
-    TraceLocator = 4,
+    TraceHead = 4,
     AttributePosting = 5,
+    TraceContinuation = 6,
+    ContinuedMarker = 7,
 }
 
 /// Page metadata carries a compact copy of the page's trace directory so
@@ -57,6 +59,9 @@ pub(crate) struct PageTrace {
     pub trace_id: TraceId,
     pub min_timestamp_ns: u64,
     pub max_timestamp_ns: u64,
+    /// Set when this page is not the trace's first. The first page cannot
+    /// know about later ones, so it is flagged by a [`marker_key`] instead.
+    pub continued: bool,
 }
 
 impl PageTrace {
@@ -76,12 +81,22 @@ impl StoredPageMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TraceLocator {
     pub segment: SegmentId,
     pub page_sequence: u64,
     pub trace_index: u32,
     pub expires_at_unix_ms: Option<u64>,
+}
+
+/// The per-trace point record. While `continued` is false, `first` is the
+/// trace's only page and its expiry is the page's. Once continued, every page
+/// including the first has a continuation record, and the head's expiry is
+/// renewed by each continuation so trace-by-ID can always reach them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TraceHead {
+    pub first: TraceLocator,
+    pub continued: bool,
 }
 
 /// A page's `(segment, sequence)` address.
@@ -124,7 +139,6 @@ pub(crate) fn metadata_prefix(namespace: &Namespace, segment: SegmentId) -> Byte
     record_prefix(namespace, segment, RecordType::PageMetadata).freeze()
 }
 
-#[cfg(test)]
 pub(crate) fn decode_metadata_sequence(key: &[u8]) -> Result<u64> {
     let (_, _, record_type, offset) = parse_record_prefix(key)?;
     if record_type != RecordType::PageMetadata || key.len() != offset + 8 {
@@ -133,38 +147,78 @@ pub(crate) fn decode_metadata_sequence(key: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(key[offset..].try_into().unwrap()))
 }
 
-pub(crate) fn locator_key(
+pub(crate) fn head_key(namespace: &Namespace, trace_id: TraceId) -> Bytes {
+    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceHead);
+    bytes.extend_from_slice(trace_id.as_bytes());
+    bytes.freeze()
+}
+
+/// Every trace head in a namespace, in trace ID order.
+pub(crate) fn head_namespace_prefix(namespace: &Namespace) -> Bytes {
+    record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceHead).freeze()
+}
+
+pub(crate) fn decode_head_trace_id(key: &[u8]) -> Result<TraceId> {
+    let (_, segment, record_type, offset) = parse_record_prefix(key)?;
+    if segment != LOCATOR_SEGMENT
+        || record_type != RecordType::TraceHead
+        || key.len() != offset + 16
+    {
+        return Err(Error::Corrupt("invalid trace head key".to_owned()));
+    }
+    TraceId::new(key[offset..].try_into().unwrap())
+}
+
+pub(crate) fn continuation_key(
     namespace: &Namespace,
     trace_id: TraceId,
     segment: SegmentId,
     sequence: u64,
 ) -> Bytes {
-    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator);
+    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceContinuation);
     bytes.extend_from_slice(trace_id.as_bytes());
     bytes.put_u64(encode_i64_sortable(segment));
     bytes.put_u64(sequence);
     bytes.freeze()
 }
 
-pub(crate) fn locator_prefix(namespace: &Namespace, trace_id: TraceId) -> Bytes {
-    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator);
+pub(crate) fn continuation_prefix(namespace: &Namespace, trace_id: TraceId) -> Bytes {
+    let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceContinuation);
     bytes.extend_from_slice(trace_id.as_bytes());
     bytes.freeze()
 }
 
-pub(crate) fn locator_namespace_prefix(namespace: &Namespace) -> Bytes {
-    record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceLocator).freeze()
+/// Flags the trace at `(sequence, index)` of `segment` as continued on
+/// later pages. Lives in the first page's segment so it ages out with it.
+pub(crate) fn marker_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    sequence: u64,
+    index: u32,
+) -> Bytes {
+    let mut bytes = record_prefix(namespace, segment, RecordType::ContinuedMarker);
+    bytes.put_u64(sequence);
+    bytes.put_u32(index);
+    bytes.freeze()
 }
 
-pub(crate) fn decode_locator_trace_id(key: &[u8]) -> Result<TraceId> {
-    let (_, segment, record_type, offset) = parse_record_prefix(key)?;
-    if segment != LOCATOR_SEGMENT
-        || record_type != RecordType::TraceLocator
-        || key.len() != offset + 16 + 8 + 8
-    {
-        return Err(Error::Corrupt("invalid trace locator key".to_owned()));
+pub(crate) fn marker_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::ContinuedMarker).freeze()
+}
+
+pub(crate) fn decode_marker(key: &[u8]) -> Result<(u64, u32)> {
+    let (_, _, record_type, offset) = parse_record_prefix(key)?;
+    if record_type != RecordType::ContinuedMarker || key.len() != offset + 12 {
+        return Err(Error::Corrupt("invalid continued marker key".to_owned()));
     }
-    TraceId::new(key[offset..offset + 16].try_into().unwrap())
+    Ok((
+        u64::from_be_bytes(key[offset..offset + 8].try_into().unwrap()),
+        u32::from_be_bytes(key[offset + 8..].try_into().unwrap()),
+    ))
+}
+
+pub(crate) fn marker_value() -> Bytes {
+    Bytes::from_static(&[VALUE_VERSION])
 }
 
 pub(crate) fn posting_key(
@@ -197,7 +251,8 @@ pub(crate) fn decode_sequence(value: &[u8]) -> Result<u64> {
 }
 
 /// Trace timestamps are stored relative to the page minimum, so the
-/// directory costs about 20 bytes per trace.
+/// directory costs about 20 bytes per trace. Continued flags follow as a
+/// bitmap, one bit per trace.
 pub(crate) fn encode_metadata(value: &StoredPageMetadata) -> Result<Bytes> {
     let page_span = value
         .max_timestamp_ns
@@ -223,6 +278,11 @@ pub(crate) fn encode_metadata(value: &StoredPageMetadata) -> Result<Bytes> {
         bytes.extend_from_slice(trace.trace_id.as_bytes());
         var_u64::serialize(offset, &mut bytes);
         var_u64::serialize(span, &mut bytes);
+    }
+    for chunk in value.traces.chunks(8) {
+        bytes.put_u8(chunk.iter().enumerate().fold(0, |bits, (bit, trace)| {
+            bits | (u8::from(trace.continued) << bit)
+        }));
     }
     Ok(bytes.freeze())
 }
@@ -265,8 +325,16 @@ pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
             trace_id,
             min_timestamp_ns: trace_min,
             max_timestamp_ns: trace_max,
+            continued: false,
         });
     }
+    let (continued, rest) = buf
+        .split_at_checked(count.div_ceil(8))
+        .ok_or_else(|| Error::Corrupt("truncated trace page metadata".to_owned()))?;
+    for (index, trace) in traces.iter_mut().enumerate() {
+        trace.continued = continued[index / 8] & (1 << (index % 8)) != 0;
+    }
+    buf = rest;
     ensure_consumed(buf, "trace page metadata")?;
     if observed_min != min_timestamp_ns || observed_max != max_timestamp_ns {
         return Err(corrupt());
@@ -301,6 +369,29 @@ pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
     };
     ensure_consumed(buf, "trace locator")?;
     Ok(locator)
+}
+
+const HEAD_CONTINUED: u8 = 1;
+
+pub(crate) fn encode_head(value: &TraceHead) -> Result<Bytes> {
+    let mut bytes = BytesMut::from(encode_locator(&value.first)?.as_ref());
+    bytes.put_u8(if value.continued { HEAD_CONTINUED } else { 0 });
+    Ok(bytes.freeze())
+}
+
+pub(crate) fn decode_head(value: &[u8]) -> Result<TraceHead> {
+    let (flags, locator) = value
+        .split_last()
+        .ok_or_else(|| Error::Corrupt("empty trace head".to_owned()))?;
+    let continued = match *flags {
+        0 => false,
+        HEAD_CONTINUED => true,
+        flags => return Err(Error::Corrupt(format!("unknown trace head flags {flags}"))),
+    };
+    Ok(TraceHead {
+        first: decode_locator(locator)?,
+        continued,
+    })
 }
 
 fn value_header(expires_at_unix_ms: Option<u64>, capacity: usize) -> BytesMut {
@@ -497,8 +588,10 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         1 => RecordType::NextPageSequence,
         2 => RecordType::PageMetadata,
         3 => RecordType::PagePayload,
-        4 => RecordType::TraceLocator,
+        4 => RecordType::TraceHead,
         5 => RecordType::AttributePosting,
+        6 => RecordType::TraceContinuation,
+        7 => RecordType::ContinuedMarker,
         value => {
             return Err(Error::Corrupt(format!(
                 "unknown Traces record type {value}"
@@ -515,7 +608,7 @@ mod tests {
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v3");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v4");
     }
 
     #[test]
@@ -531,14 +624,32 @@ mod tests {
     }
 
     #[test]
-    fn locator_uses_fixed_segment_and_unique_fragments() {
+    fn locator_records_use_fixed_segment_and_disjoint_prefixes() {
         let namespace = Namespace::default();
         let id = TraceId::new([1; 16]).unwrap();
-        let first = locator_key(&namespace, id, 2, 3);
-        let second = locator_key(&namespace, id, 4, 5);
+        let head = head_key(&namespace, id);
+        assert!(head.starts_with(&segment_prefix(&namespace, LOCATOR_SEGMENT)));
+        assert!(head.starts_with(&head_namespace_prefix(&namespace)));
+        assert_eq!(decode_head_trace_id(&head).unwrap(), id);
+
+        let first = continuation_key(&namespace, id, 2, 3);
+        let second = continuation_key(&namespace, id, 4, 5);
         assert_ne!(first, second);
-        assert!(first.starts_with(&segment_prefix(&namespace, LOCATOR_SEGMENT)));
-        assert_eq!(decode_locator_trace_id(&first).unwrap(), id);
+        for key in [&first, &second] {
+            assert!(key.starts_with(&continuation_prefix(&namespace, id)));
+            assert!(!key.starts_with(&head_namespace_prefix(&namespace)));
+            assert!(decode_head_trace_id(key).is_err());
+        }
+    }
+
+    #[test]
+    fn markers_live_in_the_first_page_segment() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let key = marker_key(&namespace, -3, 7, 11);
+        assert!(key.starts_with(&marker_prefix(&namespace, -3)));
+        assert!(!key.starts_with(&metadata_prefix(&namespace, -3)));
+        assert_eq!(decode_marker(&key).unwrap(), (7, 11));
+        assert!(decode_marker(&metadata_key(&namespace, -3, 7)).is_err());
     }
 
     #[test]
@@ -548,18 +659,14 @@ mod tests {
                 expires_at_unix_ms,
                 min_timestamp_ns: 5,
                 max_timestamp_ns: u64::MAX,
-                traces: vec![
-                    PageTrace {
-                        trace_id: TraceId::new([1; 16]).unwrap(),
-                        min_timestamp_ns: 9,
-                        max_timestamp_ns: u64::MAX,
-                    },
-                    PageTrace {
-                        trace_id: TraceId::new([2; 16]).unwrap(),
-                        min_timestamp_ns: 5,
-                        max_timestamp_ns: 5,
-                    },
-                ],
+                traces: (1..=10)
+                    .map(|id| PageTrace {
+                        trace_id: TraceId::new([id; 16]).unwrap(),
+                        min_timestamp_ns: if id == 1 { 5 } else { 9 },
+                        max_timestamp_ns: if id == 2 { u64::MAX } else { 9 },
+                        continued: id % 3 == 0 || id == 10,
+                    })
+                    .collect(),
             };
             assert_eq!(
                 decode_metadata(&encode_metadata(&metadata).unwrap()).unwrap(),
@@ -575,7 +682,31 @@ mod tests {
                 decode_locator(&encode_locator(&locator).unwrap()).unwrap(),
                 locator
             );
+            for continued in [false, true] {
+                let head = TraceHead {
+                    first: locator,
+                    continued,
+                };
+                assert_eq!(decode_head(&encode_head(&head).unwrap()).unwrap(), head);
+            }
         }
+    }
+
+    #[test]
+    fn metadata_rejects_a_truncated_continued_bitmap() {
+        let metadata = StoredPageMetadata {
+            expires_at_unix_ms: None,
+            min_timestamp_ns: 1,
+            max_timestamp_ns: 1,
+            traces: vec![PageTrace {
+                trace_id: TraceId::new([1; 16]).unwrap(),
+                min_timestamp_ns: 1,
+                max_timestamp_ns: 1,
+                continued: true,
+            }],
+        };
+        let encoded = encode_metadata(&metadata).unwrap();
+        assert!(decode_metadata(&encoded[..encoded.len() - 1]).is_err());
     }
 
     #[test]
@@ -599,6 +730,7 @@ mod tests {
             trace_id: TraceId::new([id; 16]).unwrap(),
             min_timestamp_ns: min,
             max_timestamp_ns: max,
+            continued: false,
         };
         let metadata = |traces| StoredPageMetadata {
             expires_at_unix_ms: None,

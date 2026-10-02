@@ -1,0 +1,41 @@
+mode: reader
+listeners: { http: "0.0.0.0:3200", grpc: "0.0.0.0:9092", otlp_grpc: "0.0.0.0:4317", jaeger_grpc: "0.0.0.0:14250" }
+storage:
+  type: SlateDb
+  path: regression
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: traces-regression
+    endpoint: http://minio:9000
+    allow_http: true
+  block_cache: { type: FoyerMemory, capacity: 67108864 }
+  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+segment_duration_seconds: 3600
+retention_seconds: 86400
+page: { target_size_bytes: 1048576, max_size_bytes: 4194304, max_traces: 1024 }
+write: { durability: durable, remote_concurrency: 8, remote_retries: 3 }
+sharding:
+  shards: 2
+  io_concurrency_limit: 128
+  backend: static
+  owner_id: traces-writer-0
+  owners:
+    - { id: traces-writer-0, ordinal: 0, endpoint: "traces-writer-0:9092", start_shard: 0, end_shard: 1 }
+    - { id: traces-writer-1, ordinal: 1, endpoint: "traces-writer-1:9092", start_shard: 1, end_shard: 2 }
+auth:
+  unauthenticated: false
+  internal: { source: env, name: TRACES_INTERNAL_TOKEN }
+  jwt:
+    jwks: { source: file, path: /app/regression/jwks.json }
+    refresh_interval_seconds: 300
+    request_timeout_seconds: 5
+  global: { read: [], write: [] }
+namespaces:
+  - name: regression
+    auth:
+      read:
+        - { type: basic, username: regression-reader, password: { source: literal, value: regression-read } }
+      write: []
+  - name: other
+    auth: { read: [], write: [] }

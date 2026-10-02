@@ -115,7 +115,21 @@ where
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
-                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query).await?;
+                    let outcome = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query).await;
+                    if let Some(msg) = &eval_cmd.expect_fail {
+                        match outcome {
+                            Err(err) if msg.as_ref().is_none_or(|m| err.contains(m.as_str())) => {}
+                            other => {
+                                return Err(format!(
+                                    "{name} eval #{eval_count} (query: {}): expected failure \
+                                     {msg:?}, got {other:?}",
+                                    eval_cmd.query
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    let result = outcome?;
                     assert_results(
                         &result,
                         &eval_cmd.expected,

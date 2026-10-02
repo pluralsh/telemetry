@@ -16,7 +16,7 @@ mod validation;
 pub use ast::*;
 pub use error::{ParseError, QueryError, ValidationError};
 pub use execution::{MatchedSpan, TraceQlResult};
-pub(crate) use plan::{INTRINSIC_STATUS, span_intrinsics};
+pub(crate) use plan::span_intrinsics;
 pub use plan::{IndexField, IndexPredicate, IndexTest, PushdownClause, QueryPlan, plan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

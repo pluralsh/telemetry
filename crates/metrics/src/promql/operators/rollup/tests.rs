@@ -183,8 +183,8 @@ fn should_compute_rate_over_simple_counter() {
 #[test]
 fn should_handle_counter_reset_in_rate() {
     // given: counter values 10,20,5,15 at ts 10,20,30,40 — one reset
-    // (20 → 5). `counter_increase_correction` returns 20.
-    //   last-first = 15-10 = 5; +correction 20 → 25
+    // (20 → 5), which adds 20.
+    //   last-first = 15-10 = 5; +20 → 25
     //   time_diff = 30ms = 0.03s; avg_interval = 0.01s
     //   duration_to_start = 10ms = 0.01s; duration_to_end = 0
     //   rate = 25 * (0.04/0.03) / 0.04 = 25/0.03 = 833.333.../s

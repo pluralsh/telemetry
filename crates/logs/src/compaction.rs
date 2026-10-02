@@ -3,16 +3,16 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-//! Writer-side merging of each stream's small pages.
+//! Writer-side merging of each segment's small objects.
 //!
 //! The compactor runs inside the write flusher after every flush, so merges
-//! are serialized with page writes and never race a sequence allocation. Its
-//! in-memory index of small pages is rebuilt from page metadata the first time
-//! a flush touches a segment, which also re-queues the segment's pending
-//! payload deletions from their tombstones.
+//! are serialized with object writes and never race an ID allocation. Its
+//! in-memory index of small objects is rebuilt from object directories the
+//! first time a flush touches a segment, which also re-queues the segment's
+//! pending deletions from their tombstones.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,44 +23,66 @@ use common::storage::{RecordOp, Storage, Ttl, WriteOptions};
 
 use crate::Namespace;
 use crate::codec::{
-    PageId, StoredPageMetadata, decode_deadline, decode_metadata, decode_metadata_key,
-    decode_tombstone_key, encode_deadline, encode_metadata, metadata_key, payload_key,
-    segment_metadata_prefix, tombstone_key, tombstone_prefix,
+    ObjectRef, StoredObject, block_key, decode_directory_key, decode_object, decode_tombstone,
+    decode_tombstone_key, directory_key, directory_prefix, encode_tombstone, run_key,
+    tombstone_key, tombstone_prefix,
 };
 use crate::config::{CompactionConfig, PageConfig};
 use crate::error::{Error, Result};
-use crate::model::{SegmentId, StreamId};
-use crate::page::Page;
+use crate::model::SegmentId;
+use crate::object::{
+    MergeInput, ObjectLocation, ObjectProperties, merge_objects, object_records, read_blocks,
+};
 
 /// Deletions applied per storage write.
 const DELETE_BATCH: usize = 1024;
 
-/// A page written by a flush, reported to the compactor.
-pub(crate) struct WrittenPage {
+/// An object written by a flush, reported to the compactor.
+pub(crate) struct WrittenObject {
     pub namespace: Namespace,
     pub segment: SegmentId,
-    pub stream_id: StreamId,
-    pub page_id: PageId,
-    pub metadata: StoredPageMetadata,
+    pub object: ObjectRef,
+    pub stored: StoredObject,
 }
 
 #[derive(Clone, Debug)]
 struct Tracked {
-    page_id: PageId,
-    metadata: StoredPageMetadata,
+    object: ObjectRef,
+    stored: StoredObject,
 }
 
 struct SegmentState {
-    /// Small pages of each stream, ordered by sequence.
-    streams: BTreeMap<StreamId, Vec<Tracked>>,
+    /// Small objects, ordered by ID.
+    objects: Vec<Tracked>,
     touched: Instant,
 }
 
+/// A replaced object's blocks, directory and tombstone, deleted once
+/// in-flight readers can no longer reference them.
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PendingDelete {
     deadline_unix_ms: u64,
-    payload: Bytes,
-    tombstone: Bytes,
+    keys: Vec<Bytes>,
+}
+
+impl PendingDelete {
+    fn new(
+        namespace: &Namespace,
+        segment: SegmentId,
+        object: ObjectRef,
+        blocks: u32,
+        deadline_unix_ms: u64,
+    ) -> Self {
+        let mut keys = (0..blocks)
+            .map(|block| block_key(namespace, segment, object, block))
+            .collect::<Vec<_>>();
+        keys.push(directory_key(namespace, segment, object));
+        keys.push(tombstone_key(namespace, segment, object));
+        Self {
+            deadline_unix_ms,
+            keys,
+        }
+    }
 }
 
 pub(crate) struct Compactor {
@@ -91,19 +113,19 @@ impl Compactor {
 
     /// Tracks `written`, applies due deletions, and performs merges up to the
     /// per-flush budget. Failures are logged rather than failing the flush,
-    /// whose pages are already written; the index is rebuilt from storage.
-    pub(crate) async fn after_flush(&mut self, written: Vec<WrittenPage>) {
+    /// whose objects are already written; the index is rebuilt from storage.
+    pub(crate) async fn after_flush(&mut self, written: Vec<WrittenObject>) {
         if let Err(error) = self.run(written).await {
-            tracing::warn!(%error, "line page compaction failed; rebuilding its index");
+            tracing::warn!(%error, "log object compaction failed; rebuilding its index");
             ::metrics::counter!("logs_compaction_errors_total").increment(1);
             self.segments.clear();
         }
     }
 
-    async fn run(&mut self, written: Vec<WrittenPage>) -> Result<()> {
+    async fn run(&mut self, written: Vec<WrittenObject>) -> Result<()> {
         let now = Instant::now();
-        for page in written {
-            self.track(page, now).await?;
+        for object in written {
+            self.track(object, now).await?;
         }
         let now_unix_ms = unix_time_ms()?;
         self.apply_due_deletes(now_unix_ms).await?;
@@ -129,32 +151,33 @@ impl Compactor {
         Ok(())
     }
 
-    async fn track(&mut self, page: WrittenPage, now: Instant) -> Result<()> {
-        let key = (page.namespace, page.segment);
+    async fn track(&mut self, written: WrittenObject, now: Instant) -> Result<()> {
+        let key = (written.namespace, written.segment);
         if let Some(state) = self.segments.get_mut(&key) {
             state.touched = now;
-            if is_small(&self.page, &page.metadata) {
-                let pages = state.streams.entry(page.stream_id).or_default();
-                let at = pages
-                    .partition_point(|tracked| tracked.page_id.sequence < page.page_id.sequence);
-                pages.insert(
+            if is_small(&self.page, &written.stored) {
+                let at = state
+                    .objects
+                    .partition_point(|tracked| tracked.object.id < written.object.id);
+                state.objects.insert(
                     at,
                     Tracked {
-                        page_id: page.page_id,
-                        metadata: page.metadata,
+                        object: written.object,
+                        stored: written.stored,
                     },
                 );
             }
             return Ok(());
         }
-        // The flush already applied `page`, so recovery's scan includes it.
+        // The flush already applied `written`, so recovery's scan includes it.
         let state = self.recover(&key.0, key.1, now).await?;
         self.segments.insert(key, state);
         Ok(())
     }
 
-    /// Rebuilds a segment's small-page index from metadata and re-queues its
-    /// tombstoned payloads.
+    /// Rebuilds a segment's small-object index from its directories and
+    /// re-queues its tombstoned objects. A tombstoned object's directory
+    /// outlives its replacement, so tombstones are read first.
     async fn recover(
         &mut self,
         namespace: &Namespace,
@@ -162,28 +185,7 @@ impl Compactor {
         now: Instant,
     ) -> Result<SegmentState> {
         let now_unix_ms = unix_time_ms()?;
-        let mut streams: BTreeMap<StreamId, Vec<Tracked>> = BTreeMap::new();
-        let mut metadata = self
-            .storage
-            .scan_prefix_iter(
-                segment_metadata_prefix(namespace, segment),
-                BytesRange::unbounded(),
-                None,
-            )
-            .await?;
-        while let Some(record) = metadata.next().await? {
-            let (stream_id, page_id) = decode_metadata_key(&record.key)?;
-            let metadata = decode_metadata(&record.value)?;
-            if is_small(&self.page, &metadata) && !metadata.is_expired_at(now_unix_ms) {
-                streams
-                    .entry(stream_id)
-                    .or_default()
-                    .push(Tracked { page_id, metadata });
-            }
-        }
-        for pages in streams.values_mut() {
-            pages.sort_by_key(|tracked| tracked.page_id.sequence);
-        }
+        let mut dead = HashSet::new();
         let mut tombstones = self
             .storage
             .scan_prefix_iter(
@@ -193,15 +195,39 @@ impl Compactor {
             )
             .await?;
         while let Some(record) = tombstones.next().await? {
-            let (stream_id, page_id, level) = decode_tombstone_key(&record.key)?;
-            self.deletes.push(Reverse(PendingDelete {
-                deadline_unix_ms: decode_deadline(&record.value)?,
-                payload: payload_key(namespace, segment, stream_id, page_id, level),
-                tombstone: record.key,
-            }));
+            let object = decode_tombstone_key(&record.key)?;
+            let (deadline_unix_ms, blocks) = decode_tombstone(&record.value)?;
+            self.deletes.push(Reverse(PendingDelete::new(
+                namespace,
+                segment,
+                object,
+                blocks,
+                deadline_unix_ms,
+            )));
+            dead.insert(object);
         }
+        let mut objects = Vec::new();
+        let mut directories = self
+            .storage
+            .scan_prefix_iter(
+                directory_prefix(namespace, segment),
+                BytesRange::unbounded(),
+                None,
+            )
+            .await?;
+        while let Some(record) = directories.next().await? {
+            let object = decode_directory_key(&record.key)?;
+            if dead.contains(&object) {
+                continue;
+            }
+            let stored = decode_object(&record.value)?;
+            if is_small(&self.page, &stored) && !stored.is_expired_at(now_unix_ms) {
+                objects.push(Tracked { object, stored });
+            }
+        }
+        objects.sort_by_key(|tracked| tracked.object.id);
         Ok(SegmentState {
-            streams,
+            objects,
             touched: now,
         })
     }
@@ -214,8 +240,7 @@ impl Compactor {
             .is_some_and(|Reverse(next)| next.deadline_unix_ms <= now_unix_ms)
         {
             let Reverse(due) = self.deletes.pop().expect("peeked delete");
-            ops.push(RecordOp::Delete(due.payload));
-            ops.push(RecordOp::Delete(due.tombstone));
+            ops.extend(due.keys.into_iter().map(RecordOp::Delete));
             if ops.len() >= DELETE_BATCH {
                 self.apply(std::mem::take(&mut ops)).await?;
             }
@@ -232,33 +257,31 @@ impl Compactor {
         deletes: &mut Vec<PendingDelete>,
     ) -> Result<()> {
         let finalize = self.is_settled(*segment, now_unix_ms);
-        for (stream_id, pages) in &mut state.streams {
-            pages.retain(|tracked| !tracked.metadata.is_expired_at(now_unix_ms));
-            while *budget > 0 {
-                let Some(range) = self.select(pages, finalize, now_unix_ms) else {
-                    break;
-                };
-                let (merged, replaced) = self
-                    .merge(
-                        namespace,
-                        *segment,
-                        *stream_id,
-                        &pages[range.clone()],
-                        now_unix_ms,
-                    )
-                    .await?;
-                deletes.extend(replaced);
-                let replacement = is_small(&self.page, &merged.metadata).then_some(merged);
-                pages.splice(range, replacement);
-                *budget -= 1;
-            }
+        state
+            .objects
+            .retain(|tracked| !tracked.stored.is_expired_at(now_unix_ms));
+        while *budget > 0 {
+            let Some(range) = self.select(&state.objects, finalize, now_unix_ms) else {
+                break;
+            };
+            let (merged, replaced) = self
+                .merge(
+                    namespace,
+                    *segment,
+                    &state.objects[range.clone()],
+                    now_unix_ms,
+                )
+                .await?;
+            deletes.extend(replaced);
+            let replacement = is_small(&self.page, &merged.stored).then_some(merged);
+            state.objects.splice(range, replacement);
+            *budget -= 1;
         }
-        state.streams.retain(|_, pages| !pages.is_empty());
         Ok(())
     }
 
     /// Whether the segment ended at least `finalize_after` ago, so its
-    /// remaining small pages merge regardless of fan-in.
+    /// remaining small objects merge regardless of fan-in.
     fn is_settled(&self, segment: SegmentId, now_unix_ms: u64) -> bool {
         let finalize_after_ns =
             i64::try_from(self.config.finalize_after.as_nanos()).unwrap_or(i64::MAX);
@@ -271,49 +294,66 @@ impl Compactor {
             <= now_ns
     }
 
-    /// The next run of `pages` to merge: `fan_in` consecutive same-level
-    /// pages, or when `finalize` is set the longest mergeable run of at least
-    /// two pages whose largest page is at most half of it, so late writes to a
-    /// settled segment rewrite each row a logarithmic number of times.
-    fn select(&self, pages: &[Tracked], finalize: bool, now_unix_ms: u64) -> Option<Range<usize>> {
+    /// The next run of `objects` to merge: `fan_in` adjacent same-level
+    /// objects, fewer when the next one would exceed the page limits, or when
+    /// `finalize` is set the longest mergeable run of at
+    /// least two objects whose largest is at most half of it, so late writes
+    /// to a settled segment rewrite each row a logarithmic number of times.
+    fn select(
+        &self,
+        objects: &[Tracked],
+        finalize: bool,
+        now_unix_ms: u64,
+    ) -> Option<Range<usize>> {
         let min_age_ms = u64::try_from(self.config.min_age.as_millis()).unwrap_or(u64::MAX);
         let eligible = |tracked: &Tracked| {
             finalize
-                || tracked.metadata.level > 0
-                || now_unix_ms.saturating_sub(tracked.metadata.written_at_unix_ms) >= min_age_ms
+                || tracked.object.level > 0
+                || now_unix_ms.saturating_sub(tracked.stored.written_at_unix_ms) >= min_age_ms
         };
-        for start in 0..pages.len() {
-            let first = &pages[start];
+        for start in 0..objects.len() {
+            let first = &objects[start];
             if !eligible(first) {
                 continue;
             }
-            let mut rows = first.metadata.row_count as usize;
-            let mut bytes = first.metadata.payload_bytes as usize;
+            let mut rows = first.stored.rows();
+            let mut bytes = first.stored.bytes();
             let mut end = start + 1;
-            while end < pages.len() && (finalize || end - start < self.config.fan_in) {
-                let next = &pages[end];
-                rows += next.metadata.row_count as usize;
-                bytes += next.metadata.payload_bytes as usize;
-                if !follows(&pages[end - 1], next)
+            let mut full = false;
+            while end < objects.len() && (finalize || end - start < self.config.fan_in) {
+                let next = &objects[end];
+                rows += next.stored.rows();
+                bytes += next.stored.bytes();
+                if !follows(&objects[end - 1], next)
                     || !eligible(next)
-                    || (!finalize && next.metadata.level != first.metadata.level)
-                    || rows > self.page.max_rows
-                    || bytes > self.page.target_size_bytes
+                    || (!finalize && next.object.level != first.object.level)
                 {
+                    break;
+                }
+                if rows > self.page.max_rows as u64 || bytes > self.page.target_size_bytes as u64 {
+                    full = true;
                     break;
                 }
                 end += 1;
             }
             if finalize {
                 // The longest balanced prefix of the mergeable run.
-                while end - start >= 2 && !balanced(&pages[start..end]) {
+                while end - start >= 2 && !balanced(&objects[start..end]) {
                     end -= 1;
                 }
             }
-            let wanted = if finalize { 2 } else { self.config.fan_in };
-            let level = pages[start..end]
+            // Inputs are each under half the limits, so a run that fills them
+            // merges into an object that is no longer small: waiting for
+            // `fan_in` inputs that can never fit would strand it until the
+            // segment settles.
+            let wanted = if finalize || full {
+                2
+            } else {
+                self.config.fan_in
+            };
+            let level = objects[start..end]
                 .iter()
-                .map(|tracked| tracked.metadata.level)
+                .map(|tracked| tracked.object.level)
                 .max()
                 .unwrap_or(0);
             if end - start >= wanted && level < u8::MAX {
@@ -323,66 +363,68 @@ impl Compactor {
         None
     }
 
-    /// Replaces `inputs` with one page in a single atomic write and schedules
-    /// their payloads for deletion.
+    /// Replaces `inputs` with one object in a single atomic write and
+    /// schedules their blocks and directories for deletion. The merged object
+    /// takes the first input's ID, so its run records overwrite that input's;
+    /// every other input's run records are deleted.
     async fn merge(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
-        stream_id: StreamId,
         inputs: &[Tracked],
         now_unix_ms: u64,
     ) -> Result<(Tracked, Vec<PendingDelete>)> {
-        let payloads = futures::future::try_join_all(inputs.iter().map(|tracked| {
-            self.storage.get(payload_key(
+        let started = Instant::now();
+        let blocks = futures::future::try_join_all(inputs.iter().map(|tracked| {
+            read_blocks(
+                self.storage.as_ref(),
                 namespace,
                 segment,
-                stream_id,
-                tracked.page_id,
-                tracked.metadata.level,
-            ))
+                tracked.object,
+                0..tracked.stored.blocks(),
+            )
         }))
         .await?;
-        let mut rows = Vec::new();
-        for (tracked, payload) in inputs.iter().zip(payloads) {
-            let payload = payload
-                .ok_or_else(|| Error::Corrupt("compaction input has no payload".to_owned()))?;
-            let entries = Page::decode(payload.value)?.decode_range(i64::MIN, i64::MAX)?;
-            if entries.len() != tracked.metadata.row_count as usize {
-                return Err(Error::Corrupt(
-                    "compaction input row count differs from its metadata".to_owned(),
-                ));
-            }
-            rows.extend(entries);
+        ::metrics::histogram!("logs_compaction_read_seconds")
+            .record(started.elapsed().as_secs_f64());
+        let merge_inputs = inputs
+            .iter()
+            .zip(blocks)
+            .map(|(tracked, blocks)| MergeInput {
+                object_id: tracked.object.id,
+                stored: tracked.stored.clone(),
+                blocks,
+            })
+            .collect::<Vec<_>>();
+        // Decoding and re-encoding is CPU-bound and can take milliseconds;
+        // on the async runtime it would stall queries sharing the worker.
+        let started = Instant::now();
+        let page = self.page.clone();
+        let built = tokio::task::spawn_blocking(move || merge_objects(&page, merge_inputs))
+            .await
+            .map_err(|error| Error::Invalid(format!("compaction merge task failed: {error}")))??;
+        ::metrics::histogram!("logs_compaction_merge_seconds")
+            .record(started.elapsed().as_secs_f64());
+        if built.runs.is_empty() {
+            return Err(Error::Corrupt("compaction inputs hold no rows".to_owned()));
         }
-        let page = Page::from_entries(&rows, self.page.rows_per_block)?;
-        let bytes = page.bytes();
+
         let first = &inputs[0];
         let last = inputs.last().expect("merge has inputs");
-        let expires_at_unix_ms = inputs
-            .iter()
-            .map(|tracked| tracked.metadata.expires_at_unix_ms)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|expiries| expiries.into_iter().max());
-        let metadata = StoredPageMetadata {
-            expires_at_unix_ms,
-            min_timestamp_ns: first.metadata.min_timestamp_ns,
-            max_timestamp_ns: last.metadata.max_timestamp_ns,
-            row_count: page.row_count(),
-            payload_bytes: u32::try_from(bytes.len())
-                .map_err(|_| Error::Invalid("page payload exceeds u32".to_owned()))?,
+        let object = ObjectRef {
+            id: first.object.id,
             level: inputs
                 .iter()
-                .map(|tracked| tracked.metadata.level)
+                .map(|tracked| tracked.object.level)
                 .max()
                 .unwrap_or(0)
                 + 1,
-            written_at_unix_ms: now_unix_ms,
-            leaf_rows: inputs
-                .iter()
-                .flat_map(|tracked| tracked.metadata.leaf_row_counts())
-                .collect(),
         };
+        let expires_at_unix_ms = inputs
+            .iter()
+            .map(|tracked| tracked.stored.expires_at_unix_ms)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|expiries| expiries.into_iter().max());
         let ttl = match expires_at_unix_ms {
             Some(expires_at) => Ttl::ExpireAt(i64::try_from(expires_at).unwrap_or(i64::MAX)),
             None => Ttl::NoExpiry,
@@ -391,63 +433,53 @@ impl Compactor {
             u64::try_from(self.config.delete_delay.as_millis()).unwrap_or(u64::MAX),
         );
 
-        let mut ops = Vec::with_capacity(2 + inputs.len() * 2);
-        ops.push(RecordOp::put_with_ttl(
-            metadata_key(namespace, segment, stream_id, first.page_id),
-            encode_metadata(&metadata)?,
-            ttl,
-        ));
-        ops.push(RecordOp::put_with_ttl(
-            payload_key(namespace, segment, stream_id, first.page_id, metadata.level),
-            bytes,
-            ttl,
-        ));
-        let mut deletes = Vec::with_capacity(inputs.len());
-        for tracked in inputs {
-            if tracked.page_id.sequence != first.page_id.sequence {
-                ops.push(RecordOp::Delete(metadata_key(
-                    namespace,
-                    segment,
-                    stream_id,
-                    tracked.page_id,
-                )));
-            }
-            let tombstone = tombstone_key(
+        let mut ops = Vec::new();
+        let stored = object_records(
+            &mut ops,
+            ObjectLocation {
                 namespace,
                 segment,
-                stream_id,
-                tracked.page_id,
-                tracked.metadata.level,
-            );
+                object,
+            },
+            built,
+            ObjectProperties {
+                expires_at_unix_ms,
+                written_at_unix_ms: now_unix_ms,
+                span: last.object.id + last.stored.span - first.object.id,
+                ttl,
+            },
+        )?;
+        let mut deletes = Vec::with_capacity(inputs.len());
+        for tracked in inputs {
+            if tracked.object.id != object.id {
+                ops.extend(tracked.stored.runs.iter().map(|run| {
+                    RecordOp::Delete(run_key(
+                        namespace,
+                        segment,
+                        run.stream_id,
+                        tracked.object.id,
+                    ))
+                }));
+            }
+            let blocks = tracked.stored.blocks();
             ops.push(RecordOp::put_with_ttl(
-                tombstone.clone(),
-                encode_deadline(deadline_unix_ms),
+                tombstone_key(namespace, segment, tracked.object),
+                encode_tombstone(deadline_unix_ms, blocks),
                 ttl,
             ));
-            deletes.push(PendingDelete {
+            deletes.push(PendingDelete::new(
+                namespace,
+                segment,
+                tracked.object,
+                blocks,
                 deadline_unix_ms,
-                payload: payload_key(
-                    namespace,
-                    segment,
-                    stream_id,
-                    tracked.page_id,
-                    tracked.metadata.level,
-                ),
-                tombstone,
-            });
+            ));
         }
         self.apply(ops).await?;
         ::metrics::counter!("logs_compaction_merges_total").increment(1);
         ::metrics::counter!("logs_compaction_input_pages_total").increment(inputs.len() as u64);
-        ::metrics::counter!("logs_compaction_written_bytes_total")
-            .increment(u64::from(metadata.payload_bytes));
-        Ok((
-            Tracked {
-                page_id: first.page_id,
-                metadata,
-            },
-            deletes,
-        ))
+        ::metrics::counter!("logs_compaction_written_bytes_total").increment(stored.bytes());
+        Ok((Tracked { object, stored }, deletes))
     }
 
     async fn apply(&self, ops: Vec<RecordOp>) -> Result<()> {
@@ -484,29 +516,23 @@ impl Compactor {
     }
 }
 
-/// Whether `next` directly continues `previous`: the next sequence after
-/// every leaf `previous` covers, and no earlier timestamp.
+/// Whether `next` directly continues `previous`: the next ID after every
+/// written object `previous` covers. Merging only such runs keeps every
+/// stream's rows in write order.
 fn follows(previous: &Tracked, next: &Tracked) -> bool {
-    previous
-        .page_id
-        .sequence
-        .checked_add(previous.metadata.leaf_count())
-        == Some(next.page_id.sequence)
-        && previous.metadata.max_timestamp_ns <= next.metadata.min_timestamp_ns
+    previous.object.id.checked_add(previous.stored.span) == Some(next.object.id)
 }
 
-/// Whether no page holds more than half of the run's bytes.
+/// Whether no object holds more than half of the run's bytes.
 fn balanced(run: &[Tracked]) -> bool {
-    let sizes = run
-        .iter()
-        .map(|tracked| u64::from(tracked.metadata.payload_bytes));
+    let sizes = run.iter().map(|tracked| tracked.stored.bytes());
     sizes.clone().max().unwrap_or(0).saturating_mul(2) <= sizes.sum::<u64>()
 }
 
-/// Pages under half of both limits are worth merging.
-fn is_small(page: &PageConfig, metadata: &StoredPageMetadata) -> bool {
-    (metadata.payload_bytes as usize).saturating_mul(2) < page.target_size_bytes
-        && (metadata.row_count as usize).saturating_mul(2) < page.max_rows
+/// Objects under half of both limits are worth merging.
+fn is_small(page: &PageConfig, stored: &StoredObject) -> bool {
+    (stored.bytes() as usize).saturating_mul(2) < page.target_size_bytes
+        && (stored.rows() as usize).saturating_mul(2) < page.max_rows
 }
 
 fn unix_time_ms() -> Result<u64> {

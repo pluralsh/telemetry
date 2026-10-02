@@ -707,17 +707,19 @@ pub(super) fn stored_value_matches(
     .unwrap_or(false)
 }
 
+/// Like Tempo, only a `nil` comparison can succeed against a missing value:
+/// `span.a != 1` is false for a span without `span.a`.
 fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
-    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
-        && (matches!(left, EvalValue::Missing)
-            || matches!(left, EvalValue::Static(StaticValue::Nil))
-            || matches!(right, EvalValue::Missing)
-            || matches!(right, EvalValue::Static(StaticValue::Nil)))
-    {
+    let nil = |value: &EvalValue| matches!(value, EvalValue::Static(StaticValue::Nil));
+    if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) && (nil(left) || nil(right)) {
         let equal = matches!(
             (left, right),
             (EvalValue::Missing, EvalValue::Static(StaticValue::Nil))
                 | (EvalValue::Static(StaticValue::Nil), EvalValue::Missing)
+                | (
+                    EvalValue::Static(StaticValue::Nil),
+                    EvalValue::Static(StaticValue::Nil)
+                )
         );
         return Some(if op == BinaryOp::Equal { equal } else { !equal });
     }

@@ -363,11 +363,13 @@ impl<C: Operator> CountValuesOp<C> {
             step_timestamps,
         } = std::mem::take(&mut self.counts);
 
-        // Every input batch shares the grid's timestamps. With no input
-        // batches the output has no series, so placeholder timestamps sized
-        // to the grid suffice.
-        let step_timestamps: Arc<[i64]> =
-            step_timestamps.unwrap_or_else(|| Arc::from(vec![0i64; step_count].into_boxed_slice()));
+        // Every input batch shares the grid's timestamps.
+        let grid = self.schema.step_grid;
+        let step_timestamps: Arc<[i64]> = step_timestamps.unwrap_or_else(|| {
+            (0..step_count)
+                .map(|step| grid.start_ms + step as i64 * grid.step_ms)
+                .collect()
+        });
 
         // Build the output roster in insertion order.
         let out_series_count = bucket_order.len();

@@ -54,7 +54,7 @@ pub use reader::TimeSeriesDbReader;
 pub use sharded::{MetricsShard, ShardedMetrics, ShardedTimeseries};
 pub use sharding::ShardingOptions;
 pub use timeseries::{TimeSeriesDb, Visibility};
-pub use util::{parse_duration, parse_timestamp};
+pub use util::{parse_duration, parse_timestamp, unix_seconds};
 
 /// Persisted SlateDB segment extractor identifier.
 pub const SEGMENT_EXTRACTOR_NAME: &str = storage::segment_extractor::EXTRACTOR_NAME;

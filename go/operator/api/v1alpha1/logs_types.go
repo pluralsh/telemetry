@@ -58,12 +58,6 @@ type LogsRequestSpec struct {
 	MaxInFlightQueryBytes *int64 `json:"maxInFlightQueryBytes,omitempty"`
 }
 
-type LogsCacheSpec struct {
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=256
-	QueryEntries *int64 `json:"queryEntries,omitempty"`
-}
-
 type LogsConfigSpec struct {
 	// +kubebuilder:default={"path":"logs"}
 	Storage StorageSpec `json:"storage,omitempty"`
@@ -76,7 +70,6 @@ type LogsConfigSpec struct {
 	Write            WriteSpec        `json:"write,omitempty"`
 	Sharding         ShardingSpec     `json:"sharding,omitempty"`
 	Request          LogsRequestSpec  `json:"request,omitempty"`
-	Cache            LogsCacheSpec    `json:"cache,omitempty"`
 	CacheWarmer      *CacheWarmerSpec `json:"cacheWarmer,omitempty"`
 	Auth             AuthSpec         `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}

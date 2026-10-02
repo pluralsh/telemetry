@@ -164,6 +164,31 @@ pub(super) struct MatchBuild {
     pub(super) table: MatchTable,
     /// Output schema the binary operator publishes.
     pub(super) output_schema: Arc<SeriesSchema>,
+    pub(super) partners: PartnerGroups,
+}
+
+/// Indexes the partner ("one") side by matching key. The table points each
+/// key at its first series; keys shared by several series also record every
+/// candidate so the operator can pick the one present at each step.
+fn index_partner_side(
+    side: &SeriesSchema,
+    axis: MatchingAxis,
+    match_labels: &[String],
+) -> (HashMap<Vec<Label>, u32>, PartnerGroups) {
+    let mut by_key: HashMap<Vec<Label>, Vec<u32>> = HashMap::new();
+    for j in 0..side.len() {
+        let key = matching_key(side.labels(j as u32), axis, match_labels);
+        by_key.entry(key).or_default().push(j as u32);
+    }
+    let mut first = HashMap::with_capacity(by_key.len());
+    let mut groups = PartnerGroups::new();
+    for (key, candidates) in by_key {
+        first.insert(key, candidates[0]);
+        if candidates.len() > 1 {
+            groups.insert(candidates[0], candidates.into_boxed_slice());
+        }
+    }
+    (first, groups)
 }
 
 pub(super) fn build_match_table(
@@ -204,15 +229,7 @@ pub(super) fn build_one_to_one(
     match_labels: &[String],
     include_name_on_output: bool,
 ) -> Result<MatchBuild, PlanError> {
-    // Index RHS by matching key. `OneToOne` requires at most one RHS per
-    // key; we defer duplicate-detection to runtime (operator emits per-cell
-    // validity = 0 on unmatched — duplicate pairing is a rare corner case
-    // not exercised by v1 tests).
-    let mut rhs_by_key: HashMap<Vec<Label>, u32> = HashMap::new();
-    for j in 0..rhs.len() {
-        let key = matching_key(rhs.labels(j as u32), axis, match_labels);
-        rhs_by_key.entry(key).or_insert(j as u32);
-    }
+    let (rhs_by_key, partners) = index_partner_side(rhs, axis, match_labels);
     let mut map: Vec<Option<u32>> = Vec::with_capacity(lhs.len());
     let mut out_labels: Vec<Labels> = Vec::with_capacity(lhs.len());
     for i in 0..lhs.len() {
@@ -230,7 +247,70 @@ pub(super) fn build_one_to_one(
     Ok(MatchBuild {
         table: MatchTable::OneToOne(map),
         output_schema,
+        partners,
     })
+}
+
+/// Set operators keep the input labelsets untouched (`__name__` included)
+/// and only use `on` / `ignoring` for the signature. `or` publishes LHS
+/// rows followed by RHS-only rows; an RHS series whose labels equal an LHS
+/// series shares that row.
+pub(super) fn build_set_match(
+    lhs: &SeriesSchema,
+    rhs: &SeriesSchema,
+    matching: Option<&BinaryMatching>,
+    include_rhs: bool,
+) -> MatchBuild {
+    let (axis, labels) = match matching {
+        Some(m) => (m.axis, m.labels.iter().cloned().collect::<Vec<_>>()),
+        None => default_axis_and_labels(),
+    };
+    let mut key_ids: HashMap<Vec<Label>, u32> = HashMap::new();
+    let mut key_of = |l: &Labels| {
+        let next = key_ids.len() as u32;
+        *key_ids
+            .entry(matching_key(l, axis, &labels))
+            .or_insert(next)
+    };
+    let lhs_keys: Vec<u32> = (0..lhs.len())
+        .map(|i| key_of(lhs.labels(i as u32)))
+        .collect();
+    let rhs_keys: Vec<u32> = (0..rhs.len())
+        .map(|j| key_of(rhs.labels(j as u32)))
+        .collect();
+
+    let mut rows: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(lhs.len());
+    let mut out_labels: Vec<Labels> = Vec::with_capacity(lhs.len());
+    let mut row_of: HashMap<Labels, usize> = HashMap::new();
+    for i in 0..lhs.len() {
+        let lab = lhs.labels(i as u32);
+        row_of.entry(lab.clone()).or_insert(rows.len());
+        rows.push((Some(i as u32), None));
+        out_labels.push(lab.clone());
+    }
+    if include_rhs {
+        for j in 0..rhs.len() {
+            let lab = rhs.labels(j as u32);
+            match row_of.get(lab) {
+                Some(&row) if rows[row].1.is_none() => rows[row].1 = Some(j as u32),
+                _ => {
+                    row_of.entry(lab.clone()).or_insert(rows.len());
+                    rows.push((None, Some(j as u32)));
+                    out_labels.push(lab.clone());
+                }
+            }
+        }
+    }
+    MatchBuild {
+        table: MatchTable::Set(Arc::new(SetMatch {
+            lhs_keys,
+            rhs_keys,
+            key_count: key_ids.len(),
+            rows,
+        })),
+        output_schema: build_output_schema_from_labels(out_labels),
+        partners: PartnerGroups::new(),
+    }
 }
 
 fn build_group_left(
@@ -244,11 +324,7 @@ fn build_group_left(
     // LHS is the "many" side; output has one row per LHS row pointing at
     // the single RHS "one" side. `include_labels` are carried from the
     // "one" side onto the output labels.
-    let mut rhs_by_key: HashMap<Vec<Label>, u32> = HashMap::new();
-    for j in 0..rhs.len() {
-        let key = matching_key(rhs.labels(j as u32), axis, match_labels);
-        rhs_by_key.entry(key).or_insert(j as u32);
-    }
+    let (rhs_by_key, partners) = index_partner_side(rhs, axis, match_labels);
     let mut map: Vec<Option<u32>> = Vec::with_capacity(lhs.len());
     let mut out_labels: Vec<Labels> = Vec::with_capacity(lhs.len());
     for i in 0..lhs.len() {
@@ -268,6 +344,7 @@ fn build_group_left(
     Ok(MatchBuild {
         table: MatchTable::GroupLeft(map),
         output_schema,
+        partners,
     })
 }
 
@@ -280,11 +357,7 @@ fn build_group_right(
     include_name_on_output: bool,
 ) -> Result<MatchBuild, PlanError> {
     // Mirror of GroupLeft: RHS is "many"; output rows align with RHS.
-    let mut lhs_by_key: HashMap<Vec<Label>, u32> = HashMap::new();
-    for i in 0..lhs.len() {
-        let key = matching_key(lhs.labels(i as u32), axis, match_labels);
-        lhs_by_key.entry(key).or_insert(i as u32);
-    }
+    let (lhs_by_key, partners) = index_partner_side(lhs, axis, match_labels);
     let mut map: Vec<Option<u32>> = Vec::with_capacity(rhs.len());
     let mut out_labels: Vec<Labels> = Vec::with_capacity(rhs.len());
     for j in 0..rhs.len() {
@@ -304,6 +377,7 @@ fn build_group_right(
     Ok(MatchBuild {
         table: MatchTable::GroupRight(map),
         output_schema,
+        partners,
     })
 }
 

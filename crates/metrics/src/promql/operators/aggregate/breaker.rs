@@ -439,37 +439,6 @@ impl<C: Operator> AggregateOp<C> {
     }
 }
 
-/// Linear-interpolation quantile matching
-/// `super::rollup::rollup_fns::quantile` (Prometheus
-/// `quantile_over_time`).
-///
-/// Sort is in-place on the caller's buffer to avoid a second
-/// allocation. Out-of-range `q` matches the rollup citation:
-/// `q < 0 ⇒ -inf`, `q > 1 ⇒ +inf`, `NaN ⇒ NaN`.
 fn quantile_linear_interp(q: f64, buf: &mut [f64]) -> f64 {
-    if buf.is_empty() {
-        return f64::NAN;
-    }
-    if q.is_nan() {
-        return f64::NAN;
-    }
-    if q < 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if q > 1.0 {
-        return f64::INFINITY;
-    }
-    buf.sort_by(|a, b| a.total_cmp(b));
-    let n = buf.len();
-    if n == 1 {
-        return buf[0];
-    }
-    let rank = q * (n - 1) as f64;
-    let lo = rank.floor() as usize;
-    let hi = rank.ceil() as usize;
-    if lo == hi {
-        return buf[lo];
-    }
-    let weight = rank - lo as f64;
-    buf[lo] * (1.0 - weight) + buf[hi] * weight
+    crate::util::quantile_in_place(q, buf)
 }

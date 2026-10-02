@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -25,13 +25,17 @@ use crate::logql::{
 use crate::search::{SCORE_METADATA_FIELD, query_terms, source_matches};
 use crate::{Error, Label, Labels, LogDb, LogEntry, Namespace, Result};
 
+mod label_regex;
 mod metric;
+mod parallel;
 mod pipeline;
 mod regex_cache;
 pub(crate) mod template;
 mod units;
 
+use label_regex::*;
 use metric::*;
+use parallel::ParallelSink;
 use pipeline::*;
 use regex_cache::*;
 use units::*;
@@ -100,6 +104,26 @@ impl QueryRequest {
             step_ns: Some(step_ns),
         }
     }
+
+    /// Rounds a metric range query out to step multiples (start down, end
+    /// up), as Loki's query frontend does before splitting, so every step
+    /// lands on a multiple of the step whatever bounds were requested. The
+    /// engine itself evaluates the bounds it is given, like Loki's.
+    pub fn frontend_step_aligned(mut self) -> Self {
+        let Some(step) = self.step_ns else {
+            return self;
+        };
+        let metric =
+            logql::parse(&self.query).is_ok_and(|query| !matches!(query.value, Expr::Log(_)));
+        if !metric {
+            return self;
+        }
+        self.start_ns -= self.start_ns.rem_euclid(step);
+        if let remainder @ 1.. = self.end_ns.rem_euclid(step) {
+            self.end_ns = self.end_ns.saturating_add(step - remainder);
+        }
+        self
+    }
 }
 
 /// Resource and presentation controls for one query.
@@ -163,14 +187,22 @@ struct Row {
     timestamp_ns: i64,
     line: String,
     /// Shared across a stream's rows; stages that change labels copy on write.
-    labels: Arc<BTreeMap<String, String>>,
+    labels: LabelMap,
     metadata: BTreeMap<String, String>,
     value: Option<f64>,
+    /// Loki's hash of the stored stream's labels, which stages never change.
+    /// Loki merges samples sharing a timestamp in ascending hash order.
+    stream: u64,
+    /// Hash of the stored line and structured metadata, set for metric rows
+    /// whose stages rewrite `line` or that carry metadata.
+    source: Option<u64>,
 }
 
 #[derive(Clone)]
 struct Point {
-    labels: BTreeMap<String, String>,
+    /// Shared with the range series it came from, since a series yields a
+    /// point at every step its window covers.
+    labels: LabelMap,
     value: f64,
 }
 
@@ -204,19 +236,26 @@ impl LogDb {
 }
 
 /// Storage-facing decisions for one query, shared by every database read.
-struct ScanPlan<'a> {
+pub(crate) struct ScanPlan<'a> {
     request: &'a QueryRequest,
     query: &'a Query,
-    scan_start: i64,
-    streams: StreamFilter,
+    pub(crate) scan_start: i64,
+    pub(crate) streams: StreamFilter,
     indexed_terms: Option<Vec<String>>,
     limit: usize,
     direction: Direction,
+    /// Owned copies for pipeline workers, which outlive any borrow.
+    shared: Option<Arc<(Query, QueryRequest)>>,
 }
 
 impl<'a> ScanPlan<'a> {
-    fn new(request: &'a QueryRequest, query: &'a Query, options: &QueryOptions) -> Result<Self> {
+    pub(crate) fn new(
+        request: &'a QueryRequest,
+        query: &'a Query,
+        options: &QueryOptions,
+    ) -> Result<Self> {
         Ok(Self {
+            shared: parallel::enabled().then(|| Arc::new((query.clone(), request.clone()))),
             request,
             query,
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
@@ -367,8 +406,9 @@ async fn load_rows<'a>(
 ) -> Result<PipelineSink<'a>> {
     let (start, end) = (plan.scan_start, plan.request.end_ns);
     let mut converter = RowConverter::default();
-    let mut sink = plan.sink()?;
+    let sink = plan.sink()?;
     if plan.early_stop_log().is_some() {
+        let mut sink = ParallelSink::for_logs(sink, plan.shared.clone());
         database
             .read_segments(
                 namespace,
@@ -380,16 +420,17 @@ async fn load_rows<'a>(
                     for row in segment {
                         sink.push(converter.convert(row, None))?;
                     }
-                    Ok(if sink.kept() >= plan.limit {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    })
+                    Ok(
+                        if sink.kept_logs(plan.direction, plan.limit)? >= plan.limit {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        },
+                    )
                 },
             )
             .await?;
-        sink.truncate_logs(plan.direction, plan.limit);
-        return Ok(sink);
+        return sink.finish_logs(plan.direction, plan.limit).await;
     }
     let targets = match targets {
         Some(targets) => targets,
@@ -399,6 +440,7 @@ async fn load_rows<'a>(
                 .await?
         }
     };
+    let mut sink = ParallelSink::new(sink, plan.shared.clone());
     if let Some(terms) = &plan.indexed_terms {
         let index_top_k = direct_index_top_k(plan.query, plan.limit);
         if let Some(rows) = database
@@ -408,7 +450,7 @@ async fn load_rows<'a>(
             for (row, score) in rows {
                 sink.push(converter.convert(row, Some(score)))?;
             }
-            return Ok(sink);
+            return sink.finish().await;
         }
     }
     database
@@ -419,7 +461,7 @@ async fn load_rows<'a>(
             Ok(())
         })
         .await?;
-    Ok(sink)
+    sink.finish().await
 }
 
 /// Converts decoded rows, building each stream's label map once.
@@ -427,35 +469,50 @@ async fn load_rows<'a>(
 struct RowConverter {
     /// Keyed by `Arc` address; holding the `Arc` keeps the address from being
     /// reused by another stream's labels.
-    maps: HashMap<usize, (Arc<crate::Labels>, LabelMap)>,
+    maps: HashMap<usize, (Arc<crate::Labels>, LabelMap, u64)>,
 }
 
+/// A row's or point's labels; shared, since many rows and steps carry the
+/// same stream's labels.
 type LabelMap = Arc<BTreeMap<String, String>>;
 
 impl RowConverter {
     fn convert(&mut self, row: crate::LogRow, score: Option<f32>) -> Row {
-        let labels = self
+        let (_, labels, stream) = self
             .maps
             .entry(Arc::as_ptr(&row.labels) as usize)
             .or_insert_with(|| {
-                let map = row
+                let map: BTreeMap<String, String> = row
                     .labels
                     .iter()
                     .map(|label| (label.name.clone(), label.value.clone()))
                     .collect();
-                (row.labels.clone(), Arc::new(map))
-            })
-            .1
-            .clone();
-        to_row(row.entry, labels, score)
+                let stream = stream_hash(&map);
+                (row.labels.clone(), Arc::new(map), stream)
+            });
+        to_row(row.entry, labels.clone(), *stream, score)
     }
 }
 
-fn to_row(
-    entry: crate::LogEntry,
-    labels: Arc<BTreeMap<String, String>>,
-    score: Option<f32>,
-) -> Row {
+/// Prometheus' `labels.Hash`, which Loki uses as a stream's hash: XXH64 over
+/// each name and value, in name order, each followed by `0xff`.
+fn stream_hash(labels: &BTreeMap<String, String>) -> u64 {
+    let mut bytes = Vec::new();
+    for (name, value) in labels {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0xff);
+    }
+    twox_hash::XxHash64::oneshot(0, &bytes)
+}
+
+fn hash_of(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
+}
+
+fn to_row(entry: crate::LogEntry, labels: LabelMap, stream: u64, score: Option<f32>) -> Row {
     let mut metadata = entry
         .structured_metadata
         .iter()
@@ -470,21 +527,77 @@ fn to_row(
         labels,
         metadata,
         value: None,
+        stream,
+        source: None,
     }
 }
 
-fn sort_logs(rows: &mut [Row], direction: Direction, indexed: bool) {
+/// Loki's merge iterators drop an entry when an earlier one from the same
+/// stored stream has the same timestamp and identical line: the formatted
+/// line for log queries, the stored one for metric samples. Entries that
+/// differ only in structured metadata are distinct writes and both kept.
+/// `rows` must be in timestamp order; only rows sharing a timestamp are
+/// compared.
+fn dedupe_rows(rows: &mut Vec<Row>) {
+    let mut duplicates: Option<Vec<bool>> = None;
+    let mut order = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let timestamp = rows[start].timestamp_ns;
+        let end = start
+            + rows[start..]
+                .iter()
+                .take_while(|row| row.timestamp_ns == timestamp)
+                .count();
+        if end - start > 1 {
+            // Sorting the run by identity makes duplicates adjacent, keeping
+            // the earliest of each, so a burst sharing one timestamp costs
+            // O(k log k) rather than pairwise comparison.
+            order.clear();
+            order.extend(start..end);
+            order.sort_by(|&a, &b| dedupe_order(&rows[a], &rows[b]).then(a.cmp(&b)));
+            for pair in order.windows(2) {
+                if dedupe_order(&rows[pair[0]], &rows[pair[1]]).is_eq() {
+                    duplicates.get_or_insert_with(|| vec![false; rows.len()])[pair[1]] = true;
+                }
+            }
+        }
+        start = end;
+    }
+    if let Some(duplicates) = duplicates {
+        let mut index = 0;
+        rows.retain(|_| {
+            index += 1;
+            !duplicates[index - 1]
+        });
+    }
+}
+
+/// Orders rows sharing a timestamp so that rows `dedupe_rows` treats as the
+/// same entry compare equal: same stream, then the same stored line (by hash
+/// when stages rewrote it) and the same structured metadata.
+fn dedupe_order(a: &Row, b: &Row) -> Ordering {
+    a.stream
+        .cmp(&b.stream)
+        .then_with(|| a.source.cmp(&b.source))
+        .then_with(|| match (a.source, b.source) {
+            (None, None) => a.line.cmp(&b.line),
+            _ => Ordering::Equal,
+        })
+        .then_with(|| a.metadata.cmp(&b.metadata))
+}
+
+fn sort_logs(rows: &mut Vec<Row>, direction: Direction, indexed: bool) {
+    rows.sort_by(row_order);
+    dedupe_rows(rows);
     if indexed {
         rows.sort_by(|left, right| {
             match_score(right)
                 .total_cmp(&match_score(left))
                 .then_with(|| row_order(left, right))
         });
-    } else {
-        rows.sort_by(row_order);
-        if direction == Direction::Backward {
-            rows.reverse();
-        }
+    } else if direction == Direction::Backward {
+        rows.reverse();
     }
 }
 
@@ -526,46 +639,25 @@ fn evaluate(
                     .into(),
             ));
         }
-        let mut series: BTreeMap<Vec<(String, String)>, MatrixSeries> = BTreeMap::new();
+        let mut matrix = Matrix::default();
         let mut timestamp = request.start_ns;
         loop {
             match eval_expr(query, &rows, timestamp)? {
-                Value::Scalar(value) => {
-                    series
-                        .entry(Vec::new())
-                        .or_insert_with(|| MatrixSeries {
-                            labels: Labels::new(Vec::new()).expect("empty labels"),
-                            samples: Vec::new(),
-                        })
-                        .samples
-                        .push(Sample {
-                            timestamp_ns: timestamp,
-                            value,
-                        });
-                }
-                Value::Vector(points) => {
-                    for point in points {
-                        let key = point.labels.clone().into_iter().collect::<Vec<_>>();
-                        series
-                            .entry(key)
-                            .or_insert_with(|| MatrixSeries {
-                                labels: map_labels(&point.labels),
-                                samples: Vec::new(),
-                            })
-                            .samples
-                            .push(Sample {
-                                timestamp_ns: timestamp,
-                                value: point.value,
-                            });
-                    }
-                }
+                Value::Scalar(value) => matrix.push(
+                    vec![Point {
+                        labels: Arc::default(),
+                        value,
+                    }],
+                    timestamp,
+                ),
+                Value::Vector(points) => matrix.push(points, timestamp),
             }
             match timestamp.checked_add(step) {
                 Some(next) if next <= request.end_ns => timestamp = next,
                 _ => break,
             }
         }
-        Ok(QueryResult::Matrix(series.into_values().collect()))
+        Ok(QueryResult::Matrix(matrix.finish()))
     } else {
         match eval_expr(query, &rows, request.end_ns)? {
             Value::Scalar(value) => Ok(QueryResult::Scalar(Sample {
@@ -610,6 +702,56 @@ fn validate_request(request: &QueryRequest, options: &QueryOptions) -> Result<()
     Ok(())
 }
 
+/// A range query's series, in label order once finished.
+#[derive(Default)]
+struct Matrix {
+    slots: BTreeMap<LabelMap, usize>,
+    series: Vec<MatrixSeries>,
+    /// The previous step's points by label allocation. A series yields the
+    /// same allocation at every step, so most points skip the ordered
+    /// lookup; holding the `Arc`s keeps their addresses from being reused,
+    /// and a shared `Arc` is never changed in place.
+    previous: HashMap<*const BTreeMap<String, String>, (LabelMap, usize)>,
+}
+
+impl Matrix {
+    fn push(&mut self, points: Vec<Point>, timestamp_ns: i64) {
+        let mut current = HashMap::with_capacity(points.len());
+        for point in points {
+            let address = Arc::as_ptr(&point.labels);
+            let slot = match self.previous.get(&address) {
+                Some((_, slot)) => *slot,
+                None => match self.slots.get(&*point.labels) {
+                    Some(slot) => *slot,
+                    None => {
+                        self.series.push(MatrixSeries {
+                            labels: map_labels(&point.labels),
+                            samples: Vec::new(),
+                        });
+                        self.slots
+                            .insert(Arc::clone(&point.labels), self.series.len() - 1);
+                        self.series.len() - 1
+                    }
+                },
+            };
+            self.series[slot].samples.push(Sample {
+                timestamp_ns,
+                value: point.value,
+            });
+            current.insert(address, (point.labels, slot));
+        }
+        self.previous = current;
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        let mut series = self.series.into_iter().map(Some).collect::<Vec<_>>();
+        self.slots
+            .into_values()
+            .filter_map(|slot| series[slot].take())
+            .collect()
+    }
+}
+
 fn map_labels(map: &BTreeMap<String, String>) -> Labels {
     Labels::new(
         map.iter()
@@ -620,7 +762,7 @@ fn map_labels(map: &BTreeMap<String, String>) -> Labels {
 }
 
 fn streams(rows: Vec<Row>) -> Result<QueryResult> {
-    let mut grouped: BTreeMap<Arc<BTreeMap<String, String>>, Vec<LogEntry>> = BTreeMap::new();
+    let mut grouped: BTreeMap<LabelMap, Vec<LogEntry>> = BTreeMap::new();
     for row in rows {
         grouped.entry(row.labels).or_default().push(LogEntry {
             timestamp_ns: row.timestamp_ns,
@@ -678,7 +820,9 @@ fn common_exact_matchers(query: &Query) -> Vec<Label> {
             .value
             .matchers
             .iter()
-            .filter(|matcher| matcher.value.op == MatchOp::Equal)
+            // `name=""` also matches streams without the label, which have
+            // no posting to intersect.
+            .filter(|matcher| matcher.value.op == MatchOp::Equal && !matcher.value.value.is_empty())
             .map(|matcher| (matcher.value.label.clone(), matcher.value.value.clone()))
             .collect::<BTreeSet<_>>();
         common = Some(match common {
@@ -791,25 +935,75 @@ struct PipelineSink<'a> {
     /// queries keep every row read and promote metadata to labels.
     log_window: Option<(i64, i64)>,
     outputs: Vec<Vec<Row>>,
+    /// Per log expression: whether a stage replaces the stored line, which
+    /// metric deduplication then has to remember.
+    rewrites_line: Vec<bool>,
+    /// Per log expression: whether its samples keep no labels and no stage
+    /// reads one, so parsers can be skipped as Loki does.
+    skip_parsers: Vec<bool>,
+    /// Per log expression, per stage: whether it runs.
+    runs: Vec<Vec<bool>>,
 }
 
 impl<'a> PipelineSink<'a> {
     fn new(query: &'a Query, request: &QueryRequest) -> Result<Self> {
         let mut logs = Vec::new();
         collect_log_exprs(query, &mut logs);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         logs.retain(|log| seen.insert(*log as *const LogExpr));
         let offsets = logs
             .iter()
             .map(|log| log_offset(log))
             .collect::<Result<Vec<_>>>()?;
+        let mut aggregations = Vec::new();
+        collect_range_aggregations(query, &mut aggregations);
+        let runs = logs
+            .iter()
+            .map(|log| {
+                let sampled = aggregations
+                    .iter()
+                    .find_map(|(op, sampled, _)| std::ptr::eq(*sampled, *log).then_some(*op));
+                running_stages(log, sampled)
+            })
+            .collect::<Vec<_>>();
+        let running = |index: usize| {
+            logs[index]
+                .stages
+                .iter()
+                .zip(&runs[index])
+                .filter(|(_, runs)| **runs)
+                .map(|(stage, _)| &stage.value)
+        };
+        let rewrites_line = (0..logs.len())
+            .map(|index| {
+                running(index).any(|stage| {
+                    matches!(
+                        stage,
+                        PipelineStage::LineFormat(_)
+                            | PipelineStage::Decolorize
+                            | PipelineStage::Parser(ParserStage::Unpack)
+                    )
+                })
+            })
+            .collect();
+        let mut label_free = HashSet::new();
+        collect_label_free_logs(query, &mut label_free);
+        let skip_parsers = (0..logs.len())
+            .map(|index| {
+                label_free.contains(&(logs[index] as *const LogExpr))
+                    && !running(index).any(reads_labels)
+            })
+            .collect();
         Ok(Self {
+            runs,
             outputs: vec![Vec::new(); logs.len()],
             log_window: matches!(query.value, Expr::Log(_))
                 .then_some((request.start_ns, request.end_ns)),
             query,
             logs,
             offsets,
+            rewrites_line,
+            skip_parsers,
         })
     }
 
@@ -836,9 +1030,12 @@ impl<'a> PipelineSink<'a> {
                 candidate.clone()
             };
             if self.log_window.is_none() {
+                if self.rewrites_line[index] || !row.metadata.is_empty() {
+                    row.source = Some(hash_of(&(&row.line, &row.metadata)));
+                }
                 promote_metadata(&mut row);
             }
-            if apply_stages(log, &mut row)? {
+            if apply_stages(log, &self.runs[index], &mut row, self.skip_parsers[index])? {
                 self.outputs[index].push(row);
             }
         }
@@ -859,7 +1056,13 @@ impl<'a> PipelineSink<'a> {
     }
 
     fn extend(&mut self, other: Self) {
-        for (output, rows) in self.outputs.iter_mut().zip(other.outputs) {
+        self.extend_outputs(other.outputs);
+    }
+
+    /// Appends rows from a sink over the same query, whose log expressions
+    /// are collected in the same order.
+    fn extend_outputs(&mut self, outputs: Vec<Vec<Row>>) {
+        for (output, rows) in self.outputs.iter_mut().zip(outputs) {
             output.extend(rows);
         }
     }
@@ -872,7 +1075,10 @@ impl<'a> PipelineSink<'a> {
             .zip(self.outputs)
             .map(|(log, mut rows)| {
                 if metric {
-                    rows.sort_by_key(|row| row.timestamp_ns);
+                    // Same-timestamp samples in Loki's merge order, which
+                    // `first_over_time` and `last_over_time` pick between.
+                    rows.sort_by_key(|row| (row.timestamp_ns, row.stream));
+                    dedupe_rows(&mut rows);
                 }
                 (log as *const LogExpr as usize, rows)
             })
@@ -886,12 +1092,22 @@ impl<'a> PipelineSink<'a> {
                 // are no longer needed once reduced.
                 let key = log as *const LogExpr as usize;
                 let rows = by_expr.remove(&key)?;
-                Some((key, RangeSeries::new(op, log, grouping, &rows)))
+                Some((key, RangeSeries::new(op, log, grouping, rows)))
             })
             .collect();
-        MetricRows { by_expr, ranges }
+        MetricRows {
+            by_expr,
+            ranges,
+            label_keys: RefCell::default(),
+            relabels: RefCell::default(),
+        }
     }
 }
+
+static BY_NOTHING: Grouping = Grouping {
+    without: false,
+    labels: Vec::new(),
+};
 
 fn collect_range_aggregations<'a>(
     query: &'a Query,
@@ -903,6 +1119,33 @@ fn collect_range_aggregations<'a>(
         } => result.push((*op, expr, grouping.as_ref())),
         Expr::Vector(expr) | Expr::LabelReplace { expr, .. } => {
             collect_range_aggregations(expr, result);
+        }
+        Expr::VectorAggregation {
+            op: VectorOp::Sum,
+            expr,
+            grouping,
+            ..
+        } if matches!(
+            &expr.value,
+            Expr::RangeAggregation {
+                op: RangeOp::Bytes
+                    | RangeOp::BytesRate
+                    | RangeOp::Sum
+                    | RangeOp::Rate
+                    | RangeOp::Count,
+                grouping: None,
+                ..
+            }
+        ) =>
+        {
+            // Loki's `canInjectVectorGrouping`: summing these range ops is
+            // linear, so grouping samples by the outer labels as they are
+            // extracted gives the same sums without a series per label set
+            // the parsers produced.
+            let Expr::RangeAggregation { op, expr, .. } = &expr.value else {
+                unreachable!("matched above")
+            };
+            result.push((*op, expr, Some(grouping.as_ref().unwrap_or(&BY_NOTHING))));
         }
         Expr::VectorAggregation { expr, .. } => collect_range_aggregations(expr, result),
         Expr::Binary { lhs, rhs, .. } => {
@@ -919,6 +1162,11 @@ fn collect_range_aggregations<'a>(
 struct MetricRows {
     by_expr: HashMap<usize, Vec<Row>>,
     ranges: HashMap<usize, RangeSeries>,
+    /// Per binary or aggregation expression, by address, its operands'
+    /// series keys, which steps share.
+    label_keys: RefCell<HashMap<usize, LabelKeys>>,
+    /// Per `label_replace`, by address, its rewrites, which steps share.
+    relabels: RefCell<HashMap<usize, Relabel>>,
 }
 
 impl MetricRows {
@@ -962,8 +1210,94 @@ fn log_offset(log: &LogExpr) -> Result<i64> {
         .unwrap_or(0))
 }
 
-fn apply_stages(log: &LogExpr, row: &mut Row) -> Result<bool> {
-    for stage in &log.stages {
+/// Log expressions whose samples Loki extracts with no labels at all:
+/// `absent_over_time`, and line-count or byte range aggregations directly
+/// under a `sum` without grouping, which Loki pushes into the extractor.
+fn collect_label_free_logs(query: &Query, result: &mut HashSet<*const LogExpr>) {
+    match &query.value {
+        Expr::RangeAggregation {
+            op: RangeOp::Absent,
+            expr,
+            ..
+        } => {
+            result.insert(expr);
+        }
+        Expr::VectorAggregation {
+            op: VectorOp::Sum,
+            expr,
+            grouping,
+            ..
+        } if grouping
+            .as_ref()
+            .is_none_or(|grouping| !grouping.without && grouping.labels.is_empty()) =>
+        {
+            if let Expr::RangeAggregation {
+                op: RangeOp::Count | RangeOp::Rate | RangeOp::Bytes | RangeOp::BytesRate,
+                expr: log,
+                grouping: None,
+                ..
+            } = &expr.value
+            {
+                result.insert(log);
+            } else {
+                collect_label_free_logs(expr, result);
+            }
+        }
+        Expr::Vector(expr)
+        | Expr::LabelReplace { expr, .. }
+        | Expr::VectorAggregation { expr, .. } => collect_label_free_logs(expr, result),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_label_free_logs(lhs, result);
+            collect_label_free_logs(rhs, result);
+        }
+        Expr::Log(_)
+        | Expr::RangeAggregation { .. }
+        | Expr::LabelAggregation { .. }
+        | Expr::Number(_)
+        | Expr::String(_) => {}
+    }
+}
+
+/// Loki's `removeLineformat`: samples other than byte counts never see the
+/// line, so a `line_format` runs only when a later parser or line filter
+/// reads what it wrote. `sampled` is the range aggregation over `log`.
+fn running_stages(log: &LogExpr, sampled: Option<RangeOp>) -> Vec<bool> {
+    let removes = sampled.is_some_and(|op| !matches!(op, RangeOp::Bytes | RangeOp::BytesRate));
+    (0..log.stages.len())
+        .map(|index| {
+            !removes
+                || !matches!(log.stages[index].value, PipelineStage::LineFormat(_))
+                || log.stages[index + 1..].iter().any(|stage| {
+                    matches!(
+                        stage.value,
+                        PipelineStage::Parser(_)
+                            | PipelineStage::LineFilter(_)
+                            | PipelineStage::Match(_)
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Whether a stage reads labels, which makes Loki run its parsers even when
+/// the samples keep no labels.
+fn reads_labels(stage: &PipelineStage) -> bool {
+    matches!(
+        stage,
+        PipelineStage::LabelFilter(_)
+            | PipelineStage::LineFormat(_)
+            | PipelineStage::LabelFormat(_)
+            | PipelineStage::Unwrap(_)
+    )
+}
+
+/// `skip_parsers` mirrors Loki's parser hints: when nothing downstream needs
+/// a label, parsers leave the line alone, so they never flag errors either.
+fn apply_stages(log: &LogExpr, runs: &[bool], row: &mut Row, skip_parsers: bool) -> Result<bool> {
+    for (stage, _) in log.stages.iter().zip(runs).filter(|(_, runs)| **runs) {
+        if skip_parsers && matches!(stage.value, PipelineStage::Parser(_)) {
+            continue;
+        }
         let parser = matches!(stage.value, PipelineStage::Parser(_))
             && !row.labels.contains_key(ERROR_LABEL);
         if !apply_stage(row, &stage.value)? {

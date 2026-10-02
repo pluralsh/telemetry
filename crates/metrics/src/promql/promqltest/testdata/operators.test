@@ -154,6 +154,8 @@ eval instant at 50m (rate((http_requests_total[25m])) * 25) * 60
   {group="production", instance="1", job="app-server"} 300
 
 
+resume
+
 eval instant at 50m http_requests_total{group="canary"} and http_requests_total{instance="0"}
 	http_requests_total{group="canary", instance="0", job="api-server"} 300
 	http_requests_total{group="canary", instance="0", job="app-server"} 700
@@ -265,6 +267,8 @@ eval instant at 50m http_requests_total AND IGNORING (group, instance, job) vect
 	http_requests_total{group="production", instance="1", job="api-server"} 200
 	http_requests_total{group="production", instance="1", job="app-server"} 600
 
+
+ignore
 
 # Comparisons.
 eval instant at 50m SUM(http_requests_total) BY (job) > 1000

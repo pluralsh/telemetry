@@ -1,0 +1,28 @@
+mode: standalone
+listeners: { http: "0.0.0.0:3100", grpc: "0.0.0.0:9091" }
+storage:
+  type: SlateDb
+  path: fuzz
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: logs-fuzz
+    endpoint: http://minio:9000
+    allow_http: true
+  block_cache: { type: FoyerMemory, capacity: 67108864 }
+  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+segment_duration_seconds: 60
+# Short enough that a fuzz run spans several whole rollup periods.
+discovery_rollup_seconds: 120
+# Long enough that multi-hour fuzz runs never compare against expired pages.
+retention_seconds: 86400
+page:
+  target_size_bytes: 16384
+  max_rows: 128
+  rows_per_block: 32
+compaction: { min_age_seconds: 1, finalize_after_seconds: 5, delete_delay_seconds: 30 }
+write: { flush_interval_seconds: 1 }
+auth: { unauthenticated: true }
+namespaces:
+  - name: regression
+    auth: { read: [], write: [] }

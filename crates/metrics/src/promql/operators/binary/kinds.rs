@@ -155,6 +155,29 @@ pub enum MatchTable {
     /// `group_right`: RHS is "many". `map[j]` is the LHS series index for
     /// RHS `j`, or `None`. Output schema = RHS schema.
     GroupRight(Vec<Option<u32>>),
+    /// `and` / `or` / `unless`: membership is decided per step from the
+    /// matching signatures present on each side, so it can't be reduced to
+    /// a static pairing.
+    Set(Arc<SetMatch>),
+}
+
+/// Partner-side series that share a matching key, keyed by the first of
+/// them (the index the [`MatchTable`] map points at). Prometheus matches
+/// each step's samples, so the partner is whichever candidate has a sample
+/// at that step, and two present at once is a matching error. Keys with a
+/// single candidate are absent.
+pub type PartnerGroups = HashMap<u32, Box<[u32]>>;
+
+/// Per-step set-operator matching. `lhs_keys[i]` / `rhs_keys[j]` are dense
+/// signature ids (`< key_count`). Each output row names the LHS and/or RHS
+/// series that feed it; `or` rows come from both sides, merged when the
+/// labelsets are identical.
+#[derive(Debug)]
+pub struct SetMatch {
+    pub lhs_keys: Vec<u32>,
+    pub rhs_keys: Vec<u32>,
+    pub key_count: usize,
+    pub rows: Vec<(Option<u32>, Option<u32>)>,
 }
 
 impl MatchTable {
@@ -162,6 +185,7 @@ impl MatchTable {
     pub fn len(&self) -> usize {
         match self {
             Self::OneToOne(m) | Self::GroupLeft(m) | Self::GroupRight(m) => m.len(),
+            Self::Set(set) => set.rows.len(),
         }
     }
 
@@ -190,6 +214,7 @@ pub enum BinaryShape {
         /// table's output side (LHS for `OneToOne`/`GroupLeft`, RHS for
         /// `GroupRight`).
         output_schema: Arc<SeriesSchema>,
+        partners: Arc<PartnerGroups>,
     },
     /// Vector op Scalar (scalar broadcast on the RHS). Output schema =
     /// LHS vector schema.

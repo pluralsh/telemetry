@@ -6,22 +6,22 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use common::serde::ensure_consumed;
 use common::serde::scope::{KeyScope, ScopedSegmentExtractor};
-use common::serde::sortable::{decode_i64_sortable, encode_i64_sortable};
 use common::serde::varint::{var_u32, var_u64};
 
 use crate::Namespace;
 use crate::error::{Error, Result};
 use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
 
-pub(crate) const KEY_VERSION: u8 = 3;
+pub(crate) const KEY_VERSION: u8 = 4;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v3";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v4";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
-const PAGE_METADATA_VERSION: u8 = 2;
-const PAGE_METADATA_HAS_EXPIRY: u8 = 1;
+/// Leading byte of run and object-directory values.
+const OBJECT_FORMAT: u8 = 1;
+const HAS_EXPIRY: u8 = 1;
 /// Leading byte of forward-label values.
 const LABELS_FORMAT: u8 = 1;
 
@@ -32,74 +32,151 @@ pub(crate) enum RecordType {
     StreamDictionary = 2,
     ForwardLabels = 3,
     LabelPostings = 4,
-    PageMetadata = 5,
-    PagePayload = 6,
-    NextPageSequence = 7,
+    Run = 5,
+    ObjectBlock = 6,
+    NextObjectId = 7,
     SearchFieldStats = 8,
     SearchTermStats = 9,
     SearchTermDirectory = 10,
     SearchPostingBlock = 11,
-    PageTombstone = 12,
+    ObjectTombstone = 12,
+    /// Discovery records of a whole rollup period; see [`rollup_prefix`].
+    Rollup = 13,
+    ObjectDirectory = 14,
 }
 
+/// Records under [`rollup_prefix`]. The period's discovery catalog shares
+/// the prefix and starts with `CATALOG_RECORD_TYPE`, which none of these use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PageId {
-    pub timestamp_ns: i64,
-    pub sequence: u64,
+#[repr(u8)]
+enum RollupRecord {
+    NextStreamId = 1,
+    StreamDictionary = 2,
+    ForwardLabels = 3,
+    LabelPostings = 4,
 }
 
-/// Page metadata. A compacted page keeps the key of the first page it
-/// replaced and covers the consecutive written pages ("leaves") starting at
-/// its sequence; full-text postings keep addressing those leaves.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredPageMetadata {
+/// One stored object: the blocks written together by a flush or a merge.
+/// IDs are allocated per segment in write order. A merge reuses its first
+/// input's ID one level higher, so `(id, level)` never names two objects.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ObjectRef {
+    pub id: u64,
+    pub level: u8,
+}
+
+/// A written (level-0) object holding some of a stream's rows. Full-text
+/// postings address rows by `(stream, leaf object, row in leaf)` and keep
+/// doing so after merges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Leaf {
+    pub object_id: u64,
+    pub rows: u32,
+}
+
+/// One stream's contiguous blocks inside one object, read by queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StoredRun {
+    pub level: u8,
     pub expires_at_unix_ms: Option<u64>,
     pub min_timestamp_ns: i64,
     pub max_timestamp_ns: i64,
-    pub row_count: u32,
-    pub payload_bytes: u32,
-    /// Zero for written pages; a merge produces one more than its inputs'
-    /// maximum, so `(sequence, level)` never names two different payloads.
-    pub level: u8,
-    pub written_at_unix_ms: u64,
-    /// Row count of each covered leaf in order; empty for a single leaf.
-    pub leaf_rows: Vec<u32>,
+    pub rows: u32,
+    /// Encoded size of the run's blocks.
+    pub bytes: u32,
+    pub first_block: u32,
+    pub blocks: u32,
 }
 
-impl StoredPageMetadata {
+impl StoredRun {
     pub(crate) fn is_expired_at(&self, unix_ms: u64) -> bool {
-        self.expires_at_unix_ms
-            .is_some_and(|expires_at| unix_ms >= expires_at)
+        is_expired(self.expires_at_unix_ms, unix_ms)
+    }
+}
+
+/// A run as listed in its object's directory. Runs are ordered by stream ID
+/// and their blocks follow each other, so a run's first block is the sum of
+/// its predecessors' block counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectRun {
+    pub stream_id: StreamId,
+    pub min_timestamp_ns: i64,
+    pub max_timestamp_ns: i64,
+    pub rows: u32,
+    pub bytes: u32,
+    pub blocks: u32,
+    /// The leaves whose rows the run concatenates, in order. Empty in a
+    /// level-0 object, whose runs are their own single leaf.
+    pub leaves: Vec<Leaf>,
+}
+
+/// Directory of one object, read by compaction and by full-text queries
+/// that must map postings onto merged objects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredObject {
+    pub expires_at_unix_ms: Option<u64>,
+    pub written_at_unix_ms: u64,
+    /// Count of consecutive level-0 IDs the object covers from its own.
+    pub span: u64,
+    pub runs: Vec<ObjectRun>,
+}
+
+impl StoredObject {
+    pub(crate) fn is_expired_at(&self, unix_ms: u64) -> bool {
+        is_expired(self.expires_at_unix_ms, unix_ms)
     }
 
-    pub(crate) fn leaf_count(&self) -> u64 {
-        self.leaf_rows.len().max(1) as u64
+    pub(crate) fn rows(&self) -> u64 {
+        self.runs.iter().map(|run| u64::from(run.rows)).sum()
     }
 
-    /// `(leaf sequence, first row)` for every leaf of a page at `sequence`.
-    pub(crate) fn leaves(&self, sequence: u64) -> Vec<(u64, u32)> {
-        if self.leaf_rows.is_empty() {
-            return vec![(sequence, 0)];
+    pub(crate) fn bytes(&self) -> u64 {
+        self.runs.iter().map(|run| u64::from(run.bytes)).sum()
+    }
+
+    pub(crate) fn blocks(&self) -> u32 {
+        self.runs
+            .iter()
+            .fold(0u32, |sum, run| sum.saturating_add(run.blocks))
+    }
+
+    /// The leaves of `run` in an object with ID `object_id`.
+    pub(crate) fn leaves_of(run: &ObjectRun, object_id: u64) -> Vec<Leaf> {
+        if run.leaves.is_empty() {
+            vec![Leaf {
+                object_id,
+                rows: run.rows,
+            }]
+        } else {
+            run.leaves.clone()
         }
-        let mut offset = 0u32;
-        (sequence..)
-            .zip(&self.leaf_rows)
-            .map(|(leaf, rows)| {
-                let first = offset;
-                offset = offset.saturating_add(*rows);
-                (leaf, first)
+    }
+
+    /// The query-side record of every run, with its first block.
+    pub(crate) fn stored_runs(&self, level: u8) -> Vec<(StreamId, StoredRun)> {
+        let mut first_block = 0u32;
+        self.runs
+            .iter()
+            .map(|run| {
+                let stored = StoredRun {
+                    level,
+                    expires_at_unix_ms: self.expires_at_unix_ms,
+                    min_timestamp_ns: run.min_timestamp_ns,
+                    max_timestamp_ns: run.max_timestamp_ns,
+                    rows: run.rows,
+                    bytes: run.bytes,
+                    first_block,
+                    blocks: run.blocks,
+                };
+                first_block = first_block.saturating_add(run.blocks);
+                (run.stream_id, stored)
             })
             .collect()
     }
+}
 
-    /// Row counts of the leaves, including a single-leaf page's own count.
-    pub(crate) fn leaf_row_counts(&self) -> Vec<u32> {
-        if self.leaf_rows.is_empty() {
-            vec![self.row_count]
-        } else {
-            self.leaf_rows.clone()
-        }
-    }
+fn is_expired(expires_at_unix_ms: Option<u64>, unix_ms: u64) -> bool {
+    expires_at_unix_ms.is_some_and(|expires_at| unix_ms >= expires_at)
 }
 
 pub(crate) fn segment_for(timestamp_ns: i64, segment_ns: i64) -> SegmentId {
@@ -114,18 +191,74 @@ pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes
     bytes.freeze()
 }
 
+/// Discovery records summarising every segment of the rollup period starting
+/// at `period`. They live in the scope of the period's first segment, so the
+/// segment extractor routes them like any other record, and use period-local
+/// stream IDs unrelated to that segment's.
+pub(crate) fn rollup_prefix(namespace: &Namespace, period: SegmentId) -> Bytes {
+    record_prefix(namespace, period, RecordType::Rollup).freeze()
+}
+
+fn rollup_record_prefix(
+    namespace: &Namespace,
+    period: SegmentId,
+    record: RollupRecord,
+) -> BytesMut {
+    let mut bytes = record_prefix(namespace, period, RecordType::Rollup);
+    bytes.put_u8(record as u8);
+    bytes
+}
+
+pub(crate) fn rollup_next_stream_id_key(namespace: &Namespace, period: SegmentId) -> Bytes {
+    rollup_record_prefix(namespace, period, RollupRecord::NextStreamId).freeze()
+}
+
+pub(crate) fn rollup_dictionary_key(
+    namespace: &Namespace,
+    period: SegmentId,
+    fingerprint: StreamFingerprint,
+) -> Bytes {
+    let mut bytes = rollup_record_prefix(namespace, period, RollupRecord::StreamDictionary);
+    bytes.extend_from_slice(&fingerprint);
+    bytes.freeze()
+}
+
+pub(crate) fn rollup_forward_key(
+    namespace: &Namespace,
+    period: SegmentId,
+    stream_id: StreamId,
+) -> Bytes {
+    let mut bytes = rollup_record_prefix(namespace, period, RollupRecord::ForwardLabels);
+    bytes.put_u32(stream_id);
+    bytes.freeze()
+}
+
+pub(crate) fn rollup_forward_prefix(namespace: &Namespace, period: SegmentId) -> Bytes {
+    rollup_record_prefix(namespace, period, RollupRecord::ForwardLabels).freeze()
+}
+
+/// Stream ID of a key under [`rollup_forward_prefix`] of length `prefix_len`.
+pub(crate) fn decode_rollup_forward_key(bytes: &[u8], prefix_len: usize) -> Result<StreamId> {
+    bytes
+        .get(prefix_len..)
+        .and_then(|suffix| <[u8; 4]>::try_from(suffix).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| Error::Corrupt("invalid rollup forward-label key".to_owned()))
+}
+
+pub(crate) fn rollup_posting_key(namespace: &Namespace, period: SegmentId, label: &Label) -> Bytes {
+    let mut bytes = rollup_record_prefix(namespace, period, RollupRecord::LabelPostings);
+    common::serde::terminated_bytes::serialize(label.name.as_bytes(), &mut bytes);
+    bytes.extend_from_slice(label.value.as_bytes());
+    bytes.freeze()
+}
+
 pub(crate) fn next_stream_id_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
     record_prefix(namespace, segment, RecordType::NextStreamId).freeze()
 }
 
-pub(crate) fn next_page_sequence_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    stream_id: StreamId,
-) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::NextPageSequence);
-    bytes.put_u32(stream_id);
-    bytes.freeze()
+pub(crate) fn next_object_id_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::NextObjectId).freeze()
 }
 
 pub(crate) fn dictionary_key(
@@ -199,114 +332,140 @@ pub(crate) fn term_posting_block_key(
     bytes.freeze()
 }
 
-pub(crate) fn metadata_key(
+/// The run of `stream_id` in object `object_id`. A merged object reuses its
+/// first input's ID, so its runs replace that input's runs in place.
+pub(crate) fn run_key(
     namespace: &Namespace,
     segment: SegmentId,
     stream_id: StreamId,
-    page_id: PageId,
+    object_id: u64,
 ) -> Bytes {
-    page_key(
-        namespace,
-        segment,
-        RecordType::PageMetadata,
-        stream_id,
-        page_id,
-    )
+    let mut bytes = record_prefix(namespace, segment, RecordType::Run);
+    bytes.put_u32(stream_id);
+    bytes.put_u64(object_id);
+    bytes.freeze()
 }
 
-pub(crate) fn payload_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    stream_id: StreamId,
-    page_id: PageId,
-    level: u8,
-) -> Bytes {
-    leveled_page_key(
-        namespace,
-        segment,
-        RecordType::PagePayload,
-        stream_id,
-        page_id,
-        level,
-    )
+/// Runs of every stream in a segment.
+pub(crate) fn segment_run_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::Run).freeze()
 }
 
-/// Marks a replaced payload for deletion once in-flight readers are done.
-pub(crate) fn tombstone_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    stream_id: StreamId,
-    page_id: PageId,
-    level: u8,
-) -> Bytes {
-    leveled_page_key(
-        namespace,
-        segment,
-        RecordType::PageTombstone,
-        stream_id,
-        page_id,
-        level,
-    )
-}
-
-pub(crate) fn tombstone_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::PageTombstone).freeze()
-}
-
-pub(crate) fn decode_tombstone_key(bytes: &[u8]) -> Result<(StreamId, PageId, u8)> {
-    let (_, _, record_type, offset) = parse_record_prefix(bytes)?;
-    if record_type != RecordType::PageTombstone || bytes.len() != offset + 21 {
-        return Err(Error::Corrupt("invalid page tombstone key".to_owned()));
-    }
-    let (stream_id, page_id) = decode_page_suffix(&bytes[offset..offset + 20]);
-    Ok((stream_id, page_id, bytes[offset + 20]))
-}
-
-pub(crate) fn encode_deadline(unix_ms: u64) -> Bytes {
-    Bytes::copy_from_slice(&unix_ms.to_be_bytes())
-}
-
-pub(crate) fn decode_deadline(bytes: &[u8]) -> Result<u64> {
-    bytes
-        .try_into()
-        .map(u64::from_be_bytes)
-        .map_err(|_| Error::Corrupt("tombstone deadline must contain eight bytes".to_owned()))
-}
-
-/// Page metadata of every stream in a segment.
-pub(crate) fn segment_metadata_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::PageMetadata).freeze()
-}
-
-pub(crate) fn metadata_prefix(
+pub(crate) fn stream_run_prefix(
     namespace: &Namespace,
     segment: SegmentId,
     stream_id: StreamId,
 ) -> Bytes {
-    let mut prefix = record_prefix(namespace, segment, RecordType::PageMetadata);
+    let mut prefix = record_prefix(namespace, segment, RecordType::Run);
     prefix.put_u32(stream_id);
     prefix.freeze()
 }
 
-pub(crate) fn decode_metadata_key(bytes: &[u8]) -> Result<(StreamId, PageId)> {
+/// `(stream ID, object ID)` of a run key.
+pub(crate) fn decode_run_key(bytes: &[u8]) -> Result<(StreamId, u64)> {
     let (_, _, record_type, offset) = parse_record_prefix(bytes)?;
-    if record_type != RecordType::PageMetadata || bytes.len() != offset + 20 {
-        return Err(Error::Corrupt("invalid page metadata key".to_owned()));
+    if record_type != RecordType::Run || bytes.len() != offset + 12 {
+        return Err(Error::Corrupt("invalid run key".to_owned()));
     }
-    Ok(decode_page_suffix(&bytes[offset..]))
+    Ok((
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+        u64::from_be_bytes(bytes[offset + 4..offset + 12].try_into().unwrap()),
+    ))
 }
 
-fn decode_page_suffix(bytes: &[u8]) -> (StreamId, PageId) {
-    let stream_id = u32::from_be_bytes(bytes[..4].try_into().unwrap());
-    let timestamp_ns = decode_sortable_i64(&bytes[4..12]);
-    let sequence = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
-    (
-        stream_id,
-        PageId {
-            timestamp_ns,
-            sequence,
-        },
-    )
+fn object_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    record_type: RecordType,
+    object: ObjectRef,
+) -> BytesMut {
+    let mut bytes = record_prefix(namespace, segment, record_type);
+    bytes.put_u64(object.id);
+    bytes.put_u8(object.level);
+    bytes
+}
+
+fn decode_object_key(bytes: &[u8], expected: RecordType) -> Result<ObjectRef> {
+    let (_, _, record_type, offset) = parse_record_prefix(bytes)?;
+    if record_type != expected || bytes.len() != offset + 9 {
+        return Err(Error::Corrupt(format!("invalid {expected:?} key")));
+    }
+    Ok(ObjectRef {
+        id: u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+        level: bytes[offset + 8],
+    })
+}
+
+/// Blocks of one object, ordered by index.
+pub(crate) fn object_blocks_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    object: ObjectRef,
+) -> Bytes {
+    object_key(namespace, segment, RecordType::ObjectBlock, object).freeze()
+}
+
+pub(crate) fn block_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    object: ObjectRef,
+    block: u32,
+) -> Bytes {
+    let mut bytes = object_key(namespace, segment, RecordType::ObjectBlock, object);
+    bytes.put_u32(block);
+    bytes.freeze()
+}
+
+/// Block index of a key under an [`object_blocks_prefix`] of `prefix_len`.
+pub(crate) fn decode_block_index(bytes: &[u8], prefix_len: usize) -> Result<u32> {
+    bytes
+        .get(prefix_len..)
+        .and_then(|suffix| <[u8; 4]>::try_from(suffix).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| Error::Corrupt("invalid object block key".to_owned()))
+}
+
+pub(crate) fn directory_key(namespace: &Namespace, segment: SegmentId, object: ObjectRef) -> Bytes {
+    object_key(namespace, segment, RecordType::ObjectDirectory, object).freeze()
+}
+
+pub(crate) fn directory_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::ObjectDirectory).freeze()
+}
+
+pub(crate) fn decode_directory_key(bytes: &[u8]) -> Result<ObjectRef> {
+    decode_object_key(bytes, RecordType::ObjectDirectory)
+}
+
+/// Marks a replaced object for deletion once in-flight readers are done.
+pub(crate) fn tombstone_key(namespace: &Namespace, segment: SegmentId, object: ObjectRef) -> Bytes {
+    object_key(namespace, segment, RecordType::ObjectTombstone, object).freeze()
+}
+
+pub(crate) fn tombstone_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::ObjectTombstone).freeze()
+}
+
+pub(crate) fn decode_tombstone_key(bytes: &[u8]) -> Result<ObjectRef> {
+    decode_object_key(bytes, RecordType::ObjectTombstone)
+}
+
+/// Tombstone value: the deletion deadline and the object's block count.
+pub(crate) fn encode_tombstone(deadline_unix_ms: u64, blocks: u32) -> Bytes {
+    let mut bytes = BytesMut::with_capacity(12);
+    bytes.put_u64(deadline_unix_ms);
+    bytes.put_u32(blocks);
+    bytes.freeze()
+}
+
+pub(crate) fn decode_tombstone(bytes: &[u8]) -> Result<(u64, u32)> {
+    let bytes: &[u8; 12] = bytes
+        .try_into()
+        .map_err(|_| Error::Corrupt("tombstone must contain twelve bytes".to_owned()))?;
+    Ok((
+        u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        u32::from_be_bytes(bytes[8..].try_into().unwrap()),
+    ))
 }
 
 pub(crate) fn encode_stream_id(value: StreamId) -> Bytes {
@@ -320,15 +479,15 @@ pub(crate) fn decode_stream_id(bytes: &[u8]) -> Result<StreamId> {
         .map_err(|_| Error::Corrupt("stream id must contain four bytes".to_owned()))
 }
 
-pub(crate) fn encode_page_sequence(value: u64) -> Bytes {
+pub(crate) fn encode_object_id(value: u64) -> Bytes {
     Bytes::copy_from_slice(&value.to_be_bytes())
 }
 
-pub(crate) fn decode_page_sequence(bytes: &[u8]) -> Result<u64> {
+pub(crate) fn decode_object_id(bytes: &[u8]) -> Result<u64> {
     bytes
         .try_into()
         .map(u64::from_be_bytes)
-        .map_err(|_| Error::Corrupt("page sequence must contain eight bytes".to_owned()))
+        .map_err(|_| Error::Corrupt("object id must contain eight bytes".to_owned()))
 }
 
 pub(crate) fn encode_labels(labels: &Labels) -> Result<Bytes> {
@@ -358,103 +517,195 @@ pub(crate) fn decode_labels(bytes: &[u8]) -> Result<Labels> {
     Labels::new(labels)
 }
 
-pub(crate) fn encode_metadata(metadata: &StoredPageMetadata) -> Result<Bytes> {
-    if metadata.max_timestamp_ns < metadata.min_timestamp_ns {
-        return Err(Error::Invalid(
-            "page max timestamp precedes min timestamp".to_owned(),
-        ));
-    }
+pub(crate) fn encode_run(run: &StoredRun) -> Result<Bytes> {
     let mut bytes = BytesMut::with_capacity(32);
-    bytes.put_u8(PAGE_METADATA_VERSION);
-    match metadata.expires_at_unix_ms {
-        Some(expires_at) => {
-            bytes.put_u8(PAGE_METADATA_HAS_EXPIRY);
-            var_u64::serialize(expires_at, &mut bytes);
-        }
-        None => bytes.put_u8(0),
+    bytes.put_u8(OBJECT_FORMAT);
+    put_expiry(run.expires_at_unix_ms, &mut bytes);
+    put_time_range(run.min_timestamp_ns, run.max_timestamp_ns, &mut bytes)?;
+    var_u32::serialize(run.rows, &mut bytes);
+    var_u32::serialize(run.bytes, &mut bytes);
+    bytes.put_u8(run.level);
+    var_u32::serialize(run.first_block, &mut bytes);
+    var_u32::serialize(run.blocks, &mut bytes);
+    Ok(bytes.freeze())
+}
+
+pub(crate) fn decode_run(bytes: &[u8]) -> Result<StoredRun> {
+    let mut buf = object_body(bytes, "run")?;
+    let expires_at_unix_ms = read_expiry(&mut buf)?;
+    let (min_timestamp_ns, max_timestamp_ns) = read_time_range(&mut buf)?;
+    let rows = var_u32::deserialize(&mut buf)?;
+    let bytes = var_u32::deserialize(&mut buf)?;
+    let level = read_u8(&mut buf)?;
+    let first_block = var_u32::deserialize(&mut buf)?;
+    let blocks = var_u32::deserialize(&mut buf)?;
+    ensure_consumed(buf, "run")?;
+    if blocks == 0 || first_block.checked_add(blocks).is_none() {
+        return Err(Error::Corrupt("run has invalid block bounds".to_owned()));
     }
-    bytes.put_i64(metadata.min_timestamp_ns);
-    var_u64::serialize(
-        metadata
-            .max_timestamp_ns
-            .abs_diff(metadata.min_timestamp_ns),
-        &mut bytes,
-    );
-    var_u32::serialize(metadata.row_count, &mut bytes);
-    var_u32::serialize(metadata.payload_bytes, &mut bytes);
-    bytes.put_u8(metadata.level);
-    var_u64::serialize(metadata.written_at_unix_ms, &mut bytes);
-    var_u32::serialize(value_len(metadata.leaf_rows.len())?, &mut bytes);
-    for rows in &metadata.leaf_rows {
-        var_u32::serialize(*rows, &mut bytes);
+    Ok(StoredRun {
+        level,
+        expires_at_unix_ms,
+        min_timestamp_ns,
+        max_timestamp_ns,
+        rows,
+        bytes,
+        first_block,
+        blocks,
+    })
+}
+
+/// Runs must be ordered by strictly increasing stream ID; IDs are
+/// delta-encoded.
+pub(crate) fn encode_object(object: &StoredObject) -> Result<Bytes> {
+    let mut bytes = BytesMut::with_capacity(16 + object.runs.len() * 24);
+    bytes.put_u8(OBJECT_FORMAT);
+    put_expiry(object.expires_at_unix_ms, &mut bytes);
+    var_u64::serialize(object.written_at_unix_ms, &mut bytes);
+    var_u64::serialize(object.span, &mut bytes);
+    var_u32::serialize(value_len(object.runs.len())?, &mut bytes);
+    let mut previous: Option<StreamId> = None;
+    for run in &object.runs {
+        let delta = match previous {
+            None => run.stream_id,
+            Some(previous) if run.stream_id > previous => run.stream_id - previous,
+            Some(_) => {
+                return Err(Error::Invalid(
+                    "object runs must be ordered by stream".to_owned(),
+                ));
+            }
+        };
+        previous = Some(run.stream_id);
+        var_u32::serialize(delta, &mut bytes);
+        put_time_range(run.min_timestamp_ns, run.max_timestamp_ns, &mut bytes)?;
+        var_u32::serialize(run.rows, &mut bytes);
+        var_u32::serialize(run.bytes, &mut bytes);
+        var_u32::serialize(run.blocks, &mut bytes);
+        var_u32::serialize(value_len(run.leaves.len())?, &mut bytes);
+        for leaf in &run.leaves {
+            var_u64::serialize(leaf.object_id, &mut bytes);
+            var_u32::serialize(leaf.rows, &mut bytes);
+        }
     }
     Ok(bytes.freeze())
 }
 
-pub(crate) fn decode_metadata(bytes: &[u8]) -> Result<StoredPageMetadata> {
-    let Some(&version) = bytes.first() else {
-        return Err(Error::Corrupt("empty page metadata".to_owned()));
-    };
-    if version != PAGE_METADATA_VERSION {
-        return Err(Error::Corrupt(format!(
-            "unsupported page metadata version {version}"
-        )));
-    }
-    let mut buf = &bytes[1..];
-    let (&flags, rest) = buf
-        .split_first()
-        .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
-    buf = rest;
-    let expires_at_unix_ms = match flags {
-        0 => None,
-        PAGE_METADATA_HAS_EXPIRY => Some(var_u64::deserialize(&mut buf)?),
-        _ => {
-            return Err(Error::Corrupt(format!(
-                "unknown page metadata flags {flags}"
-            )));
-        }
-    };
-    let (min, rest) = buf
-        .split_first_chunk::<8>()
-        .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
-    buf = rest;
-    let min_timestamp_ns = i64::from_be_bytes(*min);
-    let max_timestamp_ns = min_timestamp_ns
-        .checked_add_unsigned(var_u64::deserialize(&mut buf)?)
-        .ok_or_else(|| Error::Corrupt("page max timestamp overflows".to_owned()))?;
-    let row_count = var_u32::deserialize(&mut buf)?;
-    let payload_bytes = var_u32::deserialize(&mut buf)?;
-    let (&level, rest) = buf
-        .split_first()
-        .ok_or_else(|| Error::Corrupt("truncated page metadata".to_owned()))?;
-    buf = rest;
+pub(crate) fn decode_object(bytes: &[u8]) -> Result<StoredObject> {
+    let mut buf = object_body(bytes, "object directory")?;
+    let expires_at_unix_ms = read_expiry(&mut buf)?;
     let written_at_unix_ms = var_u64::deserialize(&mut buf)?;
-    let leaves = var_u32::deserialize(&mut buf)? as usize;
-    let mut leaf_rows = Vec::with_capacity(leaves.min(buf.len()));
-    for _ in 0..leaves {
-        leaf_rows.push(var_u32::deserialize(&mut buf)?);
+    let span = var_u64::deserialize(&mut buf)?;
+    let count = var_u32::deserialize(&mut buf)? as usize;
+    let mut runs = Vec::with_capacity(count.min(buf.len() / 8));
+    let mut stream_id = 0u32;
+    for index in 0..count {
+        let delta = var_u32::deserialize(&mut buf)?;
+        stream_id = if index == 0 {
+            delta
+        } else {
+            stream_id
+                .checked_add(delta)
+                .filter(|_| delta > 0)
+                .ok_or_else(|| Error::Corrupt("object runs are out of order".to_owned()))?
+        };
+        let (min_timestamp_ns, max_timestamp_ns) = read_time_range(&mut buf)?;
+        let rows = var_u32::deserialize(&mut buf)?;
+        let bytes = var_u32::deserialize(&mut buf)?;
+        let blocks = var_u32::deserialize(&mut buf)?;
+        let leaf_count = var_u32::deserialize(&mut buf)? as usize;
+        let mut leaves = Vec::with_capacity(leaf_count.min(buf.len() / 2));
+        for _ in 0..leaf_count {
+            leaves.push(Leaf {
+                object_id: var_u64::deserialize(&mut buf)?,
+                rows: var_u32::deserialize(&mut buf)?,
+            });
+        }
+        if !leaves.is_empty()
+            && leaves
+                .iter()
+                .try_fold(0u32, |sum, leaf| sum.checked_add(leaf.rows))
+                != Some(rows)
+        {
+            return Err(Error::Corrupt(
+                "run leaf rows do not sum to its row count".to_owned(),
+            ));
+        }
+        runs.push(ObjectRun {
+            stream_id,
+            min_timestamp_ns,
+            max_timestamp_ns,
+            rows,
+            bytes,
+            blocks,
+            leaves,
+        });
     }
-    ensure_consumed(buf, "page metadata")?;
-    if !leaf_rows.is_empty()
-        && leaf_rows
-            .iter()
-            .try_fold(0u32, |sum, rows| sum.checked_add(*rows))
-            != Some(row_count)
-    {
-        return Err(Error::Corrupt(
-            "page leaf rows do not sum to its row count".to_owned(),
+    ensure_consumed(buf, "object directory")?;
+    Ok(StoredObject {
+        expires_at_unix_ms,
+        written_at_unix_ms,
+        span,
+        runs,
+    })
+}
+
+fn object_body<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
+    match bytes.first() {
+        Some(&OBJECT_FORMAT) => Ok(&bytes[1..]),
+        Some(format) => Err(Error::Corrupt(format!(
+            "unsupported {what} format {format}"
+        ))),
+        None => Err(Error::Corrupt(format!("empty {what}"))),
+    }
+}
+
+fn put_expiry(expires_at_unix_ms: Option<u64>, bytes: &mut BytesMut) {
+    match expires_at_unix_ms {
+        Some(expires_at) => {
+            bytes.put_u8(HAS_EXPIRY);
+            var_u64::serialize(expires_at, bytes);
+        }
+        None => bytes.put_u8(0),
+    }
+}
+
+fn read_expiry(buf: &mut &[u8]) -> Result<Option<u64>> {
+    match read_u8(buf)? {
+        0 => Ok(None),
+        HAS_EXPIRY => Ok(Some(var_u64::deserialize(buf)?)),
+        flags => Err(Error::Corrupt(format!("unknown expiry flags {flags}"))),
+    }
+}
+
+fn put_time_range(min: i64, max: i64, bytes: &mut BytesMut) -> Result<()> {
+    if max < min {
+        return Err(Error::Invalid(
+            "max timestamp precedes min timestamp".to_owned(),
         ));
     }
-    Ok(StoredPageMetadata {
-        expires_at_unix_ms,
-        min_timestamp_ns,
-        max_timestamp_ns,
-        row_count,
-        payload_bytes,
-        level,
-        written_at_unix_ms,
-        leaf_rows,
-    })
+    bytes.put_i64(min);
+    var_u64::serialize(max.abs_diff(min), bytes);
+    Ok(())
+}
+
+fn read_time_range(buf: &mut &[u8]) -> Result<(i64, i64)> {
+    let (min, rest) = buf
+        .split_first_chunk::<8>()
+        .ok_or_else(|| Error::Corrupt("truncated timestamp".to_owned()))?;
+    *buf = rest;
+    let min = i64::from_be_bytes(*min);
+    let max = min
+        .checked_add_unsigned(var_u64::deserialize(buf)?)
+        .ok_or_else(|| Error::Corrupt("max timestamp overflows".to_owned()))?;
+    Ok((min, max))
+}
+
+fn read_u8(buf: &mut &[u8]) -> Result<u8> {
+    let (&value, rest) = buf
+        .split_first()
+        .ok_or_else(|| Error::Corrupt("truncated value".to_owned()))?;
+    *buf = rest;
+    Ok(value)
 }
 
 fn put_str(value: &str, bytes: &mut BytesMut) -> Result<()> {
@@ -491,35 +742,6 @@ pub(crate) fn decode_postings(bytes: &[u8]) -> Result<roaring::RoaringBitmap> {
         .map_err(|error| Error::Corrupt(format!("failed to decode postings: {error}")))
 }
 
-fn page_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    record_type: RecordType,
-    stream_id: StreamId,
-    page_id: PageId,
-) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, record_type);
-    bytes.put_u32(stream_id);
-    bytes.put_u64(encode_i64_sortable(page_id.timestamp_ns));
-    bytes.put_u64(page_id.sequence);
-    bytes.freeze()
-}
-
-fn leveled_page_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    record_type: RecordType,
-    stream_id: StreamId,
-    page_id: PageId,
-    level: u8,
-) -> Bytes {
-    let key = page_key(namespace, segment, record_type, stream_id, page_id);
-    let mut bytes = BytesMut::with_capacity(key.len() + 1);
-    bytes.extend_from_slice(&key);
-    bytes.put_u8(level);
-    bytes.freeze()
-}
-
 #[cfg(test)]
 pub(crate) fn record_type_prefix(
     namespace: &Namespace,
@@ -546,91 +768,93 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         2 => RecordType::StreamDictionary,
         3 => RecordType::ForwardLabels,
         4 => RecordType::LabelPostings,
-        5 => RecordType::PageMetadata,
-        6 => RecordType::PagePayload,
-        7 => RecordType::NextPageSequence,
+        5 => RecordType::Run,
+        6 => RecordType::ObjectBlock,
+        7 => RecordType::NextObjectId,
         8 => RecordType::SearchFieldStats,
         9 => RecordType::SearchTermStats,
         10 => RecordType::SearchTermDirectory,
         11 => RecordType::SearchPostingBlock,
-        12 => RecordType::PageTombstone,
+        12 => RecordType::ObjectTombstone,
+        13 => RecordType::Rollup,
+        14 => RecordType::ObjectDirectory,
         value => return Err(Error::Corrupt(format!("unknown record type {value}"))),
     };
     Ok((namespace, segment, record_type, scope_len + 1))
 }
 
-fn decode_sortable_i64(bytes: &[u8]) -> i64 {
-    decode_i64_sortable(u64::from_be_bytes(bytes.try_into().unwrap()))
-}
-
 #[cfg(test)]
 mod tests {
-    use slatedb::PrefixExtractor;
+    use slatedb::{PrefixExtractor, PrefixTarget};
 
     use super::*;
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v3");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v4");
+    }
+
+    #[test]
+    fn rollup_records_route_with_their_first_segment_and_stay_disjoint() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let period = 7_200;
+        let prefix = rollup_prefix(&namespace, period);
+        let segment = segment_prefix(&namespace, period);
+        let label = Label::new("service", "api");
+        let keys = [
+            rollup_next_stream_id_key(&namespace, period),
+            rollup_dictionary_key(&namespace, period, [3; 16]),
+            rollup_forward_key(&namespace, period, 9),
+            rollup_posting_key(&namespace, period, &label),
+        ];
+        for key in &keys {
+            assert!(key.starts_with(&prefix));
+            assert_eq!(
+                SEGMENT_EXTRACTOR.prefix_len(&PrefixTarget::Point(key.clone())),
+                Some(segment.len())
+            );
+        }
+        // The catalog record type byte follows the rollup prefix directly.
+        assert!(keys.iter().all(|key| key[prefix.len()] != u8::MAX));
+        assert!(!forward_key(&namespace, period, 9).starts_with(&prefix));
+        assert!(!posting_key(&namespace, period, &label).starts_with(&prefix));
+        let forward = rollup_forward_prefix(&namespace, period);
+        assert_eq!(
+            decode_rollup_forward_key(&keys[2], forward.len()).unwrap(),
+            9
+        );
+        assert!(decode_rollup_forward_key(&keys[3], forward.len()).is_err());
     }
 
     #[test]
     fn keys_group_by_namespace_then_segment() {
         let namespace = Namespace::new("tenant").unwrap();
-        let first = metadata_key(
-            &namespace,
-            -10,
-            2,
-            PageId {
-                timestamp_ns: -4,
-                sequence: 8,
-            },
-        );
-        let second = metadata_key(
-            &namespace,
-            10,
-            1,
-            PageId {
-                timestamp_ns: 4,
-                sequence: 7,
-            },
-        );
+        let first = run_key(&namespace, -10, 2, 8);
+        let second = run_key(&namespace, 10, 1, 7);
         assert!(first < second);
         assert!(first.starts_with(&segment_prefix(&namespace, -10)));
-        assert_eq!(
-            decode_metadata_key(&first).unwrap(),
-            (
-                2,
-                PageId {
-                    timestamp_ns: -4,
-                    sequence: 8
-                }
-            )
-        );
+        assert!(first.starts_with(&stream_run_prefix(&namespace, -10, 2)));
+        assert_eq!(decode_run_key(&first).unwrap(), (2, 8));
+        // A stream's runs sort by object ID.
+        assert!(run_key(&namespace, 0, 3, 10) < run_key(&namespace, 0, 3, 11));
     }
 
     #[test]
-    fn page_sequence_breaks_equal_timestamp_ties() {
+    fn object_blocks_are_contiguous_and_ordered() {
         let namespace = Namespace::default();
-        let first = metadata_key(
-            &namespace,
-            0,
-            3,
-            PageId {
-                timestamp_ns: 42,
-                sequence: 10,
-            },
-        );
-        let second = metadata_key(
-            &namespace,
-            0,
-            3,
-            PageId {
-                timestamp_ns: 42,
-                sequence: 11,
-            },
-        );
-        assert!(first < second);
+        let object = ObjectRef { id: 5, level: 1 };
+        let prefix = object_blocks_prefix(&namespace, 0, object);
+        let keys = [0, 1, 256].map(|block| block_key(&namespace, 0, object, block));
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        for (key, block) in keys.iter().zip([0, 1, 256]) {
+            assert!(key.starts_with(&prefix));
+            assert_eq!(decode_block_index(key, prefix.len()).unwrap(), block);
+        }
+        let other_level = block_key(&namespace, 0, ObjectRef { id: 5, level: 2 }, 0);
+        assert!(!other_level.starts_with(&prefix));
+        let key = directory_key(&namespace, 0, object);
+        assert!(key.starts_with(&directory_prefix(&namespace, 0)));
+        assert_eq!(decode_directory_key(&key).unwrap(), object);
     }
 
     #[test]
@@ -643,82 +867,128 @@ mod tests {
     }
 
     #[test]
-    fn page_metadata_roundtrips_in_binary() {
-        for (expires_at_unix_ms, leaf_rows) in [
-            (None, Vec::new()),
-            (Some(0), vec![3, 4]),
-            (Some(u64::MAX), vec![7]),
-        ] {
-            let metadata = StoredPageMetadata {
+    fn runs_roundtrip_in_binary() {
+        for expires_at_unix_ms in [None, Some(0), Some(u64::MAX)] {
+            let run = StoredRun {
+                level: 2,
                 expires_at_unix_ms,
                 min_timestamp_ns: i64::MIN,
                 max_timestamp_ns: i64::MAX,
-                row_count: 7,
-                payload_bytes: 4096,
-                level: 2,
-                written_at_unix_ms: 1_234,
-                leaf_rows,
+                rows: 7,
+                bytes: 4096,
+                first_block: 3,
+                blocks: 2,
             };
-            let encoded = encode_metadata(&metadata).unwrap();
-            assert_eq!(encoded[0], PAGE_METADATA_VERSION);
-            assert_eq!(decode_metadata(&encoded).unwrap(), metadata);
+            let encoded = encode_run(&run).unwrap();
+            assert_eq!(encoded[0], OBJECT_FORMAT);
+            assert_eq!(decode_run(&encoded).unwrap(), run);
         }
-        let single = StoredPageMetadata {
+        let run = StoredRun {
+            level: 0,
             expires_at_unix_ms: None,
             min_timestamp_ns: 1,
             max_timestamp_ns: 2,
-            row_count: 1,
-            payload_bytes: 1,
-            level: 0,
-            written_at_unix_ms: 0,
-            leaf_rows: Vec::new(),
+            rows: 1,
+            bytes: 1,
+            first_block: 0,
+            blocks: 1,
         };
-        let mut unknown = encode_metadata(&single).unwrap().to_vec();
-        unknown[0] = PAGE_METADATA_VERSION + 1;
-        assert!(decode_metadata(&unknown).is_err());
-        let mismatched = StoredPageMetadata {
-            leaf_rows: vec![2],
-            ..single
-        };
-        assert!(decode_metadata(&encode_metadata(&mismatched).unwrap()).is_err());
+        let mut unknown = encode_run(&run).unwrap().to_vec();
+        unknown[0] = OBJECT_FORMAT + 1;
+        assert!(decode_run(&unknown).is_err());
+        let empty = StoredRun { blocks: 0, ..run };
+        assert!(decode_run(&encode_run(&empty).unwrap()).is_err());
     }
 
     #[test]
-    fn leaves_address_consecutive_sequences_with_row_offsets() {
-        let metadata = StoredPageMetadata {
-            expires_at_unix_ms: None,
-            min_timestamp_ns: 0,
-            max_timestamp_ns: 0,
-            row_count: 6,
-            payload_bytes: 1,
-            level: 1,
-            written_at_unix_ms: 0,
-            leaf_rows: vec![1, 2, 3],
+    fn object_directories_roundtrip_and_derive_runs() {
+        let run = |stream_id, rows, blocks, leaves| ObjectRun {
+            stream_id,
+            min_timestamp_ns: -5,
+            max_timestamp_ns: 9,
+            rows,
+            bytes: rows * 10,
+            blocks,
+            leaves,
         };
-        assert_eq!(metadata.leaves(10), vec![(10, 0), (11, 1), (12, 3)]);
-        assert_eq!(metadata.leaf_count(), 3);
-        let single = StoredPageMetadata {
-            leaf_rows: Vec::new(),
-            ..metadata
+        let object = StoredObject {
+            expires_at_unix_ms: Some(77),
+            written_at_unix_ms: 1_234,
+            span: 3,
+            runs: vec![
+                run(2, 3, 1, Vec::new()),
+                run(
+                    9,
+                    5,
+                    2,
+                    vec![
+                        Leaf {
+                            object_id: 4,
+                            rows: 2,
+                        },
+                        Leaf {
+                            object_id: 6,
+                            rows: 3,
+                        },
+                    ],
+                ),
+            ],
         };
-        assert_eq!(single.leaves(10), vec![(10, 0)]);
-        assert_eq!(single.leaf_row_counts(), vec![6]);
-    }
-
-    #[test]
-    fn tombstone_keys_roundtrip_and_differ_by_level() {
-        let namespace = Namespace::new("tenant").unwrap();
-        let page_id = PageId {
-            timestamp_ns: -5,
-            sequence: 9,
-        };
-        let key = tombstone_key(&namespace, 7, 3, page_id, 2);
-        assert!(key.starts_with(&tombstone_prefix(&namespace, 7)));
-        assert_eq!(decode_tombstone_key(&key).unwrap(), (3, page_id, 2));
-        assert_ne!(
-            payload_key(&namespace, 7, 3, page_id, 0),
-            payload_key(&namespace, 7, 3, page_id, 1)
+        let encoded = encode_object(&object).unwrap();
+        assert_eq!(decode_object(&encoded).unwrap(), object);
+        assert_eq!((object.rows(), object.bytes(), object.blocks()), (8, 80, 3));
+        let stored = object.stored_runs(1);
+        assert_eq!(
+            stored
+                .iter()
+                .map(|(stream, run)| (*stream, run.first_block, run.blocks, run.level))
+                .collect::<Vec<_>>(),
+            [(2, 0, 1, 1), (9, 1, 2, 1)]
         );
+        assert_eq!(
+            StoredObject::leaves_of(&object.runs[0], 4),
+            [Leaf {
+                object_id: 4,
+                rows: 3
+            }]
+        );
+
+        let unordered = StoredObject {
+            runs: vec![run(9, 1, 1, Vec::new()), run(2, 1, 1, Vec::new())],
+            ..object.clone()
+        };
+        assert!(encode_object(&unordered).is_err());
+        let mismatched = StoredObject {
+            runs: vec![run(
+                1,
+                4,
+                1,
+                vec![Leaf {
+                    object_id: 0,
+                    rows: 3,
+                }],
+            )],
+            ..object
+        };
+        assert!(decode_object(&encode_object(&mismatched).unwrap()).is_err());
+    }
+
+    #[test]
+    fn tombstones_roundtrip_and_differ_by_level() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let object = ObjectRef { id: 9, level: 2 };
+        let key = tombstone_key(&namespace, 7, object);
+        assert!(key.starts_with(&tombstone_prefix(&namespace, 7)));
+        assert_eq!(decode_tombstone_key(&key).unwrap(), object);
+        assert_ne!(
+            key,
+            tombstone_key(&namespace, 7, ObjectRef { id: 9, level: 1 })
+        );
+        assert_eq!(
+            decode_tombstone(&encode_tombstone(123, 4)).unwrap(),
+            (123, 4)
+        );
+        assert!(decode_tombstone(&[0; 8]).is_err());
     }
 
     #[test]
@@ -736,12 +1006,10 @@ mod tests {
     }
 
     #[test]
-    fn page_metadata_rejects_unknown_versions() {
-        let error = decode_metadata(&[PAGE_METADATA_VERSION + 1, 0]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported page metadata version")
-        );
+    fn values_reject_unknown_formats() {
+        let error = decode_run(&[OBJECT_FORMAT + 1, 0]).unwrap_err();
+        assert!(error.to_string().contains("unsupported run format"));
+        let error = decode_object(&[]).unwrap_err();
+        assert!(error.to_string().contains("empty object directory"));
     }
 }

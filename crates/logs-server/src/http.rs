@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use common::display::{hex, prometheus_float, sanitize_label_name};
+use common::display::{PrometheusFloat, hex, prometheus_float, sanitize_label_name};
 use flate2::read::GzDecoder;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
@@ -20,8 +20,9 @@ use plural_logs::{
     QueryRequest, QueryResult,
 };
 use prost::Message;
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
 
 use crate::{AppState, config::NamespaceConfig};
@@ -115,7 +116,7 @@ async fn query_get(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     execute_query(state, namespace, headers, params).await
 }
 
@@ -124,7 +125,7 @@ async fn query_post(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     check_size(body.len(), state.config.request.max_request_bytes)?;
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query(state, namespace, headers, params).await
@@ -135,7 +136,7 @@ async fn execute_query(
     namespace: String,
     headers: HeaderMap,
     params: QueryParams,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     validate_query(&params.query)?;
     let timestamp = params
@@ -158,7 +159,7 @@ async fn query_range_get(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Query(params): Query<RangeParams>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     execute_query_range(state, namespace, headers, params).await
 }
 
@@ -167,7 +168,7 @@ async fn query_range_post(
     Path(namespace): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     check_size(body.len(), state.config.request.max_request_bytes)?;
     let params = serde_html_form::from_bytes(&body).map_err(ApiError::bad_request)?;
     execute_query_range(state, namespace, headers, params).await
@@ -178,7 +179,7 @@ async fn execute_query_range(
     namespace: String,
     headers: HeaderMap,
     params: RangeParams,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Read).await?;
     validate_query(&params.query)?;
     let now = common::time::now_ns();
@@ -222,7 +223,7 @@ async fn execute_query_range(
         ));
     }
     let options = query_options(&state, params.limit, params.direction.as_deref())?;
-    let request = QueryRequest::range(&params.query, start, end, step);
+    let request = QueryRequest::range(&params.query, start, end, step).frontend_step_aligned();
     query_response(state, namespace, headers, request, options).await
 }
 
@@ -338,129 +339,256 @@ async fn query_response(
     headers: HeaderMap,
     request: QueryRequest,
     options: QueryOptions,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LokiResponse>, ApiError> {
     let categorized = encoding_flag(&headers, CATEGORIZE_LABELS);
-    let key = format!(
-        "{namespace}\0{}\0{}\0{}\0{:?}\0{:?}\0{}\0{}\0{categorized}",
-        request.query,
-        request.start_ns,
-        request.end_ns,
-        request.step_ns,
-        options.direction,
-        options.limit,
-        options.max_pages
-    );
-    if let Some(value) = state.cached_query(&key).await {
-        return Ok(Json(value));
-    }
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let result = state
         .db
         .query(&namespace, &request, options)
         .await
         .map_err(ApiError::bad_request)?;
-    let value = loki_response(result, categorized);
-    state.cache_query(key, value.clone()).await;
-    Ok(Json(value))
+    Ok(Json(LokiResponse {
+        result,
+        categorized,
+    }))
 }
 
-fn loki_response(result: QueryResult, categorized: bool) -> Value {
-    let (kind, result) = match result {
-        QueryResult::Streams(streams) => (
-            "streams",
-            Value::Array(
-                streams
-                    .into_iter()
-                    .flat_map(|stream| stream_values(stream, categorized))
-                    .collect(),
-            ),
-        ),
-        QueryResult::Vector(samples) => (
-            "vector",
-            Value::Array(
-                samples
-                    .into_iter()
-                    .map(|sample| {
-                        json!({
-                            "metric": label_map(&sample.labels),
-                            "value": [seconds(sample.sample.timestamp_ns), prometheus_float(sample.sample.value)]
-                        })
-                    })
-                    .collect(),
-            ),
-        ),
-        QueryResult::Matrix(series) => (
-            "matrix",
-            Value::Array(
-                series
-                    .into_iter()
-                    .map(|series| {
-                        json!({
-                            "metric": label_map(&series.labels),
-                            "values": series.samples.into_iter().map(|sample| {
-                                json!([seconds(sample.timestamp_ns), prometheus_float(sample.value)])
-                            }).collect::<Vec<_>>()
-                        })
-                    })
-                    .collect(),
-            ),
-        ),
-        QueryResult::Scalar(sample) => (
-            "scalar",
-            json!([seconds(sample.timestamp_ns), prometheus_float(sample.value)]),
-        ),
-    };
-    let mut data = json!({"resultType": kind, "result": result});
-    if categorized && kind == "streams" {
-        data["encodingFlags"] = json!([CATEGORIZE_LABELS]);
+/// A query result encoded as Loki's JSON envelope while serializing, rather
+/// than built as a `Value` tree first. Keys are written in sorted order, as
+/// `serde_json`'s map gives them.
+pub(crate) struct LokiResponse {
+    result: QueryResult,
+    categorized: bool,
+}
+
+impl Serialize for LokiResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("data", &LokiData(self))?;
+        map.serialize_entry("status", "success")?;
+        map.end()
     }
-    json!({"status":"success","data":data})
 }
 
-fn stream_values(stream: plural_logs::LogStream, categorized: bool) -> Vec<Value> {
-    if categorized {
-        let values = stream
-            .entries
-            .into_iter()
-            .map(|entry| {
-                let metadata = entry
-                    .structured_metadata
+struct LokiData<'a>(&'a LokiResponse);
+
+impl Serialize for LokiData<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let LokiResponse {
+            result,
+            categorized,
+        } = self.0;
+        let kind = match result {
+            QueryResult::Streams(_) => "streams",
+            QueryResult::Vector(_) => "vector",
+            QueryResult::Matrix(_) => "matrix",
+            QueryResult::Scalar(_) => "scalar",
+        };
+        let flagged = *categorized && kind == "streams";
+        let mut map = serializer.serialize_map(Some(2 + usize::from(flagged)))?;
+        if flagged {
+            map.serialize_entry("encodingFlags", &[CATEGORIZE_LABELS])?;
+        }
+        match result {
+            QueryResult::Streams(streams) => {
+                map.serialize_entry("result", &StreamsJson(streams, *categorized))?
+            }
+            QueryResult::Vector(samples) => map.serialize_entry(
+                "result",
+                &Many(samples.iter().map(|sample| SampleJson {
+                    labels: &sample.labels,
+                    key: "value",
+                    values: Values::One(&sample.sample),
+                })),
+            )?,
+            QueryResult::Matrix(series) => map.serialize_entry(
+                "result",
+                &Many(series.iter().map(|series| SampleJson {
+                    labels: &series.labels,
+                    key: "values",
+                    values: Values::Many(&series.samples),
+                })),
+            )?,
+            QueryResult::Scalar(sample) => map.serialize_entry("result", &PointJson(sample))?,
+        }
+        map.serialize_entry("resultType", kind)?;
+        map.end()
+    }
+}
+
+/// Serializes an iterator's items as a sequence; the iterator is cloned so
+/// that `serialize` can take `&self`.
+struct Many<I>(I);
+
+impl<I, T> Serialize for Many<I>
+where
+    I: Iterator<Item = T> + Clone,
+    T: Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.clone())
+    }
+}
+
+struct LabelsJson<'a>(&'a Labels);
+
+impl Serialize for LabelsJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.0
+                .iter()
+                .map(|label| (label.name.as_str(), label.value.as_str())),
+        )
+    }
+}
+
+enum Values<'a> {
+    One(&'a plural_logs::Sample),
+    Many(&'a [plural_logs::Sample]),
+}
+
+/// A vector sample (`metric`, `value`) or matrix series (`metric`, `values`).
+struct SampleJson<'a> {
+    labels: &'a Labels,
+    key: &'static str,
+    values: Values<'a>,
+}
+
+impl Serialize for SampleJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("metric", &LabelsJson(self.labels))?;
+        match self.values {
+            Values::One(sample) => map.serialize_entry(self.key, &PointJson(sample))?,
+            Values::Many(samples) => {
+                map.serialize_entry(self.key, &Many(samples.iter().map(PointJson)))?
+            }
+        }
+        map.end()
+    }
+}
+
+struct PointJson<'a>(&'a plural_logs::Sample);
+
+impl Serialize for PointJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        seq.serialize_element(&seconds(self.0.timestamp_ns))?;
+        seq.serialize_element(&Text(PrometheusFloat(self.0.value)))?;
+        seq.end()
+    }
+}
+
+/// Serializes a value's `Display` text as a JSON string without building it.
+struct Text<T>(T);
+
+impl<T: std::fmt::Display> Serialize for Text<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+struct StreamsJson<'a>(&'a [plural_logs::LogStream], bool);
+
+impl Serialize for StreamsJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(None)?;
+        for stream in self.0 {
+            if self.1 {
+                seq.serialize_element(&StreamJson {
+                    labels: StreamLabels::Stored(&stream.labels),
+                    entries: stream.entries.iter().collect(),
+                    categorized: true,
+                })?;
+                continue;
+            }
+            // Without categorized labels, structured metadata joins the
+            // stream labels, splitting a stream by metadata.
+            let mut groups: BTreeMap<BTreeMap<&str, &str>, Vec<&LogEntry>> = BTreeMap::new();
+            for entry in &stream.entries {
+                let mut labels = stream
+                    .labels
                     .iter()
-                    .map(|field| (field.name.clone(), json!(field.value)))
-                    .collect::<Map<_, _>>();
-                json!([
-                    entry.timestamp_ns.to_string(),
-                    entry.line,
-                    {"structuredMetadata": metadata}
-                ])
-            })
-            .collect::<Vec<_>>();
-        return vec![json!({"stream":label_map(&stream.labels),"values":values})];
+                    .map(|label| (label.name.as_str(), label.value.as_str()))
+                    .collect::<BTreeMap<_, _>>();
+                labels.extend(
+                    entry
+                        .structured_metadata
+                        .iter()
+                        .map(|field| (field.name.as_str(), field.value.as_str())),
+                );
+                groups.entry(labels).or_default().push(entry);
+            }
+            for (labels, entries) in groups {
+                seq.serialize_element(&StreamJson {
+                    labels: StreamLabels::Merged(labels),
+                    entries,
+                    categorized: false,
+                })?;
+            }
+        }
+        seq.end()
     }
-    let mut groups: BTreeMap<Vec<(String, String)>, Vec<Value>> = BTreeMap::new();
-    for entry in stream.entries {
-        let mut labels = stream
-            .labels
-            .iter()
-            .map(|label| (label.name.clone(), label.value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        labels.extend(
-            entry
+}
+
+enum StreamLabels<'a> {
+    Stored(&'a Labels),
+    Merged(BTreeMap<&'a str, &'a str>),
+}
+
+struct StreamJson<'a> {
+    labels: StreamLabels<'a>,
+    entries: Vec<&'a LogEntry>,
+    categorized: bool,
+}
+
+impl Serialize for StreamJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        match &self.labels {
+            StreamLabels::Stored(labels) => map.serialize_entry("stream", &LabelsJson(labels))?,
+            StreamLabels::Merged(labels) => map.serialize_entry("stream", labels)?,
+        }
+        map.serialize_entry(
+            "values",
+            &Many(
+                self.entries
+                    .iter()
+                    .map(|entry| EntryJson(entry, self.categorized)),
+            ),
+        )?;
+        map.end()
+    }
+}
+
+struct EntryJson<'a>(&'a LogEntry, bool);
+
+impl Serialize for EntryJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let EntryJson(entry, categorized) = *self;
+        let mut seq = serializer.serialize_seq(Some(if categorized { 3 } else { 2 }))?;
+        seq.serialize_element(&Text(entry.timestamp_ns))?;
+        seq.serialize_element(&entry.line)?;
+        if categorized {
+            let metadata = entry
                 .structured_metadata
                 .iter()
-                .map(|field| (field.name.clone(), field.value.clone())),
-        );
-        groups
-            .entry(labels.into_iter().collect())
-            .or_default()
-            .push(json!([entry.timestamp_ns.to_string(), entry.line]));
+                .map(|field| (field.name.as_str(), field.value.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            seq.serialize_element(&StructuredMetadata(metadata))?;
+        }
+        seq.end()
     }
-    groups
-        .into_iter()
-        .map(|(labels, values)| {
-            json!({"stream":labels.into_iter().collect::<BTreeMap<_,_>>(),"values":values})
-        })
-        .collect()
+}
+
+struct StructuredMetadata<'a>(BTreeMap<&'a str, &'a str>);
+
+impl Serialize for StructuredMetadata<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("structuredMetadata", &self.0)?;
+        map.end()
+    }
 }
 
 async fn write_batches(
@@ -472,7 +600,6 @@ async fn write_batches(
     state
         .route_write(&namespace, batches, ulid::Ulid::new().to_string())
         .await?;
-    state.invalidate_queries().await;
     state.mark_dirty();
     Ok(())
 }
@@ -794,6 +921,69 @@ mod parameter_tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
             json!({"code": 14, "message": "flusher stopped"})
+        );
+    }
+
+    #[test]
+    fn query_responses_encode_loki_json() {
+        let encode = |result, categorized| {
+            serde_json::to_string(&LokiResponse {
+                result,
+                categorized,
+            })
+            .unwrap()
+        };
+        let labels = |pairs: &[(&str, &str)]| {
+            Labels::new(
+                pairs
+                    .iter()
+                    .map(|(name, value)| Label::new(*name, *value))
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let sample = |timestamp_ns, value| plural_logs::Sample {
+            timestamp_ns,
+            value,
+        };
+        assert_eq!(
+            encode(
+                QueryResult::Scalar(sample(3_000_000_000, f64::NEG_INFINITY)),
+                false
+            ),
+            r#"{"data":{"result":[3.0,"-Inf"],"resultType":"scalar"},"status":"success"}"#
+        );
+        assert_eq!(
+            encode(
+                QueryResult::Matrix(vec![plural_logs::MatrixSeries {
+                    labels: labels(&[("app", "a\"b")]),
+                    samples: vec![sample(1_500_000_000, f64::NAN), sample(2_000_000_000, 0.1)],
+                }]),
+                false
+            ),
+            r#"{"data":{"result":[{"metric":{"app":"a\"b"},"values":[[1.5,"NaN"],[2.0,"0.1"]]}],"resultType":"matrix"},"status":"success"}"#
+        );
+        let streams = || {
+            QueryResult::Streams(vec![plural_logs::LogStream {
+                labels: labels(&[("app", "api")]),
+                entries: vec![
+                    LogEntry {
+                        timestamp_ns: 7,
+                        line: "x".to_owned(),
+                        structured_metadata: Fields::new(vec![Field::new("trace", "t1")]).unwrap(),
+                    },
+                    LogEntry::new(8, "y"),
+                ],
+            }])
+        };
+        assert_eq!(
+            encode(streams(), true),
+            r#"{"data":{"encodingFlags":["categorize-labels"],"result":[{"stream":{"app":"api"},"values":[["7","x",{"structuredMetadata":{"trace":"t1"}}],["8","y",{"structuredMetadata":{}}]]}],"resultType":"streams"},"status":"success"}"#
+        );
+        // Structured metadata joins the labels and splits the stream.
+        assert_eq!(
+            encode(streams(), false),
+            r#"{"data":{"result":[{"stream":{"app":"api"},"values":[["8","y"]]},{"stream":{"app":"api","trace":"t1"},"values":[["7","x"]]}],"resultType":"streams"},"status":"success"}"#
         );
     }
 }

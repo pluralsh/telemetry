@@ -1,0 +1,82 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Fuzzing budget per product (e.g. 30m, 2h); excludes stack startup
+        default: 30m
+      seed:
+        description: Seed to replay; empty picks a random one
+        default: ""
+      products:
+        description: JSON list of products to fuzz
+        default: '["logs", "metrics", "traces"]'
+      logs_storage:
+        description: Logs implementation backend (s3 or local)
+        default: s3
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Differential fuzz (${{ matrix.product }})
+    runs-on: ubuntu-24.04
+    # Startup and build time sit outside FUZZ_DURATION; long manual runs need
+    # this raised alongside the duration input.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        product: ${{ fromJSON(inputs.products || '["logs", "metrics", "traces"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build ${{ matrix.product }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: crates/${{ matrix.product }}-server/Dockerfile
+          tags: telemetry-regression/plural-${{ matrix.product }}-server:local
+          load: true
+          cache-from: |
+            type=gha,scope=regression-${{ matrix.product }}
+            type=gha,scope=${{ matrix.product }}-amd64
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise exec -- python -m pip install -r tests/regression/requirements.txt
+      - name: Fuzz ${{ matrix.product }}
+        env:
+          REGRESSION_BUILD: "0"
+          FUZZ_DURATION: ${{ inputs.duration || '30m' }}
+          FUZZ_SEED: ${{ inputs.seed }}
+          FUZZ_LOGS_STORAGE: ${{ inputs.logs_storage || 's3' }}
+          FUZZ_OUTPUT_DIR: target/fuzz/${{ matrix.product }}
+          FUZZ_RECORD_DATA: "1"
+        run: >-
+          mise exec -- python -m pytest
+          tests/regression/test_fuzz/test_fuzz_${{ matrix.product }}.py --fuzz -s
+      - name: Publish summary
+        if: always()
+        run: |
+          summary=target/fuzz/${{ matrix.product }}/summary.md
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No fuzz summary was produced for ${{ matrix.product }}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.product }}-${{ github.run_id }}
+          path: target/fuzz/${{ matrix.product }}
+          if-no-files-found: ignore
+          retention-days: 14

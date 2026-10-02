@@ -117,20 +117,6 @@ impl Default for RequestConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CacheConfig {
-    /// Maximum number of serialized query responses retained in memory.
-    /// Zero disables the response cache.
-    pub query_entries: usize,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self { query_entries: 256 }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub mode: ServerMode,
     pub listeners: ListenerConfig,
@@ -138,13 +124,15 @@ pub struct Config {
     pub path_prefix: String,
     pub storage: StorageConfig,
     pub segment_duration_seconds: u64,
+    /// Discovery rollup period, a whole multiple of the segment duration;
+    /// `null` disables it.
+    pub discovery_rollup_seconds: Option<u64>,
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
-    pub cache: CacheConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub usage_reporting: UsageReportingConfig,
@@ -160,13 +148,13 @@ impl Default for Config {
             path_prefix: String::new(),
             storage: core.storage,
             segment_duration_seconds: core.segment_duration.as_secs(),
+            discovery_rollup_seconds: core.discovery_rollup.map(|value| value.as_secs()),
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
-            cache: CacheConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             auth: AuthConfig::default(),
             usage_reporting: UsageReportingConfig::default(),
@@ -211,6 +199,14 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
+            ));
+        }
+        if let Some(rollup) = self.discovery_rollup_seconds
+            && (rollup == 0 || rollup % self.segment_duration_seconds != 0)
+        {
+            return Err(ConfigError::Validation(
+                "discovery_rollup_seconds must be a whole multiple of segment_duration_seconds"
+                    .to_owned(),
             ));
         }
         if self.compaction.enabled
@@ -277,6 +273,7 @@ impl Config {
         plural_logs::Config {
             storage: self.storage.clone(),
             segment_duration: Duration::from_secs(self.segment_duration_seconds),
+            discovery_rollup: self.discovery_rollup_seconds.map(Duration::from_secs),
             retention: self.retention_seconds.map(Duration::from_secs),
             page: plural_logs::PageConfig {
                 target_size_bytes: self.page.target_size_bytes,

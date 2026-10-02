@@ -1,0 +1,19 @@
+mode: standalone
+listeners: { http: "0.0.0.0:3100", grpc: "0.0.0.0:9091" }
+storage:
+  type: SlateDb
+  path: fuzz
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: logs-fuzz
+    endpoint: http://minio:9000
+    allow_http: true
+  block_cache: { type: FoyerMemory, capacity: 67108864 }
+  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+# Segment duration, page sizing, compaction and write flushing use the defaults.
+retention_seconds: 86400
+auth: { unauthenticated: true }
+namespaces:
+  - name: regression
+    auth: { read: [], write: [] }

@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+
 use super::*;
 
 pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Result<Value> {
@@ -6,7 +8,7 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
         Expr::String(_) => Err(Error::Query("string is not a numeric expression".into())),
         Expr::Vector(expr) => match eval_expr(expr, rows, timestamp)? {
             Value::Scalar(value) => Ok(Value::Vector(vec![Point {
-                labels: BTreeMap::new(),
+                labels: Arc::default(),
                 value,
             }])),
             value => Ok(value),
@@ -34,11 +36,16 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
             let Value::Vector(points) = eval_expr(expr, rows, timestamp)? else {
                 return Err(Error::Query("vector aggregation requires a vector".into()));
             };
+            let mut label_keys = rows.label_keys.borrow_mut();
+            let keys = label_keys
+                .entry(query as *const Query as usize)
+                .or_default();
             Ok(Value::Vector(vector_aggregation(
                 *op,
                 *parameter,
                 grouping.as_ref(),
                 points,
+                keys,
             )))
         }
         Expr::LabelReplace {
@@ -51,17 +58,14 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
             let Value::Vector(mut points) = eval_expr(expr, rows, timestamp)? else {
                 return Err(Error::Query("label_replace requires a vector".into()));
             };
-            let regex = Regex::new(&format!("^(?:{regex})$"))?;
+            let mut relabels = rows.relabels.borrow_mut();
+            let relabel = match relabels.entry(query as *const Query as usize) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(Relabel::new(regex)?),
+            };
+            relabel.start_step();
             for point in &mut points {
-                let source = point.labels.get(src).map_or("", String::as_str);
-                if regex.is_match(source) {
-                    let replaced = regex.replace(source, replacement.as_str()).into_owned();
-                    if replaced.is_empty() {
-                        point.labels.remove(dst);
-                    } else {
-                        point.labels.insert(dst.clone(), replaced);
-                    }
-                }
+                point.labels = relabel.apply(&point.labels, dst, replacement, src);
             }
             Ok(Value::Vector(points))
         }
@@ -70,12 +74,17 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
             op,
             modifier,
             rhs,
-        } => binary(
-            eval_expr(lhs, rows, timestamp)?,
-            *op,
-            modifier.as_ref(),
-            eval_expr(rhs, rows, timestamp)?,
-        ),
+        } => {
+            let (lhs, rhs) = (
+                eval_expr(lhs, rows, timestamp)?,
+                eval_expr(rhs, rows, timestamp)?,
+            );
+            let mut label_keys = rows.label_keys.borrow_mut();
+            let keys = label_keys
+                .entry(query as *const Query as usize)
+                .or_default();
+            binary(lhs, *op, modifier.as_ref(), rhs, keys)
+        }
     }
 }
 
@@ -102,6 +111,18 @@ pub(super) fn range_aggregation(
         let low = timestamps.partition_point(|&at| at <= start);
         low..timestamps.partition_point(|&at| at <= end).max(low)
     };
+    // Loki's absent extracts samples without labels, so rows flagged with
+    // `__error__` still count as present rather than failing the query.
+    if op == RangeOp::Absent {
+        return Ok(Value::Vector(if window(&series.timestamps).is_empty() {
+            vec![Point {
+                labels: Arc::new(selector_equality_labels(log)),
+                value: 1.0,
+            }]
+        } else {
+            Vec::new()
+        }));
+    }
     // A failing row anywhere in the window fails the query, as the first such
     // row would before grouping.
     let first_failure = series.failures.partition_point(|(at, _)| *at <= start);
@@ -110,26 +131,15 @@ pub(super) fn range_aggregation(
     {
         return Err(Error::Query(message.clone()));
     }
-    if op == RangeOp::Absent {
-        return Ok(Value::Vector(if window(&series.timestamps).is_empty() {
-            vec![Point {
-                labels: selector_equality_labels(log),
-                value: 1.0,
-            }]
-        } else {
-            Vec::new()
-        }));
-    }
     let seconds = range as f64 / 1_000_000_000.0;
-    let effective_end = end;
     let mut points = Vec::new();
-    for group in &series.groups {
+    for group in series.active(start, end) {
         let selected = window(&group.timestamps);
         let values = &group.values[selected.clone()];
         if values.is_empty() {
             continue;
         }
-        let labels = group.labels.clone();
+        let labels = Arc::clone(&group.labels);
         let value = match op {
             RangeOp::Count | RangeOp::Bytes => group.sum(selected),
             RangeOp::Rate | RangeOp::BytesRate => group.sum(selected) / seconds,
@@ -139,7 +149,7 @@ pub(super) fn range_aggregation(
                     .copied()
                     .zip(values.iter().copied())
                     .collect::<Vec<_>>();
-                extrapolated_counter_rate(&samples, range, effective_end)
+                extrapolated_counter_rate(&samples, range, end)
             }
             RangeOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
             RangeOp::Sum => values.iter().sum(),
@@ -186,10 +196,14 @@ pub(super) struct RangeSeries {
     failures: Vec<(i64, String)>,
     /// In label order; rows that contribute no value are left out.
     groups: Vec<RangeGroup>,
+    /// Each contributing row's timestamp and group, ascending, so a step
+    /// whose window holds fewer rows than there are groups visits only the
+    /// groups it holds.
+    members: Vec<(i64, u32)>,
 }
 
 struct RangeGroup {
-    labels: BTreeMap<String, String>,
+    labels: LabelMap,
     timestamps: Vec<i64>,
     values: Vec<f64>,
     /// Running totals for ops whose values are whole numbers (counts and
@@ -208,12 +222,32 @@ impl RangeGroup {
 }
 
 impl RangeSeries {
+    /// Groups with a row in `(start, end]`, in label order, possibly with
+    /// some that have none.
+    fn active(&self, start: i64, end: i64) -> Vec<&RangeGroup> {
+        let low = self.members.partition_point(|(at, _)| *at <= start);
+        let high = self.members.partition_point(|(at, _)| *at <= end).max(low);
+        if high - low >= self.groups.len() {
+            return self.groups.iter().collect();
+        }
+        let mut indices = self.members[low..high]
+            .iter()
+            .map(|(_, group)| *group)
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .map(|group| &self.groups[group as usize])
+            .collect()
+    }
+
     /// `rows` must be in ascending timestamp order.
     pub(super) fn new(
         op: RangeOp,
         log: &LogExpr,
         grouping: Option<&Grouping>,
-        rows: &[Row],
+        rows: Vec<Row>,
     ) -> Self {
         let unwrap_label = log.stages.iter().find_map(|stage| match &stage.value {
             PipelineStage::Unwrap(unwrap) => Some(&unwrap.label),
@@ -225,11 +259,19 @@ impl RangeSeries {
             RangeOp::Rate => unwrap_label.is_none(),
             _ => false,
         };
+        let timestamps = rows.iter().map(|row| row.timestamp_ns).collect();
         let mut failures = Vec::new();
-        let mut groups: BTreeMap<BTreeMap<String, String>, RangeGroup> = BTreeMap::new();
+        let mut by_labels: HashMap<LabelMap, u32> = HashMap::new();
+        // Rows sharing a label allocation (a stream's, when no stage changed
+        // them) share a group, found once; holding the labels keeps their
+        // addresses from being reused.
+        let mut by_address: HashMap<*const BTreeMap<String, String>, (LabelMap, u32)> =
+            HashMap::new();
+        let mut groups: Vec<RangeGroup> = Vec::new();
+        let mut members = Vec::new();
         for row in rows {
             // Checked before grouping, which could otherwise hide the label.
-            if let Some(message) = error_message(row) {
+            if let Some(message) = error_message(&row) {
                 failures.push((row.timestamp_ns, message));
             }
             let value = match op {
@@ -241,26 +283,38 @@ impl RangeSeries {
             let Some(value) = value else {
                 continue;
             };
-            let mut labels = group_labels(&row.labels, grouping);
-            if row.labels.contains_key(ERROR_LABEL) {
-                labels.extend(
-                    row.labels
-                        .iter()
-                        .filter(|(name, _)| is_error_label(name))
-                        .map(|(name, value)| (name.clone(), value.clone())),
-                );
-            }
-            if drop_unwrap_label && let Some(label) = unwrap_label {
-                labels.remove(label);
-            }
-            let group = groups
-                .entry(labels)
-                .or_insert_with_key(|labels| RangeGroup {
-                    labels: labels.clone(),
-                    timestamps: Vec::new(),
-                    values: Vec::new(),
-                    totals: if whole { vec![0] } else { Vec::new() },
-                });
+            let address = Arc::as_ptr(&row.labels);
+            let id = match by_address.get(&address) {
+                Some((_, id)) => *id,
+                None => {
+                    let shared = Arc::strong_count(&row.labels) > 1;
+                    let pinned = shared.then(|| Arc::clone(&row.labels));
+                    let dropped = unwrap_label.filter(|_| drop_unwrap_label);
+                    let labels = series_labels(row.labels, grouping, dropped);
+                    let id = match by_labels.get(&labels) {
+                        Some(id) => *id,
+                        None => {
+                            let labels = Arc::new(labels);
+                            let id =
+                                u32::try_from(groups.len()).expect("fewer than u32::MAX groups");
+                            groups.push(RangeGroup {
+                                labels: Arc::clone(&labels),
+                                timestamps: Vec::new(),
+                                values: Vec::new(),
+                                totals: if whole { vec![0] } else { Vec::new() },
+                            });
+                            by_labels.insert(labels, id);
+                            id
+                        }
+                    };
+                    if let Some(pinned) = pinned {
+                        by_address.insert(address, (pinned, id));
+                    }
+                    id
+                }
+            };
+            members.push((row.timestamp_ns, id));
+            let group = &mut groups[id as usize];
             group.timestamps.push(row.timestamp_ns);
             group.values.push(value);
             if whole {
@@ -268,12 +322,59 @@ impl RangeSeries {
                 group.totals.push(total.saturating_add(value as u64));
             }
         }
+        // Groups are numbered as they first appear; renumber them, and
+        // `members`, in label order.
+        drop((by_labels, by_address));
+        let mut order = (0..groups.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|&a, &b| groups[a].labels.cmp(&groups[b].labels));
+        let mut rank = vec![0u32; groups.len()];
+        for (position, &id) in order.iter().enumerate() {
+            rank[id] = u32::try_from(position).expect("fewer than u32::MAX groups");
+        }
+        for (_, id) in &mut members {
+            *id = rank[*id as usize];
+        }
+        let mut ordered = groups.into_iter().zip(&rank).collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(_, position)| **position);
         Self {
-            timestamps: rows.iter().map(|row| row.timestamp_ns).collect(),
+            timestamps,
             failures,
-            groups: groups.into_values().collect(),
+            groups: ordered.into_iter().map(|(group, _)| group).collect(),
+            members,
         }
     }
+}
+
+/// A row's range-aggregation series: its labels narrowed by `grouping`,
+/// keeping any error labels and dropping the unwrapped one. Takes the
+/// labels' map without copying when nothing else shares it.
+fn series_labels(
+    labels: LabelMap,
+    grouping: Option<&Grouping>,
+    unwrap_label: Option<&String>,
+) -> BTreeMap<String, String> {
+    let errored = labels.contains_key(ERROR_LABEL);
+    let keep = |name: &String| {
+        (errored && is_error_label(name))
+            || grouping.is_none_or(|grouping| grouping.labels.contains(name) != grouping.without)
+    };
+    let mut labels = match Arc::try_unwrap(labels) {
+        Ok(mut labels) => {
+            if grouping.is_some() {
+                labels.retain(|name, _| keep(name));
+            }
+            labels
+        }
+        Err(shared) => shared
+            .iter()
+            .filter(|(name, _)| keep(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    };
+    if let Some(label) = unwrap_label {
+        labels.remove(label);
+    }
+    labels
 }
 
 pub(super) fn label_aggregation(
@@ -303,21 +404,28 @@ pub(super) fn label_aggregation(
         groups
             .into_iter()
             .map(|(labels, values)| Point {
-                labels,
+                labels: Arc::new(labels),
                 value: values.len() as f64,
             })
             .collect(),
     ))
 }
 
+/// Loki's `absentLabels`: a label's first equality matcher sets it, but any
+/// other matcher on the same name, including a second equality, removes it.
 pub(super) fn selector_equality_labels(log: &LogExpr) -> BTreeMap<String, String> {
-    log.selector
-        .value
-        .matchers
-        .iter()
-        .filter(|matcher| matcher.value.op == MatchOp::Equal)
-        .map(|matcher| (matcher.value.label.clone(), matcher.value.value.clone()))
-        .collect()
+    let mut labels = BTreeMap::new();
+    let mut removed = BTreeSet::new();
+    for matcher in &log.selector.value.matchers {
+        let matcher = &matcher.value;
+        if matcher.op == MatchOp::Equal && !labels.contains_key(&matcher.label) {
+            labels.insert(matcher.label.clone(), matcher.value.clone());
+        } else {
+            removed.insert(&matcher.label);
+        }
+    }
+    labels.retain(|name, value| !value.is_empty() && !removed.contains(name));
+    labels
 }
 
 pub(super) fn group_labels(
@@ -339,16 +447,21 @@ pub(super) fn group_labels(
     }
 }
 
-/// A vector aggregation without `by`/`without` aggregates every series into
-/// one, unlike a range aggregation, which then keeps each series' labels.
-fn vector_group_labels(
-    labels: &BTreeMap<String, String>,
+/// A vector aggregation's group, as borrowed pairs in name order, which sort
+/// like the label maps they become, so only each output group allocates its
+/// labels. Without `by`/`without` every series falls into one group, unlike
+/// a range aggregation, which then keeps each series' labels.
+fn vector_group_key<'a>(
+    labels: &'a BTreeMap<String, String>,
     grouping: Option<&Grouping>,
-) -> BTreeMap<String, String> {
-    match grouping {
-        None => BTreeMap::new(),
-        grouping => group_labels(labels, grouping),
-    }
+) -> Vec<(&'a str, &'a str)> {
+    labels
+        .iter()
+        .filter(|(name, _)| {
+            grouping.is_some_and(|grouping| grouping.labels.contains(*name) != grouping.without)
+        })
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
 }
 
 pub(super) fn vector_aggregation(
@@ -356,54 +469,38 @@ pub(super) fn vector_aggregation(
     parameter: Option<f64>,
     grouping: Option<&Grouping>,
     points: Vec<Point>,
+    keys: &mut LabelKeys,
 ) -> Vec<Point> {
+    if matches!(op, VectorOp::Sort | VectorOp::SortDesc) {
+        let mut points = points;
+        if op == VectorOp::Sort {
+            points.sort_by(point_value_order);
+        } else {
+            points.sort_by(point_value_order_desc);
+        }
+        return points;
+    }
+    let groups = vector_groups(&points, grouping, keys);
     if matches!(
         op,
-        VectorOp::Sort
-            | VectorOp::SortDesc
-            | VectorOp::TopK
-            | VectorOp::BottomK
-            | VectorOp::ApproxTopK
+        VectorOp::TopK | VectorOp::BottomK | VectorOp::ApproxTopK
     ) {
-        if matches!(op, VectorOp::Sort | VectorOp::SortDesc) {
-            let mut points = points;
-            if op == VectorOp::Sort {
-                points.sort_by(point_value_order);
-            } else {
-                points.sort_by(point_value_order_desc);
-            }
-            return points;
-        }
-        let mut groups: BTreeMap<BTreeMap<String, String>, Vec<Point>> = BTreeMap::new();
-        for point in points {
-            groups
-                .entry(vector_group_labels(&point.labels, grouping))
-                .or_default()
-                .push(point);
-        }
+        let count = parameter.unwrap_or(0.0).max(0.0) as usize;
         let mut selected = Vec::new();
         for (_, mut points) in groups {
             if op == VectorOp::BottomK {
-                points.sort_by(point_value_order);
+                points.sort_by(|a, b| point_value_order(a, b));
             } else {
-                points.sort_by(point_value_order_desc);
+                points.sort_by(|a, b| point_value_order_desc(a, b));
             }
-            let count = parameter.unwrap_or(0.0).max(0.0) as usize;
-            points.truncate(count);
-            selected.extend(points);
+            selected.extend(points.into_iter().take(count).cloned());
         }
         return selected;
     }
-    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<f64>> = BTreeMap::new();
-    for point in points {
-        groups
-            .entry(vector_group_labels(&point.labels, grouping))
-            .or_default()
-            .push(point.value);
-    }
     groups
         .into_iter()
-        .map(|(labels, values)| {
+        .map(|(id, points)| {
+            let values = points.iter().map(|point| point.value).collect::<Vec<_>>();
             let value = match op {
                 VectorOp::Sum => values.iter().sum(),
                 VectorOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
@@ -414,9 +511,39 @@ pub(super) fn vector_aggregation(
                 VectorOp::Stdvar => variance(&values),
                 _ => unreachable!(),
             };
-            Point { labels, value }
+            Point {
+                labels: Arc::clone(keys.labels(id)),
+                value,
+            }
         })
         .collect()
+}
+
+/// `points` by aggregation group, in the groups' label order, each group's
+/// points in input order.
+fn vector_groups<'a>(
+    points: &'a [Point],
+    grouping: Option<&Grouping>,
+    keys: &mut LabelKeys,
+) -> Vec<(u32, Vec<&'a Point>)> {
+    keys.start_step();
+    let mut slots: HashMap<u32, usize> = HashMap::new();
+    let mut groups: Vec<(u32, Vec<&Point>)> = Vec::new();
+    for point in points {
+        let id = keys.id(&point.labels, |labels| {
+            vector_group_key(labels, grouping)
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        });
+        let slot = *slots.entry(id).or_insert_with(|| {
+            groups.push((id, Vec::new()));
+            groups.len() - 1
+        });
+        groups[slot].1.push(point);
+    }
+    groups.sort_by(|(a, _), (b, _)| keys.labels(*a).cmp(keys.labels(*b)));
+    groups
 }
 
 /// Prometheus' `min`/`max`: NaN only wins when every value is NaN.
@@ -447,11 +574,117 @@ fn point_value_order_desc(a: &Point, b: &Point) -> Ordering {
         .then_with(|| a.labels.cmp(&b.labels))
 }
 
+/// One expression's keys for its operands' series (match keys for a binary
+/// expression, groups for an aggregation), interned so that series compare
+/// by id. A series' labels keep their allocation from step to step, so keys
+/// are remembered by label address for one step, as [`super::Matrix`] does,
+/// rather than rebuilt for every point at every step.
+#[derive(Default)]
+pub(super) struct LabelKeys {
+    ids: HashMap<Vec<(String, String)>, u32>,
+    /// By id: the key as labels, shared by every step's output for it.
+    labels: Vec<LabelMap>,
+    /// Holding the labels keeps their addresses from being reused.
+    previous: HashMap<*const BTreeMap<String, String>, (LabelMap, u32)>,
+    current: HashMap<*const BTreeMap<String, String>, (LabelMap, u32)>,
+}
+
+impl LabelKeys {
+    fn start_step(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    fn id(
+        &mut self,
+        labels: &LabelMap,
+        key: impl FnOnce(&BTreeMap<String, String>) -> Vec<(String, String)>,
+    ) -> u32 {
+        let address = Arc::as_ptr(labels);
+        if let Some((_, id)) = self.current.get(&address) {
+            return *id;
+        }
+        let id = match self.previous.remove(&address) {
+            Some((_, id)) => id,
+            None => {
+                let key = key(labels);
+                match self.ids.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        let id = u32::try_from(self.ids.len()).expect("fewer than u32::MAX keys");
+                        self.labels.push(Arc::new(key.iter().cloned().collect()));
+                        self.ids.insert(key, id);
+                        id
+                    }
+                }
+            }
+        };
+        self.current.insert(address, (Arc::clone(labels), id));
+        id
+    }
+
+    fn labels(&self, id: u32) -> &LabelMap {
+        &self.labels[id as usize]
+    }
+}
+
+/// One `label_replace`'s rewrites, remembered by input label address for one
+/// step as [`LabelKeys`] does, so a series is rewritten once rather than at
+/// every step and its output keeps one allocation for [`super::Matrix`].
+pub(super) struct Relabel {
+    regex: Regex,
+    /// Holding the inputs keeps their addresses from being reused.
+    previous: HashMap<*const BTreeMap<String, String>, (LabelMap, LabelMap)>,
+    current: HashMap<*const BTreeMap<String, String>, (LabelMap, LabelMap)>,
+}
+
+impl Relabel {
+    fn new(regex: &str) -> Result<Self> {
+        Ok(Self {
+            regex: Regex::new(&format!("^(?:{regex})$"))?,
+            previous: HashMap::new(),
+            current: HashMap::new(),
+        })
+    }
+
+    fn start_step(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    fn apply(&mut self, labels: &LabelMap, dst: &str, replacement: &str, src: &str) -> LabelMap {
+        let address = Arc::as_ptr(labels);
+        if let Some((_, output)) = self.current.get(&address) {
+            return Arc::clone(output);
+        }
+        let output = match self.previous.remove(&address) {
+            Some((_, output)) => output,
+            None => {
+                let source = labels.get(src).map_or("", String::as_str);
+                if self.regex.is_match(source) {
+                    let replaced = self.regex.replace(source, replacement).into_owned();
+                    let mut rewritten = BTreeMap::clone(labels);
+                    if replaced.is_empty() {
+                        rewritten.remove(dst);
+                    } else {
+                        rewritten.insert(dst.to_owned(), replaced);
+                    }
+                    Arc::new(rewritten)
+                } else {
+                    Arc::clone(labels)
+                }
+            }
+        };
+        self.current
+            .insert(address, (Arc::clone(labels), Arc::clone(&output)));
+        output
+    }
+}
+
 pub(super) fn binary(
     lhs: Value,
     op: BinaryOp,
     modifier: Option<&BinaryModifier>,
     rhs: Value,
+    keys: &mut LabelKeys,
 ) -> Result<Value> {
     match (lhs, rhs) {
         // Scalar comparisons always yield 1 or 0, with or without `bool`.
@@ -495,28 +728,29 @@ pub(super) fn binary(
                 .collect(),
         )),
         (Value::Vector(lhs), Value::Vector(rhs)) => {
-            Ok(Value::Vector(binary_vectors(lhs, op, modifier, rhs)?))
+            Ok(Value::Vector(binary_vectors(lhs, op, modifier, rhs, keys)?))
         }
     }
 }
 
-pub(super) fn binary_vectors(
+fn binary_vectors(
     lhs: Vec<Point>,
     op: BinaryOp,
     modifier: Option<&BinaryModifier>,
     rhs: Vec<Point>,
+    keys: &mut LabelKeys,
 ) -> Result<Vec<Point>> {
+    keys.start_step();
     let matching = modifier.and_then(|modifier| modifier.matching.as_ref());
     if op == BinaryOp::Or {
         let mut result = lhs;
         let existing = result
             .iter()
-            .map(|point| match_key(&point.labels, matching))
-            .collect::<BTreeSet<_>>();
-        result.extend(
-            rhs.into_iter()
-                .filter(|point| !existing.contains(&match_key(&point.labels, matching))),
-        );
+            .map(|point| keys.id(&point.labels, |labels| match_key(labels, matching)))
+            .collect::<HashSet<_>>();
+        result.extend(rhs.into_iter().filter(|point| {
+            !existing.contains(&keys.id(&point.labels, |labels| match_key(labels, matching)))
+        }));
         return Ok(result);
     }
     let group_right = matching
@@ -525,10 +759,10 @@ pub(super) fn binary_vectors(
     let group_left = matching
         .and_then(|matching| matching.grouping.as_ref())
         .is_some_and(|grouping| grouping.left);
-    let mut right: BTreeMap<Vec<(String, String)>, Vec<Point>> = BTreeMap::new();
+    let mut right: HashMap<u32, Vec<Point>> = HashMap::new();
     for point in rhs {
         right
-            .entry(match_key(&point.labels, matching))
+            .entry(keys.id(&point.labels, |labels| match_key(labels, matching)))
             .or_default()
             .push(point);
     }
@@ -539,10 +773,10 @@ pub(super) fn binary_vectors(
         ));
     }
     let mut result = Vec::new();
-    let mut matched_left = BTreeSet::new();
+    let mut matched_left = HashSet::new();
     let mut output_labels = BTreeSet::new();
     for left in lhs {
-        let key = match_key(&left.labels, matching);
+        let key = keys.id(&left.labels, |labels| match_key(labels, matching));
         let Some(right_points) = right.get(&key) else {
             if op == BinaryOp::Unless {
                 result.push(left);
@@ -556,7 +790,7 @@ pub(super) fn binary_vectors(
         if op == BinaryOp::Unless {
             continue;
         }
-        if !group_left && !group_right && !matched_left.insert(key.clone()) {
+        if !group_left && !group_right && !matched_left.insert(key) {
             return Err(Error::Query(
                 "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"
                     .into(),
@@ -573,17 +807,17 @@ pub(super) fn binary_vectors(
             };
             output.value = value;
             if group_right {
-                include_labels(&mut output.labels, &left.labels, matching);
+                include_labels(Arc::make_mut(&mut output.labels), &left.labels, matching);
             } else if group_left {
-                include_labels(&mut output.labels, &right.labels, matching);
+                include_labels(Arc::make_mut(&mut output.labels), &right.labels, matching);
             } else if let Some(matching) = matching {
                 // One-to-one results keep only the matched-on labels.
-                output
-                    .labels
+                Arc::make_mut(&mut output.labels)
                     .retain(|name, _| matching.labels.contains(name) == matching.on);
             }
-            let signature = output.labels.clone().into_iter().collect::<Vec<_>>();
-            if !output_labels.insert(signature) {
+            // One-to-one results are labelled by their match key, which the
+            // check above already keeps unique.
+            if (group_left || group_right) && !output_labels.insert(Arc::clone(&output.labels)) {
                 return Err(Error::Query(
                     "multiple matches for labels: grouping labels must ensure unique matches"
                         .into(),
@@ -722,6 +956,9 @@ pub(super) fn quantile(quantile: f64, values: &[f64]) -> f64 {
     values[lower] + (values[upper] - values[lower]) * rank.fract()
 }
 
+/// Loki's `extrapolatedRate` as fixed in grafana/loki#23684. Released Lokis
+/// through 3.7 mix nanosecond and millisecond units here and so barely
+/// extrapolate at all.
 pub(super) fn extrapolated_counter_rate(
     samples: &[(i64, f64)],
     range_ns: i64,

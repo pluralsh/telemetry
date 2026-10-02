@@ -463,6 +463,7 @@ async fn open_database() -> LogDb {
             meta_cache: None,
         }),
         segment_duration: Duration::from_secs(3600),
+        discovery_rollup: Some(Duration::from_secs(24 * 3600)),
         retention: None,
         write_buffer: Default::default(),
         page: PageConfig::default(),

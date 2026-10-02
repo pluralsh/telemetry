@@ -1,0 +1,152 @@
+# Cases found by differential fuzzing against Prometheus.
+
+load 10s
+  fuzz_gauge{code="200", region="x", service="a"} 1+1x10
+  fuzz_gauge{code="200", region="x", service="b"} 2+1x10
+  fuzz_requests_total{code="200", region="x", service="a"} 0+5x10
+
+# An empty left-hand side contributes nothing to `or`, even with `on`.
+eval instant at 60s sum_over_time(fuzz_requests_total{absent=~"non.*"}[30s]) or on (code, region) (fuzz_gauge offset 30s)
+  fuzz_gauge{code="200", region="x", service="a"} 4
+  fuzz_gauge{code="200", region="x", service="b"} 5
+
+eval instant at 60s sgn((sum_over_time(fuzz_requests_total{absent=~"non.*"}[30s]) or on (code, region) (fuzz_gauge offset 30s)) / 1e-9)
+  {code="200", region="x", service="a"} 1
+  {code="200", region="x", service="b"} 1
+
+eval instant at 60s sum by (code) (nope) or (sum by (code) (absent_over_time(fuzz_requests_total{code="200", instance="x"}[1m])))
+  {code="200"} 1
+
+eval instant at 60s min_over_time((sum by (code) (nope) or (sum by (code) (absent_over_time(fuzz_requests_total{code="200", instance="x"}[1m]))))[2m:30s])
+  {code="200"} 1
+
+# Resets fold into `last - first` in sample order: -1e308 + 1e308 cancels
+# before the 4 → -1e308 reset adds 4, which summing resets first would lose.
+clear
+load 10s
+  degenerate_total 1 1e308 2 3 4 -1e308
+
+eval instant at 50s increase(degenerate_total[1m])
+  {} 4.8
+
+# The extrapolation factor is divided by the range before it scales the
+# increase, so a rate near f64::MAX stays finite: 1.6e308 * 15.625/10/30.
+clear
+load 10s
+  huge_total 1e307 1.7e308
+
+eval instant at 15s rate(huge_total[30s])
+  {} 8.333333333333333e+306
+
+# `[range:]` steps at the 1m global evaluation interval, not the query step.
+clear
+load 10s
+  steady 1+0x20
+
+eval instant at 100s count_over_time(steady[5m:])
+  {} 2
+
+eval instant at 60s count_over_time(steady[1m:])
+  {} 1
+
+# A filtering comparison keeps the vector sample when the scalar is on the left.
+clear
+load 10s
+  g{i="a"} 5
+  g{i="b"} 50
+
+eval instant at 0s 10 >= g
+  g{i="a"} 5
+
+# avg switches to an incremental mean once the running sum would overflow.
+clear
+load 10s
+  big{i="1"} 1e308
+  big{i="2"} 1e308
+  big{i="3"} -1e308
+
+eval instant at 0s avg(big)
+  {} 3.3333333333333337e+307
+
+# quantile sorts NaN first and always interpolates, so Inf * 0 weight is NaN.
+clear
+load 10s
+  infy 1 Inf
+  nanny NaN 5
+
+eval instant at 10s quantile_over_time(1, infy[1m])
+  {} NaN
+
+eval instant at 10s quantile_over_time(0, nanny[1m])
+  {} NaN
+
+clear
+load 10s
+  lj{code="200", region="us", service="api"} 1 1
+  lj{region="us", service="db"} 2 2
+  other{code="200", region="us", service="api"} 3 4
+
+eval instant at 10s label_join(lj, "joined", "-", "region", "service") or stddev_over_time(other[1m])
+  lj{code="200", region="us", service="api", joined="us-api"} 1
+  lj{region="us", service="db", joined="us-db"} 2
+  {code="200", region="us", service="api"} 0.5
+
+# One-to-one matching picks whichever "one"-side series has a sample at the
+# step; two at once is an error, as is an implicit many-to-one match.
+clear
+load 10m
+  num{code="500", job="x"} 10 10 10
+  num{code="500", job="y"} 20 _ _
+  den{code="500", region="a"} 2 _ 4
+  den{code="500", region="b"} _ 5 5
+
+eval instant at 10m num / on(code) den
+  {code="500"} 2
+
+eval instant at 10m num / on(code) group_left den
+  {code="500", job="x"} 2
+
+eval instant at 10m den / on(code) group_right num
+  {code="500", job="x"} 0.5
+
+eval instant at 20m num / on(code) den
+  expect fail msg:found duplicate series for the match group
+
+# Prometheus skips matching entirely when either side is empty at the step.
+eval instant at 20m num{job="y"} / on(code) den
+
+eval instant at 0m num / on(code) den
+  expect fail msg:many-to-one matching must be explicit
+
+# `start()` and `end()` are the query's, even inside a subquery.
+clear
+load 10s
+  ramp 0+1x20
+
+eval instant at 100s min_over_time((ramp @ start())[1m:10s])
+  {} 10
+
+eval instant at 100s max_over_time((ramp @ end())[1m:10s] @ 50s)
+  {} 10
+
+# `count_values` composes under any parent.
+clear
+load 10s
+  cv{i="a"} 5 5
+  cv{i="b"} 5 5
+  cv{i="c"} 7 7
+
+eval instant at 10s sum(count_values("value", cv))
+  {} 3
+
+eval instant at 10s count_values("n", count_values("value", cv))
+  {n="2"} 1
+  {n="1"} 1
+
+eval instant at 10s max_over_time(count_values("value", cv)[20s:10s])
+  {value="5"} 2
+  {value="7"} 1
+
+eval instant at 10s count_values("value", cv) * count_values("value", cv)
+  {value="5"} 4
+  {value="7"} 1

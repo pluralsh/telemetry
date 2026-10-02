@@ -61,14 +61,21 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Formats a sample value the way Prometheus does: `NaN`, `+Inf`, `-Inf`, or the
 /// shortest round-trip decimal (which matches Go's `FormatFloat(v, 'f', -1, 64)`).
 pub fn prometheus_float(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".to_owned()
-    } else if value == f64::INFINITY {
-        "+Inf".to_owned()
-    } else if value == f64::NEG_INFINITY {
-        "-Inf".to_owned()
-    } else {
-        value.to_string()
+    PrometheusFloat(value).to_string()
+}
+
+/// [`prometheus_float`]'s text as a [`std::fmt::Display`], for writers that
+/// need no intermediate `String`.
+pub struct PrometheusFloat(pub f64);
+
+impl std::fmt::Display for PrometheusFloat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            value if value.is_nan() => formatter.write_str("NaN"),
+            f64::INFINITY => formatter.write_str("+Inf"),
+            f64::NEG_INFINITY => formatter.write_str("-Inf"),
+            value => std::fmt::Display::fmt(&value, formatter),
+        }
     }
 }
 

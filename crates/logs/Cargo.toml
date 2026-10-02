@@ -23,7 +23,9 @@ linkify = "0.11.0"
 logos = "0.16.1"
 metrics.workspace = true
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "serde", "fuel", "loader", "loop_controls", "macros", "urlencode", "json", "multi_template"] }
+rayon = "1.12.0"
 regex.workspace = true
+regex-syntax.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,6 +36,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash64"] }
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]

@@ -55,7 +55,14 @@ def canonicalize(response: dict[str, Any]) -> dict[str, Any]:
                 )
             )
             streams.append({"stream": _labels(stream["stream"]), "values": values})
-        streams.sort(key=lambda stream: json.dumps(stream["stream"], sort_keys=True))
+        # Values break ties between streams whose labels match once
+        # `__error_details__` is masked.
+        streams.sort(
+            key=lambda stream: (
+                json.dumps(stream["stream"], sort_keys=True),
+                json.dumps(stream["values"]),
+            )
+        )
         result = streams
     elif kind == "vector":
         result = [
