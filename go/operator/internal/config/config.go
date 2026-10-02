@@ -534,19 +534,19 @@ type renderConfig struct {
 	Namespaces          []renderNamespace `json:"namespaces"`
 }
 type renderLogsConfig struct {
-	Mode                   string               `json:"mode"`
-	Listeners              renderListeners      `json:"listeners"`
-	PathPrefix             string               `json:"path_prefix,omitempty"`
-	Storage                renderStorage        `json:"storage"`
-	SegmentDurationSeconds int64                `json:"segment_duration_seconds"`
-	RetentionSeconds       *int64               `json:"retention_seconds,omitempty"`
-	Page                   renderLogsPage       `json:"page"`
-	Write                  renderWrite          `json:"write"`
-	Sharding               renderSharding       `json:"sharding"`
-	Request                renderLogsRequest    `json:"request"`
-	CacheWarmer            renderCacheWarmer    `json:"cache_warmer"`
-	Auth                   renderAuth           `json:"auth"`
-	Namespaces             []renderNamespace    `json:"namespaces"`
+	Mode                   string            `json:"mode"`
+	Listeners              renderListeners   `json:"listeners"`
+	PathPrefix             string            `json:"path_prefix,omitempty"`
+	Storage                renderStorage     `json:"storage"`
+	SegmentDurationSeconds int64             `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64            `json:"retention_seconds,omitempty"`
+	Page                   renderLogsPage    `json:"page"`
+	Write                  renderWrite       `json:"write"`
+	Sharding               renderSharding    `json:"sharding"`
+	Request                renderLogsRequest `json:"request"`
+	CacheWarmer            renderCacheWarmer `json:"cache_warmer"`
+	Auth                   renderAuth        `json:"auth"`
+	Namespaces             []renderNamespace `json:"namespaces"`
 }
 type renderTracesConfig struct {
 	Mode                   string              `json:"mode"`

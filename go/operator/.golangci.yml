@@ -29,7 +29,9 @@ linters:
   exclusions:
     generated: lax
     rules:
+      # Each product's CRD types deliberately mirror the others' shape.
       - linters:
+          - dupl
           - lll
         path: api/*
       - linters:

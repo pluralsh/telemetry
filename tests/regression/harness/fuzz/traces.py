@@ -354,7 +354,9 @@ class TracesFuzz(FuzzProduct):
         self.catalog = Catalog()
         self.oracle = os.environ.get("FUZZ_TRACES_ORACLE") or "tempo"
         if self.oracle not in ORACLE_CONFIGS:
-            raise ValueError(f"FUZZ_TRACES_ORACLE must be one of {tuple(ORACLE_CONFIGS)}")
+            raise ValueError(
+                f"FUZZ_TRACES_ORACLE must be one of {tuple(ORACLE_CONFIGS)}"
+            )
         self.impl_config = os.environ.get("FUZZ_TRACES_CONFIG") or "regression"
         if self.impl_config not in IMPL_CONFIG_DIRS:
             raise ValueError(

@@ -265,9 +265,13 @@ class LogsFuzz(FuzzProduct):
             raise ValueError("FUZZ_LOGS_STORAGE must be 's3' or 'local'")
         self.impl_config = os.environ.get("FUZZ_LOGS_CONFIG") or "regression"
         if self.impl_config not in IMPL_CONFIG_DIRS:
-            raise ValueError(f"FUZZ_LOGS_CONFIG must be one of {tuple(IMPL_CONFIG_DIRS)}")
+            raise ValueError(
+                f"FUZZ_LOGS_CONFIG must be one of {tuple(IMPL_CONFIG_DIRS)}"
+            )
         if self.impl_config != "regression" and self.storage != "s3":
-            raise ValueError("FUZZ_LOGS_CONFIG=production requires FUZZ_LOGS_STORAGE=s3")
+            raise ValueError(
+                "FUZZ_LOGS_CONFIG=production requires FUZZ_LOGS_STORAGE=s3"
+            )
         namespace = os.environ.get("FUZZ_LOGS_NAMESPACE", "regression")
         impl = (
             "http://localhost:13111"

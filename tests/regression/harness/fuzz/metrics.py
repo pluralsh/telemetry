@@ -29,7 +29,16 @@ from ..metrics.wire import remote_write_body
 from ..process import wait_http
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .rand import chance, quote, regex_escape, sample, scaled, weighted, zipf
-from .runner import Batch, Case, FuzzProduct, Inconclusive, Mismatch, Probe, Round, json_body
+from .runner import (
+    Batch,
+    Case,
+    FuzzProduct,
+    Inconclusive,
+    Mismatch,
+    Probe,
+    Round,
+    json_body,
+)
 from .stack import fuzz_stack
 from .transport import Exchange, Request
 
@@ -185,7 +194,9 @@ def _strict_names() -> bool:
     return os.environ.get("FUZZ_METRICS_STRICT_NAME", "") not in ("", "0")
 
 
-def _drop_unmatched_names(expected: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
+def _drop_unmatched_names(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> dict[str, Any]:
     """Where the oracle keeps `__name__` on some series only (say both sides of
     an `or`), drop it from implementation series the oracle has without it."""
     oracle = {
@@ -196,7 +207,9 @@ def _drop_unmatched_names(expected: dict[str, Any], actual: dict[str, Any]) -> d
     for series in actual["data"].get("result") or ():
         metric = series["metric"]
         if "__name__" in metric and tuple(sorted(metric.items())) not in oracle:
-            unnamed = {name: value for name, value in metric.items() if name != "__name__"}
+            unnamed = {
+                name: value for name, value in metric.items() if name != "__name__"
+            }
             if tuple(sorted(unnamed.items())) in oracle:
                 series = {**series, "metric": unnamed}
         result.append(series)

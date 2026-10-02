@@ -243,6 +243,4 @@ def fixture_shard(value: Series) -> int:
 def assert_spans_writer_ranges(value: tuple[Series, ...]) -> None:
     shards = {fixture_shard(item) for item in value}
     assert 0 in shards
-    assert 1 in shards, (
-        "posting to writer-0 must exercise forwarding to writer-1"
-    )
+    assert 1 in shards, "posting to writer-0 must exercise forwarding to writer-1"

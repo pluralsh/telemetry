@@ -87,7 +87,9 @@ class ComposeProject:
 
     def save_logs(self, path: Path) -> None:
         try:
-            path.write_text(self.execute("logs", "--no-color", "--timestamps", timeout=120))
+            path.write_text(
+                self.execute("logs", "--no-color", "--timestamps", timeout=120)
+            )
         except Exception as error:
             print(f"could not save compose logs to {path}: {error}")
 
