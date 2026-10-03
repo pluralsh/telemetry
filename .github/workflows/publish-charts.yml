@@ -137,12 +137,28 @@ jobs:
           test "$metrics_app_version" = "$release"
           test "$pseudofs_app_version" = "$release"
           test "$operator_app_version" = "$release"
+      - name: Update README versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="${GITHUB_REF_NAME#v}"
+          chart_version=$(awk -F': *' '/^version:/ {print $2; exit}' chart/telemetry-operator/Chart.yaml)
+          test -n "$chart_version"
+          # Only release-owned versions: the helm --version and the CR `# version:` hints.
+          # Comparison versions (Loki, Tempo, Mimir, ...) elsewhere in the README stay untouched.
+          grep -qE -- '--version [0-9]+\.[0-9]+\.[0-9x]+' README.md
+          grep -qE '# version: [0-9]+\.[0-9]+\.[0-9]+' README.md
+          sed -i -E \
+            -e "s/(--version )[0-9]+\.[0-9]+\.[0-9x]+([-+][0-9A-Za-z.-]+)?/\1${chart_version}/" \
+            -e "s/(# version: )[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?/\1${release}/" \
+            README.md
+          git diff --stat -- README.md
       - name: Create release metadata pull request
         uses: peter-evans/create-pull-request@v8
         with:
           title: Release ${{ github.ref_name }}
-          body: Automated chart metadata update for ${{ github.ref_name }}.
-          commit-message: Update charts for ${{ github.ref_name }}
+          body: Automated chart metadata and README version update for ${{ github.ref_name }}.
+          commit-message: Update charts and README for ${{ github.ref_name }}
           branch: release-${{ github.ref_name }}
           labels: release
           base: main
