@@ -4,7 +4,6 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
 };
 use plural_traces::{Namespace, trace_batches};
-use prost::Message;
 use server_common::auth::{Permission, authorize};
 use server_common::ingest::IngestLayer;
 use tonic_otlp::{Request, Response, Status};
@@ -56,11 +55,6 @@ impl TraceService for AppState {
         }
         let namespace = Namespace::new(namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        if request.get_ref().encoded_len() > self.config.request.max_request_bytes {
-            return Err(Status::resource_exhausted(
-                "request exceeds configured byte limit",
-            ));
-        }
         let _permit = self
             .request_limit
             .acquire()
@@ -78,7 +72,8 @@ impl TraceService for AppState {
 }
 
 pub fn otlp_grpc_service(state: AppState) -> TraceServiceServer<AppState> {
-    TraceServiceServer::new(state)
+    let limit = state.config.request.max_decoded_request_bytes;
+    TraceServiceServer::new(state).max_decoding_message_size(limit)
 }
 
 pub fn otlp_ingest_layer(state: &AppState) -> IngestLayer<tonic_otlp::body::BoxBody> {

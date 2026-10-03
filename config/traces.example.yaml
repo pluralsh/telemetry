@@ -45,7 +45,8 @@ sharding:
   backend: standalone
 
 request:
-  max_request_bytes: 10485760
+  max_request_bytes: 33554432
+  max_decoded_request_bytes: 134217728
   request_concurrency: 64
   query_concurrency: 8
   max_candidates: 10000

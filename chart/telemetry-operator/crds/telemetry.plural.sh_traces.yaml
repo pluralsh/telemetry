@@ -264,13 +264,23 @@ spec:
                         format: int64
                         minimum: 1
                         type: integer
+                      maxDecodedRequestBytes:
+                        default: 134217728
+                        description: |-
+                          MaxDecodedRequestBytes caps a write body after gzip decoding and a
+                          decoded OTLP or Jaeger gRPC message. Must be at least maxRequestBytes.
+                        format: int64
+                        minimum: 1
+                        type: integer
                       maxQueryLimit:
                         default: 1000
                         format: int64
                         minimum: 1
                         type: integer
                       maxRequestBytes:
-                        default: 10485760
+                        default: 33554432
+                        description: MaxRequestBytes caps a request body as received,
+                          before content decoding.
                         format: int64
                         minimum: 1
                         type: integer
@@ -290,6 +300,10 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: maxDecodedRequestBytes must be at least maxRequestBytes
+                      rule: '!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes)
+                        || self.maxDecodedRequestBytes >= self.maxRequestBytes'
                   retentionSeconds:
                     format: int64
                     minimum: 1

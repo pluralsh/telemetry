@@ -361,6 +361,8 @@ impl AppState {
                             sharding::ForwardError::Failed(unavailable(&status))
                         })?;
                         InternalWriterClient::new(channel)
+                            .max_encoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+                            .max_decoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
                             .write(request)
                             .await
                             .map(drop)
@@ -682,6 +684,51 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+
+        cancel.cancel();
+        server.await.unwrap().unwrap();
+        writer_a.shutdown().await.unwrap();
+        writer_b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_forwarding_carries_batches_above_tonic_default_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let writer_b = AppState::open(config("writer-b", endpoint.to_string()))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(grpc_service(writer_b.clone()))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    cancel.clone().cancelled_owned(),
+                ),
+        );
+        let writer_a = AppState::open(config("writer-a", endpoint.to_string()))
+            .await
+            .unwrap();
+        let namespace = Namespace::new("tenant").unwrap();
+        let line = "x".repeat(1024);
+        let mut batch = batch_on_shard(&namespace, 1);
+        // ~6 MiB of entries, above tonic's 4 MiB default message size.
+        batch.entries = (0..6 * 1024)
+            .map(|index| LogEntry::new(index + 1, line.as_str()))
+            .collect();
+
+        writer_a
+            .write_remote(
+                &namespace,
+                Owner::new("writer-b", 1),
+                ShardId::new(1),
+                vec![batch],
+                AssignmentGeneration::new(1),
+                "large-request",
+            )
+            .await
+            .unwrap();
 
         cancel.cancel();
         server.await.unwrap().unwrap();

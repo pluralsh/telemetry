@@ -90,6 +90,10 @@ write:
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
 
+request:
+  max_request_bytes: 33554432 # Maximum request body as received; 32 MiB.
+  max_decoded_request_bytes: 134217728 # Maximum write body after gzip or snappy decoding; 128 MiB. At least max_request_bytes.
+
 sharding:
   # Storage-shard count fixed when the dataset is created.
   shards: 1

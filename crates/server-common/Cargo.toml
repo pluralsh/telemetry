@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 common = { path = "../common" }
 sharding = { path = "../sharding" }
+snap.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
 tokio.workspace = true
@@ -35,8 +36,10 @@ tokio-util.workspace = true
 tonic.workspace = true
 tower = "0.5.3"
 tracing.workspace = true
+tower-http = { version = "0.6", default-features = false, features = ["limit", "decompression-gzip"] }
 
 [dev-dependencies]
 tempfile.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
+flate2 = "1"

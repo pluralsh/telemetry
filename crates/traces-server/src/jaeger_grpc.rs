@@ -4,7 +4,6 @@ use opentelemetry_proto::tonic::{
     resource::v1::Resource,
     trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span},
 };
-use prost::Message;
 use server_common::auth::{Permission, authorize};
 use server_common::ingest::IngestLayer;
 use tonic::{Request, Response, Status as GrpcStatus};
@@ -63,11 +62,6 @@ impl CollectorService for AppState {
         {
             return Err(GrpcStatus::unauthenticated("authentication required"));
         }
-        if request.get_ref().encoded_len() > self.config.request.max_request_bytes {
-            return Err(GrpcStatus::resource_exhausted(
-                "request exceeds configured byte limit",
-            ));
-        }
         let namespace = plural_traces::Namespace::new(namespace)
             .map_err(|error| GrpcStatus::invalid_argument(error.to_string()))?;
         let _permit = self
@@ -90,7 +84,8 @@ impl CollectorService for AppState {
 }
 
 pub fn jaeger_grpc_service(state: AppState) -> CollectorServiceServer<AppState> {
-    CollectorServiceServer::new(state)
+    let limit = state.config.request.max_decoded_request_bytes;
+    CollectorServiceServer::new(state).max_decoding_message_size(limit)
 }
 
 pub fn jaeger_ingest_layer(state: &AppState) -> IngestLayer<tonic::body::Body> {

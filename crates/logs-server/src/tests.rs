@@ -145,6 +145,246 @@ async fn ingest_layer_records_accepted_pushes_by_wire_bytes() {
     state.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn pushes_are_bounded_by_wire_and_decoded_limits() {
+    let mut config = Config {
+        storage: StorageConfig::InMemory,
+        namespaces: vec![namespace("tenant")],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
+    config.write.flush_interval_seconds = 3600;
+    config.request.max_request_bytes = 4 << 20;
+    config.request.max_decoded_request_bytes = 8 << 20;
+    let state = AppState::open(config).await.unwrap();
+    // Each body is padded to roughly `bytes` with 1 KiB lines.
+    let json_push = |bytes: usize| {
+        let line = "x".repeat(1024);
+        let values = (0..bytes / 1040)
+            .map(|index| json!([(index + 1).to_string(), line]))
+            .collect::<Vec<_>>();
+        json!({"streams":[{"stream":{"app":"api"},"values":values}]})
+            .to_string()
+            .into_bytes()
+    };
+    let send = |body: Vec<u8>, content_type: &'static str, encoding: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            let mut request = Request::post("/write/ns/tenant/loki/api/v1/push")
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, body.len());
+            if let Some(encoding) = encoding {
+                request = request.header(header::CONTENT_ENCODING, encoding);
+            }
+            router(state)
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Above axum's 2 MiB default extractor limit, below the configured cap.
+    assert_eq!(
+        send(json_push(3 << 20), "application/json", None).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(json_push(5 << 20), "application/json", None).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    // Small on the wire but inflating past the decoded cap.
+    let inflated = gzip(&json_push(9 << 20));
+    assert!(inflated.len() < 1 << 20);
+    assert_eq!(
+        send(inflated, "application/json", Some("gzip")).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        send(gzip(&json_push(6 << 20)), "application/json", Some("gzip")).await,
+        StatusCode::NO_CONTENT
+    );
+    // A snappy header declaring ~4 GiB is refused before allocation.
+    assert_eq!(
+        send(
+            vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+            "application/x-protobuf",
+            None
+        )
+        .await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    state.shutdown().await.unwrap();
+}
+
+async fn bulk(state: &AppState, path: &str, body: &str) -> (StatusCode, Value) {
+    let body = gzip(body.as_bytes());
+    let response = router(state.clone())
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/x-ndjson")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    state.db.flush().await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn elasticsearch_bulk_ingests_logstash_documents() {
+    let state = state(vec![namespace("tenant")]).await;
+    // Fluent Bit with Logstash_Format: daily index, kubernetes metadata, and
+    // `log` as the message field.
+    let request = [
+        r#"{"create":{"_index":"logstash-2024.01.31"}}"#,
+        r#"{"@timestamp":"1970-01-01T00:00:01.000Z","log":"started","stream":"stdout","kubernetes":{"namespace_name":"prod","pod_name":"api-0"}}"#,
+        r#"{"index":{"_index":"logstash-2024.02.01","_id":"given"}}"#,
+        r#"{"@timestamp":1500,"log":"ready","kubernetes":{"namespace_name":"prod","pod_name":"api-1"}}"#,
+        r#"{"index":{}}"#,
+        r#"{"@timestamp":"not a time","log":"dropped"}"#,
+        r#"{"delete":{"_index":"logstash-2024.01.31","_id":"1"}}"#,
+        "",
+    ]
+    .join("\n");
+    let (status, body) = bulk(
+        &state,
+        "/write/ns/tenant/elasticsearch/_bulk?_stream_fields=kubernetes.namespace_name",
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["errors"], true);
+    let statuses = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let (action, result) = item.as_object().unwrap().iter().next().unwrap();
+            (action.as_str(), result["status"].as_u64().unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            ("create", 201),
+            ("index", 201),
+            ("index", 400),
+            ("delete", 400)
+        ]
+    );
+    assert_eq!(body["items"][1]["index"]["_id"], "given");
+
+    let categorized = |path: &'static str| {
+        let state = state.clone();
+        async move {
+            let response = router(state)
+                .oneshot(
+                    Request::get(path)
+                        .header("x-loki-response-encoding-flags", "categorize-labels")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response_json(response).await
+        }
+    };
+    let body = categorized(
+        "/read/ns/tenant/loki/api/v1/query_range?query=%7Bindex%3D%22logstash%22%7D&start=0&end=3&direction=forward",
+    )
+    .await;
+    assert_eq!(body["data"]["result"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["data"]["result"][0]["stream"],
+        json!({"index": "logstash", "kubernetes_namespace_name": "prod"})
+    );
+    assert_eq!(
+        body["data"]["result"][0]["values"],
+        json!([
+            ["1000000000", "started", {"structuredMetadata": {"kubernetes_pod_name": "api-0", "stream": "stdout"}}],
+            ["1500000000", "ready", {"structuredMetadata": {"kubernetes_pod_name": "api-1"}}]
+        ])
+    );
+
+    // The index in the path applies when actions omit `_index`.
+    let (status, body) = bulk(
+        &state,
+        "/write/ns/tenant/elasticsearch/audit/_bulk?_msg_field=event",
+        "{\"index\":{}}\n{\"@timestamp\":\"1970-01-01T00:00:02Z\",\"event\":\"login\",\"user\":\"ada\"}",
+    )
+    .await;
+    assert_eq!((status, &body["errors"]), (StatusCode::OK, &json!(false)));
+    let body = categorized(
+        "/read/ns/tenant/loki/api/v1/query_range?query=%7Bindex%3D%22audit%22%7D&start=0&end=3",
+    )
+    .await;
+    assert_eq!(
+        body["data"]["result"][0]["values"],
+        json!([["2000000000", "login", {"structuredMetadata": {"user": "ada"}}]])
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn elasticsearch_rejects_malformed_bulk_and_answers_handshakes() {
+    let state = state(vec![namespace("tenant")]).await;
+    let (status, _) = bulk(
+        &state,
+        "/write/ns/tenant/elasticsearch/_bulk",
+        "{\"message\":\"a document where an action belongs\"}\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = bulk(
+        &state,
+        "/write/ns/tenant/elasticsearch/_bulk",
+        "{\"index\":{}}\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for path in [
+        "/write/ns/tenant/elasticsearch",
+        "/write/ns/tenant/elasticsearch/",
+        "/write/ns/tenant/elasticsearch/_cluster/health",
+    ] {
+        let response = query(&state, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(response.headers()["x-elastic-product"], "Elasticsearch");
+    }
+    let info = response_json(query(&state, "/write/ns/tenant/elasticsearch").await).await;
+    assert!(
+        info["version"]["number"]
+            .as_str()
+            .unwrap()
+            .starts_with("8.")
+    );
+    state.shutdown().await.unwrap();
+
+    let protected = authenticated_state(vec![namespace("tenant")]).await;
+    let (status, _) = bulk(
+        &protected,
+        "/write/ns/tenant/elasticsearch/_bulk",
+        "{\"index\":{}}\n{\"message\":\"x\"}\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        query(&protected, "/write/ns/tenant/elasticsearch")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    protected.shutdown().await.unwrap();
+}
+
 fn namespace(name: &str) -> NamespaceConfig {
     NamespaceConfig {
         name: name.to_owned(),

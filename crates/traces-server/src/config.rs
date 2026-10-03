@@ -73,7 +73,10 @@ impl Default for PageConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestConfig {
+    /// Cap on a request body as received, before content decoding.
     pub max_request_bytes: usize,
+    /// Cap on a write body after gzip decoding, and on a decoded gRPC message.
+    pub max_decoded_request_bytes: usize,
     pub request_concurrency: usize,
     pub query_concurrency: usize,
     pub max_candidates: usize,
@@ -84,7 +87,8 @@ pub struct RequestConfig {
 impl Default for RequestConfig {
     fn default() -> Self {
         Self {
-            max_request_bytes: 10 * 1024 * 1024,
+            max_request_bytes: server_common::http::DEFAULT_MAX_REQUEST_BYTES,
+            max_decoded_request_bytes: server_common::http::DEFAULT_MAX_DECODED_REQUEST_BYTES,
             request_concurrency: 64,
             query_concurrency: 8,
             max_candidates: 10_000,
@@ -163,7 +167,6 @@ impl Config {
             || self.page.max_size_bytes == 0
             || self.page.max_traces == 0
             || self.write.has_zero_limit()
-            || self.request.max_request_bytes == 0
             || self.request.request_concurrency == 0
             || self.request.query_concurrency == 0
             || self.request.max_candidates == 0
@@ -174,6 +177,11 @@ impl Config {
                 "durations and resource limits must be greater than zero".into(),
             ));
         }
+        server_common::http::validate_request_limits(
+            self.request.max_request_bytes,
+            self.request.max_decoded_request_bytes,
+        )
+        .map_err(ConfigError::Validation)?;
         if self.page.target_size_bytes > self.page.max_size_bytes {
             return Err(ConfigError::Validation(
                 "page target_size_bytes cannot exceed max_size_bytes".into(),

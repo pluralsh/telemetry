@@ -148,12 +148,20 @@ sharding:
   # renew_interval_seconds: 5 # Must be shorter than the lease duration.
 
 request:
-  max_request_bytes: 10485760 # Maximum ingestion body; 10 MiB.
+  max_request_bytes: 33554432 # Maximum request body as received; 32 MiB.
+  max_decoded_request_bytes: 134217728 # Maximum write body after gzip or snappy decoding; 128 MiB. At least max_request_bytes.
   max_query_entries: 5000 # Maximum log entries returned.
   max_query_pages: 10000 # Maximum read units (object block ranges) per query.
   max_structured_metadata_fields: 128 # Per-entry metadata field limit.
   query_concurrency: 16 # Concurrent query work.
   max_in_flight_query_bytes: 134217728 # Query memory budget; 128 MiB.
+
+# Mapping for Elasticsearch _bulk documents; see the Logs APIs page.
+# Per-request _msg_field, _time_field, and _stream_fields parameters override it.
+elasticsearch:
+  message_fields: [message, log, msg] # First present field becomes the log line.
+  time_field: "@timestamp" # RFC3339 or epoch millis; missing uses receive time.
+  stream_fields: [] # Document fields promoted to stream labels, e.g. kubernetes.namespace_name.
 
 auth:
   unauthenticated: false # Require credentials for namespace APIs.

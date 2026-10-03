@@ -100,6 +100,85 @@ fn otlp_request() -> ExportTraceServiceRequest {
     }
 }
 
+/// An OTLP request of roughly `bytes` encoded, as 1 KiB spans across traces.
+fn sized_otlp_request(bytes: usize) -> ExportTraceServiceRequest {
+    let padding = "x".repeat(1024);
+    let spans = (0..bytes / 1100)
+        .map(|index| {
+            let mut trace_id = vec![0; 16];
+            trace_id[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            Span {
+                trace_id,
+                span_id: vec![2; 8],
+                name: "padded".into(),
+                start_time_unix_nano: 1,
+                end_time_unix_nano: 2,
+                attributes: vec![string_attribute("padding", &padding)],
+                ..Default::default()
+            }
+        })
+        .collect();
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+#[tokio::test]
+async fn otlp_grpc_accepts_messages_up_to_the_decoded_limit() {
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+
+    let mut config = Config {
+        storage: StorageConfig::InMemory,
+        request: RequestConfig {
+            max_request_bytes: 4 << 20,
+            max_decoded_request_bytes: 8 << 20,
+            ..RequestConfig::default()
+        },
+        namespaces: vec![NamespaceConfig {
+            name: "tenant".into(),
+            auth: Default::default(),
+            usage_reporting_endpoint: None,
+        }],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
+    let state = AppState::open(config).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        tonic_otlp::transport::Server::builder()
+            .add_service(crate::otlp_grpc_service(state.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let mut client = TraceServiceClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let export = |bytes: usize| {
+        let mut request = tonic_otlp::Request::new(sized_otlp_request(bytes));
+        request
+            .metadata_mut()
+            .insert("x-scope-orgid", "tenant".parse().unwrap());
+        request
+    };
+
+    // Above tonic's 4 MiB default, below the configured decoded cap.
+    let accepted = export(6 << 20);
+    assert!(accepted.get_ref().encoded_len() > 4 << 20);
+    client.export(accepted).await.unwrap();
+    let status = client.export(export(9 << 20)).await.unwrap_err();
+    assert_eq!(status.code(), tonic_otlp::Code::OutOfRange, "{status:?}");
+
+    server.abort();
+    state.shutdown().await.unwrap();
+}
+
 fn string_attribute(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.into(),
@@ -413,11 +492,13 @@ async fn enforces_auth_modes_and_request_size() {
     };
     config.auth.unauthenticated = true;
     let limited = AppState::open(config).await.unwrap();
+    let body = otlp_request().encode_to_vec();
     let response = router(limited.clone())
         .oneshot(
             Request::post("/write/ns/tenant/v1/traces")
                 .header(header::CONTENT_TYPE, "application/x-protobuf")
-                .body(Body::from(otlp_request().encode_to_vec()))
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await

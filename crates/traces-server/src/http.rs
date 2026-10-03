@@ -1,4 +1,4 @@
-use server_common::http::{check_size, content_type};
+use server_common::http::{check_content_encoding, content_type};
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
@@ -30,13 +30,17 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router {
+    // Ingest wraps the limits so it counts bytes as received, not decoded.
+    let writes = server_common::http::limit_request_bodies(
+        Router::new()
+            .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
+            .route("/write/ns/{namespace}/api/v2/spans", post(zipkin)),
+        state.config.request.max_request_bytes,
+        state.config.request.max_decoded_request_bytes,
+    )
+    .route_layer(state.ingest.http_layer());
     let public = Router::new()
-        .merge(
-            Router::new()
-                .route("/write/ns/{namespace}/v1/traces", post(otlp_http))
-                .route("/write/ns/{namespace}/api/v2/spans", post(zipkin))
-                .route_layer(state.ingest.http_layer()),
-        )
+        .merge(writes)
         .route(
             "/read/ns/{namespace}/api/traces/{trace_id}",
             get(trace_by_id),
@@ -107,7 +111,7 @@ async fn otlp_http_result(
 ) -> Result<Response, ApiError> {
     require_write_mode(state)?;
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
+    check_content_encoding(&headers, false)?;
     let _permit = state
         .request_limit
         .acquire()
@@ -189,7 +193,7 @@ async fn zipkin(
 ) -> Result<StatusCode, ApiError> {
     require_write_mode(&state)?;
     authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
+    check_content_encoding(&headers, false)?;
     if content_type(&headers) != Some("application/json") {
         return Err(ApiError::unsupported_media("unsupported content type"));
     }

@@ -203,6 +203,8 @@ fn logs_status(error: plural_logs::Error) -> Status {
 
 pub fn grpc_service(state: AppState) -> InternalWriterServer<AppState> {
     InternalWriterServer::new(state)
+        .max_decoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+        .max_encoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
 }
 
 #[cfg(test)]

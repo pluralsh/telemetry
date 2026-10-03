@@ -245,6 +245,28 @@ spec:
                     format: int64
                     minimum: 1
                     type: integer
+                  request:
+                    properties:
+                      maxDecodedRequestBytes:
+                        default: 134217728
+                        description: |-
+                          MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.
+                          Must be at least maxRequestBytes.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      maxRequestBytes:
+                        default: 33554432
+                        description: MaxRequestBytes caps a request body as received,
+                          before content decoding.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    type: object
+                    x-kubernetes-validations:
+                    - message: maxDecodedRequestBytes must be at least maxRequestBytes
+                      rule: '!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes)
+                        || self.maxDecodedRequestBytes >= self.maxRequestBytes'
                   sharding:
                     properties:
                       ioConcurrencyLimit:

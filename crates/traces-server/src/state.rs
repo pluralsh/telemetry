@@ -375,6 +375,8 @@ impl AppState {
                         internal_rpc::authorize(&mut request, token)
                             .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
                         InternalWriterClient::new(channel)
+                            .max_encoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+                            .max_decoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
                             .write(request)
                             .await
                             .map(drop)

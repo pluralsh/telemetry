@@ -361,6 +361,100 @@ async fn gzipped_otlp_json_is_queryable_with_rfc3339_times_and_duration_step() {
 }
 
 #[tokio::test]
+async fn writes_are_bounded_by_wire_and_decoded_limits() {
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.shards = 1;
+    config.request.max_request_bytes = 4 << 20;
+    config.request.max_decoded_request_bytes = 8 << 20;
+    let state = AppState::open(config).await.unwrap();
+    // An OTLP/JSON gauge of roughly `bytes`, padded with data points.
+    let otlp_json = |bytes: usize| {
+        let points = (0..bytes / 51)
+            .map(|index| {
+                format!(
+                    r#"{{"timeUnixNano":"{}","asInt":"7"}}"#,
+                    1_700_000_000_000_000_000u64 + index as u64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{{"name":"padded","gauge":{{"dataPoints":[{points}]}}}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    };
+    let gzip = |body: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, body).unwrap();
+        encoder.finish().unwrap()
+    };
+    let send = |path: &'static str,
+                content_type: &'static str,
+                encoding: Option<&'static str>,
+                body: Vec<u8>| {
+        let state = state.clone();
+        async move {
+            let mut request = HttpRequest::post(path)
+                .header(CONTENT_TYPE, content_type)
+                .header(axum::http::header::CONTENT_LENGTH, body.len());
+            if let Some(encoding) = encoding {
+                request = request.header(axum::http::header::CONTENT_ENCODING, encoding);
+            }
+            router(state)
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let otlp = "/write/ns/alpha/v1/metrics";
+
+    // Above axum's 2 MiB default extractor limit, below the configured cap.
+    let accepted = otlp_json(3 << 20);
+    assert!(accepted.len() > 2 << 20);
+    assert_eq!(
+        send(otlp, "application/json", None, accepted).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(otlp, "application/json", None, otlp_json(5 << 20)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        send(
+            otlp,
+            "application/json",
+            Some("gzip"),
+            gzip(&otlp_json(6 << 20))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let inflating = otlp_json(9 << 20);
+    assert!(inflating.len() > 8 << 20);
+    assert_eq!(
+        send(otlp, "application/json", Some("gzip"), gzip(&inflating)).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        send(otlp, "application/json", Some("br"), b"{}".to_vec()).await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    // A remote write snappy header declaring ~4 GiB is refused before allocation.
+    assert_eq!(
+        send(
+            "/write/ns/alpha/api/v1/write",
+            "application/x-protobuf",
+            Some("snappy"),
+            vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+        )
+        .await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn query_errors_use_prometheus_status_codes_and_error_types() {
     // given: two series that label_replace collapses onto one label set
     let mut config = test_config(ServerMode::Standalone);

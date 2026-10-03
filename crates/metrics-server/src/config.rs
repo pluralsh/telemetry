@@ -49,6 +49,24 @@ impl Default for ListenerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct RequestConfig {
+    /// Cap on a request body as received, before content decoding.
+    pub max_request_bytes: usize,
+    /// Cap on a write body after gzip or snappy decoding.
+    pub max_decoded_request_bytes: usize,
+}
+
+impl Default for RequestConfig {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: server_common::http::DEFAULT_MAX_REQUEST_BYTES,
+            max_decoded_request_bytes: server_common::http::DEFAULT_MAX_DECODED_REQUEST_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub mode: ServerMode,
     pub listeners: ListenerConfig,
@@ -60,6 +78,7 @@ pub struct Config {
     pub reader_cache_capacity: u64,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
+    pub request: RequestConfig,
     pub sharding: ShardingConfig,
     pub auth: AuthConfig,
     pub usage_reporting: UsageReportingConfig,
@@ -77,6 +96,7 @@ impl Default for Config {
             reader_cache_capacity: 256 * 1024 * 1024,
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
+            request: RequestConfig::default(),
             sharding: ShardingConfig::default(),
             auth: AuthConfig::default(),
             usage_reporting: UsageReportingConfig::default(),
@@ -103,6 +123,11 @@ impl Config {
                 "write buffer and concurrency limits must be greater than zero".to_owned(),
             ));
         }
+        server_common::http::validate_request_limits(
+            self.request.max_request_bytes,
+            self.request.max_decoded_request_bytes,
+        )
+        .map_err(ConfigError::Validation)?;
         if !self.path_prefix.is_empty()
             && (!self.path_prefix.starts_with('/')
                 || self.path_prefix.len() == 1

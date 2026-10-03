@@ -37,10 +37,17 @@ type LogsPageSpec struct {
 	RowsPerBlock *int64 `json:"rowsPerBlock,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes >= self.maxRequestBytes",message="maxDecodedRequestBytes must be at least maxRequestBytes"
 type LogsRequestSpec struct {
+	// MaxRequestBytes caps a request body as received, before content decoding.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=10485760
+	// +kubebuilder:default=33554432
 	MaxRequestBytes *int64 `json:"maxRequestBytes,omitempty"`
+	// MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.
+	// Must be at least maxRequestBytes.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=134217728
+	MaxDecodedRequestBytes *int64 `json:"maxDecodedRequestBytes,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=5000
 	MaxQueryEntries *int64 `json:"maxQueryEntries,omitempty"`
@@ -58,6 +65,22 @@ type LogsRequestSpec struct {
 	MaxInFlightQueryBytes *int64 `json:"maxInFlightQueryBytes,omitempty"`
 }
 
+// LogsElasticsearchSpec maps Elasticsearch _bulk documents to log entries.
+type LogsElasticsearchSpec struct {
+	// MessageFields are tried in order; the first present becomes the log line.
+	// +kubebuilder:default={"message","log","msg"}
+	// +kubebuilder:validation:items:MinLength=1
+	MessageFields []string `json:"messageFields,omitempty"`
+	// TimeField holds the entry timestamp as RFC3339 or epoch milliseconds.
+	// +kubebuilder:default="@timestamp"
+	// +kubebuilder:validation:MinLength=1
+	TimeField string `json:"timeField,omitempty"`
+	// StreamFields are document fields promoted to stream labels. Keep them
+	// low-cardinality; all other fields become structured metadata.
+	// +kubebuilder:validation:items:MinLength=1
+	StreamFields []string `json:"streamFields,omitempty"`
+}
+
 type LogsConfigSpec struct {
 	// +kubebuilder:default={"path":"logs"}
 	Storage StorageSpec `json:"storage,omitempty"`
@@ -65,13 +88,15 @@ type LogsConfigSpec struct {
 	// +kubebuilder:default=3600
 	SegmentDurationSeconds *int64 `json:"segmentDurationSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	RetentionSeconds *int64           `json:"retentionSeconds,omitempty"`
-	Page             LogsPageSpec     `json:"page,omitempty"`
-	Write            WriteSpec        `json:"write,omitempty"`
-	Sharding         ShardingSpec     `json:"sharding,omitempty"`
-	Request          LogsRequestSpec  `json:"request,omitempty"`
-	CacheWarmer      *CacheWarmerSpec `json:"cacheWarmer,omitempty"`
-	Auth             AuthSpec         `json:"auth,omitempty"`
+	RetentionSeconds *int64          `json:"retentionSeconds,omitempty"`
+	Page             LogsPageSpec    `json:"page,omitempty"`
+	Write            WriteSpec       `json:"write,omitempty"`
+	Sharding         ShardingSpec    `json:"sharding,omitempty"`
+	Request          LogsRequestSpec `json:"request,omitempty"`
+	// +kubebuilder:default={}
+	Elasticsearch LogsElasticsearchSpec `json:"elasticsearch,omitempty"`
+	CacheWarmer   *CacheWarmerSpec      `json:"cacheWarmer,omitempty"`
+	Auth          AuthSpec              `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

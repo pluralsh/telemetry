@@ -9,18 +9,21 @@ pub(super) async fn loki_push(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
+    let request = &state.config.request;
     let content_type = content_type(&headers).unwrap_or("application/x-protobuf");
     let protobuf = matches!(
         content_type,
         "application/x-protobuf" | "application/vnd.google.protobuf"
     );
-    let body = decode_content(&headers, &body, protobuf)?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
+    check_content_encoding(&headers, protobuf)?;
     let batches = if content_type == "application/json" {
-        parse_json_push(&body, state.config.request.max_structured_metadata_fields)?
+        parse_json_push(&body, request.max_structured_metadata_fields)?
     } else if protobuf {
-        parse_protobuf_push(&body, state.config.request.max_structured_metadata_fields)?
+        parse_protobuf_push(
+            &body,
+            request.max_structured_metadata_fields,
+            request.max_decoded_request_bytes,
+        )?
     } else {
         return Err(ApiError::unsupported_media(
             "unsupported content type or encoding",
@@ -128,10 +131,12 @@ struct LabelPair {
     value: String,
 }
 
-fn parse_protobuf_push(body: &[u8], metadata_limit: usize) -> Result<Vec<LogBatch>, ApiError> {
-    let decoded = snap::raw::Decoder::new()
-        .decompress_vec(body)
-        .map_err(ApiError::bad_request)?;
+fn parse_protobuf_push(
+    body: &[u8],
+    metadata_limit: usize,
+    decoded_limit: usize,
+) -> Result<Vec<LogBatch>, ApiError> {
+    let decoded = unsnappy_bounded(body, decoded_limit)?;
     let request = PushRequest::decode(decoded.as_slice()).map_err(ApiError::bad_request)?;
     request
         .streams
@@ -194,9 +199,7 @@ async fn otlp_logs_result(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
-    let body = decode_content(&headers, &body, false)?;
-    check_size(body.len(), state.config.request.max_request_bytes)?;
+    check_content_encoding(&headers, false)?;
     let json_request = content_type(&headers) == Some("application/json");
     let request: ExportLogsServiceRequest = if json_request {
         serde_json::from_slice(&body).map_err(ApiError::bad_request)?
@@ -204,7 +207,7 @@ async fn otlp_logs_result(
         content_type(&headers),
         Some("application/x-protobuf" | "application/protobuf" | "application/octet-stream")
     ) {
-        ExportLogsServiceRequest::decode(body.as_slice()).map_err(ApiError::bad_request)?
+        ExportLogsServiceRequest::decode(body).map_err(ApiError::bad_request)?
     } else {
         return Err(ApiError::unsupported_media(
             "unsupported content type or encoding",

@@ -571,6 +571,233 @@
         }
       }
     },
+    "/write/ns/{namespace}/elasticsearch": {
+      "get": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "elasticsearch_info",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Elasticsearch version handshake",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/write/ns/{namespace}/elasticsearch/_bulk": {
+      "post": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "elasticsearch_bulk",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_msg_field",
+            "in": "query",
+            "description": "Comma-separated message fields; overrides configuration",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_time_field",
+            "in": "query",
+            "description": "Timestamp field; overrides configuration",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_stream_fields",
+            "in": "query",
+            "description": "Comma-separated document fields promoted to stream labels",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Elasticsearch bulk NDJSON. `index` and `create` actions are ingested; `update` and `delete` fail per item.",
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Per-item bulk results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed bulk body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request exceeds configured limit"
+          }
+        }
+      }
+    },
+    "/write/ns/{namespace}/elasticsearch/_cluster/health": {
+      "get": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "elasticsearch_cluster_health",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Always green",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/write/ns/{namespace}/elasticsearch/{index}/_bulk": {
+      "post": {
+        "tags": [
+          "ingest"
+        ],
+        "operationId": "elasticsearch_index_bulk",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "Default index for actions without `_index`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_msg_field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_time_field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "_stream_fields",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-ndjson": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Per-item bulk results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed bulk body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request exceeds configured limit"
+          }
+        }
+      }
+    },
     "/write/ns/{namespace}/loki/api/v1/push": {
       "post": {
         "tags": [
@@ -682,6 +909,32 @@
         "type": "string",
         "format": "binary"
       },
+      "BulkResponse": {
+        "type": "object",
+        "required": [
+          "took",
+          "errors",
+          "items"
+        ],
+        "properties": {
+          "errors": {
+            "type": "boolean",
+            "description": "True when at least one item failed."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "One `{action: {_index, _id, status, ...}}` object per bulk action, in request order."
+          },
+          "took": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "ErrorEnvelope": {
         "type": "object",
         "required": [
@@ -767,7 +1020,7 @@
     },
     {
       "name": "ingest",
-      "description": "Loki and OTLP ingestion"
+      "description": "Loki, OTLP, and Elasticsearch bulk ingestion"
     },
     {
       "name": "operations",

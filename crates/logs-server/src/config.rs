@@ -94,7 +94,10 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestConfig {
+    /// Cap on a request body as received, before content decoding.
     pub max_request_bytes: usize,
+    /// Cap on a write body after gzip or snappy decoding.
+    pub max_decoded_request_bytes: usize,
     pub max_query_entries: usize,
     pub max_query_pages: usize,
     pub max_structured_metadata_fields: usize,
@@ -105,12 +108,40 @@ pub struct RequestConfig {
 impl Default for RequestConfig {
     fn default() -> Self {
         Self {
-            max_request_bytes: 10 * 1024 * 1024,
+            max_request_bytes: server_common::http::DEFAULT_MAX_REQUEST_BYTES,
+            max_decoded_request_bytes: server_common::http::DEFAULT_MAX_DECODED_REQUEST_BYTES,
             max_query_entries: 5_000,
             max_query_pages: 10_000,
             max_structured_metadata_fields: 128,
             query_concurrency: 16,
             max_in_flight_query_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+/// How Elasticsearch bulk documents map onto log entries. Requests can
+/// override each field with the `_msg_field`, `_time_field`, and
+/// `_stream_fields` query parameters.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ElasticsearchConfig {
+    /// Document fields tried in order for the log line. A document with none
+    /// of them is stored whole as a JSON line.
+    pub message_fields: Vec<String>,
+    /// Document field holding the event time; documents without it use the
+    /// receive time.
+    pub time_field: String,
+    /// Document fields, possibly dotted paths into nested objects, promoted
+    /// to stream labels alongside `index`.
+    pub stream_fields: Vec<String>,
+}
+
+impl Default for ElasticsearchConfig {
+    fn default() -> Self {
+        Self {
+            message_fields: vec!["message".to_owned(), "log".to_owned(), "msg".to_owned()],
+            time_field: "@timestamp".to_owned(),
+            stream_fields: Vec::new(),
         }
     }
 }
@@ -133,6 +164,7 @@ pub struct Config {
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
+    pub elasticsearch: ElasticsearchConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub usage_reporting: UsageReportingConfig,
@@ -155,6 +187,7 @@ impl Default for Config {
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
+            elasticsearch: ElasticsearchConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             auth: AuthConfig::default(),
             usage_reporting: UsageReportingConfig::default(),
@@ -189,7 +222,6 @@ impl Config {
             || self.page.target_size_bytes == 0
             || self.page.max_rows == 0
             || self.page.rows_per_block == 0
-            || self.request.max_request_bytes == 0
             || self.request.max_query_entries == 0
             || self.request.max_query_pages == 0
             || self.request.max_structured_metadata_fields == 0
@@ -199,6 +231,20 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
+            ));
+        }
+        server_common::http::validate_request_limits(
+            self.request.max_request_bytes,
+            self.request.max_decoded_request_bytes,
+        )
+        .map_err(ConfigError::Validation)?;
+        let elasticsearch = &self.elasticsearch;
+        if elasticsearch.time_field.is_empty()
+            || elasticsearch.message_fields.iter().any(String::is_empty)
+            || elasticsearch.stream_fields.iter().any(String::is_empty)
+        {
+            return Err(ConfigError::Validation(
+                "elasticsearch field names cannot be empty".to_owned(),
             ));
         }
         if let Some(rollup) = self.discovery_rollup_seconds
@@ -341,6 +387,11 @@ mod tests {
             usage_reporting_endpoint: None,
         }];
         config.request.max_request_bytes = 0;
+        assert!(config.validate().is_err());
+        config.request = RequestConfig {
+            max_decoded_request_bytes: RequestConfig::default().max_request_bytes - 1,
+            ..RequestConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

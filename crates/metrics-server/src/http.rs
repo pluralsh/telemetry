@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    io::Read,
     ops::RangeInclusive,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -25,11 +24,19 @@ use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
-use server_common::http::content_type;
+use server_common::http::{check_content_encoding, check_snappy_size, content_type};
 
 use crate::{config::ServerMode, state::AppState};
 
 pub fn router(state: AppState) -> Router {
+    let request = &state.config.request;
+    let limits = |router| {
+        server_common::http::limit_request_bodies(
+            router,
+            request.max_request_bytes,
+            request.max_decoded_request_bytes,
+        )
+    };
     let mut app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route(
@@ -58,14 +65,17 @@ pub fn router(state: AppState) -> Router {
             .route("/federate", get(federate));
         app = app.nest(
             &format!("{}/read/ns/{{namespace}}", state.config.path_prefix),
-            read_routes,
+            limits(read_routes),
         );
     }
     if state.config.mode != ServerMode::Reader {
-        let write_routes = Router::new()
-            .route("/api/v1/write", post(remote_write))
-            .route("/v1/metrics", post(otlp_http))
-            .route_layer(state.ingest.http_layer());
+        // Ingest wraps the limits so it counts bytes as received, not decoded.
+        let write_routes = limits(
+            Router::new()
+                .route("/api/v1/write", post(remote_write))
+                .route("/v1/metrics", post(otlp_http)),
+        )
+        .route_layer(state.ingest.http_layer());
         app = app.nest(
             &format!("{}/write/ns/{{namespace}}", state.config.path_prefix),
             write_routes,
@@ -90,6 +100,8 @@ async fn remote_write(
             content_type.unwrap_or_default()
         ))
     })?;
+    check_content_encoding(&headers, true)?;
+    check_snappy_size(&body, state.config.request.max_decoded_request_bytes)?;
     let batch = plural_metrics::remote_write::parse_remote_write(&body, protocol)
         .map_err(ApiError::bad_request)?;
     let (samples, histograms) = (batch.samples, batch.histograms);
@@ -146,8 +158,8 @@ async fn otlp_http_result(
     json: bool,
 ) -> Result<Response, ApiError> {
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
+    check_content_encoding(&headers, false)?;
     let id = request_id(&headers, &body);
-    let body = decode_content_encoding(&headers, body)?;
     let request = if json {
         plural_metrics::otel::decode_metrics_json(&body).map_err(ApiError::bad_request)?
     } else if matches!(
@@ -184,34 +196,6 @@ async fn otlp_http_result(
         encoded,
     )
         .into_response())
-}
-
-/// Upper bound on a decompressed OTLP body, guarding against gzip bombs.
-const MAX_DECODED_OTLP_BYTES: u64 = 64 * 1024 * 1024;
-
-fn decode_content_encoding(headers: &HeaderMap, body: Bytes) -> Result<Bytes, ApiError> {
-    let encoding = headers
-        .get(axum::http::header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .unwrap_or("");
-    if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
-        return Ok(body);
-    }
-    if !encoding.eq_ignore_ascii_case("gzip") {
-        return Err(ApiError::unsupported_media(format!(
-            "unsupported content encoding {encoding:?}"
-        )));
-    }
-    let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(body.as_ref())
-        .take(MAX_DECODED_OTLP_BYTES + 1)
-        .read_to_end(&mut decoded)
-        .map_err(ApiError::bad_request)?;
-    if decoded.len() as u64 > MAX_DECODED_OTLP_BYTES {
-        return Err(ApiError::too_large());
-    }
-    Ok(Bytes::from(decoded))
 }
 
 #[derive(Deserialize)]

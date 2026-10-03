@@ -225,6 +225,80 @@ fn loki_push() {}
 )]
 fn otlp_logs() {}
 
+#[derive(ToSchema)]
+struct BulkResponse {
+    took: u64,
+    /// True when at least one item failed.
+    errors: bool,
+    /// One `{action: {_index, _id, status, ...}}` object per bulk action, in request order.
+    #[schema(value_type = Vec<Object>)]
+    items: Vec<serde_json::Value>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/write/ns/{namespace}/elasticsearch/_bulk",
+    tag = "ingest",
+    params(
+        ("namespace" = String, Path),
+        ("_msg_field" = Option<String>, Query, description = "Comma-separated message fields; overrides configuration"),
+        ("_time_field" = Option<String>, Query, description = "Timestamp field; overrides configuration"),
+        ("_stream_fields" = Option<String>, Query, description = "Comma-separated document fields promoted to stream labels")
+    ),
+    request_body(
+        content(
+            (String = "application/x-ndjson")
+        ),
+        description = "Elasticsearch bulk NDJSON. `index` and `create` actions are ingested; `update` and `delete` fail per item."
+    ),
+    responses(
+        (status = 200, description = "Per-item bulk results", body = BulkResponse),
+        (status = 400, description = "Malformed bulk body", body = ErrorEnvelope),
+        (status = 413, description = "Request exceeds configured limit")
+    )
+)]
+fn elasticsearch_bulk() {}
+
+#[utoipa::path(
+    post,
+    path = "/write/ns/{namespace}/elasticsearch/{index}/_bulk",
+    tag = "ingest",
+    params(
+        ("namespace" = String, Path),
+        ("index" = String, Path, description = "Default index for actions without `_index`"),
+        ("_msg_field" = Option<String>, Query),
+        ("_time_field" = Option<String>, Query),
+        ("_stream_fields" = Option<String>, Query)
+    ),
+    request_body(content(
+        (String = "application/x-ndjson")
+    )),
+    responses(
+        (status = 200, description = "Per-item bulk results", body = BulkResponse),
+        (status = 400, description = "Malformed bulk body", body = ErrorEnvelope),
+        (status = 413, description = "Request exceeds configured limit")
+    )
+)]
+fn elasticsearch_index_bulk() {}
+
+#[utoipa::path(
+    get,
+    path = "/write/ns/{namespace}/elasticsearch",
+    tag = "ingest",
+    params(("namespace" = String, Path)),
+    responses((status = 200, description = "Elasticsearch version handshake", body = Object))
+)]
+fn elasticsearch_info() {}
+
+#[utoipa::path(
+    get,
+    path = "/write/ns/{namespace}/elasticsearch/_cluster/health",
+    tag = "ingest",
+    params(("namespace" = String, Path)),
+    responses((status = 200, description = "Always green", body = Object))
+)]
+fn elasticsearch_cluster_health() {}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -244,7 +318,11 @@ fn otlp_logs() {}
         series_get,
         series_post,
         loki_push,
-        otlp_logs
+        otlp_logs,
+        elasticsearch_bulk,
+        elasticsearch_index_bulk,
+        elasticsearch_info,
+        elasticsearch_cluster_health
     ),
     components(schemas(
         LokiEnvelope,
@@ -252,12 +330,13 @@ fn otlp_logs() {}
         BinaryBody,
         JsonBody,
         LokiPush,
-        LokiStream
+        LokiStream,
+        BulkResponse
     )),
     tags(
         (name = "query", description = "LogQL query"),
         (name = "metadata", description = "Stream-label discovery"),
-        (name = "ingest", description = "Loki and OTLP ingestion"),
+        (name = "ingest", description = "Loki, OTLP, and Elasticsearch bulk ingestion"),
         (name = "operations", description = "Health and readiness")
     )
 )]

@@ -92,7 +92,7 @@ async fn profile(production: bool) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(50);
     let dir = tempfile::tempdir().unwrap();
-    let namespace = Namespace::new("profile").unwrap();
+    let namespace = &Namespace::new("profile").unwrap();
     let now = common::time::now_ns();
     let window = 1200 * SECOND;
     let writer = LogDb::open(config(dir.path(), production)).await.unwrap();
@@ -119,7 +119,7 @@ async fn profile(production: bool) {
             })
             .collect();
         writer
-            .write_with_durability(&namespace, batches, Durability::Durable)
+            .write_with_durability(namespace, batches, Durability::Durable)
             .await
             .unwrap();
     }
@@ -158,11 +158,11 @@ async fn profile(production: bool) {
             max_pages: 1_000_000,
             ..QueryOptions::default()
         };
-        db.query(&namespace, &request, options.clone())
+        db.query(namespace, &request, options.clone())
             .await
             .unwrap();
         let started = Instant::now();
-        db.query(&namespace, &request, options).await.unwrap();
+        db.query(namespace, &request, options).await.unwrap();
         let total = started.elapsed();
         println!("query {:>7.2}ms | {query}", ms(total));
     }
@@ -175,7 +175,7 @@ async fn profile(production: bool) {
     for &segment in &segments {
         let started = Instant::now();
         let ids = db
-            .stream_ids(&namespace, segment, &filter.exact)
+            .stream_ids(namespace, segment, &filter.exact)
             .await
             .unwrap();
         ids_t += started.elapsed();
@@ -184,11 +184,11 @@ async fn profile(production: bool) {
         }
         streams += ids.len();
         let started = Instant::now();
-        db.stream_labels(&namespace, segment, ids).await.unwrap();
+        db.stream_labels(namespace, segment, ids).await.unwrap();
         labels_t += started.elapsed();
         let started = Instant::now();
         let found = db
-            .segment_streams(&namespace, segment, &filter, (start, end), now_unix_ms)
+            .segment_streams(namespace, segment, &filter, (start, end), now_unix_ms)
             .await
             .unwrap();
         meta_t += started.elapsed();
@@ -201,7 +201,7 @@ async fn profile(production: bool) {
         let mut iterator = db
             .storage
             .scan_prefix_iter(
-                crate::codec::forward_prefix(&namespace, segment),
+                crate::codec::forward_prefix(namespace, segment),
                 common::BytesRange::unbounded(),
                 None,
             )
@@ -216,7 +216,7 @@ async fn profile(production: bool) {
         let mut iterator = db
             .storage
             .scan_prefix_iter(
-                crate::codec::segment_run_prefix(&namespace, segment),
+                crate::codec::segment_run_prefix(namespace, segment),
                 common::BytesRange::unbounded(),
                 None,
             )
@@ -235,20 +235,20 @@ async fn profile(production: bool) {
     );
     let started = Instant::now();
     let targets = db
-        .scan_targets(&namespace, start, end, &filter)
+        .scan_targets(namespace, start, end, &filter)
         .await
         .unwrap();
     let scan_t = started.elapsed();
     let started = Instant::now();
     let rows = db
-        .read_bounded(&namespace, targets, &PageBudget::new(usize::MAX))
+        .read_bounded(namespace, targets, &PageBudget::new(usize::MAX))
         .await
         .unwrap();
     let read_t = started.elapsed();
     let started = Instant::now();
     let mut sequential_rows = 0;
     db.read_segments(
-        &namespace,
+        namespace,
         (start, end),
         &filter,
         &PageBudget::new(usize::MAX),
@@ -312,9 +312,29 @@ async fn profile_fuzz_replay() {
         serde_json::from_slice(&std::fs::read(replay.join("queries.json")).unwrap()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let namespace = Namespace::new("regression").unwrap();
-    let mut config = config(dir.path(), true);
+    // Reads an existing server's store (`PROFILE_DATA`, `PROFILE_DATA_PATH`)
+    // instead of ingesting the rounds.
+    let existing = std::env::var("PROFILE_DATA").ok();
+    let mut config = config(
+        existing.as_deref().map_or(dir.path(), std::path::Path::new),
+        true,
+    );
+    if let (Some(_), StorageConfig::SlateDb(storage)) = (&existing, &mut config.storage) {
+        storage.path = std::env::var("PROFILE_DATA_PATH").unwrap();
+    }
     config.compaction.enabled = std::env::var("PROFILE_COMPACT").is_ok();
     config.compaction.min_age = Duration::ZERO;
+    if existing.is_none() {
+        ingest(&config, &namespace, rounds).await;
+    }
+    let db = LogDb::open_reader(config, DbReaderOptions::default())
+        .await
+        .unwrap();
+    replay_queries(&db, &namespace, &queries).await;
+    db.close().await.unwrap();
+}
+
+async fn ingest(config: &Config, namespace: &Namespace, rounds: Vec<Vec<ReplayStream>>) {
     let writer = LogDb::open(config.clone()).await.unwrap();
     for round in rounds {
         let batches = round
@@ -338,7 +358,7 @@ async fn profile_fuzz_replay() {
             })
             .collect();
         writer
-            .write_with_durability(&namespace, batches, Durability::Durable)
+            .write_with_durability(namespace, batches, Durability::Durable)
             .await
             .unwrap();
     }
@@ -349,10 +369,10 @@ async fn profile_fuzz_replay() {
         .await;
     }
     writer.close().await.unwrap();
-    let db = LogDb::open_reader(config, DbReaderOptions::default())
-        .await
-        .unwrap();
-    for query in &queries {
+}
+
+async fn replay_queries(db: &LogDb, namespace: &Namespace, queries: &[ReplayQuery]) {
+    for query in queries {
         let mut options = QueryOptions::default();
         if let Some(limit) = query.limit {
             options.limit = limit;
@@ -367,13 +387,13 @@ async fn profile_fuzz_replay() {
             step_ns: query.step,
         }
         .frontend_step_aligned();
-        db.query(&namespace, &request, options.clone())
+        db.query(namespace, &request, options.clone())
             .await
             .unwrap();
         // Loops a query long enough for a sampling profiler to attach.
         let repeat = std::env::var("PROFILE_REPEAT").map_or(0, |value| value.parse().unwrap());
         for _ in 0..repeat {
-            db.query(&namespace, &request, options.clone())
+            db.query(namespace, &request, options.clone())
                 .await
                 .unwrap();
         }
@@ -381,7 +401,7 @@ async fn profile_fuzz_replay() {
         let mut times = Vec::new();
         for _ in 0..runs {
             let started = Instant::now();
-            db.query(&namespace, &request, options.clone())
+            db.query(namespace, &request, options.clone())
                 .await
                 .unwrap();
             times.push(started.elapsed());
@@ -401,7 +421,7 @@ async fn profile_fuzz_replay() {
         let plan = crate::query::ScanPlan::new(&request, &parsed, &options).unwrap();
         let started = Instant::now();
         let targets = db
-            .scan_targets(&namespace, plan.scan_start, request.end_ns, &plan.streams)
+            .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
             .await
             .unwrap();
         let scan_t = started.elapsed();
@@ -413,7 +433,7 @@ async fn profile_fuzz_replay() {
             .sum::<usize>();
         let started = Instant::now();
         let rows = db
-            .read_bounded(&namespace, targets, &PageBudget::new(usize::MAX))
+            .read_bounded(namespace, targets, &PageBudget::new(usize::MAX))
             .await
             .unwrap();
         let read_t = started.elapsed();
@@ -426,7 +446,7 @@ async fn profile_fuzz_replay() {
             ms(scan_t),
             ms(read_t),
             ms(total.saturating_sub(scan_t + read_t)),
-            plan_segments(&db, plan.scan_start, request.end_ns),
+            plan_segments(db, plan.scan_start, request.end_ns),
             estimate.pages,
             estimate.compressed_bytes,
             rows.len(),
@@ -435,7 +455,6 @@ async fn profile_fuzz_replay() {
                 .map_or(1, |step| (request.end_ns - request.start_ns) / step + 1),
         );
     }
-    db.close().await.unwrap();
 }
 
 fn plan_segments(db: &LogDb, start: i64, end: i64) -> usize {

@@ -37,10 +37,17 @@ type TracesPageSpec struct {
 	MaxTraces *int64 `json:"maxTraces,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes >= self.maxRequestBytes",message="maxDecodedRequestBytes must be at least maxRequestBytes"
 type TracesRequestSpec struct {
+	// MaxRequestBytes caps a request body as received, before content decoding.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=10485760
+	// +kubebuilder:default=33554432
 	MaxRequestBytes *int64 `json:"maxRequestBytes,omitempty"`
+	// MaxDecodedRequestBytes caps a write body after gzip decoding and a
+	// decoded OTLP or Jaeger gRPC message. Must be at least maxRequestBytes.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=134217728
+	MaxDecodedRequestBytes *int64 `json:"maxDecodedRequestBytes,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=64
 	RequestConcurrency *int32 `json:"requestConcurrency,omitempty"`

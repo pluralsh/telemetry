@@ -27,16 +27,30 @@ const (
 	MetricsModeSharded    = ProductModeSharded
 )
 
+// +kubebuilder:validation:XValidation:rule="!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes >= self.maxRequestBytes",message="maxDecodedRequestBytes must be at least maxRequestBytes"
+type MetricsRequestSpec struct {
+	// MaxRequestBytes caps a request body as received, before content decoding.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=33554432
+	MaxRequestBytes *int64 `json:"maxRequestBytes,omitempty"`
+	// MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.
+	// Must be at least maxRequestBytes.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=134217728
+	MaxDecodedRequestBytes *int64 `json:"maxDecodedRequestBytes,omitempty"`
+}
+
 type MetricsConfigSpec struct {
 	// +kubebuilder:default={"path":"metrics"}
 	Storage StorageSpec `json:"storage,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=268435456
-	ReaderCacheCapacity *int64           `json:"readerCacheCapacity,omitempty"`
-	CacheWarmer         *CacheWarmerSpec `json:"cacheWarmer,omitempty"`
-	Write               WriteSpec        `json:"write,omitempty"`
-	Sharding            ShardingSpec     `json:"sharding,omitempty"`
-	Auth                AuthSpec         `json:"auth,omitempty"`
+	ReaderCacheCapacity *int64             `json:"readerCacheCapacity,omitempty"`
+	CacheWarmer         *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
+	Write               WriteSpec          `json:"write,omitempty"`
+	Request             MetricsRequestSpec `json:"request,omitempty"`
+	Sharding            ShardingSpec       `json:"sharding,omitempty"`
+	Auth                AuthSpec           `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

@@ -134,7 +134,8 @@ sharding:
   # renew_interval_seconds: 5 # Must be shorter than the lease duration.
 
 request:
-  max_request_bytes: 10485760 # Maximum ingestion body; 10 MiB.
+  max_request_bytes: 33554432 # Maximum request body as received; 32 MiB.
+  max_decoded_request_bytes: 134217728 # Maximum write body after gzip, and maximum OTLP/Jaeger gRPC message; 128 MiB. At least max_request_bytes.
   request_concurrency: 64 # Concurrent ingestion requests.
   query_concurrency: 8 # Concurrent query work.
   max_candidates: 10000 # Candidate traces considered by a search.

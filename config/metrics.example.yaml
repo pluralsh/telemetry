@@ -107,6 +107,13 @@ write:
   # Retries after the initial stale-ownership gRPC attempt. Default 2.
   remote_retries: 2
 
+request:
+  # Maximum request body as received, before content decoding. Default 32 MiB.
+  max_request_bytes: 33554432
+  # Maximum write body after gzip or snappy decoding; at least
+  # max_request_bytes. Default 128 MiB.
+  max_decoded_request_bytes: 134217728
+
 sharding:
   # Storage-shard count for standalone/static backends; keep it fixed for a
   # dataset. Kubernetes uses writer replicas instead.

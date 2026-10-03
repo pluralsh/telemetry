@@ -233,6 +233,37 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                  elasticsearch:
+                    default: {}
+                    description: LogsElasticsearchSpec maps Elasticsearch _bulk documents
+                      to log entries.
+                    properties:
+                      messageFields:
+                        default:
+                        - message
+                        - log
+                        - msg
+                        description: MessageFields are tried in order; the first present
+                          becomes the log line.
+                        items:
+                          minLength: 1
+                          type: string
+                        type: array
+                      streamFields:
+                        description: |-
+                          StreamFields are document fields promoted to stream labels. Keep them
+                          low-cardinality; all other fields become structured metadata.
+                        items:
+                          minLength: 1
+                          type: string
+                        type: array
+                      timeField:
+                        default: '@timestamp'
+                        description: TimeField holds the entry timestamp as RFC3339
+                          or epoch milliseconds.
+                        minLength: 1
+                        type: string
+                    type: object
                   namespaces:
                     default:
                     - default
@@ -259,6 +290,14 @@ spec:
                     type: object
                   request:
                     properties:
+                      maxDecodedRequestBytes:
+                        default: 134217728
+                        description: |-
+                          MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.
+                          Must be at least maxRequestBytes.
+                        format: int64
+                        minimum: 1
+                        type: integer
                       maxInFlightQueryBytes:
                         default: 134217728
                         format: int64
@@ -275,7 +314,9 @@ spec:
                         minimum: 1
                         type: integer
                       maxRequestBytes:
-                        default: 10485760
+                        default: 33554432
+                        description: MaxRequestBytes caps a request body as received,
+                          before content decoding.
                         format: int64
                         minimum: 1
                         type: integer
@@ -290,6 +331,10 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: maxDecodedRequestBytes must be at least maxRequestBytes
+                      rule: '!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes)
+                        || self.maxDecodedRequestBytes >= self.maxRequestBytes'
                   retentionSeconds:
                     format: int64
                     minimum: 1

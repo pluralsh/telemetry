@@ -478,9 +478,28 @@ _Appears in:_
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `request` _[LogsRequestSpec](#logsrequestspec)_ |  |  |  |
+| `elasticsearch` _[LogsElasticsearchSpec](#logselasticsearchspec)_ |  | \{  \} |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
+
+
+#### LogsElasticsearchSpec
+
+
+
+LogsElasticsearchSpec maps Elasticsearch _bulk documents to log entries.
+
+
+
+_Appears in:_
+- [LogsConfigSpec](#logsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `messageFields` _string array_ | MessageFields are tried in order; the first present becomes the log line. | [message log msg] | items:MinLength: 1 <br /> |
+| `timeField` _string_ | TimeField holds the entry timestamp as RFC3339 or epoch milliseconds. | @timestamp | MinLength: 1 <br /> |
+| `streamFields` _string array_ | StreamFields are document fields promoted to stream labels. Keep them<br />low-cardinality; all other fields become structured metadata. |  | items:MinLength: 1 <br /> |
 
 
 
@@ -516,7 +535,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `maxRequestBytes` _integer_ |  | 10485760 | Minimum: 1 <br /> |
+| `maxRequestBytes` _integer_ | MaxRequestBytes caps a request body as received, before content decoding. | 33554432 | Minimum: 1 <br /> |
+| `maxDecodedRequestBytes` _integer_ | MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.<br />Must be at least maxRequestBytes. | 134217728 | Minimum: 1 <br /> |
 | `maxQueryEntries` _integer_ |  | 5000 | Minimum: 1 <br /> |
 | `maxQueryPages` _integer_ |  | 10000 | Minimum: 1 <br /> |
 | `maxStructuredMetadataFields` _integer_ |  | 128 | Minimum: 1 <br /> |
@@ -585,11 +605,29 @@ _Appears in:_
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
+| `request` _[MetricsRequestSpec](#metricsrequestspec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
 
 
+
+
+#### MetricsRequestSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [MetricsConfigSpec](#metricsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxRequestBytes` _integer_ | MaxRequestBytes caps a request body as received, before content decoding. | 33554432 | Minimum: 1 <br /> |
+| `maxDecodedRequestBytes` _integer_ | MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.<br />Must be at least maxRequestBytes. | 134217728 | Minimum: 1 <br /> |
 
 
 #### MetricsSpec
@@ -1085,7 +1123,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `maxRequestBytes` _integer_ |  | 10485760 | Minimum: 1 <br /> |
+| `maxRequestBytes` _integer_ | MaxRequestBytes caps a request body as received, before content decoding. | 33554432 | Minimum: 1 <br /> |
+| `maxDecodedRequestBytes` _integer_ | MaxDecodedRequestBytes caps a write body after gzip decoding and a<br />decoded OTLP or Jaeger gRPC message. Must be at least maxRequestBytes. | 134217728 | Minimum: 1 <br /> |
 | `requestConcurrency` _integer_ |  | 64 | Minimum: 1 <br /> |
 | `maxCandidates` _integer_ |  | 10000 | Minimum: 1 <br /> |
 | `maxSpansPerTrace` _integer_ |  | 100000 | Minimum: 1 <br /> |

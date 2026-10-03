@@ -1,5 +1,5 @@
-use server_common::http::{check_size, content_type};
-use std::{collections::BTreeMap, io::Read};
+use server_common::http::{check_content_encoding, check_size, content_type, unsnappy_bounded};
+use std::collections::BTreeMap;
 
 use axum::{
     Json, Router,
@@ -10,7 +10,6 @@ use axum::{
     routing::{get, post},
 };
 use common::display::{PrometheusFloat, hex, prometheus_float, sanitize_label_name};
-use flate2::read::GzDecoder;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
     common::v1::{AnyValue, KeyValue, any_value},
@@ -31,6 +30,14 @@ const ENCODING_FLAGS: &str = "x-loki-response-encoding-flags";
 const CATEGORIZE_LABELS: &str = "categorize-labels";
 
 pub fn router(state: AppState) -> Router {
+    let request = &state.config.request;
+    let limits = |router| {
+        server_common::http::limit_request_bodies(
+            router,
+            request.max_request_bytes,
+            request.max_decoded_request_bytes,
+        )
+    };
     let public = Router::new()
         .route(
             "/read/ns/{namespace}/loki/api/v1/query",
@@ -49,12 +56,34 @@ pub fn router(state: AppState) -> Router {
             "/read/ns/{namespace}/loki/api/v1/series",
             get(series_get).post(series_post),
         )
-        .merge(
-            Router::new()
-                .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
-                .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs))
-                .route_layer(state.ingest.http_layer()),
+        .route(
+            "/write/ns/{namespace}/elasticsearch",
+            get(elasticsearch::info),
+        )
+        .route(
+            "/write/ns/{namespace}/elasticsearch/",
+            get(elasticsearch::info),
+        )
+        .route(
+            "/write/ns/{namespace}/elasticsearch/_cluster/health",
+            get(elasticsearch::cluster_health),
         );
+    // Ingest wraps the limits so it counts bytes as received, not decoded.
+    let writes = limits(
+        Router::new()
+            .route("/write/ns/{namespace}/loki/api/v1/push", post(loki_push))
+            .route("/write/ns/{namespace}/otlp/v1/logs", post(otlp_logs))
+            .route(
+                "/write/ns/{namespace}/elasticsearch/_bulk",
+                post(elasticsearch::bulk),
+            )
+            .route(
+                "/write/ns/{namespace}/elasticsearch/{index}/_bulk",
+                post(elasticsearch::index_bulk),
+            ),
+    )
+    .route_layer(state.ingest.http_layer());
+    let public = limits(public).merge(writes);
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route("/metrics", get(server_common::runtime::scrape_metrics))
@@ -771,34 +800,6 @@ fn json_fields(value: &Value, limit: usize) -> Result<Fields, ApiError> {
     .map_err(ApiError::bad_request)
 }
 
-fn decode_content(
-    headers: &HeaderMap,
-    body: &[u8],
-    allow_snappy: bool,
-) -> Result<Vec<u8>, ApiError> {
-    let encoding = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("identity")
-        .trim();
-    if encoding.eq_ignore_ascii_case("identity") || encoding.is_empty() {
-        return Ok(body.to_vec());
-    }
-    if encoding.eq_ignore_ascii_case("snappy") && allow_snappy {
-        return Ok(body.to_vec());
-    }
-    if encoding.eq_ignore_ascii_case("gzip") {
-        let mut decoded = Vec::new();
-        GzDecoder::new(body)
-            .read_to_end(&mut decoded)
-            .map_err(ApiError::bad_request)?;
-        return Ok(decoded);
-    }
-    Err(ApiError::unsupported_media(
-        "unsupported content type or encoding",
-    ))
-}
-
 fn encoding_flag(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(ENCODING_FLAGS)
@@ -847,6 +848,7 @@ fn seconds(timestamp_ns: i64) -> f64 {
 
 pub(crate) use server_common::ApiError;
 
+mod elasticsearch;
 mod push;
 
 use push::*;

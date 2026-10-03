@@ -122,9 +122,13 @@ func Render(input Input) (Result, error) {
 			ReaderCacheCapacity: int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, 268435456),
 			CacheWarmer:         renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
 			Write:               renderWriteConfig(input.Metrics.Spec.Config.Write),
-			Sharding:            renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, grpcPort(input.Metrics), mode),
-			Auth:                renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
-			Namespaces:          namespaces,
+			Request: renderMetricsRequest{
+				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
+				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
+			},
+			Sharding:   renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, grpcPort(input.Metrics), mode),
+			Auth:       renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces: namespaces,
 		})
 	}
 	writerMode := modeStandalone
@@ -227,12 +231,18 @@ func renderLogs(input Input) (Result, error) {
 			},
 			Sharding: renderShardingConfig(logs.Name, logs.Namespace, spec.Sharding, resources.GRPCPort(logs), component),
 			Request: renderLogsRequest{
-				MaxRequestBytes:             int64Value(spec.Request.MaxRequestBytes, 10485760),
+				MaxRequestBytes:             int64Value(spec.Request.MaxRequestBytes, defaultMaxRequestBytes),
+				MaxDecodedRequestBytes:      int64Value(spec.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
 				MaxQueryEntries:             int64Value(spec.Request.MaxQueryEntries, 5000),
 				MaxQueryPages:               int64Value(spec.Request.MaxQueryPages, 10000),
 				MaxStructuredMetadataFields: int64Value(spec.Request.MaxStructuredMetadataFields, 128),
 				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
 				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 134217728),
+			},
+			Elasticsearch: renderElasticsearch{
+				MessageFields: lo.Ternary(spec.Elasticsearch.MessageFields == nil, []string{"message", "log", "msg"}, spec.Elasticsearch.MessageFields),
+				TimeField:     lo.CoalesceOrEmpty(spec.Elasticsearch.TimeField, "@timestamp"),
+				StreamFields:  lo.Ternary(spec.Elasticsearch.StreamFields == nil, []string{}, spec.Elasticsearch.StreamFields),
 			},
 			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
 			Auth:        renderAuth{Unauthenticated: logs.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
@@ -310,7 +320,7 @@ func renderTraces(input Input) (Result, error) {
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
 			Sharding:    renderShardingConfig(traces.Name, traces.Namespace, spec.Sharding, resources.GRPCPort(traces), component),
-			Request:     renderTracesRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, 10485760), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
+			Request:     renderTracesRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, defaultMaxRequestBytes), MaxDecodedRequestBytes: int64Value(spec.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
 			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
 			Auth:        renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:  namespaces,
@@ -517,36 +527,52 @@ func uniqueDataKey(data map[string][]byte, base string) string {
 	}
 }
 
+const (
+	defaultMaxRequestBytes        = 33554432
+	defaultMaxDecodedRequestBytes = 134217728
+)
+
 func int64Value(value *int64, fallback int64) int64 { return lo.FromPtrOr(value, fallback) }
 func int32Value(value *int32, fallback int32) int32 { return lo.FromPtrOr(value, fallback) }
 func boolValue(value *bool, fallback bool) bool     { return lo.FromPtrOr(value, fallback) }
 
 type renderConfig struct {
-	Mode                string            `json:"mode"`
-	Listeners           renderListeners   `json:"listeners"`
-	PathPrefix          string            `json:"path_prefix,omitempty"`
-	Storage             renderStorage     `json:"storage"`
-	ReaderCacheCapacity int64             `json:"reader_cache_capacity"`
-	CacheWarmer         renderCacheWarmer `json:"cache_warmer"`
-	Write               renderWrite       `json:"write"`
-	Sharding            renderSharding    `json:"sharding"`
-	Auth                renderAuth        `json:"auth"`
-	Namespaces          []renderNamespace `json:"namespaces"`
+	Mode                string               `json:"mode"`
+	Listeners           renderListeners      `json:"listeners"`
+	PathPrefix          string               `json:"path_prefix,omitempty"`
+	Storage             renderStorage        `json:"storage"`
+	ReaderCacheCapacity int64                `json:"reader_cache_capacity"`
+	CacheWarmer         renderCacheWarmer    `json:"cache_warmer"`
+	Write               renderWrite          `json:"write"`
+	Request             renderMetricsRequest `json:"request"`
+	Sharding            renderSharding       `json:"sharding"`
+	Auth                renderAuth           `json:"auth"`
+	Namespaces          []renderNamespace    `json:"namespaces"`
+}
+type renderMetricsRequest struct {
+	MaxRequestBytes        int64 `json:"max_request_bytes"`
+	MaxDecodedRequestBytes int64 `json:"max_decoded_request_bytes"`
 }
 type renderLogsConfig struct {
-	Mode                   string            `json:"mode"`
-	Listeners              renderListeners   `json:"listeners"`
-	PathPrefix             string            `json:"path_prefix,omitempty"`
-	Storage                renderStorage     `json:"storage"`
-	SegmentDurationSeconds int64             `json:"segment_duration_seconds"`
-	RetentionSeconds       *int64            `json:"retention_seconds,omitempty"`
-	Page                   renderLogsPage    `json:"page"`
-	Write                  renderWrite       `json:"write"`
-	Sharding               renderSharding    `json:"sharding"`
-	Request                renderLogsRequest `json:"request"`
-	CacheWarmer            renderCacheWarmer `json:"cache_warmer"`
-	Auth                   renderAuth        `json:"auth"`
-	Namespaces             []renderNamespace `json:"namespaces"`
+	Mode                   string              `json:"mode"`
+	Listeners              renderListeners     `json:"listeners"`
+	PathPrefix             string              `json:"path_prefix,omitempty"`
+	Storage                renderStorage       `json:"storage"`
+	SegmentDurationSeconds int64               `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64              `json:"retention_seconds,omitempty"`
+	Page                   renderLogsPage      `json:"page"`
+	Write                  renderWrite         `json:"write"`
+	Sharding               renderSharding      `json:"sharding"`
+	Request                renderLogsRequest   `json:"request"`
+	Elasticsearch          renderElasticsearch `json:"elasticsearch"`
+	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
+	Auth                   renderAuth          `json:"auth"`
+	Namespaces             []renderNamespace   `json:"namespaces"`
+}
+type renderElasticsearch struct {
+	MessageFields []string `json:"message_fields"`
+	TimeField     string   `json:"time_field"`
+	StreamFields  []string `json:"stream_fields"`
 }
 type renderTracesConfig struct {
 	Mode                   string              `json:"mode"`
@@ -582,12 +608,13 @@ type renderTracesPage struct {
 	MaxTraces       int64 `json:"max_traces"`
 }
 type renderTracesRequest struct {
-	MaxRequestBytes    int64 `json:"max_request_bytes"`
-	RequestConcurrency int32 `json:"request_concurrency"`
-	QueryConcurrency   int32 `json:"query_concurrency"`
-	MaxCandidates      int64 `json:"max_candidates"`
-	MaxSpansPerTrace   int64 `json:"max_spans_per_trace"`
-	MaxQueryLimit      int64 `json:"max_query_limit"`
+	MaxRequestBytes        int64 `json:"max_request_bytes"`
+	MaxDecodedRequestBytes int64 `json:"max_decoded_request_bytes"`
+	RequestConcurrency     int32 `json:"request_concurrency"`
+	QueryConcurrency       int32 `json:"query_concurrency"`
+	MaxCandidates          int64 `json:"max_candidates"`
+	MaxSpansPerTrace       int64 `json:"max_spans_per_trace"`
+	MaxQueryLimit          int64 `json:"max_query_limit"`
 }
 type renderLogsPage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`
@@ -596,6 +623,7 @@ type renderLogsPage struct {
 }
 type renderLogsRequest struct {
 	MaxRequestBytes             int64 `json:"max_request_bytes"`
+	MaxDecodedRequestBytes      int64 `json:"max_decoded_request_bytes"`
 	MaxQueryEntries             int64 `json:"max_query_entries"`
 	MaxQueryPages               int64 `json:"max_query_pages"`
 	MaxStructuredMetadataFields int64 `json:"max_structured_metadata_fields"`

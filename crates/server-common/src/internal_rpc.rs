@@ -21,6 +21,15 @@ use tonic::{
 
 const AUTHORIZATION: &str = "authorization";
 
+/// Message size cap for the internal writer services, in both directions.
+///
+/// A forwarded write was already admitted under the sender's public request
+/// limits, but its internal encoding can be larger than the decoded public
+/// body (remote write v2 symbol references and Loki label strings are
+/// expanded per series or stream), so the owner must accept whatever a peer
+/// was willing to forward. The internal port should not be publicly exposed.
+pub const MAX_INTERNAL_MESSAGE_BYTES: usize = usize::MAX;
+
 /// Constant-time string comparison for shared secrets.
 pub fn secure_eq(left: &str, right: &str) -> bool {
     let left = blake3::hash(left.as_bytes());

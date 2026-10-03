@@ -3,12 +3,14 @@
 use std::fmt::Display;
 
 use axum::{
-    Json,
+    Json, Router,
+    extract::DefaultBodyLimit,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use prost::Message;
 use serde_json::json;
+use tower_http::{decompression::RequestDecompressionLayer, limit::RequestBodyLimitLayer};
 
 /// An HTTP API failure. Renders as a Prometheus/Loki-style JSON error, or as
 /// a `google.rpc.Status` for OTLP/HTTP endpoints.
@@ -196,6 +198,11 @@ pub fn content_type(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Default cap on a write request body as received, before content decoding.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+/// Default cap on a write request body after gzip or snappy decoding.
+pub const DEFAULT_MAX_DECODED_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+
 /// Rejects request bodies larger than `limit` bytes with 413.
 pub fn check_size(size: usize, limit: usize) -> Result<(), ApiError> {
     if size > limit {
@@ -203,6 +210,74 @@ pub fn check_size(size: usize, limit: usize) -> Result<(), ApiError> {
     } else {
         Ok(())
     }
+}
+
+/// Caps bodies at `max_request` bytes on the wire and `max_decoded` bytes
+/// after gzip, inflating as a stream so a compression bomb stops at the cap.
+/// Other encodings (snappy) pass through for the handler to bound.
+pub fn limit_request_bodies<S>(
+    router: Router<S>,
+    max_request: usize,
+    max_decoded: usize,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(DefaultBodyLimit::max(max_decoded))
+        .layer(RequestDecompressionLayer::new().pass_through_unaccepted(true))
+        .layer(RequestBodyLimitLayer::new(max_request))
+}
+
+/// Rejects with 415 any `Content-Encoding` left after
+/// [`limit_request_bodies`] has undone gzip, except snappy when the protocol
+/// carries raw snappy blocks that the handler decodes itself.
+pub fn check_content_encoding(headers: &HeaderMap, allow_snappy: bool) -> Result<(), ApiError> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity")
+        .trim();
+    if encoding.eq_ignore_ascii_case("identity")
+        || encoding.is_empty()
+        || (allow_snappy && encoding.eq_ignore_ascii_case("snappy"))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unsupported_media(
+            "unsupported content type or encoding",
+        ))
+    }
+}
+
+/// Fails with 413 when a raw snappy block declares a decoded length above
+/// `limit`, which the decoder would otherwise allocate up front.
+pub fn check_snappy_size(body: &[u8], limit: usize) -> Result<(), ApiError> {
+    let length = snap::raw::decompress_len(body).map_err(ApiError::bad_request)?;
+    check_size(length, limit)
+}
+
+/// Decodes a raw snappy block of at most `limit` decoded bytes.
+pub fn unsnappy_bounded(body: &[u8], limit: usize) -> Result<Vec<u8>, ApiError> {
+    check_snappy_size(body, limit)?;
+    snap::raw::Decoder::new()
+        .decompress_vec(body)
+        .map_err(ApiError::bad_request)
+}
+
+/// Validates a wire and decoded request limit pair.
+pub fn validate_request_limits(max_request: usize, max_decoded: usize) -> Result<(), String> {
+    if max_request == 0 || max_decoded == 0 {
+        return Err("request size limits must be greater than zero".to_owned());
+    }
+    if max_decoded < max_request {
+        return Err(
+            "max_decoded_request_bytes must be at least max_request_bytes, since an \
+             uncompressed body decodes to itself"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,5 +347,109 @@ mod tests {
             check_size(11, 10).unwrap_err().status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[tokio::test]
+    async fn body_limits_apply_to_wire_and_gunzipped_sizes() {
+        use std::io::Write;
+
+        use axum::{
+            body::{Body, Bytes},
+            http::Request,
+            routing::post,
+        };
+        use tower::ServiceExt;
+
+        const WIRE: usize = 1 << 10;
+        const DECODED: usize = 4 << 10;
+        let app = limit_request_bodies(
+            Router::new().route(
+                "/",
+                post(|body: Bytes| async move { body.len().to_string() }),
+            ),
+            WIRE,
+            DECODED,
+        );
+        let gzip = |size: usize| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&vec![0; size]).unwrap();
+            encoder.finish().unwrap()
+        };
+        // `chunked` omits Content-Length and streams the body, as a
+        // chunked upload would; otherwise the header is set as hyper does.
+        let send = |body: Vec<u8>, encoding: Option<&'static str>, chunked: bool| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::post("/");
+                if let Some(encoding) = encoding {
+                    request = request.header(header::CONTENT_ENCODING, encoding);
+                }
+                let body = if chunked {
+                    Body::from_stream(tokio_stream::iter(
+                        body.chunks(100)
+                            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    request = request.header(header::CONTENT_LENGTH, body.len());
+                    Body::from(body)
+                };
+                let response = app.oneshot(request.body(body).unwrap()).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, body)
+            }
+        };
+
+        assert_eq!(send(vec![0; WIRE], None, false).await.0, StatusCode::OK);
+        assert_eq!(
+            send(vec![0; WIRE + 1], None, false).await.0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(send(vec![0; WIRE], None, true).await.0, StatusCode::OK);
+        // The limit error reaches axum through tower-http's decompression
+        // stream as an `io::Error`, which hides its source, so axum reports
+        // 400 rather than 413. Still rejected after reading WIRE + 1 bytes.
+        assert_eq!(
+            send(vec![0; WIRE + 1], None, true).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, body) = send(gzip(DECODED), Some("gzip"), false).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::OK, DECODED.to_string().as_bytes())
+        );
+        for chunked in [false, true] {
+            assert_eq!(
+                send(gzip(DECODED + 1), Some("gzip"), chunked).await.0,
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        let (status, body) = send(vec![1; 10], Some("snappy"), false).await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, &b"10"[..]));
+    }
+
+    #[test]
+    fn snappy_is_rejected_by_declared_length_before_decoding() {
+        let body = snap::raw::Encoder::new().compress_vec(&[7; 4096]).unwrap();
+        assert_eq!(unsnappy_bounded(&body, 4096).unwrap(), vec![7; 4096]);
+        assert_eq!(
+            unsnappy_bounded(&body, 4095).unwrap_err().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        // A header claiming ~4 GiB of output with no payload behind it.
+        let bomb = [0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(
+            check_snappy_size(&bomb, 1 << 20).unwrap_err().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn request_limits_require_decoded_at_least_wire() {
+        validate_request_limits(10, 10).unwrap();
+        assert!(validate_request_limits(0, 10).is_err());
+        assert!(validate_request_limits(10, 9).is_err());
     }
 }
