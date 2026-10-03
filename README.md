@@ -148,7 +148,7 @@ Install the telemetry-operator operator, including the `Metrics`, `Logs`, and
 
 ```sh
 helm upgrade --install telemetry-operator oci://ghcr.io/pluralsh/charts/telemetry-operator \
-  --version 0.1.x \
+  --version 0.1.16 \
   --namespace telemetry-system \
   --create-namespace
 ```
@@ -163,7 +163,7 @@ metadata:
   name: metrics-sample
 spec:
   mode: Sharded
-  # version: 0.1.11 # you can float versions by leaving them unspecified
+  # version: 0.2.0 # you can float versions by leaving them unspecified
   config:
     storage:
       path: metrics
@@ -231,7 +231,7 @@ metadata:
   name: logs-sample
 spec:
   mode: Standalone
-  # version: 0.1.11
+  # version: 0.2.0
   config:
     namespaces:
       - default
