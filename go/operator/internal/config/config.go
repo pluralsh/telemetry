@@ -113,12 +113,17 @@ func Render(input Input) (Result, error) {
 		}
 	}
 
+	retention, err := renderRetention(input.Metrics.Spec.Config.Retention, nil)
+	if err != nil {
+		return Result{}, err
+	}
 	makeConfig := func(mode string) ([]byte, error) {
 		return yaml.Marshal(renderConfig{
 			Mode:                mode,
 			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
 			PathPrefix:          input.Metrics.Spec.Ingress.PathPrefix,
 			Storage:             renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode),
+			RetentionSeconds:    retention,
 			ReaderCacheCapacity: int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, 268435456),
 			CacheWarmer:         renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
 			Write:               renderWriteConfig(input.Metrics.Spec.Config.Write),
@@ -135,7 +140,6 @@ func Render(input Input) (Result, error) {
 	if mode(input.Metrics) == telemetryv1alpha1.MetricsModeSharded {
 		writerMode = modeWriter
 	}
-	var err error
 	data[MetricsKey], err = makeConfig(writerMode)
 	if err != nil {
 		return Result{}, fmt.Errorf("render metrics config: %w", err)
@@ -203,6 +207,10 @@ func renderLogs(input Input) (Result, error) {
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
+	retention, err := renderRetention(logs.Spec.Config.Retention, logs.Spec.Config.RetentionSeconds)
+	if err != nil {
+		return Result{}, err
+	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := logs.Spec.Config
 		return yaml.Marshal(renderLogsConfig{
@@ -214,7 +222,7 @@ func renderLogs(input Input) (Result, error) {
 			},
 			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
-			RetentionSeconds:       spec.RetentionSeconds,
+			RetentionSeconds:       retention,
 			Page: renderLogsPage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
@@ -253,7 +261,6 @@ func renderLogs(input Input) (Result, error) {
 	if resources.Mode(logs) == telemetryv1alpha1.ProductModeSharded {
 		writerMode = modeWriter
 	}
-	var err error
 	data[LogsKey], err = makeConfig(writerMode)
 	if err != nil {
 		return Result{}, fmt.Errorf("render Logs config: %w", err)
@@ -296,6 +303,10 @@ func renderTraces(input Input) (Result, error) {
 			return Result{}, fmt.Errorf("auth.jwt.jwks requires url or resolved secret data")
 		}
 	}
+	retention, err := renderRetention(traces.Spec.Config.Retention, traces.Spec.Config.RetentionSeconds)
+	if err != nil {
+		return Result{}, err
+	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := traces.Spec.Config
 		return yaml.Marshal(renderTracesConfig{
@@ -308,7 +319,7 @@ func renderTraces(input Input) (Result, error) {
 			},
 			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
-			RetentionSeconds:       spec.RetentionSeconds,
+			RetentionSeconds:       retention,
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
@@ -330,7 +341,6 @@ func renderTraces(input Input) (Result, error) {
 	if resources.Mode(traces) == telemetryv1alpha1.ProductModeSharded {
 		writerMode = modeWriter
 	}
-	var err error
 	data[TracesKey], err = makeConfig(writerMode)
 	if err != nil {
 		return Result{}, fmt.Errorf("render Traces config: %w", err)
@@ -541,6 +551,7 @@ type renderConfig struct {
 	Listeners           renderListeners      `json:"listeners"`
 	PathPrefix          string               `json:"path_prefix,omitempty"`
 	Storage             renderStorage        `json:"storage"`
+	RetentionSeconds    *int64               `json:"retention_seconds,omitempty"`
 	ReaderCacheCapacity int64                `json:"reader_cache_capacity"`
 	CacheWarmer         renderCacheWarmer    `json:"cache_warmer"`
 	Write               renderWrite          `json:"write"`

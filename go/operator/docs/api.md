@@ -473,7 +473,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:logs \} |  |
 | `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
-| `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
+| `retention` _string_ | Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.<br />When unset, data is kept forever. |  | Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$` <br /> |
+| `retentionSeconds` _integer_ | RetentionSeconds is deprecated in favor of retention. |  | Minimum: 1 <br /> |
 | `page` _[LogsPageSpec](#logspagespec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |
@@ -602,6 +603,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:metrics \} |  |
+| `retention` _string_ | Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.<br />When unset, data is kept forever. |  | Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$` <br /> |
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
@@ -1080,7 +1082,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:traces \} |  |
 | `segmentDurationSeconds` _integer_ |  | 3600 | Minimum: 1 <br /> |
-| `retentionSeconds` _integer_ |  |  | Minimum: 1 <br /> |
+| `retention` _string_ | Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.<br />When unset, data is kept forever. |  | Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$` <br /> |
+| `retentionSeconds` _integer_ | RetentionSeconds is deprecated in favor of retention. |  | Minimum: 1 <br /> |
 | `page` _[TracesPageSpec](#tracespagespec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `sharding` _[ShardingSpec](#shardingspec)_ |  |  |  |

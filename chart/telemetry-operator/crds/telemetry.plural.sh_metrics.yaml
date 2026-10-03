@@ -267,6 +267,12 @@ spec:
                     - message: maxDecodedRequestBytes must be at least maxRequestBytes
                       rule: '!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes)
                         || self.maxDecodedRequestBytes >= self.maxRequestBytes'
+                  retention:
+                    description: |-
+                      Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.
+                      When unset, data is kept forever.
+                    pattern: ^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$
+                    type: string
                   sharding:
                     properties:
                       ioConcurrencyLimit:

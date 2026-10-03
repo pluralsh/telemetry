@@ -43,6 +43,10 @@ type MetricsRequestSpec struct {
 type MetricsConfigSpec struct {
 	// +kubebuilder:default={"path":"metrics"}
 	Storage StorageSpec `json:"storage,omitempty"`
+	// Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.
+	// When unset, data is kept forever.
+	// +kubebuilder:validation:Pattern=`^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`
+	Retention string `json:"retention,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=268435456
 	ReaderCacheCapacity *int64             `json:"readerCacheCapacity,omitempty"`

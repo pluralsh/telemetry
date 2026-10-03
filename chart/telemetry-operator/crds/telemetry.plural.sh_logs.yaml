@@ -335,7 +335,14 @@ spec:
                     - message: maxDecodedRequestBytes must be at least maxRequestBytes
                       rule: '!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes)
                         || self.maxDecodedRequestBytes >= self.maxRequestBytes'
+                  retention:
+                    description: |-
+                      Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.
+                      When unset, data is kept forever.
+                    pattern: ^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$
+                    type: string
                   retentionSeconds:
+                    description: RetentionSeconds is deprecated in favor of retention.
                     format: int64
                     minimum: 1
                     type: integer
@@ -834,6 +841,9 @@ spec:
                         type: integer
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: set retention or the deprecated retentionSeconds, not both
+                  rule: '!has(self.retention) || !has(self.retentionSeconds)'
               image:
                 default:
                   pullPolicy: IfNotPresent

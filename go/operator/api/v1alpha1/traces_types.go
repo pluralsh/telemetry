@@ -65,12 +65,18 @@ type TracesRequestSpec struct {
 	MaxQueryLimit *int64 `json:"maxQueryLimit,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.retention) || !has(self.retentionSeconds)",message="set retention or the deprecated retentionSeconds, not both"
 type TracesConfigSpec struct {
 	// +kubebuilder:default={"path":"traces"}
 	Storage StorageSpec `json:"storage,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3600
 	SegmentDurationSeconds *int64 `json:"segmentDurationSeconds,omitempty"`
+	// Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.
+	// When unset, data is kept forever.
+	// +kubebuilder:validation:Pattern=`^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`
+	Retention string `json:"retention,omitempty"`
+	// RetentionSeconds is deprecated in favor of retention.
 	// +kubebuilder:validation:Minimum=1
 	RetentionSeconds *int64            `json:"retentionSeconds,omitempty"`
 	Page             TracesPageSpec    `json:"page,omitempty"`

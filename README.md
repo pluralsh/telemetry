@@ -165,6 +165,7 @@ spec:
   mode: Sharded
   # version: 0.2.0 # you can float versions by leaving them unspecified
   config:
+    # retention: 30d # w, d, h, m, s units; unset keeps data forever
     storage:
       path: metrics
       objectStore:
@@ -233,6 +234,7 @@ spec:
   mode: Standalone
   # version: 0.2.0
   config:
+    # retention: 14d
     namespaces:
       - default
     storage:
