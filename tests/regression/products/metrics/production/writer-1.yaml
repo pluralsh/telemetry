@@ -1,0 +1,48 @@
+mode: writer
+# What the operator renders for a sharded Metrics writer with no overrides
+# (no block cache), except object storage, static sharding and auth.
+listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
+storage:
+  path: regression
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: metrics-regression
+    endpoint: http://minio:9000
+    allow_http: true
+  meta_cache: { type: FoyerMemory, capacity: 134217728 }
+reader_cache_capacity: 268435456
+write:
+  durability: applied
+  flush_interval_seconds: 10
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
+  remote_concurrency: 16
+  remote_retries: 2
+sharding:
+  shards: 2
+  backend: static
+  owner_id: metrics-writer-1
+  owners:
+    - { id: metrics-writer-0, ordinal: 0, endpoint: "metrics-writer-0:9090", start_shard: 0, end_shard: 1 }
+    - { id: metrics-writer-1, ordinal: 1, endpoint: "metrics-writer-1:9090", start_shard: 1, end_shard: 2 }
+auth:
+  internal: { source: env, name: METRICS_INTERNAL_TOKEN }
+  jwt:
+    jwks: { source: file, path: /app/regression/jwks.json }
+    refresh_interval_seconds: 300
+    request_timeout_seconds: 5
+  global:
+    read: []
+    write: []
+namespaces:
+  - name: regression
+    auth:
+      read:
+        - { type: basic, username: regression-reader, password: { source: literal, value: regression-read } }
+      write: []
+  - name: other
+    auth:
+      read: []
+      write: []

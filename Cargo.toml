@@ -17,17 +17,22 @@ blake3 = "1"
 bytes = "1"
 chrono = "0.4"
 config = "0.14"
+criterion = "0.8.2"
 dashmap = "6"
 dashu-float = "0.4"
 fail = "0.5"
+foldhash = "0.2"
 foyer = "0.22"
 futures = "0.3"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 kube = { version = "4.2", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
+lz4_flex = "0.14.0"
+memchr = "2"
 metrics = "0.24"
+mimalloc = "0.1"
 mixtrics = "0.2"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "trace", "gen-tonic-messages"] }
 prost = "0.13"
 prost-build = "0.13"
@@ -45,6 +50,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
+simdutf8 = "0.1"
 slatedb = { version = "0.15", features = ["azure", "compaction_filters", "gcp", "lz4", "zstd"] }
 slatedb-common = "0.15"
 snap = "1"
@@ -55,9 +61,9 @@ tokio-util = "0.7"
 tonic = "0.13"
 tonic-build = "0.13"
 tracing = "0.1"
-tsz = "0.1"
 ulid = "1"
 uuid = "1"
+zstd = "0.14.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

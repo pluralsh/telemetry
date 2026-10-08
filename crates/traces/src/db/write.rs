@@ -5,7 +5,14 @@
 
 //! Write path: segment grouping, the write-coordinator delta and page appends.
 
+use std::collections::hash_map::Entry;
+use std::time::Instant;
+
 use super::*;
+
+/// How long a segment's next page sequence stays in memory after its last
+/// write. A later write reads it again.
+const SEQUENCE_IDLE_EVICTION: Duration = Duration::from_secs(15 * 60);
 
 pub(super) struct TraceWrite {
     pub(super) namespace: Namespace,
@@ -28,7 +35,7 @@ impl Delta for TraceWriteDelta {
     type FrozenView = ();
     type ApplyResult = WriteReport;
     type DeltaView = ();
-    type Snapshot = Arc<dyn StorageSnapshot>;
+    type Snapshot = ();
 
     fn init((): Self::Context) -> Self {
         Self::default()
@@ -65,12 +72,28 @@ impl Delta for TraceWriteDelta {
     fn reader(&self) -> Self::DeltaView {}
 }
 
+/// Writes flushed traces without reading what storage already holds.
+///
+/// The flusher is the database's only writer, so the page sequences it
+/// allocates are authoritative in memory; a segment's is read once, the first
+/// time this process writes to it. Trace heads are merge operands describing
+/// only this flush's pages, so a trace's earlier pages are never looked up.
 pub(super) struct TraceFlusher {
-    pub(super) storage: Arc<dyn Storage>,
-    pub(super) page_config: PageConfig,
-    pub(super) retention: Option<Duration>,
-    pub(super) segment_ns: u64,
+    storage: Arc<dyn Storage>,
+    page_config: PageConfig,
+    retention: Option<Duration>,
+    segment_ns: u64,
+    read_cache: Arc<ReadCache>,
+    sequences: HashMap<TraceGroup, NextSequence>,
 }
+
+struct NextSequence {
+    next: u64,
+    touched: Instant,
+}
+
+/// This flush's head operand for each trace it writes, per namespace.
+type FlushHeads = HashMap<Namespace, HashMap<TraceId, TraceHead>>;
 
 #[async_trait]
 impl Flusher<TraceWriteDelta> for TraceFlusher {
@@ -78,21 +101,14 @@ impl Flusher<TraceWriteDelta> for TraceFlusher {
         &mut self,
         frozen: BTreeMap<TraceGroup, Vec<Trace>>,
         _epoch_range: &Range<u64>,
-    ) -> std::result::Result<Arc<dyn StorageSnapshot>, String> {
-        let pages = direct_write(
-            self.storage.as_ref(),
-            &self.page_config,
-            self.retention,
-            self.segment_ns,
-            frozen,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        metrics::histogram!(TRACES_FLUSH_PAGES).record(pages as f64);
-        self.storage
-            .snapshot()
+    ) -> std::result::Result<(), String> {
+        let (pages, written) = self
+            .direct_write(frozen)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.read_cache.invalidate_traces(written).await;
+        metrics::histogram!(TRACES_FLUSH_PAGES).record(pages as f64);
+        Ok(())
     }
 
     async fn flush_storage(&self) -> std::result::Result<(), String> {
@@ -103,166 +119,186 @@ impl Flusher<TraceWriteDelta> for TraceFlusher {
     }
 }
 
-async fn direct_write(
-    storage: &dyn Storage,
-    page_config: &PageConfig,
-    retention: Option<Duration>,
-    segment_ns: u64,
-    groups: BTreeMap<TraceGroup, Vec<Trace>>,
-) -> Result<usize> {
-    if groups.is_empty() {
-        return Ok(0);
-    }
-    let retention = retention_values(retention)?;
-    let mut heads = load_heads(storage, &groups).await?;
-    let mut ops = Vec::new();
-    let mut catalogs = BTreeMap::<(Namespace, SegmentId), CatalogBatch>::new();
-    let mut partition_catalogs = BTreeMap::<Namespace, CatalogBatch>::new();
-    let mut pages = 0usize;
-    for ((namespace, segment), traces) in groups {
-        let partition_catalog = partition_catalogs.entry(namespace.clone()).or_default();
-        partition_catalog.insert(
-            PARTITION_SCOPE,
-            PARTITION_NAME,
-            DiscoveryValue::Int(segment),
-        );
-        let last_segment = traces
-            .iter()
-            .map(|trace| segment_for(trace.timestamp_range().1, segment_ns))
-            .max()
-            .unwrap_or(segment);
-        if last_segment > segment {
-            partition_catalog.insert(
-                PARTITION_SCOPE,
-                PARTITION_EXTENT_NAME,
-                DiscoveryValue::String(format!("{segment}:{last_segment}")),
-            );
-        }
-        let catalog = catalogs.entry((namespace.clone(), segment)).or_default();
-        let sequence_key = next_sequence_key(&namespace, segment);
-        let mut sequence = storage
-            .get(sequence_key.clone())
-            .await?
-            .map(|record| decode_sequence(&record.value))
-            .transpose()?
-            .unwrap_or(0);
-        let mut builder = PageBuilder::new(page_config.clone())?;
-        let namespace_heads = heads.entry(namespace.clone()).or_default();
-        let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
-            append_page_ops(
-                &mut ops,
-                &namespace,
-                PageWriteId { segment, sequence },
-                &page,
-                &traces,
-                retention,
-                (catalog, &mut *namespace_heads),
-            )?;
-            sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
-            pages = pages.saturating_add(1);
-            Ok(())
-        };
-        for trace in traces {
-            if let Some(completed) = builder.append_with_traces(trace)? {
-                cut_page(completed)?;
-            }
-        }
-        if let Some(completed) = builder.finish_with_traces()? {
-            cut_page(completed)?;
-        }
-        ops.push(RecordOp::put_with_ttl(
-            sequence_key,
-            encode_sequence(sequence),
-            retention.physical_ttl,
-        ));
-    }
-    for ((namespace, segment), catalog) in catalogs {
-        ops.extend(catalog.into_ops(&segment_prefix(&namespace, segment), retention.physical_ttl));
-    }
-    for (namespace, catalog) in partition_catalogs {
-        ops.extend(catalog.into_ops(
-            &segment_prefix(&namespace, LOCATOR_SEGMENT),
-            retention.physical_ttl,
-        ));
-    }
-    for (namespace, heads) in heads {
-        for (trace_id, head) in heads {
-            if !head.dirty {
-                continue;
-            }
-            let mut first = head.first;
-            if head.continued {
-                first.expires_at_unix_ms = retention.expires_at_unix_ms;
-            }
-            ops.push(RecordOp::put_with_ttl(
-                head_key(&namespace, trace_id),
-                encode_head(&TraceHead {
-                    first,
-                    continued: head.continued,
-                })?,
-                retention.physical_ttl,
-            ));
+impl TraceFlusher {
+    pub(super) fn new(
+        storage: Arc<dyn Storage>,
+        page_config: PageConfig,
+        retention: Option<Duration>,
+        segment_ns: u64,
+        read_cache: Arc<ReadCache>,
+    ) -> Self {
+        Self {
+            storage,
+            page_config,
+            retention,
+            segment_ns,
+            read_cache,
+            sequences: HashMap::new(),
         }
     }
-    storage.apply(ops).await?;
-    Ok(pages)
-}
 
-/// A trace's head as this flush will leave it.
-struct HeadState {
-    first: TraceLocator,
-    continued: bool,
-    dirty: bool,
-}
-
-type FlushHeads = HashMap<Namespace, HashMap<TraceId, HeadState>>;
-
-/// Live heads of every trace in the flush. Head keys are point keys, so
-/// traces seen for the first time are answered by the bloom filter.
-async fn load_heads(
-    storage: &dyn Storage,
-    groups: &BTreeMap<TraceGroup, Vec<Trace>>,
-) -> Result<FlushHeads> {
-    let now = unix_time_ms()?;
-    let mut wanted = BTreeMap::<&Namespace, BTreeSet<TraceId>>::new();
-    for ((namespace, _), traces) in groups {
-        wanted
-            .entry(namespace)
-            .or_default()
-            .extend(traces.iter().map(|trace| trace.trace_id));
-    }
-    let mut heads = FlushHeads::new();
-    for (namespace, trace_ids) in wanted {
-        let found = stream::iter(trace_ids)
-            .map(|trace_id| async move {
-                let head = storage
-                    .get(head_key(namespace, trace_id))
+    /// Reads the next page sequence of every segment in `groups` this
+    /// process has not written since it last evicted it.
+    async fn load_sequences(&mut self, groups: &BTreeMap<TraceGroup, Vec<Trace>>) -> Result<()> {
+        let storage = self.storage.as_ref();
+        let missing = groups
+            .keys()
+            .filter(|group| !self.sequences.contains_key(*group))
+            .cloned()
+            .collect::<Vec<_>>();
+        let loaded = stream::iter(missing)
+            .map(|group| async move {
+                let next = storage
+                    .get(next_sequence_key(&group.0, group.1))
                     .await?
-                    .map(|record| decode_head(&record.value))
+                    .map(|record| decode_sequence(&record.value))
                     .transpose()?
-                    .filter(|head| !head.first.is_expired_at(now));
-                Ok::<_, Error>(head.map(|head| (trace_id, head)))
+                    .unwrap_or(0);
+                Ok::<_, Error>((group, next))
             })
             .buffer_unordered(READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
-        let namespace_heads = found
-            .into_iter()
-            .flatten()
-            .map(|(trace_id, head)| {
-                let state = HeadState {
-                    first: head.first,
-                    continued: head.continued,
-                    dirty: false,
-                };
-                (trace_id, state)
-            })
-            .collect();
-        heads.insert(namespace.clone(), namespace_heads);
+        let touched = Instant::now();
+        self.sequences.extend(
+            loaded
+                .into_iter()
+                .map(|(group, next)| (group, NextSequence { next, touched })),
+        );
+        Ok(())
     }
-    Ok(heads)
+
+    /// Writes every group atomically, returning the pages written and every
+    /// trace they hold. A failed write ends the flusher, so the sequences it
+    /// advanced are never reused.
+    async fn direct_write(
+        &mut self,
+        groups: BTreeMap<TraceGroup, Vec<Trace>>,
+    ) -> Result<(usize, Vec<(Namespace, TraceId)>)> {
+        if groups.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let retention = retention_values(self.retention)?;
+        self.load_sequences(&groups).await?;
+        let mut heads = FlushHeads::new();
+        let mut ops = Vec::new();
+        let mut catalogs = BTreeMap::<(Namespace, SegmentId), CatalogBatch>::new();
+        let mut partition_catalogs = BTreeMap::<Namespace, CatalogBatch>::new();
+        let mut pages = 0usize;
+        for ((namespace, segment), traces) in groups {
+            let state = self
+                .sequences
+                .get_mut(&(namespace.clone(), segment))
+                .expect("load_sequences loads every written segment");
+            state.touched = Instant::now();
+            pages = pages.saturating_add(append_segment(
+                &mut ops,
+                (&namespace, segment),
+                traces,
+                &mut state.next,
+                (&self.page_config, self.segment_ns, retention),
+                (
+                    partition_catalogs.entry(namespace.clone()).or_default(),
+                    catalogs.entry((namespace.clone(), segment)).or_default(),
+                    heads.entry(namespace.clone()).or_default(),
+                ),
+            )?);
+        }
+        for ((namespace, segment), catalog) in catalogs {
+            ops.extend(
+                catalog.into_ops(&segment_prefix(&namespace, segment), retention.physical_ttl),
+            );
+        }
+        for (namespace, catalog) in partition_catalogs {
+            ops.extend(catalog.into_ops(
+                &segment_prefix(&namespace, LOCATOR_SEGMENT),
+                retention.physical_ttl,
+            ));
+        }
+        let mut written = Vec::new();
+        for (namespace, heads) in heads {
+            for (trace_id, head) in heads {
+                ops.push(RecordOp::merge_with_ttl(
+                    head_key(&namespace, trace_id),
+                    encode_head(&head)?,
+                    retention.physical_ttl,
+                ));
+                written.push((namespace.clone(), trace_id));
+            }
+        }
+        self.storage.apply(ops).await?;
+        self.sequences
+            .retain(|_, state| state.touched.elapsed() < SEQUENCE_IDLE_EVICTION);
+        Ok((pages, written))
+    }
+}
+
+/// Appends one segment's pages, numbered from `sequence`, which it advances,
+/// and returns how many it wrote.
+fn append_segment(
+    ops: &mut Vec<RecordOp>,
+    (namespace, segment): (&Namespace, SegmentId),
+    traces: Vec<Trace>,
+    sequence: &mut u64,
+    (page_config, segment_ns, retention): (&PageConfig, u64, Retention),
+    (partition_catalog, catalog, heads): (
+        &mut CatalogBatch,
+        &mut CatalogBatch,
+        &mut HashMap<TraceId, TraceHead>,
+    ),
+) -> Result<usize> {
+    partition_catalog.insert(
+        PARTITION_SCOPE,
+        PARTITION_NAME,
+        DiscoveryValue::Int(segment),
+    );
+    let last_segment = traces
+        .iter()
+        .map(|trace| segment_for(trace.timestamp_range().1, segment_ns))
+        .max()
+        .unwrap_or(segment);
+    if last_segment > segment {
+        partition_catalog.insert(
+            PARTITION_SCOPE,
+            PARTITION_EXTENT_NAME,
+            DiscoveryValue::String(format!("{segment}:{last_segment}")),
+        );
+    }
+    let mut pages = 0usize;
+    let mut builder = PageBuilder::new(page_config.clone())?;
+    let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
+        append_page_ops(
+            ops,
+            namespace,
+            PageWriteId {
+                segment,
+                sequence: *sequence,
+            },
+            &page,
+            &traces,
+            retention,
+            (catalog, heads),
+        )?;
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
+        pages = pages.saturating_add(1);
+        Ok(())
+    };
+    for trace in traces {
+        if let Some(completed) = builder.append_with_traces(trace)? {
+            cut_page(completed)?;
+        }
+    }
+    if let Some(completed) = builder.finish_with_traces()? {
+        cut_page(completed)?;
+    }
+    ops.push(RecordOp::put_with_ttl(
+        next_sequence_key(namespace, segment),
+        encode_sequence(*sequence),
+        retention.physical_ttl,
+    ));
+    Ok(pages)
 }
 
 fn retention_values(retention: Option<Duration>) -> Result<Retention> {
@@ -306,56 +342,38 @@ struct PageWriteId {
     sequence: u64,
 }
 
-/// Records that `trace_id` is stored at `here`, returning whether this page
-/// continues it. A trace's first page only updates its head; its second
-/// also gives the first page a continuation record and a marker, since the
-/// first page's metadata was written before the trace was known to span
-/// pages.
+/// Writes the continuation record of `trace_id` at `here` and adds the page
+/// to the trace's head operand for this flush. Returns whether an earlier
+/// page of this flush holds the trace.
 fn record_page(
     ops: &mut Vec<RecordOp>,
     namespace: &Namespace,
-    heads: &mut HashMap<TraceId, HeadState>,
+    heads: &mut HashMap<TraceId, TraceHead>,
     trace_id: TraceId,
     here: TraceLocator,
     retention: Retention,
 ) -> Result<bool> {
-    let Some(head) = heads.get_mut(&trace_id) else {
-        heads.insert(
-            trace_id,
-            HeadState {
-                first: here,
-                continued: false,
-                dirty: true,
-            },
-        );
-        return Ok(false);
-    };
-    if !head.continued {
-        let first = head.first;
-        ops.push(RecordOp::put_with_ttl(
-            continuation_key(namespace, trace_id, first.segment, first.page_sequence),
-            encode_locator(&first)?,
-            retention.physical_ttl,
-        ));
-        ops.push(RecordOp::put_with_ttl(
-            marker_key(
-                namespace,
-                first.segment,
-                first.page_sequence,
-                first.trace_index,
-            ),
-            marker_value(),
-            retention.physical_ttl,
-        ));
-        head.continued = true;
-    }
     ops.push(RecordOp::put_with_ttl(
         continuation_key(namespace, trace_id, here.segment, here.page_sequence),
         encode_locator(&here)?,
         retention.physical_ttl,
     ));
-    head.dirty = true;
-    Ok(true)
+    match heads.entry(trace_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(TraceHead {
+                first: here,
+                continued: false,
+                pages: 1,
+            });
+            Ok(false)
+        }
+        Entry::Occupied(entry) => {
+            let head = entry.into_mut();
+            head.continued = true;
+            head.pages = head.pages.saturating_add(1);
+            Ok(true)
+        }
+    }
 }
 
 fn append_page_ops(
@@ -365,7 +383,7 @@ fn append_page_ops(
     page: &Page,
     traces: &[Trace],
     retention: Retention,
-    (catalog, heads): (&mut CatalogBatch, &mut HashMap<TraceId, HeadState>),
+    (catalog, heads): (&mut CatalogBatch, &mut HashMap<TraceId, TraceHead>),
 ) -> Result<()> {
     let directory = page.directory();
     let (Some(min_timestamp_ns), Some(max_timestamp_ns)) = (

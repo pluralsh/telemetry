@@ -413,6 +413,120 @@ impl BitSet {
     pub fn count_ones(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
+
+    /// Backing words, bit `i` at `words[i / 64] >> (i % 64)`. Bits at or
+    /// past `len` are always zero.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        &self.bits
+    }
+
+    /// Bitwise AND of two equal-length sets.
+    pub fn and(&self, other: &BitSet) -> BitSet {
+        assert_eq!(self.len, other.len, "bitset length mismatch");
+        BitSet {
+            bits: self
+                .bits
+                .iter()
+                .zip(&other.bits)
+                .map(|(a, b)| a & b)
+                .collect(),
+            len: self.len,
+        }
+    }
+
+    /// Calls `f` with every set index, ascending.
+    #[inline]
+    pub fn for_each_set(&self, mut f: impl FnMut(usize)) {
+        for (w, &word) in self.bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                f(w * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    /// Calls `f` with every set index within `range`, ascending. Panics if
+    /// `range` extends past `len`.
+    #[inline]
+    pub fn for_each_set_in(&self, range: Range<usize>, mut f: impl FnMut(usize)) {
+        assert!(
+            range.end <= self.len,
+            "range {range:?} out of bounds for bitset of len {}",
+            self.len
+        );
+        if range.is_empty() {
+            return;
+        }
+        let (first, last) = (range.start / 64, (range.end - 1) / 64);
+        for w in first..=last {
+            let mut bits = self.bits[w];
+            if w == first {
+                bits &= u64::MAX << (range.start % 64);
+            }
+            if w == last && !range.end.is_multiple_of(64) {
+                bits &= (1u64 << (range.end % 64)) - 1;
+            }
+            while bits != 0 {
+                f(w * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    /// Calls `f` with every cleared index in `0..len`, ascending.
+    #[inline]
+    pub fn for_each_clear(&self, mut f: impl FnMut(usize)) {
+        for (w, &word) in self.bits.iter().enumerate() {
+            let base = w * 64;
+            let in_range = if base + 64 <= self.len {
+                u64::MAX
+            } else {
+                (1u64 << (self.len - base)) - 1
+            };
+            let mut bits = !word & in_range;
+            while bits != 0 {
+                f(base + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    /// The 64 bits starting at `start` (bit `i` of the result is index
+    /// `start + i`); indices at or past `len` read as zero.
+    #[inline]
+    pub fn word_at(&self, start: usize) -> u64 {
+        let (word, shift) = (start / 64, start % 64);
+        let lo = self.bits.get(word).copied().unwrap_or(0) >> shift;
+        if shift == 0 {
+            lo
+        } else {
+            lo | self.bits.get(word + 1).copied().unwrap_or(0) << (64 - shift)
+        }
+    }
+
+    /// ORs `bits` into the 64 indices starting at `start` (bit `i` of
+    /// `bits` is index `start + i`). Panics if a set bit lands at or past
+    /// `len`.
+    #[inline]
+    pub fn or_word_at(&mut self, start: usize, bits: u64) {
+        if bits == 0 {
+            return;
+        }
+        let end = start + (64 - bits.leading_zeros() as usize);
+        assert!(
+            end <= self.len,
+            "bit {} out of bounds for bitset of len {}",
+            end - 1,
+            self.len
+        );
+        let (word, shift) = (start / 64, start % 64);
+        self.bits[word] |= bits << shift;
+        if shift != 0 && end > (word + 1) * 64 {
+            self.bits[word + 1] |= bits >> (64 - shift);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -719,5 +833,70 @@ mod tests {
         assert_eq!(bs.len(), 0);
         assert!(bs.is_empty());
         assert_eq!(bs.count_ones(), 0);
+    }
+
+    mod bitset_iteration {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn should_visit_exactly_the_matching_bits(
+                (bools, start, end) in prop::collection::vec(any::<bool>(), 0..300)
+                    .prop_flat_map(|bools| {
+                        let len = bools.len();
+                        (Just(bools), 0..=len, 0..=len)
+                    }),
+            ) {
+                let (start, end) = (start.min(end), start.max(end));
+                let mut bs = BitSet::with_len(bools.len());
+                for (i, _) in bools.iter().enumerate().filter(|(_, b)| **b) {
+                    bs.set(i);
+                }
+                let set: Vec<usize> = (0..bools.len()).filter(|&i| bools[i]).collect();
+                let clear: Vec<usize> = (0..bools.len()).filter(|&i| !bools[i]).collect();
+                let set_in: Vec<usize> = (start..end).filter(|&i| bools[i]).collect();
+
+                let mut got = Vec::new();
+                bs.for_each_set(|i| got.push(i));
+                prop_assert_eq!(&got, &set);
+                got.clear();
+                bs.for_each_clear(|i| got.push(i));
+                prop_assert_eq!(&got, &clear);
+                got.clear();
+                bs.for_each_set_in(start..end, |i| got.push(i));
+                prop_assert_eq!(&got, &set_in);
+                prop_assert_eq!(bs.and(&BitSet::all_set(bools.len())), bs.clone());
+                prop_assert_eq!(bs.words().len(), bools.len().div_ceil(64));
+            }
+
+            #[test]
+            fn should_read_and_or_words_at_any_offset(
+                (bools, start, bits) in prop::collection::vec(any::<bool>(), 1..300)
+                    .prop_flat_map(|bools| {
+                        let len = bools.len();
+                        (Just(bools), 0..len, any::<u64>())
+                    }),
+            ) {
+                let len = bools.len();
+                let mut bs = BitSet::with_len(len);
+                for (i, _) in bools.iter().enumerate().filter(|(_, b)| **b) {
+                    bs.set(i);
+                }
+                let want = (0..64)
+                    .filter(|&i| start + i < len && bools[start + i])
+                    .fold(0u64, |w, i| w | 1 << i);
+                prop_assert_eq!(bs.word_at(start), want);
+
+                let fits = (len - start).min(64);
+                let bits = if fits == 64 { bits } else { bits & ((1 << fits) - 1) };
+                bs.or_word_at(start, bits);
+                for (i, &b) in bools.iter().enumerate() {
+                    let ored = i >= start && i < start + 64 && (bits >> (i - start)) & 1 == 1;
+                    prop_assert_eq!(bs.get(i), b || ored, "bit {}", i);
+                }
+                prop_assert_eq!(bs.and(&BitSet::all_set(len)), bs.clone());
+            }
+        }
     }
 }

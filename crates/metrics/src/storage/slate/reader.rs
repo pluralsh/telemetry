@@ -529,6 +529,26 @@ impl StorageReader {
         checkpoint_id: Option<Uuid>,
         object_store: Arc<dyn ObjectStore>,
     ) -> crate::util::Result<Self> {
+        let cache = SharedDbCache::from_slatedb_config(slate_config).await?;
+        Self::try_new_with_cache(
+            slate_config,
+            reader_options,
+            checkpoint_id,
+            object_store,
+            &cache,
+        )
+        .await
+    }
+
+    /// Like [`Self::try_new_with_object_store`] but uses `cache` instead of
+    /// building one from the config.
+    pub(crate) async fn try_new_with_cache(
+        slate_config: &SlateDbStorageConfig,
+        reader_options: DbReaderOptions,
+        checkpoint_id: Option<Uuid>,
+        object_store: Arc<dyn ObjectStore>,
+        cache: &SharedDbCache,
+    ) -> crate::util::Result<Self> {
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
         let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
             .with_options(reader_options)
@@ -540,9 +560,7 @@ impl StorageReader {
             builder = builder.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint_id));
         }
 
-        if let Some(cache) =
-            build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
-        {
+        if let Some(cache) = cache.cache() {
             builder = builder.with_db_cache(cache);
         }
 
@@ -559,7 +577,8 @@ impl StorageReader {
         })
     }
 
-    /// Closes the underlying `DbReader` (which also closes the block cache).
+    /// Closes the underlying `DbReader`. An injected block cache stays open
+    /// for its owner to close.
     pub(crate) async fn close(&self) -> StorageResult<()> {
         self.reader
             .db

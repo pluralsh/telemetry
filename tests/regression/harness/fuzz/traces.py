@@ -39,6 +39,7 @@ from ..traces.normalize import (
 )
 from ..traces.wire import protobuf_body
 from .config import Endpoint, FuzzConfig, endpoint_from_env
+from .network import minio_floor_url, service_url
 from .rand import ODD_STRINGS, chance, quote, regex_escape, scaled, weighted, zipf
 from .runner import (
     Batch,
@@ -61,9 +62,18 @@ MAX_LIMIT = 1000
 # `tempo-s3` serves search and tag lookups from flushed blocks in MinIO
 # instead of ingester memory, matching the Traces reader's read path.
 ORACLE_CONFIGS = {"tempo": "tempo.yaml", "tempo-s3": "tempo-s3.yaml"}
-# `production` uses the crate defaults for page size, segment duration and
-# IO concurrency instead of the small values that exercise edge cases.
-IMPL_CONFIG_DIRS = {"regression": ".", "production": "production"}
+# `regression` runs two writers and a reader with 60s segments and two-trace
+# pages, to exercise sharding, page and segment boundaries. `production` runs
+# one standalone process and shard over MinIO with what the operator deploys
+# (1h segments, 1 MiB pages of up to 1024 traces, its cache sizes, buffered
+# writes), the shape of the single-binary oracle, for benchmarks.
+# `production-sharded` runs the operator's settings as two writers and a
+# reader, to measure what sharding costs against `production`.
+IMPL_CONFIGS = ("regression", "production", "production-sharded")
+WRITER_URL = service_url("traces-writer-0", 3200, 13201)
+WRITER_1_URL = service_url("traces-writer-1", 3200, 13202)
+READER_URL = service_url("traces-reader", 3200, 13203)
+STANDALONE_S3_URL = service_url("traces-s3", 3200, 13205)
 RESERVOIR = 5000
 
 SERVICES = (
@@ -315,6 +325,7 @@ class TracesFuzz(FuzzProduct):
         "traces-writer-0": "impl",
         "traces-writer-1": "impl",
         "traces-reader": "impl",
+        "traces-s3": "impl",
     }
 
     def __init__(self, config: FuzzConfig) -> None:
@@ -322,17 +333,30 @@ class TracesFuzz(FuzzProduct):
         tenant = os.environ.get("FUZZ_TRACES_NAMESPACE", "regression")
         scope = (("X-Scope-OrgID", tenant),)
         expires_from = int(time.time() + config.duration_s)
+        self.impl_config = os.environ.get("FUZZ_TRACES_CONFIG") or "regression"
+        if self.impl_config not in IMPL_CONFIGS:
+            raise ValueError(f"FUZZ_TRACES_CONFIG must be one of {IMPL_CONFIGS}")
+        self.standalone = self.impl_config == "production"
+        write_url, read_url = (
+            (STANDALONE_S3_URL, STANDALONE_S3_URL)
+            if self.standalone
+            else (WRITER_URL, READER_URL)
+        )
         self.oracle_read = endpoint_from_env(
-            "traces", "oracle_read", Endpoint("http://localhost:13200", headers=scope)
+            "traces",
+            "oracle_read",
+            Endpoint(service_url("tempo", 3200, 13200), headers=scope),
         )
         self.oracle_write = endpoint_from_env(
-            "traces", "oracle_write", Endpoint("http://localhost:14320", headers=scope)
+            "traces",
+            "oracle_write",
+            Endpoint(service_url("tempo", 4318, 14320), headers=scope),
         )
         self.impl_write = endpoint_from_env(
             "traces",
             "impl_write",
             Endpoint(
-                f"http://localhost:13201/write/ns/{tenant}",
+                f"{write_url}/write/ns/{tenant}",
                 bearer("regression-write", now=expires_from),
                 scope,
             ),
@@ -341,7 +365,7 @@ class TracesFuzz(FuzzProduct):
             "traces",
             "impl_read",
             Endpoint(
-                f"http://localhost:13203/read/ns/{tenant}",
+                f"{read_url}/read/ns/{tenant}",
                 basic("regression-reader", "regression-read"),
                 scope,
             ),
@@ -352,15 +376,16 @@ class TracesFuzz(FuzzProduct):
         self.duplicate_rate = float(os.environ.get("FUZZ_TRACES_DUPLICATE_RATE", "0"))
         self.window_ns = int(config.window_s * SECOND)
         self.catalog = Catalog()
-        self.oracle = os.environ.get("FUZZ_TRACES_ORACLE") or "tempo"
+        self.oracle = os.environ.get("FUZZ_TRACES_ORACLE") or (
+            "tempo-s3" if config.historical else "tempo"
+        )
         if self.oracle not in ORACLE_CONFIGS:
             raise ValueError(
                 f"FUZZ_TRACES_ORACLE must be one of {tuple(ORACLE_CONFIGS)}"
             )
-        self.impl_config = os.environ.get("FUZZ_TRACES_CONFIG") or "regression"
-        if self.impl_config not in IMPL_CONFIG_DIRS:
+        if config.historical and self.oracle != "tempo-s3":
             raise ValueError(
-                f"FUZZ_TRACES_CONFIG must be one of {tuple(IMPL_CONFIG_DIRS)}"
+                "FUZZ_SCENARIO=historical needs FUZZ_TRACES_ORACLE=tempo-s3"
             )
         self._project: ComposeProject | None = None
         self._reader_started = False
@@ -377,7 +402,17 @@ class TracesFuzz(FuzzProduct):
         # 2.9 made negated structural operators keep B, which Traces follows.
         os.environ.setdefault("TEMPO_IMAGE", "grafana/tempo:2.10.8")
         os.environ["TEMPO_CONFIG"] = ORACLE_CONFIGS[self.oracle]
-        os.environ["TRACES_CONFIG_DIR"] = IMPL_CONFIG_DIRS[self.impl_config]
+
+        if self.standalone:
+            impl_services: tuple[str, ...] = ("traces-s3",)
+            impl_ready = (f"{STANDALONE_S3_URL}/-/ready",)
+        else:
+            # Read by compose when interpolating the writer and reader mounts.
+            os.environ["TRACES_CONFIG_DIR"] = (
+                "production" if self.impl_config == "production-sharded" else "."
+            )
+            impl_services = ("traces-writer-0", "traces-writer-1")
+            impl_ready = (f"{WRITER_URL}/-/ready", f"{WRITER_1_URL}/-/ready")
 
         @contextmanager
         def managed() -> Iterator[object]:
@@ -386,31 +421,39 @@ class TracesFuzz(FuzzProduct):
                 lambda: ComposeProject(
                     file=PRODUCT_DIR / "docker-compose.yml",
                     name="traces-fuzz",
-                    services=(
-                        "tempo",
-                        "minio",
-                        "minio-init",
-                        "traces-writer-0",
-                        "traces-writer-1",
-                    ),
+                    services=("tempo", "minio", "minio-init", *impl_services),
+                    profiles=("standalone-s3",) if self.standalone else (),
                     readiness_urls=(
-                        "http://localhost:13200/ready",
-                        "http://localhost:13201/-/ready",
-                        "http://localhost:13202/-/ready",
+                        f"{service_url('tempo', 3200, 13200)}/ready",
+                        *impl_ready,
                     ),
                 ),
+                roles=self.resource_roles,
             ) as project:
                 self._project = project
                 yield project
 
         return managed()
 
+    def floor_urls(self) -> dict[str, str]:
+        urls = {"tempo": f"{service_url('tempo', 3200, 13200)}/ready"}
+        if self.standalone:
+            urls["traces-s3"] = f"{STANDALONE_S3_URL}/-/ready"
+            return {**urls, **minio_floor_url()}
+        urls["traces-writer-0"] = f"{WRITER_URL}/-/ready"
+        urls["traces-writer-1"] = f"{WRITER_1_URL}/-/ready"
+        if self._reader_started:
+            urls["traces-reader"] = f"{READER_URL}/-/ready"
+        return {**urls, **minio_floor_url()}
+
     def after_ingest(self, index: int) -> None:
         # Mirrors the regression suite: the reader starts once writers have
         # created shard state.
+        if self.standalone:
+            return
         if self._project is not None and not self._reader_started:
             self._project.up("traces-reader")
-            wait_http("http://localhost:13203/-/ready")
+            wait_http(f"{READER_URL}/-/ready")
             self._reader_started = True
 
     # Data generation ---------------------------------------------------------

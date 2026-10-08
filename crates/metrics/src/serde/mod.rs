@@ -1,3 +1,4 @@
+pub mod chunk;
 pub mod dictionary;
 pub mod forward_index;
 pub mod inverted_index;
@@ -129,6 +130,7 @@ pub enum RecordType {
     ForwardIndex = 0x03,
     InvertedIndex = 0x04,
     TimeSeries = 0x05,
+    BucketGeneration = 0x06,
 }
 
 impl RecordType {
@@ -144,6 +146,7 @@ impl RecordType {
             0x03 => Ok(RecordType::ForwardIndex),
             0x04 => Ok(RecordType::InvertedIndex),
             0x05 => Ok(RecordType::TimeSeries),
+            0x06 => Ok(RecordType::BucketGeneration),
             _ => Err(EncodingError {
                 message: format!("invalid record type: 0x{:02x}", id),
             }),
@@ -222,6 +225,25 @@ pub fn parse_record_prefix(
     ))
 }
 
+/// The record type of a bucket-scoped key, validated like
+/// [`parse_record_prefix`] but without decoding the namespace.
+pub(crate) fn record_type_of(buf: &[u8]) -> Result<RecordType, EncodingError> {
+    KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
+    let fields = common::serde::terminated_bytes::find_terminator_end(buf, KEY_PREFIX_LEN)
+        .ok_or_else(|| EncodingError {
+            message: "unterminated namespace in key".to_string(),
+        })?;
+    let bucket = buf.get(fields..fields + 6).ok_or_else(|| EncodingError {
+        message: "Buffer too short for bucket fields".to_string(),
+    })?;
+    if bucket[4] == 0 {
+        return Err(EncodingError {
+            message: "bucket_size 0 is reserved".to_string(),
+        });
+    }
+    RecordType::from_id(bucket[5])
+}
+
 /// Trait for record keys that have a record type
 pub trait RecordKey {
     const RECORD_TYPE: RecordType;
@@ -282,6 +304,18 @@ mod tests {
         assert_eq!(decoded_namespace, namespace);
         assert_eq!(decoded_bucket, bucket);
         assert_eq!(decoded_type, RecordType::TimeSeries);
+        assert_eq!(record_type_of(&buf).unwrap(), RecordType::TimeSeries);
+    }
+
+    #[test]
+    fn record_type_of_skips_an_escaped_namespace() {
+        let mut buf = BytesMut::new();
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(&mut buf);
+        common::serde::terminated_bytes::serialize(b"a\x00b\x01", &mut buf);
+        buf.put_u32(7);
+        buf.put_u8(1);
+        buf.put_u8(RecordType::InvertedIndex.id());
+        assert_eq!(record_type_of(&buf).unwrap(), RecordType::InvertedIndex);
     }
 
     #[test]
@@ -308,6 +342,8 @@ mod tests {
         let err = parse_record_prefix(&buf).unwrap_err();
 
         assert!(err.message.contains("bucket_size 0 is reserved"));
+        let err = record_type_of(&buf).unwrap_err();
+        assert!(err.message.contains("bucket_size 0 is reserved"));
     }
 
     #[test]
@@ -315,6 +351,7 @@ mod tests {
         let buf = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0, 1];
         let err = parse_record_prefix(&buf).unwrap_err();
         assert!(err.message.contains("Buffer too short"));
+        assert!(record_type_of(&buf).is_err());
     }
 
     #[test]

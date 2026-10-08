@@ -282,9 +282,88 @@ impl TimeBucketScoped for TimeSeriesKey {
     }
 }
 
+/// BucketGeneration key: the record type alone, one record per bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketGenerationKey {
+    pub namespace: Namespace,
+    pub bucket: TimeBucket,
+}
+
+impl BucketGenerationKey {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        write_record_prefix(
+            &mut buf,
+            &self.namespace,
+            &self.bucket,
+            RecordType::BucketGeneration,
+        );
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        if record_type != RecordType::BucketGeneration {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid record type: expected BucketGeneration, got {:?}",
+                    record_type
+                ),
+            });
+        }
+        if offset != buf.len() {
+            return Err(EncodingError {
+                message: "trailing bytes after BucketGenerationKey".to_string(),
+            });
+        }
+        Ok(BucketGenerationKey { namespace, bucket })
+    }
+}
+
+impl RecordKey for BucketGenerationKey {
+    const RECORD_TYPE: RecordType = RecordType::BucketGeneration;
+}
+
+impl TimeBucketScoped for BucketGenerationKey {
+    fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+    fn bucket(&self) -> TimeBucket {
+        self.bucket
+    }
+}
+
+/// A bucket's write generation, stored as `u64` little-endian.
+pub fn encode_bucket_generation(generation: u64) -> Bytes {
+    Bytes::copy_from_slice(&generation.to_le_bytes())
+}
+
+pub fn decode_bucket_generation(buf: &[u8]) -> Result<u64, EncodingError> {
+    let bytes: [u8; 8] = buf.try_into().map_err(|_| EncodingError {
+        message: format!("bucket generation must be 8 bytes, got {}", buf.len()),
+    })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_encode_and_decode_bucket_generation_key() {
+        let key = BucketGenerationKey {
+            namespace: crate::Namespace::new("tenant").unwrap(),
+            bucket: TimeBucket::hour(120),
+        };
+        let encoded = key.encode();
+        assert_eq!(*encoded.last().unwrap(), RecordType::BucketGeneration.id());
+        assert_eq!(BucketGenerationKey::decode(&encoded).unwrap(), key);
+        assert_eq!(
+            decode_bucket_generation(&encode_bucket_generation(42)).unwrap(),
+            42
+        );
+        assert!(decode_bucket_generation(&[1, 2]).is_err());
+    }
 
     #[test]
     fn should_encode_and_decode_series_dictionary_key() {

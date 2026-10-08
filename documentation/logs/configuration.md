@@ -75,7 +75,7 @@ storage:
 #   type: InMemory
 
 segment_duration_seconds: 3600 # Time partition width; keep stable for a dataset.
-retention_seconds: 2592000 # Optional logical retention; 30 days.
+retention_seconds: 1209600 # Logical retention; 14 days, the default. `null` keeps data forever.
 
 # Each write-buffer flush packs every written stream of a segment into
 # multi-stream objects; these limits cut larger flushes into several objects.

@@ -79,7 +79,8 @@ checks run with `--extended`. Traces exposes Jaeger collector gRPC on host ports
 compatibility even though the host harness currently exercises OTLP and Zipkin.
 
 Host ports are Loki `13100`, Logs `13101`, retention Logs `13102`, Prometheus
-`19090`, Metrics writers `18080`/`18081`, Metrics reader `18082`, and Metrics MinIO
+`19090`, Metrics writers `18080`/`18081`, Metrics reader `18082`, standalone
+Metrics fuzz target `18083`, and Metrics MinIO
 `19000`. Traces uses Tempo `13200`, writers `13201`/`13202`, reader `13203`,
 retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
 Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`.
@@ -122,6 +123,10 @@ the seed, although wall-clock time still shifts the data windows.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `FUZZ_SEED` | random | Seed for data and query generation |
+| `FUZZ_SCENARIO` | `recent` | `recent` (each product's default oracle) or `historical` (every oracle answers from object storage, behind a MinIO latency proxy; see below) |
+| `MINIO_FIRST_BYTE_MS` | `15` | Historical scenario: delay added before the first byte of every MinIO response |
+| `FUZZ_PIN_CPUS` | `1` | Pin shared services, the runner, the implementation, and the oracle to disjoint cpusets (needs at least 4 Docker CPUs); `0` disables |
+| `FUZZ_CPU_RANGE` | unset | Confine pinning to these cores (such as `6-11`); set per lane by `bench --lanes` |
 | `FUZZ_SCALE` | `1` | Multiplier on data volume per round |
 | `FUZZ_WINDOW` | 20m / 30m / 10m | Time span covered by each round's data |
 | `FUZZ_QUERIES_PER_ROUND` | `40-160` | Queries per round, as a fixed count or a range |
@@ -133,15 +138,20 @@ the seed, although wall-clock time still shifts the data windows.
 | `FUZZ_FAIL_ON` | `mismatch,impl_error,impl_timeout,unstable_impl,ingest` | Outcomes that fail the run |
 | `FUZZ_OUTPUT_DIR` | `target/fuzz/<product>-<run id>` | Report location |
 | `FUZZ_RECORD_DATA` | `1` | Store each round's generated dataset (gzip) |
+| `FUZZ_HISTORY_DIR` | unset (off) | Also record a compact benchmark entry under this directory (relative paths are from the repository root), e.g. `documentation/benchmarks/fuzz` |
+| `FUZZ_HISTORY_HOST_LABEL` | unset | Short machine name stored in history entries |
+| `FUZZ_HISTORY_BATCH` | unset | Groups entries from one benchmark; set by `harness.fuzz.bench` |
 | `FUZZ_LOGS_STORAGE` | `s3` | Logs implementation backend: `s3` (MinIO) or `local` |
-| `FUZZ_LOGS_CONFIG` | `regression` | Logs implementation config (S3 storage only): `regression` (60s segments, 16 KiB/128-row pages, 2m discovery rollups, fast compaction, to exercise segment, page and rollup boundaries) or `production` (crate defaults: 1h segments, 1 MiB pages, 24h rollups) |
+| `FUZZ_LOGS_CONFIG` | `regression` | Logs implementation config (S3 storage only): `regression` (60s segments, 16 KiB/128-row pages, 2m discovery rollups, fast compaction, to exercise segment, page and rollup boundaries) or `production` (the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments, 1 MiB/8192-row pages, 24h rollups) |
 | `FUZZ_LOGS_DUPLICATE_RATE` | `0.02` | Fraction of log entries re-sent with an identical timestamp and line |
 | `FUZZ_TRACES_DUPLICATE_RATE` | `0` | Fraction of spans re-sent in a later request. Opt-in: Tempo returns the copies until it compacts the trace, while Traces deduplicates them at query time |
 | `FUZZ_TRACES_ORACLE` | `tempo` | Traces oracle: `tempo` (local-disk blocks; with the default frontend settings recent data is served from ingester memory) or `tempo-s3` (blocks in the shared MinIO, search and tag lookups read only flushed blocks, ingesters drop flushed blocks after 15s; the like-for-like object-store comparison) |
-| `FUZZ_TRACES_CONFIG` | `regression` | Traces implementation configs: `regression` (60s segments, two-trace pages, IO concurrency 2, to exercise page and segment boundaries) or `production` (crate defaults: 1h segments, 1 MiB/4 MiB pages of up to 1024 traces, IO concurrency 128) |
+| `FUZZ_TRACES_CONFIG` | `regression` | Traces implementation: `regression` (two writers and a reader with 60s segments, two-trace pages, IO concurrency 2, to exercise sharding, page and segment boundaries) or `production` (one standalone process and shard over MinIO, like the single-binary Tempo, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments and 1 MiB/4 MiB pages of up to 1024 traces) |
 | `FUZZ_LOGS_UNALIGNED_RATE` | `0.5` | Fraction of LogQL metric range queries sent unaligned to their step, exercising frontend step alignment |
 | `TEMPO_IMAGE` | `grafana/tempo:2.10.8` | Tempo oracle for traces fuzzing; the live regression suite keeps `2.8.2`, which returns nothing for negated structural operators when the left side matches no spans |
-| `FUZZ_METRICS_ORACLE` | `prometheus` | Metrics oracle: `prometheus` (local-disk TSDB), `mimir` (Mimir 3.2.1 on the shared MinIO, stock read path serving recent data from ingester memory), or `mimir-blocks` (flushes each round to MinIO and reads only through the store-gateway, the like-for-like object-store comparison; adds ~30s of visibility wait per round). `MIMIR_QUERY_ENGINE=prometheus` swaps Mimir's default MQE engine for the Prometheus engine |
+| `FUZZ_METRICS_ORACLE` | `prometheus` | Metrics oracle: `prometheus` (local-disk TSDB), `mimir` (Mimir 3.2.1 on the shared MinIO, stock read path serving recent data from ingester memory), or `mimir-blocks` (flushes each round to MinIO and reads only through the store-gateway, the like-for-like object-store comparison; adds ~30s of visibility wait per round). Mimir runs with its ingester postings-for-matchers caches off, since with query sharding they hide series created within the last 10s. Where MQE answers a query Prometheus rejects for duplicate series, the case is `inconclusive`. `MIMIR_QUERY_ENGINE=prometheus` swaps Mimir's default MQE engine for the Prometheus engine |
+| `FUZZ_METRICS_STORAGE` | `s3` | Metrics under test: `s3` (two writers and a reader over MinIO) or `local` (one standalone process on a local-disk volume with the same caches, durability, and flush interval, so a Prometheus comparison leaves out the object store) |
+| `FUZZ_METRICS_CONFIG` | `regression` | Metrics implementation (S3 storage only): `regression` (two writers and a reader with 64 MiB caches and durable writes flushed every second, to exercise sharding) or `production` (one standalone process and shard over MinIO, like the single-process oracles, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s and a 256 MiB reader cache) |
 | `FUZZ_METRICS_STRICT_NAME` | `0` | Compare `__name__` even where Prometheus drops it after functions (Metrics keeps it; the live suite ignores this too) |
 
 Each run writes `summary.md` and `summary.json`, which contain per-family
@@ -152,6 +162,84 @@ line per query, with both latencies), `ingest.jsonl`, `rounds.jsonl`,
 latency outlier), and `data/` (generated datasets). Cases where both sides hit
 a result limit, or where either side fails a recheck against itself, are
 counted separately and do not count as mismatches.
+
+### Benchmark history
+
+With `FUZZ_HISTORY_DIR` set, both entrypoints also store a summary-level
+entry (git revision, host and Docker resources, settings, outcomes, latency,
+and CPU/memory, but no cases or data) and regenerate the history index. The
+checked-in history lives in
+[`documentation/benchmarks/fuzz`](../../documentation/benchmarks/fuzz/README.md);
+see [`documentation/benchmarks`](../../documentation/benchmarks/README.md) for
+the layout, how to read it, and `--lanes` for concurrent runs. To benchmark
+every product with consistent settings and record history:
+
+```sh
+PYTHONPATH=tests/regression mise exec -- \
+  python -m harness.fuzz.bench --duration 30m --products logs,metrics,traces
+# import a finished run's output directory, e.g. a CI artifact
+PYTHONPATH=tests/regression mise exec -- \
+  python -m harness.fuzz.history record target/fuzz/metrics
+# regenerate README.md, index.json, and per-entry pages; --check for CI
+PYTHONPATH=tests/regression mise exec -- python -m harness.fuzz.history rebuild
+```
+
+For benchmark numbers, run the harness inside Docker so both sides are reached
+over the compose network rather than through host port forwarding (which on
+Docker Desktop adds a proxy hop to every request):
+
+```sh
+tests/regression/products/runner/run.sh \
+  python -m harness.fuzz.bench --duration 30m --products logs,metrics,traces
+```
+
+The runner mounts the Docker socket and the repository at its host path, sets
+`FUZZ_IN_NETWORK=1`, joins each product's `<project>_default` network after
+`up`, and forwards `FUZZ_*`, `REGRESSION_*`, `MIMIR_*`, and `TEMPO_*`
+variables. `run.json` records `network` as `compose-network` or `host-ports`;
+only compare runs with the same mode.
+
+`bench` defaults its history directory to `FUZZ_HISTORY_DIR`, then
+`documentation/benchmarks/fuzz`, writes full outputs to
+`target/fuzz/bench-<timestamp>/<product>`, continues after a failing
+product, and exits non-zero if any failed. `--scenarios recent,historical`
+runs every product once per scenario, into `<product>-<scenario>`.
+`bench` sets `FUZZ_<PRODUCT>_CONFIG` from `--config`, `production` by default
+so numbers reflect a deployed configuration; `--config regression` with a short
+`--duration` is the quick correctness pass over page, segment and cache
+boundaries.
+
+The `historical` scenario compares reads of data that only exists in object
+storage. Metrics uses `mimir-blocks` and traces uses `tempo-s3`. Logs switches
+Loki to `products/logs/loki-fuzz-historical.yaml`, which stores chunks in MinIO,
+flushes idle chunks within about a second, and stops querying ingesters; the
+harness flushes Loki after every round and waits until no chunks remain in
+memory. Loki 3.5's series API cannot see flushed streams until their TSDB index
+ships (every 15 minutes), so the logs fuzz skips series cases there. In every
+product, MinIO moves to `:9010` and `products/latency-proxy/proxy.py` takes over
+`minio:9000` inside MinIO's network namespace, delaying the first byte of each
+response by `MINIO_FIRST_BYTE_MS` for both sides.
+
+Every round also times a trivial readiness request against each service and
+reports it as the "Request floor" in `summary.md`, the per-request overhead
+below which latency comparisons are noise.
+
+To profile a run's queries natively, without HTTP or Docker, convert its
+output into replay input and run the crate's ignored `profile_fuzz_cases`
+test, which ingests the rounds once into `PROFILE_STORE` and writes one JSON
+line per case to `PROFILE_OUT`:
+
+```sh
+PYTHONPATH=tests/regression mise exec -- \
+  python -m harness.fuzz.replay metrics target/fuzz/metrics /tmp/replay
+PROFILE_CASES=/tmp/replay PROFILE_STORE=/tmp/replay-store \
+PROFILE_OUT=/tmp/replay.jsonl PROFILE_REPS=3 \
+  cargo test -p plural-metrics --features remote-write --release --lib \
+  profile::profile_fuzz_cases -- --ignored
+```
+
+Logs and traces work the same way, with `-p plural-logs` or `-p plural-traces`
+and the test path `db::query::profile::profile_fuzz_cases`.
 
 By default the fuzzer starts dedicated Compose stacks: project `logs-fuzz`
 (Loki on `13110`, S3-backed Logs over MinIO on `13111`, local-disk Logs on

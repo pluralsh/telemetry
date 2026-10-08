@@ -101,6 +101,10 @@ Differences:
 
 - `label_replace` accepts an invalid UTF-8 target label, and fails when the
   result has duplicate label sets where Prometheus succeeds.
+- `exp` uses the platform's correctly rounded `exp`. Go's `math.Exp` is not
+  correctly rounded, so Prometheus' result can differ by one ulp (about 10% of
+  inputs in `[-30, 30]`). That only shows when the exact value is visible, for
+  example in a `count_values` label.
 
 ## Histograms
 

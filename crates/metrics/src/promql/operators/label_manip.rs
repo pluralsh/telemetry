@@ -47,7 +47,52 @@ pub enum LabelManipKind {
 }
 
 impl LabelManipKind {
-    pub fn apply_to_labels(&self, labels: &Labels) -> Result<Labels, QueryError> {
+    /// Compiles the call's constants once, for applying to every input
+    /// labelset.
+    pub fn rewriter(&self) -> Result<LabelRewriter<'_>, QueryError> {
+        Ok(match self {
+            Self::Replace {
+                dst_label,
+                replacement,
+                src_label,
+                regex,
+            } => LabelRewriter::Replace {
+                dst_label,
+                replacement,
+                src_label,
+                regex: Regex::new(&format!("^(?s:{regex})$"))
+                    .map_err(|err| QueryError::Internal(err.to_string()))?,
+            },
+            Self::Join {
+                dst_label,
+                separator,
+                src_labels,
+            } => LabelRewriter::Join {
+                dst_label,
+                separator,
+                src_labels,
+            },
+        })
+    }
+}
+
+/// A [`LabelManipKind`] ready to apply; see [`LabelManipKind::rewriter`].
+pub enum LabelRewriter<'a> {
+    Replace {
+        dst_label: &'a str,
+        replacement: &'a str,
+        src_label: &'a str,
+        regex: Regex,
+    },
+    Join {
+        dst_label: &'a str,
+        separator: &'a str,
+        src_labels: &'a [String],
+    },
+}
+
+impl LabelRewriter<'_> {
+    pub fn apply(&self, labels: &Labels) -> Labels {
         match self {
             Self::Replace {
                 dst_label,
@@ -59,7 +104,7 @@ impl LabelManipKind {
                 dst_label,
                 separator,
                 src_labels,
-            } => Ok(apply_label_join(labels, dst_label, separator, src_labels)),
+            } => apply_label_join(labels, dst_label, separator, src_labels),
         }
     }
 }
@@ -69,22 +114,20 @@ fn apply_label_replace(
     dst_label: &str,
     replacement: &str,
     src_label: &str,
-    regex_src: &str,
-) -> Result<Labels, QueryError> {
-    let regex = Regex::new(&format!("^(?s:{regex_src})$"))
-        .map_err(|err| QueryError::Internal(err.to_string()))?;
+    regex: &Regex,
+) -> Labels {
     let src_value = labels.get(src_label).unwrap_or_default();
     let Some(captures) = regex.captures(src_value) else {
-        return Ok(labels.clone());
+        return labels.clone();
     };
 
     let mut replaced = String::new();
     captures.expand(replacement, &mut replaced);
-    Ok(rewrite_label(
+    rewrite_label(
         labels,
         dst_label,
         (!replaced.is_empty()).then_some(replaced),
-    ))
+    )
 }
 
 fn apply_label_join(
@@ -176,6 +219,9 @@ pub struct LabelManipOp<C: Operator> {
     input_to_output: Arc<[u32]>,
     schema: OperatorSchema,
     reservation: MemoryReservation,
+    /// Rejects two input series landing on one output series at all, not
+    /// only at the same step: Prometheus' rule for range-vector functions.
+    exclusive: bool,
     done: bool,
     errored: bool,
 }
@@ -205,9 +251,15 @@ impl<C: Operator> LabelManipOp<C> {
             input_to_output,
             schema: OperatorSchema::new(SchemaRef::Static(output_schema), step_grid),
             reservation,
+            exclusive: false,
             done: false,
             errored: false,
         }
+    }
+
+    pub fn exclusive(mut self) -> Self {
+        self.exclusive = true;
+        self
     }
 
     fn drain_child(&mut self, cx: &mut Context<'_>) -> Result<Option<Vec<StepBatch>>, QueryError> {
@@ -241,6 +293,7 @@ impl<C: Operator> LabelManipOp<C> {
         let cells = step_count.saturating_mul(out_series_count);
         let mut out = OutBuffers::allocate(&self.reservation, cells)?;
         let mut histograms: Option<HistogramCells> = None;
+        let mut owners = vec![u32::MAX; if self.exclusive { out_series_count } else { 0 }];
 
         for batch in &batches {
             let in_series_count = batch.series_count();
@@ -271,7 +324,12 @@ impl<C: Operator> LabelManipOp<C> {
                         || histograms
                             .as_ref()
                             .is_some_and(|cells| cells[out_cell].is_some());
-                    if occupied {
+                    let shared = owners.get_mut(out_series).is_some_and(|owner| {
+                        let other = *owner != u32::MAX && *owner != global_series as u32;
+                        *owner = global_series as u32;
+                        other
+                    });
+                    if occupied || shared {
                         return Err(QueryError::Internal(
                             "vector cannot contain metrics with the same labelset".to_string(),
                         ));

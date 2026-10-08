@@ -37,21 +37,23 @@ pub(crate) type LabelPostingsValue = Arc<Vec<(String, RoaringBitmap)>>;
 /// `forward_index_one`, used by the source adapter to parallelise at its
 /// own layer and keep per-call traces).
 pub(crate) struct IndexCache {
-    inverted: DashMap<InvertedKey, InvertedValue>,
-    forward: DashMap<ForwardKey, ForwardValue>,
-    inverted_terms: DashMap<(TimeBucket, Label), InvertedTermValue>,
-    forward_series: DashMap<(TimeBucket, SeriesId), ForwardSeriesValue>,
-    label_postings: DashMap<(TimeBucket, String), LabelPostingsValue>,
+    inverted: Map<InvertedKey, InvertedValue>,
+    forward: Map<ForwardKey, ForwardValue>,
+    inverted_terms: Map<(TimeBucket, Label), InvertedTermValue>,
+    forward_series: Map<(TimeBucket, SeriesId), ForwardSeriesValue>,
+    label_postings: Map<(TimeBucket, String), LabelPostingsValue>,
 }
+
+type Map<K, V> = DashMap<K, V, foldhash::fast::RandomState>;
 
 impl IndexCache {
     pub(crate) fn new() -> Self {
         Self {
-            inverted: DashMap::new(),
-            forward: DashMap::new(),
-            inverted_terms: DashMap::new(),
-            forward_series: DashMap::new(),
-            label_postings: DashMap::new(),
+            inverted: Map::default(),
+            forward: Map::default(),
+            inverted_terms: Map::default(),
+            forward_series: Map::default(),
+            label_postings: Map::default(),
         }
     }
 
@@ -151,45 +153,21 @@ impl IndexCache {
         Ok(value)
     }
 
-    /// Batch form of [`Self::forward_index_one`], sharing its cache: hits
-    /// are served from the cache and the misses are fetched in one
-    /// [`QueryReader::forward_index_many`] call. Returned in `series_ids`
-    /// order.
+    /// Batch form of [`Self::forward_index_one`], in `series_ids` order.
+    /// Not memoised per query: bucket readers keep a cross-query
+    /// forward-index cache that a batch reads under one lock, cheaper than
+    /// a per-series map here.
     pub(crate) async fn forward_index_many<R: QueryReader + ?Sized>(
         &self,
         reader: &R,
         bucket: &TimeBucket,
         series_ids: &[SeriesId],
     ) -> Result<Vec<ForwardSeriesValue>> {
-        let mut out: Vec<Option<ForwardSeriesValue>> = series_ids
-            .iter()
-            .map(|&series_id| {
-                self.forward_series
-                    .get(&(*bucket, series_id))
-                    .map(|hit| hit.clone())
-            })
-            .collect();
-        let (miss_positions, miss_ids): (Vec<usize>, Vec<SeriesId>) = out
-            .iter()
-            .zip(series_ids)
-            .enumerate()
-            .filter(|(_, (slot, _))| slot.is_none())
-            .map(|(position, (_, &series_id))| (position, series_id))
-            .unzip();
-        if !miss_ids.is_empty() {
-            let fetched = reader.forward_index_many(bucket, &miss_ids).await?;
-            for ((position, series_id), spec) in
-                miss_positions.into_iter().zip(miss_ids).zip(fetched)
-            {
-                let value: ForwardSeriesValue = Arc::new(spec);
-                self.forward_series
-                    .insert((*bucket, series_id), value.clone());
-                out[position] = Some(value);
-            }
-        }
-        Ok(out
+        Ok(reader
+            .forward_index_many(bucket, series_ids)
+            .await?
             .into_iter()
-            .map(|slot| slot.expect("every slot is a hit or was fetched"))
+            .map(Arc::new)
             .collect())
     }
 }
@@ -242,7 +220,7 @@ mod tests {
                 SeriesSpec {
                     unit: None,
                     metric_type: Some(MetricType::Gauge),
-                    labels: vec![],
+                    labels: crate::model::Labels::empty(),
                 },
             );
             Ok(Box::new(fi))
@@ -292,7 +270,7 @@ mod tests {
             Ok(Some(SeriesSpec {
                 unit: None,
                 metric_type: Some(MetricType::Gauge),
-                labels: vec![],
+                labels: crate::model::Labels::empty(),
             }))
         }
 

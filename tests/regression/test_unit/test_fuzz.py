@@ -18,8 +18,9 @@ from harness.fuzz.config import (
     parse_duration,
     parse_range,
 )
+from harness.fuzz.cpus import CpuLayout, lane_ranges
 from harness.fuzz.logs import PUSH_BYTES, LogsFuzz, _grouped_positional
-from harness.fuzz.metrics import MetricsFuzz
+from harness.fuzz.metrics import MetricsFuzz, mqe_duplicate_series_quirk
 from harness.fuzz.rand import derive, quote, regex_escape
 from harness.fuzz.runner import (
     Batch,
@@ -138,6 +139,29 @@ def _equal(left: Exchange, right: Exchange) -> None:
 )
 def test_classification(oracle: Exchange, impl: Exchange, outcome: str) -> None:
     assert classify(_case(_equal), oracle, impl)[0] == outcome
+
+
+def test_mqe_duplicate_series_answer_is_inconclusive() -> None:
+    case = Case(
+        "unit",
+        "q",
+        Request("GET", "/q"),
+        _equal,
+        oracle_quirk=mqe_duplicate_series_quirk,
+    )
+    answered = _ok(
+        {"status": "success", "data": {"resultType": "vector", "result": []}}
+    )
+    for error in (
+        "found duplicate series for the match group; many-to-many matching not "
+        "allowed: matching labels must be unique on one side",
+        "vector cannot contain metrics with the same labelset",
+    ):
+        rejected = _ok({"status": "error", "error": error}, 422)
+        assert classify(case, answered, rejected)[0] == "inconclusive"
+        assert classify(_case(_equal), answered, rejected)[0] == "impl_error"
+    other = Exchange(422, b"other", 1.0)
+    assert classify(case, answered, other)[0] == "impl_error"
 
 
 def test_normalizer_assertions_count_as_mismatches() -> None:
@@ -436,3 +460,34 @@ def test_runner_respects_the_time_budget(servers, config) -> None:
     assert elapsed <= 3.5
     assert not summary.failed
     assert summary.outcomes["match"] > 0
+
+
+def test_cpu_layout_splits_cores_evenly_between_sides() -> None:
+    layout = CpuLayout.plan(9, runner=True)
+    assert layout.cpusets == {
+        "shared": "0",
+        "runner": "1",
+        "impl": "2-4",
+        "oracle": "5-7",
+    }
+    assert layout.cores["impl"] == layout.cores["oracle"] == 3
+    assert CpuLayout.plan(8, runner=False).cpusets["oracle"] == "4-6"
+    assert CpuLayout.plan(3, runner=False).describe()["pinned"] is False
+    assert CpuLayout.plan(None, runner=False).reason
+
+
+def test_cpu_layout_stays_inside_its_lane() -> None:
+    assert lane_ranges(12, 2) == ["0-5", "6-11"]
+    layout = CpuLayout.plan(12, runner=True, lane="6-11")
+    assert layout.cpusets == {
+        "shared": "6",
+        "runner": "7",
+        "impl": "8-9",
+        "oracle": "10-11",
+    }
+    assert layout.describe()["lane"] == "6-11"
+    assert CpuLayout.plan(12, runner=True, lane="9-11").reason
+    with pytest.raises(ValueError):
+        CpuLayout.plan(12, runner=True, lane="8-13")
+    with pytest.raises(ValueError):
+        lane_ranges(12, 4)

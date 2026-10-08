@@ -19,6 +19,8 @@ storage:
 
   # Optional SlateDB TOML/JSON/YAML settings file. Without this, SlateDB loads
   # its standard local settings files and SLATEDB_ environment overrides.
+  # Either way it overrides Metrics' defaults per key (16 MiB L0 SSTs,
+  # min_compaction_sources "3"); see config/SlateDb.example.toml.
   # settings_path: /etc/metrics/SlateDb.toml
 
   # Object-store variants are case-sensitive: Local, Aws, Azure, Gcp, or InMemory.
@@ -76,9 +78,9 @@ storage:
     # shards: 8 # Optional; absent lets Foyer choose.
   # FoyerHybrid is also valid for metadata and has the same fields shown above.
 
-# Optional retention. Time-bucket records get a SlateDB TTL so compaction drops
-# samples older than this. Unset (default) keeps data forever.
-retention_seconds: 2592000 # 30 days.
+# Retention. Time-bucket records get a SlateDB TTL so compaction drops samples
+# older than this. Defaults to 60 days; `null` keeps data forever.
+retention_seconds: 5184000 # 60 days.
 
 # Per-shard Moka query cache limit. Despite the field name and historical
 # default, the current unweighted implementation counts time-bucket entries,

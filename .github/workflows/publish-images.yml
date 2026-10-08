@@ -102,6 +102,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ steps.metadata.outputs.version }}
+            RUST_TARGET_CPU=${{ matrix.platform.arch == 'amd64' && vars.RUST_TARGET_CPU_AMD64 || matrix.platform.arch == 'arm64' && vars.RUST_TARGET_CPU_ARM64 || '' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.product.name }}-${{ matrix.platform.arch }}

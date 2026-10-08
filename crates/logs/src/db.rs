@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::ops::Range;
@@ -22,7 +21,8 @@ use common::discovery::{
 };
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
-    BytesRange, StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read,
+    BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics,
+    create_storage_read,
 };
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
@@ -48,18 +48,17 @@ use crate::model::{
 };
 use crate::object::{BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records};
 use crate::search::{
-    IndexDelta, block_max_scores, decode_field_stats, encode_field_stats, source_matches,
-    term_index_writes,
+    FieldStats, IndexDelta, block_max_scores, encode_field_stats, source_matches, term_index_ops,
 };
 
 mod query;
 mod write;
 
-pub(crate) use query::{ScanTargets, StreamFilter};
+#[cfg(feature = "bench-internals")]
+pub(crate) use query::run_entries;
+pub(crate) use query::{Boundaries, SampleRead, ScanTargets, StreamFilter};
 use write::*;
 
-/// Terms whose index records are read concurrently while building a write.
-const TERM_INDEX_CONCURRENCY: usize = 32;
 /// Read units fetched concurrently within one query segment.
 const PAGE_READ_CONCURRENCY: usize = 16;
 /// Streams whose forward labels and run records are read concurrently.
@@ -74,7 +73,6 @@ const SPAN_SCAN_MAX_SPREAD: usize = 4;
 const SEGMENT_LIST_CONCURRENCY: usize = 4;
 /// Segments whose discovery catalogs are scanned concurrently.
 const SEGMENT_DISCOVERY_CONCURRENCY: usize = 16;
-const DISCOVERY_ACTIVE_TTL: Duration = Duration::from_secs(5);
 /// Larger per-segment stream sets are recomputed rather than cached, which
 /// bounds the series cache to roughly `capacity * this` label sets.
 const SERIES_CACHE_MAX_STREAMS: usize = 2_048;
@@ -160,90 +158,62 @@ enum Partition {
     Rollup(SegmentId),
 }
 
-/// Per-partition discovery results. Sized so a day of 60s segments fits.
+/// Per-partition discovery results, each tagged with the partition's stream
+/// counter when it was read. Discovery only changes when a partition gains
+/// a stream, and every write that allocates one rewrites the counter in the
+/// same batch as its catalog terms and postings, so an entry is current
+/// exactly while the counter is unchanged. This holds in reader processes,
+/// which see no writes to invalidate from, and for late writes into
+/// segments wall-clock time has left. Sized so a day of 60s segments fits.
 struct DiscoveryCaches {
-    label_names: DiscoveryCache<(Namespace, Partition), Vec<String>>,
-    label_values: DiscoveryCache<(Namespace, Partition, String), Vec<String>>,
+    label_names: DiscoveryCache<(Namespace, Partition), Versioned<Vec<String>>>,
+    label_values: DiscoveryCache<(Namespace, Partition, String), Versioned<Vec<String>>>,
     /// Streams selected by a set of exact matchers, before the remaining
     /// selector matchers run.
-    series: DiscoveryCache<(Namespace, Partition, Vec<Label>), Vec<Arc<Labels>>>,
+    series: DiscoveryCache<SeriesKey, Versioned<Vec<Arc<Labels>>>>,
 }
 
-type SegmentSeries = Arc<Vec<Arc<Labels>>>;
+/// A partition's next stream ID, `None` while it has none (or expired).
+type PartitionVersion = Option<StreamId>;
+type Versioned<V> = (PartitionVersion, V);
+
+type SeriesKey = (Namespace, Partition, Vec<Label>);
+type SegmentSeries = Arc<Versioned<Vec<Arc<Labels>>>>;
 
 impl DiscoveryCaches {
     fn new() -> Self {
+        // Entries are inserted as closed, so the TTL is never consulted.
         Self {
-            label_names: DiscoveryCache::new(4_096, DISCOVERY_ACTIVE_TTL),
-            label_values: DiscoveryCache::new(16_384, DISCOVERY_ACTIVE_TTL),
-            series: DiscoveryCache::new(1_024, DISCOVERY_ACTIVE_TTL),
+            label_names: DiscoveryCache::new(4_096, Duration::ZERO),
+            label_values: DiscoveryCache::new(16_384, Duration::ZERO),
+            series: DiscoveryCache::new(1_024, Duration::ZERO),
         }
-    }
-
-    /// Drops results for every segment a write touched and the rollup
-    /// periods holding them. Late writes into a closed segment also fence
-    /// in-flight reads, since closed entries never expire on their own.
-    fn invalidate(
-        &self,
-        namespace: &Namespace,
-        segments: &BTreeSet<SegmentId>,
-        periods: &BTreeSet<SegmentId>,
-        active: SegmentId,
-    ) {
-        let touched = |ns: &Namespace, partition: &Partition| {
-            ns == namespace
-                && match partition {
-                    Partition::Segment(segment) => segments.contains(segment),
-                    Partition::Rollup(period) => periods.contains(period),
-                }
-        };
-        let fence = segments.iter().any(|segment| *segment != active);
-        remove(&self.label_names, fence, |(ns, partition)| {
-            touched(ns, partition)
-        });
-        remove(&self.label_values, fence, |(ns, partition, _)| {
-            touched(ns, partition)
-        });
-        remove(&self.series, fence, |(ns, partition, _)| {
-            touched(ns, partition)
-        });
-    }
-}
-
-/// Drops the entries of `cache` matching `stale`, fencing in-flight reads
-/// when `fence` is set.
-fn remove<K: Clone + Eq + std::hash::Hash, V>(
-    cache: &DiscoveryCache<K, V>,
-    fence: bool,
-    stale: impl FnMut(&K) -> bool,
-) {
-    if fence {
-        cache.invalidate(stale);
-    } else {
-        cache.evict(stale);
     }
 }
 
 impl LogDb {
     pub async fn open(config: Config) -> Result<Self> {
         config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        Self::open_with_cache(config, &cache).await
+    }
+
+    /// Opens a writer that uses `cache` instead of building its own.
+    pub(crate) async fn open_with_cache(config: Config, cache: &SharedDbCache) -> Result<Self> {
+        config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
-        let semantics = StorageSemantics::new()
-            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
-        let storage = StorageBuilder::new(&config.storage)
-            .await?
-            .with_semantics(semantics)
+        let storage = StorageBuilder::with_cache(&config.storage, cache)?
+            .with_semantics(storage_semantics())
             .build()
             .await?;
         let storage_read = storage.clone();
         let rollup_ns = config.discovery_rollup.map(duration_ns).transpose()?;
-        let direct_writer = Arc::new(DirectWriter {
-            storage: storage_read.clone(),
-            writer: storage.clone(),
-            config: config.clone(),
+        let direct_writer = DirectWriter::new(
+            storage_read.clone(),
+            storage.clone(),
+            config.clone(),
             rollup_ns,
-            rollup_ids: Default::default(),
-        });
+        );
         let compactor = config.compaction.enabled.then(|| {
             Compactor::new(
                 storage.clone(),
@@ -322,18 +292,27 @@ impl LogDb {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_reader(
         config: Config,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
+        Self::open_reader_with_cache(config, reader_options, &SharedDbCache::default()).await
+    }
+
+    /// Opens a reader that uses `cache`; an empty `cache` falls back to the
+    /// config's own cache settings.
+    pub(crate) async fn open_reader_with_cache(
+        config: Config,
+        reader_options: DbReaderOptions,
+        cache: &SharedDbCache,
+    ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
-        let semantics = StorageSemantics::new()
-            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
         let storage = create_storage_read(
             &config.storage,
-            StorageReaderRuntime::new(),
-            semantics,
+            StorageReaderRuntime::new().with_shared_cache(cache),
+            storage_semantics(),
             reader_options,
         )
         .await?;
@@ -381,12 +360,6 @@ impl LogDb {
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
-        let segments = groups
-            .keys()
-            .map(|(segment, _)| *segment)
-            .collect::<BTreeSet<_>>();
-        let periods = self.rollup_periods(&segments);
-        let active = segment_for(common::time::now_ns(), self.segment_ns);
         let write = LogsWrite {
             namespace: namespace.clone(),
             groups,
@@ -396,10 +369,10 @@ impl LogDb {
             .try_write(write)
             .await
             .map_err(map_write_error)?;
-        let report = write_handle.wait(CoordinatorDurability::Applied).await;
-        self.caches
-            .invalidate(namespace, &segments, &periods, active);
-        let report = report.map_err(map_write_error)?;
+        let report = write_handle
+            .wait(CoordinatorDurability::Applied)
+            .await
+            .map_err(map_write_error)?;
 
         if durability != Durability::Applied {
             let mut flush_handle = self
@@ -417,6 +390,14 @@ impl LogDb {
         }
         Ok(report)
     }
+}
+
+/// The writer updates postings and search statistics as merge operands, so
+/// readers need the operator too.
+fn storage_semantics() -> StorageSemantics {
+    StorageSemantics::new()
+        .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared())
+        .with_merge_operator(Arc::new(crate::merge::LogsMergeOperator))
 }
 
 fn duration_ns(duration: std::time::Duration) -> Result<i64> {

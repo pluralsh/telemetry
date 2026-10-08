@@ -13,18 +13,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG TARGETARCH
+# Optional `-C target-cpu` (e.g. x86-64-v3); the binary will not run on older CPUs.
+ARG RUST_TARGET_CPU=
 COPY --from=planner /workspace/recipe.json recipe.json
 COPY crates/proto/proto/ crates/proto/proto/
 COPY crates/logs/src/logql/grammar.lalrpop crates/logs/src/logql/grammar.lalrpop
 COPY crates/traces/src/traceql/grammar.lalrpop crates/traces/src/traceql/grammar.lalrpop
 RUN --mount=type=cache,id=telemetry-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,id=telemetry-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
-    cargo chef cook --release --locked --package plural-traces-server --recipe-path recipe.json
+    RUSTFLAGS="${RUST_TARGET_CPU:+-C target-cpu=$RUST_TARGET_CPU}" cargo chef cook --release --locked --package plural-traces-server --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN --mount=type=cache,id=telemetry-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,id=telemetry-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
-    cargo build --release --locked --package plural-traces-server \
+    RUSTFLAGS="${RUST_TARGET_CPU:+-C target-cpu=$RUST_TARGET_CPU}" cargo build --release --locked --package plural-traces-server \
     && mkdir -p /out \
     && cp target/release/plural-traces-server /out/plural-traces-server
 
@@ -34,6 +36,9 @@ COPY config /app/config
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 COPY --from=builder /out/plural-traces-server /usr/local/bin/plural-traces-server
 ENV HOME=/var/lib/traces
+# Keep freed pages for a second (default 10ms) so per-query buffers are reused
+# instead of being returned to the OS and faulted back in.
+ENV MIMALLOC_PURGE_DELAY=1000
 USER 10001:10001
 EXPOSE 3200 9092 4317 14250
 ENTRYPOINT ["plural-traces-server"]

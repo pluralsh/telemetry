@@ -299,15 +299,7 @@ fn build_metric_name(name: &str, unit: &str, is_monotonic_counter: bool) -> Stri
 }
 
 fn format_float(v: f64) -> String {
-    if v.fract() == 0.0 && v.is_finite() {
-        // Use i64 formatting when the value fits, otherwise fall back to f64
-        // which avoids silent saturation for values beyond i64 range.
-        let i = v as i64;
-        if i as f64 == v {
-            return format!("{i}");
-        }
-    }
-    format!("{v}")
+    common::display::prometheus_float(v)
 }
 
 fn kv_to_label(kv: &KeyValue) -> Option<Label> {

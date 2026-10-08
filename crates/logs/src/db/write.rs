@@ -5,66 +5,140 @@
 
 //! Write path: object encoding, the write-coordinator delta and its flusher.
 
-use super::*;
+use std::time::Instant;
 
+use super::*;
+use crate::codec::{decode_dictionary_key, dictionary_prefix, rollup_dictionary_prefix};
+
+/// How long a segment's or rollup period's IDs stay in memory after its
+/// last write. A later write reloads them.
+const IDS_IDLE_EVICTION: Duration = Duration::from_secs(15 * 60);
+
+/// Turns flushed deltas into one atomic write without reading what the
+/// segments already hold.
+///
+/// The flusher is the shard's only writer, so the IDs it allocates are
+/// authoritative in memory. A segment or rollup period is read once, the
+/// first time this process writes to it, to resume its counters; postings
+/// and search statistics are merge operands, and full-text blocks are new
+/// records.
 pub(super) struct DirectWriter {
-    pub(super) storage: Arc<dyn StorageRead>,
-    pub(super) writer: Arc<dyn Storage>,
-    pub(super) config: Config,
+    storage: Arc<dyn StorageRead>,
+    writer: Arc<dyn Storage>,
+    config: Config,
     /// Discovery rollup period, a whole multiple of the segment duration.
-    pub(super) rollup_ns: Option<i64>,
-    pub(super) rollup_ids: RollupIds,
+    rollup_ns: Option<i64>,
+    segments: HashMap<(Namespace, SegmentId), SegmentIds>,
+    periods: HashMap<(Namespace, SegmentId), StreamIds>,
 }
 
-type RollupKey = (Namespace, SegmentId, StreamFingerprint);
+/// Stream IDs allocated in one segment or rollup period.
+struct StreamIds {
+    ids: HashMap<StreamFingerprint, StreamId>,
+    next: StreamId,
+    touched: Instant,
+}
 
-/// Rollup stream IDs this writer has persisted, with when, so later writes
-/// of the stream skip the rollup dictionary read. An entry is trusted only
-/// while the dictionary record it was written with is still live.
-#[derive(Default)]
-pub(super) struct RollupIds(std::sync::Mutex<HashMap<RollupKey, (StreamId, u64)>>);
-
-/// Bounds [`RollupIds`]; it is emptied when full.
-const ROLLUP_ID_CACHE_ENTRIES: usize = 262_144;
-
-impl RollupIds {
-    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<RollupKey, (StreamId, u64)>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The ID persisted for `key`, if its dictionary record is still live.
-    fn get(&self, key: &RollupKey, ttl: Ttl, now_unix_ms: u64) -> Option<StreamId> {
-        let &(id, written_at) = self.entries().get(key)?;
-        let live = match ttl {
-            Ttl::ExpireAfter(ttl_ms) => now_unix_ms.saturating_sub(written_at) < ttl_ms,
-            _ => true,
-        };
-        live.then_some(id)
-    }
-
-    fn record(&self, ids: impl IntoIterator<Item = (RollupKey, StreamId)>, written_at: u64) {
-        let mut entries = self.entries();
-        for (key, id) in ids {
-            if entries.len() >= ROLLUP_ID_CACHE_ENTRIES {
-                entries.clear();
-            }
-            entries.insert(key, (id, written_at));
+impl StreamIds {
+    /// Resumes the IDs persisted under `dictionary` and the `counter` key.
+    /// The counter is rewritten by every write that allocates, but may have
+    /// expired with an idle segment, so it never trails a persisted ID.
+    async fn recover(storage: &dyn StorageRead, dictionary: Bytes, counter: Bytes) -> Result<Self> {
+        let mut next = storage
+            .get(counter)
+            .await?
+            .map(|record| decode_stream_id(&record.value))
+            .transpose()?
+            .unwrap_or(0);
+        let mut ids = HashMap::new();
+        let mut records = storage
+            .scan_prefix_iter(dictionary.clone(), BytesRange::unbounded(), None)
+            .await?;
+        while let Some(record) = records.next().await? {
+            let id = decode_stream_id(&record.value)?;
+            next = next.max(id.saturating_add(1));
+            ids.insert(decode_dictionary_key(&record.key, dictionary.len())?, id);
         }
+        Ok(Self {
+            ids,
+            next,
+            touched: Instant::now(),
+        })
+    }
+
+    fn resolve(&mut self, fingerprint: StreamFingerprint) -> Result<StreamId> {
+        if let Some(id) = self.ids.get(&fingerprint) {
+            return Ok(*id);
+        }
+        let id = self.next;
+        self.next = id
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
+        self.ids.insert(fingerprint, id);
+        Ok(id)
+    }
+}
+
+/// A segment's stream IDs and its next object ID.
+struct SegmentIds {
+    streams: StreamIds,
+    next_object: u64,
+}
+
+impl SegmentIds {
+    async fn recover(
+        storage: &dyn StorageRead,
+        namespace: &Namespace,
+        segment: SegmentId,
+    ) -> Result<Self> {
+        let (streams, next_object) = futures::try_join!(
+            StreamIds::recover(
+                storage,
+                dictionary_prefix(namespace, segment),
+                next_stream_id_key(namespace, segment),
+            ),
+            async {
+                storage
+                    .get(next_object_id_key(namespace, segment))
+                    .await?
+                    .map(|record| decode_object_id(&record.value))
+                    .transpose()
+                    .map(|next| next.unwrap_or(0))
+            },
+        )?;
+        Ok(Self {
+            streams,
+            next_object,
+        })
     }
 }
 
 impl DirectWriter {
+    pub(super) fn new(
+        storage: Arc<dyn StorageRead>,
+        writer: Arc<dyn Storage>,
+        config: Config,
+        rollup_ns: Option<i64>,
+    ) -> Self {
+        Self {
+            storage,
+            writer,
+            config,
+            rollup_ns,
+            segments: HashMap::new(),
+            periods: HashMap::new(),
+        }
+    }
+
     /// Writes every group atomically and returns the objects it wrote.
-    async fn write_groups(&self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenObject>> {
+    async fn write_groups(&mut self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenObject>> {
+        self.load_ids(&groups).await?;
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
             expires_at_unix_ms: self.logical_expiry()?,
             written_at_unix_ms: unix_time_ms()?,
         };
-        let mut rollup_ids = Vec::new();
         let mut by_namespace: BTreeMap<Namespace, StreamGroups> = BTreeMap::new();
         for ((namespace, segment, fingerprint), group) in groups.groups {
             by_namespace
@@ -74,44 +148,59 @@ impl DirectWriter {
         }
         let mut all_ops = Vec::new();
         let mut written = Vec::new();
+        let mut next_objects = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
             let mut runs: BTreeMap<SegmentId, Vec<(StreamId, Vec<LogEntry>)>> = BTreeMap::new();
             for ((segment, fingerprint), (labels, entries)) in groups {
                 let stream_id = self
-                    .resolve_stream_id(&mut write, &namespace, segment, fingerprint, &labels)
-                    .await?;
-                self.add_postings(&mut write.postings, segment, &labels, stream_id, |label| {
-                    posting_key(&namespace, segment, label)
-                })
-                .await?;
+                    .segment_ids(&namespace, segment)
+                    .streams
+                    .resolve(fingerprint)?;
+                write.put(
+                    dictionary_key(&namespace, segment, fingerprint),
+                    encode_stream_id(stream_id),
+                );
+                write.put(
+                    forward_key(&namespace, segment, stream_id),
+                    encode_labels(&labels)?,
+                );
+                for label in labels.iter() {
+                    write
+                        .postings
+                        .entry((segment, label.clone()))
+                        .or_default()
+                        .insert(stream_id);
+                }
                 if let Some(rollup_ns) = self.rollup_ns {
                     let period = segment_for(segment, rollup_ns);
-                    let rollup_id = self
-                        .resolve_rollup_id(&mut write, &namespace, period, fingerprint, &labels)
-                        .await?;
-                    self.add_postings(
-                        &mut write.rollup_postings,
-                        period,
-                        &labels,
-                        rollup_id,
-                        |label| rollup_posting_key(&namespace, period, label),
-                    )
-                    .await?;
+                    let rollup_id = self.period_ids(&namespace, period).resolve(fingerprint)?;
+                    write.put(
+                        rollup_dictionary_key(&namespace, period, fingerprint),
+                        encode_stream_id(rollup_id),
+                    );
+                    write.put(
+                        rollup_forward_key(&namespace, period, rollup_id),
+                        encode_labels(&labels)?,
+                    );
+                    for label in labels.iter() {
+                        write
+                            .rollup_postings
+                            .entry((period, label.clone()))
+                            .or_default()
+                            .insert(rollup_id);
+                    }
                 }
                 write.report.rows += entries.len();
                 runs.entry(segment).or_default().push((stream_id, entries));
             }
             for (segment, mut streams) in runs {
                 streams.sort_unstable_by_key(|(stream_id, _)| *stream_id);
-                self.append_segment_objects(&mut write, &namespace, segment, streams)
-                    .await?;
+                let first = self.segment_ids(&namespace, segment).next_object;
+                let next =
+                    self.append_segment_objects(&mut write, &namespace, segment, first, streams)?;
+                next_objects.push(((namespace.clone(), segment), next));
             }
-            rollup_ids.extend(
-                write.rollup_ids.drain().map(|((period, fingerprint), id)| {
-                    ((namespace.clone(), period, fingerprint), id)
-                }),
-            );
             written.extend(write.written.drain(..).map(|(segment, object, stored)| {
                 WrittenObject {
                     namespace: namespace.clone(),
@@ -120,8 +209,7 @@ impl DirectWriter {
                     stored,
                 }
             }));
-            let (ops, _) = self.finish_write(write, &namespace).await?;
-            all_ops.extend(ops);
+            all_ops.extend(self.finish_write(write, &namespace)?);
         }
         if !all_ops.is_empty() {
             self.writer
@@ -133,170 +221,92 @@ impl DirectWriter {
                 )
                 .await?;
         }
-        self.rollup_ids
-            .record(rollup_ids, retention.written_at_unix_ms);
+        // Object IDs advance only once their objects are written, so a failed
+        // write leaves no gap that would keep neighbouring objects unmerged.
+        // Stream IDs need no rollback: an unwritten ID is never referenced.
+        for (key, next) in next_objects {
+            if let Some(ids) = self.segments.get_mut(&key) {
+                ids.next_object = next;
+            }
+        }
+        self.evict_idle();
         Ok(written)
     }
 
-    /// The stream's period-local rollup ID, allocating the period's next one
-    /// if it has none, and rewrites its rollup dictionary and forward-label
-    /// records to refresh their TTLs.
-    async fn resolve_rollup_id(
-        &self,
-        write: &mut PendingWrite,
-        namespace: &Namespace,
-        period: SegmentId,
-        fingerprint: StreamFingerprint,
-        labels: &Labels,
-    ) -> Result<StreamId> {
-        if let Some(id) = write.rollup_ids.get(&(period, fingerprint)) {
-            return Ok(*id);
-        }
-        // Loaded for every written period, so the counter is rewritten with
-        // the records it guards and never expires before them.
-        if let Entry::Vacant(entry) = write.rollup_next_ids.entry(period) {
-            let next = self
-                .storage
-                .get(rollup_next_stream_id_key(namespace, period))
-                .await?
-                .map(|record| decode_stream_id(&record.value))
-                .transpose()?
-                .unwrap_or(0);
-            entry.insert(next);
-        }
-        let dictionary = rollup_dictionary_key(namespace, period, fingerprint);
-        let cached = self.rollup_ids.get(
-            &(namespace.clone(), period, fingerprint),
-            write.ttl,
-            unix_time_ms()?,
-        );
-        let id = match cached {
-            Some(id) => id,
-            None => match self.storage.get(dictionary.clone()).await? {
-                Some(record) => decode_stream_id(&record.value)?,
-                None => {
-                    let next = write.rollup_next_ids[&period];
-                    let following = next.checked_add(1).ok_or_else(|| {
-                        Error::Invalid("rollup period exhausted stream IDs".to_owned())
-                    })?;
-                    write.rollup_next_ids.insert(period, following);
-                    next
-                }
-            },
-        };
-        write.rollup_ids.insert((period, fingerprint), id);
-        write.put(dictionary, encode_stream_id(id));
-        write.put(
-            rollup_forward_key(namespace, period, id),
-            encode_labels(labels)?,
-        );
-        Ok(id)
-    }
-
-    /// Returns the stream's existing ID, or allocates the segment's next one,
-    /// and rewrites its dictionary and forward-label records to refresh TTLs.
-    async fn resolve_stream_id(
-        &self,
-        write: &mut PendingWrite,
-        namespace: &Namespace,
-        segment: SegmentId,
-        fingerprint: StreamFingerprint,
-        labels: &Labels,
-    ) -> Result<StreamId> {
-        let dictionary = dictionary_key(namespace, segment, fingerprint);
-        let stream_id = match self.storage.get(dictionary.clone()).await? {
-            Some(record) => {
-                let stream_id = decode_stream_id(&record.value)?;
-                let existing = self
-                    .storage
-                    .get(forward_key(namespace, segment, stream_id))
-                    .await?
-                    .ok_or_else(|| Error::Corrupt("dictionary has no forward labels".to_owned()))?;
-                if decode_labels(&existing.value)? != *labels {
-                    return Err(Error::Corrupt(
-                        "stream fingerprint maps to different labels".to_owned(),
-                    ));
-                }
-                stream_id
+    /// Reads the IDs of every segment and rollup period `groups` touches that
+    /// this process has not written since it last evicted them.
+    async fn load_ids(&mut self, groups: &FrozenLogsWriteDelta) -> Result<()> {
+        let mut segments = BTreeSet::new();
+        let mut periods = BTreeSet::new();
+        for (namespace, segment, _) in groups.groups.keys() {
+            let key = (namespace.clone(), *segment);
+            if !self.segments.contains_key(&key) {
+                segments.insert(key);
             }
-            None => self.allocate_stream_id(write, namespace, segment).await?,
-        };
-        write.put(dictionary, encode_stream_id(stream_id));
-        write.put(
-            forward_key(namespace, segment, stream_id),
-            encode_labels(labels)?,
-        );
-        Ok(stream_id)
-    }
-
-    async fn allocate_stream_id(
-        &self,
-        write: &mut PendingWrite,
-        namespace: &Namespace,
-        segment: SegmentId,
-    ) -> Result<StreamId> {
-        let next = match write.next_stream_ids.get(&segment) {
-            Some(next) => *next,
-            None => self
-                .storage
-                .get(next_stream_id_key(namespace, segment))
-                .await?
-                .map(|record| decode_stream_id(&record.value))
-                .transpose()?
-                .unwrap_or(0),
-        };
-        let following = next
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
-        write.next_stream_ids.insert(segment, following);
-        Ok(next)
-    }
-
-    /// Adds `id` to the `scope` posting of every label, loading each posting
-    /// from `key` the first time this write touches it.
-    async fn add_postings(
-        &self,
-        postings: &mut HashMap<(SegmentId, Label), RoaringBitmap>,
-        scope: SegmentId,
-        labels: &Labels,
-        id: StreamId,
-        key: impl Fn(&Label) -> Bytes,
-    ) -> Result<()> {
-        for label in labels.iter() {
-            let bitmap = match postings.entry((scope, label.clone())) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let bitmap = self
-                        .storage
-                        .get(key(label))
-                        .await?
-                        .map(|record| decode_postings(&record.value))
-                        .transpose()?
-                        .unwrap_or_default();
-                    entry.insert(bitmap)
+            if let Some(rollup_ns) = self.rollup_ns {
+                let key = (namespace.clone(), segment_for(*segment, rollup_ns));
+                if !self.periods.contains_key(&key) {
+                    periods.insert(key);
                 }
-            };
-            bitmap.insert(id);
+            }
         }
+        let storage = self.storage.as_ref();
+        let (loaded_segments, loaded_periods) = futures::try_join!(
+            futures::future::try_join_all(segments.into_iter().map(|key| async move {
+                let ids = SegmentIds::recover(storage, &key.0, key.1).await?;
+                Ok::<_, Error>((key, ids))
+            })),
+            futures::future::try_join_all(periods.into_iter().map(|key| async move {
+                let ids = StreamIds::recover(
+                    storage,
+                    rollup_dictionary_prefix(&key.0, key.1),
+                    rollup_next_stream_id_key(&key.0, key.1),
+                )
+                .await?;
+                Ok::<_, Error>((key, ids))
+            })),
+        )?;
+        self.segments.extend(loaded_segments);
+        self.periods.extend(loaded_periods);
         Ok(())
     }
 
-    /// Packs one segment's streams, in stream order, into level-0 objects.
-    async fn append_segment_objects(
+    fn segment_ids(&mut self, namespace: &Namespace, segment: SegmentId) -> &mut SegmentIds {
+        let ids = self
+            .segments
+            .get_mut(&(namespace.clone(), segment))
+            .expect("load_ids loads every written segment");
+        ids.streams.touched = Instant::now();
+        ids
+    }
+
+    fn period_ids(&mut self, namespace: &Namespace, period: SegmentId) -> &mut StreamIds {
+        let ids = self
+            .periods
+            .get_mut(&(namespace.clone(), period))
+            .expect("load_ids loads every written period");
+        ids.touched = Instant::now();
+        ids
+    }
+
+    fn evict_idle(&mut self) {
+        self.segments
+            .retain(|_, ids| ids.streams.touched.elapsed() < IDS_IDLE_EVICTION);
+        self.periods
+            .retain(|_, ids| ids.touched.elapsed() < IDS_IDLE_EVICTION);
+    }
+
+    /// Packs one segment's streams, in stream order, into level-0 objects
+    /// numbered from `first`, and returns the next unallocated object ID.
+    fn append_segment_objects(
         &self,
         write: &mut PendingWrite,
         namespace: &Namespace,
         segment: SegmentId,
+        first: u64,
         streams: Vec<(StreamId, Vec<LogEntry>)>,
-    ) -> Result<()> {
-        let next_key = next_object_id_key(namespace, segment);
-        let mut next = self
-            .storage
-            .get(next_key.clone())
-            .await?
-            .map(|record| decode_object_id(&record.value))
-            .transpose()?
-            .unwrap_or(0);
+    ) -> Result<u64> {
+        let mut next = first;
         let mut builder = ObjectBuilder::new(self.config.page.clone())?;
         for (stream_id, entries) in streams {
             builder.push_run(stream_id, entries)?;
@@ -308,30 +318,30 @@ impl DirectWriter {
                 .ok_or_else(|| Error::Invalid("segment exhausted object IDs".to_owned()))?;
             write.add_object(namespace, segment, object, built)?;
         }
-        write.put(next_key, encode_object_id(next));
-        Ok(())
+        write.flush_objects.insert(segment, first);
+        write.put(
+            next_object_id_key(namespace, segment),
+            encode_object_id(next),
+        );
+        Ok(next)
     }
 
     /// Emits the records accumulated across streams: stream ID counters,
     /// label postings, and the full-text index.
-    async fn finish_write(
-        &self,
-        write: PendingWrite,
-        namespace: &Namespace,
-    ) -> Result<(Vec<RecordOp>, WriteReport)> {
+    fn finish_write(&self, write: PendingWrite, namespace: &Namespace) -> Result<Vec<RecordOp>> {
         let PendingWrite {
             ttl,
             mut ops,
-            next_stream_ids,
             postings,
-            rollup_next_ids,
             rollup_postings,
             search_deltas,
-            report,
+            flush_objects,
             ..
         } = write;
         let mut catalogs: BTreeMap<SegmentId, CatalogBatch> = BTreeMap::new();
+        let mut counters: BTreeSet<SegmentId> = BTreeSet::new();
         for (segment, label) in postings.keys() {
+            counters.insert(*segment);
             catalogs.entry(*segment).or_default().insert(
                 "",
                 &label.name,
@@ -346,15 +356,17 @@ impl DirectWriter {
                 DiscoveryValue::String(label.value.clone()),
             );
         }
-        for (period, next) in rollup_next_ids {
+        // Rewritten with the records they guard, so a counter never expires
+        // before the IDs it allocated.
+        for period in rollup_catalogs.keys() {
             ops.push(RecordOp::put_with_ttl(
-                rollup_next_stream_id_key(namespace, period),
-                encode_stream_id(next),
+                rollup_next_stream_id_key(namespace, *period),
+                encode_stream_id(self.periods[&(namespace.clone(), *period)].next),
                 ttl,
             ));
         }
         for ((period, label), bitmap) in rollup_postings {
-            ops.push(RecordOp::put_with_ttl(
+            ops.push(RecordOp::merge_with_ttl(
                 rollup_posting_key(namespace, period, &label),
                 encode_postings(&bitmap)?,
                 ttl,
@@ -363,15 +375,15 @@ impl DirectWriter {
         for (period, catalog) in rollup_catalogs {
             ops.extend(catalog.into_ops(&rollup_prefix(namespace, period), ttl));
         }
-        for (segment, next) in next_stream_ids {
+        for segment in counters {
             ops.push(RecordOp::put_with_ttl(
                 next_stream_id_key(namespace, segment),
-                encode_stream_id(next),
+                encode_stream_id(self.segments[&(namespace.clone(), segment)].streams.next),
                 ttl,
             ));
         }
         for ((segment, label), bitmap) in postings {
-            ops.push(RecordOp::put_with_ttl(
+            ops.push(RecordOp::merge_with_ttl(
                 posting_key(namespace, segment, &label),
                 encode_postings(&bitmap)?,
                 ttl,
@@ -381,57 +393,27 @@ impl DirectWriter {
             ops.extend(catalog.into_ops(&segment_prefix(namespace, segment), ttl));
         }
         for (segment, delta) in search_deltas {
-            self.append_search_index_ops(&mut ops, namespace, segment, delta, ttl)
-                .await?;
+            ops.push(RecordOp::merge_with_ttl(
+                field_stats_key(namespace, segment),
+                encode_field_stats(FieldStats {
+                    documents: delta.documents,
+                    total_terms: delta.total_terms,
+                }),
+                ttl,
+            ));
+            let flush_object = flush_objects[&segment];
+            for (term, postings) in delta.postings {
+                term_index_ops(
+                    &mut ops,
+                    (namespace, segment),
+                    &term,
+                    postings,
+                    flush_object,
+                    ttl,
+                )?;
+            }
         }
-        Ok((ops, report))
-    }
-
-    async fn append_search_index_ops(
-        &self,
-        ops: &mut Vec<RecordOp>,
-        namespace: &Namespace,
-        segment: SegmentId,
-        delta: IndexDelta,
-        ttl: Ttl,
-    ) -> Result<()> {
-        let mut field = self
-            .storage
-            .get(field_stats_key(namespace, segment))
-            .await?
-            .map(|record| decode_field_stats(&record.value))
-            .transpose()?
-            .unwrap_or_default();
-        field.documents = field
-            .documents
-            .checked_add(delta.documents)
-            .ok_or_else(|| Error::Invalid("segment document count overflow".into()))?;
-        field.total_terms = field
-            .total_terms
-            .checked_add(delta.total_terms)
-            .ok_or_else(|| Error::Invalid("segment token count overflow".into()))?;
-        ops.push(RecordOp::put_with_ttl(
-            field_stats_key(namespace, segment),
-            encode_field_stats(field),
-            ttl,
-        ));
-
-        let storage = self.storage.as_ref();
-        let mut writes = std::pin::pin!(
-            futures::stream::iter(delta.postings)
-                .map(|(term, postings)| {
-                    term_index_writes(storage, namespace, segment, term, postings)
-                })
-                .buffer_unordered(TERM_INDEX_CONCURRENCY)
-        );
-        while let Some(term_writes) = writes.try_next().await? {
-            ops.extend(
-                term_writes
-                    .into_iter()
-                    .map(|(key, value)| RecordOp::put_with_ttl(key, value, ttl)),
-            );
-        }
-        Ok(())
+        Ok(ops)
     }
 
     fn ttl(&self) -> Result<Ttl> {
@@ -554,7 +536,7 @@ impl Delta for LogsWriteDelta {
 }
 
 pub(super) struct LogsFlusher {
-    pub(super) direct_writer: Arc<DirectWriter>,
+    pub(super) direct_writer: DirectWriter,
     pub(super) storage: Arc<dyn Storage>,
     pub(super) compactor: Option<Compactor>,
 }
@@ -621,21 +603,18 @@ pub(super) fn group_by_stream(batches: Vec<LogBatch>, segment_ns: i64) -> Result
     Ok(groups)
 }
 
-/// Records accumulated for one atomic write. Counters and postings shared by
-/// several streams are merged here and emitted once by `finish_write`.
+/// Records accumulated for one atomic write. Postings shared by several
+/// streams are merged here and emitted once by `finish_write`.
 struct PendingWrite {
     ttl: Ttl,
     retention: PageRetention,
     ops: Vec<RecordOp>,
-    /// Next unallocated stream ID for each segment that allocated one.
-    next_stream_ids: HashMap<SegmentId, StreamId>,
     postings: HashMap<(SegmentId, Label), RoaringBitmap>,
-    /// Rollup IDs resolved by this write, keyed by period.
-    rollup_ids: HashMap<(SegmentId, StreamFingerprint), StreamId>,
-    /// Next unallocated rollup ID of every period this write touches.
-    rollup_next_ids: HashMap<SegmentId, StreamId>,
     rollup_postings: HashMap<(SegmentId, Label), RoaringBitmap>,
     search_deltas: BTreeMap<SegmentId, IndexDelta>,
+    /// First object ID this write allocated in each segment, which names
+    /// its full-text blocks.
+    flush_objects: HashMap<SegmentId, u64>,
     written: Vec<(SegmentId, ObjectRef, StoredObject)>,
     report: WriteReport,
 }
@@ -646,12 +625,10 @@ impl PendingWrite {
             ttl,
             retention,
             ops: Vec::new(),
-            next_stream_ids: HashMap::new(),
             postings: HashMap::new(),
-            rollup_ids: HashMap::new(),
-            rollup_next_ids: HashMap::new(),
             rollup_postings: HashMap::new(),
             search_deltas: BTreeMap::new(),
+            flush_objects: HashMap::new(),
             written: Vec::new(),
             report: WriteReport {
                 streams,

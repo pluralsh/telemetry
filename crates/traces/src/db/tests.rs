@@ -34,6 +34,7 @@ fn test_config() -> Config {
             max_traces: 16,
         },
         write_buffer: Default::default(),
+        read_cache: Default::default(),
     }
 }
 
@@ -652,6 +653,138 @@ async fn catalog_deduplicates_pages_and_segments_without_payload_reads() {
 }
 
 #[tokio::test]
+async fn reader_catalog_sees_late_writes_to_closed_segments() {
+    const SECOND: u64 = 1_000_000_000;
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.retention = None;
+    config.segment_duration = Duration::from_secs(60);
+    config.page.max_traces = 2;
+    config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+        path: "traces-late-catalog".to_owned(),
+        object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+            path: directory.path().to_string_lossy().into_owned(),
+        }),
+        settings_path: None,
+        block_cache: None,
+        meta_cache: None,
+    });
+    let namespace = Namespace::new("late-catalog").unwrap();
+    let service = |name: &str| {
+        vec![attr(
+            "service.name",
+            any_value::Value::StringValue(name.to_owned()),
+        )]
+    };
+    let writer = TraceDb::open(config.clone()).await.unwrap();
+    let early = (0..6u8)
+        .map(|id| {
+            let name = if id % 2 == 0 { "auth" } else { "cart" };
+            trace(
+                id + 1,
+                u64::from(id) * 30 * SECOND + SECOND,
+                name,
+                service(name),
+                Vec::new(),
+            )
+        })
+        .collect::<Vec<_>>();
+    writer
+        .write_with_durability(
+            &namespace,
+            vec![TraceBatch::new(early)],
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+    let reader = TraceDb::open_reader(
+        config,
+        DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(50),
+            ..DbReaderOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (start, end) = (30 * SECOND, 150 * SECOND);
+    let values = || {
+        reader.catalog_values(
+            &namespace,
+            start,
+            end,
+            Some(AttributeScope::Resource),
+            "service.name",
+        )
+    };
+    let strings = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| DiscoveryValue::String((*name).to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values().await.unwrap(), strings(&["auth", "cart"]));
+    assert_eq!(
+        reader
+            .catalog_names(&namespace, start, end, Some(AttributeScope::Resource))
+            .await
+            .unwrap(),
+        vec!["service.name"]
+    );
+
+    // Long past segment 60s..120s, a late export lands spans of a new
+    // service there, across more than one page.
+    let mut search = service("search");
+    search.push(attr(
+        "search.tier",
+        any_value::Value::StringValue("hot".to_owned()),
+    ));
+    let late = (0..3u8)
+        .map(|id| {
+            trace(
+                id + 20,
+                70 * SECOND + u64::from(id),
+                "late",
+                search.clone(),
+                Vec::new(),
+            )
+        })
+        .collect::<Vec<_>>();
+    writer
+        .write_with_durability(&namespace, vec![TraceBatch::new(late)], Durability::Durable)
+        .await
+        .unwrap();
+    let sequence = next_sequence_key(&namespace, 1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reader
+            .storage
+            .get(sequence.clone())
+            .await
+            .unwrap()
+            .map(|record| decode_sequence(&record.value).unwrap())
+            < Some(3)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reader observes the late pages");
+
+    assert_eq!(
+        values().await.unwrap(),
+        strings(&["auth", "cart", "search"])
+    );
+    assert_eq!(
+        reader
+            .catalog_names(&namespace, start, end, Some(AttributeScope::Resource))
+            .await
+            .unwrap(),
+        vec!["search.tier", "service.name"]
+    );
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn unindexed_values_remain_in_payload() {
     let db = TraceDb::open(test_config()).await.unwrap();
     let namespace = Namespace::default();
@@ -752,6 +885,73 @@ async fn persists_across_reopen() {
         Some(original)
     );
     reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_not_pin_retention_barrier_with_idle_coordinator() {
+    // given: a coordinator that flushed once and then went idle while the
+    // database kept advancing, with memtables small enough to reach L0
+    let directory = tempfile::tempdir().unwrap();
+    let settings = directory.path().join("slatedb.json");
+    std::fs::write(&settings, r#"{"l0_sst_size_bytes": 1024}"#).unwrap();
+    let mut config = test_config();
+    config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+        path: "traces-barrier".to_owned(),
+        object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+            path: directory.path().to_string_lossy().into_owned(),
+        }),
+        settings_path: Some(settings.to_string_lossy().into_owned()),
+        block_cache: None,
+        meta_cache: None,
+    });
+    let namespace = Namespace::default();
+    let original = trace(1, 1, "idle", Vec::new(), Vec::new());
+    let db = TraceDb::open(config).await.unwrap();
+    db.write(&namespace, vec![TraceBatch::new(vec![original.clone()])])
+        .await
+        .unwrap();
+    let writer = db.writer.clone().unwrap();
+    let mut after_coordinator_seq = 0;
+    for sequence in 0..16 {
+        let ops = (100..116)
+            .map(|segment| {
+                RecordOp::put_with_ttl(
+                    next_sequence_key(&namespace, segment),
+                    encode_sequence(sequence),
+                    Ttl::NoExpiry,
+                )
+            })
+            .collect();
+        let written = writer.apply(ops).await.unwrap();
+        if sequence == 0 {
+            after_coordinator_seq = written.seqnum;
+        }
+    }
+
+    // when
+    db.flush().await.unwrap();
+    let slate = db.storage.slate_read().unwrap();
+    let manifest = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let manifest = slate.manifest();
+            if manifest.last_l0_seq() >= after_coordinator_seq {
+                return manifest;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // then: the coordinator holds no snapshot, so L0 flushes and compaction
+    // may drop overwritten versions instead of retaining them behind its
+    // last flush
+    assert_eq!(manifest.recent_snapshot_min_seq(), manifest.last_l0_seq());
+    assert_eq!(
+        db.get_trace(&namespace, original.trace_id).await.unwrap(),
+        Some(original)
+    );
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1057,6 +1257,7 @@ struct CountingStorage {
     locator_gets: std::sync::atomic::AtomicUsize,
     locator_scans: std::sync::atomic::AtomicUsize,
     metadata_gets: std::sync::atomic::AtomicUsize,
+    metadata_scans: std::sync::atomic::AtomicUsize,
 }
 
 impl CountingStorage {
@@ -1105,6 +1306,10 @@ impl StorageRead for CountingStorage {
             self.locator_scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if prefix.starts_with(&self.metadata_scope) {
+            self.metadata_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.inner
             .scan_prefix_iter(prefix, subrange, filter_context)
             .await
@@ -1119,6 +1324,7 @@ fn count_reads(db: &mut TraceDb, namespace: &Namespace) -> Arc<CountingStorage> 
         locator_gets: Default::default(),
         locator_scans: Default::default(),
         metadata_gets: Default::default(),
+        metadata_scans: Default::default(),
     });
     db.storage = counting.clone();
     counting
@@ -1179,6 +1385,57 @@ async fn metadata_reads_follow_the_most_selective_clause() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn nearby_metadata_is_scanned_and_distant_metadata_is_fetched() {
+    let mut db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    for round in 0..10u8 {
+        let mut resource = vec![attr("run", any_value::Value::StringValue("r".into()))];
+        if matches!(round, 0 | 1 | 9) {
+            resource.push(attr("edge", any_value::Value::BoolValue(true)));
+        }
+        let batch = (0..4u8)
+            .map(|offset| {
+                let id = round * 4 + offset + 1;
+                trace(id, u64::from(id) * 10, "span", resource.clone(), Vec::new())
+            })
+            .collect::<Vec<_>>();
+        db.write(&namespace, vec![TraceBatch::new(batch)])
+            .await
+            .unwrap();
+    }
+    let counting = count_reads(&mut db, &namespace);
+    let results = db
+        .query_traceql(
+            &namespace,
+            0,
+            1_000,
+            "{ resource.edge = true }",
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    let mut found = results
+        .iter()
+        .map(|result| result.trace_id)
+        .collect::<Vec<_>>();
+    found.sort();
+    assert_eq!(
+        found,
+        [1..=8u8, 37..=40]
+            .into_iter()
+            .flatten()
+            .map(|id| TraceId::new([id; 16]).unwrap())
+            .collect::<Vec<_>>()
+    );
+    // Pages 0 and 1 share one scan; seven pages separate page 9, so it is
+    // fetched on its own.
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(counting.metadata_scans.load(Relaxed), 1);
+    assert_eq!(counting.metadata_gets.load(Relaxed), 1);
+    db.close().await.unwrap();
+}
+
 async fn head(db: &TraceDb, namespace: &Namespace, trace_id: TraceId) -> TraceHead {
     decode_head(
         &db.storage
@@ -1222,7 +1479,7 @@ fn with_span_id(mut trace: Trace, span_id: u8) -> Trace {
 }
 
 #[tokio::test]
-async fn only_continued_traces_get_continuations_and_one_marker() {
+async fn every_page_gets_a_continuation_and_heads_count_pages_across_flushes() {
     let db = TraceDb::open(test_config()).await.unwrap();
     let namespace = Namespace::default();
     let once = trace(1, 1_000, "once", vec![], vec![]);
@@ -1245,18 +1502,31 @@ async fn only_continued_traces_get_continuations_and_one_marker() {
     assert!(!first.continued);
     assert_eq!(
         prefix_count(&db, continuation_prefix(&namespace, once.trace_id)).await,
-        0
+        1
     );
     assert!(!page_trace(&db, &namespace, first.first).await.continued);
+    assert_eq!(first.pages, 1);
     let split_head = head(&db, &namespace, split.trace_id).await;
     assert!(split_head.continued);
+    assert_eq!(split_head.pages, 2);
     assert_eq!(
         prefix_count(&db, continuation_prefix(&namespace, split.trace_id)).await,
         2
     );
+    // Locate `later` while it has one page, so its continuation in a later
+    // flush must replace the cached locators.
+    assert_eq!(
+        db.locate(&namespace, later.trace_id, unix_time_ms().unwrap())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
-    // Continue `later` twice, in a later segment, across separate flushes.
-    for (start, span_id) in [(25_000_000_000, 0x21), (35_000_000_000, 0x22)] {
+    // Continue `later` twice, in a later segment, across separate flushes,
+    // locating it in between so the second continuation must replace the
+    // cached locators.
+    for (pages, (start, span_id)) in [(2, (25_000_000_000, 0x21)), (3, (35_000_000_000, 0x22))] {
         db.write(
             &namespace,
             vec![TraceBatch::new(vec![with_span_id(
@@ -1266,9 +1536,15 @@ async fn only_continued_traces_get_continuations_and_one_marker() {
         )
         .await
         .unwrap();
+        let located = db
+            .cached_locate(&namespace, later.trace_id, unix_time_ms().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(located.len(), pages);
     }
     let later_head = head(&db, &namespace, later.trace_id).await;
     assert!(later_head.continued);
+    assert_eq!(later_head.pages, 3);
     let locators = db
         .locate(&namespace, later.trace_id, unix_time_ms().unwrap())
         .await
@@ -1276,33 +1552,17 @@ async fn only_continued_traces_get_continuations_and_one_marker() {
     assert_eq!(locators.len(), 3);
     let first_page = later_head.first.page();
     assert!(locators.iter().any(|locator| locator.page() == first_page));
+    // Each page of `later` was the first of its own flush.
     for locator in &locators {
-        assert_eq!(
-            page_trace(&db, &namespace, *locator).await.continued,
-            locator.page() != first_page
-        );
+        assert!(!page_trace(&db, &namespace, *locator).await.continued);
     }
-    // One marker per continued trace, under its first page's segment.
-    let segment = later_head.first.segment;
-    assert_eq!(segment, split_head.first.segment);
-    let markers = db
-        .continued_markers(&namespace, BTreeSet::from([segment]))
-        .await
-        .unwrap();
     assert_eq!(
-        markers,
-        HashSet::from([
-            (
-                segment,
-                later_head.first.page_sequence,
-                later_head.first.trace_index
-            ),
-            (
-                segment,
-                split_head.first.page_sequence,
-                split_head.first.trace_index
-            ),
-        ])
+        later_head.first.expires_at_unix_ms,
+        locators
+            .iter()
+            .map(|locator| locator.expires_at_unix_ms)
+            .max()
+            .unwrap()
     );
     assert_eq!(
         db.get_trace(&namespace, later.trace_id)
@@ -1317,7 +1577,7 @@ async fn only_continued_traces_get_continuations_and_one_marker() {
 }
 
 #[tokio::test]
-async fn single_page_traces_need_no_locator_reads() {
+async fn the_writer_reads_each_trace_head_once() {
     let mut db = TraceDb::open(test_config()).await.unwrap();
     let namespace = Namespace::default();
     let traces = (1..=20u8)
@@ -1344,7 +1604,7 @@ async fn single_page_traces_need_no_locator_reads() {
     .await
     .unwrap();
     let counting = count_reads(&mut db, &namespace);
-    for query in ["{}", r#"{ span.k = "v" }"#] {
+    for (query, reads) in [("{}", (20, 3)), (r#"{ span.k = "v" }"#, (0, 2))] {
         let before = counting.counts();
         let results = db
             .query_traceql(&namespace, 0, 1_000, query, QueryOptions::default())
@@ -1357,9 +1617,10 @@ async fn single_page_traces_need_no_locator_reads() {
             "{query}"
         );
         let after = counting.counts();
-        // The catalog scan of the locator segment, plus one continuation
-        // scan for the one continued trace.
-        assert_eq!((after.0 - before.0, after.1 - before.1), (0, 3), "{query}");
+        // The catalog scan of the locator segment, plus, until the writer
+        // has cached their locators, every candidate's head and the one
+        // continued trace's continuation scan.
+        assert_eq!((after.0 - before.0, after.1 - before.1), reads, "{query}");
     }
     let before = counting.counts();
     db.get_trace(&namespace, TraceId::new([1; 16]).unwrap())
@@ -1419,6 +1680,60 @@ async fn expired_first_page_of_a_continued_trace_is_skipped() {
     );
     let scanned = db.scan_trace_ids(&namespace, 10).await.unwrap();
     assert_eq!(scanned.len(), 1);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unconfirmed_candidates_are_kept_only_when_their_head_counts_other_pages() {
+    const SECOND: u64 = 1_000_000_000;
+    let db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    let k = |value: &str| vec![attr("k", any_value::Value::StringValue(value.into()))];
+    db.write(
+        &namespace,
+        vec![TraceBatch::new(vec![
+            trace(1, SECOND, "single", vec![], k("v")),
+            trace(2, SECOND, "split", vec![], k("v")),
+        ])],
+    )
+    .await
+    .unwrap();
+    // A later flush continues trace 2 in another segment, so each clause
+    // sees it on a different unflagged page and neither confirms it.
+    db.write(
+        &namespace,
+        vec![TraceBatch::new(vec![
+            with_span_id(trace(2, 15 * SECOND, "split", vec![], k("w")), 0x22),
+            trace(3, 15 * SECOND, "single", vec![], k("w")),
+        ])],
+    )
+    .await
+    .unwrap();
+    let query = r#"{ span.k = "v" } && { span.k = "w" }"#;
+    let plan = crate::traceql::plan(crate::traceql::parse(query).unwrap()).unwrap();
+    let located = db
+        .ordered_candidates(
+            &namespace,
+            0,
+            20 * SECOND,
+            &plan.pushdown,
+            unix_time_ms().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        located
+            .iter()
+            .map(|located| located.trace_id)
+            .collect::<Vec<_>>(),
+        vec![TraceId::new([2; 16]).unwrap()]
+    );
+    let results = db
+        .query_traceql(&namespace, 0, 20 * SECOND, query, QueryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].trace_id, TraceId::new([2; 16]).unwrap());
     db.close().await.unwrap();
 }
 
@@ -1531,6 +1846,449 @@ async fn lazy_locating_matches_evaluating_every_trace() {
                 );
             }
         }
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn column_pruning_matches_full_evaluation() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    use crate::traceql::columns::testing;
+
+    const SECOND: u64 = 1_000_000_000;
+    let mut runner = TestRunner::deterministic();
+    let mut generate = |id: u8| {
+        let trace = testing::trace(id).new_tree(&mut runner).unwrap().current();
+        let mut resource_spans = trace.resource_spans;
+        for span in resource_spans
+            .iter_mut()
+            .flat_map(|resource| &mut resource.scope_spans)
+            .flat_map(|scope| &mut scope.spans)
+        {
+            span.end_time_unix_nano = span
+                .end_time_unix_nano
+                .min(span.start_time_unix_nano + 5 * SECOND);
+        }
+        Trace::new(trace.trace_id, resource_spans).unwrap()
+    };
+    let db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    // Later writes continue a third of the traces on new pages.
+    for write in 0..3u8 {
+        let batch = (1..=60u8)
+            .filter(|id| write == 0 || id % 3 == write)
+            .map(&mut generate)
+            .collect::<Vec<_>>();
+        db.write(&namespace, vec![TraceBatch::new(batch)])
+            .await
+            .unwrap();
+    }
+    let stored = db.scan_traces(&namespace, 1_000).await.unwrap();
+    let now = unix_time_ms().unwrap();
+    let mut pages = BTreeSet::new();
+    for trace in &stored {
+        for locator in db.locate(&namespace, trace.trace_id, now).await.unwrap() {
+            pages.insert(locator.page());
+        }
+    }
+    assert!(pages.len() > 3, "{} pages", pages.len());
+
+    let mut queries = [
+        "{ duration > 1s }",
+        "{ status = error && kind = server }",
+        "{ kind = consumer && status = error && duration > 1ms }",
+        r#"{ name = "get" } >> { status = error }"#,
+        r#"{ resource.service.name = "api" && duration >= 1ms }"#,
+        "{ duration != 1ms } | count() > 1",
+        "{ status = ok } !>> { kind = client }",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let generated = testing::query();
+    queries.extend((0..80).map(|_| generated.new_tree(&mut runner).unwrap().current()));
+    let queries = queries
+        .into_iter()
+        .filter(|query| crate::traceql::plan(crate::traceql::parse(query).unwrap()).is_ok())
+        .collect::<Vec<_>>();
+
+    let window = (0, 100 * SECOND);
+    let mut pruned = 0;
+    for query in &queries {
+        let parsed = crate::traceql::parse(query).unwrap();
+        let mut expected = stored
+            .iter()
+            .filter_map(|trace| {
+                crate::traceql::execute(trace, &parsed, 10_000)
+                    .unwrap()
+                    .map(|result| (result.start_ns, result.trace_id))
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let found = db
+            .query_traceql(
+                &namespace,
+                window.0,
+                window.1,
+                query,
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|result| (result.start_ns, result.trace_id))
+            .collect::<Vec<_>>();
+        assert_eq!(found, expected, "{query}");
+
+        let Some(filter) = crate::traceql::prefilter(&parsed) else {
+            continue;
+        };
+        let located = db
+            .ordered_candidates(&namespace, window.0, window.1, &[], now)
+            .await
+            .unwrap();
+        let complete = stored.iter().map(|trace| trace.trace_id).collect();
+        let all = db
+            .load_candidates(
+                &namespace,
+                located.clone(),
+                &query::PageMemo::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let kept = db
+            .load_candidates(
+                &namespace,
+                located,
+                &query::PageMemo::default(),
+                Some(query::Prune::new(&filter, 10_000, &complete)),
+            )
+            .await
+            .unwrap();
+        let matching = |traces: &[Trace]| {
+            traces
+                .iter()
+                .filter_map(|trace| crate::traceql::execute(trace, &parsed, 10_000).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching(&kept), matching(&all), "{query}");
+        assert!(kept.iter().all(|trace| all.contains(trace)), "{query}");
+        pruned += all.len() - kept.len();
+    }
+    assert!(pruned > 0);
+    db.close().await.unwrap();
+}
+
+mod value_ranges {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::traceql::{BinaryOp, StaticValue};
+
+    const EDGE_INTS: [i64; 9] = [
+        i64::MIN,
+        -(1 << 53) - 1,
+        -1,
+        0,
+        1,
+        1 << 53,
+        (1 << 53) + 1,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    const EDGE_DOUBLES: [f64; 14] = [
+        0.0,
+        -0.0,
+        0.5,
+        -1.5,
+        1.5,
+        f64::MIN_POSITIVE,
+        9_007_199_254_740_992.0,
+        9_223_372_036_854_775_807.0,
+        -9_223_372_036_854_775_808.0,
+        1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        -f64::NAN,
+    ];
+
+    fn literal() -> impl Strategy<Value = StaticValue> {
+        prop_oneof![
+            any::<i64>().prop_map(StaticValue::Int),
+            prop::sample::select(EDGE_INTS.to_vec()).prop_map(StaticValue::Int),
+            (-3_i64..3).prop_map(StaticValue::Duration),
+            any::<f64>().prop_map(StaticValue::Float),
+            prop::sample::select(EDGE_DOUBLES.to_vec()).prop_map(StaticValue::Float),
+        ]
+    }
+
+    /// Stored values of every type, many next to the literal.
+    fn value(literal: &StaticValue) -> BoxedStrategy<AttributeValue> {
+        let (near_int, near_double) = match *literal {
+            StaticValue::Int(value) | StaticValue::Duration(value) => (value, value as f64),
+            StaticValue::Float(value) => (value as i64, value),
+            _ => (0, 0.0),
+        };
+        prop_oneof![
+            any::<i64>().prop_map(AttributeValue::Int),
+            prop::sample::select(EDGE_INTS.to_vec()).prop_map(AttributeValue::Int),
+            (-5_000_i64..5_000)
+                .prop_map(move |delta| AttributeValue::Int(near_int.saturating_add(delta))),
+            any::<f64>().prop_map(AttributeValue::Double),
+            prop::sample::select(EDGE_DOUBLES.to_vec()).prop_map(AttributeValue::Double),
+            (-3_i64..=3).prop_map(move |steps| {
+                let bits = near_double.to_bits() as i64;
+                AttributeValue::Double(f64::from_bits(bits.wrapping_add(steps) as u64))
+            }),
+            Just(AttributeValue::String("5".to_owned())),
+            Just(AttributeValue::Bool(true)),
+        ]
+        .boxed()
+    }
+
+    fn in_ranges(predicate: &IndexPredicate, value: &AttributeValue) -> Option<bool> {
+        let namespace = Namespace::default();
+        let prefix = field_scan_prefix(&namespace, 0, predicate.field, &predicate.name);
+        let key = field_posting_key(
+            &namespace,
+            0,
+            (predicate.field, &predicate.name, value),
+            u64::MAX,
+        );
+        let suffix = &key[prefix.len()..];
+        let ranges = predicate.value_ranges()?;
+        Some(ranges.iter().any(|(low, high)| {
+            let (lower, upper) = value_subrange(low, high);
+            lower.as_ref() <= suffix && suffix <= upper.as_ref()
+        }))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4_000))]
+
+        #[test]
+        fn numeric_ranges_hold_every_admitted_value(
+            (literal, values) in literal().prop_flat_map(|literal| {
+                let values = prop::collection::vec(value(&literal), 1..16);
+                (Just(literal), values)
+            }),
+            op in prop::sample::select(vec![
+                BinaryOp::Less,
+                BinaryOp::LessEqual,
+                BinaryOp::Greater,
+                BinaryOp::GreaterEqual,
+                BinaryOp::Equal,
+            ]),
+        ) {
+            let predicate = IndexPredicate {
+                field: IndexField::Span,
+                name: "n".to_owned(),
+                test: IndexTest::Compare(op, literal.clone()),
+            };
+            for value in &values {
+                let Some(found) = in_ranges(&predicate, value) else {
+                    prop_assert!(op == BinaryOp::Equal && matches!(literal, StaticValue::Float(value) if value.is_nan()));
+                    continue;
+                };
+                prop_assert!(
+                    found || !predicate.admits(value),
+                    "{:?} {:?} {:?} admitted outside its ranges", value, op, literal
+                );
+            }
+        }
+
+        #[test]
+        fn duration_ranges_hold_every_admitted_bucket(
+            nanoseconds in prop_oneof![
+                any::<f64>(),
+                (0_u64..=u64::MAX).prop_map(|value| value as f64),
+                prop::sample::select(vec![0.0, 1.0, 1.5, 1023.0, 1024.0, f64::NAN]),
+            ],
+            op in prop::sample::select(vec![
+                BinaryOp::Less,
+                BinaryOp::LessEqual,
+                BinaryOp::Greater,
+                BinaryOp::GreaterEqual,
+                BinaryOp::Equal,
+            ]),
+        ) {
+            let predicate = IndexPredicate {
+                field: IndexField::Intrinsic,
+                name: "duration".to_owned(),
+                test: IndexTest::Duration(op, nanoseconds),
+            };
+            for bucket in 0..=64 {
+                let bucket = AttributeValue::Int(bucket);
+                prop_assert_eq!(in_ranges(&predicate, &bucket), Some(predicate.admits(&bucket)));
+            }
+        }
+    }
+
+    #[test]
+    fn string_and_inequality_tests_scan_the_field() {
+        for test in [
+            IndexTest::Compare(BinaryOp::NotEqual, StaticValue::Int(1)),
+            IndexTest::Compare(BinaryOp::Greater, StaticValue::String("a".to_owned())),
+            IndexTest::Compare(BinaryOp::Regex, StaticValue::String("a.*".to_owned())),
+        ] {
+            let predicate = IndexPredicate {
+                field: IndexField::Span,
+                name: "n".to_owned(),
+                test,
+            };
+            assert_eq!(predicate.value_ranges(), None, "{predicate:?}");
+        }
+    }
+
+    /// Queries with different bounds share segments and the posting cache,
+    /// and each still returns exactly what evaluating every trace does.
+    #[tokio::test]
+    async fn bounded_scans_match_full_evaluation() {
+        let values = [
+            any_value::Value::IntValue(i64::MIN),
+            any_value::Value::IntValue(-7),
+            any_value::Value::IntValue(0),
+            any_value::Value::IntValue(1),
+            any_value::Value::IntValue(2),
+            any_value::Value::IntValue(500),
+            any_value::Value::IntValue(1 << 53),
+            any_value::Value::IntValue((1 << 53) + 1),
+            any_value::Value::IntValue(i64::MAX),
+            any_value::Value::DoubleValue(-0.0),
+            any_value::Value::DoubleValue(0.0),
+            any_value::Value::DoubleValue(1.5),
+            any_value::Value::DoubleValue(-2.5),
+            any_value::Value::DoubleValue(499.999),
+            any_value::Value::DoubleValue(f64::INFINITY),
+            any_value::Value::DoubleValue(f64::NEG_INFINITY),
+            any_value::Value::DoubleValue(f64::NAN),
+            any_value::Value::StringValue("3".to_owned()),
+            any_value::Value::BoolValue(true),
+        ];
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::default();
+        let traces = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                trace(
+                    index as u8 + 1,
+                    index as u64,
+                    "op",
+                    Vec::new(),
+                    vec![attr("n", value.clone())],
+                )
+            })
+            .collect::<Vec<_>>();
+        db.write(&namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+        let mut checked = 0;
+        for literal in [
+            "0",
+            "1",
+            "2",
+            "500",
+            "-0.0",
+            "0.0",
+            "1.5",
+            "2.0",
+            "499.999",
+            "500.0",
+            "1e300",
+            "9007199254740992",
+            "9007199254740993",
+            "9223372036854775807",
+            "1ms",
+        ] {
+            for op in ["<", "<=", ">", ">=", "="] {
+                let source = format!("{{ span.n {op} {literal} }}");
+                let Ok(parsed) = crate::traceql::parse(&source) else {
+                    continue;
+                };
+                checked += 1;
+                let mut expected = traces
+                    .iter()
+                    .filter(|trace| {
+                        crate::traceql::execute(trace, &parsed, 1_000)
+                            .unwrap()
+                            .is_some()
+                    })
+                    .map(|trace| trace.trace_id)
+                    .collect::<Vec<_>>();
+                expected.sort_unstable();
+                let mut found = db
+                    .query_traceql(&namespace, 0, 100, &source, QueryOptions::default())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|result| result.trace_id)
+                    .collect::<Vec<_>>();
+                found.sort_unstable();
+                assert_eq!(found, expected, "{source}");
+            }
+        }
+        assert!(checked > 40, "{checked} queries parsed");
+        db.close().await.unwrap();
+    }
+
+    /// Search, deciding and summarizing from columns where it can, returns
+    /// exactly what evaluating every merged trace does, for generated traces
+    /// (some continued across flushes) and queries.
+    #[tokio::test]
+    async fn generated_queries_match_the_interpreter() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::TestRunner;
+
+        use crate::traceql::columns::testing;
+
+        let mut runner = TestRunner::deterministic();
+        let mut trace = |id: u8| testing::trace(id).new_tree(&mut runner).unwrap().current();
+        let first = (1..=30).map(&mut trace).collect::<Vec<_>>();
+        let second = (1..=6).map(&mut trace).collect::<Vec<_>>();
+        let queries = (0..120)
+            .map(|_| testing::query().new_tree(&mut runner).unwrap().current())
+            .collect::<Vec<_>>();
+        let db = TraceDb::open(test_config()).await.unwrap();
+        let namespace = Namespace::default();
+        for batch in [&first, &second] {
+            db.write(&namespace, vec![TraceBatch::new(batch.clone())])
+                .await
+                .unwrap();
+        }
+        let merged = crate::db::merge_traces(first.into_iter().chain(second).collect()).unwrap();
+        let options = QueryOptions {
+            limit: 100,
+            ..QueryOptions::default()
+        };
+        let mut matched = 0;
+        for source in queries {
+            let parsed = crate::traceql::parse(&source).unwrap();
+            let mut expected = merged
+                .iter()
+                .filter_map(|trace| crate::traceql::execute(trace, &parsed, 1_000).unwrap())
+                .collect::<Vec<_>>();
+            expected.sort_by_key(|result| (result.start_ns, result.trace_id));
+            let found = db
+                .query_traceql(&namespace, 0, u64::MAX, &source, options)
+                .await
+                .unwrap();
+            assert_eq!(found, expected, "{source}");
+            let summaries = db
+                .search_traceql(&namespace, 0, u64::MAX, &source, options)
+                .await
+                .unwrap();
+            let expected = expected
+                .into_iter()
+                .map(TraceSummary::from)
+                .collect::<Vec<_>>();
+            assert_eq!(summaries, expected, "{source}");
+            matched += expected.len();
+        }
+        assert!(matched > 0);
         db.close().await.unwrap();
     }
 }

@@ -745,6 +745,7 @@ dependencies = [
  "metrics",
  "mixtrics",
  "proptest",
+ "ryu",
  "serde",
  "serde_yaml",
  "slatedb",
@@ -2819,6 +2820,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "linkify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3097,6 +3107,15 @@ dependencies = [
  "rand_xoshiro",
  "rapidhash",
  "sketches-ddsketch",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -3811,12 +3830,17 @@ dependencies = [
  "bytes",
  "chrono",
  "common",
+ "criterion",
+ "foldhash 0.2.0",
  "futures",
  "lalrpop",
  "lalrpop-util",
  "linkify",
  "logos",
+ "lz4_flex 0.14.0",
+ "memchr",
  "metrics",
+ "mimalloc",
  "minijinja",
  "proptest",
  "rayon",
@@ -3826,6 +3850,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sharding",
+ "simdutf8",
  "slatedb",
  "snap",
  "tempfile",
@@ -3835,6 +3860,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "unicode-segmentation",
+ "zstd 0.14.0",
 ]
 
 [[package]]
@@ -3854,6 +3880,7 @@ dependencies = [
  "http-body-util",
  "kube",
  "metrics",
+ "mimalloc",
  "opentelemetry-proto",
  "plural-logs",
  "prost",
@@ -3889,11 +3916,15 @@ dependencies = [
  "chrono",
  "common",
  "config",
+ "criterion",
  "dashmap",
  "dashu-float",
  "fail",
+ "figment",
+ "foldhash 0.2.0",
  "futures",
  "metrics",
+ "mimalloc",
  "moka",
  "opentelemetry-proto",
  "promql-parser",
@@ -3916,7 +3947,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tsz",
  "uuid",
 ]
 
@@ -3937,6 +3967,7 @@ dependencies = [
  "http-body-util",
  "kube",
  "metrics",
+ "mimalloc",
  "opentelemetry-proto",
  "plural-metrics",
  "prost",
@@ -3969,11 +4000,14 @@ dependencies = [
  "blake3",
  "bytes",
  "common",
+ "criterion",
  "futures",
  "lalrpop",
  "lalrpop-util",
  "logos",
  "metrics",
+ "mimalloc",
+ "moka",
  "opentelemetry-proto",
  "proptest",
  "prost",
@@ -3988,6 +4022,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -4004,6 +4039,7 @@ dependencies = [
  "http-body-util",
  "kube",
  "metrics",
+ "mimalloc",
  "opentelemetry-proto",
  "plural-traces",
  "prost",
@@ -6132,15 +6168,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tsz"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "789624517ed689bfd295209450db6c3b15dadcd576ca30eace4619fa7cc82d37"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "twox-hash"

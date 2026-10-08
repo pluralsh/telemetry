@@ -21,7 +21,7 @@ storage:
     capacity: 134217728
 
 segment_duration_seconds: 3600
-retention_seconds: 2592000
+retention_seconds: 1209600 # 14 days, the default; `null` keeps data forever.
 page:
   target_size_bytes: 1048576
   max_rows: 8192

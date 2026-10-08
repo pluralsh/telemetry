@@ -57,6 +57,39 @@ pub struct Config {
 
     /// Bounds and flush triggers for each bucket/routing-slot write delta.
     pub write_buffer: WriteCoordinatorConfig,
+
+    /// Cross-query caches on the read path.
+    pub query_cache: QueryCacheConfig,
+}
+
+/// Default [`Config::retention`]: 60 days.
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60 * 24 * 60 * 60);
+
+/// Capacities of the caches shared across queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryCacheConfig {
+    /// Byte budget of each namespace's selector-matcher cache, which maps a
+    /// bucket and a normalized matcher set to the matching series IDs.
+    pub matcher_capacity_bytes: u64,
+    /// Byte budget of each namespace's decoded-series cache, which keeps a
+    /// bucket's decoded samples per series until the bucket is next flushed.
+    pub series_capacity_bytes: u64,
+    /// Whether [`ShardedMetrics`](crate::ShardedMetrics) reuses earlier
+    /// range-query results whose dependent buckets are unchanged.
+    pub result_cache_enabled: bool,
+    /// Byte budget of the range-query result cache.
+    pub result_capacity_bytes: u64,
+}
+
+impl Default for QueryCacheConfig {
+    fn default() -> Self {
+        Self {
+            matcher_capacity_bytes: 64 * 1024 * 1024,
+            series_capacity_bytes: 128 * 1024 * 1024,
+            result_cache_enabled: true,
+            result_capacity_bytes: 128 * 1024 * 1024,
+        }
+    }
 }
 
 impl Default for Config {
@@ -75,8 +108,9 @@ impl Default for Config {
                 meta_cache: None,
             },
             flush_interval: Duration::from_secs(60),
-            retention: None,
+            retention: Some(DEFAULT_RETENTION),
             write_buffer: WriteCoordinatorConfig::default(),
+            query_cache: QueryCacheConfig::default(),
         }
     }
 }

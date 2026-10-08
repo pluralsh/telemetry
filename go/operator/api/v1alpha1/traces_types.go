@@ -73,7 +73,7 @@ type TracesConfigSpec struct {
 	// +kubebuilder:default=3600
 	SegmentDurationSeconds *int64 `json:"segmentDurationSeconds,omitempty"`
 	// Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.
-	// When unset, data is kept forever.
+	// When unset, the server default of 14 days applies.
 	// +kubebuilder:validation:Pattern=`^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`
 	Retention string `json:"retention,omitempty"`
 	// RetentionSeconds is deprecated in favor of retention.

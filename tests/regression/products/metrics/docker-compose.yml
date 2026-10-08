@@ -42,12 +42,28 @@ services:
 
   minio:
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
-    command: server /data --console-address :9001
+    command: server /data --address ${MINIO_ADDRESS:-:9000} --console-address :9001
     environment:
       MINIO_ROOT_USER: metrics
       MINIO_ROOT_PASSWORD: metrics-regression-secret
     volumes: ["minio-data:/data"]
     ports: ["19000:9000"]
+
+  # Historical scenario only: owns MinIO's address inside MinIO's network
+  # namespace, so every client's `minio:9000` goes through it, and forwards to
+  # MinIO on :9010 with a fixed first-byte delay.
+  minio-latency:
+    profiles: ["historical"]
+    image: python:3.13-slim
+    network_mode: service:minio
+    command:
+      - python
+      - /proxy.py
+      - --listen=9000
+      - --upstream=9010
+      - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+    volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
+    depends_on: [minio]
 
   minio-init:
     image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
@@ -94,6 +110,10 @@ services:
       - -ingester.max-global-series-per-user=0
       # Rounds rewrite up to 30m of history after earlier rounds were flushed.
       - -ingester.out-of-order-time-window=2h
+      # Query sharding (on by default) caches head postings for 10s, so a
+      # selector queried just before a write misses the series it creates.
+      - -blocks-storage.tsdb.head-postings-for-matchers-cache-ttl=0s
+      - -blocks-storage.tsdb.block-postings-for-matchers-cache-ttl=0s
       - -querier.query-engine=${MIMIR_QUERY_ENGINE:-mimir}
       - -querier.query-ingesters-within=${MIMIR_QUERY_INGESTERS_WITHIN:-13h}
       - -querier.query-store-after=${MIMIR_QUERY_STORE_AFTER:-12h}
@@ -106,11 +126,13 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  # `METRICS_CONFIG_DIR=production` runs the split topology with the
+  # operator's settings instead of the small regression ones.
   metrics-writer-0:
     <<: *metrics
     command: ["--config", "/app/regression/writer-0.yaml"]
     volumes:
-      - ./writer-0.yaml:/app/regression/writer-0.yaml:ro
+      - ./${METRICS_CONFIG_DIR:-.}/writer-0.yaml:/app/regression/writer-0.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18080:8080"]
 
@@ -118,7 +140,7 @@ services:
     <<: *metrics
     command: ["--config", "/app/regression/writer-1.yaml"]
     volumes:
-      - ./writer-1.yaml:/app/regression/writer-1.yaml:ro
+      - ./${METRICS_CONFIG_DIR:-.}/writer-1.yaml:/app/regression/writer-1.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18081:8080"]
 
@@ -126,11 +148,42 @@ services:
     <<: *metrics
     command: ["--config", "/app/regression/reader.yaml"]
     volumes:
-      - ./reader.yaml:/app/regression/reader.yaml:ro
+      - ./${METRICS_CONFIG_DIR:-.}/reader.yaml:/app/regression/reader.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18082:8080"]
+
+  # One process and shard over MinIO, the shape of the single-binary oracles;
+  # benchmarks use it so reads skip the split topology's per-shard fan-out.
+  metrics-s3:
+    <<: *metrics
+    profiles: ["standalone-s3"]
+    command: ["--config", "/app/regression/standalone-s3.yaml"]
+    volumes:
+      - ./production/standalone-s3.yaml:/app/regression/standalone-s3.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18084:8080"]
+
+  # One process on local disk, the writers' and reader's storage settings
+  # otherwise, so a comparison with Prometheus leaves out the object store.
+  metrics-standalone:
+    profiles: ["standalone"]
+    image: telemetry-regression/plural-metrics-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/metrics-server/Dockerfile
+    environment:
+      METRICS_INTERNAL_TOKEN: internal-regression-token
+    # Named volumes are created root-owned.
+    user: "0:0"
+    command: ["--config", "/app/regression/standalone.yaml"]
+    volumes:
+      - ./standalone.yaml:/app/regression/standalone.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+      - metrics-standalone-data:/data
+    ports: ["18083:8080"]
 
 volumes:
   prometheus-data:
   minio-data:
   mimir-data:
+  metrics-standalone-data:

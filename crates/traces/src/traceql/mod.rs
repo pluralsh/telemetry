@@ -1,6 +1,7 @@
 //! TraceQL syntax, semantic validation, planning, and non-metrics execution.
 
 mod ast;
+pub(crate) mod columns;
 mod error;
 mod execution;
 lalrpop_util::lalrpop_mod!(
@@ -15,9 +16,11 @@ mod validation;
 
 pub use ast::*;
 pub use error::{ParseError, QueryError, ValidationError};
-pub use execution::{MatchedSpan, TraceQlResult};
+pub use execution::{MatchedSpan, TraceQlResult, TraceSummary};
 pub(crate) use plan::span_intrinsics;
-pub use plan::{IndexField, IndexPredicate, IndexTest, PushdownClause, QueryPlan, plan};
+pub use plan::{
+    IndexField, IndexPredicate, IndexTest, PushdownClause, QueryPlan, existential, plan,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryOptions {
@@ -55,7 +58,10 @@ pub fn parse(source: &str) -> Result<Query, QueryError> {
     Ok(query)
 }
 
+pub(crate) use columns::{TraceFilter, prefilter};
+#[cfg(test)]
 pub(crate) use execution::execute;
+pub(crate) use execution::{CompiledQuery, execute_compiled, summarize_compiled};
 
 #[cfg(test)]
 mod tests;

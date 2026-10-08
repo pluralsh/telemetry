@@ -19,9 +19,10 @@
 //! `Sum`, `Avg`, `Min`, `Max`, `Count`, `Stddev`, `Stdvar`, `Group` apply a
 //! per-cell single-pass reducer. The child may tile its output arbitrarily
 //! (any `(step_range, series_range)` slice), so the operator buffers a
-//! `(step × group)` accumulator grid and only emits once the child signals
-//! end-of-stream. Grid footprint is
-//! `O(step_count × output_groups × sizeof(Accumulator))`.
+//! `(group × step)` accumulator grid and only emits once the child signals
+//! end-of-stream. Each kind keeps only the lanes it reduces with, so grid
+//! footprint is `O(step_count × output_groups × lane bytes(kind))`, between
+//! 8 (`count`, `group`) and 41 (`avg`) bytes per cell.
 //!
 //! # Breaker kinds — `Topk`, `Bottomk`, `Quantile`
 //!
@@ -82,6 +83,9 @@ mod breaker;
 
 use accumulator::*;
 use breaker::*;
+
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) use accumulator::reference;
 
 // ---------------------------------------------------------------------------
 // AggregateKind — function selection as data
@@ -190,13 +194,6 @@ fn out_bytes(cells: usize) -> usize {
     values.saturating_add(validity)
 }
 
-#[inline]
-fn accum_bytes(step_count: usize, group_count: usize) -> usize {
-    step_count
-        .saturating_mul(group_count)
-        .saturating_mul(std::mem::size_of::<Accumulator>())
-}
-
 /// Upper-bound bytes for the per-group min-heap scratch used by
 /// topk/bottomk. Each of the `group_count` groups holds at most `k`
 /// entries; when `k` exceeds the input series count the loop caps the
@@ -299,13 +296,13 @@ pub struct AggregateOp<C: Operator> {
     /// `true` once the optional scalar parameter child has been fully
     /// drained into [`Self::param_values`].
     param_loaded: bool,
-    /// Per-step-per-group accumulator grid used by the streaming kinds.
+    /// Per-group-per-step accumulator grid used by the streaming kinds.
     ///
-    /// Length = `step_count × group_count`, indexed row-major:
-    /// `accums[global_step * group_count + group]`. Allocated once at
-    /// construction and absorbed-into across every input batch, regardless
-    /// of how the child tiles its emission (step tiles × series tiles).
-    /// Empty for breaker kinds.
+    /// `step_count × group_count` accumulators, group-major (see
+    /// [`AccumGrid::index`]). Allocated once at construction and
+    /// absorbed-into across every input batch, regardless of how the child
+    /// tiles its emission (step tiles × series tiles). `None` for breaker
+    /// kinds.
     ///
     /// Streaming aggregate is a step-bounded breaker — it must see every
     /// series tile for a given step before it can emit, because
@@ -314,10 +311,11 @@ pub struct AggregateOp<C: Operator> {
     /// whole grid keeps the operator correct under arbitrary batch
     /// ordering (step/series tiles interleaved, or split by
     /// `Concurrent`/`Coalesce`).
-    accums: Vec<Accumulator>,
-    /// Native histogram lane parallel to [`Self::accums`], allocated on the
-    /// first histogram cell. Only `sum`, `avg`, `count` and `group` accept
-    /// histograms; the other kinds ignore them as Prometheus does.
+    accums: Option<AccumGrid>,
+    /// Native histogram lane covering the same cells as [`Self::accums`]
+    /// but step-major (`[global_step * group_count + group]`), allocated on
+    /// the first histogram cell. Only `sum`, `avg`, `count` and `group`
+    /// accept histograms; the other kinds ignore them as Prometheus does.
     hist_accums: Vec<HistogramAccumulator>,
     /// Bytes reserved for [`Self::hist_accums`]; released on `Drop`.
     hist_bytes: usize,
@@ -485,7 +483,7 @@ impl<C: Operator> AggregateOp<C> {
                 let heaps = (0..group_map.group_count)
                     .map(|_| BinaryHeap::with_capacity(cap))
                     .collect();
-                (Vec::new(), heaps, Vec::new(), bytes)
+                (None, heaps, Vec::new(), bytes)
             }
             AggregateKind::Quantile(_) => {
                 let bytes =
@@ -493,17 +491,21 @@ impl<C: Operator> AggregateOp<C> {
                 reservation.try_grow(bytes)?;
                 let sort_bufs: Vec<Vec<f64>> =
                     (0..group_map.group_count).map(|_| Vec::new()).collect();
-                (Vec::new(), Vec::new(), sort_bufs, bytes)
+                (None, Vec::new(), sort_bufs, bytes)
             }
             _ => {
-                // Streaming kinds buffer a (step × group) accumulator grid
+                // Streaming kinds buffer a (group × step) accumulator grid
                 // so they remain correct under arbitrary input tiling
                 // (series tiles × step tiles).
-                let bytes = accum_bytes(grid.step_count, group_map.group_count);
+                let (steps, groups, inputs) = (
+                    grid.step_count,
+                    group_map.group_count,
+                    group_map.input_series_count(),
+                );
+                let bytes = AccumGrid::bytes(kind, steps, groups, inputs);
                 reservation.try_grow(bytes)?;
-                let cells = grid.step_count.saturating_mul(group_map.group_count);
-                let accums = vec![Accumulator::new(); cells];
-                (accums, Vec::new(), Vec::new(), bytes)
+                let accums = AccumGrid::new(kind, steps, groups, inputs);
+                (Some(accums), Vec::new(), Vec::new(), bytes)
             }
         };
 
@@ -615,26 +617,8 @@ impl<C: Operator> AggregateOp<C> {
         let in_series_count = input.series_count();
         let group_count = self.group_map.group_count;
 
-        // Row-major: for each step in the input batch, offset to the
-        // global step index and absorb every valid cell into
-        // `accums[global_step * group_count + group]`.
-        for step_off in 0..step_count_in {
-            let global_step = input.step_range.start + step_off;
-            let step_base = step_off * in_series_count;
-            let accum_base = global_step * group_count;
-            for in_series in 0..in_series_count {
-                let cell = step_base + in_series;
-                if !input.validity.get(cell) {
-                    continue;
-                }
-                let global_series = input.series_range.start + in_series;
-                let group = match self.group_map.input_to_group[global_series] {
-                    Some(g) => g as usize,
-                    None => continue,
-                };
-                let v = input.values[cell];
-                self.accums[accum_base + group].absorb(v);
-            }
+        if let Some(accums) = self.accums.as_mut() {
+            accums.absorb_batch(input, &self.group_map.input_to_group);
         }
 
         let accepts_histograms = matches!(
@@ -645,7 +629,7 @@ impl<C: Operator> AggregateOp<C> {
             return Ok(());
         };
         if self.hist_accums.is_empty() {
-            let len = self.accums.len();
+            let len = self.schema.step_grid.step_count.saturating_mul(group_count);
             let bytes = len.saturating_mul(std::mem::size_of::<HistogramAccumulator>());
             self.reservation.try_grow(bytes)?;
             self.hist_bytes = bytes;
@@ -680,61 +664,43 @@ impl<C: Operator> AggregateOp<C> {
 
         let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
         let mut histograms: Option<HistogramCells> = None;
+        let accums = self
+            .accums
+            .as_ref()
+            .expect("streaming kinds keep an accumulator grid");
 
-        for step in 0..step_count {
-            let accum_base = step * group_count;
-            let out_base = step * group_count;
-            for g in 0..group_count {
-                let accum = &self.accums[accum_base + g];
-                let idx = out_base + g;
-                let hist_count = self.hist_accums.get(accum_base + g).map_or(0, |h| h.count);
-                if hist_count > 0 {
-                    let value = match self.kind {
-                        AggregateKind::Count => Some(accum.count as f64 + hist_count as f64),
-                        AggregateKind::Group => Some(1.0),
-                        // A group mixing floats and histograms has no sum.
-                        _ if accum.count > 0 => None,
-                        _ => {
-                            let hist = &mut self.hist_accums[accum_base + g];
-                            if let Some(mut h) = hist.take_sum() {
-                                if self.kind == AggregateKind::Avg {
-                                    h.div(hist_count as f64);
-                                }
-                                h.compact();
-                                histograms.get_or_insert_with(|| vec![None; out_cells])[idx] =
-                                    Some(Arc::new(h));
-                            }
-                            None
+        accums.write_floats(self.kind, group_count, &mut out.values, &mut out.validity);
+        for (idx, hist) in self.hist_accums.iter_mut().enumerate() {
+            if hist.count == 0 {
+                continue;
+            }
+            let count = accums.count(accums.index(idx % group_count, idx / group_count));
+            let value = match self.kind {
+                AggregateKind::Count => Some(count as f64 + hist.count as f64),
+                AggregateKind::Group => Some(1.0),
+                // A group mixing floats and histograms has no sum.
+                _ if count > 0 => None,
+                _ => {
+                    if let Some(mut h) = hist.take_sum() {
+                        if self.kind == AggregateKind::Avg {
+                            h.div(hist.count as f64);
                         }
-                    };
-                    if let Some(v) = value {
-                        out.values[idx] = v;
-                        out.validity.set(idx);
+                        h.compact();
+                        histograms.get_or_insert_with(|| vec![None; out_cells])[idx] =
+                            Some(Arc::new(h));
                     }
-                    continue;
+                    None
                 }
-                if accum.count == 0 {
-                    continue;
+            };
+            match value {
+                Some(v) => {
+                    out.values[idx] = v;
+                    out.validity.set(idx);
                 }
-                let value = match self.kind {
-                    AggregateKind::Sum => accum.sum_value(),
-                    AggregateKind::Avg => accum.avg_value(),
-                    AggregateKind::Min => accum.min,
-                    AggregateKind::Max => accum.max,
-                    AggregateKind::Count => accum.count as f64,
-                    AggregateKind::Stddev => accum.variance_value().sqrt(),
-                    AggregateKind::Stdvar => accum.variance_value(),
-                    AggregateKind::Group => 1.0,
-                    // Unreachable: breakers are routed through
-                    // `reduce_batch_breaker` and never visit this path.
-                    AggregateKind::Topk(_)
-                    | AggregateKind::Bottomk(_)
-                    | AggregateKind::Quantile(_) => {
-                        unreachable!("breaker kind routed to streaming finaliser")
-                    }
-                };
-                out.values[idx] = value;
-                out.validity.set(idx);
+                None => {
+                    out.values[idx] = 0.0;
+                    out.validity.clear(idx);
+                }
             }
         }
 

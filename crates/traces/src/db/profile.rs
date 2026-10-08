@@ -14,6 +14,10 @@ use opentelemetry_proto::tonic::{
 
 use super::*;
 
+// The server's allocator, so profiles weigh allocation as it does.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 struct StdRng(u64);
 
 impl StdRng {
@@ -53,6 +57,7 @@ const SERVICES: [&str; 6] = [
     "auth",
 ];
 const ROUTES: [&str; 4] = ["/api/cart", "/api/checkout", "/login", "/healthz"];
+const METHODS: [&str; 4] = ["GET", "POST", "PUT", "DELETE"];
 
 fn kv(key: &str, value: any_value::Value) -> KeyValue {
     KeyValue {
@@ -83,6 +88,20 @@ fn random_trace(rng: &mut StdRng, start_ns: u64) -> Trace {
                 any_value::Value::StringValue(
                     ROUTES[rng.random_range(0..ROUTES.len() as u64) as usize].into(),
                 ),
+            ));
+            attributes.push(kv(
+                "http.method",
+                any_value::Value::StringValue(
+                    METHODS[rng.random_range(0..METHODS.len() as u64) as usize].into(),
+                ),
+            ));
+            attributes.push(kv(
+                "http.status_code",
+                any_value::Value::IntValue(match rng.random_range(0..100u64) {
+                    0..3 => 500,
+                    3..8 => 404,
+                    _ => 200,
+                }),
             ));
         }
         let span = Span {
@@ -147,6 +166,7 @@ fn config(path: &std::path::Path) -> Config {
         retention: None,
         page: Default::default(),
         write_buffer: Default::default(),
+        read_cache: Default::default(),
     }
 }
 
@@ -215,6 +235,11 @@ async fn profile_traceql_phases() {
         format!(
             r#"{{ resource.fuzz.run = "{RUN}" && span.http.route = "/api/cart" }} | count() > 6"#
         ),
+        format!(r#"{{ resource.fuzz.run = "{RUN}" && span.http.route =~ "/log.*" }}"#),
+        format!(r#"{{ resource.fuzz.run = "{RUN}" && span.http.status_code >= 500 }}"#),
+        format!(
+            r#"{{ resource.fuzz.run = "{RUN}" && span.http.method = "DELETE" && span.http.status_code >= 500 }}"#
+        ),
     ];
     for source in &queries {
         for limit in [20, 1000] {
@@ -243,16 +268,12 @@ async fn profile_traceql_phases() {
                 .await
                 .unwrap();
             let candidates = started.elapsed();
-            let complete = located
-                .iter()
-                .filter(|trace| trace.locators.is_some())
-                .count();
             let started = Instant::now();
             let mut loaded = Vec::new();
             let memo = PageMemo::default();
             for batch in located.chunks(MATERIALIZE_BATCH) {
                 loaded.extend(
-                    db.load_candidates(&namespace, batch.to_vec(), &memo)
+                    db.load_candidates(&namespace, batch.to_vec(), &memo, None)
                         .await
                         .unwrap(),
                 );
@@ -270,7 +291,7 @@ async fn profile_traceql_phases() {
             }
             let execute = started.elapsed();
             println!(
-                "limit {limit:>4} results {:>4} | total {:>7.2}ms | candidates {:>5} (complete {complete:>5}) select {:>6.2} load-all {:>6.2} exec-all {:>6.2} (matched {matched}) | {}",
+                "limit {limit:>4} results {:>4} | total {:>7.2}ms | candidates {:>5} select {:>6.2} load-all {:>6.2} exec-all {:>6.2} (matched {matched}) | {}",
                 results.len(),
                 ms(total),
                 located.len(),
@@ -373,7 +394,7 @@ async fn profile_round_scoped_growth() {
             phases[1] += started.elapsed();
             let started = Instant::now();
             let loaded = db
-                .load_candidates(&namespace, located, &PageMemo::default())
+                .load_candidates(&namespace, located, &PageMemo::default(), None)
                 .await
                 .unwrap();
             phases[2] += started.elapsed();
@@ -398,6 +419,337 @@ async fn profile_round_scoped_growth() {
         reader.close().await.unwrap();
     }
     writer.close().await.unwrap();
+}
+
+#[derive(serde::Deserialize)]
+enum FuzzValue {
+    #[serde(rename = "s")]
+    String(String),
+    #[serde(rename = "i")]
+    Int(i64),
+    #[serde(rename = "d")]
+    Double(f64),
+    #[serde(rename = "b")]
+    Bool(bool),
+}
+
+type FuzzAttributes = Vec<(String, FuzzValue)>;
+
+#[derive(serde::Deserialize)]
+struct FuzzSpan {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    name: String,
+    kind: i32,
+    start: u64,
+    end: u64,
+    attributes: Vec<(String, FuzzValue)>,
+    events: Vec<(u64, String, FuzzAttributes)>,
+    status_code: i32,
+    status_message: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FuzzScope {
+    name: String,
+    version: String,
+    spans: Vec<FuzzSpan>,
+}
+
+#[derive(serde::Deserialize)]
+struct FuzzResource {
+    resource: Vec<(String, FuzzValue)>,
+    scopes: Vec<FuzzScope>,
+}
+
+/// One matched fuzz case, as flattened from `cases.jsonl` with the server's
+/// parameter defaults applied.
+#[derive(serde::Deserialize)]
+struct FuzzCase {
+    id: String,
+    family: String,
+    kind: String,
+    impl_ms: f64,
+    query: Option<String>,
+    trace_id: Option<String>,
+    start: Option<u64>,
+    end: Option<u64>,
+    limit: Option<usize>,
+    scope: Option<String>,
+    name: Option<String>,
+}
+
+fn fuzz_attributes(attributes: Vec<(String, FuzzValue)>) -> Vec<KeyValue> {
+    attributes
+        .into_iter()
+        .map(|(key, value)| {
+            kv(
+                &key,
+                match value {
+                    FuzzValue::String(value) => any_value::Value::StringValue(value),
+                    FuzzValue::Int(value) => any_value::Value::IntValue(value),
+                    FuzzValue::Double(value) => any_value::Value::DoubleValue(value),
+                    FuzzValue::Bool(value) => any_value::Value::BoolValue(value),
+                },
+            )
+        })
+        .collect()
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+fn fuzz_resource_spans(resource: FuzzResource) -> ResourceSpans {
+    ResourceSpans {
+        resource: Some(Resource {
+            attributes: fuzz_attributes(resource.resource),
+            dropped_attributes_count: 0,
+        }),
+        scope_spans: resource
+            .scopes
+            .into_iter()
+            .map(|scope| ScopeSpans {
+                scope: Some(
+                    opentelemetry_proto::tonic::common::v1::InstrumentationScope {
+                        name: scope.name,
+                        version: scope.version,
+                        ..Default::default()
+                    },
+                ),
+                spans: scope
+                    .spans
+                    .into_iter()
+                    .map(|span| Span {
+                        trace_id: hex_bytes(&span.trace_id),
+                        span_id: hex_bytes(&span.span_id),
+                        parent_span_id: hex_bytes(&span.parent_span_id),
+                        name: span.name,
+                        kind: span.kind,
+                        start_time_unix_nano: span.start,
+                        end_time_unix_nano: span.end,
+                        attributes: fuzz_attributes(span.attributes),
+                        events: span
+                            .events
+                            .into_iter()
+                            .map(|(time_unix_nano, name, attributes)| {
+                                opentelemetry_proto::tonic::trace::v1::span::Event {
+                                    time_unix_nano,
+                                    name,
+                                    attributes: fuzz_attributes(attributes),
+                                    dropped_attributes_count: 0,
+                                }
+                            })
+                            .collect(),
+                        status: Some(Status {
+                            code: span.status_code,
+                            message: span.status_message,
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn classify_key(key: &[u8]) -> &'static str {
+    match crate::codec::key_record_type(key) {
+        None => "segment",
+        Some(1) => "next_page_sequence",
+        Some(2) => "page_metadata",
+        Some(3) => "page_payload",
+        Some(4) => "trace_head",
+        Some(5) => "attribute_posting",
+        Some(6) => "trace_continuation",
+        Some(_) => "catalog",
+    }
+}
+
+async fn run_case(db: &TraceDb, namespace: &Namespace, case: &FuzzCase) -> Result<usize> {
+    let seconds =
+        |value: Option<u64>, default: u64| value.unwrap_or(default).saturating_mul(1_000_000_000);
+    let start = seconds(case.start, 0);
+    let end = seconds(case.end, u64::MAX / 1_000_000_000);
+    let scoped = |name: &str| {
+        let scope = match case.scope.as_deref() {
+            Some("resource") => Some(AttributeScope::Resource),
+            Some("span") => Some(AttributeScope::Span),
+            _ => None,
+        };
+        if let Some(name) = name.strip_prefix("resource.") {
+            (Some(AttributeScope::Resource), name.to_owned())
+        } else if let Some(name) = name.strip_prefix("span.") {
+            (Some(AttributeScope::Span), name.to_owned())
+        } else {
+            (scope, name.to_owned())
+        }
+    };
+    Ok(match case.kind.as_str() {
+        "by_id" => {
+            let trace_id = case.trace_id.as_deref().unwrap().parse()?;
+            usize::from(db.get_trace(namespace, trace_id).await?.is_some())
+        }
+        "search" => db
+            .query_traceql(
+                namespace,
+                start,
+                end,
+                case.query.as_deref().unwrap(),
+                QueryOptions {
+                    limit: case.limit.unwrap_or(20),
+                    max_candidate_traces: 10_000,
+                    max_spans_per_trace: 100_000,
+                    max_concurrency: 8,
+                },
+            )
+            .await?
+            .len(),
+        "tags" => {
+            let scopes = match case.scope.as_deref() {
+                None => vec![AttributeScope::Resource, AttributeScope::Span],
+                Some("resource") => vec![AttributeScope::Resource],
+                Some("span") => vec![AttributeScope::Span],
+                Some(_) => Vec::new(),
+            };
+            let mut names = 0;
+            for scope in scopes {
+                names += db
+                    .catalog_names(namespace, start, end, Some(scope))
+                    .await?
+                    .len();
+            }
+            names
+        }
+        "tag_values" => {
+            let (scope, name) = scoped(case.name.as_deref().unwrap());
+            db.catalog_values(namespace, start, end, scope, &name)
+                .await?
+                .len()
+        }
+        other => panic!("unknown case kind {other}"),
+    })
+}
+
+/// Replays every matched case of a fuzz run (`PROFILE_CASES/{rounds,cases}.json`,
+/// written by `python -m harness.fuzz.replay traces`) against a reader, writing per-query latency
+/// and storage reads by record type to `PROFILE_OUT` as JSON lines. The store
+/// at `PROFILE_STORE` is ingested once and reused across runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_fuzz_cases() {
+    use std::io::Write as _;
+
+    let input = std::path::PathBuf::from(std::env::var("PROFILE_CASES").unwrap());
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let reps: usize = std::env::var("PROFILE_REPS").map_or(3, |value| value.parse().unwrap());
+    let namespace = Namespace::new("regression").unwrap();
+    let mut config = config(&store);
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_size_bytes: 4 << 20,
+        max_traces: 1024,
+    };
+    // The fuzz regression stack's layout: two-trace pages, one-minute segments.
+    if std::env::var("PROFILE_LAYOUT").as_deref() == Ok("regression") {
+        config.page = PageConfig {
+            target_size_bytes: 16 << 10,
+            max_size_bytes: 1 << 20,
+            max_traces: 2,
+        };
+        config.segment_duration = Duration::from_secs(60);
+    }
+    let marker = store.join("ingested");
+    if !marker.exists() {
+        std::fs::create_dir_all(&store).unwrap();
+        let rounds: Vec<Vec<Vec<FuzzResource>>> =
+            serde_json::from_slice(&std::fs::read(input.join("rounds.json")).unwrap()).unwrap();
+        let writer = TraceDb::open(config.clone()).await.unwrap();
+        for round in rounds {
+            for request in round {
+                let resources = request.into_iter().map(fuzz_resource_spans).collect();
+                let batches = crate::trace_batches_from_resource_spans(resources).unwrap();
+                writer
+                    .write_with_durability(&namespace, batches, Durability::Durable)
+                    .await
+                    .unwrap();
+            }
+        }
+        writer.close().await.unwrap();
+        std::fs::write(&marker, b"").unwrap();
+    }
+    let cases: Vec<FuzzCase> =
+        serde_json::from_slice(&std::fs::read(input.join("cases.json")).unwrap()).unwrap();
+
+    // `PROFILE_MODE=writer` queries through the writing process, whose read
+    // cache is kept current by its own writes.
+    let mut db = if std::env::var("PROFILE_MODE").as_deref() == Ok("writer") {
+        TraceDb::open(config).await.unwrap()
+    } else {
+        TraceDb::open_reader(config, DbReaderOptions::default())
+            .await
+            .unwrap()
+    };
+    let counting = Arc::new(common::storage::counting::CountingStorage::new(
+        db.storage.clone(),
+        classify_key,
+    ));
+    db.storage = counting.clone();
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(std::env::var("PROFILE_OUT").unwrap()).unwrap(),
+    );
+    for case in &cases {
+        let mut best: Option<(Duration, serde_json::Value)> = None;
+        let mut outcome = Ok(0);
+        for _ in 0..reps {
+            counting.take();
+            let started = Instant::now();
+            outcome = run_case(&db, &namespace, case).await;
+            let elapsed = started.elapsed();
+            let io = counting
+                .take()
+                .into_iter()
+                .map(|((op, class), stats)| {
+                    (
+                        format!("{op}/{class}"),
+                        serde_json::json!({
+                            "calls": stats.calls,
+                            "records": stats.records,
+                            "bytes": stats.bytes,
+                            "ms": ms(stats.elapsed),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            if best.as_ref().is_none_or(|(fastest, _)| elapsed < *fastest) {
+                best = Some((elapsed, serde_json::Value::Object(io)));
+            }
+        }
+        let (elapsed, io) = best.unwrap();
+        let (results, error) = match outcome {
+            Ok(results) => (results, None),
+            Err(error) => (0, Some(error.to_string())),
+        };
+        let row = serde_json::json!({
+            "id": case.id,
+            "family": case.family,
+            "query": case.query,
+            "ms": ms(elapsed),
+            "impl_ms": case.impl_ms,
+            "results": results,
+            "error": error,
+            "io": io,
+        });
+        writeln!(out, "{row}").unwrap();
+    }
+    out.flush().unwrap();
+    db.close().await.unwrap();
 }
 
 /// More spans for an already written trace, starting after it ends.

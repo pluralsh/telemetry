@@ -1,4 +1,6 @@
 pub mod config;
+#[cfg(feature = "test-utils")]
+pub mod counting;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;
@@ -36,6 +38,29 @@ pub enum Ttl {
     NoExpiry,
     ExpireAfter(u64),
     ExpireAt(i64),
+}
+
+/// Per-read behavior a backend may honor; backends without the capability
+/// ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadHints {
+    /// Whether blocks fetched by the read populate the block cache. Bulk
+    /// reads of cold data (compaction inputs) pass `false` so they do not
+    /// evict the blocks recent queries rely on.
+    pub cache_blocks: bool,
+}
+
+impl ReadHints {
+    /// Reads that bypass the block cache.
+    pub const UNCACHED: Self = Self {
+        cache_blocks: false,
+    };
+}
+
+impl Default for ReadHints {
+    fn default() -> Self {
+        Self { cache_blocks: true }
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -138,6 +163,14 @@ impl RecordOp {
         Self::Put(PutRecordOp::new_with_options(
             Record::new(key, value),
             PutOptions { ttl },
+        ))
+    }
+
+    /// A merge of operand `value` into `key` that expires according to `ttl`.
+    pub fn merge_with_ttl(key: Bytes, value: Bytes, ttl: Ttl) -> Self {
+        Self::Merge(MergeRecordOp::new_with_ttl(
+            Record::new(key, value),
+            MergeOptions { ttl },
         ))
     }
 }
@@ -285,6 +318,23 @@ pub trait StorageRead: Any + Send + Sync {
         _filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         self.scan_iter(BytesRange::from_prefix_and_subrange(&prefix, &subrange))
+            .await
+    }
+
+    /// [`Self::get`] with per-read hints.
+    async fn get_with(&self, key: Bytes, _hints: ReadHints) -> StorageResult<Option<Record>> {
+        self.get(key).await
+    }
+
+    /// [`Self::scan_prefix_iter`] with per-read hints.
+    async fn scan_prefix_iter_with(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+        _hints: ReadHints,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        self.scan_prefix_iter(prefix, subrange, filter_context)
             .await
     }
 

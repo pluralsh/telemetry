@@ -19,19 +19,20 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::BytesRange;
-use common::storage::{RecordOp, Storage, Ttl, WriteOptions};
+use common::storage::{ReadHints, RecordOp, Storage, Ttl, WriteOptions};
 
 use crate::Namespace;
 use crate::codec::{
-    ObjectRef, StoredObject, block_key, decode_directory_key, decode_object, decode_tombstone,
-    decode_tombstone_key, directory_key, directory_prefix, encode_tombstone, run_key,
-    tombstone_key, tombstone_prefix,
+    BlockGroup, ObjectRef, StoredObject, block_key, decode_directory_key, decode_object,
+    decode_tombstone, decode_tombstone_key, directory_key, directory_prefix, encode_tombstone,
+    run_key, tombstone_key, tombstone_prefix,
 };
 use crate::config::{CompactionConfig, PageConfig};
 use crate::error::{Error, Result};
 use crate::model::SegmentId;
 use crate::object::{
-    MergeInput, ObjectLocation, ObjectProperties, merge_objects, object_records, read_blocks,
+    MergeInput, ObjectLocation, ObjectProperties, ReadNeeds, merge_objects, object_records,
+    read_blocks,
 };
 
 /// Deletions applied per storage write.
@@ -73,8 +74,11 @@ impl PendingDelete {
         blocks: u32,
         deadline_unix_ms: u64,
     ) -> Self {
-        let mut keys = (0..blocks)
-            .map(|block| block_key(namespace, segment, object, block))
+        let mut keys = BlockGroup::ALL
+            .into_iter()
+            .flat_map(|group| {
+                (0..blocks).map(move |block| block_key(namespace, segment, object, group, block))
+            })
             .collect::<Vec<_>>();
         keys.push(directory_key(namespace, segment, object));
         keys.push(tombstone_key(namespace, segment, object));
@@ -188,10 +192,11 @@ impl Compactor {
         let mut dead = HashSet::new();
         let mut tombstones = self
             .storage
-            .scan_prefix_iter(
+            .scan_prefix_iter_with(
                 tombstone_prefix(namespace, segment),
                 BytesRange::unbounded(),
                 None,
+                ReadHints::UNCACHED,
             )
             .await?;
         while let Some(record) = tombstones.next().await? {
@@ -209,10 +214,11 @@ impl Compactor {
         let mut objects = Vec::new();
         let mut directories = self
             .storage
-            .scan_prefix_iter(
+            .scan_prefix_iter_with(
                 directory_prefix(namespace, segment),
                 BytesRange::unbounded(),
                 None,
+                ReadHints::UNCACHED,
             )
             .await?;
         while let Some(record) = directories.next().await? {
@@ -382,6 +388,8 @@ impl Compactor {
                 segment,
                 tracked.object,
                 0..tracked.stored.blocks(),
+                ReadNeeds { lines: true },
+                ReadHints::UNCACHED,
             )
         }))
         .await?;

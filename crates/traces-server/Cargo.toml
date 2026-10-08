@@ -32,6 +32,7 @@ common = { path = "../common" }
 futures.workspace = true
 kube = { workspace = true, optional = true }
 metrics.workspace = true
+mimalloc.workspace = true
 opentelemetry-proto = { workspace = true, features = ["trace", "with-serde", "gen-tonic"] }
 plural-traces = { path = "../traces" }
 prost.workspace = true

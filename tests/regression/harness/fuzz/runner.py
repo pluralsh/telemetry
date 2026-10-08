@@ -9,10 +9,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ..compose import ComposeProject
 from .config import Budget, Endpoint, FuzzConfig, _flag
+from .history import collect_images, history_dir, record_output
+from .history.environment import collect_docker
 from .rand import derive
 from .recorder import CaseRecord, IngestRecord, Recorder, RoundRecord, Summary
 from .resources import DockerApi, ResourceSampler, docker_socket
@@ -37,6 +40,9 @@ class Case:
     request: Request
     compare: Comparator
     ok_statuses: Collection[int] = SUCCESS
+    # Returns why an implementation error is a documented oracle quirk when
+    # the oracle answered; the case is then inconclusive instead of failing.
+    oracle_quirk: Callable[[Exchange, Exchange], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,10 @@ class FuzzProduct(ABC):
         """Called once a round's writes are sent, before visibility polling."""
         return None
 
+    def floor_urls(self) -> dict[str, str]:
+        """Compose service -> a trivial URL (readiness) timed every round."""
+        return {}
+
     def describe(self) -> dict[str, object]:
         return {
             "oracle_read": self.oracle_read.describe(),
@@ -123,6 +133,8 @@ def classify(case: Case, oracle: Exchange, impl: Exchange) -> tuple[str, str | N
             return "mismatch", f"{type(error).__name__}: {error}"
         return "match", None
     if oracle_ok:
+        if case.oracle_quirk and (reason := case.oracle_quirk(oracle, impl)):
+            return "inconclusive", reason
         return ("impl_timeout" if impl.timed_out else "impl_error"), _error(impl)
     if impl_ok:
         return ("oracle_timeout" if oracle.timed_out else "oracle_error"), _error(
@@ -145,6 +157,9 @@ def _stable(case: Case, first: Exchange, second: Exchange) -> bool:
     return classify(case, first, second)[0] in ("match", "inconclusive")
 
 
+FLOOR_SAMPLES = 5
+FLOOR_REQUEST = Request("GET", "")
+
 SLOW_RATIO = 2.0
 SLOW_FLOOR_MS = 150.0
 
@@ -159,6 +174,7 @@ class Runner:
         product: FuzzProduct,
         config: FuzzConfig,
         sampler: ResourceSampler | None = None,
+        layout: dict[str, Any] | None = None,
     ) -> None:
         self.product = product
         self.config = config
@@ -167,7 +183,7 @@ class Runner:
         self.budget = Budget(config.duration_s)
         # Leave room to write the report even when a request is mid-flight.
         self.reserve = min(30.0, max(2.0, config.duration_s * 0.05))
-        self.recorder = Recorder(config, product.describe())
+        self.recorder = Recorder(config, product.describe(), layout=layout)
         self.order = derive(config.seed, "order")
         self._last_progress = time.monotonic()
 
@@ -251,7 +267,18 @@ class Runner:
                 truncated=not all(visible.values()) and self._out_of_time(),
             )
         )
+        self._measure_floor()
         return all(visible.values())
+
+    def _measure_floor(self) -> None:
+        if self.config.stack == "external":
+            return
+        for service, url in self.product.floor_urls().items():
+            role = self.product.resource_roles.get(service, "shared")
+            endpoint = Endpoint(url)
+            for _ in range(FLOOR_SAMPLES):
+                exchange = self.transport.send(endpoint, FLOOR_REQUEST)
+                self.recorder.record_floor(service, role, exchange)
 
     def _wait(self, endpoint: Endpoint, probes: list[Probe]) -> bool:
         deadline = time.monotonic() + min(
@@ -332,8 +359,33 @@ def run_fuzz(product_type: type[FuzzProduct]) -> Summary:
         product_type.name, default_window=product_type.default_window
     )
     product = product_type(config)
+    root = history_dir()
+    images: dict[str, Any] = {}
     with product.stack() as project:
-        return Runner(product, config, _sampler(project, product, config)).run()
+        layout: dict[str, Any] = {"docker": collect_docker()}
+        if isinstance(project, ComposeProject) and project.cpu_layout is not None:
+            layout["cpus"] = project.cpu_layout.describe()
+        summary = Runner(
+            product, config, _sampler(project, product, config), layout=layout
+        ).run()
+        if root is not None and isinstance(project, ComposeProject):
+            images = collect_images(project.name)
+    if root is not None:
+        summary.history = _record_history(summary, root, images)
+    return summary
+
+
+def _record_history(
+    summary: Summary, root: Path, images: dict[str, Any]
+) -> Path | None:
+    # A broken history directory must not turn a finished run into an error.
+    try:
+        path = record_output(summary.output_dir, root, images=images)
+    except Exception as error:
+        print(f"fuzz: could not record history in {root}: {error}", flush=True)
+        return None
+    print(f"fuzz: recorded history entry {path}", flush=True)
+    return path
 
 
 def _sampler(

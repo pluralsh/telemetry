@@ -386,6 +386,288 @@ async fn rate_then_sum_matches_unsharded_database() {
     assert_matches_unsharded(&sharded, &unsharded, "sum(rate(requests_total[1m]))").await;
 }
 
+const HOUR_MS: i64 = 3_600_000;
+/// Start of the hour holding [`TEST_TIME_MS`].
+const BASE_MS: i64 = TEST_TIME_MS / HOUR_MS * HOUR_MS;
+const QUARTER_MS: i64 = 15 * 60_000;
+
+fn at(ms: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)
+}
+
+/// One sample a minute from `from_ms` up to (excluding) `to_ms`.
+fn minutely(from_ms: i64, to_ms: i64) -> Vec<Sample> {
+    (from_ms..to_ms)
+        .step_by(60_000)
+        .map(|t| Sample::new(t, ((t - from_ms) / 60_000) as f64))
+        .collect()
+}
+
+fn range_normalized(series: Vec<RangeSample>) -> Vec<(String, Vec<(i64, u64)>)> {
+    normalized(QueryValue::Matrix(series))
+}
+
+async fn quarter_hour_range(
+    db: &ShardedMetrics,
+    namespace: &Namespace,
+    query: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> (Vec<RangeSample>, Option<serde_json::Value>) {
+    db.query_range_with_trace(
+        namespace,
+        query,
+        at(start_ms)..=at(end_ms),
+        Duration::from_millis(QUARTER_MS as u64),
+        true,
+    )
+    .await
+    .unwrap()
+}
+
+async fn uncached_range(
+    db: &ShardedMetrics,
+    namespace: &Namespace,
+    query: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<RangeSample> {
+    db.query_range_uncached(namespace, query, start_ms, end_ms, QUARTER_MS, false)
+        .await
+        .unwrap()
+        .0
+}
+
+fn reuse(trace: &Option<serde_json::Value>) -> (u64, u64) {
+    let cache = &trace.as_ref().expect("trace")["resultCache"];
+    (
+        cache["reusedSteps"].as_u64().unwrap(),
+        cache["computedSteps"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn late_write_recomputes_only_steps_reading_its_bucket() {
+    // given: three hours of minutely samples on both shards and a cached
+    // range query over them, one step every 15 minutes
+    let (sharded, _) = test_databases().await;
+    let namespace = Namespace::new("global-query-regression").unwrap();
+    let samples = minutely(BASE_MS - 2 * HOUR_MS, BASE_MS + HOUR_MS);
+    let series = vec![
+        series_on_shard(&sharded, "late_metric", 0, &[], samples.clone()),
+        series_on_shard(&sharded, "late_metric", 1, &[], samples),
+    ];
+    let late_shard_series = series[0].clone();
+    let routing = assignment(sharded.shards().options().shard_count());
+    sharded
+        .write(&routing, &namespace, series, Visibility::Written)
+        .await
+        .unwrap();
+    let (start, end) = (BASE_MS - 2 * HOUR_MS, BASE_MS + HOUR_MS - QUARTER_MS);
+    let query = "sum(sum_over_time(late_metric[15m]))";
+    let (cold, trace) = quarter_hour_range(&sharded, &namespace, query, start, end).await;
+    assert_eq!(reuse(&trace), (0, 12));
+
+    // when: a late sample lands in the middle hour on one shard
+    let late_time = BASE_MS - HOUR_MS + 20 * 60_000 + 30_000;
+    let mut late = late_shard_series;
+    late.samples = vec![Sample::new(late_time, 1_000.0)];
+    sharded
+        .write(&routing, &namespace, vec![late], Visibility::Written)
+        .await
+        .unwrap();
+    let (warm, trace) = quarter_hour_range(&sharded, &namespace, query, start, end).await;
+
+    // then: the first step reading the middle hour is its start (whose 15m
+    // window ends there), so the four steps before it are reused
+    assert_eq!(reuse(&trace), (4, 8));
+    assert_eq!(
+        range_normalized(warm),
+        range_normalized(uncached_range(&sharded, &namespace, query, start, end).await)
+    );
+    assert_ne!(
+        range_normalized(cold.clone()),
+        range_normalized(uncached_range(&sharded, &namespace, query, start, end).await)
+    );
+    let (_, trace) = quarter_hour_range(&sharded, &namespace, query, start, end).await;
+    assert_eq!(reuse(&trace), (12, 0));
+}
+
+#[tokio::test]
+async fn moving_end_refresh_reuses_the_cached_prefix() {
+    // given: a cached two-hour range query
+    let (sharded, _) = test_databases().await;
+    let namespace = Namespace::new("global-query-regression").unwrap();
+    let series = vec![
+        series_on_shard(
+            &sharded,
+            "refresh_metric",
+            0,
+            &[],
+            minutely(BASE_MS - 3 * HOUR_MS, BASE_MS),
+        ),
+        series_on_shard(
+            &sharded,
+            "refresh_metric",
+            1,
+            &[("region", "west")],
+            minutely(BASE_MS - 3 * HOUR_MS, BASE_MS),
+        ),
+    ];
+    let routing = assignment(sharded.shards().options().shard_count());
+    sharded
+        .write(&routing, &namespace, series, Visibility::Written)
+        .await
+        .unwrap();
+    let query = "sum by (region) (rate(refresh_metric[10m]))";
+    let (start, end) = (BASE_MS - 3 * HOUR_MS, BASE_MS - HOUR_MS);
+    quarter_hour_range(&sharded, &namespace, query, start, end).await;
+    let before = sharded.result_cache_steps().unwrap();
+
+    // when: the dashboard refreshes with its window moved forward an hour
+    let (start, end) = (start + HOUR_MS, end + HOUR_MS);
+    let (refreshed, trace) = quarter_hour_range(&sharded, &namespace, query, start, end).await;
+
+    // then: the overlapping hour is reused and only the new hour evaluated
+    let after = sharded.result_cache_steps().unwrap();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (5, 4));
+    assert_eq!(reuse(&trace), (5, 4));
+    assert_eq!(
+        range_normalized(refreshed),
+        range_normalized(uncached_range(&sharded, &namespace, query, start, end).await)
+    );
+}
+
+#[tokio::test]
+async fn result_cache_skips_at_modifiers_future_steps_and_errors() {
+    let (sharded, _) = test_databases().await;
+    let namespace = Namespace::new("global-query-regression").unwrap();
+    let series = vec![series_on_shard(
+        &sharded,
+        "skip_metric",
+        0,
+        &[],
+        minutely(BASE_MS - HOUR_MS, BASE_MS),
+    )];
+    let routing = assignment(sharded.shards().options().shard_count());
+    sharded
+        .write(&routing, &namespace, series, Visibility::Written)
+        .await
+        .unwrap();
+    let (start, end) = (BASE_MS - HOUR_MS, BASE_MS);
+
+    // `@` pins reads to absolute times: never cached
+    let pinned = format!("skip_metric @ {}", (BASE_MS - HOUR_MS) / 1000);
+    for _ in 0..2 {
+        let (_, trace) = quarter_hour_range(&sharded, &namespace, &pinned, start, end).await;
+        assert!(trace.unwrap().get("resultCache").is_none());
+    }
+
+    // errors store nothing and still surface
+    for _ in 0..2 {
+        let error = sharded
+            .query_range(
+                &namespace,
+                "label_replace(skip_metric, \"x\", \"$1\", \"y\", \"(\")",
+                at(start)..=at(end),
+                Duration::from_millis(QUARTER_MS as u64),
+            )
+            .await;
+        assert!(error.is_err());
+    }
+
+    // steps after now are evaluated every time
+    let now = common::time::now_ms();
+    let future_start = now - 2 * QUARTER_MS;
+    let query = "vector(1)";
+    for _ in 0..2 {
+        let (series, trace) = quarter_hour_range(
+            &sharded,
+            &namespace,
+            query,
+            future_start,
+            now + 2 * QUARTER_MS,
+        )
+        .await;
+        let (reused, computed) = reuse(&trace);
+        assert!(
+            computed >= 2,
+            "future steps must be evaluated: {reused}/{computed}"
+        );
+        assert_eq!(series[0].samples.len(), 5);
+    }
+}
+
+#[tokio::test]
+async fn db_reader_result_cache_sees_late_writes_after_a_manifest_poll() {
+    // given: a sharded reader over a writer's storage, with a cached range
+    let shared = Arc::new(crate::storage::in_memory_shared_storage().await);
+    let writer = crate::tsdb::Tsdb::new(shared.storage.clone());
+    let namespace = Namespace::default();
+    let series = |samples| Series::new("polled_metric", vec![Label::new("job", "a")], samples);
+    writer
+        .ingest_samples(vec![series(minutely(BASE_MS - 2 * HOUR_MS, BASE_MS))], None)
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    let opened = Arc::clone(&shared);
+    let opener = shard_opener(move |_| {
+        let shared = Arc::clone(&opened);
+        async move {
+            Ok::<_, Error>(MetricsShard::Reader(Box::new(
+                TimeSeriesDbReader::from_storage(shared.reader().await),
+            )))
+        }
+    });
+    let shards = ShardSet::open(
+        ShardRole::Reader,
+        ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
+        opener,
+        [ShardId::new(0)],
+    )
+    .await;
+    let reader = ShardedMetrics::new(
+        shards,
+        SharedDbCache::default(),
+        &QueryCacheConfig::default(),
+    )
+    .await
+    .unwrap();
+    let (start, end) = (BASE_MS - 2 * HOUR_MS, BASE_MS - QUARTER_MS);
+    let query = "max(max_over_time(polled_metric[15m]))";
+    let (cold, _) = quarter_hour_range(&reader, &namespace, query, start, end).await;
+    let (_, trace) = quarter_hour_range(&reader, &namespace, query, start, end).await;
+    assert_eq!(reuse(&trace), (8, 0));
+
+    // when: a late sample lands in the first hour
+    let late_time = BASE_MS - 2 * HOUR_MS + 40 * 60_000 + 30_000;
+    writer
+        .ingest_samples(vec![series(vec![Sample::new(late_time, 1_000.0)])], None)
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+
+    // then: once the reader polls the manifest, the dependent steps are
+    // recomputed and show the late sample
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (warm, trace) = quarter_hour_range(&reader, &namespace, query, start, end).await;
+        if range_normalized(warm.clone()) != range_normalized(cold.clone()) {
+            assert!(reuse(&trace).1 > 0, "late sample served from cache");
+            assert_eq!(
+                range_normalized(warm),
+                range_normalized(uncached_range(&reader, &namespace, query, start, end).await)
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late write stayed hidden behind the result cache"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::test]
 async fn binary_join_across_shards_matches_unsharded_database() {
     let (sharded, unsharded) = test_databases().await;

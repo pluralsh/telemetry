@@ -1,4 +1,5 @@
 use super::*;
+use memchr::memmem;
 
 #[derive(Clone, Copy)]
 pub(super) enum RegexKind {
@@ -40,6 +41,29 @@ pub(super) fn with_regex<T>(
         cache.insert(source.to_owned(), regex);
         Ok(result)
     })
+}
+
+thread_local! {
+    static FINDER_CACHE: RefCell<HashMap<String, Rc<memmem::Finder<'static>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Whether `haystack` contains `needle`, with `needle`'s searcher built once
+/// per worker thread.
+pub(super) fn contains(haystack: &str, needle: &str) -> bool {
+    let finder = FINDER_CACHE.with(|cache| {
+        if let Some(finder) = cache.borrow().get(needle) {
+            return Rc::clone(finder);
+        }
+        let finder = Rc::new(memmem::Finder::new(needle).into_owned());
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(needle.to_owned(), Rc::clone(&finder));
+        finder
+    });
+    finder.find(haystack.as_bytes()).is_some()
 }
 
 thread_local! {

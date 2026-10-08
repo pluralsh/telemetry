@@ -70,6 +70,28 @@ impl Default for PageConfig {
     }
 }
 
+/// Per-shard byte budgets of the cross-query read caches; zero disables one.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReadCacheConfig {
+    pub metadata_bytes: u64,
+    pub postings_bytes: u64,
+    pub pages_bytes: u64,
+    pub locators_bytes: u64,
+}
+
+impl Default for ReadCacheConfig {
+    fn default() -> Self {
+        let value = plural_traces::ReadCacheConfig::default();
+        Self {
+            metadata_bytes: value.metadata_bytes,
+            postings_bytes: value.postings_bytes,
+            pages_bytes: value.pages_bytes,
+            locators_bytes: value.locators_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestConfig {
@@ -107,8 +129,11 @@ pub struct Config {
     pub path_prefix: String,
     pub storage: StorageConfig,
     pub segment_duration_seconds: u64,
+    /// How long data is kept, counted from ingestion; 14 days by default,
+    /// `null` keeps it forever.
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
+    pub read_cache: ReadCacheConfig,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -129,6 +154,7 @@ impl Default for Config {
             segment_duration_seconds: core.segment_duration.as_secs(),
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
+            read_cache: ReadCacheConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
@@ -239,6 +265,12 @@ impl Config {
                 max_traces: self.page.max_traces,
             },
             write_buffer: self.write.write_buffer(),
+            read_cache: plural_traces::ReadCacheConfig {
+                metadata_bytes: self.read_cache.metadata_bytes,
+                postings_bytes: self.read_cache.postings_bytes,
+                pages_bytes: self.read_cache.pages_bytes,
+                locators_bytes: self.read_cache.locators_bytes,
+            },
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,8 +13,8 @@ use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
 use crate::postings_cache::PostingsCache;
 use crate::storage::{
-    StorageSnapshot, Store, insert_forward_index, insert_series_id, merge_inverted_index,
-    merge_samples,
+    Store, insert_forward_index, insert_series_id, merge_inverted_index, merge_samples,
+    put_bucket_generation,
 };
 use crate::tsdb_metrics;
 
@@ -31,7 +32,7 @@ fn op_estimated_bytes(op: &RecordOp) -> usize {
 /// Flusher implementation for the timeseries write coordinator.
 ///
 /// Converts a `FrozenTsdbDelta` into storage operations and applies them
-/// atomically, then returns a new snapshot for readers.
+/// atomically. Returns no snapshot: queries snapshot storage themselves.
 pub(crate) struct TsdbFlusher {
     pub(crate) storage: Arc<dyn Store>,
     /// Optional retention duration. When set, every record produced by a flush
@@ -45,6 +46,41 @@ pub(crate) struct TsdbFlusher {
     pub(crate) active_series: Arc<ActiveSeriesTracker>,
     /// Stamped with the bucket once a flush adding series is visible.
     pub(crate) postings_cache: Option<Arc<PostingsCache>>,
+    /// The bucket's latest stored write generation: seeded from storage when
+    /// the bucket is loaded, then advanced by every successful flush.
+    pub(crate) last_generation: u64,
+}
+
+/// Process-wide floor for bucket generations, so two writers for one bucket
+/// in this process (an evicted bucket reloaded while its last flush is in
+/// flight) still issue increasing generations.
+static GENERATION_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The next write generation after `persisted`: a hybrid clock of wall-clock
+/// microseconds, bumped past both the bucket's stored generation (which
+/// carries monotonicity across restarts and writer handoffs) and every
+/// generation this process has issued.
+fn next_generation(persisted: u64) -> u64 {
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        });
+    let mut last = GENERATION_CLOCK.load(Ordering::Relaxed);
+    loop {
+        let next = now_micros
+            .max(last.saturating_add(1))
+            .max(persisted.saturating_add(1));
+        match GENERATION_CLOCK.compare_exchange_weak(
+            last,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
 }
 
 /// Compute the absolute expire-at timestamp (ms since epoch) shared by every
@@ -65,7 +101,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         &mut self,
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
-    ) -> Result<StorageSnapshot, String> {
+    ) -> Result<(), String> {
         self.flush(frozen).await.map_err(|error| error.to_string())
     }
 
@@ -78,7 +114,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 }
 
 impl TsdbFlusher {
-    async fn flush(&mut self, frozen: FrozenTsdbDelta) -> crate::Result<StorageSnapshot> {
+    async fn flush(&mut self, frozen: FrozenTsdbDelta) -> crate::Result<()> {
         // Advance the active-series ring to the current minute and republish
         // the gauge. Done unconditionally (even on empty deltas) so the window
         // continues to slide for idle workloads.
@@ -86,11 +122,7 @@ impl TsdbFlusher {
         ::metrics::gauge!(tsdb_metrics::TSDB_ACTIVE_SERIES).set(active_estimate as f64);
 
         if frozen.is_empty() {
-            let snap_start = std::time::Instant::now();
-            let snapshot = self.storage.snapshot().await;
-            ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
-                .record(snap_start.elapsed().as_secs_f64());
-            return Ok(snapshot?);
+            return Ok(());
         }
 
         let bucket = frozen.bucket;
@@ -191,6 +223,14 @@ impl TsdbFlusher {
                 )?,
             );
         }
+        // Same batch as the samples: a reader never sees samples without the
+        // generation that announces them.
+        let generation = next_generation(self.last_generation);
+        push_op(
+            &mut ops,
+            &mut estimated_bytes,
+            put_bucket_generation(&frozen.namespace, frozen.bucket, generation, ttl),
+        );
         let ops_count = ops.len() as u64;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS)
             .record(build_start.elapsed().as_secs_f64());
@@ -222,19 +262,14 @@ impl TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
 
         result?;
+        self.last_generation = generation;
         // Postings only change when a flush adds series.
         if new_series_count > 0
             && let Some(cache) = &self.postings_cache
         {
             cache.stamp(bucket);
         }
-
-        // Phase 3: snapshot refresh.
-        let snap_start = std::time::Instant::now();
-        let snapshot = self.storage.snapshot().await;
-        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
-            .record(snap_start.elapsed().as_secs_f64());
-        Ok(snapshot?)
+        Ok(())
     }
 }
 
@@ -323,6 +358,7 @@ mod tests {
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -338,10 +374,10 @@ mod tests {
         let (frozen, _, _) = delta.freeze();
 
         // when
-        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot
+        let buckets = storage
             .get_buckets_in_range(&crate::Namespace::default(), None, None)
             .await
             .unwrap();
@@ -357,6 +393,7 @@ mod tests {
             retention: None,
             active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -373,7 +410,8 @@ mod tests {
         delta.apply(vec![series]).unwrap();
         let (frozen, _, _) = delta.freeze();
 
-        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        let snapshot = storage.snapshot().await.unwrap();
         let namespace = crate::Namespace::default();
         let buckets = [create_test_bucket()];
         let cache = crate::discovery::MetricsDiscoveryCache::new();
@@ -413,6 +451,7 @@ mod tests {
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -429,8 +468,7 @@ mod tests {
 
         // then
         assert!(result.is_ok());
-        let snapshot = result.unwrap();
-        let buckets = snapshot
+        let buckets = storage
             .get_buckets_in_range(&crate::Namespace::default(), None, None)
             .await
             .unwrap();
@@ -453,6 +491,70 @@ mod tests {
         frozen
     }
 
+    #[tokio::test]
+    async fn should_advance_bucket_generation_with_every_flush() {
+        // given
+        let storage = create_test_storage().await;
+        let mut flusher = TsdbFlusher {
+            storage: storage.clone(),
+            retention: None,
+            active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+            postings_cache: None,
+            last_generation: 0,
+        };
+        let namespace = crate::Namespace::default();
+        let bucket = create_test_bucket();
+        let generation = || async {
+            storage
+                .get_bucket_generation(&namespace, &bucket)
+                .await
+                .unwrap()
+        };
+        assert_eq!(generation().await, None);
+
+        // when
+        flusher
+            .flush_delta(create_non_empty_frozen(), &(1..2))
+            .await
+            .unwrap();
+        let first = generation().await.expect("first generation");
+        flusher
+            .flush_delta(create_non_empty_frozen(), &(2..3))
+            .await
+            .unwrap();
+        let second = generation().await.expect("second generation");
+
+        // then
+        assert!(second > first, "{second} should follow {first}");
+        assert_eq!(flusher.last_generation, second);
+    }
+
+    #[tokio::test]
+    async fn should_not_advance_generation_when_apply_fails() {
+        // given
+        let storage = FailingStorage::wrap_in_memory().await;
+        storage.fail_apply(StorageError::Storage("test apply error".into()));
+        let mut flusher = flusher_with(storage);
+        flusher.last_generation = 7;
+
+        // when
+        let result = flusher
+            .flush_delta(create_non_empty_frozen(), &(1..2))
+            .await;
+
+        // then
+        assert!(result.is_err());
+        assert_eq!(flusher.last_generation, 7);
+    }
+
+    #[test]
+    fn should_issue_generations_past_a_stored_one_ahead_of_the_clock() {
+        let ahead = u64::MAX / 2;
+        let next = next_generation(ahead);
+        assert!(next > ahead);
+        assert!(next_generation(0) > next);
+    }
+
     // ── storage-fault-injection tests ──────────────────────────────────
 
     fn flusher_with(storage: Arc<FailingStorage>) -> TsdbFlusher {
@@ -461,6 +563,7 @@ mod tests {
             retention: None,
             active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         }
     }
 
@@ -477,7 +580,7 @@ mod tests {
             .await;
 
         // then
-        let err = result.err().expect("expected apply error");
+        let err = result.expect_err("expected apply error");
         assert!(
             err.contains("test apply error"),
             "expected test apply error message, got: {err}"
@@ -485,23 +588,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_propagate_snapshot_error_after_apply() {
-        // given: apply succeeds against the real inner storage, but the
-        // snapshot refresh afterwards fails
+    async fn should_not_take_storage_snapshot_on_flush() {
+        // given: any snapshot attempt fails
         let storage = FailingStorage::wrap_in_memory().await;
         storage.fail_snapshot(StorageError::Storage("test snapshot error".into()));
-        let mut flusher = flusher_with(storage);
+        let mut flusher = flusher_with(storage.clone());
 
         // when
-        let result = flusher
+        let non_empty = flusher
             .flush_delta(create_non_empty_frozen(), &(1..2))
             .await;
+        let (empty, _, _) = TsdbWriteDelta::init(TsdbContext {
+            namespace: crate::Namespace::default(),
+            bucket: create_test_bucket(),
+            series_dict: Arc::new(HashMap::new()),
+            next_series_id: 0,
+            active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
+        })
+        .freeze();
+        let empty = flusher.flush_delta(empty, &(2..3)).await;
 
-        // then
-        let err = result.err().expect("expected snapshot error");
+        // then: a flush never holds a SlateDB snapshot, which would pin the
+        // merge barrier for as long as the bucket's coordinator lives
+        assert!(non_empty.is_ok(), "got {non_empty:?}");
+        assert!(empty.is_ok(), "got {empty:?}");
         assert!(
-            err.contains("test snapshot error"),
-            "expected test snapshot error message, got: {err}"
+            Store::snapshot(storage.as_ref()).await.is_err(),
+            "the injected snapshot failure should still be armed"
         );
     }
 
@@ -532,6 +645,7 @@ mod tests {
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -551,10 +665,10 @@ mod tests {
         let (frozen, _, _) = delta.freeze();
 
         // when
-        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
+        flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot
+        let buckets = storage
             .get_buckets_in_range(&crate::Namespace::default(), None, None)
             .await
             .unwrap();
@@ -570,6 +684,7 @@ mod tests {
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let bucket = create_test_bucket();
 
@@ -616,6 +731,7 @@ mod tests {
             retention: None,
             active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             postings_cache: None,
+            last_generation: 0,
         };
         let ctx = TsdbContext {
             namespace: crate::Namespace::default(),
@@ -638,12 +754,12 @@ mod tests {
         let (frozen, _, _) = delta.freeze();
 
         // when
-        let snapshot = flusher.flush_delta(frozen, &(1..3)).await.unwrap();
+        flusher.flush_delta(frozen, &(1..3)).await.unwrap();
 
         // then: verify series dictionary was persisted
         let bucket = create_test_bucket();
         let mut count = 0;
-        let _max_id = snapshot
+        let _max_id = storage
             .load_series_dictionary(
                 &crate::Namespace::default(),
                 &bucket,

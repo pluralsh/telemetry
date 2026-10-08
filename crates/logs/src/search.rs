@@ -8,25 +8,33 @@
 //! The BM25 arithmetic and block-impact idea are adapted from OpenData's MIT
 //! licensed `vector` crate. Logs deliberately uses a different persistence
 //! layout: every postings block is an independently addressable SlateDB value,
-//! while fixed-size directory pages describe those blocks.
+//! described by bounded directory fragments that each flush writes alongside
+//! its blocks, so writes never read the index they extend.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::BytesRange;
 use common::serde::ensure_consumed;
 use common::serde::varint::{var_u32, var_u64};
-use common::storage::StorageRead;
+use common::storage::{RecordOp, StorageRead, Ttl};
 use futures::{StreamExt, TryStreamExt};
 
 use crate::Namespace;
 use crate::analyzer::Analyzer;
-use crate::codec::{field_stats_key, term_directory_key, term_posting_block_key, term_stats_key};
+use crate::codec::{
+    field_stats_key, term_directory_key, term_directory_prefix, term_posting_block_key,
+    term_stats_key,
+};
 use crate::error::{Error, Result};
 use crate::model::{SegmentId, StreamId};
 
 pub(crate) const POSTINGS_PER_BLOCK: usize = 128;
 pub(crate) const DIRECTORY_ENTRIES: usize = 256;
+/// Low bits of a posting block ID, holding the block's index among one
+/// flush's blocks of a term; the high bits are the flush's first object ID.
+const BLOCK_INDEX_BITS: u32 = 24;
 pub(crate) const SCORE_METADATA_FIELD: &str = "__line_bm25_score";
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
@@ -66,16 +74,16 @@ pub(crate) struct TermStats {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BlockDirectoryEntry {
-    pub(crate) ordinal: u32,
+    pub(crate) block: u64,
     pub(crate) postings: u16,
     pub(crate) max_frequency: u32,
     pub(crate) min_length: u32,
 }
 
 impl BlockDirectoryEntry {
-    fn describe(ordinal: u32, postings: &[Posting]) -> Result<Self> {
+    fn describe(block: u64, postings: &[Posting]) -> Result<Self> {
         Ok(Self {
-            ordinal,
+            block,
             postings: u16::try_from(postings.len())
                 .map_err(|_| Error::Invalid("posting block exceeds u16".into()))?,
             max_frequency: postings
@@ -157,6 +165,31 @@ pub(crate) fn query_terms(analyzer: &dyn Analyzer, value: &str) -> Vec<String> {
     terms.into_iter().collect()
 }
 
+/// Terms of every line containing `needle`: those of each chunk the needle
+/// bounds by ASCII whitespace on both sides. Analyzed together with that
+/// whitespace, a chunk yields the same terms as it does inside any line,
+/// since neither link detection nor word boundaries reach across ASCII
+/// whitespace. The first and last chunks may be parts of longer words, and
+/// other Unicode spaces (U+202F) can join words, so neither bounds a chunk.
+pub(crate) fn interior_terms(analyzer: &dyn Analyzer, needle: &str) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    let mut previous = None;
+    for (index, byte) in needle.bytes().enumerate() {
+        if !byte.is_ascii_whitespace() {
+            continue;
+        }
+        if let Some(start) = previous
+            && index > start + 1
+        {
+            analyzer.for_each_term(&needle[start..=index], &mut |term| {
+                terms.insert(term.to_owned());
+            });
+        }
+        previous = Some(index);
+    }
+    terms.into_iter().collect()
+}
+
 /// `terms` must be analyzed, as produced by [`query_terms`].
 pub(crate) fn source_matches(analyzer: &dyn Analyzer, line: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
@@ -177,6 +210,50 @@ pub(crate) fn source_matches(analyzer: &dyn Analyzer, line: &str, terms: &[Strin
         }
     });
     remaining == 0
+}
+
+/// A segment's field statistics; `None` when the segment predates the index.
+pub(crate) async fn field_stats(
+    storage: &dyn StorageRead,
+    namespace: &Namespace,
+    segment: SegmentId,
+) -> Result<Option<FieldStats>> {
+    storage
+        .get(field_stats_key(namespace, segment))
+        .await?
+        .map(|record| decode_field_stats(&record.value))
+        .transpose()
+}
+
+pub(crate) async fn term_stats(
+    storage: &dyn StorageRead,
+    namespace: &Namespace,
+    segment: SegmentId,
+    term: &str,
+) -> Result<Option<TermStats>> {
+    storage
+        .get(term_stats_key(namespace, segment, term))
+        .await?
+        .map(|record| decode_term_stats(&record.value))
+        .transpose()
+}
+
+/// Every posting of `term`, unscored and in no particular order. `stats`
+/// must have been read before the directory, as the term may gain blocks.
+pub(crate) async fn term_postings(
+    storage: &dyn StorageRead,
+    namespace: &Namespace,
+    segment: SegmentId,
+    term: &str,
+    stats: TermStats,
+) -> Result<Vec<Posting>> {
+    let directory = load_directory(storage, namespace, segment, term, stats).await?;
+    let blocks: Vec<Vec<Posting>> = futures::stream::iter(directory)
+        .map(|entry| load_block(storage, namespace, segment, term, entry))
+        .buffer_unordered(BLOCK_PREFETCH)
+        .try_collect()
+        .await?;
+    Ok(blocks.into_iter().flatten().collect())
 }
 
 pub(crate) fn encode_field_stats(stats: FieldStats) -> Bytes {
@@ -213,19 +290,19 @@ pub(crate) fn decode_term_stats(value: &[u8]) -> Result<TermStats> {
     Ok(stats)
 }
 
-/// Entries must have strictly increasing ordinals; they are delta-encoded.
+/// Entries must have strictly increasing block IDs; they are delta-encoded.
 pub(crate) fn encode_directory(entries: &[BlockDirectoryEntry]) -> Result<Bytes> {
-    let mut buf = value_buffer(5 + entries.len() * 8);
+    let mut buf = value_buffer(5 + entries.len() * 12);
     var_u32::serialize(count_u32(entries.len())?, &mut buf);
-    let mut previous: Option<u32> = None;
+    let mut previous: Option<u64> = None;
     for entry in entries {
         let delta = match previous {
-            None => entry.ordinal,
-            Some(previous) if entry.ordinal > previous => entry.ordinal - previous,
-            Some(_) => return Err(Error::Invalid("directory ordinals must increase".into())),
+            None => entry.block,
+            Some(previous) if entry.block > previous => entry.block - previous,
+            Some(_) => return Err(Error::Invalid("directory block IDs must increase".into())),
         };
-        previous = Some(entry.ordinal);
-        var_u32::serialize(delta, &mut buf);
+        previous = Some(entry.block);
+        var_u64::serialize(delta, &mut buf);
         var_u32::serialize(u32::from(entry.postings), &mut buf);
         var_u32::serialize(entry.max_frequency, &mut buf);
         var_u32::serialize(entry.min_length, &mut buf);
@@ -237,18 +314,19 @@ pub(crate) fn decode_directory(value: &[u8]) -> Result<Vec<BlockDirectoryEntry>>
     let mut buf = binary_body(value)?;
     let count = read_count(&mut buf, DIRECTORY_ENTRIES, "term directory")?;
     let mut entries = Vec::with_capacity(count);
-    let mut ordinal = 0u32;
+    let mut block = 0u64;
     for index in 0..count {
-        let delta = var_u32::deserialize(&mut buf)?;
-        ordinal = if index == 0 {
+        let delta = var_u64::deserialize(&mut buf)?;
+        block = if index == 0 {
             delta
         } else {
-            ordinal
+            block
                 .checked_add(delta)
-                .ok_or_else(|| Error::Corrupt("directory ordinal overflow".into()))?
+                .filter(|_| delta > 0)
+                .ok_or_else(|| Error::Corrupt("directory block IDs out of order".into()))?
         };
         entries.push(BlockDirectoryEntry {
-            ordinal,
+            block,
             postings: u16::try_from(var_u32::deserialize(&mut buf)?)
                 .map_err(|_| Error::Corrupt("directory posting count exceeds u16".into()))?,
             max_frequency: var_u32::deserialize(&mut buf)?,
@@ -368,97 +446,55 @@ fn count_u32(count: usize) -> Result<u32> {
     u32::try_from(count).map_err(|_| Error::Invalid("search value count exceeds u32".into()))
 }
 
-/// Produces the key/value writes that append `postings` to one term's index.
+/// Appends the records that add one flush's `postings` of `term` to the
+/// segment's index, without reading it.
 ///
-/// A partially filled trailing block is topped up before new blocks are
-/// allocated, so a stream of small writes does not leave one tiny block (and
-/// one query-time read) per write.
-pub(crate) async fn term_index_writes(
-    storage: &dyn StorageRead,
-    namespace: &Namespace,
-    segment: SegmentId,
-    term: String,
+/// Every block is new: its ID combines `flush_object`, the first object ID
+/// the flush allocated in the segment, with its index among the flush's
+/// blocks of the term, so IDs never collide and increase across flushes.
+/// The flush's directory entries form new fragments keyed by their first
+/// block, and the term's statistics grow by a merge operand.
+pub(crate) fn term_index_ops(
+    ops: &mut Vec<RecordOp>,
+    (namespace, segment): (&Namespace, SegmentId),
+    term: &str,
     mut postings: Vec<Posting>,
-) -> Result<Vec<(Bytes, Bytes)>> {
+    flush_object: u64,
+    ttl: Ttl,
+) -> Result<()> {
     postings.sort_unstable_by_key(|posting| posting.address);
-    let stats_key = term_stats_key(namespace, segment, &term);
-    let mut stats = storage
-        .get(stats_key.clone())
-        .await?
-        .map(|record| decode_term_stats(&record.value))
-        .transpose()?
-        .unwrap_or_default();
-    stats.documents = stats
-        .documents
-        .checked_add(postings.len() as u64)
-        .ok_or_else(|| Error::Invalid("term document count overflow".into()))?;
-
-    let mut writes = Vec::new();
-    let mut directories: BTreeMap<u32, Vec<BlockDirectoryEntry>> = BTreeMap::new();
-    let mut remaining = postings.as_slice();
-
-    if let Some(tail_ordinal) = stats.blocks.checked_sub(1) {
-        let page = directory_page(tail_ordinal);
-        let mut entries = storage
-            .get(term_directory_key(namespace, segment, &term, page))
-            .await?
-            .map(|record| decode_directory(&record.value))
-            .transpose()?
-            .unwrap_or_default();
-        if entries.len() > DIRECTORY_ENTRIES {
-            return Err(Error::Corrupt("term directory exceeds bound".into()));
+    let first_block = flush_object
+        .checked_mul(1 << BLOCK_INDEX_BITS)
+        .ok_or_else(|| Error::Invalid("object ID exceeds the block ID space".into()))?;
+    let mut entries = Vec::with_capacity(postings.len().div_ceil(POSTINGS_PER_BLOCK));
+    for (index, chunk) in postings.chunks(POSTINGS_PER_BLOCK).enumerate() {
+        if index >> BLOCK_INDEX_BITS != 0 {
+            return Err(Error::Invalid("flush exceeds a term's block IDs".into()));
         }
-        if let Some(tail) = entries.last_mut()
-            && tail.ordinal == tail_ordinal
-            && usize::from(tail.postings) < POSTINGS_PER_BLOCK
-        {
-            let block_key = term_posting_block_key(namespace, segment, &term, tail_ordinal);
-            let mut block = storage
-                .get(block_key.clone())
-                .await?
-                .map(|record| decode_postings(&record.value))
-                .transpose()?
-                .ok_or_else(|| Error::Corrupt("directory references missing postings".into()))?;
-            let take = (POSTINGS_PER_BLOCK - block.len()).min(remaining.len());
-            block.extend_from_slice(&remaining[..take]);
-            block.sort_unstable_by_key(|posting| posting.address);
-            remaining = &remaining[take..];
-            *tail = BlockDirectoryEntry::describe(tail_ordinal, &block)?;
-            writes.push((block_key, encode_postings(&block)?));
-        }
-        directories.insert(page, entries);
-    }
-
-    for chunk in remaining.chunks(POSTINGS_PER_BLOCK) {
-        let ordinal = stats.blocks;
-        stats.blocks = stats
-            .blocks
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("term block ordinal overflow".into()))?;
-        // Directory pages fill in ordinal order, so any page other than the
-        // tail's (loaded above) is new.
-        let entries = directories.entry(directory_page(ordinal)).or_default();
-        if entries.len() >= DIRECTORY_ENTRIES {
-            return Err(Error::Corrupt("term directory ordinal is full".into()));
-        }
-        entries.push(BlockDirectoryEntry::describe(ordinal, chunk)?);
-        writes.push((
-            term_posting_block_key(namespace, segment, &term, ordinal),
+        let block = first_block | index as u64;
+        entries.push(BlockDirectoryEntry::describe(block, chunk)?);
+        ops.push(RecordOp::put_with_ttl(
+            term_posting_block_key(namespace, segment, term, block),
             encode_postings(chunk)?,
+            ttl,
         ));
     }
-    for (page, entries) in directories {
-        writes.push((
-            term_directory_key(namespace, segment, &term, page),
-            encode_directory(&entries)?,
+    for fragment in entries.chunks(DIRECTORY_ENTRIES) {
+        ops.push(RecordOp::put_with_ttl(
+            term_directory_key(namespace, segment, term, fragment[0].block),
+            encode_directory(fragment)?,
+            ttl,
         ));
     }
-    writes.push((stats_key, encode_term_stats(stats)));
-    Ok(writes)
-}
-
-fn directory_page(ordinal: u32) -> u32 {
-    ordinal / DIRECTORY_ENTRIES as u32
+    ops.push(RecordOp::merge_with_ttl(
+        term_stats_key(namespace, segment, term),
+        encode_term_stats(TermStats {
+            documents: postings.len() as u64,
+            blocks: count_u32(entries.len())?,
+        }),
+        ttl,
+    ));
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -528,22 +564,19 @@ pub(crate) async fn block_max_scores(
     if allowed_leaves.is_empty() {
         return Ok(Some(HashMap::new()));
     }
-    let Some(record) = storage.get(field_stats_key(namespace, segment)).await? else {
+    let Some(field) = field_stats(storage, namespace, segment).await? else {
         return Ok(None);
     };
-    let field = decode_field_stats(&record.value)?;
     if field.documents == 0 || field.total_terms == 0 || terms.is_empty() {
         return Ok(Some(HashMap::new()));
     }
     let average_length = field.total_terms as f32 / field.documents as f32;
 
-    let stats = futures::future::try_join_all(terms.iter().map(|term| async move {
-        storage
-            .get(term_stats_key(namespace, segment, term))
-            .await?
-            .map(|record| decode_term_stats(&record.value))
-            .transpose()
-    }))
+    let stats = futures::future::try_join_all(
+        terms
+            .iter()
+            .map(|term| term_stats(storage, namespace, segment, term)),
+    )
     .await?;
     let mut queries = Vec::with_capacity(terms.len());
     for (term, stats) in terms.iter().zip(stats) {
@@ -573,7 +606,8 @@ pub(crate) async fn block_max_scores(
     queries.sort_by_key(|query| query.stats.documents);
     let mut candidates: HashMap<DocAddress, Vec<Hit>> = HashMap::new();
     for (index, query) in queries.iter().enumerate() {
-        let directory = load_directory(storage, namespace, segment, query).await?;
+        let directory =
+            load_directory(storage, namespace, segment, query.term, query.stats).await?;
         let mut blocks = std::pin::pin!(
             futures::stream::iter(directory)
                 .map(|entry| load_block(storage, namespace, segment, query.term, entry))
@@ -640,12 +674,19 @@ async fn single_term_top_k(
     limit: usize,
     average_length: f32,
 ) -> Result<HashMap<DocAddress, f32>> {
-    let mut directory = load_directory(storage, scope.namespace, scope.segment, query).await?;
+    let mut directory = load_directory(
+        storage,
+        scope.namespace,
+        scope.segment,
+        query.term,
+        query.stats,
+    )
+    .await?;
     // Highest-bound blocks establish the top-k floor early.
     directory.sort_by(|left, right| {
         block_bound(*right, query.idf, average_length)
             .total_cmp(&block_bound(*left, query.idf, average_length))
-            .then_with(|| left.ordinal.cmp(&right.ordinal))
+            .then_with(|| left.block.cmp(&right.block))
     });
 
     let mut scores = HashMap::new();
@@ -692,29 +733,25 @@ async fn load_directory(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
-    query: &TermQuery<'_>,
+    term: &str,
+    stats: TermStats,
 ) -> Result<Vec<BlockDirectoryEntry>> {
-    let pages = (query.stats.blocks as usize).div_ceil(DIRECTORY_ENTRIES);
-    let pages = futures::future::try_join_all((0..pages).map(|page| async move {
-        let record = storage
-            .get(term_directory_key(
-                namespace,
-                segment,
-                query.term,
-                page as u32,
-            ))
-            .await?
-            .ok_or_else(|| Error::Corrupt("term stats reference missing directory".into()))?;
-        let entries = decode_directory(&record.value)?;
-        if entries.len() > DIRECTORY_ENTRIES {
-            return Err(Error::Corrupt("term directory exceeds bound".into()));
-        }
-        Ok(entries)
-    }))
-    .await?;
-    let directory: Vec<_> = pages.into_iter().flatten().collect();
-    if directory.len() != query.stats.blocks as usize {
-        return Err(Error::Corrupt("term directory block count mismatch".into()));
+    let mut fragments = storage
+        .scan_prefix_iter(
+            term_directory_prefix(namespace, segment, term),
+            BytesRange::unbounded(),
+            None,
+        )
+        .await?;
+    let mut directory = Vec::with_capacity(stats.blocks as usize);
+    while let Some(record) = fragments.next().await? {
+        directory.extend(decode_directory(&record.value)?);
+    }
+    // Flushes after `stats` was read may have added fragments, never removed.
+    if directory.len() < stats.blocks as usize {
+        return Err(Error::Corrupt(
+            "term stats reference missing directory".into(),
+        ));
     }
     Ok(directory)
 }
@@ -731,7 +768,7 @@ async fn load_block(
             namespace,
             segment,
             term,
-            entry.ordinal,
+            entry.block,
         ))
         .await?
         .ok_or_else(|| Error::Corrupt("directory references missing postings".into()))?;
@@ -805,6 +842,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn term_index_ops_name_blocks_and_fragments_by_flush() {
+        let namespace = Namespace::default();
+        let postings: Vec<_> = (0..(POSTINGS_PER_BLOCK * DIRECTORY_ENTRIES + 1) as u64)
+            .map(|document| posting(document, 1, 1))
+            .collect();
+        let mut ops = Vec::new();
+        term_index_ops(
+            &mut ops,
+            (&namespace, 0),
+            "error",
+            postings,
+            3,
+            Ttl::NoExpiry,
+        )
+        .unwrap();
+
+        let first = 3 << BLOCK_INDEX_BITS;
+        let mut blocks = 0;
+        let mut fragments = Vec::new();
+        let mut stats = None;
+        for op in ops {
+            match op {
+                RecordOp::Put(put)
+                    if put
+                        .record
+                        .key
+                        .starts_with(&term_directory_prefix(&namespace, 0, "error")) =>
+                {
+                    fragments.push((put.record.key, decode_directory(&put.record.value).unwrap()));
+                }
+                RecordOp::Put(_) => blocks += 1,
+                RecordOp::Merge(merge) => {
+                    assert_eq!(merge.record.key, term_stats_key(&namespace, 0, "error"));
+                    stats = Some(decode_term_stats(&merge.record.value).unwrap());
+                }
+                RecordOp::Delete(_) => unreachable!(),
+            }
+        }
+        assert_eq!(blocks, DIRECTORY_ENTRIES + 1);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|(key, entries)| (key.clone(), entries.len()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    term_directory_key(&namespace, 0, "error", first),
+                    DIRECTORY_ENTRIES
+                ),
+                (
+                    term_directory_key(&namespace, 0, "error", first | DIRECTORY_ENTRIES as u64),
+                    1
+                ),
+            ]
+        );
+        assert_eq!(fragments[1].1[0].block, first | DIRECTORY_ENTRIES as u64);
+        let stats = stats.unwrap();
+        assert_eq!(stats.blocks as usize, DIRECTORY_ENTRIES + 1);
+        assert_eq!(
+            stats.documents as usize,
+            POSTINGS_PER_BLOCK * DIRECTORY_ENTRIES + 1
+        );
+    }
+
     fn address_strategy() -> impl Strategy<Value = DocAddress> {
         (0u32..8, prop_oneof![0u64..4, any::<u64>()], any::<u32>()).prop_map(
             |(stream_id, leaf, row_id)| DocAddress {
@@ -823,7 +925,7 @@ mod tests {
         ) {
             let count = frequencies.len().min(lengths.len());
             let entry = BlockDirectoryEntry {
-                ordinal: 0,
+                block: 0,
                 postings: count as u16,
                 max_frequency: *frequencies[..count].iter().max().unwrap(),
                 min_length: *lengths[..count].iter().min().unwrap(),
@@ -892,14 +994,14 @@ mod tests {
 
         #[test]
         fn directories_roundtrip(
-            ordinals in prop::collection::btree_set(any::<u32>(), 0..DIRECTORY_ENTRIES),
+            blocks in prop::collection::btree_set(any::<u64>(), 0..DIRECTORY_ENTRIES),
             postings in 1u16..=POSTINGS_PER_BLOCK as u16,
             max_frequency in any::<u32>(),
             min_length in any::<u32>(),
         ) {
-            let entries = ordinals
+            let entries = blocks
                 .into_iter()
-                .map(|ordinal| BlockDirectoryEntry { ordinal, postings, max_frequency, min_length })
+                .map(|block| BlockDirectoryEntry { block, postings, max_frequency, min_length })
                 .collect::<Vec<_>>();
             let encoded = encode_directory(&entries).unwrap();
             prop_assert_eq!(decode_directory(&encoded).unwrap(), entries);
@@ -915,6 +1017,32 @@ mod tests {
             let expected = !terms.is_empty() && terms.iter().all(|term| tokens.contains_key(term));
             prop_assert_eq!(source_matches(&DEFAULT_ANALYZER, &line, &terms), expected);
         }
+    }
+
+    proptest! {
+        #[test]
+        fn lines_containing_a_needle_hold_its_interior_terms(
+            prefix in "(\\PC|[ \t\n.@:/_'\"-]|https?://|\u{301}|\u{200D}|\u{202F}|\u{3000}){0,12}",
+            needle in "(\\PC|[ \t\n.@:/_'\"-]|https?://|a@b\\.c|\u{301}|\u{200D}|\u{202F}|\u{3000}|[a-z]{1,4}){0,24}",
+            suffix in "(\\PC|[ \t\n.@:/_'\"-]|https?://|\u{301}|\u{200D}|\u{202F}|\u{3000}){0,12}",
+        ) {
+            let line = format!("{prefix}{needle}{suffix}");
+            let tokens = token_frequencies(&DEFAULT_ANALYZER, &line);
+            for term in interior_terms(&DEFAULT_ANALYZER, &needle) {
+                prop_assert!(tokens.contains_key(&term), "{term:?} of {needle:?} not in {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn interior_terms_skip_the_edge_chunks() {
+        let terms = |needle| interior_terms(&DEFAULT_ANALYZER, needle);
+        assert!(terms("error").is_empty());
+        assert!(terms("level=error status").is_empty());
+        assert!(terms(" error").is_empty());
+        assert_eq!(terms("ab GET /Api/v1 cd"), ["api", "get", "v1"]);
+        assert_eq!(terms("x  user@Example.com\ty"), ["user@example.com"]);
+        assert_eq!(terms(" a\u{202F}b "), ["a\u{202F}b"]);
     }
 
     #[test]

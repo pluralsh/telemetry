@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 use crate::Namespace;
 use crate::config::Config;
 use crate::error::{QueryError, Result};
-use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
-use crate::storage::Storage;
+use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series, TimeBucket};
+use crate::storage::{Storage, StorageRead};
 use crate::tsdb::{
     Tsdb, TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
@@ -62,6 +62,7 @@ pub struct TimeSeriesDb {
     namespaces: RwLock<std::collections::HashMap<Namespace, Arc<Tsdb>>>,
     retention: Option<Duration>,
     write_buffer: common::coordinator::WriteCoordinatorConfig,
+    query_cache: crate::config::QueryCacheConfig,
 }
 
 impl TimeSeriesDb {
@@ -91,10 +92,20 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
+        let cache = common::SharedDbCache::from_slatedb_config(&config.storage).await?;
+        Self::open_with_cache(config, &cache).await
+    }
+
+    /// Opens a writer that uses `cache` instead of building its own.
+    pub(crate) async fn open_with_cache(
+        config: Config,
+        cache: &common::SharedDbCache,
+    ) -> Result<Self> {
         let storage = Arc::new(
-            Storage::try_new_with_object_store(
+            Storage::try_new_with_cache(
                 &config.storage,
                 common::create_object_store(&config.storage.object_store)?,
+                cache,
             )
             .await?,
         );
@@ -103,6 +114,7 @@ impl TimeSeriesDb {
             namespaces: RwLock::new(std::collections::HashMap::new()),
             retention: config.retention,
             write_buffer: config.write_buffer,
+            query_cache: config.query_cache,
         })
     }
 
@@ -123,6 +135,7 @@ impl TimeSeriesDb {
                     Arc::clone(&self.storage),
                     self.retention,
                     self.write_buffer.clone(),
+                    self.query_cache,
                 ))
             })
             .clone()
@@ -351,6 +364,17 @@ impl TimeSeriesDb {
         Ok(())
     }
 
+    /// The write generations of `buckets` in `namespace`, in order, as
+    /// visible to a fresh snapshot; `None` for a bucket never flushed.
+    pub(crate) async fn bucket_generations(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Result<Vec<Option<u64>>> {
+        let snapshot = self.storage.snapshot().await?;
+        snapshot.get_bucket_generations(namespace, buckets).await
+    }
+
     /// Flushes pending data and creates a durable checkpoint.
     ///
     /// The returned [`common::CheckpointInfo::id`] can be passed to
@@ -453,6 +477,7 @@ mod tests {
         {
             let tsdb = TimeSeriesDb::open(Config {
                 storage: storage.clone(),
+                retention: None,
                 ..Default::default()
             })
             .await
@@ -475,6 +500,7 @@ mod tests {
         // Reopen and verify the series survived
         let tsdb = TimeSeriesDb::open(Config {
             storage: storage.clone(),
+            retention: None,
             ..Default::default()
         })
         .await
@@ -513,6 +539,7 @@ mod tests {
         {
             let db = TimeSeriesDb::open(Config {
                 storage: storage.clone(),
+                retention: None,
                 ..Default::default()
             })
             .await
@@ -533,6 +560,7 @@ mod tests {
 
         let reopened = TimeSeriesDb::open(Config {
             storage,
+            retention: None,
             ..Default::default()
         })
         .await

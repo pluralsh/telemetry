@@ -223,6 +223,9 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     let bucket_id = encode_bucket(bucket);
     let mut labels_vec: Vec<Labels> = Vec::with_capacity(candidates.len());
     let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(candidates.len());
+    // Candidates are ordered by series ID, so one metric's series tend to be
+    // adjacent and share a name allocation.
+    let mut metric_name: Arc<str> = Arc::from("");
     for (sid, slot) in candidates.iter().zip(&slots) {
         let spec = slot.as_ref().as_ref().ok_or_else(|| {
             internal_err(format!(
@@ -230,15 +233,13 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
                 sid, bucket
             ))
         })?;
-        let mut labs = spec.labels.clone();
-        labs.sort();
-        let metric_name: Arc<str> = labs
-            .iter()
-            .find(|l| l.name == "__name__")
-            .map(|l| Arc::from(l.value.as_str()))
-            .unwrap_or_else(|| Arc::from(""));
-        labels_vec.push(Labels::new(labs));
-        handles.push(ResolvedSeriesRef::new(bucket_id, *sid, metric_name));
+        let labs = spec.labels.clone();
+        let name = labs.metric_name();
+        if *metric_name != *name {
+            metric_name = Arc::from(name);
+        }
+        labels_vec.push(labs);
+        handles.push(ResolvedSeriesRef::new(bucket_id, *sid, metric_name.clone()));
     }
 
     Ok(Some(ResolvedSeriesChunk {
@@ -351,19 +352,15 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
 }
 
 fn fill_column(block: &mut SampleBlock, col_idx: usize, samples: SeriesData) {
-    let SeriesData { floats, histograms } = samples;
-    let (ts_col, val_col) = (&mut block.timestamps[col_idx], &mut block.values[col_idx]);
-    ts_col.reserve(floats.len());
-    val_col.reserve(floats.len());
-    // Preserve stale markers verbatim as STALE_NAN — the
-    // storage layer encodes them as `f64::from_bits(STALE_NAN)`,
-    // which survives the unmodified `s.value` copy below
-    // (see `crate::model::is_stale_nan` and RFC 0007 source→caller
-    // contract).
-    for s in floats {
-        ts_col.push(s.timestamp_ms);
-        val_col.push(s.value);
-    }
+    let SeriesData {
+        timestamps,
+        values,
+        histograms,
+    } = samples;
+    // Stale markers stay verbatim `f64::from_bits(STALE_NAN)` values (see
+    // `crate::model::is_stale_nan`).
+    append_column(&mut block.timestamps[col_idx], timestamps);
+    append_column(&mut block.values[col_idx], values);
     let (hts_col, h_col) = (
         &mut block.histogram_timestamps[col_idx],
         &mut block.histograms[col_idx],
@@ -373,6 +370,15 @@ fn fill_column(block: &mut SampleBlock, col_idx: usize, samples: SeriesData) {
     for h in histograms {
         hts_col.push(h.timestamp_ms);
         h_col.push(Arc::new(h.histogram));
+    }
+}
+
+/// Moves `column` into an empty `into` rather than copying it.
+fn append_column<T>(into: &mut Vec<T>, mut column: Vec<T>) {
+    if into.is_empty() {
+        *into = column;
+    } else {
+        into.append(&mut column);
     }
 }
 
@@ -575,6 +581,21 @@ pub(crate) mod selector_util {
         bucket: &TimeBucket,
         selector: &VectorSelector,
     ) -> Result<Vec<SeriesId>, QueryError> {
+        Ok(
+            find_candidate_postings(reader, index_cache, bucket, selector)
+                .await?
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// [`find_candidates`] as a postings set.
+    pub(crate) async fn find_candidate_postings<R: QueryReader + ?Sized>(
+        reader: &R,
+        index_cache: &IndexCache,
+        bucket: &TimeBucket,
+        selector: &VectorSelector,
+    ) -> Result<RoaringBitmap, QueryError> {
         let name_matcher = selector
             .name
             .as_deref()
@@ -588,6 +609,15 @@ pub(crate) mod selector_util {
             return Err(internal_err(
                 "vector selector must contain at least one non-empty matcher".to_string(),
             ));
+        }
+        let key = crate::postings_cache::selector_key(
+            name_matcher
+                .iter()
+                .chain(&selector.matchers.matchers)
+                .map(|m| (m.name.as_str(), match_op_symbol(&m.op), m.value.as_str())),
+        );
+        if let Some(hit) = reader.cached_selector(bucket, &key).await {
+            return Ok(hit.as_ref().clone());
         }
 
         let sets = futures::future::try_join_all(
@@ -605,7 +635,17 @@ pub(crate) mod selector_util {
         for (_, set) in plans.iter().zip(&sets).filter(|(plan, _)| !plan.include) {
             result -= set;
         }
-        Ok(result.iter().collect())
+        reader.cache_selector(bucket, &key, &result).await;
+        Ok(result)
+    }
+
+    fn match_op_symbol(op: &MatchOp) -> &'static str {
+        match op {
+            MatchOp::Equal => "=",
+            MatchOp::NotEqual => "!=",
+            MatchOp::Re(_) => "=~",
+            MatchOp::NotRe(_) => "!~",
+        }
     }
 
     /// Union of the postings of the values `plan` names.

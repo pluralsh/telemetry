@@ -343,7 +343,7 @@ async fn search(
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let results = state
         .db
-        .query_traceql(
+        .search_traceql(
             &namespace,
             params.start.unwrap_or(0).saturating_mul(1_000_000_000),
             params
@@ -369,7 +369,7 @@ async fn search(
                 "rootTraceName": result.root_span_name.unwrap_or_default(),
                 "startTimeUnixNano": result.start_ns.to_string(),
                 "durationMs": result.end_ns.saturating_sub(result.start_ns) as f64 / 1_000_000.0,
-                "spanSet": {"matched": result.matched_spans.len()},
+                "spanSet": {"matched": result.matched_spans},
             })
         })
         .collect::<Vec<_>>();

@@ -42,7 +42,7 @@ pub(crate) fn insert_forward_index(
         metric_unit: series_spec.unit,
         metric_meta: series_spec.metric_type.into(),
         label_count: series_spec.labels.len() as u16,
-        labels: series_spec.labels,
+        labels: series_spec.labels.as_slice().to_vec(),
     }
     .encode();
     Ok(RecordOp::Put(PutRecordOp::new_with_options(
@@ -72,6 +72,24 @@ pub(crate) fn merge_inverted_index(
     )))
 }
 
+pub(crate) fn put_bucket_generation(
+    namespace: &Namespace,
+    bucket: TimeBucket,
+    generation: u64,
+    ttl: Ttl,
+) -> RecordOp {
+    let key = BucketGenerationKey {
+        namespace: namespace.clone(),
+        bucket,
+    }
+    .encode();
+    let value = encode_bucket_generation(generation);
+    RecordOp::Put(PutRecordOp::new_with_options(
+        Record { key, value },
+        PutOptions { ttl },
+    ))
+}
+
 pub(crate) fn merge_samples(
     namespace: &Namespace,
     bucket: TimeBucket,
@@ -88,11 +106,7 @@ pub(crate) fn merge_samples(
         series_id,
     }
     .encode();
-    let value = SeriesData {
-        floats: samples,
-        histograms,
-    }
-    .encode()?;
+    let value = SeriesData::new(samples, histograms).encode()?;
     Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
         Record { key, value },
         MergeOptions { ttl },

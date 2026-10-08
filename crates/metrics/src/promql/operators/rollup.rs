@@ -172,6 +172,10 @@ pub trait WindowStream: Send {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<MatrixWindowBatch, QueryError>>>;
+
+    /// Hands back a polled batch the consumer has finished with, for a
+    /// producer that reuses its buffers.
+    fn recycle(&mut self, _window: MatrixWindowBatch) {}
 }
 
 // Production wiring lives on [`MatrixWindowSource`] below: it captures
@@ -366,13 +370,17 @@ impl<W: WindowStream> Operator for RollupOp<W> {
                 self.errored = true;
                 Poll::Ready(Some(Err(err)))
             }
-            Poll::Ready(Some(Ok(window))) => match self.reduce_batch(&window) {
-                Ok(batch) => Poll::Ready(Some(Ok(batch))),
-                Err(err) => {
-                    self.errored = true;
-                    Poll::Ready(Some(Err(err)))
+            Poll::Ready(Some(Ok(window))) => {
+                let reduced = self.reduce_batch(&window);
+                self.child.recycle(window);
+                match reduced {
+                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                    Err(err) => {
+                        self.errored = true;
+                        Poll::Ready(Some(Err(err)))
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -415,6 +423,10 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> WindowStream for MatrixWindowSource
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<MatrixWindowBatch, QueryError>>> {
         self.inner.windows(cx)
+    }
+
+    fn recycle(&mut self, window: MatrixWindowBatch) {
+        self.inner.recycle(window);
     }
 }
 

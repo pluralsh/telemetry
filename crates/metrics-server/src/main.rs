@@ -6,6 +6,11 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
+/// Query paths allocate and free per row; the system allocator made this
+/// most of their CPU time.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(name = "plural-metrics-server")]
 struct Args {

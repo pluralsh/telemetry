@@ -50,6 +50,7 @@ cross-shard queries join series by label fingerprint, never by ID.
 | `0x03` | Forward index | Series ID to labels and metric metadata |
 | `0x04` | Inverted index | Label term to series-ID postings |
 | `0x05` | Time series | Compressed samples for one series |
+| `0x06` | Bucket generation | Write generation of the bucket |
 
 ## Record types
 
@@ -100,13 +101,107 @@ single PromQL metric.
 
 ```text
 KEY   common scope │ metric name: TerminatedBytes │ series_id: u32 BE
-VALUE ┌────────────────────────────────────────────────────┐
-      │ Gorilla stream of (timestamp_ms: u64, value: f64)  │
-      └────────────────────────────────────────────────────┘
+VALUE float-only:      ┌──────┬───────────────┐
+                       │ 0x01 │ float section │
+                       └──────┴───────────────┘
+      with histograms: ┌──────┬──────────────────────┬───────────────┬───────────────────┐
+                       │ 0x81 │ section len: uvarint │ float section │ histogram section │
+                       └──────┴──────────────────────┴───────────────┴───────────────────┘
 ```
 
-Timestamps are sorted before encoding. SlateDB's merge operator combines
-sample fragments and applies last-write-wins for duplicate timestamps.
+An empty value is empty bytes. The leading byte is the value format version
+(`1`), with `0x80` set when native histograms follow; any other version is
+rejected, so values written before this format must be reset and reingested.
+Samples are sorted by timestamp, and a timestamp holds at most one sample:
+of floats sharing one the first is kept, and a histogram wins over a float.
+The histogram section is a sample count, then per sample a delta-of-delta
+timestamp and the histogram encoded against the previous one.
+
+#### Float section
+
+A float section is a sequence of chunks of 1 to 1024 samples whose
+timestamps strictly increase within and across chunks. Longer runs split into
+balanced chunks. Each chunk is self-describing:
+
+```text
+CHUNK ┌────────────┬──────────────────┬───────────────────────┬───────────────────┐
+      │ n: uvarint │ first_ts: zigzag │ last - first: uvarint │ body len: uvarint │
+      └────────────┴──────────────────┴───────────────────────┴───────────────────┘
+BODY  ┌──────────────────────────────────────────┬──────────────────┬──────────────┐
+      │ layout: u8 (ts scheme | value scheme<<4) │ timestamp column │ value column │
+      └──────────────────────────────────────────┴──────────────────┴──────────────┘
+```
+
+The header bounds the chunk without decoding it: ranged reads skip chunks
+outside `(start, end]`, and the merge operator copies chunks that do not
+overlap.
+
+Packed columns hold one `width`-bit lane per sample, LSB-first in
+little-endian `u64` words truncated to whole bytes, so every 64-lane block
+starts on a byte boundary and unpacks independently. A frame of reference
+precedes each packed column: `min` (zigzag varint), a width byte (`0x80` set
+when a shift byte follows), and the optional shift; a lane holds
+`(x - min) >> shift`.
+
+| Timestamp scheme | Column | `ts[i]` |
+| --- | --- | --- |
+| `0` varint | `n - 2` uvarint deltas | previous plus delta; the last is `first + span` |
+| `1` grid | interval (zigzag), frame, lanes | `first + i * interval + min + (lane[i] << shift)` |
+| `2` delta | frame, lanes | running sum of deltas from `first` |
+| `3` delta-of-delta | first delta (zigzag), frame, lanes | running sum of a running sum |
+
+The encoder picks the smallest. A ranged read of a grid chunk binary-searches
+the first lane of each block and unpacks only the blocks it needs.
+
+| Value scheme | Column |
+| --- | --- |
+| `0` byte XOR | first value raw (8 bytes LE), then per value `0x80` if unchanged or a header byte (leading / trailing zero bytes in the high / low nibble) and the XOR's middle bytes big-endian |
+| `1` ALP | exponent `e`, factor `f`, frame, lanes, exceptions |
+| `2` ALP delta | `e`, `f`, first int (zigzag), frame, lanes of deltas, exceptions |
+| `3` ALP-RD | right width, dictionary of up to eight `u16` left parts, packed codes, packed right parts, exceptions (`u16` left parts) |
+| `4` XOR | Gorilla XOR bit stream with the first value raw |
+| `5` constant | one raw value (8 bytes LE) |
+
+ALP stores each value as an integer `d` with `d * 10^f / 10^e` reproducing its
+bits exactly. Values that do not round-trip (NaN payloads including the stale
+marker, `-0.0`, infinities, full-precision values) are exceptions: a uvarint
+count, `u16` positions, then the raw 8-byte values, patched in after
+unpacking. ALP is used while it misses at most half the values; otherwise the
+chunk takes the smallest of ALP, ALP-RD (chunks over 64 samples) and XOR, or
+constant when every value has identical bits. Chunks of up to 16 samples also
+consider byte XOR, which is what single-sample merge operands use.
+
+SlateDB's merge operator combines sample fragments with last-write-wins for
+duplicate timestamps (the newest operand wins). Fragments whose chunks are
+disjoint merge by copying chunks; runs of four or more chunks under 32
+samples are re-encoded into one, and more than four chunks of 32 to 511
+samples, or any overlap, re-encode the whole section into balanced chunks.
+
+### Bucket generation (`0x06`)
+
+One record per bucket, rewritten (a put, not a merge) by every flush into the
+bucket, in the same atomic batch as that flush's index and sample records,
+late writes into an older bucket included. A reader that sees a flush's
+samples therefore also sees its generation, so an unchanged generation means
+the bucket's contents are unchanged.
+
+```text
+KEY   common scope (no suffix)
+VALUE ┌─────────────────────┐
+      │ generation: u64 LE  │
+      └─────────────────────┘
+```
+
+The generation strictly increases across flushes of a bucket within a shard,
+including across writer restarts and shard handoffs: each flush stores
+`max(previous + 1, wall-clock microseconds)`, where `previous` is the larger
+of the generation the bucket was loaded with and the last one the writer
+process issued. Values are not comparable across buckets or shards. The record
+shares the bucket's TTL, so it expires with the data it describes; an absent
+record means the bucket was never flushed.
+
+The range-query result cache compares the generations of the buckets a step
+depends on against those recorded when the step was cached.
 
 ## Durability and visibility
 

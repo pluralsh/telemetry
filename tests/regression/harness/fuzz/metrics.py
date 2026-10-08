@@ -28,6 +28,7 @@ from ..metrics.normalize import (
 from ..metrics.wire import remote_write_body
 from ..process import wait_http
 from .config import Endpoint, FuzzConfig, endpoint_from_env
+from .network import minio_floor_url, service_url
 from .rand import chance, quote, regex_escape, sample, scaled, weighted, zipf
 from .runner import (
     Batch,
@@ -48,7 +49,27 @@ PRODUCT_DIR = Path(__file__).resolve().parents[2] / "products" / "metrics"
 # and reads only through the store-gateway, matching Metrics' object-store
 # read path.
 ORACLES = ("prometheus", "mimir", "mimir-blocks")
-MIMIR_URL = "http://127.0.0.1:19009"
+# `s3` is two writers and a reader over MinIO; `local` is one standalone
+# process on local disk, which compares with Prometheus without the object
+# store.
+STORAGES = ("s3", "local")
+# `regression` runs the `s3` storage as two writers and a reader with small
+# caches and per-write flushes, to exercise sharding. `production` runs one
+# standalone process and shard over MinIO with what the operator deploys
+# (its cache sizes, buffered writes flushed every 10s), the shape of the
+# single-binary oracles, for benchmarks. `production-sharded` runs the
+# operator's settings as two writers and a reader, to measure what sharding
+# costs against `production`.
+IMPL_CONFIGS = ("regression", "production", "production-sharded")
+STANDALONE_URL = service_url("metrics-standalone", 8080, 18083)
+STANDALONE_S3_URL = service_url("metrics-s3", 8080, 18084)
+MIMIR_URL = service_url("mimir", 8080, 19009)
+PROMETHEUS_URL = service_url("prometheus", 9090, 19090)
+WRITER_URLS = (
+    service_url("metrics-writer-0", 8080, 18080),
+    service_url("metrics-writer-1", 8080, 18081),
+)
+READER_URL = service_url("metrics-reader", 8080, 18082)
 MIMIR_BLOCKS_ENVIRONMENT = {
     "MIMIR_QUERY_INGESTERS_WITHIN": "1s",
     "MIMIR_QUERY_STORE_AFTER": "0s",
@@ -111,7 +132,12 @@ class Catalog:
 
 
 def prometheus_comparator(
-    oracle: Exchange, impl: Exchange, *, ranked: bool = False, fused: bool = False
+    oracle: Exchange,
+    impl: Exchange,
+    *,
+    ranked: bool = False,
+    fused: bool = False,
+    exp_labels: bool = False,
 ) -> None:
     try:
         _compare(oracle, impl, ranked=ranked)
@@ -120,6 +146,11 @@ def prometheus_comparator(
             raise Inconclusive(
                 "Go may fuse multiply-adds on arm64, moving quantile weights and "
                 f"round's to_nearest by an ulp: {error}"
+            ) from error
+        if exp_labels:
+            raise Inconclusive(
+                "Go's math.Exp is not correctly rounded, and count_values puts "
+                f"the 1-ulp difference into a label: {error}"
             ) from error
         raise
 
@@ -159,9 +190,12 @@ def _compare(oracle: Exchange, impl: Exchange, *, ranked: bool) -> None:
 def _comparator(query: str):
     ranked = query.startswith(("topk", "bottomk"))
     fused = "quantile" in query or FUSED_ROUND.search(query) is not None
-    if not (ranked or fused):
+    exp_labels = "count_values" in query and "exp(" in query
+    if not (ranked or fused or exp_labels):
         return prometheus_comparator
-    return functools.partial(prometheus_comparator, ranked=ranked, fused=fused)
+    return functools.partial(
+        prometheus_comparator, ranked=ranked, fused=fused, exp_labels=exp_labels
+    )
 
 
 def _ranked(response: dict[str, Any]) -> dict[str, Any]:
@@ -228,6 +262,29 @@ def _ignored_labels(expected: dict[str, Any]) -> tuple[str, ...]:
     return ("__name__",)
 
 
+_DUPLICATE_SERIES = (
+    "many-to-many matching not allowed",
+    "found duplicate series",
+    "vector cannot contain metrics with the same labelset",
+)
+
+
+def mqe_duplicate_series_quirk(oracle: Exchange, impl: Exchange) -> str | None:
+    """Mimir's MQE only rejects duplicate series in match groups that join and
+    labelsets that survive aggregation, where Prometheus rejects the query on
+    any; Prometheus-oracle runs still catch the implementation getting these
+    wrong."""
+    body = impl.body.decode(errors="replace")
+    if impl.status != 422 or not any(text in body for text in _DUPLICATE_SERIES):
+        return None
+    try:
+        if json_body(oracle).get("status") != "success":
+            return None
+    except ValueError:
+        return None
+    return "MQE answers where Prometheus rejects duplicate series"
+
+
 def discovery_comparator(oracle: Exchange, impl: Exchange) -> None:
     assert_json_data_equivalent("discovery", json_body(oracle), json_body(impl))
 
@@ -240,6 +297,8 @@ class MetricsFuzz(FuzzProduct):
         "metrics-writer-0": "impl",
         "metrics-writer-1": "impl",
         "metrics-reader": "impl",
+        "metrics-standalone": "impl",
+        "metrics-s3": "impl",
     }
     # Prometheus rejects samples older than its head max time minus 1h.
     default_window = "30m"
@@ -248,11 +307,42 @@ class MetricsFuzz(FuzzProduct):
         super().__init__(config)
         # Tokens must outlive the run, not just the regression suite's hour.
         expires_from = int(time.time() + config.duration_s)
-        self.oracle = os.environ.get("FUZZ_METRICS_ORACLE") or "prometheus"
+        self.oracle = os.environ.get("FUZZ_METRICS_ORACLE") or (
+            "mimir-blocks" if config.historical else "prometheus"
+        )
         if self.oracle not in ORACLES:
             raise ValueError(f"FUZZ_METRICS_ORACLE must be one of {ORACLES}")
+        mqe = (
+            self.oracle != "prometheus"
+            and (os.environ.get("MIMIR_QUERY_ENGINE") or "mimir") == "mimir"
+        )
+        self._oracle_quirk = mqe_duplicate_series_quirk if mqe else None
+        self.storage = os.environ.get("FUZZ_METRICS_STORAGE") or "s3"
+        if self.storage not in STORAGES:
+            raise ValueError(f"FUZZ_METRICS_STORAGE must be one of {STORAGES}")
+        if config.historical and (
+            self.oracle != "mimir-blocks" or self.storage != "s3"
+        ):
+            raise ValueError(
+                "FUZZ_SCENARIO=historical needs FUZZ_METRICS_ORACLE=mimir-blocks "
+                "and FUZZ_METRICS_STORAGE=s3, so both sides read object storage"
+            )
+        self.impl_config = os.environ.get("FUZZ_METRICS_CONFIG") or "regression"
+        if self.impl_config not in IMPL_CONFIGS:
+            raise ValueError(f"FUZZ_METRICS_CONFIG must be one of {IMPL_CONFIGS}")
+        if self.impl_config != "regression" and self.storage != "s3":
+            raise ValueError(
+                f"FUZZ_METRICS_CONFIG={self.impl_config} requires "
+                "FUZZ_METRICS_STORAGE=s3"
+            )
+        if self.storage == "local":
+            write_url = read_url = STANDALONE_URL
+        elif self.impl_config == "production":
+            write_url = read_url = STANDALONE_S3_URL
+        else:
+            write_url, read_url = WRITER_URLS[0], READER_URL
         if self.oracle == "prometheus":
-            oracle_read = oracle_write = Endpoint("http://127.0.0.1:19090")
+            oracle_read = oracle_write = Endpoint(PROMETHEUS_URL)
         else:
             oracle_read = Endpoint(f"{MIMIR_URL}/prometheus")
             oracle_write = Endpoint(MIMIR_URL)
@@ -262,7 +352,7 @@ class MetricsFuzz(FuzzProduct):
             "metrics",
             "impl_write",
             Endpoint(
-                "http://127.0.0.1:18080/write/ns/regression",
+                f"{write_url}/write/ns/regression",
                 bearer("regression-write", now=expires_from),
             ),
         )
@@ -270,7 +360,7 @@ class MetricsFuzz(FuzzProduct):
             "metrics",
             "impl_read",
             Endpoint(
-                "http://127.0.0.1:18082/read/ns/regression",
+                f"{read_url}/read/ns/regression",
                 basic("regression-reader", "regression-read"),
             ),
         )
@@ -281,12 +371,12 @@ class MetricsFuzz(FuzzProduct):
         def start_reader(project: ComposeProject) -> None:
             # Readers require every writer-created shard manifest to exist.
             project.up("metrics-reader")
-            wait_http("http://localhost:18082/-/ready")
+            wait_http(f"{READER_URL}/-/ready")
 
         if self.oracle == "prometheus":
             oracle_service, oracle_ready, profiles = (
                 "prometheus",
-                "http://localhost:19090/-/ready",
+                f"{PROMETHEUS_URL}/-/ready",
                 (),
             )
         else:
@@ -298,27 +388,57 @@ class MetricsFuzz(FuzzProduct):
             if self.oracle == "mimir-blocks":
                 # Read by compose when interpolating the mimir service flags.
                 os.environ.update(MIMIR_BLOCKS_ENVIRONMENT)
+        services: tuple[str, ...] = (oracle_service,)
+        if self.storage == "s3" or self.oracle != "prometheus":
+            services += ("minio", "minio-init")
+        if self.storage == "local":
+            services += ("metrics-standalone",)
+            profiles += ("standalone",)
+            impl_ready: tuple[str, ...] = (f"{STANDALONE_URL}/-/ready",)
+            after_start = None
+        elif self.impl_config == "production":
+            services += ("metrics-s3",)
+            profiles += ("standalone-s3",)
+            impl_ready = (f"{STANDALONE_S3_URL}/-/ready",)
+            after_start = None
+        else:
+            # Read by compose when interpolating the writer and reader mounts.
+            os.environ["METRICS_CONFIG_DIR"] = (
+                "production" if self.impl_config == "production-sharded" else "."
+            )
+            services += ("metrics-writer-0", "metrics-writer-1")
+            impl_ready = tuple(f"{url}/-/ready" for url in WRITER_URLS)
+            after_start = start_reader
         return fuzz_stack(
             self.config,
             lambda: ComposeProject(
                 file=PRODUCT_DIR / "docker-compose.yml",
                 name="metrics-fuzz",
-                services=(
-                    oracle_service,
-                    "minio",
-                    "minio-init",
-                    "metrics-writer-0",
-                    "metrics-writer-1",
-                ),
+                services=services,
                 profiles=profiles,
-                readiness_urls=(
-                    oracle_ready,
-                    "http://localhost:18080/-/ready",
-                    "http://localhost:18081/-/ready",
-                ),
+                readiness_urls=(oracle_ready, *impl_ready),
             ),
-            after_start=start_reader,
+            roles=self.resource_roles,
+            after_start=after_start,
         )
+
+    def floor_urls(self) -> dict[str, str]:
+        urls = (
+            {"prometheus": f"{PROMETHEUS_URL}/-/ready"}
+            if self.oracle == "prometheus"
+            else {"mimir": f"{MIMIR_URL}/ready"}
+        )
+        if self.storage == "local":
+            urls["metrics-standalone"] = f"{STANDALONE_URL}/-/ready"
+        elif self.impl_config == "production":
+            urls["metrics-s3"] = f"{STANDALONE_S3_URL}/-/ready"
+        else:
+            for index, url in enumerate(WRITER_URLS):
+                urls[f"metrics-writer-{index}"] = f"{url}/-/ready"
+            urls["metrics-reader"] = f"{READER_URL}/-/ready"
+        if self.storage == "s3" or self.oracle != "prometheus":
+            urls.update(minio_floor_url(19000))
+        return urls
 
     def after_ingest(self, index: int) -> None:
         if self.oracle != "mimir-blocks":
@@ -332,7 +452,12 @@ class MetricsFuzz(FuzzProduct):
             pass
 
     def describe(self) -> dict[str, object]:
-        return {"oracle": self.oracle, **super().describe()}
+        return {
+            "oracle": self.oracle,
+            "storage": self.storage,
+            "impl_config": self.impl_config,
+            **super().describe(),
+        }
 
     # Data generation ---------------------------------------------------------
 
@@ -725,6 +850,7 @@ class MetricsFuzz(FuzzProduct):
                     "GET", "/api/v1/query", (("query", query), ("time", f"{at:.3f}"))
                 ),
                 _comparator(query),
+                oracle_quirk=self._oracle_quirk,
             )
         if kind == "range":
             query = self._vector(rng, 0)
@@ -744,6 +870,7 @@ class MetricsFuzz(FuzzProduct):
                     ),
                 ),
                 _comparator(query),
+                oracle_quirk=self._oracle_quirk,
             )
         # Prometheus answers series/label lookups at head-block granularity, so
         # narrow windows are not comparable; always span every round.

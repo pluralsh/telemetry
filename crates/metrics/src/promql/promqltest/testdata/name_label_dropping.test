@@ -59,6 +59,9 @@ resume
 eval instant at 10m max_over_time(metric_total{env="1"}[10m])
 	{env="1"} 120
 
+# ignoring delayed name removal: Prometheus' default eager removal fails
+# these on the duplicate {env="1"} labelset (see eager_name_dropping.test)
+ignore
 # Allows relabeling (to-be-dropped) __name__  via label_replace.
 eval instant at 10m label_replace(rate({env="1"}[10m]), "my_name", "rate_$1", "__name__", "(.+)")
 	{my_name="rate_metric_total", env="1"} 0.2
@@ -78,6 +81,7 @@ eval instant at 10m label_join(rate({env="1"}[10m]), "my_name", "_", "__name__")
 eval instant at 10m label_join(rate({env="1"}[10m]), "__name__", "_", "__name__", "env")
 	metric_total_1{env="1"} 0.2
 	another_metric_total_1{env="1"} 0.2
+resume
 
 
 # Does not drop metric names from aggregation operators.
@@ -93,10 +97,12 @@ eval instant at 10m sum by (__name__) (rate({env="1"}[10m]))
 
 resume
 
+ignore
 # Aggregation operators aggregate metrics with same labelset and to-be-dropped names.
 # This is an accidental side effect of delayed __name__ label dropping
 eval instant at 10m sum(rate({env="1"}[10m])) by (env)
 	{env="1"} 0.4
+resume
 
 
 # Aggregationk operators propagate __name__ label dropping information.
@@ -122,9 +128,12 @@ eval instant at 10m sum by (__name__) (metric_total{env="1"})
 eval instant at 10m sum by (__name__) (rate(metric_total{env="2"}[5m]))
   {} 0.05
 
+# ignoring delayed name removal
+ignore
 # Metric name is preserved with label_replace even though it would have been dropped with rate.
 eval instant at 10m label_replace(sum by (__name__) (rate(metric_total{env="2"}[5m])), "__name__", "$1", "__name__", "(.+)")
   metric_total 0.05
+resume
 
 # ignoring many-to-many opertor or
 ignore

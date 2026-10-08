@@ -862,7 +862,6 @@ pub(crate) fn logs_error(error: plural_logs::Error) -> ApiError {
         | plural_logs::Error::Shard(_) => ApiError::unavailable(error),
         plural_logs::Error::Corrupt(_)
         | plural_logs::Error::Json(_)
-        | plural_logs::Error::Compression(_)
         | plural_logs::Error::Query(_)
         | plural_logs::Error::Regex(_) => ApiError::internal(error),
     }

@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use crate::storage::sst_blocks;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
-    BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
-    Ttl,
+    BytesRange, CheckpointInfo, ReadHints, Record, StorageError, StorageIterator, StorageRead,
+    StorageResult, Ttl,
     storage::{
         MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot,
         WriteOptions, WriteResult,
@@ -14,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::IterationOrder;
-use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
+use slatedb::config::{CheckpointOptions, CheckpointScope, ReadOptions, ScanOptions};
 use slatedb::manifest::VersionedManifest;
 use slatedb::{
     CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbSnapshot, FilterContext,
@@ -73,6 +75,20 @@ fn default_scan_options() -> ScanOptions {
     }
 }
 
+fn hinted_scan_options(hints: ReadHints, filter_context: Option<FilterContext>) -> ScanOptions {
+    ScanOptions {
+        cache_blocks: hints.cache_blocks,
+        ..default_scan_options()
+    }
+    .with_filter_context(filter_context)
+}
+
+fn hinted_read_options(hints: ReadHints) -> ReadOptions {
+    ReadOptions {
+        cache_blocks: hints.cache_blocks,
+        ..ReadOptions::default()
+    }
+}
 /// Where a [`SlateReadHandle`] reads its manifest from. Both variants expose a
 /// live `manifest()`, so each count reflects the latest flushed state.
 enum ManifestSource {
@@ -211,6 +227,45 @@ pub struct SlateDbStorage {
     /// `new` used in tests that only exercise get/scan, where `slate_read`
     /// falls back to `None`. `Arc` so the handle can outlive a borrow of `self`.
     sst_reader: Option<Arc<SstReader>>,
+    /// Set by every write, cleared by the periodic memtable flush.
+    unflushed: Arc<AtomicBool>,
+}
+
+/// How often a writer with new writes flushes its memtable to L0. A
+/// `DbReader` replays each manifest poll's new WALs into a memtable of its
+/// own and drops them only once L0 covers them, so a writer below
+/// `l0_sst_size_bytes` would leave readers probing one memtable per poll
+/// on every get and scan; this bounds them to about this many polls' worth.
+pub const MEMTABLE_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Flushes `db`'s memtable to L0 every `every` while `unflushed` is set,
+/// until the database closes or every strong handle is dropped.
+pub fn spawn_memtable_flusher(db: Weak<Db>, unflushed: Arc<AtomicBool>, every: Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(db) = db.upgrade() else { return };
+            if !unflushed.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            let flushed = db
+                .flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                })
+                .await;
+            match flushed {
+                Ok(()) => {}
+                Err(err) if matches!(err.kind(), slatedb::ErrorKind::Closed(_)) => return,
+                Err(err) => {
+                    unflushed.store(true, Ordering::Release);
+                    tracing::warn!("periodic memtable flush failed: {err}");
+                }
+            }
+        }
+    });
 }
 
 impl SlateDbStorage {
@@ -240,7 +295,15 @@ impl SlateDbStorage {
             durable_tx,
             durable_bridge_abort: task.abort_handle(),
             sst_reader: None,
+            unflushed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Flushes the memtable to L0 every `every` while writes arrive; see
+    /// [`MEMTABLE_FLUSH_INTERVAL`].
+    pub fn with_memtable_flush(self, every: Duration) -> Self {
+        spawn_memtable_flusher(Arc::downgrade(&self.db), Arc::clone(&self.unflushed), every);
+        self
     }
 
     /// Attaches an [`SstReader`] so [`StorageRead::slate_read`] can serve the
@@ -320,6 +383,33 @@ impl StorageRead for SlateDbStorage {
         filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let options = default_scan_options().with_filter_context(filter_context);
+        let iter = self
+            .db
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_with(&self, key: Bytes, hints: ReadHints) -> StorageResult<Option<Record>> {
+        let value = self
+            .db
+            .get_with_options(&key, &hinted_read_options(hints))
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(value.map(|value| Record::new(key, value)))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter_with(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+        hints: ReadHints,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = hinted_scan_options(hints, filter_context);
         let iter = self
             .db
             .scan_prefix_with_options(prefix, subrange, &options)
@@ -412,6 +502,33 @@ impl StorageRead for SlateDbStorageSnapshot {
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
     }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_with(&self, key: Bytes, hints: ReadHints) -> StorageResult<Option<Record>> {
+        let value = self
+            .snapshot
+            .get_with_options(&key, &hinted_read_options(hints))
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(value.map(|value| Record::new(key, value)))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter_with(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+        hints: ReadHints,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = hinted_scan_options(hints, filter_context);
+        let iter = self
+            .snapshot
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
 }
 
 #[async_trait]
@@ -445,6 +562,7 @@ impl Storage for SlateDbStorage {
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
+        self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -468,6 +586,7 @@ impl Storage for SlateDbStorage {
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
+        self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -500,6 +619,7 @@ impl Storage for SlateDbStorage {
                     StorageError::from_storage(e)
                 }
             })?;
+        self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -629,6 +749,33 @@ impl StorageRead for SlateDbStorageReader {
         filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let options = default_scan_options().with_filter_context(filter_context);
+        let iter = self
+            .reader
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_with(&self, key: Bytes, hints: ReadHints) -> StorageResult<Option<Record>> {
+        let value = self
+            .reader
+            .get_with_options(&key, &hinted_read_options(hints))
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(value.map(|value| Record::new(key, value)))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter_with(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+        hints: ReadHints,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = hinted_scan_options(hints, filter_context);
         let iter = self
             .reader
             .scan_prefix_with_options(prefix, subrange, &options)

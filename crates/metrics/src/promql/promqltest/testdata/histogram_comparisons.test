@@ -1,0 +1,327 @@
+# Comparison operators between floats and native histograms, following
+# Prometheus `vectorElemBinop`: only `h == h` and `h != h` are defined for
+# histograms; every other float/histogram pairing is an incompatible-types
+# info that drops the sample, with or without `bool`.
+
+load 1m
+  h{case="eq"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+  h{case="ne"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+  h2{case="eq"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+  h2{case="ne"} {{schema:0 sum:7 count:5 buckets:[1 3 1]}}
+  f{case="eq"} 3
+  f{case="ne"} 3
+  f2{case="eq"} 3
+  f2{case="ne"} 4
+
+eval instant at 0m f == 3
+  f{case="eq"} 3
+  f{case="ne"} 3
+
+eval instant at 0m 3 == f2
+  f2{case="eq"} 3
+
+eval instant at 0m h == 3
+  # No results.
+
+eval instant at 0m 3 == h
+  # No results.
+
+eval instant at 0m f == f2
+  f{case="eq"} 3
+
+eval instant at 0m h == h2
+  h{case="eq"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+
+eval instant at 0m h == f
+  # No results.
+
+eval instant at 0m f == h
+  # No results.
+
+eval instant at 0m f == bool 3
+  {case="eq"} 1
+  {case="ne"} 1
+
+eval instant at 0m 3 == bool f2
+  {case="eq"} 1
+  {case="ne"} 0
+
+eval instant at 0m h == bool 3
+  # No results.
+
+eval instant at 0m 3 == bool h
+  # No results.
+
+eval instant at 0m f == bool f2
+  {case="eq"} 1
+  {case="ne"} 0
+
+eval instant at 0m h == bool h2
+  {case="eq"} 1
+  {case="ne"} 0
+
+eval instant at 0m h == bool f
+  # No results.
+
+eval instant at 0m f == bool h
+  # No results.
+
+eval instant at 0m f != 3
+  # No results.
+
+eval instant at 0m 3 != f2
+  f2{case="ne"} 4
+
+eval instant at 0m h != 3
+  # No results.
+
+eval instant at 0m 3 != h
+  # No results.
+
+eval instant at 0m f != f2
+  f{case="ne"} 3
+
+eval instant at 0m h != h2
+  h{case="ne"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+
+eval instant at 0m h != f
+  # No results.
+
+eval instant at 0m f != h
+  # No results.
+
+eval instant at 0m f != bool 3
+  {case="eq"} 0
+  {case="ne"} 0
+
+eval instant at 0m 3 != bool f2
+  {case="eq"} 0
+  {case="ne"} 1
+
+eval instant at 0m h != bool 3
+  # No results.
+
+eval instant at 0m 3 != bool h
+  # No results.
+
+eval instant at 0m f != bool f2
+  {case="eq"} 0
+  {case="ne"} 1
+
+eval instant at 0m h != bool h2
+  {case="eq"} 0
+  {case="ne"} 1
+
+eval instant at 0m h != bool f
+  # No results.
+
+eval instant at 0m f != bool h
+  # No results.
+
+eval instant at 0m f > 3
+  # No results.
+
+eval instant at 0m 3 > f2
+  # No results.
+
+eval instant at 0m h > 3
+  # No results.
+
+eval instant at 0m 3 > h
+  # No results.
+
+eval instant at 0m f > f2
+  # No results.
+
+eval instant at 0m h > h2
+  # No results.
+
+eval instant at 0m h > f
+  # No results.
+
+eval instant at 0m f > h
+  # No results.
+
+eval instant at 0m f > bool 3
+  {case="eq"} 0
+  {case="ne"} 0
+
+eval instant at 0m 3 > bool f2
+  {case="eq"} 0
+  {case="ne"} 0
+
+eval instant at 0m h > bool 3
+  # No results.
+
+eval instant at 0m 3 > bool h
+  # No results.
+
+eval instant at 0m f > bool f2
+  {case="eq"} 0
+  {case="ne"} 0
+
+eval instant at 0m h > bool h2
+  # No results.
+
+eval instant at 0m h > bool f
+  # No results.
+
+eval instant at 0m f > bool h
+  # No results.
+
+eval instant at 0m f < 3
+  # No results.
+
+eval instant at 0m 3 < f2
+  f2{case="ne"} 4
+
+eval instant at 0m h < 3
+  # No results.
+
+eval instant at 0m 3 < h
+  # No results.
+
+eval instant at 0m f < f2
+  f{case="ne"} 3
+
+eval instant at 0m h < h2
+  # No results.
+
+eval instant at 0m h < f
+  # No results.
+
+eval instant at 0m f < h
+  # No results.
+
+eval instant at 0m f < bool 3
+  {case="eq"} 0
+  {case="ne"} 0
+
+eval instant at 0m 3 < bool f2
+  {case="eq"} 0
+  {case="ne"} 1
+
+eval instant at 0m h < bool 3
+  # No results.
+
+eval instant at 0m 3 < bool h
+  # No results.
+
+eval instant at 0m f < bool f2
+  {case="eq"} 0
+  {case="ne"} 1
+
+eval instant at 0m h < bool h2
+  # No results.
+
+eval instant at 0m h < bool f
+  # No results.
+
+eval instant at 0m f < bool h
+  # No results.
+
+eval instant at 0m f >= 3
+  f{case="eq"} 3
+  f{case="ne"} 3
+
+eval instant at 0m 3 >= f2
+  f2{case="eq"} 3
+
+eval instant at 0m h >= 3
+  # No results.
+
+eval instant at 0m 3 >= h
+  # No results.
+
+eval instant at 0m f >= f2
+  f{case="eq"} 3
+
+eval instant at 0m h >= h2
+  # No results.
+
+eval instant at 0m h >= f
+  # No results.
+
+eval instant at 0m f >= h
+  # No results.
+
+eval instant at 0m f >= bool 3
+  {case="eq"} 1
+  {case="ne"} 1
+
+eval instant at 0m 3 >= bool f2
+  {case="eq"} 1
+  {case="ne"} 0
+
+eval instant at 0m h >= bool 3
+  # No results.
+
+eval instant at 0m 3 >= bool h
+  # No results.
+
+eval instant at 0m f >= bool f2
+  {case="eq"} 1
+  {case="ne"} 0
+
+eval instant at 0m h >= bool h2
+  # No results.
+
+eval instant at 0m h >= bool f
+  # No results.
+
+eval instant at 0m f >= bool h
+  # No results.
+
+eval instant at 0m f <= 3
+  f{case="eq"} 3
+  f{case="ne"} 3
+
+eval instant at 0m 3 <= f2
+  f2{case="eq"} 3
+  f2{case="ne"} 4
+
+eval instant at 0m h <= 3
+  # No results.
+
+eval instant at 0m 3 <= h
+  # No results.
+
+eval instant at 0m f <= f2
+  f{case="eq"} 3
+  f{case="ne"} 3
+
+eval instant at 0m h <= h2
+  # No results.
+
+eval instant at 0m h <= f
+  # No results.
+
+eval instant at 0m f <= h
+  # No results.
+
+eval instant at 0m f <= bool 3
+  {case="eq"} 1
+  {case="ne"} 1
+
+eval instant at 0m 3 <= bool f2
+  {case="eq"} 1
+  {case="ne"} 1
+
+eval instant at 0m h <= bool 3
+  # No results.
+
+eval instant at 0m 3 <= bool h
+  # No results.
+
+eval instant at 0m f <= bool f2
+  {case="eq"} 1
+  {case="ne"} 1
+
+eval instant at 0m h <= bool h2
+  # No results.
+
+eval instant at 0m h <= bool f
+  # No results.
+
+eval instant at 0m f <= bool h
+  # No results.

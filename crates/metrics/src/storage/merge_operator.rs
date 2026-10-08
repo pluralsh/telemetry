@@ -1,6 +1,6 @@
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_batch_time_series;
-use crate::serde::{EncodingError, RecordType, parse_record_prefix};
+use crate::serde::{EncodingError, RecordType, record_type_of};
 use bytes::Bytes;
 use common::storage::default_merge_batch;
 
@@ -12,8 +12,7 @@ pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let (_, _, record_type, _) =
-            parse_record_prefix(key.as_ref()).expect("Failed to decode record type");
+        let record_type = record_type_of(key.as_ref()).expect("Failed to decode record type");
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)

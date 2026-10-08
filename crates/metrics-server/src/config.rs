@@ -65,6 +65,24 @@ impl Default for RequestConfig {
     }
 }
 
+/// Reuse of range-query results whose dependent buckets are unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResultCacheConfig {
+    pub enabled: bool,
+    pub capacity_bytes: u64,
+}
+
+impl Default for ResultCacheConfig {
+    fn default() -> Self {
+        let defaults = plural_metrics::QueryCacheConfig::default();
+        Self {
+            enabled: defaults.result_cache_enabled,
+            capacity_bytes: defaults.result_capacity_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -73,9 +91,13 @@ pub struct Config {
     /// Optional prefix for public read and write HTTP APIs, such as `/metrics`.
     pub path_prefix: String,
     pub storage: SlateDbStorageConfig,
-    /// Samples older than this may be dropped by compaction. Unset keeps data forever.
+    /// Samples older than this may be dropped by compaction; 60 days by
+    /// default, `null` keeps data forever.
     pub retention_seconds: Option<u64>,
     pub reader_cache_capacity: u64,
+    /// Byte budget of each namespace's selector-matcher cache, per shard.
+    pub matcher_cache_capacity_bytes: u64,
+    pub result_cache: ResultCacheConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
     pub request: RequestConfig,
@@ -92,8 +114,11 @@ impl Default for Config {
             listeners: ListenerConfig::default(),
             path_prefix: String::new(),
             storage: SlateDbStorageConfig::default(),
-            retention_seconds: None,
+            retention_seconds: Some(plural_metrics::DEFAULT_RETENTION.as_secs()),
             reader_cache_capacity: 256 * 1024 * 1024,
+            matcher_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
+                .matcher_capacity_bytes,
+            result_cache: ResultCacheConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),

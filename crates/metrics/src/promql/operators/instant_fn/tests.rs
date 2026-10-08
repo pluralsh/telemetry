@@ -823,3 +823,154 @@ fn should_apply_abs_over_vector_selector_pipeline() {
     assert_eq!(b.get(1, 0), Some(2.0)); // abs(-2)
     assert_eq!(b.get(1, 1), Some(4.0)); // abs(-4)
 }
+
+// ---- bit-exact parity with the per-cell loop -------------------------------
+
+mod parity {
+    use super::*;
+    use crate::test_utils::strategies::edge_f64;
+    use proptest::prelude::*;
+
+    /// The per-cell evaluation `apply_batch` specialises: every valid cell
+    /// through `InstantFnKind::compute`, invalid cells left at the NaN fill.
+    fn reference(kind: InstantFnKind, batch: &StepBatch) -> Vec<f64> {
+        let series_count = batch.series_count();
+        let step_ts = batch.step_timestamps_slice();
+        let source_ts = batch.source_timestamps.as_deref();
+        let mut out = vec![f64::NAN; batch.len()];
+        for (idx, cell) in out.iter_mut().enumerate() {
+            if batch.validity.get(idx) {
+                let ts = match (kind, source_ts) {
+                    (InstantFnKind::Timestamp, Some(ts)) => ts[idx],
+                    _ => step_ts[idx / series_count],
+                };
+                *cell = kind.compute(batch.values[idx], ts);
+            }
+        }
+        out
+    }
+
+    fn kind_strategy() -> impl Strategy<Value = InstantFnKind> {
+        use InstantFnKind as K;
+        let plain = prop::sample::select(vec![
+            K::Abs,
+            K::Ceil,
+            K::Floor,
+            K::Exp,
+            K::Ln,
+            K::Log2,
+            K::Log10,
+            K::Sqrt,
+            K::Sin,
+            K::Cos,
+            K::Tan,
+            K::Asin,
+            K::Acos,
+            K::Atan,
+            K::Sinh,
+            K::Cosh,
+            K::Tanh,
+            K::Asinh,
+            K::Acosh,
+            K::Atanh,
+            K::Deg,
+            K::Rad,
+            K::Sgn,
+            K::Timestamp,
+        ]);
+        prop_oneof![
+            6 => plain,
+            1 => edge_f64().prop_map(|to_nearest| K::Round { to_nearest }),
+            1 => (edge_f64(), edge_f64()).prop_map(|(min, max)| K::Clamp { min, max }),
+            1 => edge_f64().prop_map(|min| K::ClampMin { min }),
+            1 => edge_f64().prop_map(|max| K::ClampMax { max }),
+        ]
+    }
+
+    fn calendar_kind() -> impl Strategy<Value = InstantFnKind> {
+        use InstantFnKind as K;
+        prop::sample::select(vec![
+            K::Year,
+            K::Month,
+            K::DayOfMonth,
+            K::DayOfYear,
+            K::DayOfWeek,
+            K::Hour,
+            K::Minute,
+            K::DaysInMonth,
+        ])
+    }
+
+    fn batch_strategy(value: BoxedStrategy<f64>) -> impl Strategy<Value = StepBatch> {
+        (1usize..5, 1usize..140).prop_flat_map(move |(steps, series)| {
+            let cells = steps * series;
+            (
+                prop::collection::vec(value.clone(), cells),
+                prop::collection::vec(prop::bool::weighted(0.9), cells),
+                prop::option::of(prop::collection::vec(any::<i64>(), cells)),
+            )
+                .prop_map(move |(values, validity, source_ts)| {
+                    let step_ts = (0..steps as i64).map(|i| 1_700_000_000_000 + i * 15_000);
+                    let batch = mk_batch(step_ts.collect(), series, values, validity);
+                    match source_ts {
+                        Some(ts) => batch.with_source_timestamps(Arc::from(ts)),
+                        None => batch,
+                    }
+                })
+        })
+    }
+
+    fn run(kind: InstantFnKind, batch: StepBatch) -> StepBatch {
+        let schema =
+            mk_operator_schema(batch.step_timestamps_slice(), 15_000, batch.series_count());
+        let child = MockChild::new(schema, vec![batch]);
+        let mut op = InstantFnOp::new(child, kind, MemoryReservation::new(usize::MAX));
+        let mut out = drive(&mut op);
+        assert_eq!(out.len(), 1);
+        out.remove(0).expect("batch")
+    }
+
+    fn assert_bits_eq(kind: InstantFnKind, batch: StepBatch) {
+        let (expected, expected_validity) = match kind {
+            InstantFnKind::Clamp { min, max } if min > max => {
+                (vec![f64::NAN; batch.len()], BitSet::with_len(batch.len()))
+            }
+            _ => (reference(kind, &batch), batch.validity.clone()),
+        };
+        let out = run(kind, batch);
+        assert_eq!(out.validity, expected_validity, "{kind:?} validity");
+        for (idx, (got, want)) in out.values.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{kind:?} cell {idx}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn should_match_per_cell_loop_bit_for_bit(
+            kind in kind_strategy(),
+            batch in batch_strategy(edge_f64().boxed()),
+        ) {
+            assert_bits_eq(kind, batch);
+        }
+
+        #[test]
+        fn should_match_per_cell_loop_for_calendar_kinds(
+            kind in calendar_kind(),
+            batch in batch_strategy(
+                prop_oneof![
+                    4 => -1.0e11f64..1.0e11,
+                    1 => edge_f64(),
+                ]
+                .boxed(),
+            ),
+        ) {
+            assert_bits_eq(kind, batch);
+        }
+    }
+}

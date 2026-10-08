@@ -61,7 +61,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Formats a sample value the way Prometheus does: `NaN`, `+Inf`, `-Inf`, or the
 /// shortest round-trip decimal (which matches Go's `FormatFloat(v, 'f', -1, 64)`).
 pub fn prometheus_float(value: f64) -> String {
-    PrometheusFloat(value).to_string()
+    FloatText::prometheus(value).as_str().to_owned()
 }
 
 /// [`prometheus_float`]'s text as a [`std::fmt::Display`], for writers that
@@ -70,12 +70,7 @@ pub struct PrometheusFloat(pub f64);
 
 impl std::fmt::Display for PrometheusFloat {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            value if value.is_nan() => formatter.write_str("NaN"),
-            f64::INFINITY => formatter.write_str("+Inf"),
-            f64::NEG_INFINITY => formatter.write_str("-Inf"),
-            value => std::fmt::Display::fmt(&value, formatter),
-        }
+        formatter.write_str(FloatText::prometheus(self.0).as_str())
     }
 }
 
@@ -83,37 +78,177 @@ impl std::fmt::Display for PrometheusFloat {
 /// (`jsonutil.MarshalFloat`): like [`prometheus_float`], except magnitudes below
 /// `1e-6` or at least `1e21` use Go's exponent form (`1e-07`, `1.5e+21`).
 pub fn prometheus_json_float(value: f64) -> String {
-    let abs = value.abs();
-    if !value.is_finite() || abs == 0.0 || (1e-6..1e21).contains(&abs) {
-        return prometheus_float(value);
+    FloatText::prometheus_json(value).as_str().to_owned()
+}
+
+/// A float's Prometheus spelling on the stack. Every formatter in this
+/// module goes through it: the shortest round-trip digits come from `ryu`,
+/// laid out here, so no float reaches `core::fmt`.
+pub struct FloatText {
+    buf: [u8; FLOAT_TEXT_CAPACITY],
+    len: usize,
+}
+
+/// Fixed notation of the smallest subnormal: sign, `0.`, 323 zeros and its
+/// digits.
+const FLOAT_TEXT_CAPACITY: usize = 352;
+
+impl FloatText {
+    /// [`prometheus_float`]'s text.
+    pub fn prometheus(value: f64) -> Self {
+        Self::format(value, false)
     }
-    let formatted = format!("{value:e}");
-    let (mantissa, exponent) = formatted
-        .split_once('e')
-        .expect("LowerExp output contains an exponent");
-    let (sign, digits) = match exponent.strip_prefix('-') {
-        Some(digits) => ('-', digits),
-        None => ('+', exponent),
+
+    /// [`prometheus_json_float`]'s text.
+    pub fn prometheus_json(value: f64) -> Self {
+        Self::format(value, true)
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).expect("float text is ASCII")
+    }
+
+    fn format(value: f64, json: bool) -> Self {
+        let mut text = Self {
+            buf: [0; FLOAT_TEXT_CAPACITY],
+            len: 0,
+        };
+        if value.is_nan() {
+            text.push(b"NaN");
+            return text;
+        }
+        if value.is_infinite() {
+            text.push(if value > 0.0 { b"+Inf" } else { b"-Inf" });
+            return text;
+        }
+        if value.is_sign_negative() {
+            text.push(b"-");
+        }
+        let mut ryu = ryu::Buffer::new();
+        let (digits, point) = decimal_digits(ryu.format_finite(value.abs()));
+        let Some(digits) = digits else {
+            text.push(b"0");
+            return text;
+        };
+        let digits: &[u8] = &digits;
+        let abs = value.abs();
+        if json && !(1e-6..1e21).contains(&abs) {
+            // Go's 'e' form: one leading digit and an exponent of at least
+            // two digits.
+            text.push(&digits[..1]);
+            if digits.len() > 1 {
+                text.push(b".");
+                text.push(&digits[1..]);
+            }
+            let exponent = point - 1;
+            text.push(if exponent < 0 { b"e-" } else { b"e+" });
+            let magnitude = exponent.unsigned_abs();
+            if magnitude < 10 {
+                text.push(b"0");
+            }
+            text.push(itoa(magnitude, &mut [0; 3]));
+        } else if point <= 0 {
+            text.push(b"0.");
+            text.zeros(point.unsigned_abs() as usize);
+            text.push(digits);
+        } else if point as usize >= digits.len() {
+            text.push(digits);
+            text.zeros(point as usize - digits.len());
+        } else {
+            text.push(&digits[..point as usize]);
+            text.push(b".");
+            text.push(&digits[point as usize..]);
+        }
+        text
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    fn zeros(&mut self, count: usize) {
+        self.buf[self.len..self.len + count].fill(b'0');
+        self.len += count;
+    }
+}
+
+/// The significant digits of a shortest round-trip decimal: at most 17.
+struct Digits {
+    buf: [u8; 24],
+    len: usize,
+}
+
+impl std::ops::Deref for Digits {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// The significant digits of `ryu`'s spelling of a non-negative finite
+/// value, without leading or trailing zeros (`None` for zero), and the
+/// position of the decimal point: the value is `0.DIGITS × 10^point`.
+fn decimal_digits(formatted: &str) -> (Option<Digits>, i32) {
+    let (mantissa, exponent) = match formatted.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().expect("ryu exponent")),
+        None => (formatted, 0),
     };
-    format!("{mantissa}e{sign}{digits:0>2}")
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits = Digits {
+        buf: [0; 24],
+        len: 0,
+    };
+    let mut point = integer.len() as i32 + exponent;
+    for &byte in integer.as_bytes().iter().chain(fraction.as_bytes()) {
+        if digits.len == 0 && byte == b'0' {
+            point -= 1;
+            continue;
+        }
+        digits.buf[digits.len] = byte;
+        digits.len += 1;
+    }
+    while digits.len > 0 && digits.buf[digits.len - 1] == b'0' {
+        digits.len -= 1;
+    }
+    if digits.len == 0 {
+        return (None, 0);
+    }
+    (Some(digits), point)
+}
+
+fn itoa(mut value: u32, buf: &mut [u8; 3]) -> &[u8] {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &buf[start..];
+        }
+    }
 }
 
 /// Rewrites `name` into a valid Prometheus label name: every character outside
 /// `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed with `_`.
 pub fn sanitize_label_name(name: &str) -> String {
-    let mut result = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if result.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-        result.insert(0, '_');
+    let leading_digit = name.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let valid = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    if !leading_digit && name.as_bytes().iter().all(valid) {
+        return name.to_owned();
     }
+    let mut result = String::with_capacity(name.len() + usize::from(leading_digit));
+    if leading_digit {
+        result.push('_');
+    }
+    result.extend(name.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            character
+        } else {
+            '_'
+        }
+    }));
     result
 }
 
@@ -196,9 +331,36 @@ mod tests {
         assert_eq!(prometheus_json_float(f64::NEG_INFINITY), "-Inf");
     }
 
+    proptest::proptest! {
+        #[test]
+        fn float_text_matches_core_display(bits in proptest::num::u64::ANY) {
+            let value = f64::from_bits(bits);
+            proptest::prop_assume!(value.is_finite());
+            let text = FloatText::prometheus(value);
+            proptest::prop_assert_eq!(text.as_str(), value.to_string());
+            let abs = value.abs();
+            let json = FloatText::prometheus_json(value);
+            if abs == 0.0 || (1e-6..1e21).contains(&abs) {
+                proptest::prop_assert_eq!(json.as_str(), value.to_string());
+            } else {
+                let lower = format!("{value:e}");
+                let (mantissa, exponent) = lower.split_once('e').unwrap();
+                let (sign, digits) = match exponent.strip_prefix('-') {
+                    Some(digits) => ('-', digits),
+                    None => ('+', exponent),
+                };
+                proptest::prop_assert_eq!(json.as_str(), format!("{mantissa}e{sign}{digits:0>2}"));
+            }
+        }
+    }
+
     #[test]
     fn should_sanitize_label_names() {
         assert_eq!(sanitize_label_name("service.name"), "service_name");
         assert_eq!(sanitize_label_name("9lives"), "_9lives");
+        assert_eq!(sanitize_label_name("already_valid_1"), "already_valid_1");
+        assert_eq!(sanitize_label_name("é.x"), "__x");
+        assert_eq!(sanitize_label_name("9é"), "_9_");
+        assert_eq!(sanitize_label_name(""), "");
     }
 }

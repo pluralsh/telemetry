@@ -20,7 +20,8 @@ path_prefix: /metrics
 
 storage:
   path: metrics # SlateDB object-key prefix; namespace/shard suffixes are added.
-  # Optional SlateDB TOML, JSON, or YAML settings file.
+  # Optional SlateDB TOML, JSON, or YAML settings file, layered over the
+  # Metrics SlateDB defaults below.
   settings_path: /etc/metrics/SlateDb.toml
 
   # Types: Local, Aws, Azure, Gcp, or InMemory (case-sensitive).
@@ -73,10 +74,22 @@ storage:
     capacity: 134217728 # Bytes; 128 MiB.
     shards: 8 # Optional.
 
-retention_seconds: 2592000 # Optional retention; 30 days. Unset keeps data forever.
+retention_seconds: 5184000 # 60 days, the default. `null` keeps data forever.
 
 # Per-shard query-cache capacity, counted in time-bucket entries (not bytes).
 reader_cache_capacity: 268435456
+
+# Bytes of resolved selector postings (bucket + sorted matchers -> series ids)
+# shared across queries, per namespace on each storage shard; 64 MiB.
+# Entries are dropped once their bucket gains series.
+matcher_cache_capacity_bytes: 67108864
+
+# Range-query result cache. Steps are reused while the write generations of
+# every hour bucket they read are unchanged on every shard; `@` queries,
+# steps after now, and failed queries are never cached.
+result_cache:
+  enabled: true
+  capacity_bytes: 134217728 # 128 MiB.
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
@@ -173,3 +186,44 @@ namespaces:
 
 The checked-in [`metrics.example.yaml`](../../config/metrics.example.yaml) is a
 runnable local variant of this configuration.
+
+## SlateDB defaults
+
+Metrics loads SlateDB settings from `storage.settings_path` or, without it,
+from SlateDB's `SlateDb.{json,toml,yaml,yml}` files and `SLATEDB_` environment
+variables, layered over these defaults instead of SlateDB's. Any key the user
+sets wins; nested keys merge, so overriding one scheduler option keeps the
+others.
+
+| Setting | Metrics | SlateDB |
+|---|---|---|
+| `l0_sst_size_bytes` | 16 MiB | 64 MiB |
+| `compactor_options.scheduler_options.min_compaction_sources` | `"3"` | `"4"` |
+
+Every scrape adds a merge operand per series key, and a query merges all
+operands of each key it reads that compaction has not yet collapsed. SlateDB
+only writes the memtable to L0 when it reaches `l0_sst_size_bytes`
+(`max_wal_flushes_before_l0_flush` is too high to trigger at scrape rates), so
+at 64 MiB recent data sits in many uncollapsed operands for tens of minutes.
+On the `query_profile` bench (10k series at a 15 s interval, realtime mode,
+memtable half full), PromQL range queries over the last hour ran a geometric
+mean of 2.3x slower than over fully compacted data with SlateDB's
+defaults, and 1.4x with Metrics' defaults (count over all series: 3.4x to
+1.6x). The cost is an L0 flush about every 5 minutes instead of 21: about
+1.5x the object-store puts and 3.5x the compaction bytes (16.7 vs
+4.8 MiB/hour at this rate). Smaller L0 SSTs (8 or 4 MiB) gave no further
+query gain for 5–8x the compaction bytes, and `min_compaction_sources = "2"`
+roughly doubled compaction bytes for little gain. Raise `l0_sst_size_bytes`
+to trade recent-data query latency for fewer writes.
+
+Every SlateDB writer (Metrics, Logs and Traces alike) also flushes its
+memtable to L0 every 10 seconds whenever it has
+taken writes since the last flush, whatever its size. A reader replays each
+manifest poll's new WAL files into a memtable of its own and drops those
+memtables only once an L0 flush covers them, so a writer below
+`l0_sst_size_bytes` would otherwise leave every reader get and scan probing
+one memtable per poll since the last flush (about 150 after 30 minutes of
+1 s polls). On a native replay of a 30-minute fuzz run with a split writer
+and reader, the 10 s flush cut last-quarter cold `label_values` latency from
+0.72 to 0.30 ms (p50) and instant queries from 1.13 to 0.90 ms. The cost is
+up to 360 small L0 puts an hour per writer, folded by the compactor.

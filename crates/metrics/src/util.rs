@@ -142,18 +142,22 @@ pub(crate) fn normalize_str(s: &str) -> Option<String> {
 }
 
 /// Kahan-Neumaier compensated summation step: returns the new `(sum,
-/// compensation)`. `#[inline(never)]` guards against compiler reordering
-/// that would change IEEE-754 output (cf. Prometheus #16714).
-#[inline(never)]
+/// compensation)`. Output depends on every operation rounding exactly as
+/// written — no reassociation, no FMA contraction (cf. Prometheus #16714,
+/// where Go fused one). Rust guarantees both for plain `f64` arithmetic, so
+/// this inlines safely; both arms are computed and selected so callers'
+/// loops stay branch-free and vectorizable.
+#[inline]
 pub(crate) fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
     let t = sum + inc;
-    let new_c = if t.is_infinite() {
-        0.0
-    } else if sum.abs() >= inc.abs() {
-        c + ((sum - t) + inc)
+    let sum_larger = (sum - t) + inc;
+    let inc_larger = (inc - t) + sum;
+    let lost = if sum.abs() >= inc.abs() {
+        sum_larger
     } else {
-        c + ((inc - t) + sum)
+        inc_larger
     };
+    let new_c = if t.is_infinite() { 0.0 } else { c + lost };
     (t, new_c)
 }
 

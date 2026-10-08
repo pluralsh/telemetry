@@ -158,6 +158,8 @@ pub struct Config {
     /// Discovery rollup period, a whole multiple of the segment duration;
     /// `null` disables it.
     pub discovery_rollup_seconds: Option<u64>,
+    /// How long data is kept, counted from ingestion; 14 days by default,
+    /// `null` keeps it forever.
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,

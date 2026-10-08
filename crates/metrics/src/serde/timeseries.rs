@@ -1,264 +1,92 @@
-// TimeSeries value structure with Gorilla compression using tsz crate
+// TimeSeries value structure: columnar float chunks plus native histograms
 
 use crate::histogram::{Bucket, CounterResetHint, FloatHistogram};
 use crate::model::{HistogramSample, Sample, SeriesData};
 
+use super::chunk;
 use super::*;
 use bytes::{BufMut, Bytes};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
-use tsz::stream::{BufferedWriter, Error as TszError, Read as TszRead};
-use tsz::{Bit, DataPoint, Decode, Encode, StdDecoder, StdEncoder};
 
-/// A reader that implements `tsz::stream::Read` for byte slices without copying.
-struct BytesReader<'a> {
-    bytes: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8, // 0-7, position within current byte
-}
-
-impl<'a> BytesReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            byte_pos: 0,
-            bit_pos: 0,
-        }
-    }
-}
-
-impl<'a> TszRead for BytesReader<'a> {
-    fn read_bit(&mut self) -> std::result::Result<Bit, TszError> {
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
-
-        if self.byte_pos >= self.bytes.len() {
-            return Err(TszError::EOF);
-        }
-
-        let byte = self.bytes[self.byte_pos];
-        let bit = if byte & 1u8.wrapping_shl(7 - self.bit_pos as u32) == 0 {
-            Bit::Zero
-        } else {
-            Bit::One
-        };
-
-        self.bit_pos += 1;
-
-        Ok(bit)
-    }
-
-    fn read_byte(&mut self) -> std::result::Result<u8, TszError> {
-        // When bit_pos == 0, we're byte-aligned
-        if self.bit_pos == 0 {
-            if self.byte_pos >= self.bytes.len() {
-                return Err(TszError::EOF);
-            }
-            let byte = self.bytes[self.byte_pos];
-            // Set bit_pos to 8 to mark we've consumed this byte
-            // The next read operation will increment byte_pos
-            self.bit_pos = 8;
-            return Ok(byte);
-        }
-
-        // When bit_pos == 8, move to next byte
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            if self.byte_pos >= self.bytes.len() {
-                return Err(TszError::EOF);
-            }
-            let byte = self.bytes[self.byte_pos];
-            // Keep bit_pos at 8 since we've consumed this byte
-            return Ok(byte);
-        }
-
-        // When bit_pos is between 1-7, we need to combine parts of two bytes
-        if self.byte_pos >= self.bytes.len() {
-            return Err(TszError::EOF);
-        }
-
-        let mut byte = 0;
-        let mut b = self.bytes[self.byte_pos];
-        byte |= b.wrapping_shl(self.bit_pos as u32);
-
-        self.byte_pos += 1;
-        if self.byte_pos >= self.bytes.len() {
-            return Err(TszError::EOF);
-        }
-
-        b = self.bytes[self.byte_pos];
-        byte |= b.wrapping_shr(8 - self.bit_pos as u32);
-
-        Ok(byte)
-    }
-
-    fn read_bits(&mut self, mut num: u32) -> std::result::Result<u64, TszError> {
-        if num > 64 {
-            num = 64;
-        }
-
-        let mut bits: u64 = 0;
-        while num >= 8 {
-            let byte = self.read_byte().map(u64::from)?;
-            bits = bits.wrapping_shl(8) | byte;
-            num -= 8;
-        }
-
-        while num > 0 {
-            self.read_bit()
-                .map(|bit| bits = bits.wrapping_shl(1) | bit.to_u64())?;
-            num -= 1;
-        }
-
-        Ok(bits)
-    }
-
-    fn peak_bits(&mut self, num: u32) -> std::result::Result<u64, TszError> {
-        let saved_byte_pos = self.byte_pos;
-        let saved_bit_pos = self.bit_pos;
-
-        let bits = self.read_bits(num)?;
-
-        self.byte_pos = saved_byte_pos;
-        self.bit_pos = saved_bit_pos;
-
-        Ok(bits)
-    }
-}
-
-/// Iterator over time series samples from Gorilla-compressed data.
-///
-/// This iterator lazily decodes samples from the compressed format without
-/// materializing the full series in memory.
-pub(crate) struct TimeSeriesIterator<'a> {
-    decoder: StdDecoder<BytesReader<'a>>,
-}
-
-impl<'a> TimeSeriesIterator<'a> {
-    /// Creates a new iterator from compressed time series bytes.
-    ///
-    /// Returns None if the bytes represent an empty series.
-    pub fn new(bytes: &'a [u8]) -> Option<Self> {
-        if bytes.is_empty() {
-            return None;
-        }
-
-        let reader = BytesReader::new(bytes);
-        let decoder = StdDecoder::new(reader);
-
-        Some(TimeSeriesIterator { decoder })
-    }
-}
-
-impl<'a> Iterator for TimeSeriesIterator<'a> {
-    type Item = Result<Sample, EncodingError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.decoder.next() {
-            Ok(dp) => Some(Ok(Sample {
-                timestamp_ms: dp.get_time() as i64,
-                value: dp.get_value(),
-            })),
-            Err(tsz::decode::Error::EndOfStream) => None,
-            Err(e) => Some(Err(EncodingError {
-                message: format!("Gorilla decoding failed: {}", e),
-            })),
-        }
-    }
-}
-
-/// TimeSeries value: Gorilla-compressed stream of (timestamp_ms, value) pairs
+/// TimeSeries value: the float samples of a series ([`SeriesData`] without
+/// histograms).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeSeriesValue {
     pub points: Vec<Sample>,
 }
 
 impl TimeSeriesValue {
-    /// Encode time series points using Gorilla compression
+    /// Sorts by timestamp; of samples sharing one, the first is kept.
     pub fn encode(&self) -> Result<Bytes, EncodingError> {
-        // Handle empty case
-        if self.points.is_empty() {
-            return Ok(Bytes::new());
-        }
-
-        // Gorilla delta encoding requires monotonically non-decreasing timestamps,
-        // so sort defensively to avoid a subtract-with-overflow panic on out-of-order input.
-        let mut points: Vec<&Sample> = self.points.iter().collect();
-        points.sort_by_key(|p| p.timestamp_ms);
-
-        // Use Gorilla compression
-        let w = BufferedWriter::new();
-        let start_time = points[0].timestamp_ms as u64;
-        let mut encoder = StdEncoder::new(start_time, w);
-
-        for point in &points {
-            let dp = DataPoint::new(point.timestamp_ms as u64, point.value);
-            encoder.encode(dp);
-        }
-
-        let compressed = encoder.close();
-        Ok(Bytes::from(compressed))
+        SeriesData::new(self.points.clone(), Vec::new()).encode()
     }
 
-    /// Decode time series points from Gorilla-compressed data
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.is_empty() {
-            return Ok(TimeSeriesValue { points: vec![] });
-        }
-
-        // Use the iterator to collect points
-        let points = match TimeSeriesIterator::new(buf) {
-            None => vec![], // Empty series
-            Some(iter) => iter.collect::<Result<Vec<_>, _>>()?,
-        };
-
-        Ok(TimeSeriesValue { points })
+        Ok(TimeSeriesValue {
+            points: SeriesData::decode(buf)?.floats().collect(),
+        })
     }
 }
 
-/// Leading byte of a value that carries native histograms.
-///
-/// A float-only value is a bare Gorilla stream, which opens with the
-/// big-endian `u64` start timestamp; that only begins with `0x80` for
-/// timestamps within 2^56 ms of `i64::MIN`, so the marker is unambiguous.
-const HISTOGRAM_VALUE_MARKER: u8 = 0x80;
+/// Leading byte of every non-empty value; values written in any other
+/// format are rejected.
+const FORMAT_VERSION: u8 = 1;
+/// Set in the leading byte of a value that carries native histograms.
+const HISTOGRAM_FLAG: u8 = 0x80;
+const HISTOGRAM_VALUE_TAG: u8 = FORMAT_VERSION | HISTOGRAM_FLAG;
 
 fn is_histogram_value(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&HISTOGRAM_VALUE_MARKER)
+    bytes.first() == Some(&HISTOGRAM_VALUE_TAG)
+}
+
+/// The float section of a float-only value.
+fn float_section(bytes: &[u8]) -> Result<&[u8], EncodingError> {
+    match bytes.split_first() {
+        Some((&FORMAT_VERSION, section)) => Ok(section),
+        Some((&tag, _)) => Err(EncodingError {
+            message: format!("unknown series value format {tag:#x}"),
+        }),
+        None => Ok(&[]),
+    }
 }
 
 /// Storage encoding of a series value.
 ///
-/// Float-only values encode as a bare Gorilla stream ([`TimeSeriesValue`]).
-/// Values with histograms encode as the marker byte, the length-prefixed
-/// Gorilla float stream, then the histogram section: the sample count, then
-/// per sample a delta-of-delta timestamp and the histogram encoded against
-/// the previous one ([`encode_histogram`]). A value never references data
-/// outside itself, so merge operands decode (and partially merge)
-/// independently. Within one value a timestamp holds at most one sample
-/// type; a histogram wins a collision.
+/// An empty value is empty bytes. Otherwise a format byte leads: float-only
+/// values follow it with a float section ([`chunk`]). Values with
+/// histograms set [`HISTOGRAM_FLAG`] in it and follow it with the
+/// length-prefixed float section, then the histogram section: the sample
+/// count, then per sample a delta-of-delta timestamp and the histogram
+/// encoded against the previous one ([`encode_histogram`]). A value never
+/// references data outside itself, so merge operands decode (and partially
+/// merge) independently. Samples are sorted by timestamp and a timestamp
+/// holds at most one sample: of floats sharing one the first is kept, and a
+/// histogram wins over a float.
 impl SeriesData {
     pub fn encode(mut self) -> Result<Bytes, EncodingError> {
+        self.sort_floats();
+        if !self.histograms.is_empty() {
+            self.histograms.sort_by_key(|h| h.timestamp_ms);
+            let histograms = std::mem::take(&mut self.histograms);
+            self.retain_floats(|ts| {
+                histograms
+                    .binary_search_by_key(&ts, |h| h.timestamp_ms)
+                    .is_err()
+            });
+            self.histograms = histograms;
+        }
         if self.histograms.is_empty() {
-            return TimeSeriesValue {
-                points: self.floats,
+            if self.timestamps.is_empty() {
+                return Ok(Bytes::new());
             }
-            .encode();
+            let mut buf = Vec::with_capacity(24 + 3 * self.timestamps.len());
+            buf.push(FORMAT_VERSION);
+            chunk::encode_section(&self.timestamps, &self.values, &mut buf);
+            return Ok(Bytes::from(buf));
         }
-        self.histograms.sort_by_key(|h| h.timestamp_ms);
-        let histograms = &self.histograms;
-        self.floats.retain(|f| {
-            histograms
-                .binary_search_by_key(&f.timestamp_ms, |h| h.timestamp_ms)
-                .is_err()
-        });
-        let floats = TimeSeriesValue {
-            points: self.floats,
-        }
-        .encode()?;
+        let mut floats = Vec::with_capacity(3 * self.timestamps.len());
+        chunk::encode_section(&self.timestamps, &self.values, &mut floats);
 
         let estimate: usize = self
             .histograms
@@ -266,7 +94,7 @@ impl SeriesData {
             .map(|s| 16 + 2 * (s.histogram.positive.len() + s.histogram.negative.len()))
             .sum();
         let mut buf = Vec::with_capacity(floats.len() + 20 + estimate);
-        buf.push(HISTOGRAM_VALUE_MARKER);
+        buf.push(HISTOGRAM_VALUE_TAG);
         put_uvarint(&mut buf, floats.len() as u64);
         buf.extend_from_slice(&floats);
         put_uvarint(&mut buf, self.histograms.len() as u64);
@@ -284,9 +112,8 @@ impl SeriesData {
         Ok(Bytes::from(buf))
     }
 
-    /// Decodes the samples with `start_ms < timestamp <= end_ms`. Stored
-    /// values are sorted by timestamp (encode and merge both guarantee it),
-    /// so decoding stops past `end_ms`.
+    /// Decodes the samples with `start_ms < timestamp <= end_ms`. Float
+    /// chunks outside the range are skipped without decoding them.
     pub fn decode_range(buf: &[u8], start_ms: i64, end_ms: i64) -> Result<Self, EncodingError> {
         Self::decode_bounded(buf, Some((start_ms, end_ms)))
     }
@@ -296,39 +123,48 @@ impl SeriesData {
     }
 
     fn decode_bounded(buf: &[u8], range: Option<(i64, i64)>) -> Result<Self, EncodingError> {
+        let mut data = Self::default();
         if !is_histogram_value(buf) {
-            return Ok(Self {
-                floats: decode_floats(buf, range)?,
-                histograms: Vec::new(),
-            });
+            data.decode_floats(float_section(buf)?, range)?;
+            return Ok(data);
         }
         let mut cursor = &buf[1..];
         let float_len = get_uvarint(&mut cursor)? as usize;
-        let floats = decode_floats(take(&mut cursor, float_len)?, range)?;
+        data.decode_floats(take(&mut cursor, float_len)?, range)?;
         let count = get_uvarint(&mut cursor)? as usize;
-        let histograms = decode_histograms(&mut cursor, count, range)?;
-        Ok(Self { floats, histograms })
+        data.histograms = decode_histograms(&mut cursor, count, range)?;
+        Ok(data)
     }
-}
 
-fn decode_floats(buf: &[u8], range: Option<(i64, i64)>) -> Result<Vec<Sample>, EncodingError> {
-    let Some(iter) = TimeSeriesIterator::new(buf) else {
-        return Ok(Vec::new());
-    };
-    let Some((start_ms, end_ms)) = range else {
-        return iter.collect();
-    };
-    let mut floats = Vec::new();
-    for sample in iter {
-        let sample = sample?;
-        if sample.timestamp_ms > end_ms {
-            break;
-        }
-        if sample.timestamp_ms > start_ms {
-            floats.push(sample);
+    fn decode_floats(
+        &mut self,
+        section: &[u8],
+        range: Option<(i64, i64)>,
+    ) -> Result<(), EncodingError> {
+        match range {
+            Some((start_ms, end_ms)) => chunk::decode_range(
+                section,
+                start_ms,
+                end_ms,
+                &mut self.timestamps,
+                &mut self.values,
+            ),
+            None => chunk::decode(section, &mut self.timestamps, &mut self.values),
         }
     }
-    Ok(floats)
+
+    /// Sorts the floats by timestamp; of floats sharing one, the first is
+    /// kept.
+    fn sort_floats(&mut self) {
+        if self.timestamps.is_sorted_by(|a, b| a < b) {
+            return;
+        }
+        let mut order = (0..self.timestamps.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| self.timestamps[index]);
+        order.dedup_by_key(|index| self.timestamps[*index]);
+        self.timestamps = order.iter().map(|&index| self.timestamps[index]).collect();
+        self.values = order.iter().map(|&index| self.values[index]).collect();
+    }
 }
 
 /// Samples are decoded in order since each depends on the one before;
@@ -727,6 +563,11 @@ fn merge_mixed_values(sources: &[&Bytes]) -> Result<Bytes, EncodingError> {
     let mut points: Vec<(i64, Reverse<usize>, u8, Point)> = Vec::new();
     for (priority, source) in sources.iter().enumerate() {
         let value = SeriesData::decode(source)?;
+        points.extend(
+            value
+                .floats()
+                .map(|f| (f.timestamp_ms, Reverse(priority), 1, Point::Float(f.value))),
+        );
         points.extend(value.histograms.into_iter().map(|h| {
             (
                 h.timestamp_ms,
@@ -735,12 +576,6 @@ fn merge_mixed_values(sources: &[&Bytes]) -> Result<Bytes, EncodingError> {
                 Point::Histogram(h.histogram),
             )
         }));
-        points.extend(
-            value
-                .floats
-                .into_iter()
-                .map(|f| (f.timestamp_ms, Reverse(priority), 1, Point::Float(f.value))),
-        );
     }
     points.sort_by_key(|&(ts, priority, kind, _)| (ts, priority, kind));
     points.dedup_by_key(|point| point.0);
@@ -752,7 +587,7 @@ fn merge_mixed_values(sources: &[&Bytes]) -> Result<Bytes, EncodingError> {
                 timestamp_ms,
                 histogram,
             }),
-            Point::Float(value) => merged.floats.push(Sample {
+            Point::Float(value) => merged.push(Sample {
                 timestamp_ms,
                 value,
             }),
@@ -761,24 +596,15 @@ fn merge_mixed_values(sources: &[&Bytes]) -> Result<Bytes, EncodingError> {
     merged.encode()
 }
 
-/// Merges a batch of compressed time series byte values into a single compressed value.
+/// Merges series values, `existing` (if any) then `operands` oldest to
+/// newest, into one: at a timestamp held by several the newest wins.
 ///
-/// This function performs an efficient sorted merge of Gorilla-compressed time series
-/// without fully deserializing them into memory. Samples are merged in timestamp order,
-/// with duplicates resolved by keeping the value from the newest operand (last write wins).
-/// Values carrying native histograms take a slower fully-decoded path with the same
-/// semantics across both sample types.
-///
-/// This is designed for use in merge operators during compaction.
-///
-/// # Arguments
-///
-/// * `existing` - The existing compressed time series value (if any)
-/// * `operands` - A slice of compressed time series operands, ordered oldest to newest
-///
-/// # Returns
-///
-/// A new compressed `Bytes` value containing the merged series
+/// Float-only values merge their chunks ([`chunk::merge`]): chunks that do
+/// not overlap are copied without decoding, so merging fresh operands onto
+/// a compacted value costs little more than a copy. Values carrying native
+/// histograms take a slower fully decoded path with the same semantics
+/// across both sample types. A single non-empty source passes through
+/// untouched.
 pub(crate) fn merge_batch_time_series(
     existing: Option<Bytes>,
     operands: &[Bytes],
@@ -795,7 +621,6 @@ pub(crate) fn merge_batch_time_series(
         }
     }
 
-    // Handle edge cases
     if sources.is_empty() {
         return Ok(Bytes::new());
     }
@@ -806,42 +631,18 @@ pub(crate) fn merge_batch_time_series(
         return merge_mixed_values(&sources);
     }
 
-    // K-way merge over the sources' decoders; every encoded stream is sorted
-    // by timestamp. Priority is the source index: higher = newer = wins a
-    // timestamp tie. The heap holds one head per source ordered by
-    // (timestamp, newest first), so every source holding the smallest pending
-    // timestamp is at its head when that timestamp is popped. The first pop
-    // wins; later samples at the same timestamp (older sources, or repeats
-    // within one source) are dropped.
-    let mut iters = sources
+    let sections = sources
         .iter()
-        .map(|source| TimeSeriesIterator::new(source.as_ref()).expect("Series should not be empty"))
-        .collect::<Vec<_>>();
-    let mut values = vec![0.0; iters.len()];
-    let mut heap = BinaryHeap::with_capacity(iters.len());
-    for (priority, iter) in iters.iter_mut().enumerate() {
-        if let Some(sample) = iter.next().transpose()? {
-            values[priority] = sample.value;
-            heap.push(Reverse((sample.timestamp_ms, Reverse(priority))));
-        }
+        .map(|source| float_section(source))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total: usize = sections.iter().map(|section| section.len()).sum();
+    let mut buf = Vec::with_capacity(1 + total);
+    buf.push(FORMAT_VERSION);
+    chunk::merge(&sections, &mut buf)?;
+    if buf.len() == 1 {
+        return Ok(Bytes::new());
     }
-
-    let mut encoder: Option<StdEncoder<BufferedWriter>> = None;
-    let mut last = None;
-    while let Some(Reverse((timestamp, Reverse(priority)))) = heap.pop() {
-        if last != Some(timestamp) {
-            last = Some(timestamp);
-            encoder
-                .get_or_insert_with(|| StdEncoder::new(timestamp as u64, BufferedWriter::new()))
-                .encode(DataPoint::new(timestamp as u64, values[priority]));
-        }
-        if let Some(sample) = iters[priority].next().transpose()? {
-            values[priority] = sample.value;
-            heap.push(Reverse((sample.timestamp_ms, Reverse(priority))));
-        }
-    }
-    // If all iterators returned None immediately, treat as empty.
-    Ok(encoder.map_or_else(Bytes::new, |encoder| Bytes::from(encoder.close())))
+    Ok(Bytes::from(buf))
 }
 
 #[cfg(test)]
@@ -1215,10 +1016,7 @@ mod tests {
                 })
                 .collect();
             expected.sort_by(|a, b| a.1.timestamp_ms.cmp(&b.1.timestamp_ms).then(b.0.cmp(&a.0)));
-            // A single non-empty source is passed through untouched.
-            if encoded.iter().filter(|bytes| !bytes.is_empty()).count() > 1 {
-                expected.dedup_by(|a, b| a.1.timestamp_ms == b.1.timestamp_ms);
-            }
+            expected.dedup_by(|a, b| a.1.timestamp_ms == b.1.timestamp_ms);
             let expected: Vec<Sample> = expected.into_iter().map(|(_, sample)| sample).collect();
 
             let (existing, operands) = encoded.split_first().unwrap();
@@ -1422,24 +1220,25 @@ mod tests {
     fn should_round_trip_series_value_with_histograms() {
         // given
         let bounds: Arc<[f64]> = Arc::from(vec![0.5, 1.0, 2.0]);
-        let value = SeriesData {
-            floats: vec![Sample::new(500, 1.5), Sample::new(4000, f64::NAN)],
-            histograms: vec![
+        let value = SeriesData::new(
+            vec![Sample::new(500, 1.5), Sample::new(4000, f64::NAN)],
+            vec![
                 histogram_sample(1000, exponential_histogram(10.0)),
                 histogram_sample(2000, custom_histogram(&bounds)),
                 histogram_sample(3000, custom_histogram(&bounds)),
             ],
-        };
+        );
 
         // when
         let encoded = value.clone().encode().unwrap();
         let decoded = SeriesData::decode(&encoded).unwrap();
 
         // then
-        assert_eq!(encoded[0], HISTOGRAM_VALUE_MARKER);
+        assert_eq!(encoded[0], HISTOGRAM_VALUE_TAG);
         assert_eq!(decoded.histograms, value.histograms);
-        assert_eq!(decoded.floats[0], value.floats[0]);
-        assert!(decoded.floats[1].value.is_nan());
+        assert_eq!(decoded.timestamps, value.timestamps);
+        assert_eq!(decoded.values[0], value.values[0]);
+        assert!(decoded.values[1].is_nan());
         // repeated custom bounds share one allocation after decoding
         assert!(Arc::ptr_eq(
             &decoded.histograms[1].histogram.custom_values,
@@ -1448,27 +1247,28 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_float_only_series_value_as_gorilla() {
-        let value = SeriesData {
-            floats: vec![Sample::new(1000, 1.0)],
-            histograms: Vec::new(),
-        };
+    fn should_encode_float_only_series_value_behind_format_tag() {
+        let value = SeriesData::new(vec![Sample::new(1000, 1.0)], Vec::new());
         let encoded = value.clone().encode().unwrap();
+        assert_eq!(encoded[0], FORMAT_VERSION);
         assert_eq!(
             TimeSeriesValue::decode(&encoded).unwrap().points,
-            value.floats
+            value.floats().collect::<Vec<_>>()
         );
         assert_eq!(SeriesData::decode(&encoded).unwrap(), value);
     }
 
     #[test]
     fn should_prefer_histogram_on_collision_within_value() {
-        let value = SeriesData {
-            floats: vec![Sample::new(1000, 1.0), Sample::new(2000, 2.0)],
-            histograms: vec![histogram_sample(1000, exponential_histogram(5.0))],
-        };
+        let value = SeriesData::new(
+            vec![Sample::new(1000, 1.0), Sample::new(2000, 2.0)],
+            vec![histogram_sample(1000, exponential_histogram(5.0))],
+        );
         let decoded = SeriesData::decode(&value.encode().unwrap()).unwrap();
-        assert_eq!(decoded.floats, vec![Sample::new(2000, 2.0)]);
+        assert_eq!(
+            decoded.floats().collect::<Vec<_>>(),
+            vec![Sample::new(2000, 2.0)]
+        );
         assert_eq!(decoded.histograms.len(), 1);
     }
 
@@ -1476,27 +1276,24 @@ mod tests {
     fn should_merge_floats_and_histograms_last_write_wins() {
         // given: existing floats, then an operand overwriting ts=2000 with a
         // histogram, then a float operand overwriting the ts=3000 histogram
-        let existing = SeriesData {
-            floats: vec![Sample::new(1000, 1.0), Sample::new(2000, 2.0)],
-            histograms: Vec::new(),
-        }
+        let existing = SeriesData::new(
+            vec![Sample::new(1000, 1.0), Sample::new(2000, 2.0)],
+            Vec::new(),
+        )
         .encode()
         .unwrap();
-        let op0 = SeriesData {
-            floats: Vec::new(),
-            histograms: vec![
+        let op0 = SeriesData::new(
+            Vec::new(),
+            vec![
                 histogram_sample(2000, exponential_histogram(4.0)),
                 histogram_sample(3000, exponential_histogram(6.0)),
             ],
-        }
+        )
         .encode()
         .unwrap();
-        let op1 = SeriesData {
-            floats: vec![Sample::new(3000, 30.0)],
-            histograms: Vec::new(),
-        }
-        .encode()
-        .unwrap();
+        let op1 = SeriesData::new(vec![Sample::new(3000, 30.0)], Vec::new())
+            .encode()
+            .unwrap();
 
         // when
         let merged = merge_batch_time_series(Some(existing), &[op0, op1]).unwrap();
@@ -1504,7 +1301,7 @@ mod tests {
 
         // then
         assert_eq!(
-            decoded.floats,
+            decoded.floats().collect::<Vec<_>>(),
             vec![Sample::new(1000, 1.0), Sample::new(3000, 30.0)]
         );
         assert_eq!(
@@ -1515,10 +1312,10 @@ mod tests {
 
     #[test]
     fn should_reject_truncated_histogram_value() {
-        let encoded = SeriesData {
-            floats: Vec::new(),
-            histograms: vec![histogram_sample(1000, exponential_histogram(4.0))],
-        }
+        let encoded = SeriesData::new(
+            Vec::new(),
+            vec![histogram_sample(1000, exponential_histogram(4.0))],
+        )
         .encode()
         .unwrap();
         assert!(SeriesData::decode(&encoded[..encoded.len() - 3]).is_err());
@@ -1602,10 +1399,7 @@ mod tests {
                 },
             ),
         ];
-        let value = SeriesData {
-            floats: Vec::new(),
-            histograms: samples.clone(),
-        };
+        let value = SeriesData::new(Vec::new(), samples.clone());
 
         // when
         let decoded = SeriesData::decode(&value.encode().unwrap()).unwrap();
@@ -1643,12 +1437,9 @@ mod tests {
             .collect();
 
         // when
-        let encoded = SeriesData {
-            floats: Vec::new(),
-            histograms: samples.clone(),
-        }
-        .encode()
-        .unwrap();
+        let encoded = SeriesData::new(Vec::new(), samples.clone())
+            .encode()
+            .unwrap();
 
         // then: well under the 8 bytes per bucket of raw counts
         assert!(
@@ -1662,16 +1453,16 @@ mod tests {
     #[test]
     fn should_decode_histogram_range_across_delta_chain() {
         // given: floats and histograms interleaved over ten timestamps
-        let value = SeriesData {
-            floats: (0..10)
+        let value = SeriesData::new(
+            (0..10)
                 .filter(|i| i % 2 == 1)
                 .map(|i| Sample::new(i * 1000, i as f64))
                 .collect(),
-            histograms: (0..10)
+            (0..10)
                 .filter(|i| i % 2 == 0)
                 .map(|i| histogram_sample(i * 1000, exponential_histogram(10.0 + i as f64)))
                 .collect(),
-        };
+        );
         let encoded = value.clone().encode().unwrap();
 
         for (start_ms, end_ms) in [(-1, 9000), (2500, 6000), (3999, 4000), (8000, 20_000)] {
@@ -1687,16 +1478,97 @@ mod tests {
 
     #[test]
     fn should_reject_unknown_histogram_flags() {
-        let mut encoded = SeriesData {
-            floats: Vec::new(),
-            histograms: vec![histogram_sample(0, exponential_histogram(4.0))],
-        }
+        let mut encoded = SeriesData::new(
+            Vec::new(),
+            vec![histogram_sample(0, exponential_histogram(4.0))],
+        )
         .encode()
         .unwrap()
         .to_vec();
-        // marker, empty float stream length, sample count, timestamp
-        assert_eq!(&encoded[..4], &[HISTOGRAM_VALUE_MARKER, 0, 1, 0]);
+        // tag, empty float section length, sample count, timestamp
+        assert_eq!(&encoded[..4], &[HISTOGRAM_VALUE_TAG, 0, 1, 0]);
         encoded[4] |= 0x80;
         assert!(SeriesData::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn should_reject_unknown_value_format() {
+        let mut encoded = SeriesData::new(vec![Sample::new(1000, 1.0)], Vec::new())
+            .encode()
+            .unwrap()
+            .to_vec();
+        for tag in [0, 2, 0x7f, 0x82] {
+            encoded[0] = tag;
+            assert!(SeriesData::decode(&encoded).is_err(), "tag {tag:#x}");
+            let operand = Bytes::from(encoded.clone());
+            let other = TimeSeriesValue {
+                points: vec![Sample::new(2000, 2.0)],
+            }
+            .encode()
+            .unwrap();
+            assert!(merge_batch_time_series(Some(other), &[operand]).is_err());
+        }
+    }
+
+    #[test]
+    fn should_round_trip_multi_chunk_floats_beside_histograms() {
+        // given: enough floats to span several chunks, with stale markers
+        let floats: Vec<Sample> = (0..3000)
+            .map(|i| match i % 97 {
+                0 => Sample::new(i * 15_000 + 1, f64::from_bits(crate::model::STALE_NAN)),
+                _ => Sample::new(i * 15_000 + 1, i as f64 * 0.25),
+            })
+            .collect();
+        let value = SeriesData::new(
+            floats.clone(),
+            (0..20)
+                .map(|i| histogram_sample(i * 15_000, exponential_histogram(10.0 + i as f64)))
+                .collect(),
+        );
+
+        // when
+        let encoded = value.clone().encode().unwrap();
+        let decoded = SeriesData::decode(&encoded).unwrap();
+        let ranged = SeriesData::decode_range(&encoded, 20_000_000, 30_000_000).unwrap();
+
+        // then
+        let bits = |samples: &[Sample]| {
+            samples
+                .iter()
+                .map(|s| (s.timestamp_ms, s.value.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&decoded.floats().collect::<Vec<_>>()), bits(&floats));
+        assert_eq!(decoded.histograms, value.histograms);
+        let mut expected = floats;
+        expected.retain(|s| s.timestamp_ms > 20_000_000 && s.timestamp_ms <= 30_000_000);
+        assert_eq!(bits(&ranged.floats().collect::<Vec<_>>()), bits(&expected));
+    }
+
+    #[test]
+    fn should_reject_corrupt_operands_without_panicking() {
+        let existing = TimeSeriesValue {
+            points: (0..300)
+                .map(|i| Sample::new(i * 15_000, i as f64))
+                .collect(),
+        }
+        .encode()
+        .unwrap();
+        let operand = TimeSeriesValue {
+            points: (290..310)
+                .map(|i| Sample::new(i * 15_000, -(i as f64)))
+                .collect(),
+        }
+        .encode()
+        .unwrap();
+        for len in 2..operand.len() {
+            let truncated = operand.slice(..len);
+            assert!(merge_batch_time_series(Some(existing.clone()), &[truncated]).is_err());
+        }
+        for at in 0..operand.len() {
+            let mut flipped = operand.to_vec();
+            flipped[at] ^= 0x5a;
+            let _ = merge_batch_time_series(Some(existing.clone()), &[Bytes::from(flipped)]);
+        }
     }
 }

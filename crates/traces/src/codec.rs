@@ -14,11 +14,11 @@ use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
 };
 
-pub(crate) const KEY_VERSION: u8 = 4;
+pub(crate) const KEY_VERSION: u8 = 6;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v4";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v6";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
 /// Leading byte of page metadata and locator values.
@@ -27,8 +27,8 @@ const HAS_EXPIRY: u8 = 1;
 
 /// Locator records deliberately live in one fixed routing segment per
 /// namespace. This makes trace-by-ID a single-shard lookup after data pages are
-/// time-sharded. Each trace has one [`TraceHead`] point record; only traces
-/// stored on several pages also have per-page continuation records.
+/// time-sharded. Each trace has one [`TraceHead`] point record, and one
+/// continuation record per page.
 pub(crate) const LOCATOR_SEGMENT: SegmentId = i64::MIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,7 +40,6 @@ enum RecordType {
     TraceHead = 4,
     AttributePosting = 5,
     TraceContinuation = 6,
-    ContinuedMarker = 7,
 }
 
 /// Page metadata carries a compact copy of the page's trace directory so
@@ -59,8 +58,8 @@ pub(crate) struct PageTrace {
     pub trace_id: TraceId,
     pub min_timestamp_ns: u64,
     pub max_timestamp_ns: u64,
-    /// Set when this page is not the trace's first. The first page cannot
-    /// know about later ones, so it is flagged by a [`marker_key`] instead.
+    /// Set when an earlier page of the same flush holds the trace. Unset
+    /// does not mean the trace has no other pages: its head counts them.
     pub continued: bool,
 }
 
@@ -89,14 +88,42 @@ pub(crate) struct TraceLocator {
     pub expires_at_unix_ms: Option<u64>,
 }
 
-/// The per-trace point record. While `continued` is false, `first` is the
-/// trace's only page and its expiry is the page's. Once continued, every page
-/// including the first has a continuation record, and the head's expiry is
-/// renewed by each continuation so trace-by-ID can always reach them.
+/// The per-trace point record, a merge record: every flush writing the trace
+/// adds an operand describing its own pages, combined by [`merge_heads`].
+/// While `continued` is false, `first` is the trace's only page and its
+/// expiry is the page's. Once continued, the head's expiry is the latest of
+/// its pages', so trace-by-ID can always reach their continuation records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TraceHead {
     pub first: TraceLocator,
     pub continued: bool,
+    /// Pages written for the trace, added to in the batch that writes them,
+    /// so a cached set of its continuations holding this many is current.
+    pub pages: u32,
+}
+
+/// Combines an older head with a newer one. Associative, as SlateDB
+/// requires: operands may be combined in any grouping.
+pub(crate) fn merge_heads(older: TraceHead, newer: TraceHead) -> TraceHead {
+    let expires_at_unix_ms = older
+        .first
+        .expires_at_unix_ms
+        .zip(newer.first.expires_at_unix_ms)
+        .map(|(older, newer)| older.max(newer));
+    TraceHead {
+        first: TraceLocator {
+            expires_at_unix_ms,
+            ..older.first
+        },
+        continued: true,
+        pages: older.pages.saturating_add(newer.pages),
+    }
+}
+
+/// Whether `key` is a [`TraceHead`] key, the only merge record.
+pub(crate) fn is_head_key(key: &[u8]) -> bool {
+    parse_record_prefix(key)
+        .is_ok_and(|(_, _, record_type, _)| record_type == RecordType::TraceHead)
 }
 
 /// A page's `(segment, sequence)` address.
@@ -186,39 +213,6 @@ pub(crate) fn continuation_prefix(namespace: &Namespace, trace_id: TraceId) -> B
     let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceContinuation);
     bytes.extend_from_slice(trace_id.as_bytes());
     bytes.freeze()
-}
-
-/// Flags the trace at `(sequence, index)` of `segment` as continued on
-/// later pages. Lives in the first page's segment so it ages out with it.
-pub(crate) fn marker_key(
-    namespace: &Namespace,
-    segment: SegmentId,
-    sequence: u64,
-    index: u32,
-) -> Bytes {
-    let mut bytes = record_prefix(namespace, segment, RecordType::ContinuedMarker);
-    bytes.put_u64(sequence);
-    bytes.put_u32(index);
-    bytes.freeze()
-}
-
-pub(crate) fn marker_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
-    record_prefix(namespace, segment, RecordType::ContinuedMarker).freeze()
-}
-
-pub(crate) fn decode_marker(key: &[u8]) -> Result<(u64, u32)> {
-    let (_, _, record_type, offset) = parse_record_prefix(key)?;
-    if record_type != RecordType::ContinuedMarker || key.len() != offset + 12 {
-        return Err(Error::Corrupt("invalid continued marker key".to_owned()));
-    }
-    Ok((
-        u64::from_be_bytes(key[offset..offset + 8].try_into().unwrap()),
-        u32::from_be_bytes(key[offset + 8..].try_into().unwrap()),
-    ))
-}
-
-pub(crate) fn marker_value() -> Bytes {
-    Bytes::from_static(&[VALUE_VERSION])
 }
 
 pub(crate) fn posting_key(
@@ -373,24 +367,28 @@ pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
 
 const HEAD_CONTINUED: u8 = 1;
 
+/// `locator │ pages: u32 BE │ flags: u8`.
 pub(crate) fn encode_head(value: &TraceHead) -> Result<Bytes> {
     let mut bytes = BytesMut::from(encode_locator(&value.first)?.as_ref());
+    bytes.put_u32(value.pages);
     bytes.put_u8(if value.continued { HEAD_CONTINUED } else { 0 });
     Ok(bytes.freeze())
 }
 
 pub(crate) fn decode_head(value: &[u8]) -> Result<TraceHead> {
-    let (flags, locator) = value
+    let (&flags, rest) = value
         .split_last()
         .ok_or_else(|| Error::Corrupt("empty trace head".to_owned()))?;
-    let continued = match *flags {
-        0 => false,
-        HEAD_CONTINUED => true,
-        flags => return Err(Error::Corrupt(format!("unknown trace head flags {flags}"))),
-    };
+    if flags & !HEAD_CONTINUED != 0 {
+        return Err(Error::Corrupt(format!("unknown trace head flags {flags}")));
+    }
+    let (locator, pages) = rest
+        .split_last_chunk::<4>()
+        .ok_or_else(|| Error::Corrupt("truncated trace head page count".to_owned()))?;
     Ok(TraceHead {
         first: decode_locator(locator)?,
-        continued,
+        continued: flags & HEAD_CONTINUED != 0,
+        pages: u32::from_be_bytes(*pages),
     })
 }
 
@@ -507,10 +505,15 @@ pub(crate) fn field_value_prefix(
     value: &AttributeValue,
 ) -> BytesMut {
     let mut bytes = field_scan_prefix(namespace, segment, field, name);
+    put_typed_value(value, &mut bytes);
+    bytes
+}
+
+fn put_typed_value(value: &AttributeValue, bytes: &mut BytesMut) {
     match value {
         AttributeValue::String(value) => {
             bytes.put_u8(1);
-            common::serde::terminated_bytes::serialize(value.as_bytes(), &mut bytes);
+            common::serde::terminated_bytes::serialize(value.as_bytes(), bytes);
         }
         AttributeValue::Bool(value) => {
             bytes.put_u8(2);
@@ -522,10 +525,44 @@ pub(crate) fn field_value_prefix(
         }
         AttributeValue::Double(value) => {
             bytes.put_u8(4);
-            bytes.put_u64(value.to_bits());
+            bytes.put_u64(encode_f64_sortable(*value));
         }
     }
-    bytes
+}
+
+/// Inclusive bounds, within a [`field_scan_prefix`], on the posting keys of
+/// every value from `low` through `high`. Both must be integers or both
+/// doubles, whose typed values have a fixed width.
+pub(crate) fn value_subrange(low: &AttributeValue, high: &AttributeValue) -> (Bytes, Bytes) {
+    debug_assert!(matches!(
+        (low, high),
+        (AttributeValue::Int(_), AttributeValue::Int(_))
+            | (AttributeValue::Double(_), AttributeValue::Double(_))
+    ));
+    let (mut lower, mut upper) = (BytesMut::with_capacity(9), BytesMut::with_capacity(17));
+    put_typed_value(low, &mut lower);
+    put_typed_value(high, &mut upper);
+    upper.put_u64(u64::MAX);
+    (lower.freeze(), upper.freeze())
+}
+
+/// Orders doubles numerically as unsigned big-endian bytes, with `-0.0`
+/// just below `+0.0` and NaNs beyond the infinities of their sign.
+pub(crate) fn encode_f64_sortable(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits >> 63 == 0 {
+        bits | 1 << 63
+    } else {
+        !bits
+    }
+}
+
+pub(crate) fn decode_f64_sortable(encoded: u64) -> f64 {
+    f64::from_bits(if encoded >> 63 == 1 {
+        encoded & !(1 << 63)
+    } else {
+        !encoded
+    })
 }
 
 /// The value and page sequence of a posting key found under a
@@ -555,7 +592,7 @@ pub(crate) fn decode_posting_value(key: &[u8], prefix_len: usize) -> Result<(Att
             _ => return Err(corrupt()),
         },
         3 => AttributeValue::Int(decode_i64_sortable(fixed(value)?)),
-        4 => AttributeValue::Double(f64::from_bits(fixed(value)?)),
+        4 => AttributeValue::Double(decode_f64_sortable(fixed(value)?)),
         _ => return Err(corrupt()),
     };
     Ok((value, u64::from_be_bytes(*sequence)))
@@ -570,6 +607,12 @@ fn sequence_key(
     let mut bytes = record_prefix(namespace, segment, record_type);
     bytes.put_u64(sequence);
     bytes.freeze()
+}
+
+/// The record-type byte after `key`'s scope, if it has one.
+#[cfg(test)]
+pub(crate) fn key_record_type(key: &[u8]) -> Option<u8> {
+    key.get(KEY_SCOPE.prefix_len(key)?).copied()
 }
 
 fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
@@ -591,7 +634,6 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         4 => RecordType::TraceHead,
         5 => RecordType::AttributePosting,
         6 => RecordType::TraceContinuation,
-        7 => RecordType::ContinuedMarker,
         value => {
             return Err(Error::Corrupt(format!(
                 "unknown Traces record type {value}"
@@ -608,7 +650,7 @@ mod tests {
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v4");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v6");
     }
 
     #[test]
@@ -643,13 +685,41 @@ mod tests {
     }
 
     #[test]
-    fn markers_live_in_the_first_page_segment() {
+    fn only_head_keys_are_merge_records() {
         let namespace = Namespace::new("tenant").unwrap();
-        let key = marker_key(&namespace, -3, 7, 11);
-        assert!(key.starts_with(&marker_prefix(&namespace, -3)));
-        assert!(!key.starts_with(&metadata_prefix(&namespace, -3)));
-        assert_eq!(decode_marker(&key).unwrap(), (7, 11));
-        assert!(decode_marker(&metadata_key(&namespace, -3, 7)).is_err());
+        let id = TraceId::new([1; 16]).unwrap();
+        assert!(is_head_key(&head_key(&namespace, id)));
+        assert!(!is_head_key(&continuation_key(&namespace, id, 2, 3)));
+        assert!(!is_head_key(&metadata_key(&namespace, -3, 7)));
+        assert!(!is_head_key(b"junk"));
+    }
+
+    #[test]
+    fn merged_heads_keep_the_first_page_and_the_latest_expiry() {
+        let head = |sequence, expires_at_unix_ms, pages| TraceHead {
+            first: TraceLocator {
+                segment: 1,
+                page_sequence: sequence,
+                trace_index: 0,
+                expires_at_unix_ms,
+            },
+            continued: pages > 1,
+            pages,
+        };
+        let (a, b, c) = (
+            head(1, Some(30), 1),
+            head(2, Some(10), 2),
+            head(3, Some(20), 1),
+        );
+        let left = merge_heads(merge_heads(a.clone(), b.clone()), c.clone());
+        let right = merge_heads(a, merge_heads(b, c));
+        assert_eq!(left, right);
+        assert_eq!(left.first.page_sequence, 1);
+        assert_eq!(left.first.expires_at_unix_ms, Some(30));
+        assert_eq!(left.pages, 4);
+        assert!(left.continued);
+        let forever = merge_heads(head(1, Some(5), 1), head(2, None, 1));
+        assert_eq!(forever.first.expires_at_unix_ms, None);
     }
 
     #[test]
@@ -683,11 +753,14 @@ mod tests {
                 locator
             );
             for continued in [false, true] {
-                let head = TraceHead {
-                    first: locator,
-                    continued,
-                };
-                assert_eq!(decode_head(&encode_head(&head).unwrap()).unwrap(), head);
+                for pages in [1, u32::MAX] {
+                    let head = TraceHead {
+                        first: locator,
+                        continued,
+                        pages,
+                    };
+                    assert_eq!(decode_head(&encode_head(&head).unwrap()).unwrap(), head);
+                }
             }
         }
     }
@@ -771,6 +844,59 @@ mod tests {
             posting_key(&namespace, 0, &string, 1),
             posting_key(&namespace, 0, &integer, 1)
         );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn double_postings_sort_numerically(left: f64, right: f64) {
+            let posting = |value: f64| {
+                field_posting_key(
+                    &Namespace::default(),
+                    0,
+                    (IndexField::Span, "value", &AttributeValue::Double(value)),
+                    0,
+                )
+            };
+            for value in [left, right] {
+                let key = posting(value);
+                let prefix = field_scan_prefix(&Namespace::default(), 0, IndexField::Span, "value");
+                let (decoded, _) = decode_posting_value(&key, prefix.len()).unwrap();
+                proptest::prop_assert!(AttributeValue::Double(value).exact_eq(&decoded));
+            }
+            if let Some(order) = left.partial_cmp(&right).filter(|order| order.is_ne()) {
+                proptest::prop_assert_eq!(posting(left).cmp(&posting(right)), order);
+            }
+        }
+    }
+
+    #[test]
+    fn double_encoding_orders_signed_zeros_and_extremes() {
+        let ordered = [
+            -f64::NAN,
+            f64::NEG_INFINITY,
+            f64::MIN,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                encode_f64_sortable(pair[0]) < encode_f64_sortable(pair[1]),
+                "{pair:?}"
+            );
+        }
+        for value in ordered {
+            assert_eq!(
+                decode_f64_sortable(encode_f64_sortable(value)).to_bits(),
+                value.to_bits()
+            );
+        }
     }
 
     #[test]

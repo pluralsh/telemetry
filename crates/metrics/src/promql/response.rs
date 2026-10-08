@@ -260,52 +260,13 @@ impl Serialize for PromSample {
 }
 
 /// A sample value serialized as its Prometheus JSON string
-/// ([`common::display::prometheus_json_float`]) without a heap allocation in
-/// the common case: range results carry one per point.
+/// ([`common::display::prometheus_json_float`]) without a heap allocation:
+/// range results carry one per point.
 struct PromFloat(f64);
 
 impl Serialize for PromFloat {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use std::fmt::Write;
-        let v = self.0;
-        let abs = v.abs();
-        // In this range the Prometheus spelling is plain `Display`.
-        if v.is_finite() && (abs == 0.0 || (1e-6..1e21).contains(&abs)) {
-            let mut buf = StackStr::<64>::new();
-            if write!(buf, "{v}").is_ok() {
-                return serializer.serialize_str(buf.as_str());
-            }
-        }
-        serializer.serialize_str(&common::display::prometheus_json_float(v))
-    }
-}
-
-/// Fixed-capacity UTF-8 buffer; writes past capacity fail.
-struct StackStr<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> StackStr<N> {
-    fn new() -> Self {
-        Self {
-            buf: [0; N],
-            len: 0,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.len]).expect("only whole str writes are accepted")
-    }
-}
-
-impl<const N: usize> std::fmt::Write for StackStr<N> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let end = self.len + s.len();
-        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
-        dst.copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
+        serializer.serialize_str(common::display::FloatText::prometheus_json(self.0).as_str())
     }
 }
 

@@ -6,7 +6,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
-use crate::model::{Label, QueryOptions, SeriesData};
+use crate::model::{Label, Labels, QueryOptions, SeriesData};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
 
@@ -130,6 +130,26 @@ pub(crate) trait BucketQueryReader: Send + Sync {
             })
             .collect())
     }
+
+    /// The series of a whole selector cached under `key` (see
+    /// [`crate::postings_cache::selector_key`]), valid for this reader's view.
+    async fn cached_selector(&self, _key: &Arc<str>) -> Option<Arc<RoaringBitmap>> {
+        None
+    }
+
+    /// Offers a selector's series computed from this reader's view for reuse
+    /// by later queries.
+    async fn cache_selector(&self, _key: &Arc<str>, _postings: &RoaringBitmap) {}
+
+    /// The sorted labels of this bucket's series matching the selector set
+    /// `key`, as an earlier query over the same bucket data found them.
+    async fn cached_series_set(&self, _key: &Arc<str>) -> Option<Arc<[Labels]>> {
+        None
+    }
+
+    /// Offers a selector set's series from this reader's view for reuse by
+    /// later queries.
+    async fn cache_series_set(&self, _key: &Arc<str>, _series: Arc<[Labels]>) {}
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -253,6 +273,42 @@ pub(crate) trait QueryReader: Send + Sync {
                 postings.filter(|p| !p.is_empty()).map(|p| (term.value, p))
             })
             .collect())
+    }
+
+    /// See [`BucketQueryReader::cached_selector`].
+    async fn cached_selector(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+    ) -> Option<Arc<RoaringBitmap>> {
+        None
+    }
+
+    /// See [`BucketQueryReader::cache_selector`].
+    async fn cache_selector(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+        _postings: &RoaringBitmap,
+    ) {
+    }
+
+    /// See [`BucketQueryReader::cached_series_set`].
+    async fn cached_series_set(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+    ) -> Option<Arc<[Labels]>> {
+        None
+    }
+
+    /// See [`BucketQueryReader::cache_series_set`].
+    async fn cache_series_set(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+        _series: Arc<[Labels]>,
+    ) {
     }
 }
 
@@ -392,6 +448,30 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
     ) -> Result<Vec<(String, RoaringBitmap)>> {
         let _permit = acquire(&self.limits.metadata).await;
         self.inner.label_postings(bucket, label_name).await
+    }
+
+    async fn cached_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<RoaringBitmap>> {
+        self.inner.cached_selector(bucket, key).await
+    }
+
+    async fn cache_selector(&self, bucket: &TimeBucket, key: &Arc<str>, postings: &RoaringBitmap) {
+        self.inner.cache_selector(bucket, key, postings).await
+    }
+
+    async fn cached_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<[Labels]>> {
+        self.inner.cached_series_set(bucket, key).await
+    }
+
+    async fn cache_series_set(&self, bucket: &TimeBucket, key: &Arc<str>, series: Arc<[Labels]>) {
+        self.inner.cache_series_set(bucket, key, series).await
     }
 }
 
@@ -597,9 +677,7 @@ pub(crate) mod test_utils {
             metric_type: MetricType,
             sample: Sample,
         ) -> &mut Self {
-            self.series_data(bucket, labels, metric_type)
-                .floats
-                .push(sample);
+            self.series_data(bucket, labels, metric_type).push(sample);
             self
         }
 
@@ -656,7 +734,7 @@ pub(crate) mod test_utils {
                     SeriesSpec {
                         unit: None,
                         metric_type: Some(metric_type),
-                        labels: labels.clone(),
+                        labels: crate::model::Labels::sorted(labels.clone()),
                     },
                 );
 

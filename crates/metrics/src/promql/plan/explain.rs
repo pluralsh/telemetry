@@ -151,7 +151,7 @@ pub fn describe_logical(plan: &LogicalPlan) -> PlanNode {
         LogicalPlan::Histogram { kind, child } => PlanNode::new("Histogram")
             .with_arg("kind", format!("{kind:?}"))
             .with_children(vec![describe_logical(child)]),
-        LogicalPlan::Absent { labels, child } => PlanNode::new("Absent")
+        LogicalPlan::Absent { labels, child, .. } => PlanNode::new("Absent")
             .with_arg("labels", labels_to_value(labels))
             .with_children(vec![describe_logical(child)]),
         LogicalPlan::Subquery {
@@ -336,7 +336,7 @@ fn describe_physical_inner(
         LogicalPlan::Histogram { kind, child } => PlanNode::new("HistogramOp")
             .with_arg("kind", format!("{kind:?}"))
             .with_children(vec![describe_physical_inner(child, ctx, false)]),
-        LogicalPlan::Absent { labels, child } => PlanNode::new("AbsentOp")
+        LogicalPlan::Absent { labels, child, .. } => PlanNode::new("AbsentOp")
             .with_arg("labels", labels_to_value(labels))
             .with_children(vec![describe_physical_inner(child, ctx, false)]),
         LogicalPlan::Subquery { .. } => PlanNode::new("SubqueryOp").with_arg(

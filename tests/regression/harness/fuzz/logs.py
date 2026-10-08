@@ -8,6 +8,7 @@ import os
 import random
 import re
 import time
+import urllib.request
 from collections import defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from typing import Any
 from ..canonical import assert_equivalent
 from ..compose import ComposeProject
 from .config import Endpoint, FuzzConfig, endpoint_from_env
+from .network import minio_floor_url, service_url
 from .rand import (
     ODD_STRINGS,
     WORDS,
@@ -42,8 +44,9 @@ from .stack import fuzz_stack
 from .transport import Exchange, Request
 
 PRODUCT_DIR = Path(__file__).resolve().parents[2] / "products" / "logs"
-# `production` uses the crate defaults for segment duration, page size and
-# compaction instead of the small values that exercise edge cases.
+# `production` uses what the operator deploys (1h segments, 1 MiB pages, its
+# cache sizes and buffered writes) instead of the small values that exercise
+# edge cases.
 IMPL_CONFIG_DIRS = {"regression": ".", "production": "production"}
 SECOND = 1_000_000_000
 MAX_LIMIT = 5000
@@ -51,6 +54,7 @@ MAX_POINTS = 10_000
 SENTINELS = 4
 PUSH_BYTES = 1_000_000
 METADATA_LOOKBACK = 24 * 3600 * SECOND
+FLUSH_TIMEOUT_S = 120
 
 APPS = ("checkout", "cart", "search", "auth", "billing", "gateway", "worker", "cron")
 ENVS = ("prod", "staging", "dev")
@@ -253,6 +257,15 @@ def loki_comparator(
     return compare
 
 
+def _gauge(exposition: str, name: str) -> float:
+    """Sum of every sample of `name` in a Prometheus text exposition."""
+    total = 0.0
+    for line in exposition.splitlines():
+        if line.startswith(name) and line[len(name) : len(name) + 1] in ("{", " "):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
 class LogsFuzz(FuzzProduct):
     name = "logs"
     default_window = "20m"
@@ -272,13 +285,16 @@ class LogsFuzz(FuzzProduct):
             raise ValueError(
                 "FUZZ_LOGS_CONFIG=production requires FUZZ_LOGS_STORAGE=s3"
             )
+        if config.historical and self.storage != "s3":
+            raise ValueError("FUZZ_SCENARIO=historical requires FUZZ_LOGS_STORAGE=s3")
         namespace = os.environ.get("FUZZ_LOGS_NAMESPACE", "regression")
-        impl = (
-            "http://localhost:13111"
-            if self.storage == "s3"
-            else ("http://localhost:13101")
+        self.impl_service = "logs-s3" if self.storage == "s3" else "logs"
+        self.impl_url = service_url(
+            self.impl_service, 3100, 13111 if self.storage == "s3" else 13101
         )
-        oracle = Endpoint("http://localhost:13110")
+        self.loki_url = service_url("loki-fuzz", 3100, 13110)
+        impl = self.impl_url
+        oracle = Endpoint(self.loki_url)
         self.oracle_read = endpoint_from_env("logs", "oracle_read", oracle)
         self.oracle_write = endpoint_from_env("logs", "oracle_write", oracle)
         self.impl_read = endpoint_from_env(
@@ -295,12 +311,13 @@ class LogsFuzz(FuzzProduct):
         self.catalog = Catalog()
 
     def stack(self) -> AbstractContextManager[object]:
-        impl_service = "logs-s3" if self.storage == "s3" else "logs"
-        impl_port = 13111 if self.storage == "s3" else 13101
-        services = ["loki-fuzz", impl_service]
+        services = ["loki-fuzz", self.impl_service]
         if self.storage == "s3":
             services[1:1] = ["minio", "minio-init"]
         os.environ["LOGS_CONFIG_DIR"] = IMPL_CONFIG_DIRS[self.impl_config]
+        os.environ["LOKI_FUZZ_CONFIG"] = (
+            "loki-fuzz-historical.yaml" if self.config.historical else "loki-fuzz.yaml"
+        )
         return fuzz_stack(
             self.config,
             lambda: ComposeProject(
@@ -308,12 +325,40 @@ class LogsFuzz(FuzzProduct):
                 name="logs-fuzz",
                 services=tuple(services),
                 profiles=("fuzz",),
-                readiness_urls=(
-                    "http://localhost:13110/ready",
-                    f"http://localhost:{impl_port}/-/ready",
-                ),
+                readiness_urls=tuple(self.floor_urls().values()),
             ),
+            roles=self.resource_roles,
         )
+
+    def after_ingest(self, index: int) -> None:
+        if not self.config.historical:
+            return
+        # Loki skips the ingesters here, so a round is only visible once every
+        # chunk it touched is in MinIO. /flush is asynchronous.
+        request = urllib.request.Request(f"{self.loki_url}/flush", method="POST")
+        with urllib.request.urlopen(request, timeout=30):
+            pass
+        deadline = time.monotonic() + FLUSH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(f"{self.loki_url}/metrics", timeout=30) as r:
+                text = r.read().decode()
+            if _gauge(text, "loki_ingester_memory_chunks") == 0 and (
+                _gauge(text, "loki_ingester_flush_queue_length") == 0
+            ):
+                return
+            time.sleep(0.2)
+        raise RuntimeError(
+            f"Loki did not flush round {index} within {FLUSH_TIMEOUT_S}s"
+        )
+
+    def floor_urls(self) -> dict[str, str]:
+        urls = {
+            "loki-fuzz": f"{self.loki_url}/ready",
+            self.impl_service: f"{self.impl_url}/-/ready",
+        }
+        if self.storage == "s3":
+            urls.update(minio_floor_url())
+        return urls
 
     def describe(self) -> dict[str, object]:
         return {
@@ -574,13 +619,16 @@ class LogsFuzz(FuzzProduct):
 
     def next_case(self, rng: random.Random) -> Case:
         isolated = 1.0 if self.config.isolated else 0.0
+        # Loki 3.5's series API misses flushed streams until the ingester ships
+        # its TSDB head (every 15 minutes), so it has no historical answer.
+        series = 0.0 if self.config.historical else 1.0
         kind = weighted(
             rng,
             [
                 (5, "log"),
                 (5, "metric_range"),
                 (3, "metric_instant"),
-                (1, "series"),
+                (series, "series"),
                 (0.5 * isolated, "labels"),
                 (0.5 * isolated, "label_values"),
             ],

@@ -18,6 +18,7 @@
 //! parents its concrete schema (see [`materialize`]).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -25,7 +26,6 @@ use futures::stream::BoxStream;
 use promql_parser::parser;
 
 use crate::model::{Label, Labels};
-use crate::util::Fingerprint;
 
 use super::super::batch::{SchemaRef, SeriesSchema};
 use super::super::memory::{MemoryReservation, QueryError};
@@ -38,11 +38,13 @@ use super::super::operators::binary::{
 use super::super::operators::coercion::{ScalarizeOp, TimeScalarOp};
 use super::super::operators::concurrent::ConcurrentOp;
 use super::super::operators::count_values::CountValuesOp;
+use super::super::operators::drop_name::DropNameOp;
 use super::super::operators::histogram::{BucketSeries, HistogramOp, NativeSeries};
 use super::super::operators::instant_fn::InstantFnOp;
 use super::super::operators::label_manip::{LabelManipKind, LabelManipOp};
 use super::super::operators::matrix_selector::MatrixSelectorOp;
-use super::super::operators::rollup::{MatrixWindowSource, RollupOp};
+use super::super::operators::rollup::{MatrixWindowSource, RollupKind, RollupOp};
+use super::super::operators::sort::SortOp;
 use super::super::operators::subquery::SubqueryOp;
 use super::super::operators::vector_selector::VectorSelectorOp;
 use super::super::source::{ResolvedSeriesChunk, ResolvedSeriesRef, SeriesSource, TimeRange};
@@ -237,7 +239,6 @@ fn root_instant_vector_sort(plan: &LogicalPlan) -> Option<InstantVectorSort> {
         _ => None,
     }
 }
-
 fn static_schema(schema: &SchemaRef) -> Result<&Arc<SeriesSchema>, PlanError> {
     match schema {
         SchemaRef::Static(s) => Ok(s),
@@ -314,7 +315,7 @@ struct ResolvedLeaf {
 }
 
 /// Drain [`SeriesSource::resolve`] into a unique-per-labelset series roster
-/// (`labels` + stable fingerprint) plus the per-logical-series grouped source
+/// plus the per-logical-series grouped source
 /// handles needed to load samples across buckets.
 ///
 /// `SeriesSource::resolve` is bucket-scoped by design and may therefore emit
@@ -334,27 +335,27 @@ where
     let mut stream: BoxStream<'_, Result<ResolvedSeriesChunk, QueryError>> =
         Box::pin(source.resolve(selector, time_range));
 
-    let mut roster_index: HashMap<Labels, usize> = HashMap::new();
+    let mut roster_index: HashMap<Labels, usize, foldhash::fast::RandomState> = HashMap::default();
     let mut labels: Vec<Labels> = Vec::new();
-    let mut fingerprints: Vec<u128> = Vec::new();
     let mut refs: Vec<Vec<ResolvedSeriesRef>> = Vec::new();
 
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res.map_err(map_source_err)?;
         debug_assert_eq!(chunk.labels.len(), chunk.series.len());
         for (label, sref) in chunk.labels.iter().zip(chunk.series.iter()) {
-            let canonical = canonicalize_labels(label);
-            match roster_index.get(&canonical).copied() {
-                Some(idx) => refs[idx].push(sref.clone()),
-                None => {
-                    roster_index.insert(canonical.clone(), labels.len());
-                    fingerprints.push(labels_fingerprint(&canonical));
-                    labels.push(canonical);
+            debug_assert!(label.as_slice().is_sorted(), "unsorted labels {label:?}");
+            match roster_index.entry(label.clone()) {
+                Entry::Occupied(row) => refs[*row.get()].push(sref.clone()),
+                Entry::Vacant(row) => {
+                    labels.push(row.key().clone());
+                    row.insert(refs.len());
                     refs.push(vec![sref.clone()]);
                 }
             }
         }
     }
+    // Rows are identified by position, as in every derived schema.
+    let fingerprints: Vec<u128> = (0..labels.len() as u128).collect();
 
     for series_refs in &mut refs {
         series_refs.sort_unstable_by_key(|sref| (sref.bucket_id, sref.series_id));
@@ -383,20 +384,6 @@ where
         request_series,
     })
 }
-
-#[inline]
-fn canonicalize_labels(labels: &Labels) -> Labels {
-    let mut canonical: Vec<Label> = labels.iter().cloned().collect();
-    canonical.sort();
-    Labels::new(canonical)
-}
-
-#[inline]
-fn labels_fingerprint(labels: &Labels) -> u128 {
-    let canonical: Vec<Label> = labels.iter().cloned().collect();
-    canonical.fingerprint()
-}
-
 // ---------------------------------------------------------------------------
 // Plan-tree walk (bottom-up)
 // ---------------------------------------------------------------------------
@@ -509,7 +496,12 @@ where
             let child_op = build_node(*child, env, grid, false, stats).await?;
             let _ = static_schema(&child_op.schema().series)?;
             let op = InstantFnOp::new(BoxedOp(child_op), kind, reservation.clone());
-            Ok(wrap_op(Box::new(op), "InstantFn", ctx))
+            drop_metric_name(
+                wrap_op(Box::new(op), "InstantFn", ctx),
+                NameCollisions::PerStep,
+                reservation,
+                ctx,
+            )
         }
         LogicalPlan::LabelManip { kind, child } => {
             let child_op = build_node(*child, env, grid, false, stats).await?;
@@ -524,74 +516,9 @@ where
             Ok(wrap_op(Box::new(op), "LabelManip", ctx))
         }
         LogicalPlan::Rollup { kind, child } => {
-            // Rollup wraps either a MatrixSelector (directly) or a Subquery.
-            match *child {
-                LogicalPlan::MatrixSelector {
-                    selector,
-                    range_ms,
-                    offset,
-                    at,
-                } => {
-                    let time_range = selector_time_range(grid, 0, range_ms, at, offset);
-                    let resolved = resolve_leaf(source, &selector, time_range, reservation).await?;
-                    let series_count = resolved.schema.len() as u64;
-                    let at_parser = at.map(to_parser_at);
-                    let off_parser = to_parser_offset(offset);
-                    let matrix = MatrixSelectorOp::<'static, S>::new(
-                        source.clone(),
-                        resolved.schema.clone(),
-                        resolved.request_series,
-                        grid,
-                        at_parser,
-                        Some(off_parser),
-                        range_ms,
-                        reservation.clone(),
-                        super::super::operators::matrix_selector::BatchShape::default(),
-                    );
-                    let schema_snapshot =
-                        OperatorSchema::new(SchemaRef::Static(resolved.schema), grid);
-                    let window = MatrixWindowSource::new(matrix, schema_snapshot);
-                    let op = RollupOp::new(window, kind, range_ms, reservation.clone());
-                    // Unit 4.5: `MatrixSelectorOp::next` is degenerate (see
-                    // §3a.2), so we wrap the enclosing `RollupOp` — which
-                    // owns the I/O leaf — instead of the matrix selector
-                    // itself. This preserves the "decouple I/O from
-                    // evaluation" contract at the right boundary.
-                    Ok(maybe_wrap_concurrent(
-                        Box::new(op),
-                        "Rollup",
-                        series_count,
-                        ctx,
-                        stats,
-                    ))
-                }
-                LogicalPlan::Subquery {
-                    child: inner,
-                    range_ms,
-                    step_ms,
-                    offset,
-                    at,
-                } => {
-                    let sub = build_subquery(
-                        *inner,
-                        env,
-                        grid,
-                        SubqueryWindow {
-                            range_ms,
-                            step_ms,
-                            offset,
-                            at,
-                        },
-                        stats,
-                    )
-                    .await?;
-                    let op = RollupOp::new(sub, kind, range_ms, reservation.clone());
-                    Ok(wrap_op(Box::new(op), "Rollup", ctx))
-                }
-                other => Err(PlanError::UnsupportedExpression(format!(
-                    "Rollup child must be MatrixSelector or Subquery, got {other:?}"
-                ))),
-            }
+            // `last_over_time` acts like an offset and keeps the name.
+            let drop_name = kind != RollupKind::LastOverTime;
+            build_rollup(kind, *child, env, grid, stats, drop_name).await
         }
         LogicalPlan::Binary {
             op,
@@ -616,7 +543,14 @@ where
             )
             .await
         }
-        LogicalPlan::Sort { child, .. } => build_node(*child, env, grid, false, stats).await,
+        LogicalPlan::Sort { child, .. } => {
+            let child_op = build_node(*child, env, grid, false, stats).await?;
+            Ok(wrap_op(
+                Box::new(SortOp::new(BoxedOp(child_op))),
+                "Sort",
+                ctx,
+            ))
+        }
         LogicalPlan::Histogram { kind, child } => {
             let child_op = build_node(*child, env, grid, false, stats).await?;
             let input_schema = static_schema(&child_op.schema().series)?.clone();
@@ -631,8 +565,17 @@ where
             .with_natives(&built.natives);
             Ok(wrap_op(Box::new(op), "Histogram", ctx))
         }
-        LogicalPlan::Absent { labels, child } => {
-            let child_op = build_node(*child, env, grid, false, stats).await?;
+        LogicalPlan::Absent {
+            labels,
+            child,
+            over_time,
+        } => {
+            let child_op = match *child {
+                LogicalPlan::Rollup { kind, child } if over_time => {
+                    build_rollup(kind, *child, env, grid, stats, false).await?
+                }
+                child => build_node(child, env, grid, false, stats).await?,
+            };
             let op = AbsentOp::new(BoxedOp(child_op), labels, reservation.clone());
             Ok(wrap_op(Box::new(op), "Absent", ctx))
         }
@@ -654,6 +597,135 @@ where
             ))
         }
     }
+}
+
+/// A range-function call over a matrix selector or subquery, without
+/// `__name__` when `drop_name`.
+async fn build_rollup<S>(
+    kind: RollupKind,
+    child: LogicalPlan,
+    env: BuildEnv<'_, S>,
+    grid: StepGrid,
+    stats: &mut ExchangeStats,
+    drop_name: bool,
+) -> Result<Box<dyn Operator + Send>, PlanError>
+where
+    S: SeriesSource + Send + Sync + 'static,
+{
+    let BuildEnv {
+        source,
+        reservation,
+        ctx,
+    } = env;
+    let rollup = match child {
+        LogicalPlan::MatrixSelector {
+            selector,
+            range_ms,
+            offset,
+            at,
+        } => {
+            let time_range = selector_time_range(grid, 0, range_ms, at, offset);
+            let resolved = resolve_leaf(source, &selector, time_range, reservation).await?;
+            let series_count = resolved.schema.len() as u64;
+            let at_parser = at.map(to_parser_at);
+            let off_parser = to_parser_offset(offset);
+            let matrix = MatrixSelectorOp::<'static, S>::new(
+                source.clone(),
+                resolved.schema.clone(),
+                resolved.request_series,
+                grid,
+                at_parser,
+                Some(off_parser),
+                range_ms,
+                reservation.clone(),
+                super::super::operators::matrix_selector::BatchShape::default(),
+            );
+            let schema_snapshot = OperatorSchema::new(SchemaRef::Static(resolved.schema), grid);
+            let window = MatrixWindowSource::new(matrix, schema_snapshot);
+            let op = RollupOp::new(window, kind, range_ms, reservation.clone());
+            // Unit 4.5: `MatrixSelectorOp::next` is degenerate (see
+            // §3a.2), so we wrap the enclosing `RollupOp` — which
+            // owns the I/O leaf — instead of the matrix selector
+            // itself. This preserves the "decouple I/O from
+            // evaluation" contract at the right boundary.
+            maybe_wrap_concurrent(Box::new(op), "Rollup", series_count, ctx, stats)
+        }
+        LogicalPlan::Subquery {
+            child: inner,
+            range_ms,
+            step_ms,
+            offset,
+            at,
+        } => {
+            let sub = build_subquery(
+                *inner,
+                env,
+                grid,
+                SubqueryWindow {
+                    range_ms,
+                    step_ms,
+                    offset,
+                    at,
+                },
+                stats,
+            )
+            .await?;
+            let op = RollupOp::new(sub, kind, range_ms, reservation.clone());
+            wrap_op(Box::new(op), "Rollup", ctx)
+        }
+        other => {
+            return Err(PlanError::UnsupportedExpression(format!(
+                "Rollup child must be MatrixSelector or Subquery, got {other:?}"
+            )));
+        }
+    };
+    if !drop_name {
+        return Ok(rollup);
+    }
+    drop_metric_name(rollup, NameCollisions::PerSeries, reservation, ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Metric-name removal
+// ---------------------------------------------------------------------------
+
+/// When two series end up sharing a labelset once `__name__` is gone:
+/// Prometheus rejects that outright for range-vector functions, and only
+/// when both have a sample at the same step for step-wise evaluation,
+/// merging them otherwise.
+#[derive(Clone, Copy)]
+enum NameCollisions {
+    PerStep,
+    PerSeries,
+}
+
+fn drop_metric_name(
+    op: Box<dyn Operator + Send>,
+    collisions: NameCollisions,
+    reservation: &MemoryReservation,
+    ctx: &LoweringContext,
+) -> Result<Box<dyn Operator + Send>, PlanError> {
+    // A deferred schema is `count_values` output, which never has a name.
+    let Some(input) = op.schema().series.as_static().cloned() else {
+        return Ok(op);
+    };
+    Ok(match build_drop_name(&input) {
+        DropNameBuild::Unchanged => op,
+        DropNameBuild::Relabel(schema) => Box::new(DropNameOp::new(BoxedOp(op), schema)),
+        DropNameBuild::Merge(built) => {
+            let merged = LabelManipOp::new(
+                BoxedOp(op),
+                built.input_to_output,
+                built.output_schema,
+                reservation.clone(),
+            );
+            let merged = match collisions {
+                NameCollisions::PerStep => merged,
+                NameCollisions::PerSeries => merged.exclusive(),
+            };
+            wrap_op(Box::new(merged), "DropName", ctx)
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +770,11 @@ where
                 op,
                 reservation.clone(),
             );
-            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
+            let op_box = wrap_op(Box::new(op_box), "Binary", ctx);
+            if preserves_metric_name(op) {
+                return Ok(op_box);
+            }
+            drop_metric_name(op_box, NameCollisions::PerStep, reservation, ctx)
         }
         (false, true) => {
             let op_box = BinaryOp::<BoxedOp, BoxedOp>::new_vector_scalar(
@@ -707,7 +783,11 @@ where
                 op,
                 reservation.clone(),
             );
-            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
+            let op_box = wrap_op(Box::new(op_box), "Binary", ctx);
+            if preserves_metric_name(op) {
+                return Ok(op_box);
+            }
+            drop_metric_name(op_box, NameCollisions::PerStep, reservation, ctx)
         }
         (false, false) => {
             let lhs_schema = static_schema(&lhs_op.schema().series)?.clone();

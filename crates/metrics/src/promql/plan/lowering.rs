@@ -324,6 +324,7 @@ fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan,
             return Ok(LogicalPlan::Absent {
                 labels: absent_labels(&args[0]),
                 child: Box::new(child),
+                over_time: false,
             });
         }
         "absent_over_time" => {
@@ -350,6 +351,7 @@ fn lower_call(call: &parser::Call, ctx: &LoweringContext) -> Result<LogicalPlan,
                     kind: RollupKind::CountOverTime,
                     child: Box::new(matrix),
                 }),
+                over_time: true,
             });
         }
         _ => {}

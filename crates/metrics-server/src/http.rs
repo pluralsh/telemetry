@@ -202,6 +202,15 @@ async fn otlp_http_result(
 struct InstantQuery {
     query: String,
     time: Option<String>,
+    trace: Option<String>,
+}
+
+/// `trace=true`, `trace=1`, or a bare `trace` asks for the per-query trace.
+fn trace_requested(flag: Option<&str>) -> bool {
+    flag.is_some_and(|flag| {
+        let flag = flag.trim();
+        flag.is_empty() || flag == "1" || flag.eq_ignore_ascii_case("true")
+    })
 }
 
 async fn query(
@@ -234,11 +243,18 @@ async fn execute_query(
     let reader = reader(&state, &namespace).await?;
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let expression = params.query;
-    let value = tokio::spawn(async move { reader.query(&namespace, &expression, at).await })
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(query_error)?;
-    prom_json(plural_metrics::query_value_to_response(Ok(value)))
+    let trace = trace_requested(params.trace.as_deref());
+    let (value, trace) = tokio::spawn(async move {
+        reader
+            .query_with_trace(&namespace, &expression, at, trace)
+            .await
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(query_error)?;
+    let mut response = plural_metrics::query_value_to_response(Ok(value));
+    response.trace = trace;
+    prom_json(response)
 }
 
 #[derive(Deserialize)]
@@ -247,6 +263,7 @@ struct RangeQuery {
     start: String,
     end: String,
     step: String,
+    trace: Option<String>,
 }
 
 async fn query_range(
@@ -285,15 +302,18 @@ async fn execute_query_range(
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
     let expression = params.query;
     let range = RangeInclusive::new(start, end);
-    let values = tokio::spawn(async move {
+    let trace = trace_requested(params.trace.as_deref());
+    let (values, trace) = tokio::spawn(async move {
         reader
-            .query_range(&namespace, &expression, range, step)
+            .query_range_with_trace(&namespace, &expression, range, step, trace)
             .await
     })
     .await
     .map_err(ApiError::internal)?
     .map_err(query_error)?;
-    prom_json(plural_metrics::range_result_to_response(Ok(values)))
+    let mut response = plural_metrics::range_result_to_response(Ok(values));
+    response.trace = trace;
+    prom_json(response)
 }
 
 #[derive(Default, Deserialize)]

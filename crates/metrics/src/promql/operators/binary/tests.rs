@@ -889,3 +889,510 @@ fn should_return_empty_for_scalar_op_on_empty_vector() {
     // when + then: no batches and no error
     assert!(drive(&mut op).is_empty());
 }
+
+// ========================================================================
+// bit-exact parity of the arithmetic fast paths with the per-cell loop
+// ========================================================================
+
+mod parity {
+    use super::*;
+    use crate::test_utils::strategies::edge_f64;
+    use proptest::prelude::*;
+
+    const ARITH: [BinaryOpKind; 7] = [
+        BinaryOpKind::Add,
+        BinaryOpKind::Sub,
+        BinaryOpKind::Mul,
+        BinaryOpKind::Div,
+        BinaryOpKind::Mod,
+        BinaryOpKind::Pow,
+        BinaryOpKind::Atan2,
+    ];
+
+    #[derive(Debug, Clone)]
+    struct Grid {
+        steps: usize,
+        series: usize,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    }
+
+    impl Grid {
+        fn cell(&self, step: usize, series: usize) -> Option<f64> {
+            let idx = step * self.series + series;
+            self.validity[idx].then(|| self.values[idx])
+        }
+
+        fn batch(&self, schema: Arc<SeriesSchema>) -> StepBatch {
+            mk_batch(
+                schema,
+                self.steps,
+                self.series,
+                self.values.clone(),
+                self.validity.clone(),
+            )
+        }
+    }
+
+    fn grid(steps: usize, series: usize) -> impl Strategy<Value = Grid> {
+        let cells = steps * series;
+        (
+            prop::collection::vec(edge_f64(), cells),
+            prop::collection::vec(prop::bool::weighted(0.9), cells),
+        )
+            .prop_map(move |(values, validity)| Grid {
+                steps,
+                series,
+                values,
+                validity,
+            })
+    }
+
+    #[derive(Debug, Clone)]
+    enum Shape {
+        OneToOne(Vec<Option<u32>>),
+        Identity,
+        GroupLeft(Vec<Option<u32>>),
+        GroupRight(Vec<Option<u32>>),
+    }
+
+    /// `(steps, lhs width, rhs width, shape)`.
+    fn shape() -> impl Strategy<Value = (usize, usize, usize, Shape)> {
+        (1usize..4, 1usize..140, 1usize..140).prop_flat_map(|(steps, nl, nr)| {
+            let one_to_one = (
+                Just((0..nr as u32).collect::<Vec<_>>()).prop_shuffle(),
+                prop::collection::vec(prop::bool::weighted(0.85), nl),
+            )
+                .prop_map(move |(perm, keep)| {
+                    let map = (0..nl)
+                        .map(|i| perm.get(i).copied().filter(|_| keep[i]))
+                        .collect();
+                    (steps, nl, nr, Shape::OneToOne(map))
+                });
+            let identity = Just((steps, nl, nl, Shape::Identity));
+            let group_left = prop::collection::vec(prop::option::weighted(0.85, 0..nr as u32), nl)
+                .prop_map(move |map| (steps, nl, nr, Shape::GroupLeft(map)));
+            let group_right = prop::collection::vec(prop::option::weighted(0.85, 0..nl as u32), nr)
+                .prop_map(move |map| (steps, nl, nr, Shape::GroupRight(map)));
+            prop_oneof![one_to_one, identity, group_left, group_right]
+        })
+    }
+
+    fn assert_cells(out: &StepBatch, expected: &[Option<f64>]) {
+        assert_eq!(out.len(), expected.len());
+        for (idx, want) in expected.iter().enumerate() {
+            assert_eq!(out.validity.get(idx), want.is_some(), "cell {idx} validity");
+            let want = want.unwrap_or(f64::NAN);
+            let got = out.values[idx];
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "cell {idx}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    fn run<L: Operator, R: Operator>(mut op: BinaryOp<L, R>) -> StepBatch {
+        let mut outs = drive(&mut op);
+        assert_eq!(outs.len(), 1);
+        outs.remove(0).expect("batch")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(384))]
+
+        #[test]
+        fn should_match_per_cell_loop_for_vector_vector(
+            kind in prop::sample::select(ARITH.to_vec()),
+            ((steps, nl, nr, shape), lhs, rhs) in shape().prop_flat_map(|(steps, nl, nr, shape)| {
+                (Just((steps, nl, nr, shape)), grid(steps, nl), grid(steps, nr))
+            }),
+        ) {
+            let (lschema, rschema) = (mk_schema("l", nl), mk_schema("r", nr));
+            let (table, scan_is_lhs, map) = match shape {
+                Shape::OneToOne(map) => (MatchTable::OneToOne(map.clone()), true, map),
+                Shape::Identity => {
+                    let map: Vec<_> = (0..nl as u32).map(Some).collect();
+                    (MatchTable::OneToOne(map.clone()), true, map)
+                }
+                Shape::GroupLeft(map) => (MatchTable::GroupLeft(map.clone()), true, map),
+                Shape::GroupRight(map) => (MatchTable::GroupRight(map.clone()), false, map),
+            };
+            let mut expected = Vec::new();
+            for step in 0..steps {
+                for (row, mapped) in map.iter().enumerate() {
+                    let partner = mapped.map(|j| j as usize);
+                    let (l, r) = if scan_is_lhs {
+                        (lhs.cell(step, row), partner.and_then(|j| rhs.cell(step, j)))
+                    } else {
+                        (partner.and_then(|j| lhs.cell(step, j)), rhs.cell(step, row))
+                    };
+                    expected.push(l.zip(r).map(|(l, r)| kind.apply_arith(l, r)));
+                }
+            }
+            let output_schema = if scan_is_lhs { lschema.clone() } else { rschema.clone() };
+            let op = BinaryOp::new_vector_vector(
+                MockOp::new(lschema.clone(), mk_grid(steps), vec![lhs.batch(lschema)]),
+                MockOp::new(rschema.clone(), mk_grid(steps), vec![rhs.batch(rschema)]),
+                kind,
+                table,
+                output_schema,
+                MemoryReservation::new(usize::MAX),
+            );
+            assert_cells(&run(op), &expected);
+        }
+
+        #[test]
+        fn should_match_per_cell_loop_for_vector_scalar(
+            kind in prop::sample::select(ARITH.to_vec()),
+            scalar_on_right in any::<bool>(),
+            (vector, scalar) in (1usize..4, 1usize..140).prop_flat_map(|(steps, n)| {
+                (grid(steps, n), grid(steps, 1))
+            }),
+        ) {
+            let mut expected = Vec::new();
+            for step in 0..vector.steps {
+                let s = scalar.cell(step, 0);
+                for series in 0..vector.series {
+                    let v = vector.cell(step, series);
+                    let (l, r) = if scalar_on_right { (v, s) } else { (s, v) };
+                    expected.push(l.zip(r).map(|(l, r)| kind.apply_arith(l, r)));
+                }
+            }
+            let vschema = mk_schema("v", vector.series);
+            let grid = mk_grid(vector.steps);
+            let vec_op = MockOp::new(vschema.clone(), grid, vec![vector.batch(vschema)]);
+            let scalar_op = MockOp::new(
+                mk_schema_single(),
+                grid,
+                vec![scalar.batch(mk_schema_single())],
+            );
+            let reservation = MemoryReservation::new(usize::MAX);
+            let out = if scalar_on_right {
+                run(BinaryOp::new_vector_scalar(vec_op, scalar_op, kind, reservation))
+            } else {
+                run(BinaryOp::new_scalar_vector(scalar_op, vec_op, kind, reservation))
+            };
+            assert_cells(&out, &expected);
+        }
+    }
+}
+
+// ========================================================================
+// bit-exact equivalence of every dense path with the generic loop
+// ========================================================================
+
+mod generic_equivalence {
+    use super::*;
+    use crate::test_utils::strategies::edge_f64;
+    use proptest::prelude::*;
+
+    fn dense_kinds() -> Vec<BinaryOpKind> {
+        let mut kinds = vec![
+            BinaryOpKind::Add,
+            BinaryOpKind::Sub,
+            BinaryOpKind::Mul,
+            BinaryOpKind::Div,
+            BinaryOpKind::Mod,
+            BinaryOpKind::Pow,
+            BinaryOpKind::Atan2,
+        ];
+        for bool_modifier in [false, true] {
+            kinds.extend([
+                BinaryOpKind::Eq { bool_modifier },
+                BinaryOpKind::Ne { bool_modifier },
+                BinaryOpKind::Gt { bool_modifier },
+                BinaryOpKind::Lt { bool_modifier },
+                BinaryOpKind::Gte { bool_modifier },
+                BinaryOpKind::Lte { bool_modifier },
+            ]);
+        }
+        kinds
+    }
+
+    /// Edge floats plus small integers, so equality predicates hold often.
+    fn cell_value() -> impl Strategy<Value = f64> {
+        prop_oneof![3 => edge_f64(), 2 => (-2i8..=2).prop_map(f64::from)]
+    }
+
+    #[derive(Debug, Clone)]
+    struct Grid {
+        steps: usize,
+        series: usize,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    }
+
+    impl Grid {
+        /// The grid as `tiles` step-range batches over the full step axis.
+        fn batches(&self, schema: &Arc<SeriesSchema>, tiles: usize) -> Vec<StepBatch> {
+            let ts: Arc<[i64]> = (0..self.steps as i64).map(|i| 1_000 + i * 1_000).collect();
+            let per_tile = self.steps.div_ceil(tiles.max(1)).max(1);
+            (0..self.steps)
+                .step_by(per_tile)
+                .map(|start| {
+                    let end = (start + per_tile).min(self.steps);
+                    let cells = start * self.series..end * self.series;
+                    let mut bits = BitSet::with_len(cells.len());
+                    for (i, _) in self.validity[cells.clone()]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| **v)
+                    {
+                        bits.set(i);
+                    }
+                    StepBatch::new(
+                        ts.clone(),
+                        start..end,
+                        SchemaRef::Static(schema.clone()),
+                        0..self.series,
+                        self.values[cells].to_vec(),
+                        bits,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn grid(steps: usize, series: usize) -> impl Strategy<Value = Grid> {
+        let cells = steps * series;
+        prop_oneof![Just(0.3), Just(0.9), Just(1.0)].prop_flat_map(move |density| {
+            (
+                prop::collection::vec(cell_value(), cells),
+                prop::collection::vec(prop::bool::weighted(density), cells),
+            )
+                .prop_map(move |(values, validity)| Grid {
+                    steps,
+                    series,
+                    values,
+                    validity,
+                })
+        })
+    }
+
+    /// `(steps, lhs width, rhs width, table)`: shuffled and partial
+    /// one-to-one maps, the identity, one-to-one maps reusing a partner
+    /// (a matching error when both sides are present), and group maps.
+    fn table() -> impl Strategy<Value = (usize, usize, usize, MatchTable)> {
+        (1usize..5, 1usize..200, 1usize..200).prop_flat_map(|(steps, nl, nr)| {
+            let one_to_one = (
+                Just((0..nr as u32).collect::<Vec<_>>()).prop_shuffle(),
+                prop::collection::vec(prop::bool::weighted(0.85), nl),
+            )
+                .prop_map(move |(perm, keep)| {
+                    let map = (0..nl)
+                        .map(|i| perm.get(i).copied().filter(|_| keep[i]))
+                        .collect();
+                    (steps, nl, nr, MatchTable::OneToOne(map))
+                });
+            let identity = Just((
+                steps,
+                nl,
+                nl,
+                MatchTable::OneToOne((0..nl as u32).map(Some).collect()),
+            ));
+            let reused = prop::collection::vec(prop::option::weighted(0.3, 0..nr as u32), nl)
+                .prop_map(move |map| (steps, nl, nr, MatchTable::OneToOne(map)));
+            let group_left = prop::collection::vec(prop::option::weighted(0.85, 0..nr as u32), nl)
+                .prop_map(move |map| (steps, nl, nr, MatchTable::GroupLeft(map)));
+            let group_right = prop::collection::vec(prop::option::weighted(0.85, 0..nl as u32), nr)
+                .prop_map(move |map| (steps, nl, nr, MatchTable::GroupRight(map)));
+            prop_oneof![
+                2 => one_to_one,
+                1 => identity,
+                1 => reused,
+                2 => group_left,
+                2 => group_right,
+            ]
+        })
+    }
+
+    fn drive_all<L: Operator, R: Operator>(
+        mut op: BinaryOp<L, R>,
+    ) -> Vec<Result<StepBatch, String>> {
+        drive(&mut op)
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    fn assert_same(fast: &[Result<StepBatch, String>], generic: &[Result<StepBatch, String>]) {
+        assert_eq!(fast.len(), generic.len(), "batch count");
+        for (fast, generic) in fast.iter().zip(generic) {
+            let (fast, generic) = match (fast, generic) {
+                (Ok(f), Ok(g)) => (f, g),
+                (Err(f), Err(g)) => {
+                    assert_eq!(f, g);
+                    continue;
+                }
+                _ => panic!("fast {fast:?} vs generic {generic:?}"),
+            };
+            assert_eq!(fast.step_range, generic.step_range);
+            assert_eq!(fast.series_range, generic.series_range);
+            assert_eq!(fast.validity, generic.validity, "validity");
+            assert!(fast.histograms.is_none() && generic.histograms.is_none());
+            for (idx, (f, g)) in fast.values.iter().zip(&generic.values).enumerate() {
+                assert_eq!(
+                    f.to_bits(),
+                    g.to_bits(),
+                    "cell {idx}: fast {f:?}, generic {g:?}"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn should_match_generic_path_for_vector_vector(
+            kind in prop::sample::select(dense_kinds()),
+            (tiles_l, tiles_r) in (1usize..3, 1usize..3),
+            ((steps, nl, nr, table), lhs, rhs) in table().prop_flat_map(|(steps, nl, nr, table)| {
+                (Just((steps, nl, nr, table)), grid(steps, nl), grid(steps, nr))
+            }),
+        ) {
+            let (lschema, rschema) = (mk_schema("l", nl), mk_schema("r", nr));
+            let output_schema = if matches!(table, MatchTable::GroupRight(_)) {
+                rschema.clone()
+            } else {
+                lschema.clone()
+            };
+            let build = || {
+                BinaryOp::new_vector_vector(
+                    MockOp::new(lschema.clone(), mk_grid(steps), lhs.batches(&lschema, tiles_l)),
+                    MockOp::new(rschema.clone(), mk_grid(steps), rhs.batches(&rschema, tiles_r)),
+                    kind,
+                    table.clone(),
+                    output_schema.clone(),
+                    MemoryReservation::new(usize::MAX),
+                )
+            };
+            assert_same(&drive_all(build()), &drive_all(build().with_generic_path()));
+        }
+
+        #[test]
+        fn should_match_generic_path_for_vector_scalar(
+            kind in prop::sample::select(dense_kinds()),
+            scalar_on_right in any::<bool>(),
+            tiles in 1usize..4,
+            (vector, scalar) in (1usize..6, 1usize..300).prop_flat_map(|(steps, n)| {
+                (grid(steps, n), grid(steps, 1))
+            }),
+        ) {
+            let vschema = mk_schema("v", vector.series);
+            let grid = mk_grid(vector.steps);
+            let build = || {
+                let vec_op = MockOp::new(vschema.clone(), grid, vector.batches(&vschema, tiles));
+                let scalar_op = MockOp::new(
+                    mk_schema_single(),
+                    grid,
+                    scalar.batches(&mk_schema_single(), 1),
+                );
+                let reservation = MemoryReservation::new(usize::MAX);
+                if scalar_on_right {
+                    BinaryOp::new_vector_scalar(vec_op, scalar_op, kind, reservation)
+                } else {
+                    BinaryOp::new_scalar_vector(scalar_op, vec_op, kind, reservation)
+                }
+            };
+            assert_same(&drive_all(build()), &drive_all(build().with_generic_path()));
+        }
+    }
+
+    #[test]
+    fn should_keep_vector_value_and_nan_semantics_in_filter_comparisons() {
+        // given: `1 < v`, `v != 1` and `v == bool v` over NaN, -0.0 and infinities
+        let values = vec![f64::NAN, -0.0, 0.0, 2.0, f64::INFINITY, f64::NEG_INFINITY];
+        let n = values.len();
+        let vschema = mk_schema("v", n);
+        let grid = mk_grid(1);
+        let vector = || {
+            MockOp::new(
+                vschema.clone(),
+                grid,
+                vec![mk_batch(
+                    vschema.clone(),
+                    1,
+                    n,
+                    values.clone(),
+                    vec![true; n],
+                )],
+            )
+        };
+        let one = || {
+            MockOp::new(
+                mk_schema_single(),
+                grid,
+                vec![mk_batch(mk_schema_single(), 1, 1, vec![1.0], vec![true])],
+            )
+        };
+        let reservation = || MemoryReservation::new(usize::MAX);
+        let cells = |op: &mut BinaryOp<MockOp, MockOp>| {
+            let out = drive(op).remove(0).expect("batch");
+            (0..n).map(|i| out.get(0, i)).collect::<Vec<_>>()
+        };
+
+        // when
+        let lt = cells(&mut BinaryOp::new_scalar_vector(
+            one(),
+            vector(),
+            BinaryOpKind::Lt {
+                bool_modifier: false,
+            },
+            reservation(),
+        ));
+        let ne = cells(&mut BinaryOp::new_vector_scalar(
+            vector(),
+            one(),
+            BinaryOpKind::Ne {
+                bool_modifier: false,
+            },
+            reservation(),
+        ));
+        let eq_bool = cells(&mut BinaryOp::new_vector_vector(
+            vector(),
+            vector(),
+            BinaryOpKind::Eq {
+                bool_modifier: true,
+            },
+            MatchTable::OneToOne((0..n as u32).map(Some).collect()),
+            vschema.clone(),
+            reservation(),
+        ));
+
+        // then: filters keep the vector's own value; NaN compares false except `!=`
+        let bits = |cells: &[Option<f64>]| {
+            cells
+                .iter()
+                .map(|c| c.map(f64::to_bits))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&lt),
+            bits(&[None, None, None, Some(2.0), Some(f64::INFINITY), None])
+        );
+        assert_eq!(
+            bits(&ne),
+            bits(&[
+                Some(f64::NAN),
+                Some(-0.0),
+                Some(0.0),
+                Some(2.0),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+            ])
+        );
+        assert_eq!(
+            eq_bool,
+            vec![
+                Some(0.0),
+                Some(1.0),
+                Some(1.0),
+                Some(1.0),
+                Some(1.0),
+                Some(1.0)
+            ]
+        );
+    }
+}

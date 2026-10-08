@@ -5,12 +5,16 @@
 //! locally over bounded block reads.
 
 mod analyzer;
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;
 mod codec;
 mod compaction;
 mod config;
 mod db;
 mod error;
 pub mod logql;
+mod merge;
 mod model;
 mod object;
 mod query;
@@ -20,7 +24,7 @@ mod sharded;
 
 pub use analyzer::{Analyzer, LogAnalyzer};
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
-pub use config::{CompactionConfig, Config, PageConfig};
+pub use config::{CompactionConfig, Config, DEFAULT_RETENTION, PageConfig};
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};

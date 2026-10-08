@@ -70,9 +70,14 @@ Metrics always uses SlateDB. If the whole section is omitted, it defaults to `pa
   `data`.
 - `storage.settings_path`: optional path to a SlateDB TOML, JSON, or YAML settings file. If
   omitted, SlateDB loads its normal `SlateDb.toml`, `SlateDb.json`, or `SlateDb.yaml` files and
-  `SLATEDB_` environment overrides. See `config/SlateDb.example.toml`; Zstd is recommended for
-  object-store deployments with string-heavy discovery catalogs, while LZ4 trades compression
-  ratio for lower CPU overhead.
+  `SLATEDB_` environment overrides; load errors fail startup. See `config/SlateDb.example.toml`;
+  Zstd is recommended for object-store deployments with string-heavy discovery catalogs, while
+  LZ4 trades compression ratio for lower CPU overhead. Metrics layers the file over its own
+  defaults rather than SlateDB's, so any key the file sets wins: `l0_sst_size_bytes` 16 MiB
+  (SlateDB: 64 MiB) and `compactor_options.scheduler_options.min_compaction_sources` `"3"`
+  (SlateDB: `"4"`). They keep queries over recent data near compacted speed at the cost of more
+  object-store puts and compaction work; see
+  [Metrics configuration](../documentation/metrics/configuration.md#slatedb-defaults).
 - `storage.object_store`: required object-store variant:
   - `type: InMemory`: process-local, nonpersistent storage; no additional fields.
   - `type: Local`: local filesystem storage; requires `path`.
@@ -89,6 +94,10 @@ Metrics always uses SlateDB. If the whole section is omitted, it defaults to `pa
 - `storage.block_cache`: optional SlateDB SST data-block cache.
 - `storage.meta_cache`: optional SlateDB index/filter/stats cache. Either cache may use either
   cache variant; leaving one side absent disables caching for that block class.
+
+Every storage shard a process opens shares one block cache and one meta cache, so their
+capacities are per-process budgets rather than per-shard ones. When both are `FoyerHybrid`, they
+must use different `disk_path` directories.
 
 Cache variants are:
 

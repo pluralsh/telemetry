@@ -15,7 +15,7 @@ use crate::Namespace;
 use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::minitsdb::{MiniQueryReader, MiniTsdb};
+use crate::minitsdb::{ForwardIndexCache, MiniQueryReader, MiniTsdb, SeriesCache};
 use crate::model::{
     Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series, SeriesId,
     TimeBucket,
@@ -250,8 +250,11 @@ pub(crate) struct Tsdb {
     namespace: Namespace,
     storage: Arc<Storage>,
 
-    /// TTI cache (15 min idle) for buckets being actively ingested into.
-    /// Also used during queries so that unflushed data is visible.
+    /// TTI cache (15 min idle) for buckets being actively ingested into, so
+    /// late samples reuse the bucket's series dictionary. Entries hold no
+    /// storage snapshot (see `TsdbWriteDelta::Snapshot`), so an idle entry
+    /// does not hold back SlateDB's merge-operand collapse. Queries add
+    /// cached buckets not yet listed in storage.
     ingest_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
     discovery_cache: crate::discovery::MetricsDiscoveryCache,
     /// Serializes cache misses so concurrent writes cannot construct two
@@ -271,6 +274,8 @@ pub(crate) struct Tsdb {
     /// Inverted-index postings shared across queries; bucket flushers
     /// invalidate it as they add series.
     postings_cache: Arc<PostingsCache>,
+    forward_cache: Arc<ForwardIndexCache>,
+    series_cache: Arc<SeriesCache>,
 }
 
 impl Tsdb {
@@ -292,6 +297,7 @@ impl Tsdb {
             storage,
             retention,
             common::coordinator::WriteCoordinatorConfig::default(),
+            crate::config::QueryCacheConfig::default(),
         )
     }
 
@@ -300,6 +306,7 @@ impl Tsdb {
         storage: Arc<Storage>,
         retention: Option<Duration>,
         write_buffer: common::coordinator::WriteCoordinatorConfig,
+        query_cache: crate::config::QueryCacheConfig,
     ) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
@@ -317,7 +324,12 @@ impl Tsdb {
             retention,
             write_buffer,
             active_series,
-            postings_cache: Arc::new(PostingsCache::new(retention)),
+            postings_cache: Arc::new(PostingsCache::new(
+                retention,
+                query_cache.matcher_capacity_bytes,
+            )),
+            forward_cache: Arc::new(ForwardIndexCache::new()),
+            series_cache: Arc::new(SeriesCache::new(query_cache.series_capacity_bytes)),
         }
     }
 
@@ -360,10 +372,8 @@ impl Tsdb {
         Ok(mini)
     }
 
-    /// Create a QueryReader for a time range.
-    /// For buckets in the ingest cache, uses the write coordinator's view
-    /// (includes unflushed data). For all other buckets, constructs a
-    /// lightweight reader directly from the storage snapshot.
+    /// Create a QueryReader for a time range over one storage snapshot taken
+    /// for this query, covering stored buckets plus ingest-cache buckets.
     pub(crate) async fn query_reader(
         &self,
         start_secs: i64,
@@ -438,7 +448,9 @@ impl Tsdb {
         let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let reader = MiniQueryReader::new(self.namespace.clone(), bucket, snapshot.clone())
-                .with_postings_cache(self.postings_cache.clone(), read_at);
+                .with_postings_cache(self.postings_cache.clone(), read_at)
+                .with_forward_cache(self.forward_cache.clone())
+                .with_series_cache(self.series_cache.clone());
             readers.push((bucket, reader));
         }
         readers

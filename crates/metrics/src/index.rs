@@ -1,5 +1,5 @@
 use crate::model::MetricType;
-use crate::model::{Label, SeriesId};
+use crate::model::{Label, Labels, SeriesId};
 use dashmap::{DashMap, mapref::one::Ref};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
@@ -8,7 +8,8 @@ use std::collections::HashMap;
 pub(crate) struct SeriesSpec {
     pub(crate) unit: Option<String>,
     pub(crate) metric_type: Option<MetricType>,
-    pub(crate) labels: Vec<Label>,
+    /// Always sorted, so readers use them as-is; storage order need not be.
+    pub(crate) labels: Labels,
 }
 
 /// Trait for looking up series specs by ID.

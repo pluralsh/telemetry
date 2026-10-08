@@ -14,6 +14,9 @@ and server configuration. Cross-cutting behavior lives under [common](common/):
 - [Capacity planning and scaling](common/scaling.md)
 - [Authentication](common/authentication.md)
 
+[Benchmarks](benchmarks/) records differential fuzz results against Loki,
+Prometheus/Mimir, and Tempo over time.
+
 These pages describe the implementation and operationally important limits.
 For Kubernetes CRD fields, also see the generated
 [operator API reference](../go/operator/docs/api.md). Complete runnable server

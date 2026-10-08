@@ -4,17 +4,22 @@
 // you may not use this file except in compliance with the License.
 
 use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use prost::Message;
 
+use crate::sidecar::{self, PageColumns};
 use crate::{Error, PageConfig, Result, Trace, TraceId};
 
 const MAGIC: &[u8; 4] = b"TRAK";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 3;
 const HEADER_LEN: usize = 13;
 const DIRECTORY_ENTRY_LEN: usize = 48;
+/// Compressed and uncompressed sidecar lengths, ahead of the sidecar.
+const SIDECAR_HEADER_LEN: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceDirectoryEntry {
@@ -27,11 +32,28 @@ pub struct TraceDirectoryEntry {
     pub uncompressed_len: u32,
 }
 
-/// Immutable bounded page with one independent Snappy stream per trace.
+/// Immutable bounded page with one independent Snappy stream per trace and a
+/// Snappy column sidecar of span intrinsics.
 #[derive(Clone, Debug)]
 pub struct Page {
     bytes: Bytes,
     directory: Vec<TraceDirectoryEntry>,
+    sidecar: SidecarBounds,
+    columns: OnceLock<Arc<PageColumns>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidecarBounds {
+    /// Compressed bytes within the page.
+    start: usize,
+    end: usize,
+    uncompressed_len: usize,
+}
+
+impl SidecarBounds {
+    fn range(self) -> Range<usize> {
+        self.start..self.end
+    }
 }
 
 /// One trace encoded and compressed exactly once, ready to be laid out.
@@ -70,6 +92,9 @@ impl Page {
     }
 
     /// Lays out already-encoded traces; returns the traces in directory order.
+    ///
+    /// `max_size_bytes` bounds the trace data; the column sidecar is written
+    /// in addition.
     fn assemble(
         mut traces: Vec<EncodedTrace>,
         max_size_bytes: usize,
@@ -93,18 +118,33 @@ impl Page {
                 "a page cannot contain duplicate trace IDs".to_owned(),
             ));
         }
-        let payload_bytes = traces.iter().try_fold(0usize, |sum, encoded| {
-            sum.checked_add(encoded.compressed.len())
-        });
-        let total = payload_bytes
-            .and_then(|payload_bytes| page_len(traces.len(), payload_bytes))
-            .ok_or_else(|| Error::Invalid("trace page size overflow".to_owned()))?;
-        if total > max_size_bytes {
+        let overflow = || Error::Invalid("trace page size overflow".to_owned());
+        let payload_bytes = traces
+            .iter()
+            .try_fold(0usize, |sum, encoded| {
+                sum.checked_add(encoded.compressed.len())
+            })
+            .ok_or_else(overflow)?;
+        let data_len = page_len(traces.len(), payload_bytes).ok_or_else(overflow)?;
+        if data_len > max_size_bytes {
             return Err(Error::Invalid(format!(
-                "encoded trace page is {total} bytes, exceeding {max_size_bytes}"
+                "encoded trace page is {data_len} bytes, exceeding {max_size_bytes}"
             )));
         }
-        let mut offset = total - payload_bytes.unwrap_or_default();
+        let directory_end = data_len - payload_bytes;
+        let raw = sidecar::encode(traces.iter().map(|encoded| &encoded.trace))?;
+        let compressed = snap::raw::Encoder::new().compress_vec(&raw)?;
+        let total = data_len
+            .checked_add(SIDECAR_HEADER_LEN + compressed.len())
+            .ok_or_else(overflow)?;
+        let total_u32 = to_u32(total, "page length")?;
+        let start = directory_end + SIDECAR_HEADER_LEN;
+        let sidecar = SidecarBounds {
+            start,
+            end: start + compressed.len(),
+            uncompressed_len: raw.len(),
+        };
+        let mut offset = sidecar.end;
         let mut directory = Vec::with_capacity(traces.len());
         for encoded in &traces {
             let (min_timestamp_ns, max_timestamp_ns) = encoded.trace.timestamp_range();
@@ -126,7 +166,7 @@ impl Page {
         bytes.extend_from_slice(MAGIC);
         bytes.put_u8(FORMAT_VERSION);
         bytes.put_u32(to_u32(directory.len(), "trace count")?);
-        bytes.put_u32(to_u32(total, "page length")?);
+        bytes.put_u32(total_u32);
         for entry in &directory {
             bytes.extend_from_slice(entry.trace_id.as_bytes());
             bytes.put_u64(entry.min_timestamp_ns);
@@ -136,6 +176,9 @@ impl Page {
             bytes.put_u32(entry.compressed_len);
             bytes.put_u32(entry.uncompressed_len);
         }
+        bytes.put_u32(to_u32(compressed.len(), "compressed sidecar length")?);
+        bytes.put_u32(to_u32(raw.len(), "sidecar length")?);
+        bytes.extend_from_slice(&compressed);
         let mut ordered = Vec::with_capacity(traces.len());
         for encoded in traces {
             bytes.extend_from_slice(&encoded.compressed);
@@ -145,6 +188,8 @@ impl Page {
             Self {
                 bytes: bytes.freeze(),
                 directory,
+                sidecar,
+                columns: OnceLock::new(),
             },
             ordered,
         ))
@@ -177,10 +222,22 @@ impl Page {
         if directory_end > bytes.len() {
             return Err(Error::Corrupt("truncated trace page directory".to_owned()));
         }
+        let compressed_len = read_u32(&bytes, directory_end)? as usize;
+        let uncompressed_len = read_u32(&bytes, directory_end + 4)? as usize;
+        let start = directory_end + SIDECAR_HEADER_LEN;
+        let end = start
+            .checked_add(compressed_len)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| Error::Corrupt("invalid trace page sidecar bounds".to_owned()))?;
+        let sidecar = SidecarBounds {
+            start,
+            end,
+            uncompressed_len,
+        };
         let mut directory = Vec::with_capacity(trace_count);
         let mut cursor = HEADER_LEN;
         let mut prior_id = None;
-        let mut expected_offset = directory_end;
+        let mut expected_offset = sidecar.end;
         for _ in 0..trace_count {
             let trace_id = TraceId::from_slice(&bytes[cursor..cursor + 16])
                 .map_err(|error| Error::Corrupt(error.to_string()))?;
@@ -218,11 +275,38 @@ impl Page {
         if expected_offset != bytes.len() {
             return Err(Error::Corrupt("trailing bytes in trace page".to_owned()));
         }
-        Ok(Self { bytes, directory })
+        Ok(Self {
+            bytes,
+            directory,
+            sidecar,
+            columns: OnceLock::new(),
+        })
     }
 
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
+    }
+
+    /// Compressed sidecar bytes, including their length header.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) fn sidecar_len(&self) -> usize {
+        SIDECAR_HEADER_LEN + self.sidecar.range().len()
+    }
+
+    /// The page's span columns, decoded on first use.
+    pub(crate) fn columns(&self) -> Result<Arc<PageColumns>> {
+        if let Some(columns) = self.columns.get() {
+            return Ok(Arc::clone(columns));
+        }
+        let compressed = &self.bytes[self.sidecar.range()];
+        if snap::raw::decompress_len(compressed)? != self.sidecar.uncompressed_len {
+            return Err(Error::Corrupt(
+                "trace page sidecar length mismatch".to_owned(),
+            ));
+        }
+        let raw = snap::raw::Decoder::new().decompress_vec(compressed)?;
+        let columns = Arc::new(PageColumns::decode(&raw, self.directory.len())?);
+        Ok(Arc::clone(self.columns.get_or_init(|| columns)))
     }
 
     pub fn directory(&self) -> &[TraceDirectoryEntry] {
@@ -263,7 +347,8 @@ impl Page {
     }
 }
 
-/// Cuts pages by trace count and exact encoded size. Each trace is encoded and
+/// Cuts pages by trace count and exact encoded size of the trace data; the
+/// column sidecar counts toward neither size limit. Each trace is encoded and
 /// compressed once, on append.
 pub struct PageBuilder {
     config: PageConfig,
@@ -401,6 +486,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use proptest::prelude::*;
 
@@ -455,9 +541,15 @@ mod tests {
     fn rejects_bad_version_bounds_and_size_limit() {
         let trace = trace(1, 10, "one");
         let page = Page::from_traces(std::slice::from_ref(&trace), 64 * 1024).unwrap();
-        let mut version = page.bytes().to_vec();
-        version[4] = 99;
-        assert!(Page::decode(Bytes::from(version)).is_err());
+        for stale in [1, 99] {
+            let mut version = page.bytes().to_vec();
+            version[4] = stale;
+            assert!(matches!(
+                Page::decode(Bytes::from(version)),
+                Err(Error::Corrupt(message))
+                    if message == format!("unsupported trace page version {stale}")
+            ));
+        }
 
         let mut bounds = page.bytes().to_vec();
         bounds[HEADER_LEN + 36..HEADER_LEN + 40].copy_from_slice(&0_u32.to_be_bytes());
@@ -508,7 +600,256 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pages_carry_columns() {
+        let traces = vec![trace(1, 10, "one"), trace(2, 20, "two")];
+        let page = Page::decode(Page::from_traces(&traces, 64 * 1024).unwrap().bytes()).unwrap();
+        assert_eq!(page.bytes()[4], FORMAT_VERSION);
+        let columns = page.columns().unwrap();
+        for (index, trace) in traces.iter().enumerate() {
+            assert_eq!(
+                page.get_trace(trace.trace_id).unwrap().as_ref(),
+                Some(trace)
+            );
+            assert_eq!(columns.trace_spans(index), index..index + 1);
+        }
+    }
+
+    #[test]
+    fn size_bound_excludes_the_sidecar() {
+        let traces = vec![trace(1, 10, "one")];
+        let page = Page::from_traces(&traces, 64 * 1024).unwrap();
+        let data_len = page.bytes().len() - page.sidecar_len();
+        let bounded = Page::from_traces(&traces, data_len).unwrap();
+        assert_eq!(bounded.bytes(), page.bytes());
+        assert!(bounded.bytes().len() > data_len);
+        assert!(Page::from_traces(&traces, data_len - 1).is_err());
+    }
+
+    #[test]
+    fn corrupt_sidecars_are_errors() {
+        let traces = vec![trace(1, 10, "one"), trace(2, 20, "two")];
+        let page = Page::from_traces(&traces, 64 * 1024).unwrap();
+        let sidecar = page.sidecar;
+        let header = sidecar.start - SIDECAR_HEADER_LEN;
+
+        let mut bounds = page.bytes().to_vec();
+        bounds[header..header + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(Page::decode(Bytes::from(bounds)).is_err());
+
+        let mut length = page.bytes().to_vec();
+        length[header + 4..header + 8].copy_from_slice(&1_u32.to_be_bytes());
+        let decoded = Page::decode(Bytes::from(length)).unwrap();
+        assert!(decoded.columns().is_err());
+        assert_eq!(
+            decoded.get_trace(traces[1].trace_id).unwrap().as_ref(),
+            Some(&traces[1])
+        );
+
+        for position in sidecar.range() {
+            for flip in [0x01, 0x80, 0xff] {
+                let mut bytes = page.bytes().to_vec();
+                bytes[position] ^= flip;
+                let decoded = Page::decode(Bytes::from(bytes)).unwrap();
+                let _ = decoded.columns();
+                assert_eq!(
+                    decoded.get_trace(traces[0].trace_id).unwrap().as_ref(),
+                    Some(&traces[0])
+                );
+            }
+        }
+        let raw = sidecar::encode(&traces).unwrap();
+        for len in 0..raw.len() {
+            assert!(PageColumns::decode(&raw[..len], 2).is_err());
+        }
+        assert!(PageColumns::decode(&raw, 3).is_err());
+        assert!(PageColumns::decode(&raw, 2).is_ok());
+    }
+
+    #[test]
+    fn corrupt_attribute_columns_fail_the_filters_reading_them() {
+        let traces = [(1, "GET", 200), (2, "POST", 503)].map(|(id, method, status)| {
+            let trace_id = TraceId::new([id; 16]).unwrap();
+            let attribute = |key: &str, value| KeyValue {
+                key: key.to_owned(),
+                value: Some(AnyValue { value: Some(value) }),
+            };
+            let span = Span {
+                trace_id: trace_id.as_bytes().to_vec(),
+                attributes: vec![
+                    attribute(
+                        "http.method",
+                        any_value::Value::StringValue(method.to_owned()),
+                    ),
+                    attribute("http.status_code", any_value::Value::IntValue(status)),
+                ],
+                ..Default::default()
+            };
+            let scope_spans = vec![ScopeSpans {
+                spans: vec![span],
+                ..Default::default()
+            }];
+            let resource_spans = vec![ResourceSpans {
+                scope_spans,
+                ..Default::default()
+            }];
+            Trace::new(trace_id, resource_spans).unwrap()
+        });
+        let query = crate::traceql::parse(
+            r#"{ span.http.method = "GET" || span.http.status_code >= 500 }"#,
+        )
+        .unwrap();
+        let filter = crate::traceql::prefilter(&query).unwrap();
+        let raw = sidecar::encode(&traces).unwrap();
+        assert!(
+            PageColumns::decode(&raw, 2)
+                .unwrap()
+                .exists(&filter)
+                .is_ok()
+        );
+
+        let mut lazily_caught = 0;
+        for position in 0..raw.len() {
+            for flip in [0x01, 0x80, 0xff] {
+                let mut bytes = raw.to_vec();
+                bytes[position] ^= flip;
+                if let Ok(columns) = PageColumns::decode(&bytes, 2) {
+                    lazily_caught += usize::from(columns.exists(&filter).is_err());
+                }
+            }
+        }
+        assert!(lazily_caught > 0);
+    }
+
     proptest! {
+        #[test]
+        fn arbitrary_sidecar_bytes_never_panic(
+            raw in prop::collection::vec(any::<u8>(), 0..256),
+            traces in 0_usize..4,
+        ) {
+            let _ = PageColumns::decode(&raw, traces);
+        }
+
+        #[test]
+        fn page_columns_never_rule_out_a_matching_trace(
+            traces in (1_u8..6).prop_flat_map(|count| {
+                (1..=count)
+                    .map(crate::traceql::columns::testing::trace)
+                    .collect::<Vec<_>>()
+            }),
+            source in crate::traceql::columns::testing::query(),
+        ) {
+            let query = crate::traceql::parse(&source).unwrap();
+            let Some(filter) = crate::traceql::prefilter(&query) else {
+                return Ok(());
+            };
+            let page = Page::decode(Page::from_traces(&traces, 1 << 20).unwrap().bytes()).unwrap();
+            let columns = page.columns().unwrap();
+            let exists = columns.exists(&filter).unwrap();
+            for (index, entry) in page.directory().iter().enumerate() {
+                let trace = page.get_trace(entry.trace_id).unwrap().unwrap();
+                prop_assert_eq!(columns.trace_spans(index).len(), trace.spans().count());
+                let satisfied = exists.iter().map(|leaf| leaf[index]).collect::<Vec<_>>();
+                if !filter.matches(&satisfied) {
+                    prop_assert!(
+                        crate::traceql::execute(&trace, &query, 1_000).unwrap().is_none(),
+                        "{} ruled out a matching trace", source
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn dedicated_columns_agree_with_the_interpreter(
+            traces in (1_u8..6).prop_flat_map(|count| {
+                (1..=count)
+                    .map(crate::traceql::columns::testing::trace)
+                    .collect::<Vec<_>>()
+            }),
+            leaf in crate::traceql::columns::testing::dedicated_leaf(),
+            negate in any::<bool>(),
+        ) {
+            use crate::traceql::columns::{ColumnPredicate, DedicatedTest};
+
+            let source = if negate {
+                format!("{{ !({leaf}) }}")
+            } else {
+                format!("{{ {leaf} }}")
+            };
+            let query = crate::traceql::parse(&source).unwrap();
+            let filter = crate::traceql::prefilter(&query);
+            let exact = match &filter {
+                Some(crate::traceql::TraceFilter::Exists(predicate)) => matches!(
+                    predicate,
+                    ColumnPredicate::Dedicated { test: DedicatedTest::String { .. }, .. }
+                ) || matches!(
+                    predicate,
+                    ColumnPredicate::Not(inner) if matches!(
+                        **inner,
+                        ColumnPredicate::Dedicated { test: DedicatedTest::String { .. }, .. }
+                    )
+                ),
+                _ => false,
+            };
+            let page = Page::decode(Page::from_traces(&traces, 1 << 20).unwrap().bytes()).unwrap();
+            let columns = page.columns().unwrap();
+            let exists = filter.as_ref().map(|filter| columns.exists(filter).unwrap());
+            for (index, entry) in page.directory().iter().enumerate() {
+                let trace = page.get_trace(entry.trace_id).unwrap().unwrap();
+                let matched = crate::traceql::execute(&trace, &query, 1_000).unwrap().is_some();
+                let satisfied = match (&filter, &exists) {
+                    (Some(filter), Some(exists)) => filter.matches(
+                        &exists.iter().map(|leaf| leaf[index]).collect::<Vec<_>>(),
+                    ),
+                    _ => true,
+                };
+                prop_assert!(satisfied || !matched, "{} ruled out a matching trace", source);
+                if exact {
+                    prop_assert_eq!(satisfied, matched, "{}", source);
+                }
+            }
+        }
+
+        #[test]
+        fn column_summaries_agree_with_the_interpreter(
+            traces in (1_u8..6).prop_flat_map(|count| {
+                (1..=count)
+                    .map(crate::traceql::columns::testing::trace)
+                    .collect::<Vec<_>>()
+            }),
+            source in crate::traceql::columns::testing::query(),
+        ) {
+            let query = crate::traceql::parse(&source).unwrap();
+            let Some(decider) = crate::traceql::columns::decider(&query) else {
+                return Ok(());
+            };
+            let compiled = crate::traceql::CompiledQuery::new(query);
+            let page = Page::decode(Page::from_traces(&traces, 1 << 20).unwrap().bytes()).unwrap();
+            let columns = page.columns().unwrap();
+            let indexes = (0..page.directory().len()).collect::<Vec<_>>();
+            let decided = columns.decide(&decider).unwrap().unwrap();
+            let summaries = columns.summaries(&indexes, &decider).unwrap().unwrap();
+            for (index, entry) in page.directory().iter().enumerate() {
+                let trace = page.get_trace(entry.trace_id).unwrap().unwrap();
+                let expected =
+                    crate::traceql::summarize_compiled(&trace, &compiled, 1_000).unwrap();
+                prop_assert_eq!(decided[index], expected.is_some(), "{}", source);
+                let Some(summary) = &summaries[index] else {
+                    continue;
+                };
+                match expected {
+                    Some(expected) => {
+                        prop_assert_eq!((entry.min_timestamp_ns, entry.max_timestamp_ns),
+                            (expected.start_ns, expected.end_ns));
+                        prop_assert_eq!(&summary.root_service_name, &expected.root_service_name);
+                        prop_assert_eq!(&summary.root_span_name, &expected.root_span_name);
+                        prop_assert_eq!(summary.matched, expected.matched_spans, "{}", source);
+                    }
+                    None => prop_assert_eq!(summary.matched, 0, "{}", source),
+                }
+            }
+        }
+
         #[test]
         fn page_property_round_trips(
             starts in prop::collection::vec(0_u64..1_000_000, 1..30)

@@ -16,12 +16,14 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::build_split_cache;
+use common::storage::factory::SharedDbCache;
 use common::storage::metrics_recorder::MetricsRsRecorder;
-use common::storage::slate::SlateDbStorage as CommonSlateDbStorage;
+use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
 use common::storage::{
     CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
     StorageError, StorageResult, WriteOptions, WriteResult,
@@ -50,7 +52,10 @@ use crate::model::{
 use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
-use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
+use crate::serde::key::{
+    BucketGenerationKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
+    decode_bucket_generation, encode_bucket_generation,
+};
 use crate::serde::{TimeBucketScoped, bucket_records_range};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};
@@ -172,6 +177,38 @@ pub(crate) trait StorageRead: Send + Sync {
         bucket: &TimeBucket,
         label_name: &str,
     ) -> crate::util::Result<Vec<String>>;
+
+    /// The write generation of `bucket`, or `None` if the bucket has never
+    /// been flushed (or its record has expired).
+    async fn get_bucket_generation(
+        &self,
+        namespace: &Namespace,
+        bucket: &TimeBucket,
+    ) -> crate::util::Result<Option<u64>> {
+        let key = BucketGenerationKey {
+            namespace: namespace.clone(),
+            bucket: *bucket,
+        }
+        .encode();
+        match self.get(key).await? {
+            Some(value) => Ok(Some(decode_bucket_generation(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::get_bucket_generation`] for each of `buckets`, in order.
+    async fn get_bucket_generations(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> crate::util::Result<Vec<Option<u64>>> {
+        futures::future::try_join_all(
+            buckets
+                .iter()
+                .map(|bucket| self.get_bucket_generation(namespace, bucket)),
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -387,6 +424,8 @@ impl HasReader for StorageSnapshot {
 pub(crate) struct Storage {
     db: Arc<Db>,
     reader: StorageReaderInner<Db>,
+    /// Set by every write, cleared by the periodic memtable flush.
+    unflushed: Arc<AtomicBool>,
 }
 
 impl HasReader for Storage {
@@ -411,6 +450,17 @@ impl Storage {
         slate_config: &SlateDbStorageConfig,
         object_store: Arc<dyn ObjectStore>,
     ) -> crate::util::Result<Self> {
+        let cache = SharedDbCache::from_slatedb_config(slate_config).await?;
+        Self::try_new_with_cache(slate_config, object_store, &cache).await
+    }
+
+    /// Like [`Self::try_new_with_object_store`] but uses `cache` instead of
+    /// building one from the config.
+    pub(crate) async fn try_new_with_cache(
+        slate_config: &SlateDbStorageConfig,
+        object_store: Arc<dyn ObjectStore>,
+        cache: &SharedDbCache,
+    ) -> crate::util::Result<Self> {
         let settings = load_settings(slate_config)?;
         info!(
             "create slatedb storage with config: {:?}, settings: {:?}",
@@ -424,9 +474,7 @@ impl Storage {
             .with_segment_extractor(TimeseriesSegmentExtractor::shared())
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
-        if let Some(cache) =
-            build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
-        {
+        if let Some(cache) = cache.cache() {
             builder = builder.with_db_cache(cache);
         }
 
@@ -437,7 +485,9 @@ impl Storage {
                 .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?,
         );
 
-        Ok(Self::from_db(db))
+        let storage = Self::from_db(db);
+        storage.spawn_memtable_flusher(MEMTABLE_FLUSH_INTERVAL);
+        Ok(storage)
     }
 
     fn from_db(db: Arc<Db>) -> Self {
@@ -447,7 +497,18 @@ impl Storage {
                 db: db.clone(),
                 segments: Arc::new(move || db.status().list_segments()),
             },
+            unflushed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Flushes the memtable to L0 every `every` while writes arrive; see
+    /// [`MEMTABLE_FLUSH_INTERVAL`].
+    fn spawn_memtable_flusher(&self, every: Duration) {
+        common::storage::slate::spawn_memtable_flusher(
+            Arc::downgrade(&self.db),
+            Arc::clone(&self.unflushed),
+            every,
+        );
     }
 
     // ── write path ───────────────────────────────────────────────────
@@ -521,6 +582,7 @@ impl Storage {
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
+        self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
         })
@@ -573,6 +635,29 @@ impl Storage {
     }
 }
 
+#[cfg(test)]
+impl Storage {
+    /// Freezes the memtable and writes it to L0, merging operands up to
+    /// SlateDB's oldest live snapshot.
+    pub(crate) async fn flush_memtable(&self) -> StorageResult<()> {
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await
+            .map_err(StorageError::from_storage)
+    }
+
+    /// `(recent_snapshot_min_seq, last_l0_seq)` from the manifest. The first
+    /// is the merge barrier compaction uses: the oldest live snapshot's
+    /// sequence at the last L0 flush, or that flush's last sequence when no
+    /// snapshot was live.
+    pub(crate) fn merge_barrier(&self) -> (u64, u64) {
+        let manifest = self.db.manifest();
+        (manifest.recent_snapshot_min_seq(), manifest.last_l0_seq())
+    }
+}
+
 #[async_trait::async_trait]
 impl Store for Storage {
     async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<WriteResult> {
@@ -588,16 +673,72 @@ impl Store for Storage {
     }
 }
 
-fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
-    match &slate_config.settings_path {
-        Some(path) => Settings::from_file(path).map_err(|e| {
-            StorageError::Storage(format!(
-                "Failed to load SlateDB settings from {}: {}",
-                path, e
-            ))
-        }),
-        None => Ok(Settings::load().unwrap_or_default()),
+/// Metrics' `l0_sst_size_bytes`. SlateDB's 64 MiB default holds a busy
+/// writer's merge operands in the memtable for many minutes, and every query
+/// over recent data pays to merge them; see
+/// `documentation/metrics/configuration.md`.
+pub(crate) const DEFAULT_L0_SST_SIZE_BYTES: usize = 16 << 20;
+/// Metrics' size-tiered `min_compaction_sources`, so small L0 SSTs are
+/// folded into the sorted runs sooner than with SlateDB's 4; 2 merges
+/// barely fewer operands for about twice the compaction bytes.
+pub(crate) const DEFAULT_MIN_COMPACTION_SOURCES: usize = 3;
+
+/// SlateDB's defaults with Metrics' overrides applied; the base layer that
+/// a settings file or `SLATEDB_` environment variables override per key.
+pub(crate) fn default_settings() -> Settings {
+    let mut settings = Settings {
+        l0_sst_size_bytes: DEFAULT_L0_SST_SIZE_BYTES,
+        ..Settings::default()
+    };
+    if let Some(compactor) = settings.compactor_options.as_mut() {
+        compactor.scheduler_options.insert(
+            "min_compaction_sources".to_string(),
+            DEFAULT_MIN_COMPACTION_SOURCES.to_string(),
+        );
     }
+    settings
+}
+
+/// Loads SlateDB settings the way `Settings::from_file` / `Settings::load`
+/// do, but over [`default_settings`] instead of SlateDB's defaults, so
+/// Metrics' tuning applies wherever the user leaves a key unset.
+fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
+    use figment::Figment;
+    use figment::providers::{Env, Format, Json, Toml, Yaml};
+
+    let base = Figment::from(default_settings());
+    let (figment, source) = match &slate_config.settings_path {
+        Some(path) => {
+            let extension = std::path::Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str());
+            let figment = match extension {
+                Some("json") => base.merge(Json::file(path)),
+                Some("toml") => base.merge(Toml::file(path)),
+                Some("yaml" | "yml") => base.merge(Yaml::file(path)),
+                _ => {
+                    return Err(StorageError::Storage(format!(
+                        "Failed to load SlateDB settings from {path}: \
+                         unknown format (expected .json, .toml, .yaml or .yml)"
+                    )));
+                }
+            };
+            (figment, path.as_str())
+        }
+        None => (
+            base.merge(Json::file("SlateDb.json"))
+                .merge(Toml::file("SlateDb.toml"))
+                .merge(Yaml::file("SlateDb.yaml"))
+                .merge(Yaml::file("SlateDb.yml"))
+                .admerge(Env::prefixed("SLATEDB_")),
+            "SlateDb.* / SLATEDB_*",
+        ),
+    };
+    figment.extract().map_err(|e| {
+        StorageError::Storage(format!(
+            "Failed to load SlateDB settings from {source}: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]

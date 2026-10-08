@@ -233,6 +233,122 @@ async fn discovery_unions_many_segments_and_overlapping_selectors() {
 }
 
 #[tokio::test]
+async fn reader_discovery_sees_late_writes_to_closed_partitions() {
+    const SECOND: i64 = 1_000_000_000;
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.retention = None;
+    config.storage = local_storage(&directory, "logs-late-discovery");
+    let namespace = Namespace::new("late-discovery").unwrap();
+    let writer = LogDb::open(config.clone()).await.unwrap();
+    writer
+        .write_with_durability(
+            &namespace,
+            vec![
+                LogBatch::new(labels("api", "prod"), vec![LogEntry::new(1, "a")]),
+                LogBatch::new(
+                    labels("cart", "prod"),
+                    vec![LogEntry::new(12 * SECOND, "b")],
+                ),
+            ],
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+    let reader = LogDb::open_reader(
+        config,
+        DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(50),
+            ..DbReaderOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let selector = [r#"{environment="prod"}"#.to_owned()];
+    // 0..15s reads both 10s segments; 0..20s reads their 20s rollup period.
+    let ranges = [(0, 15 * SECOND), (0, 20 * SECOND - 1)];
+    for (start, end) in ranges {
+        assert_eq!(
+            reader.label_names(&namespace, start, end).await.unwrap(),
+            vec!["environment", "service"]
+        );
+        assert_eq!(
+            reader
+                .label_values(&namespace, "service", start, end)
+                .await
+                .unwrap(),
+            vec!["api", "cart"]
+        );
+        assert_eq!(
+            reader
+                .series(&namespace, &selector, start, end)
+                .await
+                .unwrap(),
+            vec![labels("api", "prod"), labels("cart", "prod")]
+        );
+    }
+
+    // Long after segment 0s..10s closed, a late export adds a stream there.
+    let late = Labels::new(vec![
+        Label::new("service", "worker"),
+        Label::new("environment", "prod"),
+        Label::new("region", "eu"),
+    ])
+    .unwrap();
+    let counter = next_stream_id_key(&namespace, 0);
+    let before = reader
+        .partition_version(&namespace, Partition::Segment(0))
+        .await
+        .unwrap();
+    writer
+        .write_with_durability(
+            &namespace,
+            vec![LogBatch::new(late.clone(), vec![LogEntry::new(2, "c")])],
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reader
+            .storage
+            .get(counter.clone())
+            .await
+            .unwrap()
+            .map(|record| decode_stream_id(&record.value).unwrap())
+            == before
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reader observes the late stream");
+
+    let mut expected = vec![labels("api", "prod"), labels("cart", "prod"), late];
+    expected.sort();
+    for (start, end) in ranges {
+        assert_eq!(
+            reader.label_names(&namespace, start, end).await.unwrap(),
+            vec!["environment", "region", "service"]
+        );
+        assert_eq!(
+            reader
+                .label_values(&namespace, "service", start, end)
+                .await
+                .unwrap(),
+            vec!["api", "cart", "worker"]
+        );
+        let mut series = reader
+            .series(&namespace, &selector, start, end)
+            .await
+            .unwrap();
+        series.sort();
+        assert_eq!(series, expected);
+    }
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cached_closed_segments_observe_late_writes() {
     let db = LogDb::open(test_config()).await.unwrap();
     let namespace = Namespace::new("late").unwrap();
@@ -276,8 +392,10 @@ async fn cached_closed_segments_observe_late_writes() {
     )
     .await
     .unwrap();
-    assert!(db.caches.series.get(&series_key).is_none());
-    assert!(db.caches.label_values.get(&other_key).is_some());
+    assert_eq!(
+        db.label_values(&other, "service", 0, 5).await.unwrap(),
+        vec!["api"]
+    );
     assert_eq!(
         db.label_names(&namespace, 0, 5).await.unwrap(),
         vec!["environment", "service"]
@@ -357,6 +475,57 @@ async fn limited_log_queries_stop_within_a_segment() {
     // Five two-row pages share one segment; one page answers each query.
     assert_eq!(first(Direction::Forward).await, 1);
     assert_eq!(first(Direction::Backward).await, 10);
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_backward_queries_keep_the_newest_rows_of_a_large_page() {
+    use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
+
+    // One page larger than a pipeline batch is read as a single ascending
+    // chunk, so its newest rows are in its last batches.
+    let db = LogDb::open(Config {
+        retention: None,
+        page: PageConfig {
+            target_size_bytes: 1 << 20,
+            max_rows: 10_000,
+            rows_per_block: 512,
+        },
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    let namespace = Namespace::new("large-page").unwrap();
+    let entries = (1..=5_000)
+        .map(|timestamp| LogEntry::new(timestamp, format!("line-{timestamp}")))
+        .collect();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(labels("api", "prod"), entries)],
+    )
+    .await
+    .unwrap();
+    let QueryResult::Streams(streams) = db
+        .query(
+            &namespace,
+            &QueryRequest::range(r#"{service="api"}"#, 0, 5_001, 1),
+            QueryOptions {
+                limit: 100,
+                direction: Direction::Backward,
+                ..QueryOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected streams");
+    };
+    let timestamps = streams[0]
+        .entries
+        .iter()
+        .map(|entry| entry.timestamp_ns)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, (4_901..=5_000).rev().collect::<Vec<_>>());
     db.close().await.unwrap();
 }
 
@@ -557,7 +726,7 @@ async fn flush_drains_and_close_stops_the_coordinator() {
 }
 
 #[tokio::test]
-async fn small_writes_top_up_the_trailing_posting_block() {
+async fn each_flush_appends_posting_blocks_without_reading_the_index() {
     let db = LogDb::open(test_config()).await.unwrap();
     let namespace = Namespace::default();
     for timestamp in 1..=5 {
@@ -579,7 +748,7 @@ async fn small_writes_top_up_the_trailing_posting_block() {
         .unwrap();
     let stats = crate::search::decode_term_stats(&stats.value).unwrap();
     assert_eq!(stats.documents, 5);
-    assert_eq!(stats.blocks, 1);
+    assert_eq!(stats.blocks, 5);
 
     let terms = vec!["needle".to_owned()];
     for top_k in [None, Some(2)] {
@@ -642,6 +811,93 @@ async fn logical_retention_filters_reads_estimates_and_bm25_before_compaction() 
         Some(Vec::new())
     );
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reopened_writers_resume_stream_and_object_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "resume-ids".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        }),
+        ..test_config()
+    };
+    let namespace = Namespace::default();
+    let api = Label::new("service", "api");
+    let worker = Label::new("service", "worker");
+    let db = LogDb::open(config.clone()).await.unwrap();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            vec![LogEntry::new(1, "needle first")],
+        )],
+    )
+    .await
+    .unwrap();
+    let api_id = db
+        .stream_ids(&namespace, 0, std::slice::from_ref(&api))
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+
+    let reopened = LogDb::open(config).await.unwrap();
+    reopened
+        .write(
+            &namespace,
+            vec![
+                LogBatch::new(
+                    labels("api", "prod"),
+                    vec![LogEntry::new(2, "needle again")],
+                ),
+                LogBatch::new(
+                    labels("worker", "prod"),
+                    vec![LogEntry::new(3, "needle new")],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.stream_ids(&namespace, 0, &[api]).await.unwrap(),
+        api_id
+    );
+    let worker_id = reopened.stream_ids(&namespace, 0, &[worker]).await.unwrap();
+    assert_eq!(worker_id.len(), 1);
+    assert!(!api_id.contains(&worker_id[0]));
+
+    let rows = reopened
+        .read(&namespace, 0, 5, &[Label::new("environment", "prod")])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.entry.line.as_str())
+            .collect::<Vec<_>>(),
+        vec!["needle first", "needle again", "needle new"]
+    );
+    let terms = vec!["needle".to_owned()];
+    let matched = reopened
+        .read_match_bounded(
+            &namespace,
+            &reopened
+                .scan_targets(&namespace, 0, 5, &StreamFilter::exact(Vec::new()))
+                .await
+                .unwrap(),
+            (&terms, None),
+            10,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(matched.len(), 3);
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -866,14 +1122,15 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
         count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
         0
     );
-    // The merged object and the worker's object; replaced blocks are gone.
+    // The merged object and the worker's object; replaced blocks are gone,
+    // leaving a meta and a lines value per remaining block.
     assert_eq!(
         count_records(&db, &namespace, segment, RecordType::ObjectDirectory).await,
         2
     );
     assert_eq!(
         count_records(&db, &namespace, segment, RecordType::ObjectBlock).await,
-        3
+        6
     );
     assert_eq!(lines(&db, &namespace, segment, end).await, expected);
     db.close().await.unwrap();
@@ -1171,7 +1428,8 @@ async fn streams_flushed_together_are_read_with_one_object_scan() {
     let rows = db.read(&namespace, 0, 5_000, &[]).await.unwrap();
     assert_eq!(rows.len(), 80);
     assert!(ascending(&rows));
-    assert_eq!(counting.take(), vec![(0, 1)]);
+    // One scan each of the meta and lines groups.
+    assert_eq!(counting.take(), vec![(0, 2)]);
     // Half the streams: runs separated by few unselected blocks share a scan.
     let prod = [Label::new("environment", "prod")];
     let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
@@ -1181,7 +1439,7 @@ async fn streams_flushed_together_are_read_with_one_object_scan() {
         unreachable!()
     };
     assert_eq!(gets, 0);
-    assert!(scans < 5, "20 streams took {scans} scans");
+    assert!(scans < 10, "20 streams took {scans} scans");
     let one = [Label::new("service", "s07")];
     let rows = db.read(&namespace, 1_500, 5_000, &one).await.unwrap();
     assert_eq!(
@@ -1190,7 +1448,7 @@ async fn streams_flushed_together_are_read_with_one_object_scan() {
             .collect::<Vec<_>>(),
         ["again 7"]
     );
-    assert_eq!(counting.take(), vec![(0, 1)]);
+    assert_eq!(counting.take(), vec![(0, 2)]);
     db.close().await.unwrap();
 }
 
@@ -1485,4 +1743,348 @@ fn rollups_must_align_with_segments() {
     assert!(config(None).validate().is_ok());
     assert!(config(Some(Duration::from_secs(25))).validate().is_err());
     assert!(config(Some(Duration::ZERO)).validate().is_err());
+}
+
+#[test]
+fn window_boundaries_split_only_the_spans_they_fall_inside() {
+    // Windows (5, 10], (15, 20], (25, 30]: boundaries 5, 15, 25 and 10, 20, 30.
+    let read = SampleRead {
+        metadata: false,
+        boundaries: vec![
+            Boundaries {
+                first: 10,
+                step: 10,
+                count: 3,
+            },
+            Boundaries {
+                first: 5,
+                step: 10,
+                count: 3,
+            },
+        ],
+    };
+    assert!(!read.splits(6, 10));
+    assert!(read.splits(9, 11));
+    assert!(read.splits(5, 6));
+    assert!(!read.splits(11, 15));
+    assert!(!read.splits(31, 99));
+    assert!(!read.splits(-50, 5));
+    assert!(read.splits(-50, 6));
+    assert!(!read.splits(10, 10));
+    let instant = SampleRead {
+        metadata: false,
+        boundaries: vec![Boundaries {
+            first: i64::MAX,
+            step: 1,
+            count: 1,
+        }],
+    };
+    assert!(!instant.splits(i64::MIN, i64::MAX));
+    assert!(!instant.splits(i64::MAX, i64::MAX));
+    let near_max = SampleRead {
+        metadata: false,
+        boundaries: vec![Boundaries {
+            first: i64::MAX - 1,
+            step: 1,
+            count: 1,
+        }],
+    };
+    assert!(near_max.splits(i64::MIN, i64::MAX));
+    assert!(!near_max.splits(i64::MIN, i64::MAX - 1));
+}
+
+/// Writes of two streams over three segments, with lines of equal length,
+/// repeated timestamps and structured metadata on some rows; a repeated
+/// write duplicates rows across objects. With `errors`, a rare row carries
+/// `__error__` metadata, which fails the metric queries that see it.
+fn lineless_batches(rng: &mut Rng, previous: &[LogBatch], errors: bool) -> Vec<LogBatch> {
+    if !previous.is_empty() && rng.below(4) == 0 {
+        return previous.to_vec();
+    }
+    let services: Vec<_> = ["api", "cart"]
+        .into_iter()
+        .filter(|_| rng.below(3) > 0)
+        .collect();
+    services
+        .into_iter()
+        .map(|service| {
+            let entries = (0..1 + rng.below(9))
+                .map(|_| {
+                    let timestamp = rng.below(120) as i64 * 250_000_000;
+                    let line = rng.pick(&["GET /a", "GET /b", "POST /checkout", ""]);
+                    match rng.below(if errors { 60 } else { 3 }) {
+                        59 => LogEntry::with_structured_metadata(
+                            timestamp,
+                            line,
+                            crate::Fields::new(vec![crate::Field::new("__error__", "bad")])
+                                .unwrap(),
+                        ),
+                        0..20 if errors => LogEntry::new(timestamp, line),
+                        0 | 20..40 => LogEntry::with_structured_metadata(
+                            timestamp,
+                            line,
+                            crate::Fields::new(vec![crate::Field::new(
+                                "pod",
+                                rng.pick(&["x", "y"]),
+                            )])
+                            .unwrap(),
+                        ),
+                        _ => LogEntry::new(timestamp, line),
+                    }
+                })
+                .collect();
+            LogBatch::new(labels(service, "prod"), entries)
+        })
+        .collect()
+}
+
+/// Lineless metric reads count from run records, block headers and meta
+/// values; a no-op line filter forces the full-row read, which must agree.
+#[tokio::test]
+async fn lineless_metric_reads_match_full_row_reads() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    const MS: i64 = 1_000_000;
+    let ops = ["count_over_time", "rate", "bytes_over_time", "bytes_rate"];
+    let wrappers = [
+        "{}",
+        "sum({})",
+        "sum by (service) ({})",
+        "sum by (pod) ({})",
+        "sum without (pod) ({})",
+        "sum({}) + sum by (service) ({})",
+    ];
+    let selectors = [r#"{environment="prod"}"#, r#"{service="api"}"#];
+    for seed in 1..=30u64 {
+        let db = LogDb::open(Config {
+            retention: None,
+            page: PageConfig {
+                target_size_bytes: 4096,
+                max_rows: 12,
+                rows_per_block: 3,
+            },
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut previous = Vec::new();
+        for _ in 0..1 + rng.below(6) {
+            let batches = lineless_batches(&mut rng, &previous, seed % 5 == 0);
+            db.write(&namespace, batches.clone()).await.unwrap();
+            previous = batches;
+        }
+        for _ in 0..40 {
+            let op = ops[rng.below(ops.len() as u64) as usize];
+            let selector = selectors[rng.below(2) as usize];
+            let range = [1_000, 2_500, 5_000, 7_000][rng.below(4) as usize];
+            let offset = [0, 1_000, 750][rng.below(3) as usize];
+            let window = |filter: &str| {
+                let offset = if offset == 0 {
+                    String::new()
+                } else {
+                    format!(" offset {offset}ms")
+                };
+                format!("{op}({selector}{filter} [{range}ms]{offset})")
+            };
+            let wrapper = wrappers[rng.below(wrappers.len() as u64) as usize];
+            let (fast, slow) = (
+                wrapper.replace("{}", &window("")),
+                wrapper.replace("{}", &window(r#" |= """#)),
+            );
+            let start = rng.below(140) as i64 * 250 * MS;
+            let (fast, slow) = if rng.below(4) == 0 {
+                (
+                    QueryRequest::instant(fast, start),
+                    QueryRequest::instant(slow, start),
+                )
+            } else {
+                let end = start + rng.below(80) as i64 * 250 * MS;
+                let step = [250, 1_000, 3_000, 5_000][rng.below(4) as usize] * MS;
+                (
+                    QueryRequest::range(fast, start, end, step),
+                    QueryRequest::range(slow, start, end, step),
+                )
+            };
+            let result = async |request| {
+                db.query(&namespace, request, QueryOptions::default())
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+            assert_eq!(
+                result(&fast).await,
+                result(&slow).await,
+                "seed {seed}: {fast:?}"
+            );
+        }
+        db.close().await.unwrap();
+    }
+}
+
+/// Runs counted from their records leave gaps between the runs decoded
+/// around them, which the query's page estimate covered in one read unit.
+#[tokio::test]
+async fn lineless_reads_stay_within_the_page_estimate() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    // One object of three streams' runs in one-row blocks. The window
+    // (5s, 30s] splits two of them; the third lies inside it and is counted,
+    // leaving a 12-block gap when its run falls between the other two.
+    for counted in 0..3 {
+        let db = LogDb::open(Config {
+            segment_duration: Duration::from_secs(60),
+            discovery_rollup: None,
+            retention: None,
+            page: PageConfig {
+                target_size_bytes: 1 << 20,
+                max_rows: 1_000,
+                rows_per_block: 1,
+            },
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let batches = (0..3)
+            .map(|stream| {
+                let seconds = if stream == counted { 6..18 } else { 0..36 };
+                let entries = seconds
+                    .map(|second| LogEntry::new(second * 1_000_000_000, "GET /a"))
+                    .collect();
+                LogBatch::new(labels(&format!("s{stream}"), "prod"), entries)
+            })
+            .collect();
+        db.write(&namespace, batches).await.unwrap();
+        let result = async |query: &str, max_pages| {
+            db.query(
+                &namespace,
+                &QueryRequest::instant(query, 30_000_000_000),
+                QueryOptions {
+                    max_pages,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        };
+        let full = r#"sum(count_over_time({environment="prod"} |= "" [25s]))"#;
+        let mut max_pages = 1;
+        let expected = loop {
+            match result(full, max_pages).await {
+                Err(error) if error.contains("max_pages") => max_pages += 1,
+                other => break other,
+            }
+        };
+        assert!(expected.is_ok(), "{expected:?}");
+        assert_eq!(
+            result(
+                r#"sum(count_over_time({environment="prod"} [25s]))"#,
+                max_pages
+            )
+            .await,
+            expected,
+            "stream {counted} counted, {max_pages} pages"
+        );
+        db.close().await.unwrap();
+    }
+}
+
+/// A line of words from a small vocabulary plus a rare request ID, so some
+/// interior terms are rare enough to prefilter.
+fn prefilter_line(rng: &mut Rng) -> String {
+    format!(
+        "{} {} {} req{} {}",
+        rng.pick(&["GET", "POST", "get"]),
+        rng.pick(&["/api/users", "/api/cart", "/Api/users"]),
+        rng.pick(&["200", "500", "timeout"]),
+        rng.below(300),
+        rng.pick(&["user@example.com", "https://x.io/a?b=1", "done", "-"]),
+    )
+}
+
+/// `|=` filters whose interior terms narrow reads through postings return
+/// what the same filter returns unnarrowed, as a two-branch filter is.
+#[tokio::test]
+async fn prefiltered_line_filters_match_unfiltered_reads() {
+    use crate::codec::RecordType;
+    use crate::query::{Direction, QueryOptions, QueryRequest};
+
+    let mut narrowed_reads = 0;
+    let mut plain_reads = 0;
+    for seed in 1..=10u64 {
+        let mut db = LogDb::open(compacting_config()).await.unwrap();
+        let namespace = Namespace::default();
+        let segment = current_segment();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut written = Vec::new();
+        for _ in 0..12 {
+            let batches = ["api", "cart", "web"]
+                .into_iter()
+                .map(|service| {
+                    let entries = (0..1 + rng.below(12))
+                        .map(|_| {
+                            let line = prefilter_line(&mut rng);
+                            written.push(line.clone());
+                            LogEntry::new(segment + rng.below(20_000) as i64 * 1_000_000, line)
+                        })
+                        .collect();
+                    LogBatch::new(labels(service, "prod"), entries)
+                })
+                .collect();
+            db.write(&namespace, batches).await.unwrap();
+        }
+        let counting = count_reads(
+            &mut db,
+            vec![crate::codec::record_type_prefix(
+                &namespace,
+                segment,
+                RecordType::ObjectBlock,
+            )],
+        );
+        let end = segment + 20_000_000_000;
+        for _ in 0..30 {
+            let line = &written[rng.below(written.len() as u64) as usize];
+            let needle = if rng.below(5) == 0 {
+                "GET /api/users req999 x".to_owned()
+            } else {
+                let start = rng.below(line.len() as u64 / 2) as usize;
+                line[start..line.len() - rng.below(line.len() as u64 / 3) as usize].to_owned()
+            };
+            let needle = needle.replace('"', "");
+            let selector = r#"{environment="prod"}"#;
+            let shape = rng.below(4);
+            let query = |filter: String| match shape {
+                0 => format!("{selector} {filter}"),
+                1 => format!("count_over_time({selector} {filter} [5s])"),
+                2 => format!("sum by (service) (bytes_over_time({selector} {filter} [3s]))"),
+                _ => format!("{selector} {filter} | logfmt | __error__=\"\""),
+            };
+            let narrowed = query(format!("|= \"{needle}\""));
+            let plain = query(format!("|= \"{needle}\" or \"{needle}\""));
+            let options = QueryOptions {
+                limit: [3, 1_000][rng.below(2) as usize],
+                direction: [Direction::Forward, Direction::Backward][rng.below(2) as usize],
+                ..QueryOptions::default()
+            };
+            let run = async |query: String| {
+                let request = QueryRequest::range(query, segment, end, 1_000_000_000);
+                let result = db.query(&namespace, &request, options.clone()).await;
+                (
+                    result.map_err(|error| error.to_string()),
+                    counting.take()[0],
+                )
+            };
+            let (narrowed_result, (gets, scans)) = run(narrowed.clone()).await;
+            narrowed_reads += gets + scans;
+            let (plain_result, (gets, scans)) = run(plain).await;
+            plain_reads += gets + scans;
+            assert_eq!(narrowed_result, plain_result, "seed {seed}: {narrowed}");
+        }
+        db.close().await.unwrap();
+    }
+    assert!(
+        narrowed_reads < plain_reads,
+        "{narrowed_reads} block reads with postings, {plain_reads} without"
+    );
 }

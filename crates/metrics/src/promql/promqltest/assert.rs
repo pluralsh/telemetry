@@ -1,19 +1,10 @@
 use crate::histogram::{Bucket, FloatHistogram};
 use crate::model::RangeSample;
 
-/// Compare actual results against expected results
+/// Compare actual results against expected results.
 ///
-/// IMPORTANT: Metric name handling follows Prometheus promqltest semantics:
-/// - Prometheus represents the metric name as the __name__ label
-/// - If expected sample omits __name__ → we don't check it (allows flexible matching)
-/// - If expected sample includes __name__ → we verify it matches
-///
-/// This means test expectations can be written as:
-///   {job="test"} 42          # Matches any metric with job="test"
-///   {__name__="metric"} 42   # Must be exactly "metric"
-///
-/// The implementation achieves this by only checking labels that are present in the
-/// expected sample, not all labels from the actual result.
+/// Labelsets must match exactly, as in Prometheus' promqltest: an
+/// expectation without a metric name asserts that the result has none.
 pub(super) fn assert_results(
     results: &[RangeSample],
     expected: &[RangeSample],
@@ -35,36 +26,26 @@ pub(super) fn assert_results(
 
     // Most instant vectors are unordered in PromQL, but promqltest supports
     // `expect ordered` for order-sensitive checks (e.g. topk/bottomk).
+    let sorted_labels = |s: &RangeSample| {
+        let mut labels: Vec<_> = s.labels.iter().cloned().collect();
+        labels.sort();
+        labels
+    };
     let mut results_sorted = results.to_vec();
     let mut expected_sorted = expected.to_vec();
-    // Expectations may omit `__name__`, so it can't take part in the order.
     if !expect_ordered {
-        let key = |s: &RangeSample| {
-            s.labels
-                .iter()
-                .filter(|l| l.name != "__name__")
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        results_sorted.sort_by_cached_key(key);
-        expected_sorted.sort_by_cached_key(key);
+        results_sorted.sort_by_cached_key(sorted_labels);
+        expected_sorted.sort_by_cached_key(sorted_labels);
     }
 
     for (i, exp) in expected_sorted.iter().enumerate() {
         let result = &results_sorted[i];
 
-        // Check all expected labels are present and match
-        for label in exp.labels.iter() {
-            let actual = result.labels.get(&label.name).ok_or(format!(
-                "{} eval #{} (query: {}): Missing label '{}'",
-                test_name, eval_num, query, label.name
-            ))?;
-            if actual != label.value {
-                return Err(format!(
-                    "{} eval #{} (query: {}): Label {} mismatch: expected '{}', got '{}'",
-                    test_name, eval_num, query, label.name, label.value, actual
-                ));
-            }
+        if sorted_labels(result) != sorted_labels(exp) {
+            return Err(format!(
+                "{} eval #{} (query: {}): Labels mismatch: expected {:?}, got {:?}",
+                test_name, eval_num, query, exp.labels, result.labels
+            ));
         }
 
         let mismatch = match (exp.histograms.first(), result.histograms.first()) {
@@ -162,6 +143,22 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_unexpected_metric_name() {
+        // given
+        let results = vec![range_sample(
+            labels_from(&[("__name__", "metric"), ("job", "test")]),
+            42.0,
+        )];
+        let expected = vec![range_sample(labels_from(&[("job", "test")]), 42.0)];
+
+        // when
+        let result = assert_results(&results, &expected, false, "test", 1, "metric");
+
+        // then
+        assert!(result.unwrap_err().contains("Labels mismatch"));
+    }
+
+    #[test]
     fn should_reject_count_mismatch() {
         // given
         let results = vec![range_sample(Labels::empty(), 42.0)];
@@ -206,7 +203,7 @@ mod tests {
 
         // then
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Label instance mismatch"));
+        assert!(result.unwrap_err().contains("Labels mismatch"));
     }
 
     #[test]

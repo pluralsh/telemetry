@@ -22,11 +22,7 @@ pub(super) fn eval_expr(query: &Query, rows: &MetricRows, timestamp: i64) -> Res
             expr,
             ..
         } => range_aggregation(*op, *parameter, expr, rows, timestamp),
-        Expr::LabelAggregation {
-            field,
-            expr,
-            grouping,
-        } => label_aggregation(field, expr, grouping.as_ref(), rows, timestamp),
+        Expr::LabelAggregation { expr, .. } => label_aggregation(expr, rows, timestamp),
         Expr::VectorAggregation {
             op,
             parameter,
@@ -167,23 +163,72 @@ pub(super) fn range_aggregation(
     Ok(Value::Vector(points))
 }
 
-/// A metric sample carrying `__error__` fails the query unless the pipeline
-/// asked to keep it with `__preserve_error__="true"`.
-fn check_error(row: &Row) -> Result<()> {
-    error_message(row).map_or(Ok(()), |message| Err(Error::Query(message)))
-}
-
-fn error_message(row: &Row) -> Option<String> {
-    match row.labels.get(ERROR_LABEL) {
-        Some(kind) if row.labels.get(PRESERVE_ERROR_LABEL).map(String::as_str) != Some("true") => {
-            let details = row
-                .labels
-                .get(ERROR_DETAILS_LABEL)
-                .map_or("", String::as_str);
+/// The error a metric sample with labels `label` fails its query with: one
+/// carrying `__error__` fails it unless the pipeline asked to keep it with
+/// `__preserve_error__="true"`.
+pub(super) fn pipeline_error<'a>(label: impl Fn(&str) -> Option<&'a str>) -> Option<String> {
+    match label(ERROR_LABEL) {
+        Some(kind) if label(PRESERVE_ERROR_LABEL) != Some("true") => {
+            let details = label(ERROR_DETAILS_LABEL).unwrap_or("");
             Some(format!("pipeline error: {kind}: {details}"))
         }
         _ => None,
     }
+}
+
+/// What a row contributes to a range aggregation: a weighted row stands for
+/// stored rows that every window holds all or none of, so it contributes
+/// their totals at once.
+pub(super) fn sample_value(
+    op: RangeOp,
+    unwraps: bool,
+    weight: Option<(u32, u64)>,
+    line_bytes: usize,
+    unwrapped: Option<f64>,
+) -> Option<f64> {
+    match (op, weight) {
+        (RangeOp::Bytes | RangeOp::BytesRate, Some((_, bytes))) => Some(bytes as f64),
+        (RangeOp::Count | RangeOp::Rate, Some((rows, _))) => Some(f64::from(rows)),
+        (RangeOp::Bytes | RangeOp::BytesRate, None) => Some(line_bytes as f64),
+        (RangeOp::Rate, _) if unwraps => unwrapped,
+        (RangeOp::Count | RangeOp::Rate | RangeOp::Absent, _) => Some(1.0),
+        _ => unwrapped,
+    }
+}
+
+/// One row's contribution to a range aggregation.
+pub(super) struct RangeRow {
+    pub(super) timestamp_ns: i64,
+    pub(super) stream: u64,
+    /// The stored row's identity among those sharing its timestamp and
+    /// stream; unset for lineless reads, which need no deduplication.
+    pub(super) identity: u64,
+    /// Orders rows sharing a timestamp and stream as Loki's merge does.
+    pub(super) tie: Tie,
+    pub(super) value: Option<f64>,
+    /// Index of the row's series labels; meaningless without a value.
+    pub(super) series: u32,
+    pub(super) failure: Option<String>,
+}
+
+/// A label aggregation's rows, in timestamp order.
+#[derive(Default)]
+pub(super) struct LabelSamples {
+    pub(super) timestamps: Vec<i64>,
+    pub(super) rows: Vec<LabelRow>,
+    pub(super) groups: Vec<LabelMap>,
+}
+
+pub(super) struct LabelRow {
+    pub(super) timestamp_ns: i64,
+    pub(super) stream: u64,
+    pub(super) identity: u64,
+    pub(super) tie: Tie,
+    pub(super) failure: Option<String>,
+    /// The counted field's value, when present and not empty.
+    pub(super) value: Option<String>,
+    /// Index of the row's group labels; meaningless without a value.
+    pub(super) group: u32,
 }
 
 /// A range aggregation's rows reduced to what every step needs: each row's
@@ -242,79 +287,46 @@ impl RangeSeries {
             .collect()
     }
 
-    /// `rows` must be in ascending timestamp order.
-    pub(super) fn new(
+    /// From rows in timestamp order, whose series index `labels`.
+    pub(super) fn from_rows(
         op: RangeOp,
         log: &LogExpr,
-        grouping: Option<&Grouping>,
-        rows: Vec<Row>,
+        rows: Vec<RangeRow>,
+        labels: &[LabelMap],
     ) -> Self {
-        let unwrap_label = log.stages.iter().find_map(|stage| match &stage.value {
-            PipelineStage::Unwrap(unwrap) => Some(&unwrap.label),
-            _ => None,
-        });
-        let drop_unwrap_label = grouping.is_none_or(|grouping| grouping.without);
+        let unwraps = log
+            .stages
+            .iter()
+            .any(|stage| matches!(stage.value, PipelineStage::Unwrap(_)));
         let whole = match op {
             RangeOp::Count | RangeOp::Bytes | RangeOp::BytesRate => true,
-            RangeOp::Rate => unwrap_label.is_none(),
+            RangeOp::Rate => !unwraps,
             _ => false,
         };
         let timestamps = rows.iter().map(|row| row.timestamp_ns).collect();
         let mut failures = Vec::new();
-        let mut by_labels: HashMap<LabelMap, u32> = HashMap::new();
-        // Rows sharing a label allocation (a stream's, when no stage changed
-        // them) share a group, found once; holding the labels keeps their
-        // addresses from being reused.
-        let mut by_address: HashMap<*const BTreeMap<String, String>, (LabelMap, u32)> =
-            HashMap::new();
+        let mut ids = vec![u32::MAX; labels.len()];
         let mut groups: Vec<RangeGroup> = Vec::new();
         let mut members = Vec::new();
         for row in rows {
-            // Checked before grouping, which could otherwise hide the label.
-            if let Some(message) = error_message(&row) {
+            if let Some(message) = row.failure {
                 failures.push((row.timestamp_ns, message));
             }
-            let value = match op {
-                RangeOp::Bytes | RangeOp::BytesRate => Some(row.line.len() as f64),
-                RangeOp::Rate if unwrap_label.is_some() => row.value,
-                RangeOp::Count | RangeOp::Rate | RangeOp::Absent => Some(1.0),
-                _ => row.value,
-            };
-            let Some(value) = value else {
+            let Some(value) = row.value else {
                 continue;
             };
-            let address = Arc::as_ptr(&row.labels);
-            let id = match by_address.get(&address) {
-                Some((_, id)) => *id,
-                None => {
-                    let shared = Arc::strong_count(&row.labels) > 1;
-                    let pinned = shared.then(|| Arc::clone(&row.labels));
-                    let dropped = unwrap_label.filter(|_| drop_unwrap_label);
-                    let labels = series_labels(row.labels, grouping, dropped);
-                    let id = match by_labels.get(&labels) {
-                        Some(id) => *id,
-                        None => {
-                            let labels = Arc::new(labels);
-                            let id =
-                                u32::try_from(groups.len()).expect("fewer than u32::MAX groups");
-                            groups.push(RangeGroup {
-                                labels: Arc::clone(&labels),
-                                timestamps: Vec::new(),
-                                values: Vec::new(),
-                                totals: if whole { vec![0] } else { Vec::new() },
-                            });
-                            by_labels.insert(labels, id);
-                            id
-                        }
-                    };
-                    if let Some(pinned) = pinned {
-                        by_address.insert(address, (pinned, id));
-                    }
-                    id
-                }
-            };
-            members.push((row.timestamp_ns, id));
-            let group = &mut groups[id as usize];
+            let id = &mut ids[row.series as usize];
+            if *id == u32::MAX {
+                *id = u32::try_from(groups.len()).expect("fewer than u32::MAX groups");
+                groups.push(RangeGroup {
+                    labels: Arc::clone(&labels[row.series as usize]),
+                    timestamps: Vec::new(),
+                    values: Vec::new(),
+                    totals: if whole { vec![0] } else { Vec::new() },
+                });
+            }
+            members.push((row.timestamp_ns, *id));
+            let group = &mut groups[*id as usize];
             group.timestamps.push(row.timestamp_ns);
             group.values.push(value);
             if whole {
@@ -322,9 +334,17 @@ impl RangeSeries {
                 group.totals.push(total.saturating_add(value as u64));
             }
         }
-        // Groups are numbered as they first appear; renumber them, and
-        // `members`, in label order.
-        drop((by_labels, by_address));
+        Self::ordered(timestamps, failures, groups, members)
+    }
+
+    /// Groups are numbered as they first appear; renumbers them, and
+    /// `members`, in label order.
+    fn ordered(
+        timestamps: Vec<i64>,
+        failures: Vec<(i64, String)>,
+        groups: Vec<RangeGroup>,
+        mut members: Vec<(i64, u32)>,
+    ) -> Self {
         let mut order = (0..groups.len()).collect::<Vec<_>>();
         order.sort_unstable_by(|&a, &b| groups[a].labels.cmp(&groups[b].labels));
         let mut rank = vec![0u32; groups.len()];
@@ -345,66 +365,44 @@ impl RangeSeries {
     }
 }
 
-/// A row's range-aggregation series: its labels narrowed by `grouping`,
-/// keeping any error labels and dropping the unwrapped one. Takes the
-/// labels' map without copying when nothing else shares it.
-fn series_labels(
-    labels: LabelMap,
-    grouping: Option<&Grouping>,
-    unwrap_label: Option<&String>,
-) -> BTreeMap<String, String> {
-    let errored = labels.contains_key(ERROR_LABEL);
-    let keep = |name: &String| {
-        (errored && is_error_label(name))
-            || grouping.is_none_or(|grouping| grouping.labels.contains(name) != grouping.without)
-    };
-    let mut labels = match Arc::try_unwrap(labels) {
-        Ok(mut labels) => {
-            if grouping.is_some() {
-                labels.retain(|name, _| keep(name));
-            }
-            labels
-        }
-        Err(shared) => shared
-            .iter()
-            .filter(|(name, _)| keep(name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-    };
-    if let Some(label) = unwrap_label {
-        labels.remove(label);
-    }
-    labels
-}
-
-pub(super) fn label_aggregation(
-    field: &str,
-    log: &LogExpr,
-    grouping: Option<&Grouping>,
-    rows: &MetricRows,
-    timestamp: i64,
-) -> Result<Value> {
+/// Counts distinct values of the aggregated field per group; the pipeline
+/// already narrowed each row's labels to its group, without the field.
+pub(super) fn label_aggregation(log: &LogExpr, rows: &MetricRows, timestamp: i64) -> Result<Value> {
     let range = log
         .range
         .as_ref()
         .ok_or_else(|| Error::Query("label aggregation requires a range".into()))
         .and_then(|value| parse_duration_ns(&value.value))?;
-    let selected = rows.window(log, timestamp.saturating_sub(range), timestamp)?;
-    let mut groups: BTreeMap<BTreeMap<String, String>, BTreeSet<String>> = BTreeMap::new();
-    for row in selected {
-        check_error(row)?;
-        if let Some(value) = lookup(row, field).filter(|value| !value.is_empty()) {
-            let mut labels = group_labels(&row.labels, grouping);
-            // The counted field would otherwise split every value into its own series.
-            labels.remove(field);
-            groups.entry(labels).or_default().insert(value.to_owned());
+    let samples = rows
+        .label_samples
+        .get(&(log as *const LogExpr as usize))
+        .ok_or_else(|| Error::Query("label aggregation was not prepared".into()))?;
+    let offset = log_offset(log)?;
+    let (start, end) = (
+        timestamp.saturating_sub(range).saturating_sub(offset),
+        timestamp.saturating_sub(offset),
+    );
+    let low = samples.timestamps.partition_point(|&at| at <= start);
+    let high = samples.timestamps.partition_point(|&at| at <= end).max(low);
+    let mut groups: BTreeMap<&BTreeMap<String, String>, (u32, BTreeSet<&str>)> = BTreeMap::new();
+    for row in &samples.rows[low..high] {
+        if let Some(message) = &row.failure {
+            return Err(Error::Query(message.clone()));
+        }
+        if let Some(value) = &row.value {
+            let labels = &samples.groups[row.group as usize];
+            groups
+                .entry(labels)
+                .or_insert_with(|| (row.group, BTreeSet::new()))
+                .1
+                .insert(value);
         }
     }
     Ok(Value::Vector(
         groups
-            .into_iter()
-            .map(|(labels, values)| Point {
-                labels: Arc::new(labels),
+            .into_values()
+            .map(|(group, values)| Point {
+                labels: Arc::clone(&samples.groups[group as usize]),
                 value: values.len() as f64,
             })
             .collect(),
@@ -426,25 +424,6 @@ pub(super) fn selector_equality_labels(log: &LogExpr) -> BTreeMap<String, String
     }
     labels.retain(|name, value| !value.is_empty() && !removed.contains(name));
     labels
-}
-
-pub(super) fn group_labels(
-    labels: &BTreeMap<String, String>,
-    grouping: Option<&Grouping>,
-) -> BTreeMap<String, String> {
-    match grouping {
-        None => labels.clone(),
-        Some(grouping) if grouping.without => labels
-            .iter()
-            .filter(|(name, _)| !grouping.labels.contains(name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-        Some(grouping) => labels
-            .iter()
-            .filter(|(name, _)| grouping.labels.contains(name))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-    }
 }
 
 /// A vector aggregation's group, as borrowed pairs in name order, which sort
@@ -932,13 +911,17 @@ pub(super) fn string_match(op: MatchOp, actual: &str, expected: &str) -> Result<
     })
 }
 
+/// Population variance by Welford's update, as Loki computes it, so equal
+/// values give exactly zero.
 pub(super) fn variance(values: &[f64]) -> f64 {
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    values
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f64>()
-        / values.len() as f64
+    let (mut count, mut mean, mut aux) = (0.0, 0.0, 0.0);
+    for &value in values {
+        count += 1.0;
+        let delta = value - mean;
+        mean += delta / count;
+        aux += delta * (value - mean);
+    }
+    aux / count
 }
 
 pub(super) fn quantile(quantile: f64, values: &[f64]) -> f64 {
@@ -999,4 +982,20 @@ pub(super) fn extrapolated_counter_rate(
     }
     result * ((sampled_interval + to_start + to_end) / sampled_interval)
         / (range_ns as f64 / 1_000_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::variance;
+
+    #[test]
+    fn should_give_zero_variance_for_equal_values() {
+        assert_eq!(variance(&[0.1, 0.1, 0.1]), 0.0);
+        assert_eq!(variance(&[0.3; 7]), 0.0);
+    }
+
+    #[test]
+    fn should_compute_population_variance() {
+        assert_eq!(variance(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]), 4.0);
+    }
 }

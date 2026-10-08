@@ -48,6 +48,38 @@ async fn should_read_data_written_by_storage_via_reader() {
 }
 
 #[tokio::test]
+async fn should_flush_memtable_to_l0_periodically_only_after_writes() {
+    // given: a storage whose periodic flusher runs every 50 ms
+    let db = DbBuilder::new("periodic-flush", Arc::new(InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    let storage = SlateDbStorage::new(Arc::new(db)).with_memtable_flush(Duration::from_millis(50));
+    let last_l0_seq = || storage.db().manifest().last_l0_seq();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(last_l0_seq(), 0, "no writes, so no L0 flush");
+
+    // when
+    storage
+        .put(vec![
+            Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+        ])
+        .await
+        .unwrap();
+
+    // then
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_l0_seq() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write never reached L0"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn should_scan_data_written_by_storage_via_reader() {
     let object_store = Arc::new(InMemory::new());
     let path = "/test/db";
