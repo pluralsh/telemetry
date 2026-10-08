@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "name": "2026-10-08T0424Z-0b54fe965a-64799c3c",
+  "product": "traces",
+  "run_id": "20261008T042430Z-64799c3c",
+  "batch": "bench-20261008T024931Z",
+  "started_at": "2026-10-08T04:24:49Z",
+  "finished_at": "2026-10-08T04:54:26Z",
+  "git": {
+    "commit": "0b54fe965ae87da5e3f20652478d99d79edd89f5",
+    "short": "0b54fe965a",
+    "branch": "simd-perf",
+    "dirty": false
+  },
+  "host": {
+    "label": null,
+    "os": "Linux",
+    "os_release": "7.0.14-orbstack-00380-ga7e0a2dc9535",
+    "arch": "aarch64",
+    "cpu": null,
+    "cores": 12,
+    "memory_gib": 8.8,
+    "python": "3.13.16",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 1800.0,
+    "seed": 1685691452,
+    "scale": 1.0,
+    "window_s": 600.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 30.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "historical",
+    "isolated": true
+  },
+  "settings": {
+    "impl_config": "production",
+    "oracle": "tempo-s3"
+  },
+  "environment": {
+    "FUZZ_IN_NETWORK": "1",
+    "FUZZ_SCENARIO": "historical",
+    "FUZZ_TRACES_CONFIG": "production",
+    "REGRESSION_BUILD": "0",
+    "TEMPO_IMAGE": "grafana/tempo:2.10.8"
+  },
+  "images": {
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    },
+    "minio-latency": {
+      "image": "python:3.13-slim",
+      "id": "3874bc630edc"
+    },
+    "tempo": {
+      "image": "grafana/tempo:2.10.8",
+      "id": "432b0c85b622"
+    },
+    "traces-s3": {
+      "image": "telemetry-regression/plural-traces-server:local",
+      "id": "fd0907919f53"
+    }
+  },
+  "layout": {
+    "network": "compose-network",
+    "cpus": {
+      "docker_cpus": 12,
+      "lane": "6-11",
+      "pinned": true,
+      "cpusets": {
+        "shared": "6",
+        "runner": "7",
+        "impl": "8-9",
+        "oracle": "10-11"
+      }
+    }
+  },
+  "variant": "impl_config=production, oracle=tempo-s3, scenario=historical, network=compose, pinned",
+  "results": {
+    "status": "failed",
+    "reasons": [
+      "1 mismatch case(s)"
+    ],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 1776.7,
+    "rounds": 36,
+    "invisible_rounds": 0,
+    "cases": 3461,
+    "non_match": 368,
+    "outcomes": {
+      "match": 3093,
+      "mismatch": 1,
+      "inconclusive": 367
+    },
+    "ingest": {
+      "batches": 72,
+      "outcomes": {
+        "ok": 72
+      },
+      "oracle_ms": {
+        "p50": 3.326,
+        "p90": 15.462,
+        "p99": 26.194,
+        "max": 26.194
+      },
+      "impl_ms": {
+        "p50": 1.478,
+        "p90": 5.294,
+        "p99": 8.651,
+        "max": 8.651
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": 409.576,
+        "p90": 554.53,
+        "p99": 796.935,
+        "p99.9": 1297.485,
+        "max": 1388.467
+      },
+      "impl_ms": {
+        "p50": 5.882,
+        "p90": 20.72,
+        "p99": 51.774,
+        "p99.9": 121.88,
+        "max": 226.876
+      },
+      "ratio": {
+        "p50": 0.017,
+        "p90": 0.053,
+        "p99": 0.196
+      },
+      "outliers": 0
+    },
+    "families": {
+      "tags.names": {
+        "cases": 156,
+        "non_match": 99,
+        "outcomes": {
+          "match": 57,
+          "inconclusive": 99
+        },
+        "oracle_ms": {
+          "p50": 231.189,
+          "p90": 385.769,
+          "p99": 442.027
+        },
+        "impl_ms": {
+          "p50": 3.731,
+          "p90": 8.495,
+          "p99": 22.291
+        },
+        "ratio": {
+          "p50": 0.018,
+          "p90": 0.044
+        }
+      },
+      "tags.values": {
+        "cases": 153,
+        "non_match": 1,
+        "outcomes": {
+          "match": 152,
+          "mismatch": 1
+        },
+        "oracle_ms": {
+          "p50": 74.796,
+          "p90": 138.644,
+          "p99": 155.216
+        },
+        "impl_ms": {
+          "p50": 3.735,
+          "p90": 21.058,
+          "p99": 26.693
+        },
+        "ratio": {
+          "p50": 0.043,
+          "p90": 0.29
+        }
+      },
+      "trace.by_id": {
+        "cases": 608,
+        "non_match": 0,
+        "outcomes": {
+          "match": 608
+        },
+        "oracle_ms": {
+          "p50": 199.474,
+          "p90": 299.535,
+          "p99": 1054.757
+        },
+        "impl_ms": {
+          "p50": 1.959,
+          "p90": 5.617,
+          "p99": 23.078
+        },
+        "ratio": {
+          "p50": 0.01,
+          "p90": 0.052
+        }
+      },
+      "traceql.aggregate": {
+        "cases": 372,
+        "non_match": 16,
+        "outcomes": {
+          "match": 356,
+          "inconclusive": 16
+        },
+        "oracle_ms": {
+          "p50": 425.74,
+          "p90": 552.925,
+          "p99": 1003.995
+        },
+        "impl_ms": {
+          "p50": 6.968,
+          "p90": 20.552,
+          "p99": 46.745
+        },
+        "ratio": {
+          "p50": 0.018,
+          "p90": 0.053
+        }
+      },
+      "traceql.by": {
+        "cases": 143,
+        "non_match": 22,
+        "outcomes": {
+          "match": 121,
+          "inconclusive": 22
+        },
+        "oracle_ms": {
+          "p50": 476.681,
+          "p90": 555.393,
+          "p99": 671.962
+        },
+        "impl_ms": {
+          "p50": 7.034,
+          "p90": 18.848,
+          "p99": 65.761
+        },
+        "ratio": {
+          "p50": 0.016,
+          "p90": 0.038
+        }
+      },
+      "traceql.pipeline": {
+        "cases": 136,
+        "non_match": 6,
+        "outcomes": {
+          "match": 130,
+          "inconclusive": 6
+        },
+        "oracle_ms": {
+          "p50": 405.376,
+          "p90": 556.438,
+          "p99": 634.944
+        },
+        "impl_ms": {
+          "p50": 6.462,
+          "p90": 24.128,
+          "p99": 47.064
+        },
+        "ratio": {
+          "p50": 0.018,
+          "p90": 0.053
+        }
+      },
+      "traceql.select": {
+        "cases": 101,
+        "non_match": 12,
+        "outcomes": {
+          "match": 89,
+          "inconclusive": 12
+        },
+        "oracle_ms": {
+          "p50": 498.866,
+          "p90": 591.724,
+          "p99": 712.342
+        },
+        "impl_ms": {
+          "p50": 6.417,
+          "p90": 20.239,
+          "p99": 30.207
+        },
+        "ratio": {
+          "p50": 0.015,
+          "p90": 0.044
+        }
+      },
+      "traceql.spanset": {
+        "cases": 1195,
+        "non_match": 171,
+        "outcomes": {
+          "match": 1024,
+          "inconclusive": 171
+        },
+        "oracle_ms": {
+          "p50": 445.009,
+          "p90": 534.17,
+          "p99": 774.039
+        },
+        "impl_ms": {
+          "p50": 7.906,
+          "p90": 23.771,
+          "p99": 62.233
+        },
+        "ratio": {
+          "p50": 0.02,
+          "p90": 0.051
+        }
+      },
+      "traceql.structural": {
+        "cases": 597,
+        "non_match": 41,
+        "outcomes": {
+          "match": 556,
+          "inconclusive": 41
+        },
+        "oracle_ms": {
+          "p50": 497.051,
+          "p90": 622.702,
+          "p99": 762.23
+        },
+        "impl_ms": {
+          "p50": 7.784,
+          "p90": 23.721,
+          "p99": 60.031
+        },
+        "ratio": {
+          "p50": 0.017,
+          "p90": 0.045
+        }
+      }
+    },
+    "floor": {
+      "minio": {
+        "role": "shared",
+        "p50": 20.536,
+        "p99": 39.766
+      },
+      "tempo": {
+        "role": "oracle",
+        "p50": 1.671,
+        "p99": 8.838
+      },
+      "traces-s3": {
+        "role": "impl",
+        "p50": 0.983,
+        "p99": 7.065
+      }
+    },
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 1776.8,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "traces-s3"
+          ],
+          "cpu_seconds": 44.2,
+          "cpu_cores": {
+            "mean": 0.025,
+            "p95": 0.054,
+            "max": 0.286
+          },
+          "memory_mib": {
+            "mean": 97.9,
+            "p95": 125.3,
+            "max": 129.9
+          }
+        },
+        "oracle": {
+          "services": [
+            "tempo"
+          ],
+          "cpu_seconds": 270.6,
+          "cpu_cores": {
+            "mean": 0.152,
+            "p95": 0.264,
+            "max": 0.552
+          },
+          "memory_mib": {
+            "mean": 354.1,
+            "p95": 491.7,
+            "max": 665.3
+          }
+        },
+        "shared": {
+          "services": [
+            "minio",
+            "minio-latency"
+          ],
+          "cpu_seconds": 411.4,
+          "cpu_cores": {
+            "mean": 0.232,
+            "p95": 0.358,
+            "max": 0.656
+          },
+          "memory_mib": {
+            "mean": 372.9,
+            "p95": 466.9,
+            "max": 555.7
+          }
+        }
+      },
+      "services": {
+        "minio": {
+          "cpu_seconds": 322.3,
+          "peak_memory_mib": 515.5
+        },
+        "minio-latency": {
+          "cpu_seconds": 89.1,
+          "peak_memory_mib": 40.7
+        },
+        "tempo": {
+          "cpu_seconds": 270.6,
+          "peak_memory_mib": 665.3
+        },
+        "traces-s3": {
+          "cpu_seconds": 44.2,
+          "peak_memory_mib": 129.9
+        }
+      }
+    }
+  }
+}

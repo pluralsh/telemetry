@@ -1,13 +1,14 @@
 //! A batch of one stream's rows, and the per-expression state its pipeline
 //! stages change.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
 use super::super::parallel::BATCH_ROWS;
-use super::super::pipeline::{StageRow, lookup};
+use super::super::pipeline::{LogfmtValue, StageRow, logfmt_pairs, lookup, set_error};
 use super::super::template::Context;
 use super::super::{ERROR_LABEL, LabelMap, SCORE_METADATA_FIELD, stream_hash};
 use crate::Labels;
@@ -535,6 +536,58 @@ impl Cursor<'_, '_> {
     fn at(&self) -> usize {
         self.row - self.work.base
     }
+
+    /// Runs a `logfmt` stage without expressions as
+    /// [`parse_stage`](super::super::pipeline::parse_stage) does, with values
+    /// left in the batch's buffer unless unescaped; `false`, having done
+    /// nothing, when the row's line is not the stored one.
+    pub(super) fn logfmt(&mut self, strict: bool, keep_empty: bool) -> bool {
+        let at = self.at();
+        if self.work.lines.get(at).copied().flatten().is_some() {
+            return false;
+        }
+        let batch = self.work.batch;
+        let Some(&(line_start, line_end)) = batch.lines.get(self.row) else {
+            return false;
+        };
+        let line = batch.span(line_start, line_end);
+        let mut pairs = Vec::new();
+        let error = logfmt_pairs(line, strict, |key, value| {
+            if keep_empty || !value.is_empty() {
+                pairs.push((key, value));
+            }
+        });
+        // Name order, the first of each name kept, as a map would merge them.
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs.dedup_by(|later, first| later.0 == first.0);
+        let rows = self.work.rows;
+        for (key, value) in pairs {
+            let clashes = self.work.labels.get(&key, at).is_some()
+                || self.work.metadata.get(&key, at).is_some();
+            let name = if clashes {
+                // An empty extraction never displaces a clashing label's `_extracted` copy.
+                if value.is_empty() {
+                    continue;
+                }
+                Cow::Owned(format!("{key}_extracted"))
+            } else {
+                key
+            };
+            let span = match value {
+                LogfmtValue::Range(range) => Span {
+                    owned: false,
+                    start: line_start + offset(range.start),
+                    end: line_start + offset(range.end),
+                },
+                LogfmtValue::Owned(value) => push_owned(&mut self.work.arena, &value),
+            };
+            self.work.labels.set(&name, at, rows, Some(span));
+        }
+        if let Some(error) = error {
+            set_error(self, "LogfmtParserErr", &error);
+        }
+        true
+    }
 }
 
 impl Context for Cursor<'_, '_> {
@@ -632,5 +685,64 @@ impl StageRow for Cursor<'_, '_> {
             values.resize(rows, None);
         }
         values[at] = Some(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::pipeline::parse_stage;
+    use super::*;
+    use crate::logql::ParserStage;
+
+    fn batch(lines: &[&str]) -> BatchSlice {
+        let labels = BTreeMap::from([
+            ("app".to_owned(), "api".to_owned()),
+            ("level".to_owned(), "info".to_owned()),
+        ]);
+        let mut batch = ColumnBatch::new(Arc::new(labels), 0, false, Tie::default());
+        for (index, line) in lines.iter().enumerate() {
+            batch.push(index as i64, line, [("trace_id", "abc")], None);
+        }
+        BatchSlice::whole(batch)
+    }
+
+    #[test]
+    fn logfmt_fast_path_matches_the_row_parser() {
+        let lines = [
+            "level=warn msg=\"a \\\"quoted\\\" value\" took=5ms",
+            "a=1 a=2 b= c b=3",
+            "app=web app_extracted=x trace_id=t trace_id=",
+            "service.name=x 9lives=y é=z",
+            "msg=\"unterminated",
+            "k=v=w x=\"y\"z",
+            "=bad \"quoted\" key=value",
+            "",
+        ];
+        let slice = batch(&lines);
+        let stored = Fields::stored(&slice);
+        for strict in [false, true] {
+            for keep_empty in [false, true] {
+                let parser = ParserStage::Logfmt {
+                    strict,
+                    keep_empty,
+                    expressions: Vec::new(),
+                };
+                let (mut fast, mut slow) = (Work::new(&slice, &stored), Work::new(&slice, &stored));
+                for (row, line) in lines.iter().enumerate() {
+                    assert!(fast.cursor(row).logfmt(strict, keep_empty));
+                    parse_stage(&mut slow.cursor(row), &parser).unwrap();
+                    let labels = |work: &Work<'_>| {
+                        work.labels(row)
+                            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        labels(&fast),
+                        labels(&slow),
+                        "{line:?} strict {strict} keep_empty {keep_empty}"
+                    );
+                }
+            }
+        }
     }
 }

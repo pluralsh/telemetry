@@ -37,7 +37,7 @@ pub fn decode_block(block: &EncodedBlock) -> Result<Vec<LogEntry>> {
 pub fn decode_samples(block: &EncodedBlock) -> Result<Vec<(i64, u32)>> {
     let mut samples = Vec::new();
     crate::object::decode_samples_where(
-        &block.0.meta,
+        &block.0,
         (i64::MIN, i64::MAX),
         |_| true,
         false,

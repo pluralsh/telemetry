@@ -905,7 +905,18 @@ impl LogDb {
         range: Range<u32>,
         needs: ReadNeeds,
     ) -> Result<Vec<Block>> {
-        read_blocks(
+        let (database, first) = (self.database_id, range.start);
+        if let Some(blocks) = self.blocks.get(
+            database,
+            namespace,
+            segment,
+            object,
+            range.clone(),
+            needs.lines,
+        ) {
+            return Ok(blocks);
+        }
+        let blocks = read_blocks(
             self.storage.as_ref(),
             namespace,
             segment,
@@ -914,7 +925,10 @@ impl LogDb {
             needs,
             ReadHints::default(),
         )
-        .await
+        .await?;
+        self.blocks
+            .insert(database, namespace, segment, object, first, &blocks);
+        Ok(blocks)
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -1035,20 +1049,13 @@ impl LogDb {
                 && run.max_timestamp_ns >= start_ns
                 && run.min_timestamp_ns <= end_ns
         };
-        let labelled = if filter.exact.is_empty() {
-            self.scan_labels(
-                forward_prefix(namespace, segment),
-                BytesRange::unbounded(),
-                decode_forward_key,
-            )
+        let labelled = self
+            .exact_streams(namespace, segment, &filter.exact)
             .await?
-        } else {
-            let stream_ids = self.stream_ids(namespace, segment, &filter.exact).await?;
-            self.stream_labels(namespace, segment, stream_ids).await?
-        };
-        let labelled = labelled
-            .into_iter()
+            .1
+            .iter()
             .filter(|(_, labels)| filter.matches(labels))
+            .map(|(stream_id, labels)| (*stream_id, Arc::clone(labels)))
             .collect::<Vec<_>>();
         let stream_ids = labelled.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         if let Some(span) = self.span_scan(&stream_ids) {
@@ -1078,6 +1085,42 @@ impl LogDb {
             .buffered(STREAM_METADATA_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// Streams of `segment` holding every `exact` label, in ID order, cached
+    /// while the segment's stream counter is unchanged.
+    async fn exact_streams(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        exact: &[Label],
+    ) -> Result<SegmentStreams> {
+        let version = self
+            .partition_version(namespace, Partition::Segment(segment))
+            .await?;
+        let key = (namespace.clone(), segment, exact.to_vec());
+        if let Some(streams) = self
+            .caches
+            .streams
+            .get(&key)
+            .filter(|cached| cached.0 == version)
+        {
+            return Ok(streams);
+        }
+        let labelled = if exact.is_empty() {
+            self.scan_labels(
+                forward_prefix(namespace, segment),
+                BytesRange::unbounded(),
+                decode_forward_key,
+            )
+            .await?
+        } else {
+            let stream_ids = self.stream_ids(namespace, segment, exact).await?;
+            self.stream_labels(namespace, segment, stream_ids).await?
+        };
+        let streams = Arc::new((version, labelled));
+        self.caches.streams.insert(key, Arc::clone(&streams));
+        Ok(streams)
     }
 
     /// Runs of `stream_ids` (ascending) passing `keep`, from one scan over
@@ -1692,7 +1735,7 @@ fn isolated_samples(
             continue;
         }
         decode_samples_where(
-            &block.meta,
+            block,
             range,
             |_| true,
             metadata,
@@ -1710,7 +1753,7 @@ fn run_samples(blocks: &[Block], range: (i64, i64), metadata: bool) -> Result<Ve
             continue;
         }
         decode_samples_where(
-            &block.meta,
+            block,
             range,
             |_| true,
             metadata,

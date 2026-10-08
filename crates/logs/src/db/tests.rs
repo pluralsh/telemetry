@@ -35,6 +35,8 @@ fn test_config() -> Config {
             ..CompactionConfig::default()
         },
         write_buffer: Default::default(),
+        // Read-counting tests count storage reads.
+        block_cache_capacity_bytes: 0,
     }
 }
 
@@ -1391,11 +1393,28 @@ async fn many_selected_streams_cost_two_scans_per_segment() {
     let rows = db.read(&namespace, 0, 5_000, &[]).await.unwrap();
     assert_eq!(rows.len(), 80);
     assert_eq!(counting.take(), vec![(0, 1), (0, 1)]);
+    // Selected streams are cached until the segment gains one.
+    let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
+    assert_eq!(rows.len(), 40);
+    assert_eq!(counting.take(), vec![(0, 0), (0, 1)]);
 
     db.span_scan_min_streams = usize::MAX;
+    db.caches.streams.invalidate_all();
     let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
     assert_eq!(rows.len(), 40);
     assert_eq!(counting.take(), vec![(20, 0), (0, 20)]);
+
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("s40", "prod"),
+            vec![LogEntry::new(1_040, "line 40")],
+        )],
+    )
+    .await
+    .unwrap();
+    let rows = db.read(&namespace, 0, 5_000, &prod).await.unwrap();
+    assert_eq!(rows.len(), 41);
     db.close().await.unwrap();
 }
 
@@ -1449,6 +1468,68 @@ async fn streams_flushed_together_are_read_with_one_object_scan() {
         ["again 7"]
     );
     assert_eq!(counting.take(), vec![(0, 2)]);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cached_blocks_answer_repeat_reads_and_gain_lines_when_needed() {
+    use crate::codec::{RecordType, record_type_prefix};
+
+    let mut config = test_config();
+    config.block_cache_capacity_bytes = crate::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES;
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_rows: 1_024,
+        rows_per_block: 4,
+    };
+    let mut db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::default();
+    let second = 1_000_000_000;
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            (1..=3)
+                .map(|index| LogEntry::new(index * second, format!("line {index}")))
+                .collect(),
+        )],
+    )
+    .await
+    .unwrap();
+    let counting = count_reads(
+        &mut db,
+        vec![record_type_prefix(&namespace, 0, RecordType::ObjectBlock)],
+    );
+    // The window splits the block, so it is decoded from its meta value.
+    let count = async |db: &LogDb| {
+        let request =
+            crate::QueryRequest::instant(r#"count_over_time({service="api"}[1s])"#, 2 * second + 1);
+        format!(
+            "{:?}",
+            db.query(&namespace, &request, crate::QueryOptions::default())
+                .await
+                .unwrap()
+        )
+    };
+    let lines = async |db: &LogDb| {
+        db.read(&namespace, 0, 4 * second, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.entry.line)
+            .collect::<Vec<_>>()
+    };
+
+    let counted = count(&db).await;
+    assert_eq!(counting.take(), vec![(1, 0)]);
+    assert_eq!(count(&db).await, counted);
+    assert_eq!(counting.take(), vec![(0, 0)]);
+    // A block cached without lines is read again with them.
+    assert_eq!(lines(&db).await, ["line 1", "line 2", "line 3"]);
+    assert_eq!(counting.take(), vec![(2, 0)]);
+    assert_eq!(lines(&db).await, ["line 1", "line 2", "line 3"]);
+    assert_eq!(count(&db).await, counted);
+    assert_eq!(counting.take(), vec![(0, 0)]);
     db.close().await.unwrap();
 }
 

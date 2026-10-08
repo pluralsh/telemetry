@@ -1,0 +1,64 @@
+import { PageHeader } from "@/components/doc-page";
+import { Callout } from "@/components/mdx-ui";
+import { TelemetryIcon } from "@/components/icons";
+
+export const metadata = { title: "Manifesto" };
+
+<PageHeader
+  icon={<TelemetryIcon size={28} />}
+  eyebrow="Manifesto · Draft"
+  title="Observability should be cheap and easy."
+  lede="Why we're building Plural Telemetry, and the principles every design decision is held to."
+/>
+
+<Callout title="This is a living draft">
+  The principles below are settled. The prose around them is a scaffold and will keep evolving.
+</Callout>
+
+> The most useful telemetry is the telemetry you can afford to keep. Today, most teams sample, drop and expire data because of what it costs, not because they no longer need it.
+
+## The bill is the bug
+
+Observability spend now commonly rivals compute spend. Vendors price per gigabyte ingested and per million events indexed, which penalizes exactly the behavior you want: instrumenting more and keeping it longer. Self-hosting is supposed to be the escape hatch, but it trades the invoice for a pager. Running a production Loki, Mimir or Tempo means operating a dozen microservices, hash rings, replicated ingesters with write-ahead logs on persistent disks, and several caching tiers.
+
+We think both options are the wrong shape. Plural Telemetry should cost about what the object storage underneath it costs, plus a small, predictable amount of compute.
+
+## Principles
+
+### 1. Object storage is the database
+
+S3-class storage is the cheapest, most durable, most scalable storage most organizations have. We treat it as the system of record, not a cold tier. Through [SlateDB](https://slatedb.io), writes go to a bucket, and local disks are disposable caches. There's no replication factor to tune and no cross-zone replication traffic to pay for.
+
+### 2. Fewer moving parts
+
+Every component is something you have to size, upgrade, monitor and debug at 3 a.m. Plural Telemetry has two: **writers** and **readers**. There is no distributor tier, no ingester ring, no query scheduler, and no memcached fleet. When you need more throughput you add writers. When you need more query capacity you add readers.
+
+### 3. Compatible by default
+
+Re-instrumenting is a non-starter. Each database speaks the protocols you already run: Prometheus remote write, Loki push, OTLP, Zipkin, Elasticsearch `_bulk`. Each answers PromQL, LogQL or TraceQL through the same HTTP APIs Grafana already uses. Switching should be a change of URL.
+
+### 4. Kubernetes is the control plane
+
+Distributed databases usually bring their own consensus system. Kubernetes already *is* one, and it's already running. Plural Telemetry coordinates through StatefulSets for stable identity, a `ShardMap` custom resource for routing, and `Lease` objects for shard ownership, so there's no ZooKeeper, etcd or gossip protocol to operate.
+
+### 5. Scale without moving data
+
+Rebalancing is where distributed stores get dangerous. Because telemetry is ordered by time, Plural Telemetry scales by changing where *future* data goes. A new routing epoch takes effect at the next hour boundary, new shards start empty, and nothing is copied. See [epoch sharding](/sharding/).
+
+### 6. Prove it
+
+Claims about speed and compatibility are cheap. Every database is fuzzed against its reference implementation on identical data, and the latency, CPU and memory of both sides are recorded and published, including the cases where we lose. See each database's **Benchmarks** page.
+
+### 7. Open, and sponsored by Plural
+
+Plural Telemetry is Apache 2.0 and developed in the open by [Plural](https://plural.sh). Plural runs fleets of Kubernetes clusters for its customers, and cheap, boring observability is a prerequisite for doing that well.
+
+## What we won't do
+
+- Build a proprietary query language. If PromQL, LogQL and TraceQL can express it, that's what we implement.
+- Require a managed service. Everything runs in your cluster, against your bucket.
+- Hide the trade-offs. Writer shards aren't replicated in-cluster: failover moves a `Lease` and reopens the same data from object storage. Scale-down isn't supported yet. Both are documented rather than glossed over.
+
+## Get involved
+
+Read the [architecture guide](/architecture/), try the [installation](/installation/), and open issues or pull requests on GitHub.

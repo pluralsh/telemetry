@@ -163,6 +163,9 @@ pub struct Config {
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
+    /// Byte budget of the process's cache of object blocks with their
+    /// decompressed bodies, shared by every shard; `0` disables it.
+    pub reader_cache_capacity: u64,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -186,6 +189,7 @@ impl Default for Config {
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
+            reader_cache_capacity: core.block_cache_capacity_bytes,
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
@@ -337,6 +341,7 @@ impl Config {
                 max_merges_per_flush: self.compaction.max_merges_per_flush,
             },
             write_buffer: self.write.write_buffer(),
+            block_cache_capacity_bytes: self.reader_cache_capacity,
         }
     }
 }

@@ -21,6 +21,7 @@ fn config(path: &str, enabled: bool) -> Config {
         discovery_rollup: Some(Duration::from_secs(20)),
         retention: None,
         write_buffer: Default::default(),
+        block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         page: PageConfig {
             target_size_bytes: 64 * 1024,
             max_rows: 1024,

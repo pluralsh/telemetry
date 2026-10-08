@@ -1,0 +1,60 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
+import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Metrics architecture" };
+
+<PageHeader
+  icon={<SpaceIcon space="metrics" size={28} />}
+  eyebrow="Metrics"
+  title="Architecture"
+  lede="A Prometheus-compatible time-series database on SlateDB. It takes remote write and OTLP, answers PromQL, and runs as two StatefulSets and a bucket."
+/>
+
+<ArchitectureCompare product="metrics" caption="Fig. 1 · Plural Metrics vs Grafana Mimir" />
+
+## Write path
+
+1. Prometheus, Alloy or an OTel Collector sends a batch to **any writer**, over Remote Write 1.0 or 2.0 or OTLP.
+2. Each series is hashed by its namespace and sorted labels to a storage shard, using the [routing epoch](/sharding/) in effect at each sample's timestamp. Samples for other shards are forwarded to their owner over internal gRPC.
+3. The owner buffers samples in memory and acknowledges at the configured durability.
+4. On flush, samples are appended to their series in the current hour bucket as merge operands, alongside any new series dictionary and index entries, in one atomic SlateDB write. The bucket's write generation is bumped.
+5. SlateDB compaction collapses the merge operands of each series into compressed sample records.
+
+## Read path
+
+1. Grafana sends PromQL to **any reader**. Readers open every shard read-only.
+2. The planner narrows the hour buckets by time, then resolves label matchers against each bucket's Roaring-bitmap postings, smallest first. Resolved matchers are cached per bucket.
+3. Only the matching series' sample records are loaded, through the block cache.
+4. Series are joined across shards by label fingerprint and evaluated.
+5. Range-query steps are cached and reused while the write generation of every bucket they read is unchanged, so dashboards refreshing over old data skip storage entirely.
+
+## Storage layout
+
+Each storage shard is one SlateDB database. Keys are scoped by tenant namespace and hour bucket:
+
+<KeyLayout product="metrics" caption="Fig. 2 · Every Metrics key begins with the same prefix. Series IDs are local to one bucket of one shard." />
+
+Indexes are bucket-local. A query over a long range repeats lookups per bucket, and old buckets stay isolated from series churn in the current one. Retention drops whole buckets.
+
+## Compared with Mimir
+
+| Concern | Mimir | Plural Metrics |
+| --- | --- | --- |
+| Recent data | TSDB head in ingester memory, 3× replicated, cut into 2-hour blocks | Writer buffer, then SlateDB on object storage |
+| Write fan-out | 3× to ingesters via the hash ring | 1× to the shard owner |
+| Historical reads | Store-gateways shard blocks via their own ring | Readers open every shard; one block cache |
+| Compaction | Separate compactor ring, block splitting | SlateDB's built-in compactor, per shard |
+| Query tiers | Frontend, scheduler, queriers, store-gateways, caches | Readers |
+
+## Compatibility
+
+PromQL is checked against the upstream Prometheus `promqltest` corpus. Unsupported constructs return an error rather than a wrong answer. Supported: native histograms, out-of-order samples, staleness markers, `offset` and `@`, subqueries, every stable aggregation and function, and `/federate`. Not supported:
+
+- Exemplars are dropped, and remote read (`/api/v1/read`) is not served.
+- The lookback delta is fixed at 5 minutes; `timeout`, `limit` and `stats` are ignored.
+- There is no scraper, rule evaluator or alerting. Run Prometheus or Alloy in agent mode, and evaluate rules elsewhere.
+- Experimental upstream functions such as `limitk`, `mad_over_time` and `info`.
+
+<NextSteps product="metrics" links={["installation", "api", "benchmarks"]} />

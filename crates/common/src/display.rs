@@ -233,10 +233,15 @@ fn itoa(mut value: u32, buf: &mut [u8; 3]) -> &[u8] {
 /// Rewrites `name` into a valid Prometheus label name: every character outside
 /// `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed with `_`.
 pub fn sanitize_label_name(name: &str) -> String {
+    sanitized_label_name(name).into_owned()
+}
+
+/// [`sanitize_label_name`], borrowing `name` when it is already valid.
+pub fn sanitized_label_name(name: &str) -> std::borrow::Cow<'_, str> {
     let leading_digit = name.as_bytes().first().is_some_and(u8::is_ascii_digit);
     let valid = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
     if !leading_digit && name.as_bytes().iter().all(valid) {
-        return name.to_owned();
+        return std::borrow::Cow::Borrowed(name);
     }
     let mut result = String::with_capacity(name.len() + usize::from(leading_digit));
     if leading_digit {
@@ -249,7 +254,7 @@ pub fn sanitize_label_name(name: &str) -> String {
             '_'
         }
     }));
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 #[cfg(test)]

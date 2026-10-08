@@ -1,0 +1,86 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { Callout } from "@/components/mdx-ui";
+import {
+  AccessSpec,
+  ClientConfigs,
+  InstallSpec,
+  NextSteps,
+  PasswordSecrets,
+  PodIdentitySetup,
+  ToolEndpoints,
+  VerifyInstall,
+} from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Logs installation" };
+
+<PageHeader
+  icon={<SpaceIcon space="logs" size={28} />}
+  eyebrow="Logs"
+  title="Installation"
+  lede="Run a Logs database on Kubernetes: grant it a bucket, declare it as a custom resource, and give each tenant namespace credentials."
+/>
+
+This guide assumes the operator is already installed; see [Installation](/installation/). Examples use the `telemetry` Kubernetes namespace and an S3 bucket named `acme-telemetry`.
+
+## Grant S3 access
+
+Logs authenticates to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). The operator creates a ServiceAccount named after the database, `logs`, so associate an IAM role with it:
+
+<PodIdentitySetup product="logs" />
+
+The role's trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` and `sts:TagSession`. No keys go in the spec.
+
+## Quick start
+
+A `Standalone` database is a single pod that ingests and queries, which is enough for development and small clusters. Every field not shown takes its default:
+
+<InstallSpec product="logs" variant="quickstart" />
+
+## Production
+
+A `Sharded` database runs writers and readers as separate StatefulSets. Hover a field, or its note, to see what it does:
+
+<InstallSpec product="logs" variant="production" />
+
+Apply it with `kubectl apply -f logs.yaml`. The operator renders the server config, then creates the ServiceAccount, StatefulSets, Services and Ingress. It rolls the pods whenever the spec changes.
+
+## Access
+
+Logs serves a tenant namespace only once it has credentials. Each `NamespaceAuthentication` creates its namespace if needed and grants one username `read` or `write`. Create the password Secrets first:
+
+<PasswordSecrets product="logs" />
+
+Then grant a writer for the collector and a reader for Grafana:
+
+<AccessSpec product="logs" />
+
+Clients send these as HTTP basic auth.
+
+## Connect your tools
+
+Writers serve ingest routes and readers serve queries. Inside the cluster:
+
+<ToolEndpoints product="logs" />
+
+Any writer accepts any entry and forwards it to the shard's owner, so the plain `logs-writer` ClusterIP Service is all a client needs. For an OTel Collector and Grafana:
+
+<ClientConfigs product="logs" />
+
+<Callout title="Elasticsearch shippers">
+  Fluent Bit, Vector, Fluentd and Filebeat can use `/write/ns/payments/elasticsearch` as their Elasticsearch host. Promote low-cardinality fields to stream labels with `spec.config.elasticsearch.streamFields`, or per request with `_stream_fields`. See the [API reference](/logs/api/).
+</Callout>
+
+## Verify
+
+<VerifyInstall product="logs" />
+
+An empty `data` array is expected until the collector has sent something.
+
+## Scaling
+
+- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take writes from the next aligned hour. Existing data stays where it is, so scale-down is blocked until it expires. See [epoch sharding](/sharding/).
+- **Readers:** change `spec.reader.replicas` at any time. They hold no state beyond their cache.
+- **Heavy queries:** raise `request.queryConcurrency` and `request.maxInFlightQueryBytes` together with reader memory.
+
+<NextSteps product="logs" links={["architecture", "api", "benchmarks"]} />

@@ -1,5 +1,7 @@
+use std::ops::Range;
+
 use super::*;
-use common::display::sanitize_label_name;
+use common::display::{sanitize_label_name, sanitized_label_name};
 use template::Context;
 
 /// One row as pipeline stages see it: its line, its labels, and its
@@ -394,57 +396,12 @@ pub(super) fn parse_logfmt(
     expressions: &[ParserExpression],
 ) -> Result<(BTreeMap<String, String>, Option<String>)> {
     let mut all = BTreeMap::new();
-    let mut cursor = 0usize;
-    let mut parse_error = None;
-    while cursor < line.len() {
-        while cursor < line.len() && line.as_bytes()[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor == line.len() {
-            break;
-        }
-        let token_start = cursor;
-        let key_start = cursor;
-        while cursor < line.len()
-            && !line.as_bytes()[cursor].is_ascii_whitespace()
-            && !matches!(line.as_bytes()[cursor], b'=' | b'"')
-        {
-            cursor += 1;
-        }
-        if cursor == key_start || line.as_bytes().get(cursor) == Some(&b'"') {
-            if strict {
-                parse_error = Some(format!(
-                    "logfmt syntax error at pos {} : invalid key",
-                    cursor + 1
-                ));
-                break;
-            }
-            skip_logfmt_token(line, &mut cursor);
-            continue;
-        }
-        let key = sanitize_label_name(&line[key_start..cursor]);
-        let value = match logfmt_value(line, &mut cursor, strict) {
-            Ok(Some(value)) => value,
-            Ok(None) => continue,
-            Err(error) => {
-                parse_error = Some(error);
-                break;
-            }
-        };
-        if key.is_empty() {
-            if strict {
-                parse_error = Some(format!(
-                    "logfmt syntax error at pos {} : invalid key",
-                    token_start + 1
-                ));
-                break;
-            }
-            continue;
-        }
+    let parse_error = logfmt_pairs(line, strict, |key, value| {
         if keep_empty || !value.is_empty() {
-            all.entry(key).or_insert(value);
+            all.entry(key.into_owned())
+                .or_insert_with(|| value.into_string(line));
         }
-    }
+    });
     if expressions.is_empty() {
         Ok((all, parse_error))
     } else {
@@ -454,7 +411,7 @@ pub(super) fn parse_logfmt(
                 .map(|expression| {
                     (
                         expression.label.clone(),
-                        all.get(&sanitize_label_name(&expression.expression))
+                        all.get(&*sanitized_label_name(&expression.expression))
                             .cloned()
                             .unwrap_or_default(),
                     )
@@ -465,15 +422,92 @@ pub(super) fn parse_logfmt(
     }
 }
 
+/// A logfmt value: bytes of its line, or a quoted value with escapes.
+pub(super) enum LogfmtValue {
+    Range(Range<usize>),
+    Owned(String),
+}
+
+impl LogfmtValue {
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Range(range) => range.is_empty(),
+            Self::Owned(value) => value.is_empty(),
+        }
+    }
+
+    fn into_string(self, line: &str) -> String {
+        match self {
+            Self::Range(range) => line[range].to_owned(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+/// Passes `pair` each sanitized key and value of a logfmt `line`, in line
+/// order, and returns the syntax error that ended a strict parse; pairs
+/// before it were passed.
+pub(super) fn logfmt_pairs<'a>(
+    line: &'a str,
+    strict: bool,
+    mut pair: impl FnMut(Cow<'a, str>, LogfmtValue),
+) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < line.len() {
+        while cursor < line.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == line.len() {
+            break;
+        }
+        let token_start = cursor;
+        let key_start = cursor;
+        while cursor < line.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'"')
+        {
+            cursor += 1;
+        }
+        if cursor == key_start || bytes.get(cursor) == Some(&b'"') {
+            if strict {
+                return Some(format!(
+                    "logfmt syntax error at pos {} : invalid key",
+                    cursor + 1
+                ));
+            }
+            skip_logfmt_token(line, &mut cursor);
+            continue;
+        }
+        let key = sanitized_label_name(&line[key_start..cursor]);
+        let value = match logfmt_value(line, &mut cursor, strict) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(error) => return Some(error),
+        };
+        if key.is_empty() {
+            if strict {
+                return Some(format!(
+                    "logfmt syntax error at pos {} : invalid key",
+                    token_start + 1
+                ));
+            }
+            continue;
+        }
+        pair(key, value);
+    }
+    None
+}
+
 /// Scans the value following a logfmt key. `Ok(None)` means a malformed
 /// pair was skipped; errors are only reported in strict mode.
 fn logfmt_value(
     line: &str,
     cursor: &mut usize,
     strict: bool,
-) -> std::result::Result<Option<String>, String> {
+) -> std::result::Result<Option<LogfmtValue>, String> {
     if line.as_bytes().get(*cursor) != Some(&b'=') {
-        return Ok(Some(String::new()));
+        return Ok(Some(LogfmtValue::Range(*cursor..*cursor)));
     }
     *cursor += 1;
     if line.as_bytes().get(*cursor) == Some(&b'"') {
@@ -496,7 +530,7 @@ fn logfmt_value(
             char::from(value.as_bytes()[offset])
         ));
     }
-    Ok(Some(value.to_owned()))
+    Ok(Some(LogfmtValue::Range(start..*cursor)))
 }
 
 pub(super) fn skip_logfmt_token(line: &str, cursor: &mut usize) {
@@ -505,17 +539,23 @@ pub(super) fn skip_logfmt_token(line: &str, cursor: &mut usize) {
     }
 }
 
-pub(super) fn scan_logfmt_quoted(
-    line: &str,
-    cursor: &mut usize,
-) -> std::result::Result<String, String> {
+/// The quoted value opening at `cursor`, borrowed from the line unless it
+/// holds escapes.
+fn scan_logfmt_quoted(line: &str, cursor: &mut usize) -> std::result::Result<LogfmtValue, String> {
+    let start = *cursor + 1;
+    if let Some(offset) = memchr::memchr2(b'"', b'\\', &line.as_bytes()[start..])
+        && line.as_bytes()[start + offset] == b'"'
+    {
+        *cursor = start + offset + 1;
+        return Ok(LogfmtValue::Range(start..start + offset));
+    }
     *cursor += 1;
     let mut output = String::new();
     let mut chars = line[*cursor..].char_indices();
     while let Some((relative, character)) = chars.next() {
         *cursor += character.len_utf8();
         match character {
-            '"' => return Ok(output),
+            '"' => return Ok(LogfmtValue::Owned(output)),
             '\\' => {
                 let Some((_, escaped)) = chars.next() else {
                     return Err(format!(

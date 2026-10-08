@@ -11,6 +11,7 @@ use sharding::{
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::BlockCache;
 use crate::query::query_databases;
 use crate::{
     Config, Durability, Error, Labels, LogBatch, LogDb, Namespace, QueryOptions, QueryRequest,
@@ -56,10 +57,12 @@ impl ShardedLogs {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let cache = shard_cache.clone();
-            async move { LogDb::open_with_cache(config, &cache).await }
+            let blocks = blocks.clone();
+            async move { LogDb::open_with_cache(config, &cache, &blocks).await }
         });
         Self::new(
             ShardSet::open(ShardRole::Writer, options, opener, shards).await,
@@ -77,11 +80,13 @@ impl ShardedLogs {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let reader_options = reader_options.clone();
             let cache = shard_cache.clone();
-            async move { LogDb::open_reader_with_cache(config, reader_options, &cache).await }
+            let blocks = blocks.clone();
+            async move { LogDb::open_reader_with_cache(config, reader_options, &cache, &blocks).await }
         });
         Self::new(
             ShardSet::open(ShardRole::Reader, options, opener, shards).await,

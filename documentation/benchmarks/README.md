@@ -157,6 +157,31 @@ below `1.00x` mean the implementation is usually faster. CPU is mean cores
 over the run and memory is the p95 working set (page cache excluded, as in
 `docker stats`).
 
+## Results: 2026-10-08
+
+`bench --lanes 2 --duration 30m --scenarios recent,historical` with production
+configs on OrbStack (12 CPUs, 8.8 GiB), 2 pinned cores per side. Medians are
+over every query both sides answered; the ratio is the median per-query
+implementation/oracle latency.
+
+| product | oracle | scenario | cases | mismatches | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| logs | Loki | recent | 8913 | 0 | 14.9 / 10.4 | 317 / 574 | 0.98x |
+| logs | Loki | historical | 8136 | 12 | 12.6 / 12.0 | 343 / 816 | 0.72x |
+| metrics | Prometheus | recent | 17201 | 1 | 2.4 / 1.6 | 92 / 135 | 1.30x |
+| metrics | Mimir | recent | 15604 | 14 | 2.7 / 4.9 | 112 / 179 | 0.62x |
+| metrics | Mimir store-gateway | historical | 3647 | 1 | 2.3 / 27.3 | 55 / 342 | 0.10x |
+| traces | Tempo | recent | 14064 | 0 | 3.1 / 37.3 | 62 / 269 | 0.12x |
+| traces | Tempo on MinIO | historical | 3461 | 1 | 5.9 / 410 | 52 / 797 | 0.02x |
+
+Open divergences: logs historical returns an entry or two more than Loki on
+some log queries; metrics against Prometheus differs once on `floor` of a
+`log10` rate near zero (Go computes `log10` as `log2(x) * Ln2/Ln10`); the
+stock-Mimir run differs on 14 queries where Mimir returns less data, still
+under investigation; metrics historical and traces historical each differ
+once (`stdvar_over_time` NaN versus 0, and one extra `span.http.status_code`
+tag value).
+
 ## Caveats
 
 - **One shared host.** Both systems, object storage, and the fuzzer share the
@@ -171,10 +196,13 @@ over the run and memory is the p95 working set (page cache excluded, as in
   `FUZZ_METRICS_ORACLE=mimir-blocks` and `FUZZ_TRACES_ORACLE=tempo-s3`
   are the object-store comparisons. Loki and the default Tempo serve recent
   data from ingester memory. Treat each variant as its own series.
-- **Implementation configs.** The default `regression` configs use tiny
-  segments and pages to exercise boundaries, which costs latency;
-  `FUZZ_LOGS_CONFIG=production` and `FUZZ_TRACES_CONFIG=production` use crate
-  defaults and are the fairer performance comparison.
+- **Implementation configs.** `bench` runs `production` configs (what the
+  operator deploys). The `regression` configs a plain fuzz run defaults to use
+  tiny segments and pages to exercise boundaries, which costs latency, so
+  never compare the two.
+- **Visibility wait.** Production configs flush writes every 10s, so each
+  round waits about that long before queries start; the oracles show data
+  sooner. Query latency excludes that wait.
 - **Randomized workloads.** Seeds change the data shapes and query mix, so
   per-family numbers move between runs even on the same code. Pass `--seed`
   to compare two builds on the same workload.

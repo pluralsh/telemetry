@@ -192,6 +192,12 @@ either group of a block range is one contiguous scan. Merges copy both values
 of full blocks unchanged and re-encode the rest; a tombstoned object's
 deletion removes both groups.
 
+Since `(id, level)` never names two objects of a segment, a block never
+changes once written. Readers keep blocks in a cross-query cache bounded by
+`reader_cache_capacity`, each with its bodies decompressed on first use, so a
+repeated read does no storage reads and decompresses nothing. A block cached
+without lines is read again when a query needs them.
+
 The object directory lists every run of the object in stream order; a run's
 first block is the sum of the block counts before it. The directory is read by
 compaction and by full-text queries over merged objects, never by plain

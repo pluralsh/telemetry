@@ -11,9 +11,10 @@
 //! the blocks of many streams, ordered by stream, so a query selecting most
 //! of a segment's streams reads each object with one range scan.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::{Bound, Range};
+use std::sync::{Arc, OnceLock};
 
 use bytes::{BufMut, Bytes};
 use common::BytesRange;
@@ -36,16 +37,12 @@ const META_HEADER_LEN: usize = 29;
 const LINES_HEADER_LEN: usize = 5;
 const ZSTD_LEVEL: i32 = 3;
 const ERROR_METADATA: &str = "__error__";
-/// Decompression buffers above this are freed rather than kept per thread.
-const MAX_RETAINED_BUFFER: usize = 4 << 20;
 
 thread_local! {
     static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
         const { RefCell::new(None) };
     static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
         const { RefCell::new(None) };
-    static META_BUFFER: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
-    static LINES_BUFFER: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,16 +63,78 @@ impl BlockHeader {
 
 /// A block's two stored values. `lines` is absent when the read that
 /// fetched the block needed no lines.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Block {
     pub meta: Bytes,
     pub lines: Option<Bytes>,
+    /// Decompressed bodies, kept once a decode needs them and shared by
+    /// clones, so a cached block is decompressed at most once.
+    bodies: Arc<Bodies>,
 }
 
+#[derive(Debug, Default)]
+struct Bodies {
+    meta: OnceLock<Box<[u8]>>,
+    lines: OnceLock<Box<[u8]>>,
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        self.meta == other.meta && self.lines == other.lines
+    }
+}
+
+impl Eq for Block {}
+
 impl Block {
+    pub(crate) fn new(meta: Bytes, lines: Option<Bytes>) -> Self {
+        Self {
+            meta,
+            lines,
+            bodies: Arc::default(),
+        }
+    }
+
     /// Stored size of the values held.
     pub(crate) fn encoded_len(&self) -> usize {
         self.meta.len() + self.lines.as_ref().map_or(0, Bytes::len)
+    }
+
+    /// Memory the block may come to hold, with both bodies decompressed.
+    pub(crate) fn resident_len(&self) -> Result<usize> {
+        let header = block_header(&self.meta)?;
+        let lines = if self.lines.is_some() {
+            header.line_bytes as usize
+        } else {
+            0
+        };
+        Ok(self.encoded_len() + header.uncompressed_len as usize + lines)
+    }
+
+    fn meta_body(&self, header: &BlockHeader) -> Result<&[u8]> {
+        if let Some(body) = self.bodies.meta.get() {
+            return Ok(body);
+        }
+        let mut body = Vec::new();
+        decompress_zstd(
+            &self.meta[META_HEADER_LEN..],
+            header.uncompressed_len,
+            &mut body,
+        )?;
+        Ok(self.bodies.meta.get_or_init(|| body.into_boxed_slice()))
+    }
+
+    fn lines_body(&self, header: &BlockHeader) -> Result<&[u8]> {
+        if let Some(body) = self.bodies.lines.get() {
+            return Ok(body);
+        }
+        let lines = self
+            .lines
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("block lines were not read".to_owned()))?;
+        let mut body = Vec::new();
+        decompress_lines(lines, header.line_bytes, &mut body)?;
+        Ok(self.bodies.lines.get_or_init(|| body.into_boxed_slice()))
     }
 }
 
@@ -127,10 +186,10 @@ pub(crate) fn encode_block(entries: &[LogEntry]) -> Result<Block> {
         Vec::with_capacity(LINES_HEADER_LEN + zstd::zstd_safe::compress_bound(lines_body.len()));
     lines.put_u8(LINES_FORMAT);
     lines.put_u32(line_bytes);
-    Ok(Block {
-        meta: compress_after(meta, &meta_body)?,
-        lines: Some(compress_after(lines, &lines_body)?),
-    })
+    Ok(Block::new(
+        compress_after(meta, &meta_body)?,
+        Some(compress_after(lines, &lines_body)?),
+    ))
 }
 
 /// `header` followed by the zstd frame of `body`.
@@ -224,19 +283,15 @@ pub(crate) fn decode_block_where(
     keep: impl FnMut(u32) -> bool,
     mut emit: impl FnMut(u32, LogEntry),
 ) -> Result<()> {
-    let lines = block
-        .lines
-        .as_deref()
-        .ok_or_else(|| Error::Invalid("block lines were not read".to_owned()))?;
-    with_meta(&block.meta, range, |header, columns| {
+    if block.lines.is_none() {
+        return Err(Error::Invalid("block lines were not read".to_owned()));
+    }
+    with_meta(block, range, |header, columns| {
         let kept = columns.kept(range, keep);
         if kept.is_empty() {
             return Ok(());
         }
-        with_buffer(&LINES_BUFFER, |buffer| {
-            decompress_lines(lines, header.line_bytes, buffer)?;
-            columns.emit_entries(buffer, &kept, &mut emit)
-        })
+        columns.emit_entries(block.lines_body(header)?, &kept, &mut emit)
     })
 }
 
@@ -248,19 +303,15 @@ pub(crate) fn decode_block_rows(
     keep: impl FnMut(u32) -> bool,
     mut emit: impl FnMut(u32, i64, &str, &[(&str, &str)]),
 ) -> Result<()> {
-    let lines = block
-        .lines
-        .as_deref()
-        .ok_or_else(|| Error::Invalid("block lines were not read".to_owned()))?;
-    with_meta(&block.meta, range, |header, columns| {
+    if block.lines.is_none() {
+        return Err(Error::Invalid("block lines were not read".to_owned()));
+    }
+    with_meta(block, range, |header, columns| {
         let kept = columns.kept(range, keep);
         if kept.is_empty() {
             return Ok(());
         }
-        with_buffer(&LINES_BUFFER, |buffer| {
-            decompress_lines(lines, header.line_bytes, buffer)?;
-            columns.lend_rows(buffer, &kept, &mut emit)
-        })
+        columns.lend_rows(block.lines_body(header)?, &kept, &mut emit)
     })
 }
 
@@ -268,13 +319,13 @@ pub(crate) fn decode_block_rows(
 /// the block passes `keep`, without their lines, reading only the block's
 /// meta value. Structured metadata is materialized only with `metadata`.
 pub(crate) fn decode_samples_where(
-    meta: &[u8],
+    block: &Block,
     range: (i64, i64),
     keep: impl FnMut(u32) -> bool,
     metadata: bool,
     mut emit: impl FnMut(u32, RowSample),
 ) -> Result<()> {
-    with_meta(meta, range, |_, columns| {
+    with_meta(block, range, |_, columns| {
         let kept = columns.kept(range, keep);
         columns.emit_samples(&kept, metadata, &mut emit)
     })
@@ -282,29 +333,13 @@ pub(crate) fn decode_samples_where(
 
 /// Runs `f` with the parsed columns of a block's meta value.
 fn with_meta<T>(
-    meta: &[u8],
+    block: &Block,
     range: (i64, i64),
     f: impl FnOnce(&BlockHeader, &MetaColumns<'_>) -> Result<T>,
 ) -> Result<T> {
-    let header = block_header(meta)?;
-    with_buffer(&META_BUFFER, |buffer| {
-        decompress_zstd(&meta[META_HEADER_LEN..], header.uncompressed_len, buffer)?;
-        let columns = MetaColumns::parse(buffer, &header, range)?;
-        f(&header, &columns)
-    })
-}
-
-/// Runs `f` with this thread's reusable decompression buffer `slot`.
-fn with_buffer<T>(
-    slot: &'static std::thread::LocalKey<Cell<Vec<u8>>>,
-    f: impl FnOnce(&mut Vec<u8>) -> T,
-) -> T {
-    let mut buffer = slot.take();
-    let result = f(&mut buffer);
-    if buffer.capacity() <= MAX_RETAINED_BUFFER {
-        slot.set(buffer);
-    }
-    result
+    let header = block_header(&block.meta)?;
+    let columns = MetaColumns::parse(block.meta_body(&header)?, &header, range)?;
+    f(&header, &columns)
 }
 
 /// Decompresses a block's lines value, which must hold `line_bytes` bytes.
@@ -808,17 +843,14 @@ pub(crate) async fn read_blocks<S: StorageRead + ?Sized>(
         let meta = read(BlockGroup::Meta).await?;
         return Ok(meta
             .into_iter()
-            .map(|meta| Block { meta, lines: None })
+            .map(|meta| Block::new(meta, None))
             .collect());
     }
     let (meta, lines) = futures::try_join!(read(BlockGroup::Meta), read(BlockGroup::Lines))?;
     Ok(meta
         .into_iter()
         .zip(lines)
-        .map(|(meta, lines)| Block {
-            meta,
-            lines: Some(lines),
-        })
+        .map(|(meta, lines)| Block::new(meta, Some(lines)))
         .collect())
 }
 
@@ -1431,30 +1463,21 @@ mod tests {
         let mut lines_value = vec![LINES_FORMAT];
         lines_value.extend(line_bytes.to_be_bytes());
         lines_value.extend(zstd::bulk::compress(lines, ZSTD_LEVEL).unwrap());
-        Block {
-            meta: meta.into(),
-            lines: Some(lines_value.into()),
-        }
+        Block::new(meta.into(), Some(lines_value.into()))
     }
 
     fn with_meta_value(block: &Block, meta: &[u8]) -> Block {
-        Block {
-            meta: Bytes::copy_from_slice(meta),
-            lines: block.lines.clone(),
-        }
+        Block::new(Bytes::copy_from_slice(meta), block.lines.clone())
     }
 
     fn with_lines_value(block: &Block, lines: &[u8]) -> Block {
-        Block {
-            meta: block.meta.clone(),
-            lines: Some(Bytes::copy_from_slice(lines)),
-        }
+        Block::new(block.meta.clone(), Some(Bytes::copy_from_slice(lines)))
     }
 
     fn samples_of(block: &Block, range: (i64, i64), metadata: bool) -> Vec<(u32, RowSample)> {
         let mut samples = Vec::new();
         decode_samples_where(
-            &block.meta,
+            block,
             range,
             |_| true,
             metadata,
@@ -1551,10 +1574,7 @@ mod tests {
     fn samples_read_only_the_meta_value() {
         let rows = mixed_rows();
         let block = encode_block(&rows).unwrap();
-        let meta_only = Block {
-            meta: block.meta.clone(),
-            lines: None,
-        };
+        let meta_only = Block::new(block.meta.clone(), None);
         let expected = |metadata: bool| {
             rows.iter()
                 .enumerate()
@@ -1925,7 +1945,7 @@ mod tests {
                 .collect();
             prop_assert_eq!(decode_where(&block, (start, end), |index| index % 3 != 1).unwrap(), expected);
             let mut sampled = Vec::new();
-            decode_samples_where(&block.meta, (start, end), |index| index % 3 != 1, false, |index, sample| {
+            decode_samples_where(&block, (start, end), |index| index % 3 != 1, false, |index, sample| {
                 sampled.push((index, sample.timestamp_ns, sample.line_len));
             }).unwrap();
             prop_assert_eq!(sampled, samples);

@@ -24,7 +24,9 @@ mod sharded;
 
 pub use analyzer::{Analyzer, LogAnalyzer};
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
-pub use config::{CompactionConfig, Config, DEFAULT_RETENTION, PageConfig};
+pub use config::{
+    CompactionConfig, Config, DEFAULT_BLOCK_CACHE_CAPACITY_BYTES, DEFAULT_RETENTION, PageConfig,
+};
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};

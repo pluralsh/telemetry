@@ -23,7 +23,14 @@ pub struct Config {
     pub page: PageConfig,
     pub compaction: CompactionConfig,
     pub write_buffer: WriteCoordinatorConfig,
+    /// Byte budget of the process's cross-query cache of object blocks,
+    /// which keeps each cached block's bodies once a query decompresses
+    /// them. Zero disables it.
+    pub block_cache_capacity_bytes: u64,
 }
+
+/// Default [`Config::block_cache_capacity_bytes`]: 256 MiB.
+pub const DEFAULT_BLOCK_CACHE_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default [`Config::retention`]: 14 days.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
@@ -74,6 +81,7 @@ impl Default for Config {
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),
+            block_cache_capacity_bytes: DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         }
     }
 }

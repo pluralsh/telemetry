@@ -1,0 +1,85 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { Callout } from "@/components/mdx-ui";
+import {
+  AccessSpec,
+  ClientConfigs,
+  InstallSpec,
+  NextSteps,
+  PasswordSecrets,
+  PodIdentitySetup,
+  ToolEndpoints,
+  VerifyInstall,
+} from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Metrics installation" };
+
+<PageHeader
+  icon={<SpaceIcon space="metrics" size={28} />}
+  eyebrow="Metrics"
+  title="Installation"
+  lede="Run a Metrics database on Kubernetes: grant it a bucket, declare it as a custom resource, and give each tenant namespace credentials."
+/>
+
+This guide assumes the operator is already installed; see [Installation](/installation/). Examples use the `telemetry` Kubernetes namespace and an S3 bucket named `acme-telemetry`.
+
+## Grant S3 access
+
+Metrics authenticates to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). The operator creates a ServiceAccount named after the database, `metrics`, so associate an IAM role with it:
+
+<PodIdentitySetup product="metrics" />
+
+The role's trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` and `sts:TagSession`. No keys go in the spec.
+
+## Quick start
+
+A `Standalone` database is a single pod that ingests and queries, which is enough for development and small clusters. Every field not shown takes its default, including 60 days of retention:
+
+<InstallSpec product="metrics" variant="quickstart" />
+
+## Production
+
+A `Sharded` database runs writers and readers as separate StatefulSets. Hover a field, or its note, to see what it does:
+
+<InstallSpec product="metrics" variant="production" />
+
+Apply it with `kubectl apply -f metrics.yaml`. The operator renders the server config, then creates the ServiceAccount, StatefulSets, Services and Ingress. It rolls the pods whenever the spec changes.
+
+## Access
+
+Metrics serves a tenant namespace only once it has credentials. Each `NamespaceAuthentication` creates its namespace if needed and grants one username `read` or `write`. Create the password Secrets first:
+
+<PasswordSecrets product="metrics" />
+
+Then grant a writer for the collector and a reader for Grafana:
+
+<AccessSpec product="metrics" />
+
+Clients send these as HTTP basic auth.
+
+## Connect your tools
+
+Writers serve ingest routes and readers serve queries. Inside the cluster:
+
+<ToolEndpoints product="metrics" />
+
+Any writer accepts any sample and forwards it to the shard's owner, so the plain `metrics-writer` ClusterIP Service is all a client needs. For an OTel Collector and Grafana:
+
+<ClientConfigs product="metrics" />
+
+For Prometheus or Alloy, add a `remote_write` entry with the writer URL above and the same `basic_auth` credentials.
+
+<Callout title="Scraping and rules">
+  Metrics stores and queries; it does not scrape or evaluate rules. Keep Prometheus in agent mode, or Alloy, as the scraper, and evaluate recording and alerting rules with a ruler that queries the reader URL.
+</Callout>
+
+## Verify
+
+<VerifyInstall product="metrics" />
+
+## Scaling
+
+- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take samples from the next aligned hour. Series written across the cutover appear in both shards and are joined at query time. Scale-down is blocked. See [epoch sharding](/sharding/).
+- **Readers:** change `spec.reader.replicas` at any time. They hold no state beyond their cache.
+
+<NextSteps product="metrics" links={["architecture", "api", "benchmarks"]} />

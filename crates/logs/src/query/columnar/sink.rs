@@ -282,7 +282,15 @@ impl<'a> Plan<'a> {
                 let at = row as usize;
                 let unflagged = parser && !work.has_error(at);
                 let mut cursor = work.cursor(at);
-                if !apply_stage(&mut cursor, stage)? {
+                let parsed = match stage {
+                    PipelineStage::Parser(ParserStage::Logfmt {
+                        strict,
+                        keep_empty,
+                        expressions,
+                    }) if expressions.is_empty() => cursor.logfmt(*strict, *keep_empty),
+                    _ => false,
+                };
+                if !parsed && !apply_stage(&mut cursor, stage)? {
                     continue;
                 }
                 // Loki flags only parser errors, when a filter asks about

@@ -51,9 +51,11 @@ use crate::search::{
     FieldStats, IndexDelta, block_max_scores, encode_field_stats, source_matches, term_index_ops,
 };
 
+mod block_cache;
 mod query;
 mod write;
 
+pub(crate) use block_cache::BlockCache;
 #[cfg(feature = "bench-internals")]
 pub(crate) use query::run_entries;
 pub(crate) use query::{Boundaries, SampleRead, ScanTargets, StreamFilter};
@@ -146,6 +148,9 @@ pub struct LogDb {
     write_handle: Option<WriteCoordinatorHandle<LogsWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<LogsWriteDelta, LogsFlusher>>>,
     caches: DiscoveryCaches,
+    blocks: BlockCache,
+    /// This database's ID in `blocks`.
+    database_id: u64,
     /// [`SPAN_SCAN_MIN_STREAMS`], overridable so tests cover both read paths.
     span_scan_min_streams: usize,
 }
@@ -171,6 +176,9 @@ struct DiscoveryCaches {
     /// Streams selected by a set of exact matchers, before the remaining
     /// selector matchers run.
     series: DiscoveryCache<SeriesKey, Versioned<Vec<Arc<Labels>>>>,
+    /// A segment's streams holding every exact label, with their IDs, as
+    /// queries select them; weighed by label bytes.
+    streams: moka::sync::Cache<StreamsKey, SegmentStreams>,
 }
 
 /// A partition's next stream ID, `None` while it has none (or expired).
@@ -179,6 +187,11 @@ type Versioned<V> = (PartitionVersion, V);
 
 type SeriesKey = (Namespace, Partition, Vec<Label>);
 type SegmentSeries = Arc<Versioned<Vec<Arc<Labels>>>>;
+type StreamsKey = (Namespace, SegmentId, Vec<Label>);
+type SegmentStreams = Arc<Versioned<Vec<(StreamId, Arc<Labels>)>>>;
+
+/// Byte budget of [`DiscoveryCaches::streams`].
+const STREAMS_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl DiscoveryCaches {
     fn new() -> Self {
@@ -187,6 +200,22 @@ impl DiscoveryCaches {
             label_names: DiscoveryCache::new(4_096, Duration::ZERO),
             label_values: DiscoveryCache::new(16_384, Duration::ZERO),
             series: DiscoveryCache::new(1_024, Duration::ZERO),
+            streams: moka::sync::Cache::builder()
+                .max_capacity(STREAMS_CACHE_BYTES)
+                .weigher(|_, streams: &SegmentStreams| {
+                    let bytes: usize = streams
+                        .1
+                        .iter()
+                        .map(|(_, labels)| {
+                            48 + labels
+                                .iter()
+                                .map(|label| 48 + label.name.len() + label.value.len())
+                                .sum::<usize>()
+                        })
+                        .sum();
+                    u32::try_from(bytes + 64).unwrap_or(u32::MAX)
+                })
+                .build(),
         }
     }
 }
@@ -195,11 +224,17 @@ impl LogDb {
     pub async fn open(config: Config) -> Result<Self> {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
-        Self::open_with_cache(config, &cache).await
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+        Self::open_with_cache(config, &cache, &blocks).await
     }
 
-    /// Opens a writer that uses `cache` instead of building its own.
-    pub(crate) async fn open_with_cache(config: Config, cache: &SharedDbCache) -> Result<Self> {
+    /// Opens a writer that uses `cache` and `blocks` instead of building its
+    /// own.
+    pub(crate) async fn open_with_cache(
+        config: Config,
+        cache: &SharedDbCache,
+        blocks: &BlockCache,
+    ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
@@ -243,6 +278,8 @@ impl LogDb {
             write_handle: Some(write_handle),
             write_coordinator: Mutex::new(Some(write_coordinator)),
             caches: DiscoveryCaches::new(),
+            blocks: blocks.clone(),
+            database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
         })
     }
@@ -297,15 +334,18 @@ impl LogDb {
         config: Config,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
-        Self::open_reader_with_cache(config, reader_options, &SharedDbCache::default()).await
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+        Self::open_reader_with_cache(config, reader_options, &SharedDbCache::default(), &blocks)
+            .await
     }
 
-    /// Opens a reader that uses `cache`; an empty `cache` falls back to the
-    /// config's own cache settings.
+    /// Opens a reader that uses `cache` and `blocks`; an empty `cache` falls
+    /// back to the config's own cache settings.
     pub(crate) async fn open_reader_with_cache(
         config: Config,
         reader_options: DbReaderOptions,
         cache: &SharedDbCache,
+        blocks: &BlockCache,
     ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
@@ -324,6 +364,8 @@ impl LogDb {
             write_handle: None,
             write_coordinator: Mutex::new(None),
             caches: DiscoveryCaches::new(),
+            blocks: blocks.clone(),
+            database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
         })
     }

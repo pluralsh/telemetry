@@ -6,4 +6,5 @@
 
 | started | commit | variant | status | budget | cases | mismatch | non-match | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 | CPU cores impl / oracle | memory p95 MiB impl / oracle | entry |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-08 04:24Z | `0b54fe965a` | impl_config=production, oracle=tempo-s3, scenario=historical, network=compose, pinned | **FAILED** (1) | 30m | 3461 | 1 | 368 | 5.9 / 409.6 | 51.8 / 796.9 | 0.02x | 0.03 / 0.15 | 125 / 492 | [2026-10-08T0424Z-0b54fe965a-64799c3c](2026-10-08T0424Z-0b54fe965a-64799c3c.md) |
 | 2026-10-08 03:24Z | `97bdc82e99` (dirty) | impl_config=production, oracle=tempo, network=compose, pinned | passed | 30m | 14064 | 0 | 2418 | 3.1 / 37.3 | 61.9 / 268.5 | 0.12x | 0.09 / 0.70 | 468 / 1112 | [2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e](2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e.md) |

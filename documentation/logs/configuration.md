@@ -98,6 +98,11 @@ compaction:
   delete_delay_seconds: 600
   max_merges_per_flush: 256
 
+# Bytes of object blocks kept in memory across queries, with their bodies
+# decompressed once a query needs them; one budget shared by every storage
+# shard of the process; 256 MiB, the default. 0 disables it.
+reader_cache_capacity: 268435456
+
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: applied

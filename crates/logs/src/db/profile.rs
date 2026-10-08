@@ -83,6 +83,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
             ..CompactionConfig::default()
         },
         write_buffer: Default::default(),
+        block_cache_capacity_bytes: crate::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
     }
 }
 
@@ -576,6 +577,9 @@ async fn profile_fuzz_cases() {
         ..Config::default()
     };
     config.compaction.min_age = Duration::ZERO;
+    if let Ok(bytes) = std::env::var("PROFILE_BLOCK_CACHE") {
+        config.block_cache_capacity_bytes = bytes.parse().unwrap();
+    }
     let marker = store.join("ingested");
     if !marker.exists() {
         std::fs::create_dir_all(&store).unwrap();
@@ -738,6 +742,65 @@ async fn profile_repeat_case() {
                 );
             }
         }
+    }
+    db.close().await.unwrap();
+}
+
+/// Shape of the replay store's runs: count, rows and blocks per level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_store_shape() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let config = Config {
+        storage: config(&store, true).storage,
+        retention: None,
+        ..Config::default()
+    };
+    let db = LogDb::open_reader(config, DbReaderOptions::default())
+        .await
+        .unwrap();
+    let mut records = db
+        .storage
+        .scan_prefix_iter(Bytes::new(), BytesRange::unbounded(), None)
+        .await
+        .unwrap();
+    let mut levels = std::collections::BTreeMap::<u8, Vec<(u32, u32, i64)>>::new();
+    let mut classes = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+    let mut totals = (0u64, 0u64, 0u64);
+    while let Some(record) = records.next().await.unwrap() {
+        let class = classify_key(&record.key);
+        let entry = classes.entry(class).or_default();
+        entry.0 += 1;
+        entry.1 += record.value.len();
+        if class == "run" {
+            let run = crate::codec::decode_run(&record.value).unwrap();
+            totals.0 += u64::from(run.rows);
+            totals.1 += run.line_bytes;
+            totals.2 += u64::from(run.bytes);
+            levels.entry(run.level).or_default().push((
+                run.rows,
+                run.blocks,
+                run.max_timestamp_ns - run.min_timestamp_ns,
+            ));
+        }
+    }
+    for (class, (count, bytes)) in classes {
+        println!("{class:24} records {count:9} bytes {bytes:12}");
+    }
+    println!(
+        "rows {} line bytes {} encoded bytes {}",
+        totals.0, totals.1, totals.2
+    );
+    for (level, mut runs) in levels {
+        let median = |runs: &mut Vec<(u32, u32, i64)>, key: fn(&(u32, u32, i64)) -> i64| {
+            runs.sort_by_key(key);
+            key(&runs[runs.len() / 2])
+        };
+        let count = runs.len();
+        let rows = median(&mut runs, |run| run.0.into());
+        let blocks = median(&mut runs, |run| run.1.into());
+        let span = median(&mut runs, |run| run.2) / 1_000_000_000;
+        println!("level {level}: runs {count} median rows {rows} blocks {blocks} span {span}s");
     }
     db.close().await.unwrap();
 }

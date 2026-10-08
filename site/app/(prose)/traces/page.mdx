@@ -1,0 +1,59 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
+import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Traces architecture" };
+
+<PageHeader
+  icon={<SpaceIcon space="traces" size={28} />}
+  eyebrow="Traces"
+  title="Architecture"
+  lede="A Tempo-compatible trace database on SlateDB. It takes OTLP, Zipkin and Jaeger, answers TraceQL and trace-by-ID lookups, and runs as two StatefulSets and a bucket."
+/>
+
+<ArchitectureCompare product="traces" caption="Fig. 1 · Plural Traces vs Grafana Tempo" />
+
+## Write path
+
+1. A collector sends spans to **any writer**: OTLP over HTTP or gRPC, Zipkin v2 JSON, or Jaeger gRPC.
+2. Spans are grouped by trace ID, and each trace is hashed to a storage shard with the [routing epoch](/sharding/) in effect at its earliest span. Traces for other shards are forwarded to their owner over internal gRPC.
+3. The owner buffers traces in memory and acknowledges at the configured durability.
+4. On flush, traces are packed into pages of up to 1,024 traces (about 1 MiB). Page metadata, the compressed payload, trace heads and typed attribute postings are committed to SlateDB in one atomic write.
+5. Spans that arrive after their trace was flushed become a continuation page; the trace head records how many pages to read.
+
+## Read path
+
+1. Grafana sends a trace ID or a TraceQL search to **any reader**. Readers open every shard read-only.
+2. **By ID:** the trace head points at the trace's first page and page count, so a lookup reads exactly those pages and assembles one trace.
+3. **TraceQL:** equality predicates on typed attributes are resolved against postings to find candidate pages. Searches with no usable predicate prune pages by the per-trace time summaries in page metadata.
+4. Candidates are decoded and the complete TraceQL expression is evaluated, so the index never changes query semantics.
+5. Results are merged across shards and cut at the requested limit.
+
+## Storage layout
+
+Each storage shard is one SlateDB database. Keys are scoped by tenant namespace and time segment:
+
+<KeyLayout product="traces" caption="Fig. 2 · Every Traces key begins with the same prefix. Segments default to one hour." />
+
+Attribute posting keys include the scope (`resource` or `span`) and the value type, so the integer `7` and the string `"7"` never collide.
+
+## Compared with Tempo
+
+| Concern | Tempo | Plural Traces |
+| --- | --- | --- |
+| Recent data | Live traces in ingester memory, 3× replicated, plus a WAL | Writer buffer, then SlateDB on object storage |
+| Write fan-out | 3× to ingesters via the hash ring | 1× to the shard owner |
+| Block format | Parquet blocks, compacted through their own ring | Pages in SlateDB, compacted per shard |
+| Search | Queriers fan out to ingesters and backend blocks | Readers use typed attribute postings |
+| Query tiers | Frontend, queriers, compactors, caches | Readers |
+
+## Compatibility
+
+Against Tempo's TraceQL example corpus, **300 of 463** queries match Tempo exactly. Most of the rest are TraceQL metrics. Supported: scoped and unscoped attributes, every intrinsic, structural operators (`>`, `>>`, `~` and their negated and union forms), and `count`, `sum`, `avg`, `min`, `max`, `by()` and `select()` pipelines. Not supported:
+
+- TraceQL metrics (`rate()`, `*_over_time`, `compare()`). The query-range route returns `501`.
+- Span event and link attributes (`event.x`, `link.x`).
+- A pipeline as a structural operand.
+
+<NextSteps product="traces" links={["installation", "api", "benchmarks"]} />
