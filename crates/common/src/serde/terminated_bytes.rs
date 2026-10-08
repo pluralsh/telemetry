@@ -80,6 +80,13 @@ pub fn serialize(data: &[u8], buf: &mut BytesMut) {
 /// - The buffer contains an invalid escape sequence
 /// - The buffer is missing the terminator byte
 pub fn deserialize(buf: &mut &[u8]) -> Result<Bytes, DeserializeError> {
+    if let Some(end) = buf.iter().position(|&byte| byte == TERMINATOR_BYTE)
+        && !buf[..end].contains(&ESCAPE_BYTE)
+    {
+        let result = Bytes::copy_from_slice(&buf[..end]);
+        *buf = &buf[end + 1..];
+        return Ok(result);
+    }
     let mut result = BytesMut::new();
     let mut i = 0;
 

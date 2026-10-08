@@ -1,0 +1,35 @@
+mode: standalone
+listeners: { http: "0.0.0.0:8080", grpc: "0.0.0.0:9090" }
+storage:
+  path: regression
+  object_store: { type: Local, path: /data }
+  block_cache: { type: FoyerMemory, capacity: 67108864 }
+  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+reader_cache_capacity: 67108864
+write:
+  durability: durable
+  flush_interval_seconds: 1
+  remote_concurrency: 8
+  remote_retries: 3
+sharding:
+  shards: 2
+  backend: standalone
+auth:
+  internal: { source: env, name: METRICS_INTERNAL_TOKEN }
+  jwt:
+    jwks: { source: file, path: /app/regression/jwks.json }
+    refresh_interval_seconds: 300
+    request_timeout_seconds: 5
+  global:
+    read: []
+    write: []
+namespaces:
+  - name: regression
+    auth:
+      read:
+        - { type: basic, username: regression-reader, password: { source: literal, value: regression-read } }
+      write: []
+  - name: other
+    auth:
+      read: []
+      write: []

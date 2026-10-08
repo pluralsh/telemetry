@@ -61,6 +61,11 @@ jobs:
           FUZZ_LOGS_STORAGE: ${{ inputs.logs_storage || 's3' }}
           FUZZ_OUTPUT_DIR: target/fuzz/${{ matrix.product }}
           FUZZ_RECORD_DATA: "1"
+          # Uploaded with the artifact; copy history/<product>/*.json into
+          # documentation/benchmarks/fuzz and run `harness.fuzz.history rebuild`
+          # to publish a nightly result.
+          FUZZ_HISTORY_DIR: target/fuzz/${{ matrix.product }}/history
+          FUZZ_HISTORY_HOST_LABEL: github-ubuntu-24.04
         run: >-
           mise exec -- python -m pytest
           tests/regression/test_fuzz/test_fuzz_${{ matrix.product }}.py --fuzz -s

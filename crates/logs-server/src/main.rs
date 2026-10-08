@@ -5,6 +5,11 @@ use plural_logs_server::{AppState, config::Config, grpc_service, router};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
+/// Query paths allocate and free per row; the system allocator made this
+/// most of their CPU time.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(name = "plural-logs-server")]
 struct Args {

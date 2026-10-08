@@ -62,15 +62,25 @@ struct WindowBuffers {
 }
 
 impl WindowBuffers {
-    fn allocate(reservation: &MemoryReservation, cell_count: usize) -> Result<Self, QueryError> {
+    /// Refills `spare`'s columns rather than allocating new ones.
+    fn allocate(
+        reservation: &MemoryReservation,
+        cell_count: usize,
+        spare: (Vec<i64>, Vec<f64>, Vec<CellIndex>),
+    ) -> Result<Self, QueryError> {
         let bytes = window_bytes(cell_count, 0);
         reservation.try_grow(bytes)?;
+        let (mut timestamps, mut values, mut cells) = spare;
+        timestamps.clear();
+        values.clear();
+        cells.clear();
+        cells.resize(cell_count, CellIndex::EMPTY);
         Ok(Self {
             reservation: reservation.clone(),
             bytes,
-            timestamps: Vec::new(),
-            values: Vec::new(),
-            cells: vec![CellIndex::EMPTY; cell_count],
+            timestamps,
+            values,
+            cells,
         })
     }
 
@@ -248,6 +258,9 @@ pub struct SubqueryOp {
     inner: InnerColumns,
     next_outer_step: usize,
     errored: bool,
+    /// A consumed batch's float columns, refilled for the next outer step.
+    /// Unreserved, but never more than one batch's columns.
+    spare: (Vec<i64>, Vec<f64>, Vec<CellIndex>),
 }
 
 impl SubqueryOp {
@@ -314,6 +327,7 @@ impl SubqueryOp {
             inner,
             next_outer_step: 0,
             errored: false,
+            spare: Default::default(),
         }
     }
 
@@ -358,13 +372,14 @@ impl SubqueryOp {
     /// Pack outer step `outer_step_idx`'s window of the drained columns
     /// into a `MatrixWindowBatch`.
     fn build_outer_step_batch(
-        &self,
+        &mut self,
         outer_step_idx: usize,
     ) -> Result<MatrixWindowBatch, QueryError> {
         let series_count = self.series.len();
         let effective_t = self.effective_times[outer_step_idx];
         let lo_exclusive = effective_t.saturating_sub(self.range_ms);
-        let mut buffers = WindowBuffers::allocate(&self.reservation, series_count)?;
+        let spare = std::mem::take(&mut self.spare);
+        let mut buffers = WindowBuffers::allocate(&self.reservation, series_count, spare)?;
 
         // Each cell's samples land contiguously; `CellIndex` records its
         // `[offset, offset+len)` slice.
@@ -383,23 +398,26 @@ impl SubqueryOp {
         }
 
         let histograms = if self.inner.hist.iter().any(|col| !col.is_empty()) {
-            let mut out = WindowHistograms {
-                cells: vec![CellIndex::EMPTY; series_count],
-                ..Default::default()
-            };
+            let mut cells = vec![CellIndex::EMPTY; series_count];
+            let mut timestamps = Vec::new();
+            let mut values = Vec::new();
             for (series_off, col) in self.inner.hist.iter().enumerate() {
                 let (start, end) = window_slice(col, |(t, _)| *t, lo_exclusive, effective_t);
                 buffers.grow_samples(end - start)?;
-                out.cells[series_off] = CellIndex {
-                    offset: out.timestamps.len() as u32,
+                cells[series_off] = CellIndex {
+                    offset: timestamps.len() as u32,
                     len: (end - start) as u32,
                 };
                 for (t, h) in &col[start..end] {
-                    out.timestamps.push(*t);
-                    out.values.push(h.clone());
+                    timestamps.push(*t);
+                    values.push(h.clone());
                 }
             }
-            Some(out)
+            Some(WindowHistograms {
+                timestamps: Arc::new(timestamps),
+                values: Arc::new(values),
+                cells,
+            })
         } else {
             None
         };
@@ -413,8 +431,8 @@ impl SubqueryOp {
             step_range: outer_step_idx..(outer_step_idx + 1),
             series: SchemaRef::Static(self.series.clone()),
             series_range: 0..series_count,
-            timestamps,
-            values,
+            timestamps: Arc::new(timestamps),
+            values: Arc::new(values),
             cells,
             effective_times,
             histograms,
@@ -455,8 +473,8 @@ impl SubqueryOp {
                 step_range: idx..(idx + 1),
                 series: SchemaRef::Static(self.series.clone()),
                 series_range: 0..0,
-                timestamps: Vec::new(),
-                values: Vec::new(),
+                timestamps: Arc::default(),
+                values: Arc::default(),
                 cells: Vec::new(),
                 effective_times: None,
                 histograms: None,
@@ -517,6 +535,14 @@ impl WindowStream for SubqueryOp {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<MatrixWindowBatch, QueryError>>> {
         self.windows(cx)
+    }
+
+    fn recycle(&mut self, window: MatrixWindowBatch) {
+        self.spare = (
+            Arc::try_unwrap(window.timestamps).unwrap_or_default(),
+            Arc::try_unwrap(window.values).unwrap_or_default(),
+            window.cells,
+        );
     }
 }
 

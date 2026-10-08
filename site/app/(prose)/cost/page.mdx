@@ -1,0 +1,57 @@
+import { PageHeader } from "@/components/doc-page";
+import { Callout } from "@/components/mdx-ui";
+import { TelemetryIcon } from "@/components/icons";
+import { CostCalculator } from "@/components/diagrams/cost-calculator";
+
+export const metadata = { title: "Cost estimates" };
+
+<PageHeader
+  icon={<TelemetryIcon size={28} />}
+  eyebrow="Concepts"
+  title="Cost estimates"
+  lede="What 5 TB/day of logs costs to run on Plural Telemetry, on self-hosted Loki, and on Datadog. Every assumption is adjustable."
+/>
+
+<CostCalculator />
+
+## The scenario
+
+The default scenario is a mid-to-large platform team:
+
+- **5 TB/day** of raw logs, about 58 MB/s on average and 87 MB/s at a 1.5× peak.
+- **15-day** retention, which is Datadog's standard indexed tier.
+- **650-byte** average event: 70% at 250 B, 25% at 1 KiB, 5% at 4 KiB. That's about 7.7 billion events a day.
+- **8×** compression on the stored data, applied equally to Plural Telemetry and Loki.
+- AWS **us-east-1** on-demand prices, three availability zones.
+
+## Where the differences come from
+
+**Datadog** is priced per event indexed. At this volume, indexing is about 96% of the bill, and the price scales linearly with event count, not bytes. Flex Logs and sampling bring it down, but only by keeping less searchable data.
+
+**Loki** is much cheaper than Datadog, but three things in its architecture cost real money at this scale:
+
+1. **Replication factor 3.** Every write fans out to three ingesters, so ingest CPU and memory roughly triple.
+2. **Cross-AZ traffic.** Two of the three replicas sit in other zones, and AWS charges $0.01/GB in each direction. At 5 TB/day that's around $2,000/month that does nothing but move bytes.
+3. **Component sprawl.** Frontends, schedulers, index gateways, rulers and three memcached fleets all need baseline capacity.
+
+**Plural Telemetry** writes each record once, to one shard owner, and lets S3 provide durability. Its cross-AZ cost comes only from forwarding a request to the shard owner when an agent hits a different writer. An ingest buffer partitioned by shard would remove even that.
+
+## Assumptions
+
+| Input | Value | Source |
+| --- | --- | --- |
+| Compute | $0.0408 per vCPU-hour, memory included | m7g.2xlarge: 8 vCPU / 32 GiB at $0.3264/h |
+| Plural Telemetry writer throughput | 20 MiB/s per 8-vCPU writer, run at 65% | Midpoint of the [provisional envelope](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md) |
+| Plural Telemetry readers | ½ the writer count + 1, at least 2 | Moderate query load |
+| Loki distributor | 1 vCPU per 10 MB/s at peak | Grafana sizing guidance |
+| Loki ingester | 1 vCPU per 4 MB/s, ×3 replicas | RF=3 |
+| Loki query path | 60% of Plural Telemetry's total compute | Generous to Loki |
+| Loki other | 12 vCPU + 4 per TB/day | index-gw, compactor, ruler, frontend, scheduler, memcached |
+| S3 storage | $0.023 / GB-month | S3 Standard |
+| S3 requests | $0.005 / 1k PUT, $0.0004 / 1k GET | WAL at 10 PUT/s per writer, plus SST and compaction writes |
+| Cross-AZ | $0.02 / GB crossing | Wire compression about 3× |
+| Datadog | $0.10 / GB ingested + $1.06–$2.50 / M events indexed by retention | List price, annual commitment |
+
+<Callout tone="warn" title="These are planning numbers, not quotes">
+  Plural Telemetry's per-writer throughput is still a provisional estimate until the product-shaped scalability benchmarks are published. Your mix of event sizes, stream cardinality, and query load will move all three columns. Run the [scalability runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) on your own object store and instance types before committing to a size.
+</Callout>

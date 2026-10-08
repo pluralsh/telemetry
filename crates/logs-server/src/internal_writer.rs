@@ -195,7 +195,6 @@ fn logs_status(error: plural_logs::Error) -> Status {
         | plural_logs::Error::Shard(_) => Status::unavailable(error.to_string()),
         plural_logs::Error::Corrupt(_)
         | plural_logs::Error::Json(_)
-        | plural_logs::Error::Compression(_)
         | plural_logs::Error::Query(_)
         | plural_logs::Error::Regex(_) => Status::internal(error.to_string()),
     }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::SharedDbCache;
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
     shard_opener,
@@ -10,6 +11,7 @@ use sharding::{
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::BlockCache;
 use crate::query::query_databases;
 use crate::{
     Config, Durability, Error, Labels, LogBatch, LogDb, Namespace, QueryOptions, QueryRequest,
@@ -38,8 +40,12 @@ fn shard_config(config: &Config, shard: ShardId) -> Config {
 }
 
 /// A facade over independently opened storage-shard databases.
+///
+/// Every shard shares one SlateDB block and metadata cache, so the configured
+/// cache capacities bound the whole process rather than each shard.
 pub struct ShardedLogs {
     shards: Arc<ShardSet<LogDb>>,
+    cache: SharedDbCache,
 }
 
 impl ShardedLogs {
@@ -48,10 +54,21 @@ impl ShardedLogs {
         options: ShardingOptions,
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
-        let opener = shard_opener(move |shard| LogDb::open(shard_config(&config, shard)));
-        Ok(Self {
-            shards: Arc::new(ShardSet::open(ShardRole::Writer, options, opener, shards).await?),
-        })
+        config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        let shard_cache = cache.clone();
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+        let opener = shard_opener(move |shard| {
+            let config = shard_config(&config, shard);
+            let cache = shard_cache.clone();
+            let blocks = blocks.clone();
+            async move { LogDb::open_with_cache(config, &cache, &blocks).await }
+        });
+        Self::new(
+            ShardSet::open(ShardRole::Writer, options, opener, shards).await,
+            cache,
+        )
+        .await
     }
 
     pub async fn open_readers(
@@ -60,12 +77,35 @@ impl ShardedLogs {
         shards: impl IntoIterator<Item = ShardId>,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
+        config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        let shard_cache = cache.clone();
+        let blocks = BlockCache::new(config.block_cache_capacity_bytes);
         let opener = shard_opener(move |shard| {
-            LogDb::open_reader(shard_config(&config, shard), reader_options.clone())
+            let config = shard_config(&config, shard);
+            let reader_options = reader_options.clone();
+            let cache = shard_cache.clone();
+            let blocks = blocks.clone();
+            async move { LogDb::open_reader_with_cache(config, reader_options, &cache, &blocks).await }
         });
-        Ok(Self {
-            shards: Arc::new(ShardSet::open(ShardRole::Reader, options, opener, shards).await?),
-        })
+        Self::new(
+            ShardSet::open(ShardRole::Reader, options, opener, shards).await,
+            cache,
+        )
+        .await
+    }
+
+    async fn new(shards: Result<ShardSet<LogDb>>, cache: SharedDbCache) -> Result<Self> {
+        match shards {
+            Ok(shards) => Ok(Self {
+                shards: Arc::new(shards),
+                cache,
+            }),
+            Err(error) => {
+                cache.close().await?;
+                Err(error)
+            }
+        }
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -191,8 +231,11 @@ impl ShardedLogs {
         self.shards.flush_all().await
     }
 
+    /// Closes every shard, then the cache they share.
     pub async fn close(&self) -> Result<()> {
-        self.shards.close_all().await
+        let closed = self.shards.close_all().await;
+        self.cache.close().await?;
+        closed
     }
 }
 
@@ -217,7 +260,10 @@ impl ReaderShardLifecycle for ShardedLogs {
 
 #[cfg(test)]
 mod tests {
-    use common::storage::config::StorageConfig;
+    use common::storage::config::{
+        BlockCacheConfig, FoyerHybridCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
+        SlateDbStorageConfig, StorageConfig,
+    };
     use sharding::DEFAULT_IO_CONCURRENCY_LIMIT;
 
     use super::*;
@@ -366,6 +412,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("max_pages"));
+    }
+
+    #[tokio::test]
+    async fn shards_share_one_hybrid_block_cache_as_writers_and_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let config = Config {
+            storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "logs".to_owned(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: tmp.path().join("objects").to_str().unwrap().to_owned(),
+                }),
+                settings_path: None,
+                block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                    memory_capacity: 1 << 20,
+                    // Foyer's disk tier uses 16 MiB blocks, and closing the
+                    // cache waits for a free block to flush into.
+                    disk_capacity: 64 << 20,
+                    disk_path: cache_dir.to_str().unwrap().to_owned(),
+                    write_policy: Default::default(),
+                    flushers: 1,
+                    buffer_pool_size: None,
+                    submit_queue_size_threshold: 1 << 20,
+                })),
+                meta_cache: None,
+            }),
+            ..Config::default()
+        };
+        let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+        let shards = [ShardId::new(0), ShardId::new(1)];
+        let routing = assignment(options.shard_count());
+        let namespace = Namespace::new("tenant").unwrap();
+        let batches = (0..2)
+            .map(|shard| {
+                let labels = (0..10_000)
+                    .map(|candidate| labels(&[("app", &format!("{shard}-{candidate}"))]))
+                    .find(|labels| route(&routing, &namespace, labels, 0).get() == shard)
+                    .unwrap();
+                LogBatch::new(labels, vec![LogEntry::new(i64::from(shard) + 1, "line")])
+            })
+            .collect();
+        let request = QueryRequest::range("{app=~\".+\"}", 0, 10, 1);
+        let streams = |result| match result {
+            QueryResult::Streams(streams) => streams.len(),
+            _ => panic!("expected streams"),
+        };
+
+        let writers = ShardedLogs::open(config.clone(), options, shards)
+            .await
+            .unwrap();
+        writers
+            .write(&routing, &namespace, batches, Durability::Written)
+            .await
+            .unwrap();
+        writers.flush().await.unwrap();
+        let written = writers
+            .query(&namespace, &request, QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(streams(written), 2);
+        writers.close().await.unwrap();
+
+        let readers =
+            ShardedLogs::open_readers(config, options, shards, DbReaderOptions::default())
+                .await
+                .unwrap();
+        let read = readers
+            .query(&namespace, &request, QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(streams(read), 2);
+        readers.close().await.unwrap();
     }
 
     #[tokio::test]

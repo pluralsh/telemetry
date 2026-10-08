@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from .fuzz.network import join_project_network, leave_project_network
 from .process import CommandFailed, run, wait_http
 
 
@@ -35,6 +38,10 @@ class ComposeProject:
     services: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ()
     build: bool = field(default_factory=build_images_default)
+    # Run after every `up`, including services started after `start`.
+    after_up: list[Callable[[], None]] = field(default_factory=list)
+    # The fuzz harness's `CpuLayout`, recorded in `run.json`.
+    cpu_layout: Any = field(default=None, init=False)
     _started: bool = field(default=False, init=False)
 
     @property
@@ -59,6 +66,9 @@ class ComposeProject:
         if self.build:
             args.append("--build")
         self.execute(*args, *services, timeout=900)
+        join_project_network(self.name)
+        for hook in self.after_up:
+            hook()
 
     def start(self) -> None:
         try:
@@ -99,6 +109,8 @@ class ComposeProject:
         try:
             if logs := os.getenv("REGRESSION_COMPOSE_LOGS"):
                 self.save_logs(Path(logs))
+            # Compose cannot remove a network the runner is still attached to.
+            leave_project_network(self.name)
             self.execute("down", "--volumes", "--remove-orphans", timeout=180)
         finally:
             self._started = False

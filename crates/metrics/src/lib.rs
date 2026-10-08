@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 mod active_series;
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
 mod config;
 mod delta;
 mod discovery;
@@ -16,11 +18,14 @@ mod index;
 mod minitsdb;
 pub(crate) mod model;
 mod postings_cache;
+#[cfg(all(test, feature = "remote-write"))]
+mod profile;
 mod promql;
 mod query;
 mod reader;
 #[cfg(feature = "remote-write")]
 pub mod remote_write;
+mod result_cache;
 pub mod routing;
 mod serde;
 mod sharded;
@@ -38,7 +43,7 @@ pub mod otel;
 pub mod testing;
 
 pub use common::namespace::{Namespace, NamespaceError};
-pub use config::Config;
+pub use config::{Config, DEFAULT_RETENTION, QueryCacheConfig};
 pub use error::{Error, QueryError, Result};
 pub use histogram::{Bucket, CounterResetHint, FloatHistogram};
 pub use model::{

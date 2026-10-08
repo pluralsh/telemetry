@@ -13,17 +13,19 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG TARGETARCH
+# Optional `-C target-cpu` (e.g. x86-64-v3); the binary will not run on older CPUs.
+ARG RUST_TARGET_CPU=
 COPY --from=planner /workspace/recipe.json recipe.json
 COPY crates/proto/proto/ crates/proto/proto/
 COPY crates/logs/src/logql/grammar.lalrpop crates/logs/src/logql/grammar.lalrpop
 RUN --mount=type=cache,id=telemetry-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,id=telemetry-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
-    cargo chef cook --release --locked --package pseudofs-server --recipe-path recipe.json
+    RUSTFLAGS="${RUST_TARGET_CPU:+-C target-cpu=$RUST_TARGET_CPU}" cargo chef cook --release --locked --package pseudofs-server --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN --mount=type=cache,id=telemetry-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
     --mount=type=cache,id=telemetry-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
-    cargo build --release --locked --package pseudofs-server \
+    RUSTFLAGS="${RUST_TARGET_CPU:+-C target-cpu=$RUST_TARGET_CPU}" cargo build --release --locked --package pseudofs-server \
     && mkdir -p /out \
     && cp target/release/pseudofs-server /out/pseudofs-server
 

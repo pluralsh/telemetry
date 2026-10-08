@@ -12,16 +12,24 @@ use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, Storage
 pub struct Config {
     pub storage: StorageConfig,
     pub segment_duration: Duration,
+    /// How long data is kept, counted from ingestion; `None` keeps it
+    /// forever.
     pub retention: Option<Duration>,
     pub page: PageConfig,
     pub write_buffer: WriteCoordinatorConfig,
+    pub read_cache: crate::ReadCacheConfig,
 }
+
+/// Default [`Config::retention`]: 14 days.
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct PageConfig {
-    /// Soft target used to cut a page before adding another trace.
+    /// Soft target used to cut a page before adding another trace, measured
+    /// over trace data without the page's column sidecar.
     pub target_size_bytes: usize,
-    /// Hard encoded page bound. A single trace exceeding it is rejected.
+    /// Hard bound on a page's trace data, without its column sidecar, which
+    /// is always written in addition. A single trace exceeding it is rejected.
     pub max_size_bytes: usize,
     pub max_traces: usize,
 }
@@ -39,9 +47,10 @@ impl Default for Config {
                 meta_cache: None,
             }),
             segment_duration: Duration::from_secs(60 * 60),
-            retention: None,
+            retention: Some(DEFAULT_RETENTION),
             page: PageConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),
+            read_cache: crate::ReadCacheConfig::default(),
         }
     }
 }

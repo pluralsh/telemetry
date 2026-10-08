@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
-use super::slate::{SlateDbStorage, SlateDbStorageReader};
+use super::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::Settings;
 pub use slatedb::db_cache::DbCache;
@@ -75,6 +75,12 @@ impl StorageBuilder {
     /// policies. For InMemory configs it stores a sentinel so that `build()`
     /// returns an `InMemoryStorage`.
     pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
+        Self::with_cache(config, &SharedDbCache::from_config(config).await?)
+    }
+
+    /// Like [`Self::new`], but uses `cache` instead of building one from the
+    /// config's `block_cache` / `meta_cache`.
+    pub fn with_cache(config: &StorageConfig, cache: &SharedDbCache) -> StorageResult<Self> {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
@@ -84,8 +90,7 @@ impl StorageBuilder {
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
                 );
-                let cache =
-                    build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?;
+                let cache = cache.cache();
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store.clone())
                         .with_settings(settings);
@@ -168,7 +173,9 @@ impl StorageBuilder {
                     StorageError::Storage(format!("Failed to create SlateDB: {}", e))
                 })?;
                 Ok(Arc::new(
-                    SlateDbStorage::new(Arc::new(db)).with_sst_reader(sst_reader),
+                    SlateDbStorage::new(Arc::new(db))
+                        .with_sst_reader(sst_reader)
+                        .with_memtable_flush(MEMTABLE_FLUSH_INTERVAL),
                 ))
             }
         }
@@ -206,6 +213,15 @@ impl StorageReaderRuntime {
     /// This option only affects SlateDB storage; it is ignored for in-memory storage.
     pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
         self.block_cache = Some(cache);
+        self
+    }
+
+    /// Uses `cache` when it holds a cache; otherwise the reader builds one
+    /// from config, which yields none when `cache` came from the same config.
+    pub fn with_shared_cache(mut self, cache: &SharedDbCache) -> Self {
+        if let Some(cache) = cache.cache() {
+            self.block_cache = Some(cache);
+        }
         self
     }
 
@@ -427,9 +443,8 @@ pub async fn create_storage_read(
             };
 
             // Prefer the runtime-provided cache (owned by the caller); fall
-            // back to the config-driven split cache. SlateDB drives cache
-            // shutdown from `DbReader::close()`, so we don't hold a handle.
-            // The reader and its count-path `SstReader` share this cache.
+            // back to the config-driven split cache. The reader and its
+            // count-path `SstReader` share this cache.
             let cache = if let Some(cache) = runtime.block_cache {
                 Some(cache)
             } else {
@@ -467,6 +482,49 @@ pub async fn create_storage_read(
     }
 }
 
+/// One SlateDB block and metadata cache shared by every database opened with
+/// it, such as all storage shards of a process.
+///
+/// SlateDB scopes cache keys per `Db` / `DbReader`, so sharing is safe. One
+/// cache keeps the configured capacities a per-process bound rather than a
+/// per-shard one, and gives a hybrid cache's disk tier a single owner of its
+/// `disk_path`; Foyer names its files deterministically, so two caches on one
+/// directory overwrite each other.
+///
+/// SlateDB never closes a cache passed to `with_db_cache`. Call
+/// [`Self::close`] after every database using the cache has closed so a
+/// hybrid cache flushes its memory tier.
+#[derive(Clone, Default)]
+pub struct SharedDbCache(Option<Arc<dyn DbCache>>);
+
+impl SharedDbCache {
+    /// Builds the cache described by `config`; empty for in-memory storage or
+    /// when neither `block_cache` nor `meta_cache` is set.
+    pub async fn from_config(config: &StorageConfig) -> StorageResult<Self> {
+        match config {
+            StorageConfig::InMemory => Ok(Self::default()),
+            StorageConfig::SlateDb(slate_config) => Self::from_slatedb_config(slate_config).await,
+        }
+    }
+
+    pub async fn from_slatedb_config(config: &SlateDbStorageConfig) -> StorageResult<Self> {
+        Ok(Self(
+            build_split_cache(&config.block_cache, &config.meta_cache).await?,
+        ))
+    }
+
+    pub fn cache(&self) -> Option<Arc<dyn DbCache>> {
+        self.0.clone()
+    }
+
+    pub async fn close(&self) -> StorageResult<()> {
+        if let Some(cache) = &self.0 {
+            cache.close().await.map_err(StorageError::from_storage)?;
+        }
+        Ok(())
+    }
+}
+
 /// Builds the combined SlateDB cache from the serializable data- and
 /// metadata-cache configs.
 ///
@@ -476,8 +534,9 @@ pub async fn create_storage_read(
 /// cache. Returns `None` only when neither side is configured, so callers can
 /// skip `with_db_cache` entirely.
 ///
-/// SlateDB drives cache shutdown from `Db::close()` / `DbReader::close()`, so
-/// callers do not need to retain a handle to close the cache themselves.
+/// SlateDB does not close a cache passed to `with_db_cache`; callers that
+/// need a hybrid cache flushed on shutdown should hold it in a
+/// [`SharedDbCache`] and close it after its databases.
 ///
 /// Public so crates that build SlateDB directly (e.g. timeseries) can reuse
 /// the foyer plumbing rather than duplicating it; the returned cache is handed
@@ -488,6 +547,15 @@ pub async fn build_split_cache(
 ) -> StorageResult<Option<Arc<dyn DbCache>>> {
     if data.is_none() && meta.is_none() {
         return Ok(None);
+    }
+    if let (Some(BlockCacheConfig::FoyerHybrid(data)), Some(BlockCacheConfig::FoyerHybrid(meta))) =
+        (data, meta)
+        && data.disk_path == meta.disk_path
+    {
+        return Err(StorageError::Storage(format!(
+            "block_cache and meta_cache must use different disk_path values; both use {}",
+            data.disk_path
+        )));
     }
     let data_cache = build_cache(data, "data").await?;
     let meta_cache = build_cache(meta, "meta").await?;
@@ -630,7 +698,10 @@ async fn build_cache(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
+    use crate::storage::Record;
     use crate::storage::config::{
         FoyerHybridCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig,
         SlateDbStorageConfig,
@@ -939,6 +1010,79 @@ mod tests {
             result.is_ok(),
             "reader runtime cache should take precedence, skipping invalid config cache"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_cache_serves_several_databases_and_outlives_their_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("block-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let config = |path: &str| {
+            StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: path.to_string(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: tmp.path().join("obj").to_str().unwrap().to_string(),
+                }),
+                settings_path: None,
+                // Foyer's disk tier uses 16 MiB blocks, and closing the cache
+                // waits for a free block to flush into.
+                block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
+                    1024 * 1024,
+                    64 * 1024 * 1024,
+                    cache_dir.to_str().unwrap().to_string(),
+                ))),
+                meta_cache: None,
+            })
+        };
+        let cache = SharedDbCache::from_config(&config("shard-0000"))
+            .await
+            .unwrap();
+        let open = |path: &str| {
+            let config = config(path);
+            let cache = cache.clone();
+            async move {
+                StorageBuilder::with_cache(&config, &cache)
+                    .unwrap()
+                    .build()
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = open("shard-0000").await;
+        let second = open("shard-0001").await;
+        for (storage, value) in [(&first, "first"), (&second, "second")] {
+            storage
+                .put(vec![
+                    Record::new(Bytes::from_static(b"key"), Bytes::from(value)).into(),
+                ])
+                .await
+                .unwrap();
+            storage.flush().await.unwrap();
+        }
+
+        first.close().await.unwrap();
+        let record = second.get(Bytes::from_static(b"key")).await.unwrap();
+        assert_eq!(record.unwrap().value, Bytes::from_static(b"second"));
+
+        second.close().await.unwrap();
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_reject_data_and_meta_hybrid_caches_on_one_disk_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hybrid = || {
+            Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
+                1024 * 1024,
+                4 * 1024 * 1024,
+                path.clone(),
+            )))
+        };
+
+        let error = build_split_cache(&hybrid(), &hybrid()).await.err().unwrap();
+
+        assert!(error.to_string().contains("different disk_path"));
     }
 
     #[tokio::test]

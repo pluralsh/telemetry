@@ -1,0 +1,675 @@
+{
+  "schema_version": 1,
+  "products": {
+    "logs": {
+      "runs": 4,
+      "latest": "2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82",
+      "readme": "history/logs/README.md"
+    },
+    "metrics": {
+      "runs": 3,
+      "latest": "2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1",
+      "readme": "history/metrics/README.md"
+    },
+    "traces": {
+      "runs": 2,
+      "latest": "2026-10-08T0424Z-0b54fe965a-64799c3c",
+      "readme": "history/traces/README.md"
+    }
+  },
+  "entries": [
+    {
+      "name": "2026-10-08T0254Z-97bdc82e99-dirty-7a9a258f",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T02:54:26Z",
+      "finished_at": "2026-10-08T03:24:02Z",
+      "json": "history/logs/2026-10-08T0254Z-97bdc82e99-dirty-7a9a258f.json",
+      "markdown": "history/logs/2026-10-08T0254Z-97bdc82e99-dirty-7a9a258f.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 2056922511,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 92,
+      "cases": 8913,
+      "mismatch": 0,
+      "non_match": 337,
+      "outcomes": {
+        "match": 8576,
+        "inconclusive": 139,
+        "oracle_error": 2,
+        "oracle_timeout": 2,
+        "both_error": 157,
+        "unstable_oracle": 37
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 14.926,
+          "p90": 109.771,
+          "p99": 316.705
+        },
+        "oracle_ms": {
+          "p50": 10.421,
+          "p90": 122.108,
+          "p99": 573.725
+        },
+        "ratio_p50": 0.982
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.324,
+          "memory_mib_p95": 1563.0
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.365,
+          "memory_mib_p95": 1352.0
+        },
+        "shared": {
+          "cpu_cores_mean": 0.031,
+          "memory_mib_p95": 266.8
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0354Z-97bdc82e99-dirty-1e8421be",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, scenario=historical, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T03:54:32Z",
+      "finished_at": "2026-10-08T04:24:03Z",
+      "json": "history/logs/2026-10-08T0354Z-97bdc82e99-dirty-1e8421be.json",
+      "markdown": "history/logs/2026-10-08T0354Z-97bdc82e99-dirty-1e8421be.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 511975870,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 83,
+      "cases": 8136,
+      "mismatch": 12,
+      "non_match": 400,
+      "outcomes": {
+        "match": 7736,
+        "mismatch": 12,
+        "inconclusive": 142,
+        "oracle_error": 7,
+        "oracle_timeout": 4,
+        "both_error": 188,
+        "unstable_oracle": 47
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 12.648,
+          "p90": 99.003,
+          "p99": 342.862
+        },
+        "oracle_ms": {
+          "p50": 11.994,
+          "p90": 169.284,
+          "p99": 815.67
+        },
+        "ratio_p50": 0.72
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.26,
+          "memory_mib_p95": 1323.6
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.372,
+          "memory_mib_p95": 727.1
+        },
+        "shared": {
+          "cpu_cores_mean": 0.048,
+          "memory_mib_p95": 338.6
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T2002Z-0b54fe965a-dirty-a0187749",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, pinned",
+      "batch": "bench-20261008T200205Z",
+      "started_at": "2026-10-08T20:02:29Z",
+      "finished_at": "2026-10-08T20:31:59Z",
+      "json": "history/logs/2026-10-08T2002Z-0b54fe965a-dirty-a0187749.json",
+      "markdown": "history/logs/2026-10-08T2002Z-0b54fe965a-dirty-a0187749.md",
+      "git": {
+        "commit": "0b54fe965ae87da5e3f20652478d99d79edd89f5",
+        "short": "0b54fe965a",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 2685957961,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 87,
+      "cases": 8946,
+      "mismatch": 1,
+      "non_match": 341,
+      "outcomes": {
+        "match": 8605,
+        "mismatch": 1,
+        "inconclusive": 121,
+        "oracle_error": 2,
+        "oracle_timeout": 6,
+        "both_error": 170,
+        "unstable_oracle": 41
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 9.541,
+          "p90": 66.363,
+          "p99": 271.915
+        },
+        "oracle_ms": {
+          "p50": 10.995,
+          "p90": 118.69,
+          "p99": 740.113
+        },
+        "ratio_p50": 0.606
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.231,
+          "memory_mib_p95": 1017.4
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.438,
+          "memory_mib_p95": 1939.7
+        },
+        "shared": {
+          "cpu_cores_mean": 0.051,
+          "memory_mib_p95": 331.8
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, scenario=historical, pinned",
+      "batch": "bench-20261008T200205Z",
+      "started_at": "2026-10-08T20:32:32Z",
+      "finished_at": "2026-10-08T21:02:03Z",
+      "json": "history/logs/2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82.json",
+      "markdown": "history/logs/2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82.md",
+      "git": {
+        "commit": "0b54fe965ae87da5e3f20652478d99d79edd89f5",
+        "short": "0b54fe965a",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 3562957698,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 94,
+      "cases": 9154,
+      "mismatch": 2,
+      "non_match": 353,
+      "outcomes": {
+        "match": 8801,
+        "mismatch": 2,
+        "inconclusive": 69,
+        "oracle_error": 6,
+        "oracle_timeout": 6,
+        "both_error": 223,
+        "unstable_oracle": 47
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 10.115,
+          "p90": 58.404,
+          "p99": 252.205
+        },
+        "oracle_ms": {
+          "p50": 11.868,
+          "p90": 119.714,
+          "p99": 539.225
+        },
+        "ratio_p50": 0.544
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.226,
+          "memory_mib_p95": 742.6
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.4,
+          "memory_mib_p95": 694.8
+        },
+        "shared": {
+          "cpu_cores_mean": 0.084,
+          "memory_mib_p95": 356.7
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0254Z-97bdc82e99-dirty-deb2606f",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=prometheus, storage=s3, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T02:54:11Z",
+      "finished_at": "2026-10-08T03:23:43Z",
+      "json": "history/metrics/2026-10-08T0254Z-97bdc82e99-dirty-deb2606f.json",
+      "markdown": "history/metrics/2026-10-08T0254Z-97bdc82e99-dirty-deb2606f.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 3736232047,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "prometheus",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 168,
+      "cases": 17201,
+      "mismatch": 1,
+      "non_match": 314,
+      "outcomes": {
+        "match": 16887,
+        "mismatch": 1,
+        "inconclusive": 7,
+        "oracle_error": 1,
+        "both_error": 305
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.363,
+          "p90": 15.121,
+          "p99": 92.223
+        },
+        "oracle_ms": {
+          "p50": 1.64,
+          "p90": 12.528,
+          "p99": 134.93
+        },
+        "ratio_p50": 1.301
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.097,
+          "memory_mib_p95": 751.2
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.102,
+          "memory_mib_p95": 335.6
+        },
+        "shared": {
+          "cpu_cores_mean": 0.037,
+          "memory_mib_p95": 256.8
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0324Z-97bdc82e99-dirty-53205f4d",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=mimir, storage=s3, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T03:24:14Z",
+      "finished_at": "2026-10-08T03:53:44Z",
+      "json": "history/metrics/2026-10-08T0324Z-97bdc82e99-dirty-53205f4d.json",
+      "markdown": "history/metrics/2026-10-08T0324Z-97bdc82e99-dirty-53205f4d.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 1394630477,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "mimir",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 2,
+      "rounds": 156,
+      "cases": 15604,
+      "mismatch": 14,
+      "non_match": 328,
+      "outcomes": {
+        "match": 15276,
+        "mismatch": 14,
+        "inconclusive": 81,
+        "impl_error": 1,
+        "both_error": 232
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.737,
+          "p90": 17.888,
+          "p99": 112.173
+        },
+        "oracle_ms": {
+          "p50": 4.895,
+          "p90": 30.436,
+          "p99": 178.649
+        },
+        "ratio_p50": 0.618
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.095,
+          "memory_mib_p95": 996.1
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.146,
+          "memory_mib_p95": 465.6
+        },
+        "shared": {
+          "cpu_cores_mean": 0.023,
+          "memory_mib_p95": 255.6
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=mimir-blocks, storage=s3, scenario=historical, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T03:54:37Z",
+      "finished_at": "2026-10-08T04:24:19Z",
+      "json": "history/metrics/2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1.json",
+      "markdown": "history/metrics/2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 239835345,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "mimir-blocks",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 36,
+      "cases": 3647,
+      "mismatch": 1,
+      "non_match": 66,
+      "outcomes": {
+        "match": 3581,
+        "mismatch": 1,
+        "inconclusive": 21,
+        "oracle_error": 1,
+        "both_error": 43
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.333,
+          "p90": 11.562,
+          "p99": 55.167
+        },
+        "oracle_ms": {
+          "p50": 27.341,
+          "p90": 100.394,
+          "p99": 341.679
+        },
+        "ratio_p50": 0.1
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.029,
+          "memory_mib_p95": 378.7
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.534,
+          "memory_mib_p95": 1271.4
+        },
+        "shared": {
+          "cpu_cores_mean": 0.071,
+          "memory_mib_p95": 342.4
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e",
+      "product": "traces",
+      "variant": "impl_config=production, oracle=tempo, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T03:24:35Z",
+      "finished_at": "2026-10-08T03:54:11Z",
+      "json": "history/traces/2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e.json",
+      "markdown": "history/traces/2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e.md",
+      "git": {
+        "commit": "97bdc82e9948aaad8f31f6ea924776366b2b5cd4",
+        "short": "97bdc82e99",
+        "branch": "simd-perf",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 4097109854,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "tempo"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 148,
+      "cases": 14064,
+      "mismatch": 0,
+      "non_match": 2418,
+      "outcomes": {
+        "match": 11646,
+        "inconclusive": 2418
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 3.081,
+          "p90": 20.167,
+          "p99": 61.891
+        },
+        "oracle_ms": {
+          "p50": 37.301,
+          "p90": 106.739,
+          "p99": 268.518
+        },
+        "ratio_p50": 0.124
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.09,
+          "memory_mib_p95": 467.8
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.698,
+          "memory_mib_p95": 1112.1
+        },
+        "shared": {
+          "cpu_cores_mean": 0.023,
+          "memory_mib_p95": 272.9
+        }
+      }
+    },
+    {
+      "name": "2026-10-08T0424Z-0b54fe965a-64799c3c",
+      "product": "traces",
+      "variant": "impl_config=production, oracle=tempo-s3, scenario=historical, network=compose, pinned",
+      "batch": "bench-20261008T024931Z",
+      "started_at": "2026-10-08T04:24:49Z",
+      "finished_at": "2026-10-08T04:54:26Z",
+      "json": "history/traces/2026-10-08T0424Z-0b54fe965a-64799c3c.json",
+      "markdown": "history/traces/2026-10-08T0424Z-0b54fe965a-64799c3c.md",
+      "git": {
+        "commit": "0b54fe965ae87da5e3f20652478d99d79edd89f5",
+        "short": "0b54fe965a",
+        "branch": "simd-perf",
+        "dirty": false
+      },
+      "host": {
+        "label": null,
+        "cpu": null,
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 1685691452,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "tempo-s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 36,
+      "cases": 3461,
+      "mismatch": 1,
+      "non_match": 368,
+      "outcomes": {
+        "match": 3093,
+        "mismatch": 1,
+        "inconclusive": 367
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 5.882,
+          "p90": 20.72,
+          "p99": 51.774
+        },
+        "oracle_ms": {
+          "p50": 409.576,
+          "p90": 554.53,
+          "p99": 796.935
+        },
+        "ratio_p50": 0.017
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.025,
+          "memory_mib_p95": 125.3
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.152,
+          "memory_mib_p95": 491.7
+        },
+        "shared": {
+          "cpu_cores_mean": 0.232,
+          "memory_mib_p95": 466.9
+        }
+      }
+    }
+  ]
+}

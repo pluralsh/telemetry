@@ -148,23 +148,34 @@ pub fn reshape_range(
     }
 
     // Aggregate per global series index so out-of-order batch emission
-    // still produces stable `RangeSample`s. `or_insert_with` clones each
-    // series' `Labels` exactly once — the first time a valid cell for
-    // that series is seen — never per step.
+    // still produces stable `RangeSample`s. Each batch is walked one
+    // series column at a time, so the map is probed once per series per
+    // batch and each series' `Labels` are cloned once, never per step.
     let mut per_series: BTreeMap<u32, RangeSample> = BTreeMap::new();
     for batch in &batches {
         check_batch_shape(batch)?;
         let schema = batch_static_schema(batch)?;
-        for (series_off, step_ts, cell) in present_cells(batch) {
+        let series_count = batch.series_count();
+        let steps = &batch.step_timestamps_slice()[..batch.step_count()];
+        for series_off in 0..series_count {
+            let cell = |step_off: usize| step_off * series_count + series_off;
+            let Some(first) = (0..steps.len()).find(|&step_off| batch.is_present(cell(step_off)))
+            else {
+                continue;
+            };
             let global_idx = (batch.series_range.start + series_off) as u32;
             let series = per_series.entry(global_idx).or_insert_with(|| RangeSample {
                 labels: schema.labels(global_idx).clone(),
-                samples: Vec::new(),
+                samples: Vec::with_capacity(steps.len() - first),
                 histograms: Vec::new(),
             });
-            match cell {
-                Cell::Float(v) => series.samples.push((step_ts, v)),
-                Cell::Histogram(h) => series.histograms.push((step_ts, h.clone())),
+            for (step_off, &step_ts) in steps.iter().enumerate().skip(first) {
+                let cell = cell(step_off);
+                if batch.validity.get(cell) {
+                    series.samples.push((step_ts, batch.values[cell]));
+                } else if let Some(h) = batch.histogram(cell) {
+                    series.histograms.push((step_ts, h.clone()));
+                }
             }
         }
     }
@@ -175,8 +186,12 @@ pub fn reshape_range(
     let out = per_series
         .into_values()
         .map(|mut series| {
-            series.samples.sort_by_key(|(ts, _)| *ts);
-            series.histograms.sort_by_key(|(ts, _)| *ts);
+            if !series.samples.is_sorted_by_key(|(ts, _)| *ts) {
+                series.samples.sort_by_key(|(ts, _)| *ts);
+            }
+            if !series.histograms.is_sorted_by_key(|(ts, _)| *ts) {
+                series.histograms.sort_by_key(|(ts, _)| *ts);
+            }
             series
         })
         .collect();

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use common::SharedDbCache;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use sharding::{
@@ -23,14 +24,15 @@ use crate::promql::source::{
 use crate::promql::source_adapter::QueryReaderSource;
 use crate::query::{LimitedQueryReader, QueryLimits, QueryReader};
 use crate::reader::ReaderQueryReader;
+use crate::result_cache::{CachePlan, Generations, ResultCache, has_duplicate_labels, merge};
 use crate::storage::{StorageRead, WarmStorage};
 use crate::tsdb::{
     TsdbQueryReader, TsdbReadEngine, duration_to_ms, execute_query_source,
     preload_ranges_for_query, query_value_to_range_samples, system_time_to_ms,
 };
 use crate::{
-    Config, Error, Label, Labels, MetricMetadata, Namespace, QueryError, QueryValue, RangeSample,
-    Result, Series, TimeSeriesDb, TimeSeriesDbReader, Visibility,
+    Config, Error, Label, Labels, MetricMetadata, Namespace, QueryCacheConfig, QueryError,
+    QueryValue, RangeSample, Result, Series, TimeSeriesDb, TimeSeriesDbReader, Visibility,
 };
 
 const SOURCE_BUCKET_BITS: u32 = 40;
@@ -103,28 +105,59 @@ async fn warm_storage<S: StorageRead + WarmStorage>(
 }
 
 /// Namespace-aware facade over locally owned storage shards.
+///
+/// Every shard shares one SlateDB block and metadata cache, so the configured
+/// cache capacities bound the whole process rather than each shard.
 pub struct ShardedMetrics {
     shards: Arc<ShardSet<MetricsShard>>,
+    block_cache: SharedDbCache,
+    result_cache: Option<ResultCache>,
 }
 
 pub type ShardedTimeseries = ShardedMetrics;
 
 impl ShardedMetrics {
+    async fn new(
+        shards: Result<ShardSet<MetricsShard>>,
+        block_cache: SharedDbCache,
+        caches: &QueryCacheConfig,
+    ) -> Result<Self> {
+        let shards = match shards {
+            Ok(shards) => shards,
+            Err(error) => {
+                block_cache.close().await?;
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            shards: Arc::new(shards),
+            block_cache,
+            result_cache: caches
+                .result_cache_enabled
+                .then(|| ResultCache::new(caches.result_capacity_bytes)),
+        })
+    }
+
     pub async fn open_writers(
         config: Config,
         options: ShardingOptions,
         owned_shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
+        let caches = config.query_cache;
+        let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
+        let shard_cache = block_cache.clone();
         let opener = shard_opener(move |shard| {
             let mut config = config.clone();
             config.storage = shard_storage(&config, shard);
-            async move { TimeSeriesDb::open(config).await.map(MetricsShard::Writer) }
+            let cache = shard_cache.clone();
+            async move {
+                TimeSeriesDb::open_with_cache(config, &cache)
+                    .await
+                    .map(MetricsShard::Writer)
+            }
         });
-        Ok(Self {
-            shards: Arc::new(
-                ShardSet::open(ShardRole::Writer, options, opener, owned_shards).await?,
-            ),
-        })
+        let shards = ShardSet::open(ShardRole::Writer, options, opener, owned_shards).await;
+        Self::new(shards, block_cache, &caches).await
     }
 
     pub async fn open_readers(
@@ -134,19 +167,30 @@ impl ShardedMetrics {
         reader_options: DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
+        let caches = config.query_cache;
+        let matcher_capacity = caches.matcher_capacity_bytes;
+        let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
+        let shard_cache = block_cache.clone();
         let opener = shard_opener(move |shard| {
-            let open = TimeSeriesDbReader::open(
-                shard_storage(&config, shard),
-                reader_options.clone(),
-                cache_capacity,
-            );
-            async move { open.await.map(|db| MetricsShard::Reader(Box::new(db))) }
+            let storage = shard_storage(&config, shard);
+            let reader_options = reader_options.clone();
+            let cache = shard_cache.clone();
+            async move {
+                TimeSeriesDbReader::open_with_cache(
+                    storage,
+                    reader_options,
+                    cache_capacity,
+                    None,
+                    &cache,
+                )
+                .await
+                .map(|db| {
+                    MetricsShard::Reader(Box::new(db.with_matcher_cache_capacity(matcher_capacity)))
+                })
+            }
         });
-        Ok(Self {
-            shards: Arc::new(
-                ShardSet::open(ShardRole::Reader, options, opener, local_shards).await?,
-            ),
-        })
+        let shards = ShardSet::open(ShardRole::Reader, options, opener, local_shards).await;
+        Self::new(shards, block_cache, &caches).await
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -241,8 +285,11 @@ impl ShardedMetrics {
         self.shards.flush_all().await
     }
 
+    /// Closes every shard, then the block cache they share.
     pub async fn close(&self) -> Result<()> {
-        self.shards.close_all().await
+        let closed = self.shards.close_all().await;
+        self.block_cache.close().await?;
+        closed
     }
 
     pub async fn query(
@@ -251,6 +298,19 @@ impl ShardedMetrics {
         query: &str,
         time: Option<SystemTime>,
     ) -> std::result::Result<QueryValue, QueryError> {
+        self.query_with_trace(namespace, query, time, false)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::query`], plus the per-query trace as JSON when `trace` is set.
+    pub async fn query_with_trace(
+        &self,
+        namespace: &Namespace,
+        query: &str,
+        time: Option<SystemTime>,
+        trace: bool,
+    ) -> std::result::Result<(QueryValue, Option<serde_json::Value>), QueryError> {
         let query_time = time.unwrap_or_else(SystemTime::now);
         let at_ms = system_time_to_ms(query_time);
         let options = crate::QueryOptions::default();
@@ -259,10 +319,11 @@ impl ShardedMetrics {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, at_ms, at_ms, options.lookback_delta)?;
-        let source = Arc::new(self.query_source(namespace, &ranges, &options).await?);
-        execute_query_source(query, source, plan, true)
-            .await
-            .map(|outcome| outcome.value)
+        let (source, plan) = self
+            .traced_query_source(namespace, &ranges, &options, plan, trace)
+            .await?;
+        let outcome = execute_query_source(query, source, plan, true).await?;
+        Ok((outcome.value, trace_json(outcome.trace)))
     }
 
     pub async fn query_range(
@@ -272,6 +333,21 @@ impl ShardedMetrics {
         range: impl RangeBounds<SystemTime> + Clone + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
+        self.query_range_with_trace(namespace, query, range, step, false)
+            .await
+            .map(|(samples, _)| samples)
+    }
+
+    /// [`Self::query_range`], plus the per-query trace as JSON when `trace`
+    /// is set.
+    pub async fn query_range_with_trace(
+        &self,
+        namespace: &Namespace,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Clone + Send,
+        step: Duration,
+        trace: bool,
+    ) -> std::result::Result<(Vec<RangeSample>, Option<serde_json::Value>), QueryError> {
         let (start, end) = crate::util::range_bounds_to_system_time(range);
         let start_ms = system_time_to_ms(start);
         let end_ms = system_time_to_ms(end);
@@ -281,6 +357,122 @@ impl ShardedMetrics {
                 "step must be greater than zero".to_string(),
             ));
         }
+        let lookback = crate::QueryOptions::default().lookback_delta;
+        let now_ms = common::time::now_ms();
+        let plan = self
+            .result_cache
+            .as_ref()
+            .filter(|_| start_ms <= end_ms && start_ms <= now_ms)
+            .and_then(|cache| {
+                let plan = CachePlan::new(namespace, query, start_ms, step_ms, lookback)?;
+                Some((cache, plan))
+            });
+        let (mut series, trace_value) = match plan {
+            Some((cache, plan)) => {
+                self.query_range_cached(
+                    cache, &plan, namespace, query, start_ms, end_ms, step_ms, now_ms, trace,
+                )
+                .await?
+            }
+            None => {
+                self.query_range_uncached(namespace, query, start_ms, end_ms, step_ms, trace)
+                    .await?
+            }
+        };
+        // Prometheus sorts range results by labels; doing the same makes a
+        // cached answer's order match a cold one's.
+        series.sort_by(|left, right| left.labels.cmp(&right.labels));
+        Ok((series, trace_value))
+    }
+
+    /// Range query served by reusing the longest still-valid prefix of
+    /// cached steps and evaluating the rest. Steps after `now_ms` are
+    /// evaluated but never stored, nor is anything when evaluation fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_range_cached(
+        &self,
+        cache: &ResultCache,
+        plan: &CachePlan,
+        namespace: &Namespace,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        now_ms: i64,
+        trace: bool,
+    ) -> std::result::Result<(Vec<RangeSample>, Option<serde_json::Value>), QueryError> {
+        let started = std::time::Instant::now();
+        let step_count = usize::try_from((end_ms - start_ms) / step_ms + 1).unwrap_or(usize::MAX);
+        let last_cacheable = start_ms + (now_ms.min(end_ms) - start_ms) / step_ms * step_ms;
+        // Generations are read before evaluation: a write racing the query
+        // can only make the stored generations older than what was read.
+        let buckets = plan.buckets(start_ms, last_cacheable);
+        let current = match self.bucket_generations(namespace, &buckets).await {
+            Ok(per_shard) => Generations::new(&buckets, per_shard),
+            Err(_) => {
+                return self
+                    .query_range_uncached(namespace, query, start_ms, end_ms, step_ms, trace)
+                    .await;
+            }
+        };
+        let lookup = cache.lookup(plan, start_ms, last_cacheable, &current).await;
+        let reused = lookup.reused_steps;
+        let computed = step_count - reused;
+        let tail_start = start_ms + reused as i64 * step_ms;
+        let head = ResultCache::reused(&lookup, start_ms, tail_start - step_ms);
+
+        let (series, trace_value) = if computed == 0 {
+            let trace_value = trace.then(|| {
+                serde_json::json!({
+                    "totalMs": started.elapsed().as_secs_f64() * 1000.0,
+                    "phases": [],
+                    "operators": [],
+                })
+            });
+            (head, trace_value)
+        } else {
+            let (tail, trace_value) = self
+                .query_range_uncached(namespace, query, tail_start, end_ms, step_ms, trace)
+                .await?;
+            if has_duplicate_labels(&tail) || has_duplicate_labels(&head) {
+                cache.record(0, step_count);
+                if reused == 0 {
+                    return Ok((tail, trace_value));
+                }
+                return self
+                    .query_range_uncached(namespace, query, start_ms, end_ms, step_ms, trace)
+                    .await;
+            }
+            (merge(head, tail), trace_value)
+        };
+
+        cache.record(reused, computed);
+        if computed > 0 {
+            cache
+                .insert(plan, start_ms, last_cacheable, &series, current)
+                .await;
+        }
+        let trace_value = trace_value.map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "resultCache".to_string(),
+                    serde_json::json!({ "reusedSteps": reused, "computedSteps": computed }),
+                );
+            }
+            value
+        });
+        Ok((series, trace_value))
+    }
+
+    async fn query_range_uncached(
+        &self,
+        namespace: &Namespace,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        trace: bool,
+    ) -> std::result::Result<(Vec<RangeSample>, Option<serde_json::Value>), QueryError> {
         let options = crate::QueryOptions::default();
         let plan = crate::promql::plan::LoweringContext::new(
             start_ms,
@@ -289,10 +481,53 @@ impl ShardedMetrics {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, start_ms, end_ms, options.lookback_delta)?;
-        let source = Arc::new(self.query_source(namespace, &ranges, &options).await?);
-        execute_query_source(query, source, plan, false)
-            .await
-            .and_then(|outcome| query_value_to_range_samples(outcome.value))
+        let (source, plan) = self
+            .traced_query_source(namespace, &ranges, &options, plan, trace)
+            .await?;
+        let outcome = execute_query_source(query, source, plan, false).await?;
+        Ok((
+            query_value_to_range_samples(outcome.value)?,
+            trace_json(outcome.trace),
+        ))
+    }
+
+    /// `(reused, computed)` range-query steps since open, when the result
+    /// cache is enabled.
+    #[cfg(test)]
+    pub(crate) fn result_cache_steps(&self) -> Option<(u64, u64)> {
+        self.result_cache.as_ref().map(ResultCache::step_counts)
+    }
+
+    /// The query source, with reader setup recorded into a fresh trace
+    /// collector that `plan` then carries when `trace` is set.
+    async fn traced_query_source(
+        &self,
+        namespace: &Namespace,
+        ranges: &[(i64, i64)],
+        options: &crate::QueryOptions,
+        plan: crate::promql::plan::LoweringContext,
+        trace: bool,
+    ) -> std::result::Result<
+        (
+            Arc<MultiShardSeriesSource>,
+            crate::promql::plan::LoweringContext,
+        ),
+        QueryError,
+    > {
+        use crate::promql::trace::{Phase, TraceCollector, with_trace};
+        if !trace {
+            let source = self.query_source(namespace, ranges, options).await?;
+            return Ok((Arc::new(source), plan));
+        }
+        let collector = TraceCollector::new();
+        let started = std::time::Instant::now();
+        let source = with_trace(
+            collector.clone(),
+            self.query_source(namespace, ranges, options),
+        )
+        .await?;
+        collector.record_phase(Phase::ReaderSetup, started.elapsed().as_nanos() as u64);
+        Ok((Arc::new(source), plan.with_trace(collector)))
     }
 
     pub async fn series(
@@ -405,6 +640,30 @@ impl ShardedMetrics {
         ))
     }
 
+    /// The write generations of `buckets` in `namespace` on every open shard,
+    /// sorted by shard; each shard's list follows `buckets`, with `None` for
+    /// a bucket the shard has never flushed.
+    pub(crate) async fn bucket_generations(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Result<Vec<(ShardId, Vec<Option<u64>>)>> {
+        let mut generations = futures::future::try_join_all(
+            self.shards.entries().await.into_iter().map(|(id, shard)| {
+                self.shards.with_io(async move {
+                    let generations = match &*shard {
+                        MetricsShard::Writer(db) => db.bucket_generations(namespace, buckets).await,
+                        MetricsShard::Reader(db) => db.bucket_generations(namespace, buckets).await,
+                    }?;
+                    Ok::<_, Error>((id, generations))
+                })
+            }),
+        )
+        .await?;
+        generations.sort_unstable_by_key(|(id, _)| *id);
+        Ok(generations)
+    }
+
     async fn query_source(
         &self,
         namespace: &Namespace,
@@ -445,6 +704,10 @@ impl ReaderShardLifecycle for ShardedMetrics {
     ) -> std::result::Result<(), sharding::BoxError> {
         self.shards.reconcile(assignment).await.map_err(Into::into)
     }
+}
+
+fn trace_json(trace: Option<crate::promql::trace::QueryTrace>) -> Option<serde_json::Value> {
+    trace.and_then(|trace| serde_json::to_value(trace).ok())
 }
 
 enum ShardQueryReader {
@@ -587,6 +850,42 @@ impl QueryReader for ShardQueryReader {
             Self::Reader(reader) => reader.inverted_index_term(bucket, term).await,
         }
     }
+
+    async fn cached_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<RoaringBitmap>> {
+        match self {
+            Self::Writer(reader) => reader.cached_selector(bucket, key).await,
+            Self::Reader(reader) => reader.cached_selector(bucket, key).await,
+        }
+    }
+
+    async fn cache_selector(&self, bucket: &TimeBucket, key: &Arc<str>, postings: &RoaringBitmap) {
+        match self {
+            Self::Writer(reader) => reader.cache_selector(bucket, key, postings).await,
+            Self::Reader(reader) => reader.cache_selector(bucket, key, postings).await,
+        }
+    }
+
+    async fn cached_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<[Labels]>> {
+        match self {
+            Self::Writer(reader) => reader.cached_series_set(bucket, key).await,
+            Self::Reader(reader) => reader.cached_series_set(bucket, key).await,
+        }
+    }
+
+    async fn cache_series_set(&self, bucket: &TimeBucket, key: &Arc<str>, series: Arc<[Labels]>) {
+        match self {
+            Self::Writer(reader) => reader.cache_series_set(bucket, key, series).await,
+            Self::Reader(reader) => reader.cache_series_set(bucket, key, series).await,
+        }
+    }
 }
 
 struct IoLimitedQueryReader<R> {
@@ -704,6 +1003,30 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
     ) -> Result<Option<RoaringBitmap>> {
         let _permit = self.acquire().await?;
         self.inner.inverted_index_term(bucket, term).await
+    }
+
+    async fn cached_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<RoaringBitmap>> {
+        self.inner.cached_selector(bucket, key).await
+    }
+
+    async fn cache_selector(&self, bucket: &TimeBucket, key: &Arc<str>, postings: &RoaringBitmap) {
+        self.inner.cache_selector(bucket, key, postings).await
+    }
+
+    async fn cached_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<[Labels]>> {
+        self.inner.cached_series_set(bucket, key).await
+    }
+
+    async fn cache_series_set(&self, bucket: &TimeBucket, key: &Arc<str>, series: Arc<[Labels]>) {
+        self.inner.cache_series_set(bucket, key, series).await
     }
 }
 

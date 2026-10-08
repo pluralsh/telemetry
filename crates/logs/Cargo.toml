@@ -10,6 +10,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+bench-internals = []
+
 [dependencies]
 async-trait.workspace = true
 base64 = "0.23.1"
@@ -17,12 +20,15 @@ blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 common = { version = "0.1.0", path = "../common" }
+foldhash.workspace = true
 futures.workspace = true
 lalrpop-util = "0.23.1"
 linkify = "0.11.0"
 logos = "0.16.1"
+memchr.workspace = true
 metrics.workspace = true
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "serde", "fuel", "loader", "loop_controls", "macros", "urlencode", "json", "multi_template"] }
+moka.workspace = true
 rayon = "1.12.0"
 regex.workspace = true
 regex-syntax.workspace = true
@@ -30,18 +36,29 @@ roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sharding = { path = "../sharding" }
+simdutf8.workspace = true
 slatedb.workspace = true
-snap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash64"] }
 unicode-segmentation = "1.13.3"
+zstd.workspace = true
 
 [dev-dependencies]
+common = { path = "../common", features = ["test-utils"] }
+criterion.workspace = true
+lz4_flex.workspace = true
+mimalloc.workspace = true
 proptest.workspace = true
+snap.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "block_codec"
+harness = false
+required-features = ["bench-internals"]
 
 [build-dependencies]
 lalrpop = "0.23.1"

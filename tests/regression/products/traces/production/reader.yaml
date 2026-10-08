@@ -1,4 +1,6 @@
 mode: reader
+# What the operator renders for a sharded Traces reader with no overrides,
+# except object storage, retention, static sharding and auth.
 listeners: { http: "0.0.0.0:3200", grpc: "0.0.0.0:9092", otlp_grpc: "0.0.0.0:4317", jaeger_grpc: "0.0.0.0:14250" }
 storage:
   type: SlateDb
@@ -9,12 +11,23 @@ storage:
     bucket: traces-regression
     endpoint: http://minio:9000
     allow_http: true
-  block_cache: { type: FoyerMemory, capacity: 67108864 }
-  meta_cache: { type: FoyerMemory, capacity: 16777216 }
+  block_cache:
+    type: FoyerHybrid
+    memory_capacity: 536870912
+    disk_capacity: 10737418240
+    disk_path: /tmp/traces-cache
+  meta_cache: { type: FoyerMemory, capacity: 134217728 }
 segment_duration_seconds: 3600
 retention_seconds: 86400
 page: { target_size_bytes: 1048576, max_size_bytes: 4194304, max_traces: 1024 }
-write: { durability: durable, remote_concurrency: 8, remote_retries: 3 }
+write:
+  durability: applied
+  flush_interval_seconds: 10
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
+  remote_concurrency: 16
+  remote_retries: 2
 sharding:
   shards: 2
   io_concurrency_limit: 128

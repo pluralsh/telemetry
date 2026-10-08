@@ -18,8 +18,6 @@ pub enum Error {
     Storage(#[from] common::StorageError),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("compression error: {0}")]
-    Compression(#[from] snap::Error),
     #[error("query error: {0}")]
     Query(String),
     #[error("regular expression error: {0}")]

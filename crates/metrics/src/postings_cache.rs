@@ -42,11 +42,13 @@ pub(crate) struct PostingsCache {
     stamps: DashMap<TimeBucket, u64>,
     terms: Cache<(TimeBucket, Label), Versioned<Option<RoaringBitmap>>>,
     labels: Cache<(TimeBucket, String), Versioned<LabelPostings>>,
+    /// Whole-selector results keyed by [`selector_key`].
+    selectors: Cache<(TimeBucket, Arc<str>), Versioned<RoaringBitmap>>,
     retention: Option<Duration>,
 }
 
 impl PostingsCache {
-    pub(crate) fn new(retention: Option<Duration>) -> Self {
+    pub(crate) fn new(retention: Option<Duration>, selector_capacity_bytes: u64) -> Self {
         let capacity_bytes = DEFAULT_CAPACITY_BYTES;
         Self {
             seq: AtomicU64::new(0),
@@ -76,6 +78,15 @@ impl PostingsCache {
                             .map(|(value, postings)| value.len() + postings.serialized_size())
                             .sum();
                         weight(name.len() + values)
+                    },
+                )
+                .build(),
+            selectors: Cache::builder()
+                .max_capacity(selector_capacity_bytes)
+                .time_to_live(ENTRY_TTL)
+                .weigher(
+                    |(_, key): &(TimeBucket, Arc<str>), entry: &Versioned<RoaringBitmap>| {
+                        weight(key.len() + entry.value.serialized_size())
                     },
                 )
                 .build(),
@@ -165,6 +176,51 @@ impl PostingsCache {
                 .await;
         }
     }
+
+    /// The cached series of a selector in `bucket` for a reader stamped
+    /// `read_at`. Entries read under a later sequence are not served: they
+    /// may name series missing from that reader's snapshot.
+    pub(crate) async fn selector(
+        &self,
+        bucket: TimeBucket,
+        key: &Arc<str>,
+        read_at: u64,
+    ) -> Option<Arc<RoaringBitmap>> {
+        let entry = self.selectors.get(&(bucket, Arc::clone(key))).await?;
+        (entry.read_at <= read_at && self.fresh(bucket, entry.read_at)).then_some(entry.value)
+    }
+
+    pub(crate) async fn insert_selector(
+        &self,
+        bucket: TimeBucket,
+        key: &Arc<str>,
+        read_at: u64,
+        postings: RoaringBitmap,
+    ) {
+        if self.cacheable(bucket) && self.fresh(bucket, read_at) {
+            let value = Arc::new(postings);
+            self.selectors
+                .insert((bucket, Arc::clone(key)), Versioned { read_at, value })
+                .await;
+        }
+    }
+}
+
+/// Canonical form of a selector's matchers, so selectors that differ only
+/// in matcher order or repetition share an entry. Fields are
+/// length-prefixed, so no label or value content can forge another key.
+pub(crate) fn selector_key<'a>(
+    matchers: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> Arc<str> {
+    let mut matchers: Vec<_> = matchers.into_iter().collect();
+    matchers.sort_unstable();
+    matchers.dedup();
+    let mut key = String::new();
+    for (name, op, value) in matchers {
+        use std::fmt::Write;
+        let _ = write!(key, "{}:{name}{op}{}:{value};", name.len(), value.len());
+    }
+    Arc::from(key)
 }
 
 fn weight(bytes: usize) -> u32 {
@@ -182,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn should_serve_entries_read_after_the_latest_stamp() {
         // given
-        let cache = PostingsCache::new(None);
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
         let bucket = TimeBucket::hour(60);
         let term = Label::metric_name("up");
         cache.stamp(bucket);
@@ -201,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn should_drop_entries_read_before_a_stamp() {
         // given: an entry read under the current sequence
-        let cache = PostingsCache::new(None);
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
         let bucket = TimeBucket::hour(60);
         let read_at = cache.read_seq();
         cache
@@ -219,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_cache_reads_that_race_a_stamp() {
         // given: a reader stamped before a flush lands
-        let cache = PostingsCache::new(None);
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
         let bucket = TimeBucket::hour(60);
         let term = Label::metric_name("up");
         let read_at = cache.read_seq();
@@ -235,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn should_keep_other_buckets_across_a_stamp() {
         // given
-        let cache = PostingsCache::new(None);
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
         let (old, active) = (TimeBucket::hour(60), TimeBucket::hour(120));
         let term = Label::metric_name("up");
         let read_at = cache.read_seq();
@@ -250,11 +306,69 @@ mod tests {
         assert!(cache.term(old, &term).await.is_some());
     }
 
+    #[test]
+    fn should_normalize_selector_keys_by_order_and_repetition() {
+        let a = selector_key([("job", "=", "api"), ("__name__", "=", "up")]);
+        let b = selector_key([
+            ("__name__", "=", "up"),
+            ("job", "=", "api"),
+            ("job", "=", "api"),
+        ]);
+        let c = selector_key([("__name__", "=", "up"), ("job", "!=", "api")]);
+        let forged = selector_key([("jo", "=", "b=api")]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(selector_key([("job", "=", "api")]), forged);
+    }
+
+    #[tokio::test]
+    async fn should_invalidate_selectors_when_their_bucket_gains_series() {
+        // given
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
+        let (bucket, other) = (TimeBucket::hour(60), TimeBucket::hour(120));
+        let key = selector_key([("__name__", "=", "up")]);
+        let read_at = cache.read_seq();
+        cache
+            .insert_selector(bucket, &key, read_at, bitmap(&[1, 2]))
+            .await;
+        cache
+            .insert_selector(other, &key, read_at, bitmap(&[3]))
+            .await;
+        let hit = cache.selector(bucket, &key, read_at).await.expect("cached");
+        assert_eq!(*hit, bitmap(&[1, 2]));
+
+        // when
+        cache.stamp(bucket);
+
+        // then
+        let read_at = cache.read_seq();
+        assert!(cache.selector(bucket, &key, read_at).await.is_none());
+        assert!(cache.selector(other, &key, read_at).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_not_serve_selectors_read_after_the_reader_snapshot() {
+        // given: an entry inserted under a later sequence than the reader's
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
+        let bucket = TimeBucket::hour(60);
+        let key = selector_key([("__name__", "=", "up")]);
+        let old_reader = cache.read_seq();
+        cache.stamp(TimeBucket::hour(120));
+        let new_reader = cache.read_seq();
+        cache
+            .insert_selector(bucket, &key, new_reader, bitmap(&[1]))
+            .await;
+
+        // then
+        assert!(cache.selector(bucket, &key, old_reader).await.is_none());
+        assert!(cache.selector(bucket, &key, new_reader).await.is_some());
+    }
+
     #[tokio::test]
     async fn should_not_cache_buckets_near_retention_expiry() {
         // given: retention that expires the bucket within the margin
         let bucket = TimeBucket::round_to_hour(std::time::SystemTime::now()).unwrap();
-        let cache = PostingsCache::new(Some(Duration::from_secs(60)));
+        let cache = PostingsCache::new(Some(Duration::from_secs(60)), DEFAULT_CAPACITY_BYTES);
         let term = Label::metric_name("up");
 
         // when

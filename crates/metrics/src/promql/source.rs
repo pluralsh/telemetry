@@ -87,8 +87,8 @@ impl ResolvedSeriesRef {
 /// concatenates them into the plan-time series roster.
 ///
 /// Each chunk is self-describing: `labels` and `series` are parallel arrays
-/// indexed together, and every handle in `series` points into this chunk's
-/// `bucket_id`.
+/// indexed together, every handle in `series` points into this chunk's
+/// `bucket_id`, and each entry of `labels` is sorted.
 #[derive(Debug, Clone)]
 pub struct ResolvedSeriesChunk {
     pub bucket_id: u64,

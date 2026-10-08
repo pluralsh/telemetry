@@ -1,6 +1,16 @@
 # SlateDB settings shared by Metrics, Logs, and Traces.
 #
 # Zstd reduces object-store transfer and is well suited to string-heavy
-# discovery catalogs. Use "lz4" instead when lower compression CPU is more
-# important than storage size.
-compression_codec = "zstd"
+# discovery catalogs. Use "Lz4" instead when lower compression CPU is more
+# important than storage size. Values are case-sensitive.
+compression_codec = "Zstd"
+
+# Metrics applies its own defaults beneath this file, so these two keys only
+# need setting to override them (Logs and Traces use SlateDB's defaults:
+# 64 MiB and "4"). Smaller L0 SSTs plus eager compaction keep the merge
+# operands queries over recent data must combine low, for more object-store
+# puts and compaction work. See documentation/metrics/configuration.md.
+# l0_sst_size_bytes = 16777216 # 16 MiB
+#
+# [compactor_options.scheduler_options]
+# min_compaction_sources = "3"

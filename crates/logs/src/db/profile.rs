@@ -12,6 +12,10 @@ use super::*;
 use crate::config::{CompactionConfig, PageConfig};
 use crate::{Direction, LogBatch, LogEntry, QueryOptions, QueryRequest};
 
+// The server's allocator, so profiles weigh allocation as it does.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const RUN: &str = "profile-run";
 const SERVICES: [&str; 6] = [
     "frontend",
@@ -79,6 +83,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
             ..CompactionConfig::default()
         },
         write_buffer: Default::default(),
+        block_cache_capacity_bytes: crate::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
     }
 }
 
@@ -325,7 +330,10 @@ async fn profile_fuzz_replay() {
     config.compaction.enabled = std::env::var("PROFILE_COMPACT").is_ok();
     config.compaction.min_age = Duration::ZERO;
     if existing.is_none() {
-        ingest(&config, &namespace, rounds).await;
+        let settle = std::env::var("PROFILE_COMPACT").map_or(Duration::ZERO, |secs| {
+            Duration::from_secs(secs.parse().unwrap())
+        });
+        ingest(&config, &namespace, rounds, settle).await;
     }
     let db = LogDb::open_reader(config, DbReaderOptions::default())
         .await
@@ -334,7 +342,13 @@ async fn profile_fuzz_replay() {
     db.close().await.unwrap();
 }
 
-async fn ingest(config: &Config, namespace: &Namespace, rounds: Vec<Vec<ReplayStream>>) {
+/// Writes `rounds`, then gives compaction `settle` to catch up when enabled.
+async fn ingest(
+    config: &Config,
+    namespace: &Namespace,
+    rounds: Vec<Vec<ReplayStream>>,
+    settle: Duration,
+) {
     let writer = LogDb::open(config.clone()).await.unwrap();
     for round in rounds {
         let batches = round
@@ -363,10 +377,7 @@ async fn ingest(config: &Config, namespace: &Namespace, rounds: Vec<Vec<ReplaySt
             .unwrap();
     }
     if config.compaction.enabled {
-        tokio::time::sleep(Duration::from_secs(
-            std::env::var("PROFILE_COMPACT").unwrap().parse().unwrap(),
-        ))
-        .await;
+        tokio::time::sleep(settle).await;
     }
     writer.close().await.unwrap();
 }
@@ -455,6 +466,343 @@ async fn replay_queries(db: &LogDb, namespace: &Namespace, queries: &[ReplayQuer
                 .map_or(1, |step| (request.end_ns - request.start_ns) / step + 1),
         );
     }
+}
+
+/// One matched fuzz case, as flattened from `cases.jsonl` with the server's
+/// parameter defaults applied.
+#[derive(serde::Deserialize)]
+struct FuzzCase {
+    id: String,
+    family: String,
+    kind: String,
+    impl_ms: f64,
+    query: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+    step: Option<i64>,
+    time: Option<i64>,
+    limit: Option<usize>,
+    direction: Option<String>,
+    name: Option<String>,
+    selectors: Option<Vec<String>>,
+}
+
+fn classify_key(key: &[u8]) -> &'static str {
+    match crate::codec::key_record_type(key) {
+        None => "segment",
+        Some(1) => "next_stream_id",
+        Some(2) => "stream_dictionary",
+        Some(3) => "forward_labels",
+        Some(4) => "label_postings",
+        Some(5) => "run",
+        Some(6) => "object_block",
+        Some(7) => "next_object_id",
+        Some(8) => "search_field_stats",
+        Some(9) => "search_term_stats",
+        Some(10) => "search_term_directory",
+        Some(11) => "search_posting_block",
+        Some(12) => "object_tombstone",
+        Some(13) => "rollup",
+        Some(14) => "object_directory",
+        Some(_) => "catalog",
+    }
+}
+
+async fn run_case(db: &LogDb, namespace: &Namespace, case: &FuzzCase) -> Result<usize> {
+    let span = || (case.start.unwrap(), case.end.unwrap());
+    Ok(match case.kind.as_str() {
+        "labels" => {
+            let (start, end) = span();
+            db.label_names(namespace, start, end).await?.len()
+        }
+        "label_values" => {
+            let (start, end) = span();
+            db.label_values(namespace, case.name.as_deref().unwrap(), start, end)
+                .await?
+                .len()
+        }
+        "series" => {
+            let (start, end) = span();
+            db.series(namespace, case.selectors.as_deref().unwrap(), start, end)
+                .await?
+                .len()
+        }
+        kind => {
+            let query = case.query.clone().unwrap();
+            let request = match kind {
+                "range" => {
+                    let (start, end) = span();
+                    QueryRequest::range(query, start, end, case.step.unwrap())
+                        .frontend_step_aligned()
+                }
+                "instant_logs" => QueryRequest::instant_logs(query, case.time.unwrap()),
+                "instant" => QueryRequest::instant(query, case.time.unwrap()),
+                other => panic!("unknown case kind {other}"),
+            };
+            let options = QueryOptions {
+                limit: case.limit.unwrap_or(100),
+                direction: if case.direction.as_deref() == Some("forward") {
+                    Direction::Forward
+                } else {
+                    Direction::Backward
+                },
+                ..QueryOptions::default()
+            };
+            match db.query(namespace, &request, options).await? {
+                crate::QueryResult::Streams(streams) => streams.len(),
+                crate::QueryResult::Vector(samples) => samples.len(),
+                crate::QueryResult::Matrix(series) => series.len(),
+                crate::QueryResult::Scalar(_) => 1,
+            }
+        }
+    })
+}
+
+/// Replays every matched case of a fuzz run (`PROFILE_CASES/{rounds,cases}.json`,
+/// written by `python -m harness.fuzz.replay logs`) against a reader, writing per-query latency
+/// and storage reads by record type to `PROFILE_OUT` as JSON lines. The store
+/// at `PROFILE_STORE` is ingested once and reused across runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_fuzz_cases() {
+    use std::io::Write as _;
+
+    let input = std::path::PathBuf::from(std::env::var("PROFILE_CASES").unwrap());
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let reps: usize = std::env::var("PROFILE_REPS").map_or(3, |value| value.parse().unwrap());
+    let namespace = Namespace::new("regression").unwrap();
+    let mut config = Config {
+        storage: config(&store, true).storage,
+        retention: None,
+        ..Config::default()
+    };
+    config.compaction.min_age = Duration::ZERO;
+    if let Ok(bytes) = std::env::var("PROFILE_BLOCK_CACHE") {
+        config.block_cache_capacity_bytes = bytes.parse().unwrap();
+    }
+    let marker = store.join("ingested");
+    if !marker.exists() {
+        std::fs::create_dir_all(&store).unwrap();
+        let rounds: Vec<Vec<ReplayStream>> =
+            serde_json::from_slice(&std::fs::read(input.join("rounds.json")).unwrap()).unwrap();
+        ingest(&config, &namespace, rounds, Duration::from_secs(30)).await;
+        std::fs::write(&marker, b"").unwrap();
+    }
+    let cases: Vec<FuzzCase> =
+        serde_json::from_slice(&std::fs::read(input.join("cases.json")).unwrap()).unwrap();
+
+    let mut db = LogDb::open_reader(config, DbReaderOptions::default())
+        .await
+        .unwrap();
+    let counting = Arc::new(common::storage::counting::CountingStorage::new(
+        db.storage.clone(),
+        classify_key,
+    ));
+    db.storage = counting.clone();
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(std::env::var("PROFILE_OUT").unwrap()).unwrap(),
+    );
+    for case in &cases {
+        let mut best: Option<(Duration, serde_json::Value)> = None;
+        let mut outcome = Ok(0);
+        for _ in 0..reps {
+            counting.take();
+            let started = Instant::now();
+            outcome = run_case(&db, &namespace, case).await;
+            let elapsed = started.elapsed();
+            let io = counting
+                .take()
+                .into_iter()
+                .map(|((op, class), stats)| {
+                    (
+                        format!("{op}/{class}"),
+                        serde_json::json!({
+                            "calls": stats.calls,
+                            "records": stats.records,
+                            "bytes": stats.bytes,
+                            "ms": ms(stats.elapsed),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            if best.as_ref().is_none_or(|(fastest, _)| elapsed < *fastest) {
+                best = Some((elapsed, serde_json::Value::Object(io)));
+            }
+        }
+        let (elapsed, io) = best.unwrap();
+        let (results, error) = match outcome {
+            Ok(results) => (results, None),
+            Err(error) => (0, Some(error.to_string())),
+        };
+        let row = serde_json::json!({
+            "id": case.id,
+            "family": case.family,
+            "query": case.query,
+            "ms": ms(elapsed),
+            "impl_ms": case.impl_ms,
+            "results": results,
+            "error": error,
+            "io": io,
+        });
+        writeln!(out, "{row}").unwrap();
+    }
+    out.flush().unwrap();
+    db.close().await.unwrap();
+}
+
+/// Runs one replay case (`PROFILE_CASE` id from `PROFILE_CASES/cases.json`)
+/// several times against the replay store and reports how results differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_repeat_case() {
+    let input = std::path::PathBuf::from(std::env::var("PROFILE_CASES").unwrap());
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let id = std::env::var("PROFILE_CASE").unwrap();
+    let cases: Vec<FuzzCase> =
+        serde_json::from_slice(&std::fs::read(input.join("cases.json")).unwrap()).unwrap();
+    let case = cases.into_iter().find(|case| case.id == id).unwrap();
+    let mut config = Config {
+        storage: config(&store, true).storage,
+        retention: None,
+        ..Config::default()
+    };
+    config.compaction.min_age = Duration::ZERO;
+    let db = LogDb::open_reader(config, DbReaderOptions::default())
+        .await
+        .unwrap();
+    let namespace = Namespace::new("regression").unwrap();
+    let (start, end) = (case.start.unwrap(), case.end.unwrap());
+    let request = QueryRequest::range(case.query.clone().unwrap(), start, end, case.step.unwrap())
+        .frontend_step_aligned();
+    let options = QueryOptions {
+        limit: case.limit.unwrap_or(100),
+        direction: Direction::Backward,
+        ..QueryOptions::default()
+    };
+    let mut first: Option<Vec<crate::LogStream>> = None;
+    for run in 0..8 {
+        let crate::QueryResult::Streams(streams) = db
+            .query(&namespace, &request, options.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected streams");
+        };
+        let entries = streams
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum::<usize>();
+        let timestamps = streams
+            .iter()
+            .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns));
+        let (min, max) = timestamps.fold((i64::MAX, i64::MIN), |(lo, hi), ts| {
+            (lo.min(ts), hi.max(ts))
+        });
+        println!(
+            "run {run}: streams {} entries {entries} oldest {min} newest {max}",
+            streams.len()
+        );
+        match &first {
+            None => first = Some(streams),
+            Some(first) => {
+                let labels = |streams: &[crate::LogStream]| {
+                    streams
+                        .iter()
+                        .map(|stream| format!("{:?}", stream.labels))
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                let (a, b) = (labels(first), labels(&streams));
+                let entries = |streams: &[crate::LogStream]| {
+                    streams
+                        .iter()
+                        .flat_map(|stream| {
+                            stream.entries.iter().map(move |entry| {
+                                (
+                                    entry.timestamp_ns,
+                                    format!("{:?}", stream.labels),
+                                    entry.line.clone(),
+                                )
+                            })
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                let (ea, eb) = (entries(first), entries(&streams));
+                let missing = ea.difference(&eb).map(|entry| entry.0).collect::<Vec<_>>();
+                let extra = eb.difference(&ea).map(|entry| entry.0).collect::<Vec<_>>();
+                println!(
+                    "  vs run 0: streams -{} +{}; entries -{} (ts {:?}..{:?}) +{} (ts {:?}..{:?})",
+                    a.difference(&b).count(),
+                    b.difference(&a).count(),
+                    missing.len(),
+                    missing.first(),
+                    missing.last(),
+                    extra.len(),
+                    extra.first(),
+                    extra.last(),
+                );
+            }
+        }
+    }
+    db.close().await.unwrap();
+}
+
+/// Shape of the replay store's runs: count, rows and blocks per level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_store_shape() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let config = Config {
+        storage: config(&store, true).storage,
+        retention: None,
+        ..Config::default()
+    };
+    let db = LogDb::open_reader(config, DbReaderOptions::default())
+        .await
+        .unwrap();
+    let mut records = db
+        .storage
+        .scan_prefix_iter(Bytes::new(), BytesRange::unbounded(), None)
+        .await
+        .unwrap();
+    let mut levels = std::collections::BTreeMap::<u8, Vec<(u32, u32, i64)>>::new();
+    let mut classes = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+    let mut totals = (0u64, 0u64, 0u64);
+    while let Some(record) = records.next().await.unwrap() {
+        let class = classify_key(&record.key);
+        let entry = classes.entry(class).or_default();
+        entry.0 += 1;
+        entry.1 += record.value.len();
+        if class == "run" {
+            let run = crate::codec::decode_run(&record.value).unwrap();
+            totals.0 += u64::from(run.rows);
+            totals.1 += run.line_bytes;
+            totals.2 += u64::from(run.bytes);
+            levels.entry(run.level).or_default().push((
+                run.rows,
+                run.blocks,
+                run.max_timestamp_ns - run.min_timestamp_ns,
+            ));
+        }
+    }
+    for (class, (count, bytes)) in classes {
+        println!("{class:24} records {count:9} bytes {bytes:12}");
+    }
+    println!(
+        "rows {} line bytes {} encoded bytes {}",
+        totals.0, totals.1, totals.2
+    );
+    for (level, mut runs) in levels {
+        let median = |runs: &mut Vec<(u32, u32, i64)>, key: fn(&(u32, u32, i64)) -> i64| {
+            runs.sort_by_key(key);
+            key(&runs[runs.len() / 2])
+        };
+        let count = runs.len();
+        let rows = median(&mut runs, |run| run.0.into());
+        let blocks = median(&mut runs, |run| run.1.into());
+        let span = median(&mut runs, |run| run.2) / 1_000_000_000;
+        println!("level {level}: runs {count} median rows {rows} blocks {blocks} span {span}s");
+    }
+    db.close().await.unwrap();
 }
 
 fn plan_segments(db: &LogDb, start: i64, end: i64) -> usize {

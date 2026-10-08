@@ -1,9 +1,44 @@
-use super::*;
-use common::display::sanitize_label_name;
+use std::ops::Range;
 
-pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> {
+use super::*;
+use common::display::{sanitize_label_name, sanitized_label_name};
+use template::Context;
+
+/// One row as pipeline stages see it: its line, its labels, and its
+/// structured metadata, which a label lookup falls back to.
+pub(super) trait StageRow: Context {
+    fn set_line(&mut self, line: String);
+    fn label(&self, name: &str) -> Option<&str>;
+    fn metadata_value(&self, name: &str) -> Option<&str>;
+    fn insert_label(&mut self, name: String, value: String);
+    fn remove_label(&mut self, name: &str) -> Option<String>;
+    fn remove_metadata(&mut self, name: &str) -> Option<String>;
+    /// Removes every label and metadata field `keep` rejects.
+    fn retain_fields(&mut self, keep: &mut dyn FnMut(&str, &str) -> bool);
+    fn set_value(&mut self, value: f64);
+}
+
+/// `None` unless `stage` only tests the line, so it can run before a row's
+/// labels or metadata are touched.
+pub(super) fn line_test(line: &str, stage: &PipelineStage) -> Option<Result<bool>> {
     match stage {
-        PipelineStage::LineFilter(filter) => line_filter(&row.line, filter),
+        PipelineStage::LineFilter(filter) => Some(line_filter(line, filter)),
+        // The index only produces candidates; the source line remains the
+        // authority so stale/colliding postings cannot create false matches.
+        PipelineStage::Match(query) => Some(Ok(source_matches(
+            &DEFAULT_ANALYZER,
+            line,
+            &match_terms(query),
+        ))),
+        _ => None,
+    }
+}
+
+pub(super) fn apply_stage<R: StageRow>(row: &mut R, stage: &PipelineStage) -> Result<bool> {
+    match stage {
+        PipelineStage::LineFilter(_) | PipelineStage::Match(_) => {
+            line_test(row.line(), stage).expect("line filters and matches are line tests")
+        }
         PipelineStage::Parser(parser) => {
             parse_stage(row, parser)?;
             Ok(true)
@@ -11,7 +46,7 @@ pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> 
         PipelineStage::LabelFilter(filter) => label_filter(row, &filter.value),
         PipelineStage::LineFormat(template) => {
             match template.compiled().render(row) {
-                Ok(line) => row.line = line,
+                Ok(line) => row.set_line(line),
                 Err(error) => set_error(row, "TemplateFormatErr", &error.to_string()),
             }
             Ok(true)
@@ -20,30 +55,28 @@ pub(super) fn apply_stage(row: &mut Row, stage: &PipelineStage) -> Result<bool> 
             label_format(row, assignments);
             Ok(true)
         }
+        // Applies to structured metadata as well as labels, as in Loki.
         PipelineStage::Drop(selections) => {
-            retain_labels(row, |name, value| !selected(selections, name, value));
+            row.retain_fields(&mut |name, value| !selected(selections, name, value));
             Ok(true)
         }
         PipelineStage::Keep(selections) => {
-            retain_labels(row, |name, value| {
+            row.retain_fields(&mut |name, value| {
                 is_error_label(name) || selected(selections, name, value)
             });
             Ok(true)
         }
         PipelineStage::Decolorize => {
-            if let Cow::Owned(line) = ANSI_ESCAPE.replace_all(&row.line, "") {
-                row.line = line;
+            let decolorized = match ANSI_ESCAPE.replace_all(row.line(), "") {
+                Cow::Owned(line) => Some(line),
+                Cow::Borrowed(_) => None,
+            };
+            if let Some(line) = decolorized {
+                row.set_line(line);
             }
             Ok(true)
         }
         PipelineStage::Unwrap(unwrap) => apply_unwrap(row, unwrap),
-        // The index only produces candidates; the source line remains the
-        // authority so stale/colliding postings cannot create false matches.
-        PipelineStage::Match(query) => Ok(source_matches(
-            &DEFAULT_ANALYZER,
-            &row.line,
-            &match_terms(query),
-        )),
     }
 }
 
@@ -55,16 +88,6 @@ fn selected(selections: &[crate::logql::LabelSelection], name: &str, value: &str
                 .as_ref()
                 .is_none_or(|(op, expected)| string_match(*op, value, expected).unwrap_or(false))
     })
-}
-
-/// Applies to structured metadata as well as labels, as `drop`/`keep` do in
-/// Loki. Copies the stream's shared labels only if something is removed.
-fn retain_labels(row: &mut Row, mut keep: impl FnMut(&str, &str) -> bool) {
-    row.metadata.retain(|name, value| keep(name, value));
-    if row.labels.iter().all(|(name, value)| keep(name, value)) {
-        return;
-    }
-    Arc::make_mut(&mut row.labels).retain(|name, value| keep(name, value));
 }
 
 /// `or` operands share the first operand's operator: a positive filter keeps
@@ -84,7 +107,7 @@ pub(super) fn line_filter(line: &str, filter: &LineFilter) -> Result<bool> {
             (LineFilterOp::Contains | LineFilterOp::NotContains, LineFilterTerm::Ip(value)) => {
                 contains_ip(line, value)
             }
-            (LineFilterOp::Contains | LineFilterOp::NotContains, _) => line.contains(term),
+            (LineFilterOp::Contains | LineFilterOp::NotContains, _) => contains(line, term),
             (LineFilterOp::Regex | LineFilterOp::NotRegex, _) => {
                 with_regex(RegexKind::Plain, term, |regex| regex.is_match(line))?
             }
@@ -99,14 +122,14 @@ pub(super) fn line_filter(line: &str, filter: &LineFilter) -> Result<bool> {
     Ok(negative)
 }
 
-pub(super) fn parse_stage(row: &mut Row, parser: &ParserStage) -> Result<()> {
+pub(super) fn parse_stage<R: StageRow>(row: &mut R, parser: &ParserStage) -> Result<()> {
     if let ParserStage::Logfmt {
         strict,
         keep_empty,
         expressions,
     } = parser
     {
-        let (labels, error) = parse_logfmt(&row.line, *strict, *keep_empty, expressions)?;
+        let (labels, error) = parse_logfmt(row.line(), *strict, *keep_empty, expressions)?;
         merge_parsed(row, labels);
         if let Some(error) = error {
             set_error(row, "LogfmtParserErr", &error);
@@ -114,14 +137,14 @@ pub(super) fn parse_stage(row: &mut Row, parser: &ParserStage) -> Result<()> {
         return Ok(());
     }
     let result = match parser {
-        ParserStage::Json { expressions } => parse_json(&row.line, expressions),
+        ParserStage::Json { expressions } => parse_json(row.line(), expressions),
         ParserStage::Logfmt { .. } => unreachable!(),
         ParserStage::Regexp(expression) => Ok(with_regex(RegexKind::Plain, expression, |regex| {
-            named_captures(regex, &row.line)
+            named_captures(regex, row.line())
         })?),
-        ParserStage::Pattern(pattern) => Ok(pattern_captures(pattern, &row.line)),
-        ParserStage::Unpack => unpack(&row.line).map(|(line, labels)| {
-            row.line = line;
+        ParserStage::Pattern(pattern) => Ok(pattern_captures(pattern, row.line())),
+        ParserStage::Unpack => unpack(row.line()).map(|(line, labels)| {
+            row.set_line(line);
             labels
         }),
     };
@@ -175,40 +198,16 @@ pub(super) fn parser_error_name(parser: &ParserStage) -> &'static str {
     }
 }
 
-pub(super) fn merge_parsed(row: &mut Row, labels: BTreeMap<String, String>) {
-    if labels.is_empty() {
-        return;
-    }
-    let row_labels = Arc::make_mut(&mut row.labels);
+pub(super) fn merge_parsed<R: StageRow>(row: &mut R, labels: BTreeMap<String, String>) {
     for (mut name, value) in labels {
-        if row_labels.contains_key(&name) || row.metadata.contains_key(&name) {
+        if row.label(&name).is_some() || row.metadata_value(&name).is_some() {
             // An empty extraction never displaces a clashing label's `_extracted` copy.
             if value.is_empty() {
                 continue;
             }
             name.push_str("_extracted");
         }
-        row_labels.insert(name, value);
-    }
-}
-
-/// Moves structured metadata into the labels, as Loki does for metric
-/// queries; a name clashing with a stream label gets `_extracted`.
-pub(super) fn promote_metadata(row: &mut Row) {
-    let promoted = row.metadata.keys().any(|name| name != SCORE_METADATA_FIELD);
-    if !promoted {
-        return;
-    }
-    let labels = Arc::make_mut(&mut row.labels);
-    for (mut name, value) in std::mem::take(&mut row.metadata) {
-        if name == SCORE_METADATA_FIELD {
-            row.metadata.insert(name, value);
-            continue;
-        }
-        if labels.contains_key(&name) {
-            name.push_str("_extracted");
-        }
-        labels.insert(name, value);
+        row.insert_label(name, value);
     }
 }
 
@@ -220,10 +219,9 @@ pub(super) fn is_error_label(name: &str) -> bool {
     )
 }
 
-pub(super) fn set_error(row: &mut Row, kind: &str, details: &str) {
-    let labels = Arc::make_mut(&mut row.labels);
-    labels.insert(ERROR_LABEL.into(), kind.into());
-    labels.insert(ERROR_DETAILS_LABEL.into(), details.into());
+pub(super) fn set_error<R: StageRow>(row: &mut R, kind: &str, details: &str) {
+    row.insert_label(ERROR_LABEL.into(), kind.into());
+    row.insert_label(ERROR_DETAILS_LABEL.into(), details.into());
 }
 
 pub(super) fn parse_json(
@@ -398,55 +396,12 @@ pub(super) fn parse_logfmt(
     expressions: &[ParserExpression],
 ) -> Result<(BTreeMap<String, String>, Option<String>)> {
     let mut all = BTreeMap::new();
-    let mut cursor = 0usize;
-    let mut parse_error = None;
-    while cursor < line.len() {
-        while cursor < line.len() && line.as_bytes()[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor == line.len() {
-            break;
-        }
-        let token_start = cursor;
-        let key_start = cursor;
-        while cursor < line.len()
-            && !line.as_bytes()[cursor].is_ascii_whitespace()
-            && !matches!(line.as_bytes()[cursor], b'=' | b'"')
-        {
-            cursor += 1;
-        }
-        if cursor == key_start || line.as_bytes().get(cursor) == Some(&b'"') {
-            let error = format!("logfmt syntax error at pos {} : invalid key", cursor + 1);
-            if strict {
-                parse_error = Some(error);
-                break;
-            }
-            skip_logfmt_token(line, &mut cursor);
-            continue;
-        }
-        let key = sanitize_label_name(&line[key_start..cursor]);
-        let value = match logfmt_value(line, &mut cursor, strict) {
-            Ok(Some(value)) => value,
-            Ok(None) => continue,
-            Err(error) => {
-                parse_error = Some(error);
-                break;
-            }
-        };
-        if key.is_empty() {
-            if strict {
-                parse_error = Some(format!(
-                    "logfmt syntax error at pos {} : invalid key",
-                    token_start + 1
-                ));
-                break;
-            }
-            continue;
-        }
+    let parse_error = logfmt_pairs(line, strict, |key, value| {
         if keep_empty || !value.is_empty() {
-            all.entry(key).or_insert(value);
+            all.entry(key.into_owned())
+                .or_insert_with(|| value.into_string(line));
         }
-    }
+    });
     if expressions.is_empty() {
         Ok((all, parse_error))
     } else {
@@ -456,7 +411,7 @@ pub(super) fn parse_logfmt(
                 .map(|expression| {
                     (
                         expression.label.clone(),
-                        all.get(&sanitize_label_name(&expression.expression))
+                        all.get(&*sanitized_label_name(&expression.expression))
                             .cloned()
                             .unwrap_or_default(),
                     )
@@ -467,15 +422,92 @@ pub(super) fn parse_logfmt(
     }
 }
 
+/// A logfmt value: bytes of its line, or a quoted value with escapes.
+pub(super) enum LogfmtValue {
+    Range(Range<usize>),
+    Owned(String),
+}
+
+impl LogfmtValue {
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Range(range) => range.is_empty(),
+            Self::Owned(value) => value.is_empty(),
+        }
+    }
+
+    fn into_string(self, line: &str) -> String {
+        match self {
+            Self::Range(range) => line[range].to_owned(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+/// Passes `pair` each sanitized key and value of a logfmt `line`, in line
+/// order, and returns the syntax error that ended a strict parse; pairs
+/// before it were passed.
+pub(super) fn logfmt_pairs<'a>(
+    line: &'a str,
+    strict: bool,
+    mut pair: impl FnMut(Cow<'a, str>, LogfmtValue),
+) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < line.len() {
+        while cursor < line.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == line.len() {
+            break;
+        }
+        let token_start = cursor;
+        let key_start = cursor;
+        while cursor < line.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'"')
+        {
+            cursor += 1;
+        }
+        if cursor == key_start || bytes.get(cursor) == Some(&b'"') {
+            if strict {
+                return Some(format!(
+                    "logfmt syntax error at pos {} : invalid key",
+                    cursor + 1
+                ));
+            }
+            skip_logfmt_token(line, &mut cursor);
+            continue;
+        }
+        let key = sanitized_label_name(&line[key_start..cursor]);
+        let value = match logfmt_value(line, &mut cursor, strict) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
+            Err(error) => return Some(error),
+        };
+        if key.is_empty() {
+            if strict {
+                return Some(format!(
+                    "logfmt syntax error at pos {} : invalid key",
+                    token_start + 1
+                ));
+            }
+            continue;
+        }
+        pair(key, value);
+    }
+    None
+}
+
 /// Scans the value following a logfmt key. `Ok(None)` means a malformed
 /// pair was skipped; errors are only reported in strict mode.
 fn logfmt_value(
     line: &str,
     cursor: &mut usize,
     strict: bool,
-) -> std::result::Result<Option<String>, String> {
+) -> std::result::Result<Option<LogfmtValue>, String> {
     if line.as_bytes().get(*cursor) != Some(&b'=') {
-        return Ok(Some(String::new()));
+        return Ok(Some(LogfmtValue::Range(*cursor..*cursor)));
     }
     *cursor += 1;
     if line.as_bytes().get(*cursor) == Some(&b'"') {
@@ -498,7 +530,7 @@ fn logfmt_value(
             char::from(value.as_bytes()[offset])
         ));
     }
-    Ok(Some(value.to_owned()))
+    Ok(Some(LogfmtValue::Range(start..*cursor)))
 }
 
 pub(super) fn skip_logfmt_token(line: &str, cursor: &mut usize) {
@@ -507,17 +539,23 @@ pub(super) fn skip_logfmt_token(line: &str, cursor: &mut usize) {
     }
 }
 
-pub(super) fn scan_logfmt_quoted(
-    line: &str,
-    cursor: &mut usize,
-) -> std::result::Result<String, String> {
+/// The quoted value opening at `cursor`, borrowed from the line unless it
+/// holds escapes.
+fn scan_logfmt_quoted(line: &str, cursor: &mut usize) -> std::result::Result<LogfmtValue, String> {
+    let start = *cursor + 1;
+    if let Some(offset) = memchr::memchr2(b'"', b'\\', &line.as_bytes()[start..])
+        && line.as_bytes()[start + offset] == b'"'
+    {
+        *cursor = start + offset + 1;
+        return Ok(LogfmtValue::Range(start..start + offset));
+    }
     *cursor += 1;
     let mut output = String::new();
     let mut chars = line[*cursor..].char_indices();
     while let Some((relative, character)) = chars.next() {
         *cursor += character.len_utf8();
         match character {
-            '"' => return Ok(output),
+            '"' => return Ok(LogfmtValue::Owned(output)),
             '\\' => {
                 let Some((_, escaped)) = chars.next() else {
                     return Err(format!(
@@ -704,7 +742,7 @@ pub(super) fn named_captures(regex: &Regex, line: &str) -> BTreeMap<String, Stri
 /// empty; typed filters drop rows missing the label and keep unparsable
 /// values, marked `LabelFilterErr` unless an earlier error is reported;
 /// `ip()` passes any row that already carries an error.
-pub(super) fn label_filter(row: &mut Row, expression: &LabelFilterExpr) -> Result<bool> {
+pub(super) fn label_filter<R: StageRow>(row: &mut R, expression: &LabelFilterExpr) -> Result<bool> {
     match expression {
         LabelFilterExpr::And(lhs, rhs) => {
             // Both sides run, so either can report an error.
@@ -726,8 +764,7 @@ pub(super) fn label_filter(row: &mut Row, expression: &LabelFilterExpr) -> Resul
                 let actual = lookup(row, &predicate.label).unwrap_or("");
                 return compare_filter(actual, predicate.op, &predicate.value);
             }
-            if matches!(predicate.value, FilterValue::Ip(_)) && row.labels.contains_key(ERROR_LABEL)
-            {
+            if matches!(predicate.value, FilterValue::Ip(_)) && row.label(ERROR_LABEL).is_some() {
                 return Ok(true);
             }
             let Some(actual) = lookup(row, &predicate.label) else {
@@ -742,7 +779,7 @@ pub(super) fn label_filter(row: &mut Row, expression: &LabelFilterExpr) -> Resul
                 _ => parse_go_duration_ns(actual),
             };
             if parsed.is_none() {
-                if !row.labels.contains_key(ERROR_LABEL) {
+                if row.label(ERROR_LABEL).is_none() {
                     let details = format!(
                         "cannot parse {:?} as {}",
                         actual,
@@ -825,25 +862,19 @@ pub(super) fn compare_ordering(ordering: Ordering, op: ComparisonOp) -> bool {
     }
 }
 
-pub(super) fn label_format(row: &mut Row, assignments: &[FormatAssignment]) {
+pub(super) fn label_format<R: StageRow>(row: &mut R, assignments: &[FormatAssignment]) {
     for assignment in assignments {
         // A reported error owns its labels; formatting cannot rewrite them.
         if matches!(assignment.label.as_str(), ERROR_LABEL | ERROR_DETAILS_LABEL)
-            && row.labels.contains_key(ERROR_LABEL)
+            && row.label(ERROR_LABEL).is_some()
         {
             continue;
         }
         let value = match &assignment.value {
-            FormatValue::Rename(source) => {
-                let renamed = if row.labels.contains_key(source) {
-                    Arc::make_mut(&mut row.labels).remove(source)
-                } else {
-                    None
-                };
-                renamed
-                    .or_else(|| row.metadata.remove(source))
-                    .unwrap_or_default()
-            }
+            FormatValue::Rename(source) => row
+                .remove_label(source)
+                .or_else(|| row.remove_metadata(source))
+                .unwrap_or_default(),
             FormatValue::Template(template) => match template.compiled().render(row) {
                 Ok(value) => value,
                 Err(error) => {
@@ -854,30 +885,24 @@ pub(super) fn label_format(row: &mut Row, assignments: &[FormatAssignment]) {
         };
         // An empty value leaves the label absent, as in Loki's label builder.
         if value.is_empty() {
-            if row.labels.contains_key(&assignment.label) {
-                Arc::make_mut(&mut row.labels).remove(&assignment.label);
-            }
+            row.remove_label(&assignment.label);
         } else {
-            Arc::make_mut(&mut row.labels).insert(assignment.label.clone(), value);
+            row.insert_label(assignment.label.clone(), value);
         }
     }
 }
 
-pub(super) fn lookup<'a>(row: &'a Row, name: &str) -> Option<&'a str> {
+pub(super) fn lookup<'a, R: StageRow>(row: &'a R, name: &str) -> Option<&'a str> {
     match name {
-        "__line__" => Some(&row.line),
-        _ => row
-            .labels
-            .get(name)
-            .or_else(|| row.metadata.get(name))
-            .map(String::as_str),
+        "__line__" => Some(row.line()),
+        _ => row.label(name).or_else(|| row.metadata_value(name)),
     }
 }
 
 /// A row without the unwrapped label is dropped; an unconvertible value keeps
 /// the row, marked with `SampleExtractionErr`. `duration()` and
 /// `duration_seconds()` both yield seconds.
-pub(super) fn apply_unwrap(row: &mut Row, unwrap: &Unwrap) -> Result<bool> {
+pub(super) fn apply_unwrap<R: StageRow>(row: &mut R, unwrap: &Unwrap) -> Result<bool> {
     let Some(source) = lookup(row, &unwrap.label).map(str::to_owned) else {
         return Ok(false);
     };
@@ -889,7 +914,7 @@ pub(super) fn apply_unwrap(row: &mut Row, unwrap: &Unwrap) -> Result<bool> {
         }
     };
     match parsed {
-        Some(value) => row.value = Some(value),
+        Some(value) => row.set_value(value),
         None => set_error(
             row,
             "SampleExtractionErr",
@@ -905,6 +930,41 @@ pub(super) fn apply_unwrap(row: &mut Row, unwrap: &Unwrap) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_stage_free_counts_and_byte_sums_read_no_lines() {
+        let read = |query: &str| {
+            let query = logql::parse(query).unwrap();
+            lineless_read(&query, &QueryRequest::range("", 0, 10, 1)).unwrap()
+        };
+        for query in [
+            r#"count_over_time({a="b"}[1m])"#,
+            r#"sum by (a) (rate({a="b"}[1m] offset 5s))"#,
+            r#"bytes_rate({a="b"}[1m]) / bytes_over_time({c="d"}[5m])"#,
+        ] {
+            assert!(read(query).is_some(), "{query}");
+        }
+        for query in [
+            r#"{a="b"}"#,
+            r#"count_over_time({a="b"} |= "" [1m])"#,
+            r#"sum_over_time({a="b"} | unwrap x [1m])"#,
+            r#"absent_over_time({a="b"}[1m])"#,
+            r#"count_over_time({a="b"}[1m]) / sum_over_time({a="b"} | unwrap x [1m])"#,
+        ] {
+            assert!(read(query).is_none(), "{query}");
+        }
+        assert!(
+            !read(r#"sum(count_over_time({a="b"}[1m]))"#)
+                .unwrap()
+                .metadata
+        );
+        assert!(
+            read(r#"sum by (a) (count_over_time({a="b"}[1m]))"#)
+                .unwrap()
+                .metadata
+        );
+        assert!(read(r#"count_over_time({a="b"}[1m])"#).unwrap().metadata);
+    }
 
     fn logfmt(line: &str, strict: bool) -> (BTreeMap<String, String>, Option<String>) {
         parse_logfmt(line, strict, false, &[]).unwrap()

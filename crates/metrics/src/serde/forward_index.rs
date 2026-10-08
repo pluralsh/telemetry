@@ -1,7 +1,7 @@
 // ForwardIndex value structure with MetricMeta and LabelBinding
 
 use crate::index::SeriesSpec;
-use crate::model::{Label, MetricType, Temporality};
+use crate::model::{Label, Labels, MetricType, Temporality};
 
 use super::*;
 use bytes::{Bytes, BytesMut};
@@ -185,7 +185,7 @@ impl From<ForwardIndexValue> for SeriesSpec {
         SeriesSpec {
             unit: value.metric_unit,
             metric_type,
-            labels: value.labels,
+            labels: Labels::sorted(value.labels),
         }
     }
 }

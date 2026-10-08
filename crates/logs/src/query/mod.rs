@@ -3,28 +3,31 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use futures::{StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::analyzer::DEFAULT_ANALYZER;
-use crate::db::{PageBudget, ScanTargets, StreamFilter};
+use crate::db::{Boundaries, PageBudget, SampleRead, ScanTargets, StreamFilter};
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
     FormatValue, Grouping, IpPattern, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm,
     LogExpr, MatchOp, ParserExpression, ParserStage, PipelineStage, Query, RangeOp, Unwrap,
     VectorMatching, VectorOp,
 };
-use crate::search::{SCORE_METADATA_FIELD, query_terms, source_matches};
+use crate::search::{SCORE_METADATA_FIELD, interior_terms, query_terms, source_matches};
 use crate::{Error, Label, Labels, LogDb, LogEntry, Namespace, Result};
 
+mod columnar;
+pub(crate) use columnar::{BatchSlice, ColumnBatch, StreamBatches, Tie};
 mod label_regex;
 mod metric;
 mod parallel;
@@ -35,7 +38,6 @@ mod units;
 
 use label_regex::*;
 use metric::*;
-use parallel::ParallelSink;
 use pipeline::*;
 use regex_cache::*;
 use units::*;
@@ -182,20 +184,15 @@ pub enum QueryResult {
     Scalar(Sample),
 }
 
-#[derive(Clone)]
-struct Row {
+/// A row a log query may return; built only for rows that can be among the
+/// first `limit`.
+struct LogLine {
     timestamp_ns: i64,
     line: String,
-    /// Shared across a stream's rows; stages that change labels copy on write.
     labels: LabelMap,
     metadata: BTreeMap<String, String>,
-    value: Option<f64>,
-    /// Loki's hash of the stored stream's labels, which stages never change.
-    /// Loki merges samples sharing a timestamp in ascending hash order.
+    /// Loki's hash of the stored stream's labels.
     stream: u64,
-    /// Hash of the stored line and structured metadata, set for metric rows
-    /// whose stages rewrite `line` or that carry metadata.
-    source: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -223,15 +220,9 @@ impl LogDb {
         let query =
             logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
         let plan = ScanPlan::new(request, &query, &options)?;
-        let rows = load_rows(
-            self,
-            namespace,
-            &plan,
-            &PageBudget::new(options.max_pages),
-            None,
-        )
-        .await?;
-        plan.evaluate(vec![rows], options)
+        let budget = PageBudget::new(options.max_pages);
+        let loaded = plan.load(self, namespace, &budget, None).await?;
+        plan.finish(vec![loaded], options)
     }
 }
 
@@ -242,6 +233,8 @@ pub(crate) struct ScanPlan<'a> {
     pub(crate) scan_start: i64,
     pub(crate) streams: StreamFilter,
     indexed_terms: Option<Vec<String>>,
+    /// Set for metric queries that read no lines.
+    lineless: Option<SampleRead>,
     limit: usize,
     direction: Direction,
     /// Owned copies for pipeline workers, which outlive any borrow.
@@ -261,9 +254,28 @@ impl<'a> ScanPlan<'a> {
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
             streams: stream_filter(query)?,
             indexed_terms: indexed_match_terms(query),
+            lineless: lineless_read(query, request)?,
             limit: options.limit,
             direction: options.direction,
         })
+    }
+
+    async fn load(
+        &self,
+        database: &LogDb,
+        namespace: &Namespace,
+        budget: &PageBudget,
+        targets: Option<ScanTargets>,
+    ) -> Result<columnar::ColumnarSink<'a>> {
+        columnar::load(database, namespace, self, budget, targets).await
+    }
+
+    fn finish(
+        &self,
+        loaded: Vec<columnar::ColumnarSink<'a>>,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
+        columnar::evaluate(self, loaded, options)
     }
 
     /// Unindexed log queries return the first `limit` rows by timestamp, so
@@ -274,25 +286,6 @@ impl<'a> ScanPlan<'a> {
             Expr::Log(log) if self.indexed_terms.is_none() => Some(log),
             _ => None,
         }
-    }
-
-    fn sink(&self) -> Result<PipelineSink<'a>> {
-        PipelineSink::new(self.query, self.request)
-    }
-
-    fn evaluate(&self, sinks: Vec<PipelineSink<'a>>, options: QueryOptions) -> Result<QueryResult> {
-        let mut sinks = sinks.into_iter();
-        let mut rows = sinks.next().map_or_else(|| self.sink(), Ok)?;
-        for other in sinks {
-            rows.extend(other);
-        }
-        evaluate(
-            self.query,
-            rows.finish(),
-            self.request,
-            options,
-            self.indexed_terms.is_some(),
-        )
     }
 }
 
@@ -321,13 +314,13 @@ pub(crate) async fn query_databases(
                     .acquire_owned()
                     .await
                     .map_err(|_| Error::Query("global query scheduler closed".into()))?;
-                load_rows(&database, namespace, plan, shared_budget, None).await
+                plan.load(&database, namespace, shared_budget, None).await
             }
         }))
         .buffered(options.max_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
-        return plan.evaluate(rows, options);
+        return plan.finish(rows, options);
     }
     let targets = stream::iter(databases.iter().cloned())
         .map(|database| {
@@ -377,10 +370,9 @@ pub(crate) async fn query_databases(
                     .acquire_owned()
                     .await
                     .map_err(|_| Error::Query("global query scheduler closed".into()))?;
-                load_rows(
+                plan.load(
                     &database,
                     namespace,
-                    plan,
                     &PageBudget::new(estimate.pages),
                     Some(targets),
                 )
@@ -393,106 +385,12 @@ pub(crate) async fn query_databases(
     .await
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
-    plan.evaluate(stored, options)
-}
-
-/// Reads one database, running the query's pipelines as pages decode.
-async fn load_rows<'a>(
-    database: &LogDb,
-    namespace: &Namespace,
-    plan: &ScanPlan<'a>,
-    budget: &PageBudget,
-    targets: Option<ScanTargets>,
-) -> Result<PipelineSink<'a>> {
-    let (start, end) = (plan.scan_start, plan.request.end_ns);
-    let mut converter = RowConverter::default();
-    let sink = plan.sink()?;
-    if plan.early_stop_log().is_some() {
-        let mut sink = ParallelSink::for_logs(sink, plan.shared.clone());
-        database
-            .read_segments(
-                namespace,
-                (start, end),
-                &plan.streams,
-                budget,
-                plan.direction == Direction::Backward,
-                |segment| {
-                    for row in segment {
-                        sink.push(converter.convert(row, None))?;
-                    }
-                    Ok(
-                        if sink.kept_logs(plan.direction, plan.limit)? >= plan.limit {
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(())
-                        },
-                    )
-                },
-            )
-            .await?;
-        return sink.finish_logs(plan.direction, plan.limit).await;
-    }
-    let targets = match targets {
-        Some(targets) => targets,
-        None => {
-            database
-                .scan_targets(namespace, start, end, &plan.streams)
-                .await?
-        }
-    };
-    let mut sink = ParallelSink::new(sink, plan.shared.clone());
-    if let Some(terms) = &plan.indexed_terms {
-        let index_top_k = direct_index_top_k(plan.query, plan.limit);
-        if let Some(rows) = database
-            .read_match_bounded(namespace, &targets, (terms, index_top_k), budget.limit())
-            .await?
-        {
-            for (row, score) in rows {
-                sink.push(converter.convert(row, Some(score)))?;
-            }
-            return sink.finish().await;
-        }
-    }
-    database
-        .read_bounded_with(namespace, targets, budget, |chunk| {
-            for row in chunk {
-                sink.push(converter.convert(row, None))?;
-            }
-            Ok(())
-        })
-        .await?;
-    sink.finish().await
-}
-
-/// Converts decoded rows, building each stream's label map once.
-#[derive(Default)]
-struct RowConverter {
-    /// Keyed by `Arc` address; holding the `Arc` keeps the address from being
-    /// reused by another stream's labels.
-    maps: HashMap<usize, (Arc<crate::Labels>, LabelMap, u64)>,
+    plan.finish(stored, options)
 }
 
 /// A row's or point's labels; shared, since many rows and steps carry the
 /// same stream's labels.
 type LabelMap = Arc<BTreeMap<String, String>>;
-
-impl RowConverter {
-    fn convert(&mut self, row: crate::LogRow, score: Option<f32>) -> Row {
-        let (_, labels, stream) = self
-            .maps
-            .entry(Arc::as_ptr(&row.labels) as usize)
-            .or_insert_with(|| {
-                let map: BTreeMap<String, String> = row
-                    .labels
-                    .iter()
-                    .map(|label| (label.name.clone(), label.value.clone()))
-                    .collect();
-                let stream = stream_hash(&map);
-                (row.labels.clone(), Arc::new(map), stream)
-            });
-        to_row(row.entry, labels.clone(), *stream, score)
-    }
-}
 
 /// Prometheus' `labels.Hash`, which Loki uses as a stream's hash: XXH64 over
 /// each name and value, in name order, each followed by `0xff`.
@@ -507,38 +405,24 @@ fn stream_hash(labels: &BTreeMap<String, String>) -> u64 {
     twox_hash::XxHash64::oneshot(0, &bytes)
 }
 
-fn hash_of(value: &impl std::hash::Hash) -> u64 {
-    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-    BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
+#[cfg(feature = "bench-internals")]
+pub(crate) fn count_line_matches<'a>(
+    filter: &LineFilter,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Result<usize> {
+    let mut matches = 0;
+    for line in lines {
+        matches += usize::from(line_filter(line, filter)?);
+    }
+    Ok(matches)
 }
 
-fn to_row(entry: crate::LogEntry, labels: LabelMap, stream: u64, score: Option<f32>) -> Row {
-    let mut metadata = entry
-        .structured_metadata
-        .iter()
-        .map(|field| (field.name.clone(), field.value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    if let Some(score) = score {
-        metadata.insert(SCORE_METADATA_FIELD.to_owned(), score.to_string());
-    }
-    Row {
-        timestamp_ns: entry.timestamp_ns,
-        line: entry.line,
-        labels,
-        metadata,
-        value: None,
-        stream,
-        source: None,
-    }
-}
-
-/// Loki's merge iterators drop an entry when an earlier one from the same
-/// stored stream has the same timestamp and identical line: the formatted
-/// line for log queries, the stored one for metric samples. Entries that
-/// differ only in structured metadata are distinct writes and both kept.
-/// `rows` must be in timestamp order; only rows sharing a timestamp are
-/// compared.
-fn dedupe_rows(rows: &mut Vec<Row>) {
+/// Loki's merge iterators drop a log entry when an earlier one from the same
+/// stored stream has the same timestamp and identical formatted line.
+/// Entries that differ only in structured metadata are distinct writes and
+/// both kept. `rows` must be in timestamp order; only rows sharing a
+/// timestamp are compared.
+fn dedupe_rows(rows: &mut Vec<LogLine>) {
     let mut duplicates: Option<Vec<bool>> = None;
     let mut order = Vec::new();
     let mut start = 0;
@@ -574,20 +458,15 @@ fn dedupe_rows(rows: &mut Vec<Row>) {
 }
 
 /// Orders rows sharing a timestamp so that rows `dedupe_rows` treats as the
-/// same entry compare equal: same stream, then the same stored line (by hash
-/// when stages rewrote it) and the same structured metadata.
-fn dedupe_order(a: &Row, b: &Row) -> Ordering {
+/// same entry compare equal: same stream, line and structured metadata.
+fn dedupe_order(a: &LogLine, b: &LogLine) -> Ordering {
     a.stream
         .cmp(&b.stream)
-        .then_with(|| a.source.cmp(&b.source))
-        .then_with(|| match (a.source, b.source) {
-            (None, None) => a.line.cmp(&b.line),
-            _ => Ordering::Equal,
-        })
+        .then_with(|| a.line.cmp(&b.line))
         .then_with(|| a.metadata.cmp(&b.metadata))
 }
 
-fn sort_logs(rows: &mut Vec<Row>, direction: Direction, indexed: bool) {
+fn sort_logs(rows: &mut Vec<LogLine>, direction: Direction, indexed: bool) {
     rows.sort_by(row_order);
     dedupe_rows(rows);
     if indexed {
@@ -601,7 +480,11 @@ fn sort_logs(rows: &mut Vec<Row>, direction: Direction, indexed: bool) {
     }
 }
 
-fn finish_logs(mut rows: Vec<Row>, options: &QueryOptions, indexed: bool) -> Result<QueryResult> {
+fn finish_logs(
+    mut rows: Vec<LogLine>,
+    options: &QueryOptions,
+    indexed: bool,
+) -> Result<QueryResult> {
     sort_logs(&mut rows, options.direction, indexed);
     rows.truncate(options.limit);
     streams(rows)
@@ -621,17 +504,8 @@ fn uses_vector_op(query: &Query, wanted: VectorOp) -> bool {
     }
 }
 
-fn evaluate(
-    query: &Query,
-    mut rows: MetricRows,
-    request: &QueryRequest,
-    options: QueryOptions,
-    indexed: bool,
-) -> Result<QueryResult> {
-    if let Expr::Log(log) = &query.value {
-        return finish_logs(rows.take(log), &options, indexed);
-    }
-
+/// Evaluates a metric query over what its pipelines kept.
+fn evaluate(query: &Query, rows: MetricRows, request: &QueryRequest) -> Result<QueryResult> {
     if let Some(step) = request.step_ns {
         if uses_vector_op(query, VectorOp::ApproxTopK) {
             return Err(Error::Query(
@@ -761,7 +635,7 @@ fn map_labels(map: &BTreeMap<String, String>) -> Labels {
     .expect("map has unique non-empty label names")
 }
 
-fn streams(rows: Vec<Row>) -> Result<QueryResult> {
+fn streams(rows: Vec<LogLine>) -> Result<QueryResult> {
     let mut grouped: BTreeMap<LabelMap, Vec<LogEntry>> = BTreeMap::new();
     for row in rows {
         grouped.entry(row.labels).or_default().push(LogEntry {
@@ -786,7 +660,7 @@ fn streams(rows: Vec<Row>) -> Result<QueryResult> {
     ))
 }
 
-fn row_order(a: &Row, b: &Row) -> Ordering {
+fn row_order(a: &LogLine, b: &LogLine) -> Ordering {
     a.timestamp_ns
         .cmp(&b.timestamp_ns)
         .then_with(|| a.labels.cmp(&b.labels))
@@ -799,12 +673,50 @@ fn row_order(a: &Row, b: &Row) -> Ordering {
 fn stream_filter(query: &Query) -> Result<StreamFilter> {
     let mut selectors = Vec::new();
     collect_log_exprs(query, &mut selectors);
-    StreamFilter::new(
+    Ok(StreamFilter::new(
         common_exact_matchers(query),
         selectors
             .into_iter()
             .map(|log| log.selector.value.matchers.as_slice()),
-    )
+    )?
+    .with_line_terms(line_prefilter(query)))
+}
+
+/// Analyzed terms every row the query keeps holds in its stored line: the
+/// interior terms of each single-branch `|=` that runs before the line can
+/// be rewritten. Every log expression must require the same terms.
+fn line_prefilter(query: &Query) -> Option<Vec<String>> {
+    let mut logs = Vec::new();
+    collect_log_exprs(query, &mut logs);
+    let mut common: Option<Vec<String>> = None;
+    for log in logs {
+        let mut terms = BTreeSet::new();
+        for stage in &log.stages {
+            match &stage.value {
+                PipelineStage::LineFilter(LineFilter { branches }) => {
+                    if let [branch] = branches.as_slice()
+                        && branch.op == LineFilterOp::Contains
+                        && let LineFilterTerm::String(needle) = &branch.term
+                    {
+                        terms.extend(interior_terms(&DEFAULT_ANALYZER, needle));
+                    }
+                }
+                PipelineStage::LineFormat(_)
+                | PipelineStage::Decolorize
+                | PipelineStage::Parser(ParserStage::Unpack) => break,
+                _ => {}
+            }
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        let terms = terms.into_iter().collect::<Vec<_>>();
+        if common.as_ref().is_some_and(|current| *current != terms) {
+            return None;
+        }
+        common = Some(terms);
+    }
+    common
 }
 
 fn common_exact_matchers(query: &Query) -> Vec<Label> {
@@ -898,7 +810,7 @@ fn direct_index_top_k(query: &Query, limit: usize) -> Option<usize> {
     .then_some(limit)
 }
 
-fn match_score(row: &Row) -> f32 {
+fn match_score(row: &LogLine) -> f32 {
     row.metadata
         .get(SCORE_METADATA_FIELD)
         .and_then(|score| score.parse().ok())
@@ -925,27 +837,29 @@ fn max_lookback(query: &Query) -> Result<i64> {
     })
 }
 
-/// Runs every log expression's pipeline over rows as they are read, so only
-/// rows some pipeline keeps are held.
-struct PipelineSink<'a> {
-    query: &'a Query,
+/// How each of a query's log expressions runs its pipeline.
+struct Pipelines<'a> {
     logs: Vec<&'a LogExpr>,
     offsets: Vec<i64>,
     /// Log queries keep rows in `[start, end)` of the request; metric
     /// queries keep every row read and promote metadata to labels.
     log_window: Option<(i64, i64)>,
-    outputs: Vec<Vec<Row>>,
-    /// Per log expression: whether a stage replaces the stored line, which
-    /// metric deduplication then has to remember.
-    rewrites_line: Vec<bool>,
     /// Per log expression: whether its samples keep no labels and no stage
-    /// reads one, so parsers can be skipped as Loki does.
+    /// reads one, so parsers can be skipped as Loki does: when nothing
+    /// downstream needs a label, parsers leave the line alone, so they never
+    /// flag errors either.
     skip_parsers: Vec<bool>,
-    /// Per log expression, per stage: whether it runs.
+    /// Per log expression, per stage: whether it runs after the line tests.
     runs: Vec<Vec<bool>>,
+    /// Per log expression: positions of the running stages before any other
+    /// that only test the stored line. They run first, so rows they drop
+    /// are never copied or have their metadata promoted.
+    line_tests: Vec<Vec<usize>>,
+    /// Rows come from a lineless read, already deduplicated.
+    lineless: bool,
 }
 
-impl<'a> PipelineSink<'a> {
+impl<'a> Pipelines<'a> {
     fn new(query: &'a Query, request: &QueryRequest) -> Result<Self> {
         let mut logs = Vec::new();
         collect_log_exprs(query, &mut logs);
@@ -974,18 +888,6 @@ impl<'a> PipelineSink<'a> {
                 .filter(|(_, runs)| **runs)
                 .map(|(stage, _)| &stage.value)
         };
-        let rewrites_line = (0..logs.len())
-            .map(|index| {
-                running(index).any(|stage| {
-                    matches!(
-                        stage,
-                        PipelineStage::LineFormat(_)
-                            | PipelineStage::Decolorize
-                            | PipelineStage::Parser(ParserStage::Unpack)
-                    )
-                })
-            })
-            .collect();
         let mut label_free = HashSet::new();
         collect_label_free_logs(query, &mut label_free);
         let skip_parsers = (0..logs.len())
@@ -994,113 +896,47 @@ impl<'a> PipelineSink<'a> {
                     && !running(index).any(reads_labels)
             })
             .collect();
+        let mut runs = runs;
+        let line_tests = logs
+            .iter()
+            .zip(&mut runs)
+            .map(|(log, runs)| {
+                let leading = runs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, runs)| **runs)
+                    .map(|(position, _)| position)
+                    .take_while(|&position| {
+                        matches!(
+                            log.stages[position].value,
+                            PipelineStage::LineFilter(_) | PipelineStage::Match(_)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for &position in &leading {
+                    runs[position] = false;
+                }
+                leading
+            })
+            .collect();
         Ok(Self {
+            lineless: lineless_read(query, request)?.is_some(),
             runs,
-            outputs: vec![Vec::new(); logs.len()],
+            line_tests,
             log_window: matches!(query.value, Expr::Log(_))
                 .then_some((request.start_ns, request.end_ns)),
-            query,
             logs,
             offsets,
-            rewrites_line,
             skip_parsers,
         })
     }
 
-    fn push(&mut self, source: Row) -> Result<()> {
-        let last = self.logs.len().saturating_sub(1);
-        let mut source = Some(source);
-        for (index, log) in self.logs.iter().enumerate() {
-            let candidate = source.as_ref().expect("the source moves on the last pass");
-            if let Some((start, end)) = self.log_window {
-                let offset = self.offsets[index];
-                let timestamp = candidate.timestamp_ns;
-                if timestamp < start.saturating_sub(offset)
-                    || timestamp >= end.saturating_sub(offset)
-                {
-                    continue;
-                }
-            }
-            if !selector_matches(log, &candidate.labels)? {
-                continue;
-            }
-            let mut row = if index == last {
-                source.take().expect("the source moves on the last pass")
-            } else {
-                candidate.clone()
-            };
-            if self.log_window.is_none() {
-                if self.rewrites_line[index] || !row.metadata.is_empty() {
-                    row.source = Some(hash_of(&(&row.line, &row.metadata)));
-                }
-                promote_metadata(&mut row);
-            }
-            if apply_stages(log, &self.runs[index], &mut row, self.skip_parsers[index])? {
-                self.outputs[index].push(row);
-            }
-        }
-        Ok(())
-    }
-
-    /// Rows kept for a log query.
-    fn kept(&self) -> usize {
-        self.outputs.first().map_or(0, Vec::len)
-    }
-
-    /// Keeps the first `limit` log rows in `direction`.
-    fn truncate_logs(&mut self, direction: Direction, limit: usize) {
-        if let Some(rows) = self.outputs.first_mut() {
-            sort_logs(rows, direction, false);
-            rows.truncate(limit);
-        }
-    }
-
-    fn extend(&mut self, other: Self) {
-        self.extend_outputs(other.outputs);
-    }
-
-    /// Appends rows from a sink over the same query, whose log expressions
-    /// are collected in the same order.
-    fn extend_outputs(&mut self, outputs: Vec<Vec<Row>>) {
-        for (output, rows) in self.outputs.iter_mut().zip(outputs) {
-            output.extend(rows);
-        }
-    }
-
-    fn finish(self) -> MetricRows {
-        let metric = self.log_window.is_none();
-        let mut by_expr: HashMap<usize, Vec<Row>> = self
-            .logs
-            .into_iter()
-            .zip(self.outputs)
-            .map(|(log, mut rows)| {
-                if metric {
-                    // Same-timestamp samples in Loki's merge order, which
-                    // `first_over_time` and `last_over_time` pick between.
-                    rows.sort_by_key(|row| (row.timestamp_ns, row.stream));
-                    dedupe_rows(&mut rows);
-                }
-                (log as *const LogExpr as usize, rows)
-            })
-            .collect();
-        let mut aggregations = Vec::new();
-        collect_range_aggregations(self.query, &mut aggregations);
-        let ranges = aggregations
-            .into_iter()
-            .filter_map(|(op, log, grouping)| {
-                // Each log expression belongs to one aggregation, so its rows
-                // are no longer needed once reduced.
-                let key = log as *const LogExpr as usize;
-                let rows = by_expr.remove(&key)?;
-                Some((key, RangeSeries::new(op, log, grouping, rows)))
-            })
-            .collect();
-        MetricRows {
-            by_expr,
-            ranges,
-            label_keys: RefCell::default(),
-            relabels: RefCell::default(),
-        }
+    /// Whether a log query's expression `index` keeps a row at `timestamp`.
+    fn in_log_window(&self, index: usize, timestamp: i64) -> bool {
+        self.log_window.is_none_or(|(start, end)| {
+            let offset = self.offsets[index];
+            timestamp >= start.saturating_sub(offset) && timestamp < end.saturating_sub(offset)
+        })
     }
 }
 
@@ -1156,12 +992,12 @@ fn collect_range_aggregations<'a>(
     }
 }
 
-/// Pipeline output of every log expression, sorted by timestamp for metric
-/// queries. Stages never change timestamps, so each step's range window is a
-/// binary-searched slice rather than a fresh pipeline pass.
+/// What a metric query's pipelines kept, per log expression by address,
+/// sorted by timestamp. Stages never change timestamps, so each step's range
+/// window is a binary-searched slice rather than a fresh pipeline pass.
 struct MetricRows {
-    by_expr: HashMap<usize, Vec<Row>>,
     ranges: HashMap<usize, RangeSeries>,
+    label_samples: HashMap<usize, LabelSamples>,
     /// Per binary or aggregation expression, by address, its operands'
     /// series keys, which steps share.
     label_keys: RefCell<HashMap<usize, LabelKeys>>,
@@ -1175,30 +1011,6 @@ impl MetricRows {
             .get(&(log as *const LogExpr as usize))
             .ok_or_else(|| Error::Query("range aggregation was not prepared".into()))
     }
-
-    fn rows(&self, log: &LogExpr) -> Result<&[Row]> {
-        self.by_expr
-            .get(&(log as *const LogExpr as usize))
-            .map(Vec::as_slice)
-            .ok_or_else(|| Error::Query("metric expression was not prepared".into()))
-    }
-
-    fn take(&mut self, log: &LogExpr) -> Vec<Row> {
-        self.by_expr
-            .remove(&(log as *const LogExpr as usize))
-            .unwrap_or_default()
-    }
-
-    /// Rows of `log` in the LogQL range window `(start, end]`, shifted by
-    /// the expression's offset.
-    fn window(&self, log: &LogExpr, start: i64, end: i64) -> Result<&[Row]> {
-        let offset = log_offset(log)?;
-        let (start, end) = (start.saturating_sub(offset), end.saturating_sub(offset));
-        let rows = self.rows(log)?;
-        let low = rows.partition_point(|row| row.timestamp_ns <= start);
-        let high = rows.partition_point(|row| row.timestamp_ns <= end).max(low);
-        Ok(&rows[low..high])
-    }
 }
 
 fn log_offset(log: &LogExpr) -> Result<i64> {
@@ -1208,6 +1020,62 @@ fn log_offset(log: &LogExpr) -> Result<i64> {
         .map(|value| parse_duration_ns(&value.value))
         .transpose()?
         .unwrap_or(0))
+}
+
+/// The read of a metric query no stage of which sees a line: every log
+/// expression is the input of a `count_over_time`, `rate`, `bytes_over_time`
+/// or `bytes_rate` with no pipeline stages, so each row contributes only its
+/// timestamp, line length and labels. Structured metadata, which becomes
+/// labels, is read unless every such aggregation groups by nothing.
+fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleRead>> {
+    let mut logs = Vec::new();
+    collect_log_exprs(query, &mut logs);
+    let mut aggregations = Vec::new();
+    collect_range_aggregations(query, &mut aggregations);
+    let qualifies = |log: &LogExpr| {
+        log.stages.is_empty()
+            && aggregations.iter().any(|(op, aggregated, _)| {
+                std::ptr::eq(*aggregated, log)
+                    && matches!(
+                        op,
+                        RangeOp::Count | RangeOp::Rate | RangeOp::Bytes | RangeOp::BytesRate
+                    )
+            })
+    };
+    if logs.is_empty() || !logs.iter().all(|log| qualifies(log)) {
+        return Ok(None);
+    }
+    let metadata = !aggregations.iter().all(|(_, _, grouping)| {
+        grouping.is_some_and(|grouping| !grouping.without && grouping.labels.is_empty())
+    });
+    let (first, step, count) = match request.step_ns {
+        Some(step) => (
+            request.start_ns,
+            step,
+            u64::try_from((request.end_ns - request.start_ns) / step).unwrap_or(0) + 1,
+        ),
+        None => (request.end_ns, 1, 1),
+    };
+    let mut boundaries = Vec::with_capacity(logs.len() * 2);
+    for log in logs {
+        let range = log
+            .range
+            .as_ref()
+            .ok_or_else(|| Error::Query("range aggregation requires a range".into()))
+            .and_then(|value| parse_duration_ns(&value.value))?;
+        let end = first.saturating_sub(log_offset(log)?);
+        for boundary in [end, end.saturating_sub(range)] {
+            boundaries.push(Boundaries {
+                first: boundary,
+                step,
+                count,
+            });
+        }
+    }
+    Ok(Some(SampleRead {
+        metadata,
+        boundaries,
+    }))
 }
 
 /// Log expressions whose samples Loki extracts with no labels at all:
@@ -1291,22 +1159,10 @@ fn reads_labels(stage: &PipelineStage) -> bool {
     )
 }
 
-/// `skip_parsers` mirrors Loki's parser hints: when nothing downstream needs
-/// a label, parsers leave the line alone, so they never flag errors either.
-fn apply_stages(log: &LogExpr, runs: &[bool], row: &mut Row, skip_parsers: bool) -> Result<bool> {
-    for (stage, _) in log.stages.iter().zip(runs).filter(|(_, runs)| **runs) {
-        if skip_parsers && matches!(stage.value, PipelineStage::Parser(_)) {
-            continue;
-        }
-        let parser = matches!(stage.value, PipelineStage::Parser(_))
-            && !row.labels.contains_key(ERROR_LABEL);
-        if !apply_stage(row, &stage.value)? {
+fn passes_line_tests(log: &LogExpr, positions: &[usize], line: &str) -> Result<bool> {
+    for &position in positions {
+        if !line_test(line, &log.stages[position].value).expect("only line tests are collected")? {
             return Ok(false);
-        }
-        // Loki flags only parser errors, when a filter asks about them, at
-        // parse time so later stages can still `drop` the flag.
-        if parser && row.labels.contains_key(ERROR_LABEL) && filters_on_error(log) {
-            Arc::make_mut(&mut row.labels).insert(PRESERVE_ERROR_LABEL.into(), "true".into());
         }
     }
     Ok(true)

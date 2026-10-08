@@ -1,0 +1,18 @@
+name: fuzz-runner
+
+# Started by run.sh, never by `up`: the repository is mounted at its host path
+# so compose files the harness starts resolve their relative bind mounts the
+# same way the Docker daemon sees them.
+services:
+  fuzz-runner:
+    profiles: ["bench"]
+    image: telemetry-regression/fuzz-runner:local
+    build:
+      context: ../..
+      dockerfile: products/runner/Dockerfile
+    working_dir: ${REPO_ROOT:?set by run.sh}
+    environment:
+      PYTHONPATH: ${REPO_ROOT}/tests/regression
+    volumes:
+      - ${REPO_ROOT}:${REPO_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock

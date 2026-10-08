@@ -9,6 +9,10 @@
 
 use regex_syntax::ast::{self, Ast, Flag, FlagsItemKind, GroupKind, RepetitionKind};
 
+use super::contains;
+
+/// The `bool` of `Equal` and `Contains` is case folding; folded text is
+/// stored lowercased.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum LabelRegexFilter {
     True,
@@ -24,13 +28,19 @@ impl LabelRegexFilter {
             Self::True => true,
             Self::Exists => !value.is_empty(),
             Self::Equal(expected, false) => value == expected,
-            Self::Equal(expected, true) => value.to_lowercase() == expected.to_lowercase(),
-            Self::Contains(expected, false) => value.contains(expected.as_str()),
-            Self::Contains(expected, true) => value
-                .to_lowercase()
-                .contains(expected.to_lowercase().as_str()),
+            Self::Equal(expected, true) => value.to_lowercase() == *expected,
+            Self::Contains(expected, false) => contains(value, expected),
+            Self::Contains(expected, true) => contains(&value.to_lowercase(), expected),
             Self::Or(lhs, rhs) => lhs.matches(value) || rhs.matches(value),
         }
+    }
+
+    fn equal(text: String, fold: bool) -> Self {
+        Self::Equal(folded(text, fold), fold)
+    }
+
+    fn contains(text: String, fold: bool) -> Self {
+        Self::Contains(folded(text, fold), fold)
     }
 
     fn or(current: Option<Self>, next: Self) -> Self {
@@ -39,6 +49,10 @@ impl LabelRegexFilter {
             None => next,
         }
     }
+}
+
+fn folded(text: String, fold: bool) -> String {
+    if fold { text.to_lowercase() } else { text }
 }
 
 /// `None` when Loki would fall back to an anchored regex.
@@ -326,7 +340,7 @@ fn simplify(node: &Node) -> Option<LabelRegexFilter> {
         }
         Node::Concat(items) => simplify_concat(items, String::new(), false),
         Node::Capture(inner) => simplify(inner),
-        Node::Literal { text, fold } => Some(LabelRegexFilter::Equal(text.clone(), *fold)),
+        Node::Literal { text, fold } => Some(LabelRegexFilter::equal(text.clone(), *fold)),
         Node::AnyStar | Node::Empty => Some(LabelRegexFilter::True),
         Node::AnyPlus => Some(LabelRegexFilter::Exists),
         Node::Class | Node::Other => None,
@@ -366,7 +380,7 @@ fn simplify_concat(items: &[Node], mut base: String, has_base: bool) -> Option<L
             _ => return None,
         }
     }
-    current.or_else(|| has_base.then_some(LabelRegexFilter::Contains(base, base_fold)))
+    current.or_else(|| has_base.then(|| LabelRegexFilter::contains(base, base_fold)))
 }
 
 fn simplify_concat_alternate(
@@ -378,9 +392,9 @@ fn simplify_concat_alternate(
     for branch in branches {
         let filter = match branch {
             Node::Literal { fold: true, .. } if !base_fold => return None,
-            Node::Empty | Node::AnyStar => LabelRegexFilter::Contains(base.to_owned(), base_fold),
+            Node::Empty | Node::AnyStar => LabelRegexFilter::contains(base.to_owned(), base_fold),
             Node::Literal { text, .. } => {
-                LabelRegexFilter::Contains(format!("{base}{text}"), base_fold)
+                LabelRegexFilter::contains(format!("{base}{text}"), base_fold)
             }
             Node::Concat(items) => simplify_concat(items, base.to_owned(), true)?,
             _ => return None,
@@ -437,6 +451,8 @@ mod tests {
             ("foo.*bar", None),
             (r"\d+", None),
             ("(?i)foo", Some(Equal("foo".into(), true))),
+            ("(?i)FoO", Some(Equal("foo".into(), true))),
+            ("(?i).*FOO.*", Some(Contains("foo".into(), true))),
             ("(?s).*", None),
             ("^foo$", None),
         ];

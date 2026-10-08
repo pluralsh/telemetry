@@ -21,9 +21,12 @@ message Label {
   string value = 2;
 }
 
+// Float fields that may carry a sample's value have explicit presence:
+// proto3 skips a plain `double` equal to 0.0, which includes -0.0, so the
+// sign would be lost in transit.
 message Sample {
   int64 timestamp_ms = 1;
-  double value = 2;
+  optional double value = 2;
 }
 
 message MetricMetadata {
@@ -57,10 +60,10 @@ message HistogramSample {
   int64 timestamp_ms = 1;
   CounterResetHint counter_reset_hint = 2;
   sint32 schema = 3;
-  double zero_threshold = 4;
-  double zero_count = 5;
-  double count = 6;
-  double sum = 7;
+  optional double zero_threshold = 4;
+  optional double zero_count = 5;
+  optional double count = 6;
+  optional double sum = 7;
   repeated sint32 positive_indexes = 8;
   repeated double positive_counts = 9;
   repeated sint32 negative_indexes = 10;

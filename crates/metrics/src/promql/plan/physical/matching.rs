@@ -462,13 +462,12 @@ pub(super) fn build_label_manip(
     input: &SeriesSchema,
 ) -> Result<LabelManipBuild, PlanError> {
     let mut input_to_output: Vec<u32> = Vec::with_capacity(input.len());
-    let mut seen: HashMap<Labels, u32> = HashMap::new();
+    let mut seen: HashMap<Labels, u32, foldhash::fast::RandomState> = HashMap::default();
     let mut output_labels: Vec<Labels> = Vec::new();
+    let rewriter = kind.rewriter().map_err(map_construct_err)?;
 
     for index in 0..input.len() {
-        let transformed = kind
-            .apply_to_labels(input.labels(index as u32))
-            .map_err(map_construct_err)?;
+        let transformed = rewriter.apply(input.labels(index as u32));
         let out_idx = match seen.get(&transformed) {
             Some(idx) => *idx,
             None => {
@@ -487,13 +486,85 @@ pub(super) fn build_label_manip(
     })
 }
 
-/// `true` when a binary op preserves the source metric's `__name__` label.
-/// Matches the legacy engine's `changes_metric_schema`: arithmetic ops
-/// drop `__name__`; set ops and non-`bool` comparisons preserve it.
+pub(super) enum DropNameBuild {
+    /// No series carries `__name__`.
+    Unchanged,
+    /// Stripped labelsets stay distinct: one output series per input.
+    Relabel(Arc<SeriesSchema>),
+    /// Some stripped labelsets collide and must be merged.
+    Merge(LabelManipBuild),
+}
+
+/// `input` without `__name__`. A relabelled schema keeps the input's
+/// fingerprints, since every series keeps its identity.
+pub(super) fn build_drop_name(input: &SeriesSchema) -> DropNameBuild {
+    if !input
+        .labels_slice()
+        .iter()
+        .any(|labels| labels.get("__name__").is_some())
+    {
+        return DropNameBuild::Unchanged;
+    }
+    let strip = |labels: &Labels| {
+        Labels::new(
+            labels
+                .iter()
+                .filter(|l| l.name != "__name__")
+                .cloned()
+                .collect(),
+        )
+    };
+    // Schema rows are distinct labelsets, so when every row carries the same
+    // name, stripping it cannot make two rows collide.
+    let first_name = input.labels_slice().first().and_then(|l| l.get("__name__"));
+    if first_name.is_some()
+        && input
+            .labels_slice()
+            .iter()
+            .all(|labels| labels.get("__name__") == first_name)
+    {
+        return DropNameBuild::Relabel(Arc::new(SeriesSchema::new(
+            input.labels_slice().iter().map(strip).collect(),
+            Arc::from(input.fingerprints_slice()),
+        )));
+    }
+    let mut input_to_output: Vec<u32> = Vec::with_capacity(input.len());
+    let mut seen: HashMap<Labels, u32, foldhash::fast::RandomState> =
+        HashMap::with_capacity_and_hasher(input.len(), Default::default());
+    let mut output_labels: Vec<Labels> = Vec::with_capacity(input.len());
+    for labels in input.labels_slice() {
+        let stripped = strip(labels);
+        let next = output_labels.len() as u32;
+        let out_idx = *seen.entry(stripped.clone()).or_insert(next);
+        if out_idx == next {
+            output_labels.push(stripped);
+        }
+        input_to_output.push(out_idx);
+    }
+    if output_labels.len() == input.len() {
+        return DropNameBuild::Relabel(Arc::new(SeriesSchema::new(
+            Arc::from(output_labels),
+            Arc::from(input.fingerprints_slice()),
+        )));
+    }
+    DropNameBuild::Merge(LabelManipBuild {
+        input_to_output: Arc::from(input_to_output),
+        output_schema: build_output_schema_from_labels(output_labels),
+    })
+}
+
+/// `true` when a binary op preserves the source metric's `__name__` label,
+/// following Prometheus' `changesMetricSchema`: arithmetic ops drop
+/// `__name__`; set ops and non-`bool` comparisons preserve it.
 pub(super) fn preserves_metric_name(op: BinaryOpKind) -> bool {
     match op {
-        BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul | BinaryOpKind::Div => false,
-        BinaryOpKind::Mod | BinaryOpKind::Pow | BinaryOpKind::Atan2 => true,
+        BinaryOpKind::Add
+        | BinaryOpKind::Sub
+        | BinaryOpKind::Mul
+        | BinaryOpKind::Div
+        | BinaryOpKind::Mod
+        | BinaryOpKind::Pow
+        | BinaryOpKind::Atan2 => false,
         BinaryOpKind::Eq { bool_modifier } => !bool_modifier,
         BinaryOpKind::Ne { bool_modifier } => !bool_modifier,
         BinaryOpKind::Gt { bool_modifier } => !bool_modifier,

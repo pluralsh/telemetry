@@ -12,11 +12,11 @@ use crate::Namespace;
 use crate::error::{Error, Result};
 use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
 
-pub(crate) const KEY_VERSION: u8 = 4;
+pub(crate) const KEY_VERSION: u8 = 5;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v4";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v5";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
 /// Leading byte of run and object-directory values.
@@ -84,6 +84,12 @@ pub(crate) struct StoredRun {
     pub rows: u32,
     /// Encoded size of the run's blocks.
     pub bytes: u32,
+    /// Total length of the run's log lines.
+    pub line_bytes: u64,
+    /// See [`ObjectRun::duplicate_free`].
+    pub duplicate_free: bool,
+    /// See [`ObjectRun::error_metadata`].
+    pub error_metadata: bool,
     pub first_block: u32,
     pub blocks: u32,
 }
@@ -104,6 +110,13 @@ pub(crate) struct ObjectRun {
     pub max_timestamp_ns: i64,
     pub rows: u32,
     pub bytes: u32,
+    pub line_bytes: u64,
+    /// No two of the run's rows share a timestamp, line and structured
+    /// metadata, the rows queries deduplicate. False when that is unknown.
+    pub duplicate_free: bool,
+    /// Some row carries `__error__` structured metadata, which fails metric
+    /// queries that keep it.
+    pub error_metadata: bool,
     pub blocks: u32,
     /// The leaves whose rows the run concatenates, in order. Empty in a
     /// level-0 object, whose runs are their own single leaf.
@@ -165,6 +178,9 @@ impl StoredObject {
                     max_timestamp_ns: run.max_timestamp_ns,
                     rows: run.rows,
                     bytes: run.bytes,
+                    line_bytes: run.line_bytes,
+                    duplicate_free: run.duplicate_free,
+                    error_metadata: run.error_metadata,
                     first_block,
                     blocks: run.blocks,
                 };
@@ -223,6 +239,10 @@ pub(crate) fn rollup_dictionary_key(
     bytes.freeze()
 }
 
+pub(crate) fn rollup_dictionary_prefix(namespace: &Namespace, period: SegmentId) -> Bytes {
+    rollup_record_prefix(namespace, period, RollupRecord::StreamDictionary).freeze()
+}
+
 pub(crate) fn rollup_forward_key(
     namespace: &Namespace,
     period: SegmentId,
@@ -271,6 +291,19 @@ pub(crate) fn dictionary_key(
     bytes.freeze()
 }
 
+pub(crate) fn dictionary_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::StreamDictionary).freeze()
+}
+
+/// Fingerprint of a key under a stream-dictionary prefix of length
+/// `prefix_len`, segment or rollup.
+pub(crate) fn decode_dictionary_key(bytes: &[u8], prefix_len: usize) -> Result<StreamFingerprint> {
+    bytes
+        .get(prefix_len..)
+        .and_then(|suffix| StreamFingerprint::try_from(suffix).ok())
+        .ok_or_else(|| Error::Corrupt("invalid stream dictionary key".to_owned()))
+}
+
 pub(crate) fn forward_key(namespace: &Namespace, segment: SegmentId, stream_id: StreamId) -> Bytes {
     let mut bytes = record_prefix(namespace, segment, RecordType::ForwardLabels);
     bytes.put_u32(stream_id);
@@ -308,27 +341,42 @@ pub(crate) fn term_stats_key(namespace: &Namespace, segment: SegmentId, term: &s
     bytes.freeze()
 }
 
+/// One directory fragment of `term`, keyed by its first block's ID.
 pub(crate) fn term_directory_key(
     namespace: &Namespace,
     segment: SegmentId,
     term: &str,
-    ordinal: u32,
+    first_block: u64,
 ) -> Bytes {
+    let mut bytes = term_directory_prefix_buf(namespace, segment, term);
+    bytes.put_u64(first_block);
+    bytes.freeze()
+}
+
+/// Every directory fragment of `term`, in block order.
+pub(crate) fn term_directory_prefix(
+    namespace: &Namespace,
+    segment: SegmentId,
+    term: &str,
+) -> Bytes {
+    term_directory_prefix_buf(namespace, segment, term).freeze()
+}
+
+fn term_directory_prefix_buf(namespace: &Namespace, segment: SegmentId, term: &str) -> BytesMut {
     let mut bytes = record_prefix(namespace, segment, RecordType::SearchTermDirectory);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
-    bytes.put_u32(ordinal);
-    bytes.freeze()
+    bytes
 }
 
 pub(crate) fn term_posting_block_key(
     namespace: &Namespace,
     segment: SegmentId,
     term: &str,
-    ordinal: u32,
+    block: u64,
 ) -> Bytes {
     let mut bytes = record_prefix(namespace, segment, RecordType::SearchPostingBlock);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
-    bytes.put_u32(ordinal);
+    bytes.put_u64(block);
     bytes.freeze()
 }
 
@@ -396,22 +444,42 @@ fn decode_object_key(bytes: &[u8], expected: RecordType) -> Result<ObjectRef> {
     })
 }
 
-/// Blocks of one object, ordered by index.
+/// The two values a block is stored as. Every meta value of an object sorts
+/// before its line values, so a read that needs no lines scans one compact
+/// key range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum BlockGroup {
+    /// Timestamps, line lengths and structured metadata.
+    Meta = 0,
+    Lines = 1,
+}
+
+impl BlockGroup {
+    pub(crate) const ALL: [Self; 2] = [Self::Meta, Self::Lines];
+}
+
+/// One group of an object's blocks, ordered by index.
 pub(crate) fn object_blocks_prefix(
     namespace: &Namespace,
     segment: SegmentId,
     object: ObjectRef,
+    group: BlockGroup,
 ) -> Bytes {
-    object_key(namespace, segment, RecordType::ObjectBlock, object).freeze()
+    let mut bytes = object_key(namespace, segment, RecordType::ObjectBlock, object);
+    bytes.put_u8(group as u8);
+    bytes.freeze()
 }
 
 pub(crate) fn block_key(
     namespace: &Namespace,
     segment: SegmentId,
     object: ObjectRef,
+    group: BlockGroup,
     block: u32,
 ) -> Bytes {
     let mut bytes = object_key(namespace, segment, RecordType::ObjectBlock, object);
+    bytes.put_u8(group as u8);
     bytes.put_u32(block);
     bytes.freeze()
 }
@@ -524,6 +592,8 @@ pub(crate) fn encode_run(run: &StoredRun) -> Result<Bytes> {
     put_time_range(run.min_timestamp_ns, run.max_timestamp_ns, &mut bytes)?;
     var_u32::serialize(run.rows, &mut bytes);
     var_u32::serialize(run.bytes, &mut bytes);
+    var_u64::serialize(run.line_bytes, &mut bytes);
+    put_run_flags(run.duplicate_free, run.error_metadata, &mut bytes);
     bytes.put_u8(run.level);
     var_u32::serialize(run.first_block, &mut bytes);
     var_u32::serialize(run.blocks, &mut bytes);
@@ -536,6 +606,8 @@ pub(crate) fn decode_run(bytes: &[u8]) -> Result<StoredRun> {
     let (min_timestamp_ns, max_timestamp_ns) = read_time_range(&mut buf)?;
     let rows = var_u32::deserialize(&mut buf)?;
     let bytes = var_u32::deserialize(&mut buf)?;
+    let line_bytes = var_u64::deserialize(&mut buf)?;
+    let (duplicate_free, error_metadata) = read_run_flags(&mut buf, "run")?;
     let level = read_u8(&mut buf)?;
     let first_block = var_u32::deserialize(&mut buf)?;
     let blocks = var_u32::deserialize(&mut buf)?;
@@ -550,6 +622,9 @@ pub(crate) fn decode_run(bytes: &[u8]) -> Result<StoredRun> {
         max_timestamp_ns,
         rows,
         bytes,
+        line_bytes,
+        duplicate_free,
+        error_metadata,
         first_block,
         blocks,
     })
@@ -580,6 +655,8 @@ pub(crate) fn encode_object(object: &StoredObject) -> Result<Bytes> {
         put_time_range(run.min_timestamp_ns, run.max_timestamp_ns, &mut bytes)?;
         var_u32::serialize(run.rows, &mut bytes);
         var_u32::serialize(run.bytes, &mut bytes);
+        var_u64::serialize(run.line_bytes, &mut bytes);
+        put_run_flags(run.duplicate_free, run.error_metadata, &mut bytes);
         var_u32::serialize(run.blocks, &mut bytes);
         var_u32::serialize(value_len(run.leaves.len())?, &mut bytes);
         for leaf in &run.leaves {
@@ -611,6 +688,8 @@ pub(crate) fn decode_object(bytes: &[u8]) -> Result<StoredObject> {
         let (min_timestamp_ns, max_timestamp_ns) = read_time_range(&mut buf)?;
         let rows = var_u32::deserialize(&mut buf)?;
         let bytes = var_u32::deserialize(&mut buf)?;
+        let line_bytes = var_u64::deserialize(&mut buf)?;
+        let (duplicate_free, error_metadata) = read_run_flags(&mut buf, "object directory")?;
         let blocks = var_u32::deserialize(&mut buf)?;
         let leaf_count = var_u32::deserialize(&mut buf)? as usize;
         let mut leaves = Vec::with_capacity(leaf_count.min(buf.len() / 2));
@@ -636,6 +715,9 @@ pub(crate) fn decode_object(bytes: &[u8]) -> Result<StoredObject> {
             max_timestamp_ns,
             rows,
             bytes,
+            line_bytes,
+            duplicate_free,
+            error_metadata,
             blocks,
             leaves,
         });
@@ -708,6 +790,25 @@ fn read_u8(buf: &mut &[u8]) -> Result<u8> {
     Ok(value)
 }
 
+const DUPLICATE_FREE: u8 = 1;
+const ERROR_METADATA: u8 = 2;
+
+fn put_run_flags(duplicate_free: bool, error_metadata: bool, bytes: &mut BytesMut) {
+    bytes.put_u8(
+        if duplicate_free { DUPLICATE_FREE } else { 0 }
+            | if error_metadata { ERROR_METADATA } else { 0 },
+    );
+}
+
+fn read_run_flags(buf: &mut &[u8], what: &str) -> Result<(bool, bool)> {
+    match read_u8(buf)? {
+        flags if flags & !(DUPLICATE_FREE | ERROR_METADATA) == 0 => {
+            Ok((flags & DUPLICATE_FREE != 0, flags & ERROR_METADATA != 0))
+        }
+        flags => Err(Error::Corrupt(format!("invalid {what} flags {flags}"))),
+    }
+}
+
 fn put_str(value: &str, bytes: &mut BytesMut) -> Result<()> {
     var_u32::serialize(value_len(value.len())?, bytes);
     bytes.put_slice(value.as_bytes());
@@ -742,6 +843,30 @@ pub(crate) fn decode_postings(bytes: &[u8]) -> Result<roaring::RoaringBitmap> {
         .map_err(|error| Error::Corrupt(format!("failed to decode postings: {error}")))
 }
 
+/// Records written as merge operands, combined by [`crate::merge::LogsMergeOperator`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MergeKind {
+    /// Segment and rollup label postings: stream-ID bitmaps, unioned.
+    StreamPostings,
+    /// Search field statistics, summed.
+    FieldStats,
+    /// Search term statistics, summed.
+    TermStats,
+}
+
+pub(crate) fn merge_kind(key: &[u8]) -> Option<MergeKind> {
+    let (_, _, record_type, offset) = parse_record_prefix(key).ok()?;
+    match record_type {
+        RecordType::LabelPostings => Some(MergeKind::StreamPostings),
+        RecordType::Rollup if key.get(offset) == Some(&(RollupRecord::LabelPostings as u8)) => {
+            Some(MergeKind::StreamPostings)
+        }
+        RecordType::SearchFieldStats => Some(MergeKind::FieldStats),
+        RecordType::SearchTermStats => Some(MergeKind::TermStats),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn record_type_prefix(
     namespace: &Namespace,
@@ -749,6 +874,12 @@ pub(crate) fn record_type_prefix(
     record_type: RecordType,
 ) -> Bytes {
     record_prefix(namespace, segment, record_type).freeze()
+}
+
+/// The record-type byte after `key`'s scope, if it has one.
+#[cfg(test)]
+pub(crate) fn key_record_type(key: &[u8]) -> Option<u8> {
+    key.get(KEY_SCOPE.prefix_len(key)?).copied()
 }
 
 fn record_prefix(namespace: &Namespace, segment: SegmentId, record_type: RecordType) -> BytesMut {
@@ -791,7 +922,48 @@ mod tests {
 
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v4");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v5");
+    }
+
+    #[test]
+    fn merge_records_are_classified_by_key() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let label = Label::new("service", "api");
+        assert_eq!(
+            merge_kind(&posting_key(&namespace, 0, &label)),
+            Some(MergeKind::StreamPostings)
+        );
+        assert_eq!(
+            merge_kind(&rollup_posting_key(&namespace, 0, &label)),
+            Some(MergeKind::StreamPostings)
+        );
+        assert_eq!(
+            merge_kind(&field_stats_key(&namespace, 0)),
+            Some(MergeKind::FieldStats)
+        );
+        assert_eq!(
+            merge_kind(&term_stats_key(&namespace, 0, "error")),
+            Some(MergeKind::TermStats)
+        );
+        assert_eq!(
+            merge_kind(&rollup_dictionary_key(&namespace, 0, [1; 16])),
+            None
+        );
+        assert_eq!(merge_kind(&forward_key(&namespace, 0, 1)), None);
+    }
+
+    #[test]
+    fn dictionary_keys_decode_their_fingerprint() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let prefix = dictionary_prefix(&namespace, 3);
+        let key = dictionary_key(&namespace, 3, [7; 16]);
+        assert!(key.starts_with(&prefix));
+        assert_eq!(decode_dictionary_key(&key, prefix.len()).unwrap(), [7; 16]);
+        let rollup = rollup_dictionary_prefix(&namespace, 3);
+        let key = rollup_dictionary_key(&namespace, 3, [9; 16]);
+        assert!(key.starts_with(&rollup));
+        assert_eq!(decode_dictionary_key(&key, rollup.len()).unwrap(), [9; 16]);
+        assert!(decode_dictionary_key(&key[..key.len() - 1], rollup.len()).is_err());
     }
 
     #[test]
@@ -843,15 +1015,22 @@ mod tests {
     fn object_blocks_are_contiguous_and_ordered() {
         let namespace = Namespace::default();
         let object = ObjectRef { id: 5, level: 1 };
-        let prefix = object_blocks_prefix(&namespace, 0, object);
-        let keys = [0, 1, 256].map(|block| block_key(&namespace, 0, object, block));
-        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
-        for (key, block) in keys.iter().zip([0, 1, 256]) {
-            assert!(key.starts_with(&prefix));
-            assert_eq!(decode_block_index(key, prefix.len()).unwrap(), block);
+        for group in BlockGroup::ALL {
+            let prefix = object_blocks_prefix(&namespace, 0, object, group);
+            let keys = [0, 1, 256].map(|block| block_key(&namespace, 0, object, group, block));
+            assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+            for (key, block) in keys.iter().zip([0, 1, 256]) {
+                assert!(key.starts_with(&prefix));
+                assert_eq!(decode_block_index(key, prefix.len()).unwrap(), block);
+            }
+            let other_level = block_key(&namespace, 0, ObjectRef { id: 5, level: 2 }, group, 0);
+            assert!(!other_level.starts_with(&prefix));
         }
-        let other_level = block_key(&namespace, 0, ObjectRef { id: 5, level: 2 }, 0);
-        assert!(!other_level.starts_with(&prefix));
+        // Every meta block precedes every lines block of the same object.
+        assert!(
+            block_key(&namespace, 0, object, BlockGroup::Meta, u32::MAX)
+                < block_key(&namespace, 0, object, BlockGroup::Lines, 0)
+        );
         let key = directory_key(&namespace, 0, object);
         assert!(key.starts_with(&directory_prefix(&namespace, 0)));
         assert_eq!(decode_directory_key(&key).unwrap(), object);
@@ -876,6 +1055,9 @@ mod tests {
                 max_timestamp_ns: i64::MAX,
                 rows: 7,
                 bytes: 4096,
+                line_bytes: u64::MAX,
+                duplicate_free: expires_at_unix_ms.is_some(),
+                error_metadata: expires_at_unix_ms.is_none(),
                 first_block: 3,
                 blocks: 2,
             };
@@ -890,6 +1072,9 @@ mod tests {
             max_timestamp_ns: 2,
             rows: 1,
             bytes: 1,
+            line_bytes: 1,
+            duplicate_free: true,
+            error_metadata: false,
             first_block: 0,
             blocks: 1,
         };
@@ -908,6 +1093,9 @@ mod tests {
             max_timestamp_ns: 9,
             rows,
             bytes: rows * 10,
+            line_bytes: u64::from(rows) * 40,
+            duplicate_free: stream_id % 2 == 0,
+            error_metadata: stream_id % 3 == 0,
             blocks,
             leaves,
         };

@@ -338,7 +338,7 @@ spec:
                   retention:
                     description: |-
                       Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.
-                      When unset, data is kept forever.
+                      When unset, the server default of 14 days applies.
                     pattern: ^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$
                     type: string
                   retentionSeconds:

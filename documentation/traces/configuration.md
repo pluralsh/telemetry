@@ -77,11 +77,11 @@ storage:
 #   type: InMemory
 
 segment_duration_seconds: 3600 # Trace time partition width.
-retention_seconds: 2592000 # Optional logical retention; 30 days.
+retention_seconds: 1209600 # Logical retention; 14 days, the default. `null` keeps data forever.
 
 page:
-  target_size_bytes: 1048576 # Preferred encoded page size; 1 MiB.
-  max_size_bytes: 4194304 # Hard encoded page limit; 4 MiB.
+  target_size_bytes: 1048576 # Preferred page trace data size, excluding the column sidecar; 1 MiB.
+  max_size_bytes: 4194304 # Hard page trace data limit, excluding the column sidecar; 4 MiB.
   max_traces: 1024 # Maximum traces in one page.
 
 write:

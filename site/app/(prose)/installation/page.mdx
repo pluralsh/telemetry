@@ -1,0 +1,171 @@
+import { PageHeader } from "@/components/doc-page";
+import { Callout } from "@/components/mdx-ui";
+import { TelemetryIcon } from "@/components/icons";
+
+export const metadata = { title: "Installation" };
+
+<PageHeader
+  icon={<TelemetryIcon size={28} />}
+  eyebrow="Get started"
+  title="Installation"
+  lede="Plural Telemetry is installed on Kubernetes with an operator. You declare a database as a custom resource, and the operator runs it."
+/>
+
+## How it fits together
+
+The **telemetry-operator** watches these custom resources in the `telemetry.plural.sh/v1alpha1` group:
+
+| Kind | Purpose |
+| --- | --- |
+| `Metrics` | A Prometheus-compatible metrics database |
+| `Logs` | A Loki-compatible log database |
+| `Traces` | A Tempo-compatible trace database |
+| `NamespaceAuthentication` | A read or write credential for one tenant namespace of one database |
+
+For each database the operator renders configuration, then creates a ServiceAccount, writer and reader StatefulSets, Services, an optional Ingress, and PVCs for cache volumes. It also handles rolling restarts on config changes and PVC resizing.
+
+Every database runs in one of two modes:
+
+- **`Standalone`**: a single pod that both reads and writes. Good for development, small clusters, and edge sites.
+- **`Sharded`**: separate writer and reader StatefulSets that scale independently. Writer replicas equal storage shards.
+
+## 1. Install the operator
+
+```bash
+helm upgrade --install telemetry-operator oci://ghcr.io/pluralsh/charts/telemetry-operator \
+  --version 0.1.16 \
+  --namespace telemetry \
+  --create-namespace
+```
+
+The chart installs the CRDs from its `crds/` directory before any templated resources. Helm never upgrades or deletes CRDs automatically, so review schema changes before upgrading the chart. The examples below put the databases in the same `telemetry` namespace.
+
+## 2. Grant the database access to S3
+
+Databases authenticate to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html), so no keys are stored in the cluster. The operator creates a ServiceAccount named after the database (here `logs`), and you associate an IAM role with it:
+
+```bash
+aws eks create-pod-identity-association \
+  --cluster-name prod \
+  --namespace telemetry \
+  --service-account logs \
+  --role-arn arn:aws:iam::123456789012:role/plural-telemetry-logs
+```
+
+The role needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the database's prefix:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::acme-telemetry" },
+    { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::acme-telemetry/logs/*" }
+  ]
+}
+```
+
+Its trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` and `sts:TagSession`, and the cluster needs the `eks-pod-identity-agent` add-on.
+
+<Callout title="Using IRSA instead">
+  On clusters that use IAM Roles for Service Accounts, skip the association and set `spec.serviceAccount.annotations` to `eks.amazonaws.com/role-arn: <role>`. The database picks up either kind of ambient credential without further configuration.
+</Callout>
+
+## 3. Declare a database
+
+This creates a sharded log database with three writers (and so three storage shards) and two readers, on S3. No credentials appear in the spec:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Logs
+metadata:
+  name: logs
+  namespace: telemetry
+spec:
+  mode: Sharded
+  config:
+    retention: 14d
+    storage:
+      path: logs
+      objectStore:
+        type: Aws
+        aws:
+          region: us-east-1
+          bucket: acme-telemetry
+  writer:
+    replicas: 3
+    cacheVolume:
+      persistentVolumeClaim:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 20Gi } }
+  reader:
+    replicas: 2
+    cacheVolume:
+      emptyDir: { sizeLimit: 20Gi }
+```
+
+`Metrics` and `Traces` take the same shape. Each database's installation guide annotates every field: [Metrics](/metrics/installation/), [Logs](/logs/installation/), [Traces](/traces/installation/).
+
+## 4. Add a tenant namespace
+
+Data inside a database is partitioned into tenant namespaces, and every route is prefixed with one. You never list them on the database: each `NamespaceAuthentication` both creates the namespace (if it doesn't exist yet) and grants a username `read` or `write` on it, with the password held in a Secret.
+
+A pair of credentials for a `payments` namespace, one for the collector and one for Grafana, looks like this:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: payments-writer
+  namespace: telemetry
+spec:
+  dataStoreRef: { kind: Logs, name: logs }
+  namespace: payments
+  username: otel-collector
+  permission: write
+  secretKeyRef: { name: payments-writer, key: password }
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: payments-reader
+  namespace: telemetry
+spec:
+  dataStoreRef: { kind: Logs, name: logs }
+  namespace: payments
+  username: grafana
+  permission: read
+  secretKeyRef: { name: payments-reader, key: password }
+```
+
+The operator rolls the database's config when a `NamespaceAuthentication` or its Secret changes. Clients authenticate with HTTP basic auth.
+
+## 5. Verify
+
+```bash
+kubectl -n telemetry get logs
+# NAME   MODE      READY   AGE
+# logs   Sharded   True    2m
+
+kubectl -n telemetry get nsauth
+# NAME              DATASTORE   NAMESPACE   PERMISSION   READY   AGE
+# payments-reader   logs        payments    read         True    1m
+# payments-writer   logs        payments    write        True    1m
+```
+
+## 6. Point your tools at it
+
+Writers serve ingest routes and readers serve queries:
+
+| Tool | URL |
+| --- | --- |
+| Grafana Loki data source | `http://logs-reader.telemetry:3100/read/ns/payments` |
+| Alloy / Promtail `loki.write` | `http://logs-writer.telemetry:3100/write/ns/payments/loki/api/v1/push` |
+| OTel Collector `otlphttp` | `http://logs-writer.telemetry:3100/write/ns/payments/otlp` |
+
+Any writer accepts any record and forwards it over internal gRPC to the shard's owner, so a plain ClusterIP Service in front of the writers is enough.
+
+## Scaling later
+
+Raise `spec.writer.replicas` and the operator adds pods first; the new shards start taking writes at the next aligned hour. Readers can be scaled at any time. Scale-down of writers is intentionally blocked, because existing shards must stay writable until their data expires. See [epoch sharding](/sharding/).

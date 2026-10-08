@@ -8,7 +8,7 @@ use crate::active_series::ActiveSeriesTracker;
 use crate::error::{Error, Result};
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{
-    HistogramSample, Label, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint,
+    HistogramSample, Label, Labels, MetricMetadata, MetricType, Sample, Series, SeriesFingerprint,
     SeriesId, TimeBucket,
 };
 use crate::util::Fingerprint;
@@ -167,7 +167,7 @@ impl TsdbWriteDelta {
         let series_spec = SeriesSpec {
             unit: unit.clone(),
             metric_type,
-            labels: labels.to_vec(),
+            labels: Labels::sorted(labels.to_vec()),
         };
         self.forward_index.series.insert(id, series_spec);
 
@@ -191,7 +191,12 @@ impl Delta for TsdbWriteDelta {
     type FrozenView = ();
     type ApplyResult = ();
     type DeltaView = ();
-    type Snapshot = crate::storage::StorageSnapshot;
+    /// Readers take a fresh storage snapshot per query instead. A SlateDB
+    /// snapshot held in the coordinator's view would live as long as the
+    /// bucket's `MiniTsdb` and, once the bucket goes idle, pin SlateDB's
+    /// oldest-snapshot sequence: L0 flush and compaction refuse to merge any
+    /// operand newer than it, across every bucket.
+    type Snapshot = ();
 
     fn init(context: Self::Context) -> Self {
         Self {

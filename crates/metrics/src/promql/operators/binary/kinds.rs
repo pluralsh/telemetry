@@ -102,6 +102,179 @@ impl BinaryOpKind {
     }
 }
 
+/// Binds `$op` to a closure computing `$kind.apply_arith` with the kind
+/// fixed at compile time, then evaluates `$body` once per arithmetic kind
+/// so its per-cell loop monomorphizes; `$fallback` for non-arith kinds.
+macro_rules! with_arith {
+    ($kind:expr, |$op:ident| $body:expr, else $fallback:expr) => {
+        match $kind {
+            BinaryOpKind::Add => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Add.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Sub => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Sub.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Mul => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Mul.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Div => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Div.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Mod => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Mod.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Pow => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Pow.apply_arith(l, r);
+                $body
+            }
+            BinaryOpKind::Atan2 => {
+                let $op = |l: f64, r: f64| BinaryOpKind::Atan2.apply_arith(l, r);
+                $body
+            }
+            _ => $fallback,
+        }
+    };
+}
+pub(super) use with_arith;
+
+/// Binds `$k` to a [`CmpKernel`] for comparison `$kind` with the predicate
+/// fixed at compile time, filtering to the `$keep` operand without the
+/// `bool` modifier, then evaluates `$body`; `$fallback` for other kinds.
+macro_rules! with_cmp {
+    ($kind:expr, $keep:expr, |$k:ident| $body:expr, else $fallback:expr) => {
+        match $kind {
+            BinaryOpKind::Eq { bool_modifier } => with_cmp!(@bind Eq, bool_modifier, $keep, $k, $body),
+            BinaryOpKind::Ne { bool_modifier } => with_cmp!(@bind Ne, bool_modifier, $keep, $k, $body),
+            BinaryOpKind::Gt { bool_modifier } => with_cmp!(@bind Gt, bool_modifier, $keep, $k, $body),
+            BinaryOpKind::Lt { bool_modifier } => with_cmp!(@bind Lt, bool_modifier, $keep, $k, $body),
+            BinaryOpKind::Gte { bool_modifier } => {
+                with_cmp!(@bind Gte, bool_modifier, $keep, $k, $body)
+            }
+            BinaryOpKind::Lte { bool_modifier } => {
+                with_cmp!(@bind Lte, bool_modifier, $keep, $k, $body)
+            }
+            _ => $fallback,
+        }
+    };
+    (@bind $variant:ident, $bool_modifier:ident, $keep:expr, $k:ident, $body:expr) => {{
+        let $k = CmpKernel::new(
+            |l: f64, r: f64| {
+                BinaryOpKind::$variant {
+                    bool_modifier: false,
+                }
+                .apply_cmp(l, r)
+            },
+            $bool_modifier,
+            $keep,
+        );
+        $body
+    }};
+}
+pub(super) use with_cmp;
+
+/// One elementwise pass over a chunk of at most 64 cells: writes `dst[i]`
+/// from the `i`th operands and returns the mask of cells the op keeps
+/// given both operands are present. Bits past `dst.len()` are unspecified.
+pub(super) trait ChunkKernel: Copy {
+    fn run(
+        self,
+        dst: &mut [f64],
+        l: impl Iterator<Item = f64>,
+        r: impl Iterator<Item = f64>,
+    ) -> u64;
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ArithKernel<F>(pub(super) F);
+
+impl<F: Fn(f64, f64) -> f64 + Copy> ChunkKernel for ArithKernel<F> {
+    #[inline(always)]
+    fn run(
+        self,
+        dst: &mut [f64],
+        l: impl Iterator<Item = f64>,
+        r: impl Iterator<Item = f64>,
+    ) -> u64 {
+        for ((d, l), r) in dst.iter_mut().zip(l).zip(r) {
+            *d = (self.0)(l, r);
+        }
+        u64::MAX
+    }
+}
+
+/// Which value a comparison emits for a cell whose operands are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CmpOutput {
+    /// `bool` modifier: `1.0` / `0.0`, nothing is filtered.
+    Bool,
+    /// Filter, keeping the left operand where the predicate holds.
+    KeepLeft,
+    /// Filter, keeping the right operand (the vector of `scalar OP vector`).
+    KeepRight,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CmpKernel<P> {
+    pred: P,
+    output: CmpOutput,
+}
+
+impl<P: Fn(f64, f64) -> bool + Copy> CmpKernel<P> {
+    #[inline(always)]
+    pub(super) fn new(pred: P, bool_modifier: bool, keep: CmpOutput) -> Self {
+        let output = if bool_modifier { CmpOutput::Bool } else { keep };
+        Self { pred, output }
+    }
+}
+
+impl<P: Fn(f64, f64) -> bool + Copy> ChunkKernel for CmpKernel<P> {
+    #[inline(always)]
+    fn run(
+        self,
+        dst: &mut [f64],
+        l: impl Iterator<Item = f64>,
+        r: impl Iterator<Item = f64>,
+    ) -> u64 {
+        let pred = self.pred;
+        let cells = dst.iter_mut().zip(l.zip(r));
+        let mut keep = 0u64;
+        match self.output {
+            CmpOutput::Bool => {
+                for (d, (l, r)) in cells {
+                    *d = f64::from(u8::from(pred(l, r)));
+                }
+                return u64::MAX;
+            }
+            CmpOutput::KeepLeft => {
+                for (i, (d, (l, r))) in cells.enumerate() {
+                    let p = pred(l, r);
+                    *d = if p { l } else { f64::NAN };
+                    keep |= u64::from(p) << i;
+                }
+            }
+            CmpOutput::KeepRight => {
+                for (i, (d, (l, r))) in cells.enumerate() {
+                    let p = pred(l, r);
+                    *d = if p { r } else { f64::NAN };
+                    keep |= u64::from(p) << i;
+                }
+            }
+        }
+        keep
+    }
+}
+
+/// Mask of the low `n` bits, `n <= 64`.
+#[inline(always)]
+pub(super) fn lane_mask(n: usize) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OpClass {
     Arith,

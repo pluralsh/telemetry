@@ -150,3 +150,90 @@ eval instant at 10s max_over_time(count_values("value", cv)[20s:10s])
 eval instant at 10s count_values("value", cv) * count_values("value", cv)
   {value="5"} 4
   {value="7"} 1
+
+# The one-to-one cardinality check skips float/histogram pairs whose
+# operation is undefined, but counts filtered comparisons.
+clear
+load 1m
+  lf{code="200", instance="a"} 1 1
+  lf{code="200", instance="b"} 2 2
+  rh{code="200"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+  rf{code="200"} 1 1
+  lh{code="200", instance="a"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+  lh{code="200", instance="b"} {{schema:0 sum:6 count:4 buckets:[1 2 1]}} {{schema:0 sum:6 count:4 buckets:[1 2 1]}}
+
+eval instant at 1m lf % on(code) rh
+
+eval instant at 1m log2(lf % on(code) rh)
+
+eval instant at 1m lf < on(code) rf
+  expect fail msg:many-to-one matching must be explicit
+
+eval instant at 1m lf > on(code) rf
+  expect fail msg:many-to-one matching must be explicit
+
+eval instant at 1m lh == on(code) rh
+  expect fail msg:many-to-one matching must be explicit
+
+eval instant at 1m lf >= on(code) rf
+  expect fail msg:many-to-one matching must be explicit
+
+eval instant at 1m lf == bool on(code) rf
+  expect fail msg:many-to-one matching must be explicit
+
+eval instant at 1m lf % on(code) rf
+  expect fail msg:many-to-one matching must be explicit
+
+# `absent_over_time` only asks whether any series has a sample, so series
+# sharing a labelset once `__name__` is gone don't collide.
+clear
+load 1m
+  ag{job="j", instance="a"} 1 _ _ _ _ _ _ _ _ _ _
+  aq{job="j", instance="a"} _ _ _ 1 _ _ _ _ _ _ _
+
+eval instant at 3m absent_over_time({__name__=~"ag|aq"}[5m])
+
+eval instant at 3m sum by (job) (sum without (job) (absent_over_time({__name__=~"ag|aq", job="j"}[5m])))
+
+eval instant at 10m absent_over_time({__name__=~"ag|aq", job="j"}[1m])
+  {job="j"} 1
+
+eval instant at 10m 2 - sum by (instance) (absent_over_time({__name__=~"ag|aq", job="j"}[1m]))
+  {} 1
+
+eval instant at 10m count_over_time(absent_over_time({__name__=~"ag|aq"}[2m])[10m:1m])
+  {} 7
+
+# Other range functions still reject the collision.
+eval instant at 3m absent(count_over_time({__name__=~"ag|aq"}[5m]))
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+# `timestamp()` reads sample timestamps only from a selector argument; through
+# `sort` it returns the evaluation time.
+clear
+load 1m
+  ts_sorted{job="j"} 1 2
+
+eval instant at 90s timestamp(ts_sorted)
+  {job="j"} 60
+
+eval instant at 90s timestamp((ts_sorted @ 60))
+  {job="j"} 60
+
+eval instant at 90s timestamp(sort_desc(ts_sorted))
+  {job="j"} 90
+
+eval instant at 90s timestamp(sort(ts_sorted @ 60))
+  {job="j"} 90
+
+# `sort` and `sort_desc` drop native histogram samples, as Prometheus'
+# `filterFloats` does.
+clear
+load 1m
+  sorted_mixed{kind="float"} 1 2
+  sorted_mixed{kind="histogram"} {{schema:0 sum:5 count:4 buckets:[1 2 1]}} {{schema:0 sum:5 count:4 buckets:[1 2 1]}}
+
+eval instant at 1m sort(sorted_mixed)
+  sorted_mixed{kind="float"} 2
+
+eval instant at 1m sort_desc(sorted_mixed{kind="histogram"})

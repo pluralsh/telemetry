@@ -180,26 +180,71 @@ impl HistogramSample {
 }
 
 /// Float and native histogram samples of one series, each ascending by
-/// timestamp. A timestamp appears in at most one of the two.
+/// timestamp. A timestamp appears in at most one of the two. Floats are
+/// held as index-aligned timestamp and value columns, the shape both the
+/// chunk codec and query evaluation use.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SeriesData {
-    pub floats: Vec<Sample>,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
     pub histograms: Vec<HistogramSample>,
 }
 
 impl SeriesData {
+    pub(crate) fn new(floats: Vec<Sample>, histograms: Vec<HistogramSample>) -> Self {
+        let mut data = Self {
+            timestamps: Vec::with_capacity(floats.len()),
+            values: Vec::with_capacity(floats.len()),
+            histograms,
+        };
+        for sample in floats {
+            data.push(sample);
+        }
+        data
+    }
+
+    pub(crate) fn push(&mut self, sample: Sample) {
+        self.timestamps.push(sample.timestamp_ms);
+        self.values.push(sample.value);
+    }
+
+    /// The float samples, in column order.
+    pub(crate) fn floats(&self) -> impl ExactSizeIterator<Item = Sample> + '_ {
+        self.timestamps
+            .iter()
+            .zip(&self.values)
+            .map(|(&timestamp_ms, &value)| Sample {
+                timestamp_ms,
+                value,
+            })
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.floats.len() + self.histograms.len()
+        self.timestamps.len() + self.histograms.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.floats.is_empty() && self.histograms.is_empty()
+        self.timestamps.is_empty() && self.histograms.is_empty()
+    }
+
+    /// Keeps the floats whose timestamps pass `keep`, in order.
+    pub(crate) fn retain_floats(&mut self, mut keep: impl FnMut(i64) -> bool) {
+        let mut kept = 0;
+        for index in 0..self.timestamps.len() {
+            if keep(self.timestamps[index]) {
+                self.timestamps[kept] = self.timestamps[index];
+                self.values[kept] = self.values[index];
+                kept += 1;
+            }
+        }
+        self.timestamps.truncate(kept);
+        self.values.truncate(kept);
     }
 
     /// Keeps samples with `start_ms < timestamp <= end_ms`.
     pub(crate) fn retain_range(&mut self, start_ms: i64, end_ms: i64) {
         let in_range = |ts: i64| ts > start_ms && ts <= end_ms;
-        self.floats.retain(|s| in_range(s.timestamp_ms));
+        self.retain_floats(in_range);
         self.histograms.retain(|h| in_range(h.timestamp_ms));
     }
 }
@@ -525,34 +570,53 @@ impl SeriesBuilder {
 /// `Labels` wraps a sorted `Vec<Label>` and provides convenience accessors
 /// for looking up label values and the metric name. This is the type returned
 /// by read/query APIs to identify each result series.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Labels(Vec<Label>);
+///
+/// Immutable and shared: a series' labels pass through caches, plan schemas
+/// and results, so cloning only bumps a reference count. The hash is
+/// computed once, so sets and maps keyed by `Labels` never rehash them.
+#[derive(Clone)]
+pub struct Labels {
+    labels: Arc<[Label]>,
+    hash: u64,
+}
 
 impl Labels {
     /// Creates an empty `Labels`.
     pub fn empty() -> Self {
-        Self(Vec::new())
+        Self::from_arc(Arc::new([]))
     }
 
     /// Creates a new `Labels` from a vec of labels.
     pub fn new(labels: Vec<Label>) -> Self {
-        Self(labels)
+        Self::from_arc(Arc::from(labels))
+    }
+
+    fn from_arc(labels: Arc<[Label]>) -> Self {
+        use std::hash::BuildHasher;
+        let hash = foldhash::fast::FixedState::default().hash_one(&*labels);
+        Self { labels, hash }
+    }
+
+    /// `labels` sorted.
+    pub(crate) fn sorted(mut labels: Vec<Label>) -> Self {
+        labels.sort();
+        Self::new(labels)
     }
 
     /// Returns the number of labels.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.labels.len()
     }
 
     /// Returns `true` if there are no labels.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.labels.is_empty()
     }
 
     /// Returns the value of the label with the given name, if present.
     // TODO: labels are sorted, could use binary_search_by for O(log n)
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0
+        self.labels
             .iter()
             .find(|l| l.name == name)
             .map(|l| l.value.as_str())
@@ -567,13 +631,37 @@ impl Labels {
 
     /// Iterates over the labels.
     pub fn iter(&self) -> impl Iterator<Item = &Label> {
-        self.0.iter()
+        self.labels.iter()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Label] {
+        &self.labels
+    }
+}
+
+impl fmt::Debug for Labels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Labels").field(&self.labels).finish()
+    }
+}
+
+impl PartialEq for Labels {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.labels == other.labels
+    }
+}
+
+impl Eq for Labels {}
+
+impl std::hash::Hash for Labels {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
     }
 }
 
 impl Ord for Labels {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        self.labels.cmp(&other.labels)
     }
 }
 
@@ -585,8 +673,8 @@ impl PartialOrd for Labels {
 
 impl Serialize for Labels {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for label in &self.0 {
+        let mut map = serializer.serialize_map(Some(self.labels.len()))?;
+        for label in self.labels.iter() {
             map.serialize_entry(&label.name, &label.value)?;
         }
         map.end()
@@ -610,7 +698,7 @@ impl<'de> Deserialize<'de> for Labels {
                     labels.push(Label { name, value });
                 }
                 labels.sort();
-                Ok(Labels(labels))
+                Ok(Labels::new(labels))
             }
         }
 
@@ -620,7 +708,10 @@ impl<'de> Deserialize<'de> for Labels {
 
 impl From<Labels> for HashMap<String, String> {
     fn from(labels: Labels) -> Self {
-        labels.0.into_iter().map(|l| (l.name, l.value)).collect()
+        labels
+            .iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect()
     }
 }
 
@@ -631,7 +722,7 @@ impl From<HashMap<String, String>> for Labels {
             .map(|(name, value)| Label { name, value })
             .collect();
         labels.sort();
-        Self(labels)
+        Self::new(labels)
     }
 }
 

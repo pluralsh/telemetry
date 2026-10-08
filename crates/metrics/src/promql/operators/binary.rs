@@ -85,6 +85,9 @@ pub struct BinaryOp<L: Operator, R: Operator> {
     /// [`Self::drain_broadcast`].
     broadcast: Option<BufferedSide>,
     broadcast_done: bool,
+    /// Skips the dense fast paths so tests and benches can compare them
+    /// with the per-cell loop.
+    generic_only: bool,
     done: bool,
     errored: bool,
 }
@@ -144,6 +147,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             vv_emitted: false,
             broadcast: None,
             broadcast_done: false,
+            generic_only: false,
             done: false,
             errored: false,
         }
@@ -155,6 +159,14 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         if let BinaryShape::VectorVector { partners, .. } = &mut self.shape {
             *partners = Arc::new(groups);
         }
+        self
+    }
+
+    /// Evaluate every cell through the per-cell loop, the reference the
+    /// dense paths must match bit for bit.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn with_generic_path(mut self) -> Self {
+        self.generic_only = true;
         self
     }
 
@@ -191,6 +203,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             vv_emitted: false,
             broadcast: None,
             broadcast_done: false,
+            generic_only: false,
             done: false,
             errored: false,
         }
@@ -227,6 +240,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             vv_emitted: false,
             broadcast: None,
             broadcast_done: false,
+            generic_only: false,
             done: false,
             errored: false,
         }
@@ -267,6 +281,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             vv_emitted: false,
             broadcast: None,
             broadcast_done: false,
+            generic_only: false,
             done: false,
             errored: false,
         }
@@ -446,54 +461,51 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         let mut chosen = vec![NO_SERIES; shared.groups.len()];
         let mut matched_at = vec![usize::MAX; shared.many_count];
 
-        for step_off in 0..step_count {
-            if !shared.groups.is_empty() {
-                resolve_partner_groups(
-                    scan,
-                    partner,
-                    &shared.groups,
-                    scan_is_lhs,
-                    step_off,
-                    &mut chosen,
-                )?;
-            }
-            for (out_row, mapped) in map.iter().enumerate() {
-                // `out_row` is the scan side's global series index;
-                // `map[out_row]` names the first partner series for the
-                // row's match key, or None when no partner shares it.
-                let partner_idx = match shared.row_group.get(out_row) {
-                    Some(&g) if g != NO_SERIES => Some(chosen[g as usize])
-                        .filter(|&j| j != NO_SERIES)
-                        .map(|j| j as usize),
-                    _ => mapped.map(|g| g as usize),
-                };
-                if let Some(&key) = shared.row_many.get(out_row)
-                    && key != NO_SERIES
-                    && partner_idx.is_some_and(|j| present(partner, step_off, j))
-                    && present(scan, step_off, out_row)
-                {
-                    if matched_at[key as usize] == step_off {
-                        return Err(QueryError::Internal(
-                            "multiple matches for labels: many-to-one matching must be explicit \
-                             (group_left/group_right)"
-                                .to_string(),
-                        ));
-                    }
-                    matched_at[key as usize] = step_off;
+        // Every row has at most one fixed partner and no cell can carry a
+        // histogram, so only `write_cell`'s arithmetic and comparison arms
+        // are reachable.
+        let dense = matches!(class, OpClass::Arith | OpClass::Cmp)
+            && !self.generic_only
+            && !any_histograms
+            && shared.groups.is_empty()
+            && shared.row_many.is_empty()
+            && lhs.step_count == rhs.step_count;
+        if dense {
+            self.apply_vv_dense(scan, partner, scan_is_lhs, map, &mut out);
+        } else {
+            for step_off in 0..step_count {
+                if !shared.groups.is_empty() {
+                    resolve_partner_groups(
+                        scan,
+                        partner,
+                        &shared.groups,
+                        scan_is_lhs,
+                        step_off,
+                        &mut chosen,
+                    )?;
                 }
-                let (lhs_idx, rhs_idx) = if scan_is_lhs {
-                    (Some(out_row), partner_idx)
-                } else {
-                    (partner_idx, Some(out_row))
-                };
-                let out_idx = step_off * out_series_count + out_row;
-                let l_cell = lhs_idx.and_then(|idx| lhs.get(step_off, idx));
-                let r_cell = rhs_idx.and_then(|idx| rhs.get(step_off, idx));
-
-                if any_histograms {
+                for (out_row, mapped) in map.iter().enumerate() {
+                    // `out_row` is the scan side's global series index;
+                    // `map[out_row]` names the first partner series for the
+                    // row's match key, or None when no partner shares it.
+                    let partner_idx = match shared.row_group.get(out_row) {
+                        Some(&g) if g != NO_SERIES => Some(chosen[g as usize])
+                            .filter(|&j| j != NO_SERIES)
+                            .map(|j| j as usize),
+                        _ => mapped.map(|g| g as usize),
+                    };
+                    let (lhs_idx, rhs_idx) = if scan_is_lhs {
+                        (Some(out_row), partner_idx)
+                    } else {
+                        (partner_idx, Some(out_row))
+                    };
+                    let out_idx = step_off * out_series_count + out_row;
+                    let l_cell = lhs_idx.and_then(|idx| lhs.get(step_off, idx));
+                    let r_cell = rhs_idx.and_then(|idx| rhs.get(step_off, idx));
                     let l_h = lhs_idx.and_then(|idx| lhs.get_histogram(step_off, idx));
                     let r_h = rhs_idx.and_then(|idx| rhs.get_histogram(step_off, idx));
-                    if l_h.is_some() || r_h.is_some() {
+
+                    if any_histograms && (l_h.is_some() || r_h.is_some()) {
                         self.write_mixed_cell(
                             Operand::of(l_cell, l_h),
                             Operand::of(r_cell, r_h),
@@ -501,18 +513,53 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                             &mut out_hist,
                             out_idx,
                         );
-                        continue;
+                    } else {
+                        self.write_cell(
+                            class,
+                            bool_mod,
+                            l_cell,
+                            r_cell,
+                            &mut out.values,
+                            &mut out.validity,
+                            out_idx,
+                        );
+                    }
+
+                    // Prometheus counts every pair whose operation is defined
+                    // for its operand types, including comparisons that filter
+                    // the sample out; only incompatible or failed
+                    // float/histogram pairs skip the cardinality check.
+                    let matched = match (Operand::of(l_cell, l_h), Operand::of(r_cell, r_h)) {
+                        (Some(Operand::Float(_)), Some(Operand::Float(_))) => true,
+                        (Some(Operand::Histogram(_)), Some(Operand::Histogram(_)))
+                            if matches!(
+                                self.kind,
+                                BinaryOpKind::Eq { .. } | BinaryOpKind::Ne { .. }
+                            ) =>
+                        {
+                            true
+                        }
+                        _ => {
+                            out.validity.get(out_idx)
+                                || out_hist
+                                    .as_ref()
+                                    .is_some_and(|cells| cells[out_idx].is_some())
+                        }
+                    };
+                    if matched
+                        && let Some(&key) = shared.row_many.get(out_row)
+                        && key != NO_SERIES
+                    {
+                        if matched_at[key as usize] == step_off {
+                            return Err(QueryError::Internal(
+                                "multiple matches for labels: many-to-one matching must be explicit \
+                                 (group_left/group_right)"
+                                    .to_string(),
+                            ));
+                        }
+                        matched_at[key as usize] = step_off;
                     }
                 }
-                self.write_cell(
-                    class,
-                    bool_mod,
-                    l_cell,
-                    r_cell,
-                    &mut out.values,
-                    &mut out.validity,
-                    out_idx,
-                );
             }
         }
 
@@ -628,42 +675,57 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
         let bool_mod = self.kind.bool_modifier();
         let mut out_hist: Option<HistogramCells> = None;
 
-        for step_off in 0..step_count {
-            let scalar = scalar.get(vec_batch.step_range.start + step_off, 0);
-            for series_off in 0..series_count {
-                let v = cell_of(&vec_batch, step_off, series_off);
-                let out_idx = step_off * series_count + series_off;
-                if let Some(h) = vec_batch.histogram(out_idx) {
-                    let (l, r) = if scalar_on_right {
-                        (Some(Operand::Histogram(h)), scalar.map(Operand::Float))
+        let dense = !self.generic_only && vec_batch.histograms.is_none();
+        if dense && matches!(class, OpClass::Arith) {
+            self.apply_vs_arith(&vec_batch, scalar, scalar_on_right, &mut out);
+        } else if dense && matches!(class, OpClass::Cmp) {
+            let keep = if scalar_on_right {
+                CmpOutput::KeepLeft
+            } else {
+                CmpOutput::KeepRight
+            };
+            with_cmp!(self.kind, keep, |kernel| {
+                vs_dense(&vec_batch, scalar, scalar_on_right, &mut out, kernel)
+            }, else ());
+        } else {
+            for step_off in 0..step_count {
+                let scalar = scalar.get(vec_batch.step_range.start + step_off, 0);
+                for series_off in 0..series_count {
+                    let v = cell_of(&vec_batch, step_off, series_off);
+                    let out_idx = step_off * series_count + series_off;
+                    if let Some(h) = vec_batch.histogram(out_idx) {
+                        let (l, r) = if scalar_on_right {
+                            (Some(Operand::Histogram(h)), scalar.map(Operand::Float))
+                        } else {
+                            (scalar.map(Operand::Float), Some(Operand::Histogram(h)))
+                        };
+                        self.write_mixed_cell(l, r, &mut out, &mut out_hist, out_idx);
+                        continue;
+                    }
+                    let (l_cell, r_cell) = if scalar_on_right {
+                        (v, scalar)
                     } else {
-                        (scalar.map(Operand::Float), Some(Operand::Histogram(h)))
+                        (scalar, v)
                     };
-                    self.write_mixed_cell(l, r, &mut out, &mut out_hist, out_idx);
-                    continue;
-                }
-                let (l_cell, r_cell) = if scalar_on_right {
-                    (v, scalar)
-                } else {
-                    (scalar, v)
-                };
-                self.write_cell(
-                    class,
-                    bool_mod,
-                    l_cell,
-                    r_cell,
-                    &mut out.values,
-                    &mut out.validity,
-                    out_idx,
-                );
-                // A filtering comparison keeps the vector sample even when
-                // the scalar is on the left (`3 < v` yields v's values).
-                if !scalar_on_right
-                    && matches!(class, OpClass::Cmp)
-                    && !bool_mod
-                    && let Some(v) = v
-                {
-                    out.values[out_idx] = v;
+                    self.write_cell(
+                        class,
+                        bool_mod,
+                        l_cell,
+                        r_cell,
+                        &mut out.values,
+                        &mut out.validity,
+                        out_idx,
+                    );
+                    // A filtering comparison keeps the vector sample even when
+                    // the scalar is on the left (`3 < v` yields v's values).
+                    if !scalar_on_right
+                        && matches!(class, OpClass::Cmp)
+                        && !bool_mod
+                        && out.validity.get(out_idx)
+                        && let Some(v) = v
+                    {
+                        out.values[out_idx] = v;
+                    }
                 }
             }
         }
@@ -719,6 +781,86 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             values,
             validity,
         ))
+    }
+
+    /// Arithmetic and comparison `apply_vv` for rows with at most one fixed
+    /// partner each and no histograms. When every row pairs with the same
+    /// index on an equally wide partner, the grids line up and arithmetic
+    /// is one elementwise pass over the whole tile; otherwise see
+    /// [`gather_vv`].
+    fn apply_vv_dense(
+        &self,
+        scan: &BufferedSide,
+        partner: &BufferedSide,
+        scan_is_lhs: bool,
+        map: &[Option<u32>],
+        out: &mut OutBuffers,
+    ) {
+        let (scan_width, partner_width) = (scan.total_series, partner.total_series);
+        let out_width = map.len();
+        let aligned = out_width == scan_width
+            && scan_width == partner_width
+            && map
+                .iter()
+                .enumerate()
+                .all(|(row, &mapped)| mapped == Some(row as u32));
+        let (lhs, rhs) = if scan_is_lhs {
+            (scan, partner)
+        } else {
+            (partner, scan)
+        };
+        if aligned && matches!(self.kind.class(), OpClass::Arith) {
+            with_arith!(self.kind, |op| {
+                for ((dst, &l), &r) in out.values.iter_mut().zip(lhs.values()).zip(rhs.values()) {
+                    *dst = op(l, r);
+                }
+            }, else return);
+            let validity = lhs.validity().and(rhs.validity());
+            validity.for_each_clear(|idx| out.values[idx] = f64::NAN);
+            out.validity = validity;
+            return;
+        }
+
+        with_cmp!(self.kind, CmpOutput::KeepLeft, |kernel| {
+            gather_vv(scan, partner, scan_is_lhs, map, out, kernel)
+        }, else with_arith!(self.kind, |op| {
+            gather_vv(scan, partner, scan_is_lhs, map, out, ArithKernel(op))
+        }, else ()));
+    }
+
+    /// Arithmetic `apply_vs` for a histogram-free vector: a step with a
+    /// scalar is one elementwise pass over its row, a step without one
+    /// yields no samples.
+    fn apply_vs_arith(
+        &self,
+        vec_batch: &StepBatch,
+        scalar: &BufferedSide,
+        scalar_on_right: bool,
+        out: &mut OutBuffers,
+    ) {
+        let series_count = vec_batch.series_count();
+        let mut validity = vec_batch.validity.clone();
+        with_arith!(self.kind, |op| {
+            for step_off in 0..vec_batch.step_count() {
+                let row = step_off * series_count..(step_off + 1) * series_count;
+                let Some(s) = scalar.get(vec_batch.step_range.start + step_off, 0) else {
+                    row.for_each(|idx| validity.clear(idx));
+                    continue;
+                };
+                let (dst, src) = (&mut out.values[row.clone()], &vec_batch.values[row]);
+                if scalar_on_right {
+                    for (dst, &v) in dst.iter_mut().zip(src) {
+                        *dst = op(v, s);
+                    }
+                } else {
+                    for (dst, &v) in dst.iter_mut().zip(src) {
+                        *dst = op(s, v);
+                    }
+                }
+            }
+        }, else return);
+        validity.for_each_clear(|idx| out.values[idx] = f64::NAN);
+        out.validity = validity;
     }
 
     /// Write one output cell given the class and the two (optional) input
@@ -806,8 +948,8 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
     /// Slow path for cells where at least one operand is a native
     /// histogram, following Prometheus `vectorElemBinop`: `h + h`, `h - h`,
     /// `h * s`, `s * h` and `h / s` produce histograms; `h == h` / `h != h`
-    /// filter on exact equality; every other combination drops the sample
-    /// (or yields `0` under `bool`).
+    /// filter on exact equality (or yield `0`/`1` under `bool`); every other
+    /// combination drops the sample, with or without `bool`.
     fn write_mixed_cell(
         &self,
         l: Option<Operand<'_>>,
@@ -859,6 +1001,8 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                 let (Some(l), Some(r)) = (l, r) else {
                     return;
                 };
+                // Every other pairing is an incompatible-types info in
+                // Prometheus, which drops the sample even under `bool`.
                 let keep = match (self.kind, l, r) {
                     (BinaryOpKind::Eq { .. }, Operand::Histogram(a), Operand::Histogram(b)) => {
                         a.equals(b)
@@ -866,7 +1010,7 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                     (BinaryOpKind::Ne { .. }, Operand::Histogram(a), Operand::Histogram(b)) => {
                         !a.equals(b)
                     }
-                    _ => false,
+                    _ => return,
                 };
                 if self.kind.bool_modifier() {
                     out.values[out_idx] = if keep { 1.0 } else { 0.0 };
@@ -916,8 +1060,127 @@ fn attach_histograms(batch: StepBatch, histograms: Option<HistogramCells>) -> St
     }
 }
 
+#[inline(always)]
+fn bit(words: &[u64], idx: usize) -> bool {
+    (words[idx / 64] >> (idx % 64)) & 1 == 1
+}
+
 fn present(side: &BufferedSide, step: usize, idx: usize) -> bool {
     side.get(step, idx).is_some() || side.get_histogram(step, idx).is_some()
+}
+
+/// Dense vector/vector loop for rows with at most one fixed partner each.
+/// The partner column of every row is resolved once into a gather index;
+/// each step then gathers 64 rows' partner cells (and validity bits) at a
+/// time into a contiguous chunk lined up with the scan row, so `kernel`
+/// runs over plain slices. Rows already in partner order skip the gather.
+fn gather_vv<K: ChunkKernel>(
+    scan: &BufferedSide,
+    partner: &BufferedSide,
+    scan_is_lhs: bool,
+    map: &[Option<u32>],
+    out: &mut OutBuffers,
+    kernel: K,
+) {
+    let (scan_width, partner_width) = (scan.total_series, partner.total_series);
+    let out_width = map.len();
+    let rows = out_width.min(scan_width);
+    let mut index = Vec::with_capacity(rows);
+    let mut has_partner = vec![0u64; rows.div_ceil(64)];
+    for (row, &mapped) in map[..rows].iter().enumerate() {
+        match mapped.filter(|&j| (j as usize) < partner_width) {
+            Some(j) => {
+                index.push(j);
+                has_partner[row / 64] |= 1 << (row % 64);
+            }
+            None => index.push(0),
+        }
+    }
+    if has_partner.iter().all(|&w| w == 0) {
+        return;
+    }
+    let identity = index.iter().enumerate().all(|(row, &j)| j as usize == row)
+        && has_partner
+            .iter()
+            .enumerate()
+            .all(|(w, &bits)| bits == lane_mask(rows - w * 64));
+
+    let (scan_values, scan_valid) = (scan.values(), scan.validity());
+    let (partner_values, partner_valid) = (partner.values(), partner.validity());
+    let partner_words = partner_valid.words();
+    let mut gathered = [f64::NAN; 64];
+    for step in 0..scan.step_count {
+        let (scan_base, partner_base) = (step * scan_width, step * partner_width);
+        let out_base = step * out_width;
+        for start in (0..rows).step_by(64) {
+            let n = (rows - start).min(64);
+            let scan_cells = &scan_values[scan_base + start..][..n];
+            let (partner_cells, partner_bits) = if identity {
+                let cells = &partner_values[partner_base + start..][..n];
+                (cells, partner_valid.word_at(partner_base + start))
+            } else {
+                let mut bits = 0u64;
+                let lanes = gathered[..n].iter_mut().zip(&index[start..start + n]);
+                for (i, (dst, &j)) in lanes.enumerate() {
+                    let cell = partner_base + j as usize;
+                    *dst = partner_values[cell];
+                    bits |= u64::from(bit(partner_words, cell)) << i;
+                }
+                (&gathered[..n], bits)
+            };
+            let present = scan_valid.word_at(scan_base + start)
+                & partner_bits
+                & has_partner[start / 64]
+                & lane_mask(n);
+            let (l, r) = if scan_is_lhs {
+                (scan_cells, partner_cells)
+            } else {
+                (partner_cells, scan_cells)
+            };
+            let dst = &mut out.values[out_base + start..][..n];
+            let keep = kernel.run(dst, l.iter().copied(), r.iter().copied());
+            out.validity.or_word_at(out_base + start, present & keep);
+            let mut absent = !present & lane_mask(n);
+            while absent != 0 {
+                dst[absent.trailing_zeros() as usize] = f64::NAN;
+                absent &= absent - 1;
+            }
+        }
+    }
+}
+
+/// Dense vector/scalar loop for a histogram-free vector: 64 cells of a
+/// step's row at a time against the broadcast scalar; a step without a
+/// scalar yields no samples.
+fn vs_dense<K: ChunkKernel>(
+    vec_batch: &StepBatch,
+    scalar: &BufferedSide,
+    scalar_on_right: bool,
+    out: &mut OutBuffers,
+    kernel: K,
+) {
+    let series_count = vec_batch.series_count();
+    for step_off in 0..vec_batch.step_count() {
+        let Some(s) = scalar.get(vec_batch.step_range.start + step_off, 0) else {
+            continue;
+        };
+        let row = step_off * series_count;
+        for start in (0..series_count).step_by(64) {
+            let (cell, n) = (row + start, (series_count - start).min(64));
+            let src = vec_batch.values[cell..][..n].iter().copied();
+            let dst = &mut out.values[cell..][..n];
+            let keep = if scalar_on_right {
+                kernel.run(dst, src, std::iter::repeat(s))
+            } else {
+                kernel.run(dst, std::iter::repeat(s), src)
+            };
+            let valid = keep & vec_batch.validity.word_at(cell) & lane_mask(n);
+            out.validity.or_word_at(cell, valid);
+        }
+    }
+    vec_batch
+        .validity
+        .for_each_clear(|idx| out.values[idx] = f64::NAN);
 }
 
 const NO_SERIES: u32 = u32::MAX;

@@ -1,0 +1,112 @@
+# `__name__` removal as the Prometheus server does it by default (no
+# `promql-delayed-name-removal`): the name is dropped as soon as an
+# operator changes the metric's meaning, and series that end up sharing a
+# labelset are merged when they never overlap, or fail the query.
+
+load 5m
+  metric_total{env="1"}          0 60 120
+  another_metric_total{env="1"}  60 120 180
+
+# The delayed-removal cases in name_label_dropping.test fail here, since
+# `rate` leaves two `{env="1"}` series.
+eval instant at 10m sum(rate({env="1"}[10m])) by (env)
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+eval instant at 10m label_replace(rate({env="1"}[10m]), "my_name", "rate_$1", "__name__", "(.+)")
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+eval instant at 10m label_replace(sum by (__name__) (rate(metric_total{env="1"}[10m])), "__name__", "$1", "__name__", "(.+)")
+  {} 0.2
+
+clear
+
+load 1m
+  a_total{inst="1"}  0 10 20 30 _ _ _ _ _ _ _
+  b_total{inst="1"}  _ _ _ _ _ _ 0 1 2 3 4
+  c_total{inst="1"}  7 7 7 7 7 7 7 7 7 7 7
+  d_total{inst="1"}  2 2 2 2 2 2 2 2 2 2 2
+
+# Every arithmetic operator drops the name, vector/vector or not.
+eval instant at 10m c_total + d_total
+  {inst="1"} 9
+
+eval instant at 10m c_total % d_total
+  {inst="1"} 1
+
+eval instant at 10m c_total ^ d_total
+  {inst="1"} 49
+
+eval instant at 10m c_total atan2 d_total
+  {inst="1"} 1.2924966677897853
+
+eval instant at 10m c_total % 4
+  {inst="1"} 3
+
+eval instant at 10m 2 ^ d_total
+  {inst="1"} 4
+
+eval instant at 10m -c_total
+  {inst="1"} -7
+
+# Comparisons keep the name unless they are `bool`.
+eval instant at 10m c_total > 1
+  c_total{inst="1"} 7
+
+eval instant at 10m c_total > bool 1
+  {inst="1"} 1
+
+eval instant at 10m 1 < bool c_total
+  {inst="1"} 1
+
+eval instant at 10m c_total > bool d_total
+  {inst="1"} 1
+
+# Functions drop the name; `last_over_time` and the label functions keep it.
+eval instant at 10m abs(c_total)
+  {inst="1"} 7
+
+eval instant at 10m clamp_max(c_total, 5)
+  {inst="1"} 5
+
+eval instant at 10m timestamp(c_total)
+  {inst="1"} 600
+
+eval instant at 10m resets(c_total[5m])
+  {inst="1"} 0
+
+eval instant at 10m max_over_time(c_total[5m])
+  {inst="1"} 7
+
+eval instant at 10m last_over_time(c_total[5m])
+  c_total{inst="1"} 7
+
+eval instant at 10m label_replace(c_total, "x", "y", "", "")
+  c_total{inst="1", x="y"} 7
+
+# Only `b_total` has samples in the window, so there is no collision.
+eval instant at 10m resets({__name__=~"a_total|b_total"}[3m])
+  {inst="1"} 0
+
+eval instant at 10m {__name__=~"a_total|b_total"} * 2
+  {inst="1"} 8
+
+# Range-vector functions reject two series sharing a labelset as soon as
+# both produce a point anywhere in the evaluated range.
+eval instant at 10m max_over_time(resets({__name__=~"a_total|b_total"}[3m])[10m:1m])
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+# Step-wise evaluation only rejects them at a step where both have a value
+# (a_total stays visible through lookback until 8m, b_total starts at 6m) ...
+eval instant at 10m count_over_time(({__name__=~"a_total|b_total"} * 2)[10m:1m])
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+eval instant at 10m count_over_time((-{__name__=~"a_total|b_total"})[10m:1m])
+  expect fail msg:vector cannot contain metrics with the same labelset
+
+# ... and merges them otherwise: `increase` has values at 1m-4m, `resets`
+# at 6m-10m, and `or` combines them into one series.
+eval instant at 10m count_over_time((increase(a_total[3m]) or resets(b_total[3m]))[10m:1m])
+  {inst="1"} 9
+
+eval instant at 10m count_over_time((increase(a_total[3m]) or on(inst) resets(b_total[3m]))[10m:1m])
+  {inst="1"} 9

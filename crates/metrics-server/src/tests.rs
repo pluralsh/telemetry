@@ -15,6 +15,7 @@ use axum::{
 use base64::Engine;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use http_body_util::BodyExt;
+use prost::Message as _;
 use proto::metrics::internal::v1::internal_writer_server::InternalWriter;
 use sharding::{
     AssignmentGeneration, AssignmentState, BoxError, FakeAssignmentStore, FakeLeaseBackend,
@@ -357,6 +358,115 @@ async fn gzipped_otlp_json_is_queryable_with_rfc3339_times_and_duration_step() {
     assert_eq!(values.len(), 5);
     assert_eq!(values[0], serde_json::json!([1_700_000_000.0, "7"]));
     assert_eq!(values[4], serde_json::json!([1_700_000_060.0, "7"]));
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn trace_flag_attaches_a_query_trace_to_instant_and_range_responses() {
+    // given: one stored gauge sample
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.shards = 1;
+    config.write.durability = Durability::Written;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+    let body = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [
+      {"name": "traced_gauge", "gauge": {"dataPoints": [
+        {"timeUnixNano": "1700000000000000000", "asInt": "7"}
+      ]}}
+    ]}]}]}"#;
+    let write = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/write/ns/alpha/v1/metrics")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(&body[..]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::OK);
+
+    // when
+    let mut responses = Vec::new();
+    for path in [
+        "/read/ns/alpha/api/v1/query?query=traced_gauge&time=1700000000&trace=true",
+        "/read/ns/alpha/api/v1/query_range?query=traced_gauge\
+         &start=1700000000&end=1700000060&step=15&trace=1",
+        "/read/ns/alpha/api/v1/query?query=traced_gauge&time=1700000000",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        responses.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+    }
+
+    // then
+    for traced in &responses[..2] {
+        assert_eq!(traced["data"]["result"].as_array().unwrap().len(), 1);
+        let trace = &traced["trace"];
+        assert!(trace["totalMs"].is_number(), "{trace}");
+        assert!(trace["phases"].is_array(), "{trace}");
+    }
+    // The range query is served from series the instant query decoded.
+    assert!(responses[0]["trace"]["io"].is_array(), "{}", responses[0]);
+    assert!(responses[2].get("trace").is_none());
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn negative_zero_survives_internal_forwarding_end_to_end() {
+    // given: a -0.0 sample forwarded to its owning shard over the wire
+    let mut config = test_config(ServerMode::Standalone);
+    config.sharding.shards = 1;
+    config.write.durability = Durability::Written;
+    let state = AppState::open(config).await.unwrap();
+    let app = router(state.clone());
+    let namespace = Namespace::new("alpha").unwrap();
+    let routing = state.router.assignment().read().await.clone();
+    let series = Series::new(
+        "signed_zero",
+        vec![Label::new("instance", "a")],
+        vec![Sample::new(1_700_000_000_000, -0.0)],
+    );
+    let shard =
+        plural_metrics::routing::route(&routing, &namespace, &series.labels, 1_700_000_000_000);
+    let request = internal_writer::to_proto_request(
+        "alpha",
+        shard,
+        routing.generation.get(),
+        "signed-zero",
+        Durability::Written,
+        vec![series],
+    );
+    let request =
+        WriteBatchRequest::decode(prost::Message::encode_to_vec(&request).as_slice()).unwrap();
+
+    // when
+    InternalWriter::write(&state, Request::new(request))
+        .await
+        .unwrap();
+    let query = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/read/ns/alpha/api/v1/query?query=1%2Fsigned_zero&time=1700000000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // then
+    assert_eq!(query.status(), StatusCode::OK);
+    let body = query.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["data"]["result"][0]["value"],
+        serde_json::json!([1_700_000_000.0, "-Inf"])
+    );
     state.shutdown().await.unwrap();
 }
 
@@ -944,7 +1054,7 @@ async fn grpc_retries_are_idempotent() {
                 .collect(),
             samples: vec![ProtoSample {
                 timestamp_ms: 1_700_000_000_000,
-                value: 1.0,
+                value: Some(1.0),
             }],
             histograms: vec![],
         }],

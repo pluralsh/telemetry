@@ -19,6 +19,10 @@ DEFAULT_FAIL_ON = frozenset(
     {"mismatch", "impl_error", "impl_timeout", "unstable_impl", "ingest"}
 )
 
+SCENARIOS = ("recent", "historical")
+# MinIO listens here in the historical scenario, behind the latency proxy.
+HISTORICAL_ENVIRONMENT = {"MINIO_ADDRESS": ":9010"}
+
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
 _UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
@@ -127,6 +131,10 @@ class FuzzConfig:
     max_artifacts: int
     artifact_bytes: int
     record_data: bool
+    # `recent` reads what production serves from memory and fresh storage;
+    # `historical` forces every oracle onto object-store reads and puts a
+    # first-byte delay in front of MinIO for both sides.
+    scenario: str = "recent"
 
     @classmethod
     def from_env(cls, product: str, *, default_window: str) -> FuzzConfig:
@@ -136,6 +144,9 @@ class FuzzConfig:
         stack = _env("FUZZ_STACK", "compose")
         if stack not in ("compose", "external"):
             raise ValueError("FUZZ_STACK must be 'compose' or 'external'")
+        scenario = _env("FUZZ_SCENARIO", "recent")
+        if scenario not in SCENARIOS:
+            raise ValueError(f"FUZZ_SCENARIO must be one of {SCENARIOS}")
         fail_on = _env("FUZZ_FAIL_ON", ",".join(sorted(DEFAULT_FAIL_ON)))
         output = _env(
             "FUZZ_OUTPUT_DIR",
@@ -167,7 +178,12 @@ class FuzzConfig:
             max_artifacts=int(_env("FUZZ_MAX_ARTIFACTS", "200")),
             artifact_bytes=int(_env("FUZZ_ARTIFACT_BYTES", str(256 * 1024))),
             record_data=_flag("FUZZ_RECORD_DATA", True),
+            scenario=scenario,
         )
+
+    @property
+    def historical(self) -> bool:
+        return self.scenario == "historical"
 
     def describe(self) -> dict[str, object]:
         return {
@@ -176,6 +192,7 @@ class FuzzConfig:
             "seed": self.seed,
             "run_id": self.run_id,
             "stack": self.stack,
+            "scenario": self.scenario,
             "isolated": self.isolated,
             "scale": self.scale,
             "window_s": self.window_s,

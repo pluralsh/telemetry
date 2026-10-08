@@ -75,7 +75,7 @@ storage:
 #   type: InMemory
 
 segment_duration_seconds: 3600 # Time partition width; keep stable for a dataset.
-retention_seconds: 2592000 # Optional logical retention; 30 days.
+retention_seconds: 1209600 # Logical retention; 14 days, the default. `null` keeps data forever.
 
 # Each write-buffer flush packs every written stream of a segment into
 # multi-stream objects; these limits cut larger flushes into several objects.
@@ -97,6 +97,11 @@ compaction:
   # read replicas; keep it above the longest query and replica lag.
   delete_delay_seconds: 600
   max_merges_per_flush: 256
+
+# Bytes of object blocks kept in memory across queries, with their bodies
+# decompressed once a query needs them; one budget shared by every storage
+# shard of the process; 256 MiB, the default. 0 disables it.
+reader_cache_capacity: 268435456
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.

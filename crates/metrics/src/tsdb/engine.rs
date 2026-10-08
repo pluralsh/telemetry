@@ -389,4 +389,42 @@ impl QueryReader for TsdbQueryReader {
         })?;
         mini.inverted_index_term(term).await
     }
+
+    async fn cached_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+    ) -> Option<std::sync::Arc<roaring::RoaringBitmap>> {
+        self.mini_readers.get(bucket)?.cached_selector(key).await
+    }
+
+    async fn cache_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+        postings: &roaring::RoaringBitmap,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_selector(key, postings).await;
+        }
+    }
+
+    async fn cached_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+    ) -> Option<std::sync::Arc<[Labels]>> {
+        self.mini_readers.get(bucket)?.cached_series_set(key).await
+    }
+
+    async fn cache_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+        series: std::sync::Arc<[Labels]>,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_series_set(key, series).await;
+        }
+    }
 }

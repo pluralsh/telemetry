@@ -12,7 +12,6 @@ use std::rc::Rc;
 
 use chrono::{TimeZone, Utc};
 
-use super::{Row, lookup};
 use crate::logql::TemplateSyntax;
 use crate::{Error, Result};
 
@@ -44,11 +43,7 @@ impl Template {
         }))
     }
 
-    pub(super) fn render(&self, row: &Row) -> Result<String> {
-        self.render_context(row)
-    }
-
-    fn render_context(&self, context: &dyn Context) -> Result<String> {
+    pub(super) fn render(&self, context: &dyn Context) -> Result<String> {
         match &self.0 {
             Engine::Go(template) => template.render(context),
             Engine::Jinja(template) => template.render(context),
@@ -58,35 +53,11 @@ impl Template {
 
 /// The row a template renders: its line, timestamp and labels (stream,
 /// parsed and structured metadata, as Loki's label builder merges them).
-trait Context {
+pub(super) trait Context {
     fn line(&self) -> &str;
     fn timestamp_ns(&self) -> i64;
     fn get(&self, name: &str) -> Option<&str>;
     fn entries(&self) -> BTreeMap<String, String>;
-}
-
-impl Context for Row {
-    fn line(&self) -> &str {
-        &self.line
-    }
-
-    fn timestamp_ns(&self) -> i64 {
-        self.timestamp_ns
-    }
-
-    fn get(&self, name: &str) -> Option<&str> {
-        lookup(self, name)
-    }
-
-    fn entries(&self) -> BTreeMap<String, String> {
-        let mut entries = self.metadata.clone();
-        entries.extend(
-            self.labels
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
-        entries
-    }
 }
 
 /// A template value. Integers and floats stay distinct because Go prints,
@@ -301,7 +272,7 @@ mod tests {
     pub(super) fn render(syntax: TemplateSyntax, source: &str, row: &TestRow) -> Result<String> {
         Template::compile(syntax, source)
             .map_err(Error::Query)?
-            .render_context(row)
+            .render(row)
     }
 
     #[test]

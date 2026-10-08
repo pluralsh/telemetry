@@ -2,6 +2,8 @@ mod assert;
 mod dsl;
 mod evaluator;
 mod loader;
+#[cfg(test)]
+mod range_cache;
 pub mod runner;
 
 #[cfg(test)]

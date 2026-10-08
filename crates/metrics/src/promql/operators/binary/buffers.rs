@@ -111,25 +111,31 @@ impl BufferedSide {
     pub(super) fn absorb(&mut self, batch: &StepBatch) {
         let step_count_in = batch.step_count();
         let series_count_in = batch.series_count();
+        let in_row_width =
+            series_count_in.min(self.total_series.saturating_sub(batch.series_range.start));
         for step_off in 0..step_count_in {
             let global_step = batch.step_range.start + step_off;
             if global_step >= self.step_count {
                 continue;
             }
             let in_base = step_off * series_count_in;
-            let out_base = global_step * self.total_series;
-            for s in 0..series_count_in {
-                let in_cell = in_base + s;
-                if !batch.validity.get(in_cell) {
-                    continue;
+            let out_base = global_step * self.total_series + batch.series_range.start;
+            for start in (0..in_row_width).step_by(64) {
+                let n = (in_row_width - start).min(64);
+                let valid = batch.validity.word_at(in_base + start) & lane_mask(n);
+                let src = &batch.values[in_base + start..][..n];
+                let dst = &mut self.values[out_base + start..][..n];
+                if valid == lane_mask(n) {
+                    dst.copy_from_slice(src);
+                } else {
+                    let mut bits = valid;
+                    while bits != 0 {
+                        let i = bits.trailing_zeros() as usize;
+                        dst[i] = src[i];
+                        bits &= bits - 1;
+                    }
                 }
-                let global_series = batch.series_range.start + s;
-                if global_series >= self.total_series {
-                    continue;
-                }
-                let out_cell = out_base + global_series;
-                self.values[out_cell] = batch.values[in_cell];
-                self.validity.set(out_cell);
+                self.validity.or_word_at(out_base + start, valid);
             }
         }
         let Some(cells) = &batch.histograms else {
@@ -152,6 +158,18 @@ impl BufferedSide {
                 }
             }
         }
+    }
+
+    /// The full `step_count × total_series` grid; cells with a clear
+    /// validity bit hold the NaN fill.
+    #[inline]
+    pub(super) fn values(&self) -> &[f64] {
+        &self.values
+    }
+
+    #[inline]
+    pub(super) fn validity(&self) -> &BitSet {
+        &self.validity
     }
 
     #[inline]

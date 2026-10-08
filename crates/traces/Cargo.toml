@@ -11,6 +11,9 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[features]
+bench-internals = []
+
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
@@ -20,6 +23,7 @@ futures.workspace = true
 lalrpop-util = "0.23.1"
 logos = "0.16.1"
 metrics.workspace = true
+moka.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 regex.workspace = true
@@ -31,11 +35,20 @@ snap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+common = { path = "../common", features = ["test-utils"] }
+criterion.workspace = true
+mimalloc.workspace = true
 proptest.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "traces"
+harness = false
+required-features = ["bench-internals"]
 
 [build-dependencies]
 lalrpop = "0.23.1"

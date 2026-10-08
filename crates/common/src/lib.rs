@@ -17,8 +17,8 @@ pub use storage::config::{
     BlockCacheConfig, CacheWarmerConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
 pub use storage::factory::{
-    CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_object_store, create_storage_read, new_slatedb_compactor_builder,
+    CompactorBuilder, DbBuilder, SharedDbCache, StorageBuilder, StorageReaderRuntime,
+    StorageSemantics, create_object_store, create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::slate::SlateReadHandle;
@@ -26,6 +26,6 @@ pub use storage::sst_blocks::{
     BlockOpCounts, CountResult, L0Stats, SortedRunStats, WalkStats, count_in_range,
 };
 pub use storage::{
-    CheckpointInfo, MergeRecordOp, PutRecordOp, Record, Storage, StorageError, StorageIterator,
-    StorageRead, StorageResult, Ttl, WriteOptions, WriteResult,
+    CheckpointInfo, MergeRecordOp, PutRecordOp, ReadHints, Record, Storage, StorageError,
+    StorageIterator, StorageRead, StorageResult, Ttl, WriteOptions, WriteResult,
 };

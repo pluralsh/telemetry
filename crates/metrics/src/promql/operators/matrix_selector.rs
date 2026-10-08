@@ -28,8 +28,11 @@
 //! [`MatrixWindowBatch`] layout: flat `timestamps` / `values` buffers plus
 //! a row-major-by-step `cells: Vec<CellIndex>` where
 //! `cells[t * series_count + s] = { offset, len }` indexes into the flat
-//! buffers. Adjacent-step cells for the same series advance monotonically,
-//! so `RollupOp`'s two-pointer driver reuses state across steps.
+//! buffers. This operator packs a series chunk's samples into those
+//! buffers once and shares them across the chunk's step tiles, so a cell
+//! is a range into the series' samples rather than a copy of its window.
+//! Adjacent-step cells for the same series advance monotonically, so
+//! `RollupOp`'s two-pointer driver reuses state across steps.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -142,11 +145,11 @@ pub struct MatrixWindowBatch {
     /// Slice of the series roster covered by this batch.
     pub series_range: std::ops::Range<usize>,
 
-    /// Flat per-cell sample timestamps (ms), packed in row-major step ×
-    /// series order. A cell's slice lives at [`CellIndex::range`].
-    pub timestamps: Vec<i64>,
-    /// Flat per-cell sample values, parallel to [`Self::timestamps`].
-    pub values: Vec<f64>,
+    /// Flat sample timestamps (ms). A cell's slice lives at
+    /// [`CellIndex::range`]; cells may overlap.
+    pub timestamps: Arc<Vec<i64>>,
+    /// Flat sample values, parallel to [`Self::timestamps`].
+    pub values: Arc<Vec<f64>>,
     /// Per-cell index. Length is `step_count * series_count`, row-major
     /// by step (cell `(t_off, s_off)` lives at `t_off * series_count +
     /// s_off`).
@@ -175,8 +178,8 @@ pub struct MatrixWindowBatch {
 /// Histogram counterpart of [`MatrixWindowBatch`]'s flat float columns.
 #[derive(Debug, Clone, Default)]
 pub struct WindowHistograms {
-    pub timestamps: Vec<i64>,
-    pub values: Vec<Arc<FloatHistogram>>,
+    pub timestamps: Arc<Vec<i64>>,
+    pub values: Arc<Vec<Arc<FloatHistogram>>>,
     /// Same length and layout as [`MatrixWindowBatch::cells`].
     pub cells: Vec<CellIndex>,
 }
@@ -237,83 +240,20 @@ impl MatrixWindowBatch {
 // Memory-guarded window-batch buffers
 // ---------------------------------------------------------------------------
 
-/// Conservative byte estimate for a per-cell index array + flat sample
-/// buffer with `cells` cells and `samples` total samples.
-#[inline]
-fn window_bytes(cells: usize, samples: usize) -> usize {
-    let cell_bytes = cells.saturating_mul(std::mem::size_of::<CellIndex>());
-    let ts_bytes = samples.saturating_mul(std::mem::size_of::<i64>());
-    let val_bytes = samples.saturating_mul(std::mem::size_of::<f64>());
-    cell_bytes
-        .saturating_add(ts_bytes)
-        .saturating_add(val_bytes)
-}
-
 /// Per-series sample column byte estimate.
 #[inline]
 fn samples_bytes(n: usize) -> usize {
     n.saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<f64>())
 }
 
-/// RAII reservation wrapper around an in-flight window batch's buffers.
-///
-/// Reserves on construction (cells-only, up front), grows as samples are
-/// pushed, and releases the entire reservation on [`Drop`]. Callers move
-/// the inner vectors out via [`Self::finish`], which transfers ownership
-/// of the bytes and releases the reservation slice (downstream
-/// re-reserves if it holds the batch).
-struct WindowBuffers {
-    reservation: MemoryReservation,
-    bytes: usize,
-    timestamps: Vec<i64>,
-    values: Vec<f64>,
-    cells: Vec<CellIndex>,
-}
-
-impl WindowBuffers {
-    /// Reserve space for `cell_count` cell indices (samples accrue via
-    /// [`Self::grow_samples`] as the driver walks the window).
-    fn allocate(reservation: &MemoryReservation, cell_count: usize) -> Result<Self, QueryError> {
-        let bytes = window_bytes(cell_count, 0);
-        reservation.try_grow(bytes)?;
-        Ok(Self {
-            reservation: reservation.clone(),
-            bytes,
-            timestamps: Vec::new(),
-            values: Vec::new(),
-            cells: vec![CellIndex::EMPTY; cell_count],
-        })
-    }
-
-    /// Reserve incremental bytes for `extra` additional samples before
-    /// pushing. Returns `MemoryLimit` without pushing on reject.
-    fn grow_samples(&mut self, extra: usize) -> Result<(), QueryError> {
-        if extra == 0 {
-            return Ok(());
-        }
-        let bytes = extra.saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<f64>());
-        self.reservation.try_grow(bytes)?;
-        self.bytes = self.bytes.saturating_add(bytes);
-        Ok(())
-    }
-
-    /// Consume the buffers into an owned window batch body.
-    fn finish(mut self) -> (Vec<i64>, Vec<f64>, Vec<CellIndex>) {
-        let ts = std::mem::take(&mut self.timestamps);
-        let vs = std::mem::take(&mut self.values);
-        let cells = std::mem::take(&mut self.cells);
-        self.reservation.release(self.bytes);
-        self.bytes = 0;
-        (ts, vs, cells)
-    }
-}
-
-impl Drop for WindowBuffers {
-    fn drop(&mut self) {
-        if self.bytes > 0 {
-            self.reservation.release(self.bytes);
-        }
-    }
+/// Checks a window batch's cell index against the reservation. The bytes
+/// are released once the batch is built; the consumer re-reserves if it
+/// holds the batch.
+fn check_cells(reservation: &MemoryReservation, cell_count: usize) -> Result<(), QueryError> {
+    let bytes = cell_count.saturating_mul(std::mem::size_of::<CellIndex>());
+    reservation.try_grow(bytes)?;
+    reservation.release(bytes);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +360,62 @@ impl ChunkSamples {
         }
     }
 
-    fn has_histograms(&self) -> bool {
-        self.histograms.iter().any(|col| !col.is_empty())
+    /// Moves every series' samples, minus `STALE_NAN`s, into one shared
+    /// column per kind.
+    fn pack(mut self) -> Result<PackedChunk, QueryError> {
+        let total: usize = self.timestamps.iter().map(Vec::len).sum();
+        let histogram_total: usize = self.histogram_timestamps.iter().map(Vec::len).sum();
+        if u32::try_from(total.max(histogram_total)).is_err() {
+            return Err(QueryError::Internal(format!(
+                "matrix selector chunk of {total} samples exceeds the cell index range"
+            )));
+        }
+        // The per-series columns are freed as the packed ones fill, but
+        // both exist at the start.
+        let transient = samples_bytes(total);
+        self.reservation.try_grow(transient)?;
+
+        let mut timestamps = Vec::with_capacity(total);
+        let mut values = Vec::with_capacity(total);
+        let mut starts = Vec::with_capacity(self.timestamps.len() + 1);
+        for (ts, vs) in std::mem::take(&mut self.timestamps)
+            .into_iter()
+            .zip(std::mem::take(&mut self.values))
+        {
+            starts.push(timestamps.len());
+            for (t, v) in ts.into_iter().zip(vs) {
+                if !is_stale_nan(v) {
+                    timestamps.push(t);
+                    values.push(v);
+                }
+            }
+        }
+        starts.push(timestamps.len());
+
+        let mut histogram_timestamps = Vec::with_capacity(histogram_total);
+        let mut histograms = Vec::with_capacity(histogram_total);
+        let mut histogram_starts = Vec::with_capacity(self.histograms.len() + 1);
+        for (hts, hs) in std::mem::take(&mut self.histogram_timestamps)
+            .into_iter()
+            .zip(std::mem::take(&mut self.histograms))
+        {
+            histogram_starts.push(histogram_timestamps.len());
+            histogram_timestamps.extend(hts);
+            histograms.extend(hs);
+        }
+        histogram_starts.push(histogram_timestamps.len());
+        self.reservation.release(transient);
+
+        Ok(PackedChunk {
+            reservation: self.reservation.clone(),
+            bytes: std::mem::take(&mut self.bytes),
+            timestamps: Arc::new(timestamps),
+            values: Arc::new(values),
+            starts,
+            histogram_timestamps: Arc::new(histogram_timestamps),
+            histograms: Arc::new(histograms),
+            histogram_starts,
+        })
     }
 
     fn absorb(
@@ -470,6 +464,34 @@ impl Drop for ChunkSamples {
     }
 }
 
+/// A loaded series chunk whose samples sit in shared flat columns, so its
+/// window batches index into them instead of copying.
+struct PackedChunk {
+    reservation: MemoryReservation,
+    bytes: usize,
+    timestamps: Arc<Vec<i64>>,
+    values: Arc<Vec<f64>>,
+    /// Chunk-local series `s` owns `starts[s]..starts[s + 1]`.
+    starts: Vec<usize>,
+    histogram_timestamps: Arc<Vec<i64>>,
+    histograms: Arc<Vec<Arc<FloatHistogram>>>,
+    histogram_starts: Vec<usize>,
+}
+
+impl PackedChunk {
+    fn has_histograms(&self) -> bool {
+        !self.histograms.is_empty()
+    }
+}
+
+impl Drop for PackedChunk {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.reservation.release(self.bytes);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sliding-walk driver — the correctness-sensitive bit
 // ---------------------------------------------------------------------------
@@ -509,9 +531,8 @@ impl SeriesCursor {
     /// Advance the cursor to cover `(window_lo_exclusive, window_hi_inclusive]`
     /// in `timestamps`. Returns the `[lo, hi)` range of samples in-window.
     ///
-    /// `timestamps` is assumed ascending. `STALE_NAN` exclusion is *not*
-    /// performed here — the caller filters while packing into the window
-    /// batch, so the cursor can stay simple and integer-only.
+    /// `timestamps` is assumed ascending, with `STALE_NAN`s already dropped
+    /// by [`ChunkSamples::pack`].
     fn advance(
         &mut self,
         timestamps: &[i64],
@@ -547,6 +568,29 @@ impl SeriesCursor {
     }
 }
 
+/// The cell of chunk-local series `series_off` for the window
+/// `(lo_exclusive, hi_inclusive]`, as a range into the packed `timestamps`.
+fn cell(
+    starts: &[usize],
+    series_off: usize,
+    cursor: &mut SeriesCursor,
+    timestamps: &[i64],
+    lo_exclusive: i64,
+    hi_inclusive: i64,
+) -> CellIndex {
+    let base = starts[series_off];
+    let range = cursor.advance(
+        &timestamps[base..starts[series_off + 1]],
+        lo_exclusive,
+        hi_inclusive,
+    );
+    // `PackedChunk` bounds its columns to `u32` lengths.
+    CellIndex {
+        offset: (base + range.start) as u32,
+        len: range.len() as u32,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Operator state machine
 // ---------------------------------------------------------------------------
@@ -559,12 +603,12 @@ enum State<'a> {
         chunk_start: usize,
         chunk_len: usize,
         #[allow(clippy::type_complexity)]
-        future: Pin<Box<dyn Future<Output = Result<ChunkSamples, QueryError>> + Send + 'a>>,
+        future: Pin<Box<dyn Future<Output = Result<PackedChunk, QueryError>> + Send + 'a>>,
     },
     Emitting {
         chunk_start: usize,
         chunk_len: usize,
-        samples: Box<ChunkSamples>,
+        samples: Box<PackedChunk>,
         /// Per-series cursor for the current series chunk. `cursors[i]`
         /// tracks chunk-local series `i`.
         cursors: Vec<SeriesCursor>,
@@ -608,6 +652,9 @@ pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
 
     // Runtime state ---------------------------------------------------------
     state: State<'a>,
+    /// A consumed batch's cell index, kept for the next batch. Unreserved,
+    /// but never more than one batch's.
+    spare_cells: Vec<CellIndex>,
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
@@ -668,7 +715,14 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             shape,
             reservation,
             state: State::Init,
+            spare_cells: Vec::new(),
         }
+    }
+
+    /// Takes back a batch this operator emitted once its consumer is done
+    /// with it, so the next batch reuses its cell index.
+    pub(crate) fn recycle(&mut self, window: MatrixWindowBatch) {
+        self.spare_cells = window.cells;
     }
 
     fn total_series(&self) -> usize {
@@ -704,8 +758,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                 let batch = item?;
                 samples.absorb(batch, &request_to_series)?;
             }
-            let _ = chunk_start;
-            Ok(samples)
+            samples.pack()
         });
 
         State::LoadingChunk {
@@ -716,10 +769,10 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
     }
 
     fn build_window_batch(
-        &self,
+        &mut self,
         chunk_start: usize,
         chunk_len: usize,
-        samples: &ChunkSamples,
+        samples: &PackedChunk,
         cursors: &mut [SeriesCursor],
         hist_cursors: &mut [SeriesCursor],
         step_chunk_start: usize,
@@ -729,12 +782,13 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         let step_count = step_chunk_end - step_chunk_start;
         let cell_count = step_count * chunk_len;
 
-        let mut buffers = WindowBuffers::allocate(&self.reservation, cell_count)?;
-        let mut histograms = samples.has_histograms().then(|| WindowHistograms {
-            timestamps: Vec::new(),
-            values: Vec::new(),
-            cells: vec![CellIndex::EMPTY; cell_count],
-        });
+        check_cells(&self.reservation, cell_count)?;
+        let mut cells = std::mem::take(&mut self.spare_cells);
+        cells.clear();
+        cells.resize(cell_count, CellIndex::EMPTY);
+        let mut histogram_cells = samples
+            .has_histograms()
+            .then(|| vec![CellIndex::EMPTY; cell_count]);
 
         for step_off in 0..step_count {
             let step_idx = step_chunk_start + step_off;
@@ -743,55 +797,35 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             let window_hi = effective; // inclusive
 
             for (series_off, cursor) in cursors.iter_mut().enumerate().take(chunk_len) {
-                let ts = &samples.timestamps[series_off];
-                let vs = &samples.values[series_off];
-
-                // Integer-only cursor advance first — STALE_NAN filter
-                // happens while packing.
-                let window_range = cursor.advance(ts, window_lo, window_hi);
-
-                // Count non-stale samples up front so we can grow the
-                // reservation once per cell rather than once per sample.
-                let mut in_cell: usize = 0;
-                for i in window_range.clone() {
-                    if !is_stale_nan(vs[i]) {
-                        in_cell += 1;
-                    }
-                }
-                buffers.grow_samples(in_cell)?;
-
-                let cell_offset = buffers.timestamps.len() as u32;
-                for i in window_range {
-                    let v = vs[i];
-                    if is_stale_nan(v) {
-                        continue;
-                    }
-                    buffers.timestamps.push(ts[i]);
-                    buffers.values.push(v);
-                }
                 let cell_idx = step_off * chunk_len + series_off;
-                buffers.cells[cell_idx] = CellIndex {
-                    offset: cell_offset,
-                    len: in_cell as u32,
-                };
-
-                if let Some(out) = histograms.as_mut() {
-                    let hts = &samples.histogram_timestamps[series_off];
-                    let range = hist_cursors[series_off].advance(hts, window_lo, window_hi);
-                    let offset = out.timestamps.len() as u32;
-                    let len = range.len() as u32;
-                    // Histogram sample bytes were reserved at absorb time;
-                    // cells only clone `Arc`s.
-                    buffers.grow_samples(range.len())?;
-                    out.timestamps.extend_from_slice(&hts[range.clone()]);
-                    out.values
-                        .extend_from_slice(&samples.histograms[series_off][range]);
-                    out.cells[cell_idx] = CellIndex { offset, len };
+                cells[cell_idx] = cell(
+                    &samples.starts,
+                    series_off,
+                    cursor,
+                    &samples.timestamps,
+                    window_lo,
+                    window_hi,
+                );
+                if let Some(out) = histogram_cells.as_mut() {
+                    out[cell_idx] = cell(
+                        &samples.histogram_starts,
+                        series_off,
+                        &mut hist_cursors[series_off],
+                        &samples.histogram_timestamps,
+                        window_lo,
+                        window_hi,
+                    );
                 }
             }
         }
 
-        let (timestamps, values, cells) = buffers.finish();
+        let histograms = histogram_cells.map(|cells| WindowHistograms {
+            timestamps: samples.histogram_timestamps.clone(),
+            values: samples.histograms.clone(),
+            cells,
+        });
+        let timestamps = samples.timestamps.clone();
+        let values = samples.values.clone();
         let series_range = chunk_start..(chunk_start + chunk_len);
         let step_range = step_chunk_start..step_chunk_end;
         let effective_times = if self.has_effective_shift {

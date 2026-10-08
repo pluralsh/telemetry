@@ -12,17 +12,18 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use common::storage::config::SlateDbStorageConfig;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use moka::future::Cache;
 use uuid::Uuid;
 
 use crate::Namespace;
 use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::minitsdb::MiniQueryReader;
+use crate::minitsdb::{ForwardIndexCache, MiniQueryReader, ReplicaPostings, SeriesCache};
 use crate::model::{
     Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, SeriesId, TimeBucket,
 };
+use crate::postings_cache::PostingsCache;
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::{StorageRead, StorageReader};
 use crate::tsdb::{
@@ -166,6 +167,44 @@ impl QueryReader for ReaderQueryReader {
         })?;
         mini.inverted_index_term(term).await
     }
+
+    async fn cached_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<roaring::RoaringBitmap>> {
+        self.mini_readers.get(bucket)?.cached_selector(key).await
+    }
+
+    async fn cache_selector(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        postings: &roaring::RoaringBitmap,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_selector(key, postings).await;
+        }
+    }
+
+    async fn cached_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<[crate::model::Labels]>> {
+        self.mini_readers.get(bucket)?.cached_series_set(key).await
+    }
+
+    async fn cache_series_set(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        series: Arc<[crate::model::Labels]>,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_series_set(key, series).await;
+        }
+    }
 }
 
 // ── TimeSeriesDbReader ───────────────────────────────────────────────
@@ -203,6 +242,11 @@ pub struct TimeSeriesDbReader {
     storage: StorageReader,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<(Namespace, TimeBucket), Arc<MiniQueryReader<StorageReader>>>,
+    forward_cache: Arc<ForwardIndexCache>,
+    /// Half of the reader's cache budget, in bytes.
+    series_cache: Arc<SeriesCache>,
+    postings_caches: dashmap::DashMap<Namespace, Arc<PostingsCache>>,
+    matcher_cache_capacity_bytes: u64,
     discovery_cache: crate::discovery::MetricsDiscoveryCache,
 }
 
@@ -250,7 +294,34 @@ impl TimeSeriesDbReader {
         cache_capacity: u64,
         checkpoint_id: Option<Uuid>,
     ) -> Result<Self> {
-        let reader = StorageReader::try_new(&storage_config, reader_options, checkpoint_id).await?;
+        let cache = common::SharedDbCache::from_slatedb_config(&storage_config).await?;
+        Self::open_with_cache(
+            storage_config,
+            reader_options,
+            cache_capacity,
+            checkpoint_id,
+            &cache,
+        )
+        .await
+    }
+
+    /// Opens a reader whose SlateDB block cache is `cache` instead of one
+    /// built from `storage_config`.
+    pub(crate) async fn open_with_cache(
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Option<Uuid>,
+        cache: &common::SharedDbCache,
+    ) -> Result<Self> {
+        let reader = StorageReader::try_new_with_cache(
+            &storage_config,
+            reader_options,
+            checkpoint_id,
+            common::create_object_store(&storage_config.object_store)?,
+            cache,
+        )
+        .await?;
         Ok(Self::from_storage_with_capacity(reader, cache_capacity))
     }
 
@@ -264,8 +335,31 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
+            forward_cache: Arc::new(ForwardIndexCache::new()),
+            series_cache: Arc::new(SeriesCache::new(cache_capacity / 2)),
+            postings_caches: dashmap::DashMap::new(),
+            matcher_cache_capacity_bytes: crate::config::QueryCacheConfig::default()
+                .matcher_capacity_bytes,
             discovery_cache: crate::discovery::MetricsDiscoveryCache::new(),
         }
+    }
+
+    /// Sets the byte budget of each namespace's selector-matcher cache.
+    pub fn with_matcher_cache_capacity(mut self, bytes: u64) -> Self {
+        self.matcher_cache_capacity_bytes = bytes;
+        self
+    }
+
+    /// The write generations of `buckets` in `namespace`, in order, as of
+    /// the last manifest poll; `None` for a bucket never flushed.
+    pub(crate) async fn bucket_generations(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Result<Vec<Option<u64>>> {
+        self.storage
+            .get_bucket_generations(namespace, buckets)
+            .await
     }
 
     /// Returns a read handle to the underlying storage, for background tasks
@@ -287,19 +381,35 @@ impl TimeSeriesDbReader {
         .await
     }
 
-    /// Get a cached bucket reader, loading from storage if needed.
-    async fn get_or_load_bucket(
+    /// A bucket reader for one query, built from the cached bucket reader.
+    async fn bucket_reader_for_query(
         &self,
         namespace: &Namespace,
         bucket: TimeBucket,
-    ) -> Arc<MiniQueryReader<StorageReader>> {
+    ) -> Result<Arc<MiniQueryReader<StorageReader>>> {
         let storage = self.storage.clone();
-        let namespace = namespace.clone();
-        self.query_cache
-            .get_with((namespace.clone(), bucket), async move {
-                Arc::new(MiniQueryReader::new(namespace, bucket, storage))
+        let forward_cache = Arc::clone(&self.forward_cache);
+        let series_cache = Arc::clone(&self.series_cache);
+        let postings = self
+            .postings_caches
+            .entry(namespace.clone())
+            .or_insert_with(|| {
+                Arc::new(PostingsCache::new(None, self.matcher_cache_capacity_bytes))
             })
-            .await
+            .clone();
+        let owned_namespace = namespace.clone();
+        let cached = self
+            .query_cache
+            .get_with((namespace.clone(), bucket), async move {
+                Arc::new(
+                    MiniQueryReader::new(owned_namespace, bucket, storage)
+                        .with_forward_cache(forward_cache)
+                        .with_series_cache(series_cache)
+                        .with_replica_postings(Arc::new(ReplicaPostings::new(postings))),
+                )
+            })
+            .await;
+        Ok(Arc::new(cached.for_query().await?))
     }
 
     // ── Public inherent methods ───────────────────────────────────────
@@ -467,9 +577,9 @@ impl TimeSeriesDbReader {
 /// Maximum number of buckets to load concurrently.
 const BUCKET_LOAD_CONCURRENCY: usize = 16;
 
-struct ScopedReader<'a> {
-    namespace: &'a Namespace,
-    reader: &'a TimeSeriesDbReader,
+pub(crate) struct ScopedReader<'a> {
+    pub(crate) namespace: &'a Namespace,
+    pub(crate) reader: &'a TimeSeriesDbReader,
 }
 
 #[async_trait]
@@ -485,12 +595,15 @@ impl TsdbReadEngine for ScopedReader<'_> {
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
-                let mini = self.reader.get_or_load_bucket(self.namespace, bucket).await;
-                (bucket, mini)
+                let mini = self
+                    .reader
+                    .bucket_reader_for_query(self.namespace, bucket)
+                    .await?;
+                Ok::<_, crate::error::Error>((bucket, mini))
             })
             .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
 
         Ok(ReaderQueryReader::new(readers))
     }
@@ -510,12 +623,15 @@ impl TsdbReadEngine for ScopedReader<'_> {
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
                 let _g = crate::promql::trace::Scope::enter("bucket_load");
-                let mini = self.reader.get_or_load_bucket(self.namespace, bucket).await;
-                (bucket, mini)
+                let mini = self
+                    .reader
+                    .bucket_reader_for_query(self.namespace, bucket)
+                    .await?;
+                Ok::<_, crate::error::Error>((bucket, mini))
             })
             .buffer_unordered(BUCKET_LOAD_CONCURRENCY)
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
 
         Ok(ReaderQueryReader::new(readers))
     }

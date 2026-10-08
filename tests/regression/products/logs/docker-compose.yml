@@ -45,18 +45,34 @@ services:
     image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
     command: ["-config.file=/etc/loki/fuzz.yaml"]
     volumes:
-      - ./loki-fuzz.yaml:/etc/loki/fuzz.yaml:ro
+      - ./${LOKI_FUZZ_CONFIG:-loki-fuzz.yaml}:/etc/loki/fuzz.yaml:ro
       - loki-fuzz-data:/loki
     ports: ["13110:3100"]
 
   minio:
     profiles: ["fuzz"]
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
-    command: server /data --console-address :9001
+    command: server /data --address ${MINIO_ADDRESS:-:9000} --console-address :9001
     environment:
       MINIO_ROOT_USER: logs
       MINIO_ROOT_PASSWORD: logs-fuzz-secret
     volumes: ["minio-data:/data"]
+
+  # Historical scenario only: owns MinIO's address inside MinIO's network
+  # namespace, so every client's `minio:9000` goes through it, and forwards to
+  # MinIO on :9010 with a fixed first-byte delay.
+  minio-latency:
+    profiles: ["historical"]
+    image: python:3.13-slim
+    network_mode: service:minio
+    command:
+      - python
+      - /proxy.py
+      - --listen=9000
+      - --upstream=9010
+      - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+    volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
+    depends_on: [minio]
 
   minio-init:
     profiles: ["fuzz"]
@@ -66,7 +82,7 @@ services:
     depends_on:
       minio:
         condition: service_started
-    command: ["mb", "--ignore-existing", "local/logs-fuzz"]
+    command: ["mb", "--ignore-existing", "local/logs-fuzz", "local/loki-fuzz"]
     restart: on-failure
 
   logs-s3:

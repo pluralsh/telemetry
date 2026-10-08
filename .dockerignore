@@ -3,3 +3,8 @@ target
 .data
 .env
 *.log
+site/node_modules
+site/.next
+site/out
+site/.shots
+site/tsconfig.tsbuildinfo

@@ -1,5 +1,6 @@
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
 use common::display::hex;
 use opentelemetry_proto::tonic::{
@@ -14,6 +15,7 @@ use super::ast::{
     AggregateOp, AttributeScope, BinaryOp, Expr, FieldExpr, Intrinsic, KindValue, PipelineStage,
     Query, ScalarExpr, SpansetExpr, StaticValue, StatusValue, StructuralOp, UnaryOp,
 };
+use super::columns::{self, ColumnPredicate, ColumnSource, Target};
 use super::error::QueryError;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +39,30 @@ pub struct TraceQlResult {
     pub matched_spans: Vec<MatchedSpan>,
 }
 
+/// A search hit without its spans: what a search response lists per trace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceSummary {
+    pub trace_id: TraceId,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub root_service_name: Option<String>,
+    pub root_span_name: Option<String>,
+    pub matched_spans: usize,
+}
+
+impl From<TraceQlResult> for TraceSummary {
+    fn from(result: TraceQlResult) -> Self {
+        Self {
+            trace_id: result.trace_id,
+            start_ns: result.start_ns,
+            end_ns: result.end_ns,
+            root_service_name: result.root_service_name,
+            root_span_name: result.root_span_name,
+            matched_spans: result.matched_spans.len(),
+        }
+    }
+}
+
 struct SpanContext<'a> {
     span: &'a Span,
     resource_attributes: &'a [KeyValue],
@@ -52,23 +78,212 @@ struct NestedSet {
     parent: i64,
 }
 
+/// Structural indexes and intrinsic columns are built on first use, so a
+/// query pays only for what it reads.
 struct TraceContext<'a> {
     trace: &'a Trace,
     spans: Vec<SpanContext<'a>>,
-    by_id: HashMap<Vec<u8>, usize>,
-    children: HashMap<Vec<u8>, Vec<usize>>,
-    nested_sets: Vec<NestedSet>,
-    root: Option<usize>,
+    /// Span ranges of each `ResourceSpans`, in span order.
+    resources: Vec<Range<usize>>,
+    columnar: bool,
+    by_id: OnceCell<HashMap<&'a [u8], usize>>,
+    children: OnceCell<HashMap<&'a [u8], Vec<usize>>>,
+    nested_sets: OnceCell<Vec<NestedSet>>,
+    root: OnceCell<Option<usize>>,
+    durations: OnceCell<Vec<i64>>,
+    statuses: OnceCell<Vec<u8>>,
+    kinds: OnceCell<Vec<u8>>,
     start_ns: u64,
     end_ns: u64,
 }
 
+/// How one spanset filter is evaluated.
+#[derive(Clone, Debug)]
+struct FilterPlan {
+    expression: FieldExpr,
+    /// The column form of the top-level conjuncts it covers exactly.
+    columns: Option<ColumnPredicate>,
+    /// Conjuncts left to the interpreter, for spans the columns admit.
+    residual: Vec<FieldExpr>,
+}
+
+impl FilterPlan {
+    fn new(expression: &FieldExpr) -> Self {
+        let mut conjuncts = Vec::new();
+        flatten_and(expression, &mut conjuncts);
+        let mut columns = None;
+        let mut residual = Vec::new();
+        for conjunct in conjuncts {
+            match columns::compile_exact(conjunct, Target::Trace) {
+                Some(compiled) => {
+                    columns = Some(match columns {
+                        Some(previous) => {
+                            ColumnPredicate::And(Box::new(previous), Box::new(compiled))
+                        }
+                        None => compiled,
+                    });
+                }
+                None => residual.push(conjunct.clone()),
+            }
+        }
+        Self {
+            expression: expression.clone(),
+            columns,
+            residual,
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn interpreted(expression: &FieldExpr) -> Self {
+        Self {
+            expression: expression.clone(),
+            columns: None,
+            residual: Vec::new(),
+        }
+    }
+
+    /// Whether each span matches, when the plan has a column form.
+    fn mask(&self, context: &TraceContext<'_>) -> Option<Vec<bool>> {
+        let mut mask = columns::evaluate(self.columns.as_ref()?, context)?;
+        if !self.residual.is_empty() {
+            for (index, admitted) in mask.iter_mut().enumerate() {
+                *admitted = *admitted
+                    && self
+                        .residual
+                        .iter()
+                        .all(|conjunct| span_matches(conjunct, index, context));
+            }
+        }
+        Some(mask)
+    }
+}
+
+/// `span_matches(a && b)` equals `span_matches(a) && span_matches(b)`, so
+/// top-level conjuncts are evaluated independently.
+fn flatten_and<'e>(expression: &'e FieldExpr, conjuncts: &mut Vec<&'e FieldExpr>) {
+    match &expression.value {
+        Expr::Binary {
+            lhs,
+            op: BinaryOp::And,
+            rhs,
+        } => {
+            flatten_and(lhs, conjuncts);
+            flatten_and(rhs, conjuncts);
+        }
+        _ => conjuncts.push(expression),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SpansetPlan {
+    Filter(FilterPlan),
+    Binary {
+        lhs: Box<SpansetPlan>,
+        op: StructuralOp,
+        rhs: Box<SpansetPlan>,
+    },
+}
+
+impl SpansetPlan {
+    fn new(expression: &SpansetExpr, plan: fn(&FieldExpr) -> FilterPlan) -> Self {
+        match expression {
+            SpansetExpr::Filter(expression) => Self::Filter(plan(expression)),
+            SpansetExpr::Binary { lhs, op, rhs } => Self::Binary {
+                lhs: Box::new(Self::new(&lhs.value, plan)),
+                op: *op,
+                rhs: Box::new(Self::new(&rhs.value, plan)),
+            },
+        }
+    }
+}
+
+/// A query with its spanset filters planned once for every trace.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledQuery {
+    query: Query,
+    spanset: SpansetPlan,
+    /// Aligned with `query.stages`; set for spanset filter stages.
+    stage_filters: Vec<Option<FilterPlan>>,
+    columnar: bool,
+}
+
+impl CompiledQuery {
+    pub(crate) fn new(query: Query) -> Self {
+        Self::with_planner(query, FilterPlan::new, true)
+    }
+
+    /// Evaluates everything with the interpreter alone.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) fn interpreted(query: Query) -> Self {
+        Self::with_planner(query, FilterPlan::interpreted, false)
+    }
+
+    fn with_planner(query: Query, plan: fn(&FieldExpr) -> FilterPlan, columnar: bool) -> Self {
+        let spanset = SpansetPlan::new(&query.spanset.value, plan);
+        let stage_filters = query
+            .stages
+            .iter()
+            .map(|stage| match stage {
+                PipelineStage::SpansetFilter(expression) => Some(plan(expression)),
+                _ => None,
+            })
+            .collect();
+        Self {
+            query,
+            spanset,
+            stage_filters,
+            columnar,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn execute(
     trace: &Trace,
     query: &Query,
     max_spans: usize,
 ) -> Result<Option<TraceQlResult>, QueryError> {
-    let context = TraceContext::new(trace, max_spans)?;
+    execute_compiled(trace, &CompiledQuery::new(query.clone()), max_spans)
+}
+
+pub(crate) fn execute_compiled(
+    trace: &Trace,
+    compiled: &CompiledQuery,
+    max_spans: usize,
+) -> Result<Option<TraceQlResult>, QueryError> {
+    Ok(
+        run(trace, compiled, max_spans, true)?.map(|(summary, spanset_count, matched_spans)| {
+            TraceQlResult {
+                trace_id: summary.trace_id,
+                start_ns: summary.start_ns,
+                end_ns: summary.end_ns,
+                root_service_name: summary.root_service_name,
+                root_span_name: summary.root_span_name,
+                spanset_count,
+                matched_spans,
+            }
+        }),
+    )
+}
+
+/// [`execute_compiled`]'s summary, without materializing matched spans.
+pub(crate) fn summarize_compiled(
+    trace: &Trace,
+    compiled: &CompiledQuery,
+    max_spans: usize,
+) -> Result<Option<TraceSummary>, QueryError> {
+    Ok(run(trace, compiled, max_spans, false)?.map(|(summary, ..)| summary))
+}
+
+/// A match's summary, its spanset count, and with `spans` its matched spans.
+fn run(
+    trace: &Trace,
+    compiled: &CompiledQuery,
+    max_spans: usize,
+    spans: bool,
+) -> Result<Option<(TraceSummary, usize, Vec<MatchedSpan>)>, QueryError> {
+    let query = &compiled.query;
+    let context = TraceContext::new(trace, max_spans, compiled.columnar)?;
     for stage in &query.stages {
         if let PipelineStage::Metric { name, .. } = stage {
             return Err(QueryError::Unsupported(format!(
@@ -76,13 +291,24 @@ pub(crate) fn execute(
             )));
         }
     }
-    let mut spansets = eval_spanset(&query.spanset.value, &context)?;
+    let mut spansets = eval_spanset(&compiled.spanset, &context)?;
     let mut selected = Vec::new();
-    for stage in &query.stages {
+    for (stage, filter) in query.stages.iter().zip(&compiled.stage_filters) {
         match stage {
             PipelineStage::SpansetFilter(expression) => {
+                let filter = filter.as_ref().expect("spanset filter stages are planned");
+                let mask = if spansets.is_empty() {
+                    None
+                } else {
+                    filter.mask(&context)
+                };
                 for spanset in &mut spansets {
-                    spanset.retain(|&index| span_matches(expression, index, &context));
+                    match &mask {
+                        Some(mask) => spanset.retain(|&index| mask[index]),
+                        None => {
+                            spanset.retain(|&index| span_matches(expression, index, &context));
+                        }
+                    }
                 }
                 spansets.retain(|spanset| !spanset.is_empty());
             }
@@ -112,6 +338,10 @@ pub(crate) fn execute(
         return Ok(None);
     }
     let matched = spansets.iter().flatten().copied().collect::<BTreeSet<_>>();
+    let summary = summarize(trace, &context, matched.len());
+    if !spans {
+        return Ok(Some((summary, spansets.len(), Vec::new())));
+    }
     let mut matched_spans = matched
         .into_iter()
         .map(|index| {
@@ -136,8 +366,12 @@ pub(crate) fn execute(
     matched_spans.sort_by(|left, right| {
         (left.start_ns, &left.span_id).cmp(&(right.start_ns, &right.span_id))
     });
-    let root = context.root.map(|index| &context.spans[index]);
-    Ok(Some(TraceQlResult {
+    Ok(Some((summary, spansets.len(), matched_spans)))
+}
+
+fn summarize(trace: &Trace, context: &TraceContext<'_>, matched_spans: usize) -> TraceSummary {
+    let root = context.root().map(|index| &context.spans[index]);
+    TraceSummary {
         trace_id: trace.trace_id,
         start_ns: context.start_ns,
         end_ns: context.end_ns,
@@ -146,15 +380,16 @@ pub(crate) fn execute(
                 .and_then(EvalValue::into_string)
         }),
         root_span_name: root.map(|root| root.span.name.clone()),
-        spanset_count: spansets.len(),
         matched_spans,
-    }))
+    }
 }
 
 impl<'a> TraceContext<'a> {
-    fn new(trace: &'a Trace, max_spans: usize) -> Result<Self, QueryError> {
+    fn new(trace: &'a Trace, max_spans: usize, columnar: bool) -> Result<Self, QueryError> {
         let mut spans = Vec::new();
+        let mut resources = Vec::with_capacity(trace.resource_spans.len());
         for resource_spans in &trace.resource_spans {
+            let first = spans.len();
             let attributes = resource_spans
                 .resource
                 .as_ref()
@@ -174,54 +409,154 @@ impl<'a> TraceContext<'a> {
                     }
                 }
             }
+            resources.push(first..spans.len());
         }
-        let by_id = spans
-            .iter()
-            .enumerate()
-            .map(|(index, span)| (span.span.span_id.clone(), index))
-            .collect::<HashMap<_, _>>();
-        let mut children: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-        for (index, span) in spans.iter().enumerate() {
-            children
-                .entry(span.span.parent_span_id.clone())
-                .or_default()
-                .push(index);
-        }
-        let root = spans
-            .iter()
-            .enumerate()
-            .filter(|(_, span)| {
-                span.span.parent_span_id.is_empty()
-                    || !by_id.contains_key(&span.span.parent_span_id)
-            })
-            .min_by_key(|(_, span)| (span.span.start_time_unix_nano, &span.span.span_id))
-            .map(|(index, _)| index);
         let (start_ns, end_ns) = trace.timestamp_range();
-        let nested_sets = nested_sets(&spans, &children);
         Ok(Self {
             trace,
             spans,
-            by_id,
-            children,
-            nested_sets,
-            root,
+            resources,
+            columnar,
+            by_id: OnceCell::new(),
+            children: OnceCell::new(),
+            nested_sets: OnceCell::new(),
+            root: OnceCell::new(),
+            durations: OnceCell::new(),
+            statuses: OnceCell::new(),
+            kinds: OnceCell::new(),
             start_ns,
             end_ns,
         })
+    }
+
+    /// Spans by span ID; a repeated ID maps to its last span.
+    fn by_id(&self) -> &HashMap<&'a [u8], usize> {
+        self.by_id.get_or_init(|| {
+            self.spans
+                .iter()
+                .enumerate()
+                .map(|(index, span)| (span.span.span_id.as_slice(), index))
+                .collect()
+        })
+    }
+
+    fn children(&self) -> &HashMap<&'a [u8], Vec<usize>> {
+        self.children.get_or_init(|| {
+            let mut children: HashMap<&[u8], Vec<usize>> = HashMap::new();
+            for (index, span) in self.spans.iter().enumerate() {
+                children
+                    .entry(span.span.parent_span_id.as_slice())
+                    .or_default()
+                    .push(index);
+            }
+            children
+        })
+    }
+
+    fn nested_sets(&self) -> &[NestedSet] {
+        self.nested_sets
+            .get_or_init(|| nested_sets(&self.spans, self.children()))
+    }
+
+    fn root(&self) -> Option<usize> {
+        *self.root.get_or_init(|| {
+            let by_id = self.by_id();
+            self.spans
+                .iter()
+                .enumerate()
+                .filter(|(_, span)| {
+                    span.span.parent_span_id.is_empty()
+                        || !by_id.contains_key(span.span.parent_span_id.as_slice())
+                })
+                .min_by_key(|(_, span)| (span.span.start_time_unix_nano, &span.span.span_id))
+                .map(|(index, _)| index)
+        })
+    }
+}
+
+impl ColumnSource for TraceContext<'_> {
+    fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn durations(&self) -> &[i64] {
+        self.durations.get_or_init(|| {
+            self.spans
+                .iter()
+                .map(|span| columns::duration_ns(span.span))
+                .collect()
+        })
+    }
+
+    fn statuses(&self) -> &[u8] {
+        self.statuses.get_or_init(|| {
+            self.spans
+                .iter()
+                .map(|span| columns::status_code(span.span))
+                .collect()
+        })
+    }
+
+    fn kinds(&self) -> &[u8] {
+        self.kinds.get_or_init(|| {
+            self.spans
+                .iter()
+                .map(|span| columns::kind_code(span.span))
+                .collect()
+        })
+    }
+
+    fn names_equal(&self, value: &str, out: &mut [bool]) {
+        for (out, span) in out.iter_mut().zip(&self.spans) {
+            *out = span.span.name == value;
+        }
+    }
+
+    fn service_names(&self, equal: bool, value: &str, out: &mut [bool]) -> Option<()> {
+        let op = if equal {
+            BinaryOp::Equal
+        } else {
+            BinaryOp::NotEqual
+        };
+        let literal = EvalValue::Str(value);
+        for range in &self.resources {
+            let Some(first) = self.spans.get(range.start) else {
+                continue;
+            };
+            let found = lookup_attribute(first.resource_attributes, "service.name")
+                .unwrap_or(EvalValue::Missing);
+            out[range.clone()].fill(compare(op, &found, &literal).unwrap_or(false));
+        }
+        Some(())
+    }
+
+    fn dedicated(
+        &self,
+        _column: usize,
+        _test: &columns::DedicatedTest,
+        _out: &mut [bool],
+    ) -> Option<()> {
+        None
+    }
+
+    fn constant(&self, expression: &FieldExpr, out: &mut [bool]) -> Option<()> {
+        for range in &self.resources {
+            if !range.is_empty() {
+                out[range.clone()].fill(span_matches(expression, range.start, self));
+            }
+        }
+        Some(())
     }
 }
 
 /// Numbers spans depth first from each root span, assigning `left` on the way
 /// down and `right` on the way up, as Tempo does at ingest.
-fn nested_sets(
-    spans: &[SpanContext<'_>],
-    children: &HashMap<Vec<u8>, Vec<usize>>,
-) -> Vec<NestedSet> {
+fn nested_sets(spans: &[SpanContext<'_>], children: &HashMap<&[u8], Vec<usize>>) -> Vec<NestedSet> {
     let mut output = vec![NestedSet::default(); spans.len()];
     let mut visited = vec![false; spans.len()];
     let mut bound = 1;
     let children_of = |index: usize| {
-        let span_id = &spans[index].span.span_id;
+        let span_id = spans[index].span.span_id.as_slice();
         if span_id.is_empty() {
             &[][..]
         } else {
@@ -267,25 +602,32 @@ fn nested_sets(
 }
 
 fn eval_spanset(
-    expression: &SpansetExpr,
+    plan: &SpansetPlan,
     context: &TraceContext<'_>,
 ) -> Result<Vec<Vec<usize>>, QueryError> {
-    match expression {
-        SpansetExpr::Filter(expression) => {
-            let matches = (0..context.spans.len())
-                .filter(|&index| span_matches(expression, index, context))
-                .collect::<Vec<_>>();
+    match plan {
+        SpansetPlan::Filter(filter) => {
+            let matches = match filter.mask(context) {
+                Some(mask) => mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &matched)| matched.then_some(index))
+                    .collect::<Vec<_>>(),
+                None => (0..context.spans.len())
+                    .filter(|&index| span_matches(&filter.expression, index, context))
+                    .collect::<Vec<_>>(),
+            };
             Ok((!matches.is_empty())
                 .then_some(matches)
                 .into_iter()
                 .collect())
         }
-        SpansetExpr::Binary { lhs, op, rhs } => {
-            let left = eval_spanset(&lhs.value, context)?
+        SpansetPlan::Binary { lhs, op, rhs } => {
+            let left = eval_spanset(lhs, context)?
                 .into_iter()
                 .flatten()
                 .collect::<BTreeSet<_>>();
-            let right = eval_spanset(&rhs.value, context)?
+            let right = eval_spanset(rhs, context)?
                 .into_iter()
                 .flatten()
                 .collect::<BTreeSet<_>>();
@@ -409,8 +751,8 @@ impl<'l> LeftIndex<'l> {
         let span = context.spans[right].span;
         match self.relation {
             Relation::Child => context
-                .by_id
-                .get(&span.parent_span_id)
+                .by_id()
+                .get(span.parent_span_id.as_slice())
                 .copied()
                 .filter(|parent| left.contains(parent))
                 .into_iter()
@@ -441,9 +783,10 @@ impl<'l> LeftIndex<'l> {
 /// Parent chain of `index` through `by_id`, stopping at a missing parent or
 /// a cycle.
 fn ancestors(mut index: usize, context: &TraceContext<'_>) -> Vec<usize> {
+    let by_id = context.by_id();
     let mut visited = HashSet::from([index]);
     let mut chain = Vec::new();
-    while let Some(&parent) = context.by_id.get(&context.spans[index].span.parent_span_id) {
+    while let Some(&parent) = by_id.get(context.spans[index].span.parent_span_id.as_slice()) {
         chain.push(parent);
         if !visited.insert(parent) {
             break;
@@ -466,13 +809,16 @@ fn group_by(
     Ok(groups.into_values().collect())
 }
 
+/// A value under evaluation. Strings borrow from the trace or the query, so
+/// comparing them per span allocates nothing.
 #[derive(Clone, Debug, PartialEq)]
-enum EvalValue {
+enum EvalValue<'v> {
     Missing,
+    Str(&'v str),
     Static(StaticValue),
 }
 
-impl EvalValue {
+impl EvalValue<'_> {
     fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Static(StaticValue::Bool(value)) => Some(*value),
@@ -480,23 +826,41 @@ impl EvalValue {
         }
     }
 
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(value) => Some(value),
+            Self::Static(StaticValue::String(value)) => Some(value),
+            _ => None,
+        }
+    }
+
     fn into_static(self) -> Option<StaticValue> {
         match self {
             Self::Missing => None,
+            Self::Str(value) => Some(StaticValue::String(value.to_owned())),
             Self::Static(value) => Some(value),
         }
     }
 
     fn into_string(self) -> Option<String> {
         match self {
+            Self::Str(value) => Some(value.to_owned()),
             Self::Static(StaticValue::String(value)) => Some(value),
             _ => None,
+        }
+    }
+
+    fn into_owned(self) -> EvalValue<'static> {
+        match self.into_static() {
+            Some(value) => EvalValue::Static(value),
+            None => EvalValue::Missing,
         }
     }
 
     fn key(&self) -> String {
         match self {
             Self::Missing => "missing".to_owned(),
+            Self::Str(value) => format!("{:?}", StaticValue::String((*value).to_owned())),
             Self::Static(value) => format!("{value:?}"),
         }
     }
@@ -509,12 +873,13 @@ fn span_matches(expression: &FieldExpr, index: usize, context: &TraceContext<'_>
         .unwrap_or(false)
 }
 
-fn eval_expr(
-    expression: &FieldExpr,
+fn eval_expr<'v, 'a: 'v>(
+    expression: &'v FieldExpr,
     index: usize,
-    context: &TraceContext<'_>,
-) -> Result<EvalValue, QueryError> {
+    context: &TraceContext<'a>,
+) -> Result<EvalValue<'v>, QueryError> {
     match &expression.value {
+        Expr::Static(StaticValue::String(value)) => Ok(EvalValue::Str(value)),
         Expr::Static(value) => Ok(EvalValue::Static(value.clone())),
         Expr::Attribute(attribute) => {
             let span = &context.spans[index];
@@ -589,13 +954,17 @@ fn eval_expr(
     }
 }
 
-fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>) -> EvalValue {
+fn eval_intrinsic<'a>(
+    intrinsic: Intrinsic,
+    index: usize,
+    context: &TraceContext<'a>,
+) -> EvalValue<'a> {
     let span = context.spans[index].span;
     let value = match intrinsic {
         Intrinsic::TraceId => StaticValue::String(context.trace.trace_id.to_string()),
         Intrinsic::SpanId => StaticValue::String(hex(&span.span_id)),
         Intrinsic::ParentId => StaticValue::String(hex(&span.parent_span_id)),
-        Intrinsic::Name => StaticValue::String(span.name.clone()),
+        Intrinsic::Name => return EvalValue::Str(&span.name),
         Intrinsic::Duration => StaticValue::Duration(
             i64::try_from(
                 span.end_time_unix_nano
@@ -610,11 +979,9 @@ fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>
                 _ => StatusValue::Unset,
             })
         }
-        Intrinsic::StatusMessage => StaticValue::String(
-            span.status
-                .as_ref()
-                .map_or_else(String::new, |s| s.message.clone()),
-        ),
+        Intrinsic::StatusMessage => {
+            return EvalValue::Str(span.status.as_ref().map_or("", |s| s.message.as_str()));
+        }
         Intrinsic::Kind => StaticValue::Kind(match span.kind {
             1 => KindValue::Internal,
             2 => KindValue::Server,
@@ -625,12 +992,12 @@ fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>
         }),
         Intrinsic::RootName => StaticValue::String(
             context
-                .root
+                .root()
                 .map_or_else(String::new, |root| context.spans[root].span.name.clone()),
         ),
         Intrinsic::RootServiceName => StaticValue::String(
             context
-                .root
+                .root()
                 .and_then(|root| {
                     lookup_attribute(context.spans[root].resource_attributes, "service.name")
                         .and_then(EvalValue::into_string)
@@ -639,8 +1006,8 @@ fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>
         ),
         Intrinsic::ChildCount => StaticValue::Int(
             context
-                .children
-                .get(&span.span_id)
+                .children()
+                .get(span.span_id.as_slice())
                 .map_or(0, Vec::len)
                 .try_into()
                 .unwrap_or(i64::MAX),
@@ -648,30 +1015,37 @@ fn eval_intrinsic(intrinsic: Intrinsic, index: usize, context: &TraceContext<'_>
         Intrinsic::TraceDuration => StaticValue::Duration(
             i64::try_from(context.end_ns.saturating_sub(context.start_ns)).unwrap_or(i64::MAX),
         ),
-        Intrinsic::InstrumentationName => StaticValue::String(
-            context.spans[index]
-                .scope
-                .map_or_else(String::new, |scope| scope.name.clone()),
-        ),
-        Intrinsic::InstrumentationVersion => StaticValue::String(
-            context.spans[index]
-                .scope
-                .map_or_else(String::new, |scope| scope.version.clone()),
-        ),
-        Intrinsic::NestedSetLeft => StaticValue::Int(context.nested_sets[index].left),
-        Intrinsic::NestedSetRight => StaticValue::Int(context.nested_sets[index].right),
-        Intrinsic::NestedSetParent => StaticValue::Int(context.nested_sets[index].parent),
+        Intrinsic::InstrumentationName => {
+            return EvalValue::Str(
+                context.spans[index]
+                    .scope
+                    .map_or("", |scope| scope.name.as_str()),
+            );
+        }
+        Intrinsic::InstrumentationVersion => {
+            return EvalValue::Str(
+                context.spans[index]
+                    .scope
+                    .map_or("", |scope| scope.version.as_str()),
+            );
+        }
+        Intrinsic::NestedSetLeft => StaticValue::Int(context.nested_sets()[index].left),
+        Intrinsic::NestedSetRight => StaticValue::Int(context.nested_sets()[index].right),
+        Intrinsic::NestedSetParent => StaticValue::Int(context.nested_sets()[index].parent),
     };
     EvalValue::Static(value)
 }
 
-fn lookup_attribute(attributes: &[KeyValue], name: &str) -> Option<EvalValue> {
-    attributes
+fn lookup_attribute<'a>(attributes: &'a [KeyValue], name: &str) -> Option<EvalValue<'a>> {
+    let value = attributes
         .iter()
-        .find(|attribute| attribute.key == name)
-        .and_then(|attribute| attribute.value.as_ref())
-        .and_then(any_value)
-        .map(EvalValue::Static)
+        .find(|attribute| attribute.key == name)?
+        .value
+        .as_ref()?;
+    match value.value.as_ref()? {
+        any_value::Value::StringValue(value) => Some(EvalValue::Str(value)),
+        _ => any_value(value).map(EvalValue::Static),
+    }
 }
 
 fn any_value(value: &AnyValue) -> Option<StaticValue> {
@@ -694,23 +1068,38 @@ pub(super) fn stored_value_matches(
     literal: &StaticValue,
 ) -> bool {
     let value = match value {
-        crate::AttributeValue::String(value) => StaticValue::String(value.clone()),
-        crate::AttributeValue::Bool(value) => StaticValue::Bool(*value),
-        crate::AttributeValue::Int(value) => StaticValue::Int(*value),
-        crate::AttributeValue::Double(value) => StaticValue::Float(*value),
+        crate::AttributeValue::String(value) => EvalValue::Str(value),
+        crate::AttributeValue::Bool(value) => EvalValue::Static(StaticValue::Bool(*value)),
+        crate::AttributeValue::Int(value) => EvalValue::Static(StaticValue::Int(*value)),
+        crate::AttributeValue::Double(value) => EvalValue::Static(StaticValue::Float(*value)),
     };
-    compare(
-        op,
-        &EvalValue::Static(value),
-        &EvalValue::Static(literal.clone()),
-    )
-    .unwrap_or(false)
+    let literal = match literal {
+        StaticValue::String(literal) => EvalValue::Str(literal),
+        literal => EvalValue::Static(literal.clone()),
+    };
+    compare(op, &value, &literal).unwrap_or(false)
 }
 
 /// Like Tempo, only a `nil` comparison can succeed against a missing value:
 /// `span.a != 1` is false for a span without `span.a`.
-fn compare(op: BinaryOp, left: &EvalValue, right: &EvalValue) -> Option<bool> {
-    let nil = |value: &EvalValue| matches!(value, EvalValue::Static(StaticValue::Nil));
+fn compare(op: BinaryOp, left: &EvalValue<'_>, right: &EvalValue<'_>) -> Option<bool> {
+    if let (Some(left), Some(right)) = (left.as_str(), right.as_str()) {
+        return match op {
+            BinaryOp::Equal => Some(left == right),
+            BinaryOp::NotEqual => Some(left != right),
+            BinaryOp::Less => Some(left < right),
+            BinaryOp::LessEqual => Some(left <= right),
+            BinaryOp::Greater => Some(left > right),
+            BinaryOp::GreaterEqual => Some(left >= right),
+            BinaryOp::Regex => regex_is_match(right, left),
+            BinaryOp::NotRegex => regex_is_match(right, left).map(|matched| !matched),
+            _ => None,
+        };
+    }
+    if matches!(left, EvalValue::Str(_)) || matches!(right, EvalValue::Str(_)) {
+        return compare(op, &left.clone().into_owned(), &right.clone().into_owned());
+    }
+    let nil = |value: &EvalValue<'_>| matches!(value, EvalValue::Static(StaticValue::Nil));
     if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) && (nil(left) || nil(right)) {
         let equal = matches!(
             (left, right),
@@ -803,8 +1192,14 @@ fn static_cmp(left: &StaticValue, right: &StaticValue) -> Option<std::cmp::Order
     }
 }
 
-fn arithmetic(op: BinaryOp, left: EvalValue, right: EvalValue) -> Result<EvalValue, QueryError> {
-    let (EvalValue::Static(left), EvalValue::Static(right)) = (left, right) else {
+fn arithmetic(
+    op: BinaryOp,
+    left: EvalValue<'_>,
+    right: EvalValue<'_>,
+) -> Result<EvalValue<'static>, QueryError> {
+    let (EvalValue::Static(left), EvalValue::Static(right)) =
+        (left.into_owned(), right.into_owned())
+    else {
         return Ok(EvalValue::Missing);
     };
     let result = match (left, right) {
@@ -855,11 +1250,11 @@ fn as_float(value: &StaticValue) -> Option<f64> {
     }
 }
 
-fn eval_scalar(
-    expression: &ScalarExpr,
+fn eval_scalar<'v, 'a: 'v>(
+    expression: &'v ScalarExpr,
     spanset: &[usize],
-    context: &TraceContext<'_>,
-) -> Result<EvalValue, QueryError> {
+    context: &TraceContext<'a>,
+) -> Result<EvalValue<'v>, QueryError> {
     match expression {
         ScalarExpr::Static(value) => Ok(EvalValue::Static(value.clone())),
         ScalarExpr::Aggregate { op, field } => {
@@ -869,16 +1264,26 @@ fn eval_scalar(
                 )));
             }
             let field = field.as_ref().expect("validated numeric aggregate field");
-            let values = spanset
-                .iter()
-                .filter_map(|&index| eval_expr(field, index, context).ok())
-                .filter_map(|value| match value {
-                    EvalValue::Static(StaticValue::Int(value)) => Some(value as f64),
-                    EvalValue::Static(StaticValue::Float(value)) => Some(value),
-                    EvalValue::Static(StaticValue::Duration(value)) => Some(value as f64),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let values = if context.columnar
+                && matches!(field.value, Expr::Intrinsic(Intrinsic::Duration))
+            {
+                let durations = context.durations();
+                spanset
+                    .iter()
+                    .map(|&index| durations[index] as f64)
+                    .collect::<Vec<_>>()
+            } else {
+                spanset
+                    .iter()
+                    .filter_map(|&index| eval_expr(field, index, context).ok())
+                    .filter_map(|value| match value {
+                        EvalValue::Static(StaticValue::Int(value)) => Some(value as f64),
+                        EvalValue::Static(StaticValue::Float(value)) => Some(value),
+                        EvalValue::Static(StaticValue::Duration(value)) => Some(value as f64),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
             if values.is_empty() {
                 return Ok(EvalValue::Missing);
             }

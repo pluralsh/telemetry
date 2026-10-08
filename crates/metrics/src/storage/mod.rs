@@ -20,7 +20,7 @@ pub(crate) mod slate;
 
 pub(crate) use slate::{
     Storage, StorageRead, StorageReader, StorageSnapshot, Store, WarmStorage, insert_forward_index,
-    insert_series_id, merge_inverted_index, merge_samples,
+    insert_series_id, merge_inverted_index, merge_samples, put_bucket_generation,
 };
 
 // The cache warmer is the only consumer; featureless builds would flag an

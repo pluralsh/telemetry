@@ -18,6 +18,112 @@ fn reader_from_db_reader(reader: DbReader) -> StorageReader {
     }
 }
 
+fn settings_config(path: Option<String>) -> SlateDbStorageConfig {
+    SlateDbStorageConfig {
+        settings_path: path,
+        ..SlateDbStorageConfig::default()
+    }
+}
+
+fn min_compaction_sources(settings: &Settings) -> Option<&str> {
+    settings
+        .compactor_options
+        .as_ref()?
+        .scheduler_options
+        .get("min_compaction_sources")
+        .map(String::as_str)
+}
+
+#[test]
+fn should_apply_metrics_slatedb_defaults_without_settings_file() {
+    let settings = load_settings(&settings_config(None)).unwrap();
+
+    assert_eq!(settings.l0_sst_size_bytes, DEFAULT_L0_SST_SIZE_BYTES);
+    assert_eq!(
+        min_compaction_sources(&settings),
+        Some(DEFAULT_MIN_COMPACTION_SOURCES.to_string().as_str())
+    );
+    assert_eq!(settings.l0_max_ssts, Settings::default().l0_max_ssts);
+}
+
+#[test]
+fn should_keep_metrics_defaults_for_keys_a_settings_file_leaves_unset() {
+    // given: a file overriding one top-level key and one other scheduler key
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slatedb.toml");
+    std::fs::write(
+        &path,
+        "l0_max_ssts = 16\n[compactor_options.scheduler_options]\nmax_compaction_sources = \"6\"\n",
+    )
+    .unwrap();
+
+    // when
+    let settings =
+        load_settings(&settings_config(Some(path.to_string_lossy().into_owned()))).unwrap();
+
+    // then
+    assert_eq!(settings.l0_max_ssts, 16);
+    assert_eq!(settings.l0_sst_size_bytes, DEFAULT_L0_SST_SIZE_BYTES);
+    let scheduler = &settings
+        .compactor_options
+        .as_ref()
+        .unwrap()
+        .scheduler_options;
+    assert_eq!(scheduler.get("max_compaction_sources").unwrap(), "6");
+    assert_eq!(
+        min_compaction_sources(&settings),
+        Some(DEFAULT_MIN_COMPACTION_SOURCES.to_string().as_str())
+    );
+}
+
+#[test]
+fn should_let_a_settings_file_override_metrics_defaults() {
+    // given
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slatedb.json");
+    std::fs::write(
+        &path,
+        r#"{"l0_sst_size_bytes": 67108864,
+            "compactor_options": {"scheduler_options": {"min_compaction_sources": "4"}}}"#,
+    )
+    .unwrap();
+
+    // when
+    let settings =
+        load_settings(&settings_config(Some(path.to_string_lossy().into_owned()))).unwrap();
+
+    // then
+    assert_eq!(settings.l0_sst_size_bytes, 64 << 20);
+    assert_eq!(min_compaction_sources(&settings), Some("4"));
+}
+
+#[test]
+fn should_load_example_settings_file_over_metrics_defaults() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/SlateDb.example.toml"
+    );
+
+    let settings = load_settings(&settings_config(Some(path.to_string()))).unwrap();
+
+    assert_eq!(
+        settings.compression_codec,
+        Some(slatedb::config::CompressionCodec::Zstd)
+    );
+    assert_eq!(settings.l0_sst_size_bytes, DEFAULT_L0_SST_SIZE_BYTES);
+    assert_eq!(
+        min_compaction_sources(&settings),
+        Some(DEFAULT_MIN_COMPACTION_SOURCES.to_string().as_str())
+    );
+}
+
+#[test]
+fn should_reject_settings_file_with_unknown_extension() {
+    let err = load_settings(&settings_config(Some("slatedb.ini".to_string()))).unwrap_err();
+
+    assert!(err.to_string().contains("unknown format"), "{err}");
+}
+
 #[test]
 fn metadata_only_cache_warm_targets_avoid_data_cache() {
     let namespace = Namespace::new("tenant").unwrap();
@@ -321,6 +427,38 @@ async fn snapshot_sees_writes_made_before_it() {
     let value = snapshot.get(Bytes::from("k1")).await.unwrap();
     assert_eq!(value, Some(Bytes::from("v1")));
 
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_flush_memtable_to_l0_periodically_only_after_writes() {
+    // given: a storage whose periodic flusher runs every 50 ms
+    let db = DbBuilder::new("periodic-flush", Arc::new(InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    let storage = storage_from_db(db);
+    storage.spawn_memtable_flusher(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(storage.merge_barrier().1, 0, "no writes, so no L0 flush");
+
+    // when
+    storage
+        .put(vec![
+            Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
+        ])
+        .await
+        .unwrap();
+
+    // then
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while storage.merge_barrier().1 == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write never reached L0"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     storage.close().await.unwrap();
 }
 

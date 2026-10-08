@@ -80,6 +80,107 @@ impl IndexPredicate {
             }
         }
     }
+
+    /// Inclusive ranges of stored values, each bounded by two integers or two
+    /// doubles, that hold every value [`Self::admits`]; `None` when the whole
+    /// field must be scanned. Exact predicates name their one value instead.
+    pub(crate) fn value_ranges(&self) -> Option<Vec<(AttributeValue, AttributeValue)>> {
+        match &self.test {
+            IndexTest::Exact(_) => None,
+            IndexTest::Compare(op, literal) => numeric_ranges(*op, literal),
+            IndexTest::Duration(..) => {
+                let mut admitted = (0..=i64::from(u64::BITS))
+                    .filter(|&bucket| self.admits(&AttributeValue::Int(bucket)));
+                let first = admitted.next();
+                Some(
+                    first
+                        .map(|first| {
+                            let last = admitted.next_back().unwrap_or(first);
+                            (AttributeValue::Int(first), AttributeValue::Int(last))
+                        })
+                        .into_iter()
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+/// Ranges holding every stored value `v` with `v op literal` for an ordering
+/// or equality against a number. Strings and booleans never compare equal
+/// or ordered to numbers, and NaN orders against nothing.
+fn numeric_ranges(
+    op: BinaryOp,
+    literal: &StaticValue,
+) -> Option<Vec<(AttributeValue, AttributeValue)>> {
+    let (bounded_below, bounded_above) = match op {
+        BinaryOp::Greater | BinaryOp::GreaterEqual => (true, false),
+        BinaryOp::Less | BinaryOp::LessEqual => (false, true),
+        BinaryOp::Equal => (true, true),
+        _ => return None,
+    };
+    let strict = matches!(op, BinaryOp::Greater | BinaryOp::Less);
+    let (ints, double) = match *literal {
+        StaticValue::Int(value) | StaticValue::Duration(value) => {
+            let low = match (bounded_below, strict) {
+                (false, _) => Some(i64::MIN),
+                (true, true) => value.checked_add(1),
+                (true, false) => Some(value),
+            };
+            let high = match (bounded_above, strict) {
+                (false, _) => Some(i64::MAX),
+                (true, true) => value.checked_sub(1),
+                (true, false) => Some(value),
+            };
+            (low.zip(high), value as f64)
+        }
+        // Doubles equal doubles bitwise, so only `=` matches a NaN.
+        StaticValue::Float(value) if value.is_nan() => {
+            return (op != BinaryOp::Equal).then(Vec::new);
+        }
+        StaticValue::Float(value) => {
+            // Integers compare as their nearest double, which beyond 2^53 may
+            // lie on either side of the literal, so the bounds leave room.
+            let margin = if value.abs() < EXACT_FLOAT_INTEGER {
+                1
+            } else {
+                1 << 12
+            };
+            let near = value as i64;
+            let low = if bounded_below {
+                near.saturating_sub(margin)
+            } else {
+                i64::MIN
+            };
+            let high = if bounded_above {
+                near.saturating_add(margin)
+            } else {
+                i64::MAX
+            };
+            (Some((low, high)), value)
+        }
+        _ => return None,
+    };
+    // Both zeros equal a zero literal, and `-0.0` sorts first.
+    let (low, high) = if double == 0.0 {
+        (-0.0, 0.0)
+    } else {
+        (double, double)
+    };
+    let mut ranges = ints
+        .filter(|(low, high)| low <= high)
+        .map(|(low, high)| (AttributeValue::Int(low), AttributeValue::Int(high)))
+        .into_iter()
+        .collect::<Vec<_>>();
+    ranges.push((
+        AttributeValue::Double(if bounded_below {
+            low
+        } else {
+            f64::NEG_INFINITY
+        }),
+        AttributeValue::Double(if bounded_above { high } else { f64::INFINITY }),
+    ));
+    Some(ranges)
 }
 
 /// Index candidates for one condition: a trace can only match if it
@@ -104,6 +205,48 @@ pub fn plan(query: Query) -> Result<QueryPlan> {
         }
     }
     Ok(QueryPlan { query, pushdown })
+}
+
+/// Whether one span decides a match: a spanset filter, or a union of them,
+/// refined only by spanset filter stages, over fields of the span alone.
+/// Every pushdown clause then holds on the matching span itself, so its page
+/// is posted by any clause, and a trace matches exactly when some part of it
+/// the index saw does.
+pub fn existential(query: &Query) -> bool {
+    fn spanset(expression: &SpansetExpr) -> bool {
+        match expression {
+            SpansetExpr::Filter(expression) => span_local(expression),
+            SpansetExpr::Binary {
+                lhs,
+                op: StructuralOp::Union,
+                rhs,
+            } => spanset(&lhs.value) && spanset(&rhs.value),
+            SpansetExpr::Binary { .. } => false,
+        }
+    }
+    spanset(&query.spanset.value)
+        && query.stages.iter().all(|stage| match stage {
+            PipelineStage::SpansetFilter(expression) => span_local(expression),
+            _ => false,
+        })
+}
+
+fn span_local(expression: &FieldExpr) -> bool {
+    match &expression.value {
+        Expr::Static(_) | Expr::Attribute(_) => true,
+        Expr::Intrinsic(intrinsic) => !matches!(
+            intrinsic,
+            Intrinsic::RootName
+                | Intrinsic::RootServiceName
+                | Intrinsic::ChildCount
+                | Intrinsic::TraceDuration
+                | Intrinsic::NestedSetLeft
+                | Intrinsic::NestedSetRight
+                | Intrinsic::NestedSetParent
+        ),
+        Expr::Unary { expr, .. } => span_local(expr),
+        Expr::Binary { lhs, rhs, .. } => span_local(lhs) && span_local(rhs),
+    }
 }
 
 /// The intrinsic postings of one span, as written at ingest.

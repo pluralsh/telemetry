@@ -111,9 +111,14 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
             kind,
             child: Box::new(fold_constants(*child)),
         },
-        LogicalPlan::Absent { labels, child } => LogicalPlan::Absent {
+        LogicalPlan::Absent {
+            labels,
+            child,
+            over_time,
+        } => LogicalPlan::Absent {
             labels,
             child: Box::new(fold_constants(*child)),
+            over_time,
         },
         LogicalPlan::Subquery {
             child,
@@ -282,9 +287,14 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
             kind,
             child: Box::new(dedupe_vector_selector_matchers(*child)),
         },
-        LogicalPlan::Absent { labels, child } => LogicalPlan::Absent {
+        LogicalPlan::Absent {
+            labels,
+            child,
+            over_time,
+        } => LogicalPlan::Absent {
             labels,
             child: Box::new(dedupe_vector_selector_matchers(*child)),
+            over_time,
         },
         LogicalPlan::Subquery {
             child,

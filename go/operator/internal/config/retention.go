@@ -47,7 +47,7 @@ func parseRetention(value string) (int64, error) {
 }
 
 // renderRetention prefers the duration form and falls back to the
-// deprecated seconds field; nil keeps data forever.
+// deprecated seconds field; nil leaves the server default.
 func renderRetention(retention string, deprecatedSeconds *int64) (*int64, error) {
 	if retention == "" {
 		return deprecatedSeconds, nil

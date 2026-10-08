@@ -1,5 +1,7 @@
 mode: standalone
 listeners: { http: "0.0.0.0:3100", grpc: "0.0.0.0:9091" }
+# What the operator renders for a Logs resource with no overrides, except
+# object storage, retention and auth.
 storage:
   type: SlateDb
   path: fuzz
@@ -9,10 +11,23 @@ storage:
     bucket: logs-fuzz
     endpoint: http://minio:9000
     allow_http: true
-  block_cache: { type: FoyerMemory, capacity: 67108864 }
-  meta_cache: { type: FoyerMemory, capacity: 16777216 }
-# Segment duration, page sizing, compaction and write flushing use the defaults.
+  block_cache:
+    type: FoyerHybrid
+    memory_capacity: 536870912
+    disk_capacity: 10737418240
+    disk_path: /tmp/logs-cache
+  meta_cache: { type: FoyerMemory, capacity: 134217728 }
+segment_duration_seconds: 3600
 retention_seconds: 86400
+page: { target_size_bytes: 1048576, max_rows: 8192, rows_per_block: 256 }
+write:
+  durability: applied
+  flush_interval_seconds: 10
+  buffer_queue_capacity: 10000
+  buffer_flush_interval_milliseconds: 10000
+  buffer_size_threshold_bytes: 67108864
+  remote_concurrency: 16
+  remote_retries: 2
 auth: { unauthenticated: true }
 namespaces:
   - name: regression

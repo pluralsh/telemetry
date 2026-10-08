@@ -53,7 +53,7 @@ pub(crate) fn to_proto_request(
                     .into_iter()
                     .map(|sample| ProtoSample {
                         timestamp_ms: sample.timestamp_ms,
-                        value: sample.value,
+                        value: Some(sample.value),
                     })
                     .collect(),
                 histograms: series
@@ -81,10 +81,10 @@ fn to_proto_histogram(sample: HistogramSample) -> ProtoHistogram {
         timestamp_ms: sample.timestamp_ms,
         counter_reset_hint: hint as i32,
         schema: h.schema,
-        zero_threshold: h.zero_threshold,
-        zero_count: h.zero_count,
-        count: h.count,
-        sum: h.sum,
+        zero_threshold: Some(h.zero_threshold),
+        zero_count: Some(h.zero_count),
+        count: Some(h.count),
+        sum: Some(h.sum),
         positive_indexes: h.positive.iter().map(|b| b.index).collect(),
         positive_counts: h.positive.iter().map(|b| b.count).collect(),
         negative_indexes: h.negative.iter().map(|b| b.index).collect(),
@@ -115,10 +115,10 @@ fn from_proto_histogram(sample: ProtoHistogram) -> Result<HistogramSample, Strin
     let histogram = FloatHistogram {
         counter_reset_hint,
         schema: sample.schema,
-        zero_threshold: sample.zero_threshold,
-        zero_count: sample.zero_count,
-        count: sample.count,
-        sum: sample.sum,
+        zero_threshold: sample.zero_threshold(),
+        zero_count: sample.zero_count(),
+        count: sample.count(),
+        sum: sample.sum(),
         positive: buckets(sample.positive_indexes, sample.positive_counts)?,
         negative: buckets(sample.negative_indexes, sample.negative_counts)?,
         custom_values: sample.custom_values.into(),
@@ -140,7 +140,7 @@ fn from_proto_series(series: ProtoSeries) -> Result<Series, String> {
         samples: series
             .samples
             .into_iter()
-            .map(|sample| Sample::new(sample.timestamp_ms, sample.value))
+            .map(|sample| Sample::new(sample.timestamp_ms, sample.value()))
             .collect(),
         histograms: series
             .histograms
@@ -252,4 +252,52 @@ pub fn grpc_service(state: AppState) -> InternalWriterServer<AppState> {
     InternalWriterServer::new(state)
         .max_decoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
         .max_encoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+
+    #[test]
+    fn should_round_trip_signed_zeros_bit_exactly() {
+        // given
+        let histogram = FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 0.0,
+            sum: -0.0,
+            ..FloatHistogram::default()
+        };
+        let series = Series {
+            labels: vec![Label::new("__name__", "m")],
+            metric_type: None,
+            unit: None,
+            description: None,
+            samples: vec![Sample::new(1, -0.0), Sample::new(2, 0.0)],
+            histograms: vec![HistogramSample::new(3, histogram)],
+        };
+        let request = to_proto_request(
+            "alpha",
+            ShardId::new(0),
+            1,
+            "r",
+            Durability::Applied,
+            vec![series],
+        );
+
+        // when
+        let decoded = WriteBatchRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        let series = from_proto_series(decoded.series.into_iter().next().unwrap()).unwrap();
+
+        // then
+        let bits: Vec<u64> = series.samples.iter().map(|s| s.value.to_bits()).collect();
+        assert_eq!(bits, [(-0.0f64).to_bits(), 0.0f64.to_bits()]);
+        assert_eq!(
+            series.histograms[0].histogram.sum.to_bits(),
+            (-0.0f64).to_bits()
+        );
+    }
 }

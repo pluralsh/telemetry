@@ -1,0 +1,71 @@
+import { PageHeader } from "@/components/doc-page";
+import { Callout } from "@/components/mdx-ui";
+import { TelemetryIcon } from "@/components/icons";
+import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
+
+export const metadata = { title: "Architecture" };
+
+<PageHeader
+  icon={<TelemetryIcon size={28} />}
+  eyebrow="Concepts"
+  title="Architecture"
+  lede="A worked example: a production log database, built with Plural Telemetry and with Grafana Loki. Same data and same queries, very different amounts of machinery."
+/>
+
+Every Plural Telemetry database has the same shape, so this guide uses **Logs** as the example. The [Metrics](/metrics/) and [Traces](/traces/) architecture pages make the same comparison against Mimir and Tempo.
+
+<ArchitectureCompare product="logs" caption="Fig. 2 · Plural Logs vs Grafana Loki" />
+
+Use the controls to switch between the write and read paths, and drag the ingest slider. On the left, scaling adds pods to two StatefulSets. On the right, it adds pods to nine kinds of component, most of which have their own ring membership, cache sizing and failure modes.
+
+## The Plural Telemetry shape
+
+A sharded Logs deployment is two StatefulSets and a bucket:
+
+- **Writers** each own one storage shard, which is a SlateDB database. A Kubernetes `Lease` guarantees one owner per shard.
+- **Readers** open every shard read-only and merge the results.
+
+Durability comes from object storage, not replicas. If a writer dies, another pod takes its Lease and reopens the shard from the bucket.
+
+**Writes.** An agent sends a batch to any writer. Each entry is hashed to a shard ([epoch sharding](/sharding/)), forwarded to its owner, and committed to SlateDB, which uploads to object storage. Readers see it within about 10 seconds.
+
+**Reads.** Grafana sends LogQL to any reader. The reader prunes by labels and time, fetches only the blocks it needs through a RAM + NVMe cache, and merges streams across shards.
+
+## The Loki shape
+
+Loki's microservices mode, the one Grafana recommends above about 1 TB/day, splits the same job across many services:
+
+| Component | Why it exists | What it costs you |
+| --- | --- | --- |
+| distributor | Validates writes and hashes streams onto the ingester ring | Ring membership, rate-limit tuning |
+| ingester | Buffers chunks in memory, replicated 3× | Persistent WAL volumes, careful rollouts, 3× write fan-out |
+| query-frontend | Splits and caches queries | Results-cache sizing |
+| query-scheduler | Queues work for queriers | Another ring, another deployment |
+| querier | Executes LogQL against ingesters and storage | Scales with scan width |
+| index-gateway | Serves TSDB index lookups | Stateful; needs disk |
+| compactor | Compacts the index, applies retention | Singleton; must be healthy for deletes |
+| ruler | Evaluates alert rules | Separate scaling |
+| memcached ×3 | Chunk, results, and index caches | Three fleets to size |
+
+None of these are bad decisions. They follow from Loki's design: recent data lives in replicated ingester memory, so durability, replication, ring coordination and query fan-out all have to be built into the cluster. Plural Telemetry moves those concerns into object storage and Kubernetes primitives instead.
+
+## How scaling works
+
+<Callout title="Writes: add a writer, change the future">
+  Raising `writer.replicas` from 3 to 5 adds two pods and two empty shards. From the next hour on, new entries spread across five shards; older entries stay where they are. No data is copied and no ring is rebalanced.
+</Callout>
+
+Reads scale by adding readers, which are stateless views over the bucket and need no coordination.
+
+With Loki, adding ingesters triggers a ring rebalance and changes which three replicas own each stream. Removing ingesters requires flushing their in-memory chunks first. Read capacity scales across several tiers: frontend, scheduler, queriers, index gateways, and caches.
+
+## Failure modes, compared
+
+| Event | Plural Telemetry | Loki |
+| --- | --- | --- |
+| Writer / ingester crash | Lease expires, another writer reopens the shard from S3. Unflushed `applied` writes in the delta are lost; use `written` or `durable` if that matters | Replicas keep serving; WAL replays on restart |
+| Zone outage | Pods reschedule and reopen shards from the bucket | Survives if replicas are spread across zones |
+| Object store slowdown | Write latency grows and backpressure returns `429` with `Retry-After` | Flushes back up and ingester memory grows |
+| Bad rollout | Two StatefulSets to roll back | Up to nine components with version-skew rules |
+
+Plural Telemetry trades in-cluster replication for object-store durability. That's the right trade for most observability data, and the [cost estimates](/cost/) show what it's worth.

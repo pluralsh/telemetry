@@ -1663,3 +1663,218 @@ fn should_compute_quantile_globally_across_multiple_series_tile_batches() {
     assert_eq!(b.step_count(), 1);
     assert_eq!(b.get(0, 0), Some(3.5));
 }
+
+// ---- bit-exact parity with the cell-at-a-time accumulator ------------------
+
+mod parity {
+    use super::*;
+    use crate::test_utils::strategies::edge_f64;
+    use proptest::prelude::*;
+
+    const STREAMING: [AggregateKind; 8] = [
+        AggregateKind::Sum,
+        AggregateKind::Avg,
+        AggregateKind::Min,
+        AggregateKind::Max,
+        AggregateKind::Count,
+        AggregateKind::Stddev,
+        AggregateKind::Stdvar,
+        AggregateKind::Group,
+    ];
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        kind: AggregateKind,
+        steps: usize,
+        series: usize,
+        group_map: GroupMap,
+        values: Vec<f64>,
+        validity: Vec<bool>,
+        step_tile: usize,
+        series_tile: usize,
+        shuffle_seed: u64,
+    }
+
+    /// Values that rarely overflow, so `avg` mostly stays on its direct
+    /// Kahan path.
+    fn tame_f64() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            6 => -1.0e6f64..1.0e6,
+            1 => prop::sample::select(vec![0.0, -0.0, 1.0, -1.0, f64::from_bits(1), f64::NAN]),
+        ]
+    }
+
+    fn case_strategy() -> impl Strategy<Value = Case> {
+        let shape = prop_oneof![
+            3 => (1usize..=12, 1usize..=12),
+            1 => (1usize..=80, 1usize..=140),
+        ];
+        (
+            prop::sample::select(STREAMING.to_vec()),
+            1usize..=8,
+            shape,
+            any::<bool>(),
+        )
+            .prop_flat_map(|(kind, group_count, (series, steps), tame)| {
+                let cells = steps * series;
+                let value = if tame {
+                    tame_f64().boxed()
+                } else {
+                    edge_f64().boxed()
+                };
+                (
+                    prop::collection::vec(value, cells),
+                    prop::collection::vec(prop::bool::weighted(0.85), cells),
+                    prop::collection::vec(
+                        prop::option::weighted(0.9, 0..group_count as u32),
+                        series,
+                    ),
+                    1..=steps,
+                    1..=series,
+                    any::<u64>(),
+                )
+                    .prop_map(
+                        move |(values, validity, groups, step_tile, series_tile, shuffle_seed)| {
+                            Case {
+                                kind,
+                                steps,
+                                series,
+                                group_map: GroupMap::new(groups, group_count),
+                                values,
+                                validity,
+                                step_tile,
+                                series_tile,
+                                shuffle_seed,
+                            }
+                        },
+                    )
+            })
+    }
+
+    /// The `(steps × series)` grid of `case` cut into `step_tile ×
+    /// series_tile` batches, in a seeded shuffled arrival order.
+    fn batches(case: &Case, schema: &Arc<SeriesSchema>) -> Vec<StepBatch> {
+        let ts: Arc<[i64]> = (0..case.steps as i64).map(|i| i * 10).collect();
+        let mut out = Vec::new();
+        for t0 in (0..case.steps).step_by(case.step_tile) {
+            let steps = t0..(t0 + case.step_tile).min(case.steps);
+            for s0 in (0..case.series).step_by(case.series_tile) {
+                let series = s0..(s0 + case.series_tile).min(case.series);
+                let mut values = Vec::with_capacity(steps.len() * series.len());
+                let mut bits = BitSet::with_len(steps.len() * series.len());
+                for t in steps.clone() {
+                    for s in series.clone() {
+                        let cell = t * case.series + s;
+                        if case.validity[cell] {
+                            bits.set(values.len());
+                        }
+                        values.push(case.values[cell]);
+                    }
+                }
+                out.push(StepBatch::new(
+                    ts.clone(),
+                    steps.clone(),
+                    SchemaRef::Static(schema.clone()),
+                    series,
+                    values,
+                    bits,
+                ));
+            }
+        }
+        let mut state = case.shuffle_seed | 1;
+        for i in (1..out.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+        out
+    }
+
+    fn assert_bits_eq(case: Case) {
+        let in_schema = mk_schema("in", case.series);
+        let out_schema = mk_schema("out", case.group_map.group_count);
+        let input = batches(&case, &in_schema);
+        let (want, want_validity) =
+            reference::aggregate(case.kind, case.steps, &case.group_map, &input);
+
+        let child = MockOp::new(in_schema, mk_grid(case.steps), input);
+        let mut op = AggregateOp::new(
+            child,
+            case.kind,
+            case.group_map.clone(),
+            out_schema,
+            MemoryReservation::new(usize::MAX),
+        )
+        .expect("operator constructs");
+        let mut outs = drive(&mut op);
+        assert_eq!(outs.len(), 1);
+        let got = outs.remove(0).expect("batch");
+
+        let kind = case.kind;
+        assert_eq!(got.validity, want_validity, "{kind:?} validity");
+        for (idx, (&got, &want)) in got.values.iter().zip(&want).enumerate() {
+            assert!(
+                same_bits(got, want),
+                "{kind:?} cell {idx}: got {got:?} {:#x}, want {want:?} {:#x}",
+                got.to_bits(),
+                want.to_bits(),
+            );
+        }
+    }
+
+    /// Bit-identical, except that NaN payload and sign are left free: Rust
+    /// doesn't specify which NaN an operation on NaN inputs returns, and
+    /// optimised builds of the old accumulator already varied by inlining.
+    fn same_bits(got: f64, want: f64) -> bool {
+        got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn should_match_cell_at_a_time_accumulator_bit_for_bit(case in case_strategy()) {
+            assert_bits_eq(case);
+        }
+
+        #[test]
+        fn should_match_original_kahan_step_bit_for_bit(
+            inc in edge_f64(),
+            sum in edge_f64(),
+            c in edge_f64(),
+        ) {
+            let got = crate::util::kahan_inc(inc, sum, c);
+            let want = reference::kahan_inc(inc, sum, c);
+            prop_assert!(same_bits(got.0, want.0), "sum {:?} vs {:?}", got.0, want.0);
+            prop_assert!(same_bits(got.1, want.1), "c {:?} vs {:?}", got.1, want.1);
+        }
+    }
+
+    #[test]
+    fn should_switch_avg_to_incremental_mean_inside_a_run() {
+        // given: one group, 8 steps (a transposed run), three series whose
+        // running sum overflows on the second series at even steps only.
+        let (steps, series) = (8, 3);
+        let values: Vec<f64> = (0..steps)
+            .flat_map(|t| {
+                let big = if t % 2 == 0 { f64::MAX } else { 1.0 };
+                [big, big, -3.0 * t as f64]
+            })
+            .collect();
+        let case = Case {
+            kind: AggregateKind::Avg,
+            steps,
+            series,
+            group_map: GroupMap::new(vec![Some(0); series], 1),
+            validity: vec![true; values.len()],
+            values,
+            step_tile: steps,
+            series_tile: series,
+            shuffle_seed: 0,
+        };
+
+        // then
+        assert_bits_eq(case);
+    }
+}

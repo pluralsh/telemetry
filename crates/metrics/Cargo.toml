@@ -30,6 +30,8 @@ chrono.workspace = true
 common = { path = "../common" }
 config.workspace = true
 dashmap.workspace = true
+foldhash.workspace = true
+figment = { version = "0.10.19", features = ["env", "json", "toml", "yaml"] }
 futures.workspace = true
 metrics.workspace = true
 moka.workspace = true
@@ -50,15 +52,46 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-tsz.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 common = { path = "../common", features = ["test-utils"] }
+criterion.workspace = true
 dashu-float.workspace = true
 fail.workspace = true
+mimalloc.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 slatedb = { workspace = true, features = ["test-util"] }
 slatedb-common = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "series_codec"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "promql_ops"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "aggregate"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "query_profile"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "chunk_codec"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "query_growth"
+harness = false
+required-features = ["bench-internals"]

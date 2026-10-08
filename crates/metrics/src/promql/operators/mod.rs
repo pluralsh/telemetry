@@ -11,7 +11,7 @@
 //! - Per-cell transforms (one output value per input cell, schema
 //!   preserved): [`instant_fn`] (math functions like `abs`, `ln`),
 //!   [`coercion`] (`scalar()`, `time()`), [`label_manip`]
-//!   (`label_replace`, `label_join`).
+//!   (`label_replace`, `label_join`), [`drop_name`] (`__name__` removal).
 //! - Range-function driver: [`rollup`] — reduces each bracketed window to
 //!   one scalar for `rate`, `*_over_time`, and friends.
 //! - Binary ops and match-time broadcasting: [`binary`] — pointwise
@@ -21,6 +21,8 @@
 //!   series depend on sample values), [`histogram`]
 //!   (`histogram_quantile` / `histogram_fraction` over `le` buckets).
 //! - Presence: [`absent`] (`absent`, `absent_over_time`).
+//! - Ordering: [`sort`] (`sort`, `sort_desc`), whose order the planner
+//!   applies to the final result.
 //! - Shape and plumbing (no semantic change, just data movement):
 //!   [`subquery`], [`rechunk`], [`concurrent`], [`coalesce`].
 //!
@@ -33,11 +35,13 @@ pub(crate) mod coalesce;
 pub(crate) mod coercion;
 pub(crate) mod concurrent;
 pub(crate) mod count_values;
+pub(crate) mod drop_name;
 pub(crate) mod histogram;
 pub(crate) mod instant_fn;
 pub(crate) mod label_manip;
 pub(crate) mod matrix_selector;
 pub(crate) mod rechunk;
 pub(crate) mod rollup;
+pub(crate) mod sort;
 pub(crate) mod subquery;
 pub(crate) mod vector_selector;

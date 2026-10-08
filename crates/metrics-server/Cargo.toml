@@ -34,6 +34,7 @@ futures.workspace = true
 http-body-util = "0.1.5"
 kube = { workspace = true, optional = true }
 metrics.workspace = true
+mimalloc.workspace = true
 opentelemetry-proto.workspace = true
 plural-metrics = { path = "../metrics", features = ["remote-write", "otel"] }
 prost.workspace = true

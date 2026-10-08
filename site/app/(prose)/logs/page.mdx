@@ -1,0 +1,64 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
+import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Logs architecture" };
+
+<PageHeader
+  icon={<SpaceIcon space="logs" size={28} />}
+  eyebrow="Logs"
+  title="Architecture"
+  lede="A Loki-compatible log database on SlateDB. It speaks LogQL and Loki push, and also takes OTLP and Elasticsearch _bulk writes, from two StatefulSets and a bucket."
+/>
+
+<ArchitectureCompare product="logs" caption="Fig. 1 · Plural Logs vs Grafana Loki" />
+
+## Write path
+
+1. An agent sends a batch to **any writer**: Loki push, OTLP, or Elasticsearch `_bulk`.
+2. Each entry's stream is hashed to a storage shard with the [routing epoch](/sharding/) in effect at its timestamp. Entries for other shards are forwarded to their owner over internal gRPC.
+3. The owner buffers entries in memory and acknowledges at the configured durability (`applied` by default).
+4. Every 10 seconds, or at 64 MiB, the buffer is flushed. The flush packs every stream of a time segment into ~1 MiB multi-stream objects, updates label and term postings, and commits it all to SlateDB in one atomic write.
+5. Writer-side compaction later merges small objects of a segment, so long-lived streams end up in few objects.
+
+## Read path
+
+1. Grafana sends LogQL to **any reader**. Readers open every shard read-only and share one block cache.
+2. For each time segment in range, label matchers intersect Roaring-bitmap postings to find stream IDs.
+3. Each stream's runs carry their min and max timestamps, so out-of-range objects are rejected before any block is read.
+4. The surviving blocks are range-read through the RAM + NVMe cache and decoded, then the LogQL pipeline runs over the rows.
+5. Results from every shard are merged by timestamp and cut at the query's `limit`.
+
+`| match "…"`, a Logs extension, uses the full-text term index to nominate rows before decoding. Loki-style line filters (`|=`, `|~`) still scan decoded rows, since they must match substrings.
+
+## Storage layout
+
+Each storage shard is one SlateDB database. Keys are scoped by tenant namespace and time segment:
+
+<KeyLayout product="logs" caption="Fig. 2 · Every Logs key begins with the same prefix. Segments default to one hour." />
+
+Rows of one stream are stored as independently decoded blocks of 256 rows. Replaced objects stay readable for 10 minutes after compaction, so in-flight queries never lose data underneath them.
+
+## Compared with Loki
+
+| Concern | Loki | Plural Logs |
+| --- | --- | --- |
+| Recent data | Replicated ingester memory and WAL | Writer buffer, then SlateDB on object storage |
+| Write fan-out | 3× to ingesters via the hash ring | 1× to the shard owner |
+| Index | TSDB index, index gateways, compactor | Per-segment postings in the same SlateDB keyspace |
+| Query tiers | Frontend, scheduler, queriers, three caches | Readers with one block cache |
+| Full-text search | Line filters only | Line filters, plus indexed `\| match` |
+
+The [overview architecture guide](/architecture/) walks through each Loki component and the failure modes on both sides.
+
+## Compatibility
+
+Against Loki's own LogQL conformance scripts, **1373 of 1385** evaluations match. Stream selectors, line and label filters, `json`, `logfmt`, `pattern`, `regexp`, `line_format`, `label_format`, and all range and vector aggregations are supported. The main differences:
+
+- Empty stream labels are dropped at ingest.
+- `json` keeps the last value of a repeated key; Loki keeps the first.
+- `approx_count_distinct` is exact rather than a HyperLogLog estimate.
+- `line_format` and `label_format` also accept Jinja templates.
+
+<NextSteps product="logs" links={["installation", "api", "benchmarks"]} />

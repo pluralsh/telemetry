@@ -54,6 +54,12 @@ deduplicates series by fingerprint across shards, Logs merges streams with
 equal labels, and Traces merges the partial traces returned by each shard a
 trace ID may have been routed to.
 
+All shards opened by one process share a single SlateDB block cache and meta
+cache, so `storage.block_cache` and `storage.meta_cache` capacities are
+per-process budgets. A reader's cache memory therefore stays flat as the shard
+count grows, although each shard still holds its own SlateDB reader state and
+WAL replay buffer.
+
 ## Backends
 
 - `standalone`: one process owns every shard.

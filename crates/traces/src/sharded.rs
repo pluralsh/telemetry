@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use common::SharedDbCache;
 use common::discovery::DiscoveryValue;
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
@@ -16,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::routing::{route_trace, trace_shards};
 use crate::{
     AttributeMatcher, AttributeScope, Config, Durability, Error, Namespace, QueryOptions, Result,
-    Trace, TraceBatch, TraceDb, TraceId, TraceQlResult, WriteReport,
+    Trace, TraceBatch, TraceDb, TraceId, TraceQlResult, TraceSummary, WriteReport,
 };
 
 #[async_trait]
@@ -41,8 +42,12 @@ fn shard_config(config: &Config, shard: ShardId) -> Config {
 }
 
 /// A facade over independently opened storage-shard trace databases.
+///
+/// Every shard shares one SlateDB block and metadata cache, so the configured
+/// cache capacities bound the whole process rather than each shard.
 pub struct ShardedTraces {
     shards: Arc<ShardSet<TraceDb>>,
+    cache: SharedDbCache,
 }
 
 impl ShardedTraces {
@@ -51,10 +56,19 @@ impl ShardedTraces {
         options: ShardingOptions,
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
-        let opener = shard_opener(move |shard| TraceDb::open(shard_config(&config, shard)));
-        Ok(Self {
-            shards: Arc::new(ShardSet::open(ShardRole::Writer, options, opener, shards).await?),
-        })
+        config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        let shard_cache = cache.clone();
+        let opener = shard_opener(move |shard| {
+            let config = shard_config(&config, shard);
+            let cache = shard_cache.clone();
+            async move { TraceDb::open_with_cache(config, &cache).await }
+        });
+        Self::new(
+            ShardSet::open(ShardRole::Writer, options, opener, shards).await,
+            cache,
+        )
+        .await
     }
 
     pub async fn open_readers(
@@ -63,12 +77,33 @@ impl ShardedTraces {
         shards: impl IntoIterator<Item = ShardId>,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
+        config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        let shard_cache = cache.clone();
         let opener = shard_opener(move |shard| {
-            TraceDb::open_reader(shard_config(&config, shard), reader_options.clone())
+            let config = shard_config(&config, shard);
+            let reader_options = reader_options.clone();
+            let cache = shard_cache.clone();
+            async move { TraceDb::open_reader_with_cache(config, reader_options, &cache).await }
         });
-        Ok(Self {
-            shards: Arc::new(ShardSet::open(ShardRole::Reader, options, opener, shards).await?),
-        })
+        Self::new(
+            ShardSet::open(ShardRole::Reader, options, opener, shards).await,
+            cache,
+        )
+        .await
+    }
+
+    async fn new(shards: Result<ShardSet<TraceDb>>, cache: SharedDbCache) -> Result<Self> {
+        match shards {
+            Ok(shards) => Ok(Self {
+                shards: Arc::new(shards),
+                cache,
+            }),
+            Err(error) => {
+                cache.close().await?;
+                Err(error)
+            }
+        }
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -274,12 +309,39 @@ impl ShardedTraces {
         .await
     }
 
+    /// [`Self::query_traceql`] without matched spans, as a search response
+    /// lists them.
+    pub async fn search_traceql(
+        &self,
+        namespace: &Namespace,
+        start_ns: u64,
+        end_ns: u64,
+        source: &str,
+        options: QueryOptions,
+    ) -> Result<Vec<TraceSummary>> {
+        let databases = self.shards.databases().await;
+        let shards = databases.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        let permits = self.shards.io_permits();
+        crate::db::execute_traceql(
+            &shards,
+            Some(&permits),
+            namespace,
+            (start_ns, end_ns),
+            source,
+            options,
+        )
+        .await
+    }
+
     pub async fn flush(&self) -> Result<()> {
         self.shards.flush_all().await
     }
 
+    /// Closes every shard, then the cache they share.
     pub async fn close(&self) -> Result<()> {
-        self.shards.close_all().await
+        let closed = self.shards.close_all().await;
+        self.cache.close().await?;
+        closed
     }
 }
 

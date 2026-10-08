@@ -69,6 +69,58 @@ class DockerApi:
         finally:
             connection.close()
 
+    def _network(self, action: str, network: str, container: str) -> bytes:
+        connection = _UnixConnection(self.path, self.timeout)
+        try:
+            connection.request(
+                "POST",
+                f"/networks/{quote(network)}/{action}",
+                body=json.dumps({"Container": container, "Force": True}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            body = response.read()
+            if response.status == 200:
+                return b""
+            return f"HTTP {response.status} ".encode() + body[:200]
+        finally:
+            connection.close()
+
+    def connect(self, network: str, container: str) -> None:
+        """Attach a container to a network; already attached is fine."""
+        error = self._network("connect", network, container)
+        if error and b"already exists" not in error:
+            raise RuntimeError(f"docker API connect {network}: {error.decode()}")
+
+    def info(self) -> dict[str, Any]:
+        return self._get("/info")
+
+    def update_cpus(self, container: str, cpuset: str, cores: int) -> None:
+        """Pin a running container to `cpuset` and cap it at `cores`."""
+        connection = _UnixConnection(self.path, self.timeout)
+        try:
+            connection.request(
+                "POST",
+                f"/containers/{quote(container)}/update",
+                body=json.dumps({"CpusetCpus": cpuset, "NanoCpus": cores * 10**9}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            body = response.read()
+            if response.status != 200:
+                raise RuntimeError(
+                    f"docker API update {container[:12]}: HTTP {response.status} "
+                    f"{body[:200].decode(errors='replace')}"
+                )
+        finally:
+            connection.close()
+
+    def disconnect(self, network: str, container: str) -> None:
+        """Detach a container from a network; not attached is fine."""
+        error = self._network("disconnect", network, container)
+        if error and not error.startswith((b"HTTP 404", b"HTTP 403")):
+            raise RuntimeError(f"docker API disconnect {network}: {error.decode()}")
+
     def containers(self, project: str) -> dict[str, str]:
         """Running container IDs of a compose project, keyed to their service."""
         filters = json.dumps({"label": [f"com.docker.compose.project={project}"]})
@@ -77,6 +129,20 @@ class DockerApi:
             item["Id"]: item["Labels"].get(_SERVICE_LABEL, item["Id"][:12])
             for item in listed
         }
+
+    def images(self, project: str) -> dict[str, dict[str, str]]:
+        """Image reference and short image ID per service of a compose project."""
+        filters = json.dumps({"label": [f"com.docker.compose.project={project}"]})
+        listed = self._get(f"/containers/json?filters={quote(filters)}")
+        images = {}
+        for item in listed:
+            service = item["Labels"].get(_SERVICE_LABEL, item["Id"][:12])
+            image_id = str(item.get("ImageID", ""))
+            images[service] = {
+                "image": str(item.get("Image", "")),
+                "id": image_id.removeprefix("sha256:")[:12],
+            }
+        return dict(sorted(images.items()))
 
     def usage(self, container: str) -> tuple[int, int]:
         """Cumulative CPU nanoseconds and the working-set memory in bytes."""

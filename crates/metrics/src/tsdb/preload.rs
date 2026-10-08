@@ -59,6 +59,43 @@ pub(crate) fn preload_ranges_for_query(
     Ok(preload_ranges(&stmt, default_start_secs, default_end_secs))
 }
 
+/// The windows one step of `expr` reads, as inclusive `(earliest, latest)`
+/// millisecond offsets from the step's time: [`preload_ranges_for_query`]
+/// at `start = end = t`, shifted by `-t`. Without `@` every read is relative
+/// to the step, so the windows of step `t` are these offsets plus `t`.
+/// `None` when `expr` uses `@`, which pins reads to absolute times.
+pub(crate) fn step_read_offsets(expr: &Expr, lookback_delta: Duration) -> Option<Vec<(i64, i64)>> {
+    if uses_at(expr) {
+        return None;
+    }
+    let mut offsets = Vec::new();
+    preload_ranges_inner(
+        expr,
+        0,
+        0,
+        0,
+        0,
+        duration_to_ms(lookback_delta),
+        &mut offsets,
+    );
+    Some(offsets)
+}
+
+fn uses_at(expr: &Expr) -> bool {
+    match expr {
+        Expr::VectorSelector(vs) => vs.at.is_some(),
+        Expr::MatrixSelector(ms) => ms.vs.at.is_some(),
+        Expr::Subquery(sq) => sq.at.is_some() || uses_at(&sq.expr),
+        Expr::Aggregate(agg) => uses_at(&agg.expr) || agg.param.as_deref().is_some_and(uses_at),
+        Expr::Binary(b) => uses_at(&b.lhs) || uses_at(&b.rhs),
+        Expr::Paren(p) => uses_at(&p.expr),
+        Expr::Call(call) => call.args.args.iter().any(|arg| uses_at(arg)),
+        Expr::Unary(u) => uses_at(&u.expr),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+        Expr::Extension(_) => true,
+    }
+}
+
 // ── Preload-range computation (ported from v1 evaluator) ──
 
 /// Walk the AST and compute the disjoint time ranges needed for bucket preloading.

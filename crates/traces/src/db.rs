@@ -15,9 +15,10 @@ use common::coordinator::{
     WriteError,
 };
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
-use common::storage::{RecordOp, Storage, StorageRead, StorageSnapshot, Ttl};
+use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
-    BytesRange, StorageBuilder, StorageReaderRuntime, StorageSemantics, create_storage_read,
+    BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics,
+    create_storage_read,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use opentelemetry_proto::tonic::{
@@ -32,12 +33,11 @@ use tokio_util::sync::CancellationToken;
 use crate::codec::{
     LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceHead, TraceLocator,
     continuation_key, continuation_prefix, decode_head, decode_head_trace_id, decode_indices,
-    decode_locator, decode_marker, decode_metadata, decode_metadata_sequence,
-    decode_posting_sequence, decode_posting_value, decode_sequence, encode_head, encode_indices,
-    encode_locator, encode_metadata, encode_sequence, field_posting_key, field_scan_prefix,
-    field_value_prefix, head_key, head_namespace_prefix, marker_key, marker_prefix, marker_value,
-    metadata_key, metadata_prefix, next_sequence_key, payload_key, posting_key, segment_for,
-    segment_prefix,
+    decode_locator, decode_metadata, decode_metadata_sequence, decode_posting_sequence,
+    decode_posting_value, decode_sequence, encode_head, encode_indices, encode_locator,
+    encode_metadata, encode_sequence, field_posting_key, field_scan_prefix, field_value_prefix,
+    head_key, head_namespace_prefix, metadata_key, metadata_prefix, next_sequence_key, payload_key,
+    posting_key, segment_for, segment_prefix, value_subrange,
 };
 
 /// Concurrent storage reads per query stage.
@@ -46,14 +46,26 @@ const READ_CONCURRENCY: usize = 32;
 const MATERIALIZE_BATCH: usize = 256;
 /// Segments whose metadata or postings are scanned concurrently.
 const SEGMENT_SCAN_CONCURRENCY: usize = 8;
-use crate::traceql::{IndexField, IndexPredicate, IndexTest, PushdownClause, span_intrinsics};
+/// Most unwanted pages a metadata scan steps over between two wanted ones.
+/// A point get costs about as much as reading seven adjacent small records,
+/// so wider gaps are cheaper as separate reads.
+const METADATA_SCAN_MAX_GAP: u64 = 6;
+use crate::sidecar::PageColumns;
+use crate::traceql::{
+    IndexField, IndexPredicate, IndexTest, PushdownClause, TraceFilter, span_intrinsics,
+};
 use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Config, Error, Namespace, Page, PageBuilder,
     PageConfig, QueryOptions, Result, SegmentId, Trace, TraceBatch, TraceId, TraceQlResult,
+    TraceSummary,
 };
 
 mod query;
+mod read_cache;
 mod write;
+
+pub use read_cache::ReadCacheConfig;
+use read_cache::{PostingEntry, ReadCache, SegmentPostings, TraceLocators};
 
 pub(crate) use query::{execute_traceql, merge_traces};
 use write::*;
@@ -85,11 +97,22 @@ pub struct WriteReport {
     pub spans: usize,
 }
 
+/// Readers need the merge operator too: trace heads are merge records.
+fn storage_semantics() -> StorageSemantics {
+    StorageSemantics::new()
+        .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared())
+        .with_merge_operator(Arc::new(crate::merge::TracesMergeOperator))
+}
+
 #[derive(Clone, Copy)]
 struct Retention {
     physical_ttl: Ttl,
     expires_at_unix_ms: Option<u64>,
 }
+
+/// A segment catalog scan tagged with the segment's next page sequence when
+/// it was taken; it is current only while that sequence is unchanged.
+type SequencedCatalog<K, V> = DiscoveryCache<K, (u64, Vec<V>)>;
 
 /// Single-node OTLP trace database over the common SlateDB abstraction.
 pub struct TraceDb {
@@ -98,10 +121,13 @@ pub struct TraceDb {
     write_handle: Option<WriteCoordinatorHandle<TraceWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<TraceWriteDelta, TraceFlusher>>>,
     segment_ns: u64,
-    catalog_names_cache:
-        DiscoveryCache<(Namespace, SegmentId, Option<AttributeScope>), Vec<String>>,
+    catalog_names_cache: SequencedCatalog<(Namespace, SegmentId, Option<AttributeScope>), String>,
     catalog_values_cache:
-        DiscoveryCache<(Namespace, SegmentId, Option<AttributeScope>, String), Vec<DiscoveryValue>>,
+        SequencedCatalog<(Namespace, SegmentId, Option<AttributeScope>, String), DiscoveryValue>,
+    read_cache: Arc<ReadCache>,
+    /// Whether records expire, so cached postings may name pages that no
+    /// longer exist.
+    expiring: bool,
 }
 
 impl TraceDb {
@@ -134,28 +160,33 @@ impl TraceDb {
 
     pub async fn open(config: Config) -> Result<Self> {
         config.validate()?;
+        let cache = SharedDbCache::from_config(&config.storage).await?;
+        Self::open_with_cache(config, &cache).await
+    }
+
+    /// Opens a writer that uses `cache` instead of building its own.
+    pub(crate) async fn open_with_cache(config: Config, cache: &SharedDbCache) -> Result<Self> {
+        config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
-        let semantics = StorageSemantics::new()
-            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
-        let storage = StorageBuilder::new(&config.storage)
-            .await?
-            .with_semantics(semantics)
+        let storage = StorageBuilder::with_cache(&config.storage, cache)?
+            .with_semantics(storage_semantics())
             .build()
             .await?;
         let storage_read = storage.clone();
-        let initial_snapshot = storage.snapshot().await?;
-        let flusher = TraceFlusher {
-            storage: storage.clone(),
-            page_config: config.page.clone(),
-            retention: config.retention,
+        let read_cache = Arc::new(ReadCache::new(&config.read_cache, true));
+        let flusher = TraceFlusher::new(
+            storage.clone(),
+            config.page.clone(),
+            config.retention,
             segment_ns,
-        };
+            read_cache.clone(),
+        );
         let mut write_coordinator = WriteCoordinator::new(
             config.write_buffer.clone(),
             vec![WRITE_CHANNEL],
             (),
-            initial_snapshot,
+            (),
             flusher,
         );
         let write_handle = write_coordinator.handle(WRITE_CHANNEL);
@@ -168,22 +199,33 @@ impl TraceDb {
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
             catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+            read_cache,
+            expiring: config.retention.is_some(),
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_reader(
         config: Config,
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
+        Self::open_reader_with_cache(config, reader_options, &SharedDbCache::default()).await
+    }
+
+    /// Opens a reader that uses `cache`; an empty `cache` falls back to the
+    /// config's own cache settings.
+    pub(crate) async fn open_reader_with_cache(
+        config: Config,
+        reader_options: DbReaderOptions,
+        cache: &SharedDbCache,
+    ) -> Result<Self> {
         config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
-        let semantics = StorageSemantics::new()
-            .with_segment_extractor(crate::codec::SEGMENT_EXTRACTOR.shared());
         let storage = create_storage_read(
             &config.storage,
-            StorageReaderRuntime::new(),
-            semantics,
+            StorageReaderRuntime::new().with_shared_cache(cache),
+            storage_semantics(),
             reader_options,
         )
         .await?;
@@ -195,6 +237,8 @@ impl TraceDb {
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
             catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+            read_cache: Arc::new(ReadCache::new(&config.read_cache, false)),
+            expiring: config.retention.is_some(),
         })
     }
 
@@ -238,8 +282,6 @@ impl TraceDb {
         for traces in groups.values_mut() {
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
-        self.catalog_names_cache.clear();
-        self.catalog_values_cache.clear();
         let write = TraceWrite {
             namespace: namespace.clone(),
             groups,

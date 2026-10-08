@@ -179,7 +179,7 @@ async fn should_match_per_series_reads_for_batched_scans() {
         assert_eq!(batched.len(), request.len(), "{case}");
         assert_eq!(specs.len(), request.len(), "{case}");
         // `(start_ms, end_ms]` holds the second of three samples.
-        assert!(batched.iter().any(|s| s.floats.len() == 1), "{case}");
+        assert!(batched.iter().any(|s| s.timestamps.len() == 1), "{case}");
         for ((&id, samples), spec) in request.iter().zip(&batched).zip(&specs) {
             let expected = reader
                 .samples(&bucket, id, "m", start_ms, end_ms)
@@ -613,6 +613,44 @@ async fn eval_query_range_should_return_range_samples() {
 }
 
 #[tokio::test]
+async fn eval_query_range_sort_should_drop_native_histograms() {
+    let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
+    let float = create_sample("mixed", vec![("kind", "float")], 4_000_000, 1.0);
+    let mut native = create_sample("mixed", vec![("kind", "histogram")], 4_000_000, 0.0);
+    native.samples.clear();
+    native.histograms.push(crate::model::HistogramSample::new(
+        4_000_000,
+        crate::FloatHistogram {
+            count: 4.0,
+            sum: 5.0,
+            ..crate::FloatHistogram::default()
+        },
+    ));
+    tsdb.ingest_samples(vec![float, native], None)
+        .await
+        .unwrap();
+    tsdb.flush().await.unwrap();
+    let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4000);
+    let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4060);
+    let step = std::time::Duration::from_secs(60);
+
+    let opts = QueryOptions::default();
+    let unsorted = tsdb
+        .eval_query_range("mixed", start..=end, step, &opts)
+        .await
+        .unwrap();
+    let sorted = tsdb
+        .eval_query_range("sort(mixed)", start..=end, step, &opts)
+        .await
+        .unwrap();
+
+    // Prometheus' `sort` keeps only float samples.
+    assert_eq!(unsorted.len(), 2);
+    assert_eq!(sorted.len(), 1);
+    assert_eq!(sorted[0].labels.get("kind"), Some("float"));
+}
+
+#[tokio::test]
 async fn eval_query_range_should_return_scalar() {
     let storage = Arc::new(in_memory_storage().await);
     let tsdb = Tsdb::new(storage);
@@ -731,6 +769,89 @@ async fn should_see_series_late_written_into_a_cached_bucket() {
     }
 }
 
+/// Hour bucket at minute 60 (3,600,000–7,199,999 ms), then one scrape per
+/// flush into the next hour, leaving the first bucket idle in the ingest
+/// cache.
+async fn ingest_across_rollover(tsdb: &Tsdb) {
+    let cpu = |ts, value| create_sample("cpu", vec![("host", "a")], ts, value);
+    tsdb.ingest_samples(vec![cpu(4_000_000, 1.0)], None)
+        .await
+        .unwrap();
+    tsdb.flush().await.unwrap();
+    for scrape in 0..4 {
+        let sample = cpu(7_300_000 + scrape * 15_000, scrape as f64);
+        tsdb.ingest_samples(vec![sample], None).await.unwrap();
+        tsdb.flush().await.unwrap();
+    }
+}
+
+async fn instant_values(tsdb: &Tsdb, query: &str, at_secs: u64) -> Vec<(String, f64)> {
+    let time = std::time::UNIX_EPOCH + Duration::from_secs(at_secs);
+    let mut values: Vec<_> = tsdb
+        .eval_query(query, Some(time), &QueryOptions::default())
+        .await
+        .unwrap()
+        .into_matrix()
+        .into_iter()
+        .map(|series| {
+            let host = series.labels.get("host").unwrap_or_default().to_string();
+            (host, series.samples.last().expect("sample").1)
+        })
+        .collect();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    values
+}
+
+#[tokio::test]
+async fn should_not_pin_merge_barrier_with_idle_previous_bucket() {
+    // given: the previous hour's bucket idles in the ingest cache while the
+    // current hour keeps receiving merge operands
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage.clone());
+    ingest_across_rollover(&tsdb).await;
+    tsdb.ingest_cache.run_pending_tasks().await;
+    assert_eq!(tsdb.ingest_cache.entry_count(), 2);
+
+    // when
+    storage.flush_memtable().await.unwrap();
+
+    // then: no snapshot is live, so the L0 flush merged every operand and
+    // compaction may too, without waiting for the idle bucket's eviction
+    let (barrier, last_l0_seq) = storage.merge_barrier();
+    assert_eq!(barrier, last_l0_seq);
+}
+
+#[tokio::test]
+async fn should_accept_late_writes_into_previous_bucket_after_rollover() {
+    // given
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage.clone());
+    ingest_across_rollover(&tsdb).await;
+    storage.flush_memtable().await.unwrap();
+
+    // when: late samples land in the previous hour, for an existing series
+    // and for a new one
+    let late = vec![
+        create_sample("cpu", vec![("host", "a")], 4_100_000, 7.0),
+        create_sample("cpu", vec![("host", "b")], 4_100_000, 9.0),
+    ];
+    tsdb.ingest_samples(late, None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    // then: both are visible, and flushing them still leaves no barrier
+    assert_eq!(
+        instant_values(&tsdb, "cpu", 4_150).await,
+        vec![("a".to_string(), 7.0), ("b".to_string(), 9.0)]
+    );
+    storage.flush_memtable().await.unwrap();
+    let (barrier, last_l0_seq) = storage.merge_barrier();
+    assert_eq!(barrier, last_l0_seq);
+    assert_eq!(
+        instant_values(&tsdb, "cpu", 4_150).await,
+        vec![("a".to_string(), 7.0), ("b".to_string(), 9.0)]
+    );
+}
+
 #[tokio::test]
 async fn should_serve_repeat_selector_postings_from_the_shared_cache() {
     // given
@@ -756,6 +877,52 @@ async fn should_serve_repeat_selector_postings_from_the_shared_cache() {
             .term(bucket, &Label::metric_name("cpu"))
             .await
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn should_reuse_and_invalidate_cached_selector_results() {
+    // given: a selector's result cached from one query
+    let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
+    let cpu = |host| create_sample("cpu", vec![("host", host), ("env", "prod")], 4_000_000, 1.0);
+    tsdb.ingest_samples(vec![cpu("a")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let bucket = TimeBucket::round_to_hour(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(4_000_000),
+    )
+    .unwrap();
+    let query = r#"cpu{host!="z", env="prod"}"#;
+    let key = crate::postings_cache::selector_key([
+        ("__name__", "=", "cpu"),
+        ("env", "=", "prod"),
+        ("host", "!=", "z"),
+    ]);
+    let first = instant_values(&tsdb, query, 4_000).await;
+    let read_at = tsdb.postings_cache.read_seq();
+    let cached = tsdb.postings_cache.selector(bucket, &key, read_at).await;
+    assert_eq!(cached.map(|ids| ids.len()), Some(1));
+
+    // when: the same selector with reordered matchers runs again
+    let reordered = instant_values(&tsdb, r#"cpu{env="prod", host!="z"}"#, 4_000).await;
+
+    // then
+    assert_eq!(reordered, first);
+
+    // when: a new series joins the bucket
+    tsdb.ingest_samples(vec![cpu("b")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    // then: the stale entry is not served and the new series is found
+    let read_at = tsdb.postings_cache.read_seq();
+    assert!(
+        tsdb.postings_cache
+            .selector(bucket, &key, read_at)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        instant_values(&tsdb, query, 4_000).await,
+        vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)]
     );
 }
 
@@ -816,6 +983,50 @@ async fn find_label_values_should_filter_by_matcher() {
         .unwrap();
 
     assert_eq!(results, vec!["prod"]);
+}
+
+#[tokio::test]
+async fn find_label_values_should_union_matched_series_across_selectors_and_buckets() {
+    let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
+    let series = vec![
+        create_sample("up", vec![("env", "prod"), ("zone", "a")], 4_000_000, 1.0),
+        create_sample(
+            "up",
+            vec![("env", "staging"), ("zone", "b")],
+            4_000_000,
+            1.0,
+        ),
+        create_sample("up", vec![("env", "dev")], 4_000_000, 1.0),
+        create_sample("other", vec![("zone", "c")], 4_000_000, 1.0),
+        create_sample("up", vec![("env", "prod"), ("zone", "d")], 8_000_000, 1.0),
+    ];
+    tsdb.ingest_samples(series, None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    let values = |matchers: &'static [&'static str], start, end| {
+        let tsdb = &tsdb;
+        async move {
+            let mut values = tsdb
+                .find_label_values("zone", Some(matchers), start, end)
+                .await
+                .unwrap();
+            values.sort();
+            values
+        }
+    };
+
+    assert_eq!(
+        values(&[r#"up{env="prod"}"#], 3600, 10_800).await,
+        vec!["a", "d"]
+    );
+    assert_eq!(values(&[r#"up{env="prod"}"#], 3600, 7199).await, vec!["a"]);
+    assert_eq!(values(&[r#"up{env!="prod"}"#], 3600, 7199).await, vec!["b"]);
+    assert_eq!(
+        values(&[r#"up{env=~"st.*"}"#, "other"], 3600, 7199).await,
+        vec!["b", "c"]
+    );
+    assert!(values(&[r#"up{env="dev"}"#], 3600, 7199).await.is_empty());
+    assert!(values(&[r#"up{env="none"}"#], 3600, 7199).await.is_empty());
 }
 
 #[tokio::test]

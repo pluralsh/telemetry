@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import FuzzConfig
+from .network import network_mode
 from .transport import Exchange, Request
 
 OUTCOMES = (
@@ -80,6 +81,7 @@ class Summary:
     output_dir: Path
     markdown: str
     outcomes: Counter[str] = field(default_factory=Counter)
+    history: Path | None = None
 
 
 PERCENTILES = ("p50", "p90", "p99", "p99.9", "max")
@@ -116,7 +118,12 @@ def _ratio(value: float | None) -> str:
 
 
 class Recorder:
-    def __init__(self, config: FuzzConfig, endpoints: dict[str, object]) -> None:
+    def __init__(
+        self,
+        config: FuzzConfig,
+        endpoints: dict[str, object],
+        layout: dict[str, Any] | None = None,
+    ) -> None:
         self.config = config
         self.root = config.output_dir
         (self.root / "artifacts").mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,9 @@ class Recorder:
         self.ingest_outcomes: Counter[str] = Counter()
         self.ingest_latency: dict[str, list[float]] = defaultdict(list)
         self.invisible_rounds: list[int] = []
+        self.floor_roles: dict[str, str] = {}
+        self.floor_latency: dict[str, list[float]] = defaultdict(list)
+        self.floor_errors: Counter[str] = Counter()
         self.rounds = 0
         self.artifacts = 0
         self.notes: list[str] = []
@@ -144,6 +154,8 @@ class Recorder:
                 {
                     "config": config.describe(),
                     "endpoints": endpoints,
+                    "network": network_mode(),
+                    "layout": layout or {},
                     "started_at": self.started,
                 },
                 indent=2,
@@ -276,6 +288,25 @@ class Recorder:
         )
         self._rounds.flush()
 
+    def record_floor(self, service: str, role: str, exchange: Exchange) -> None:
+        self.floor_roles[service] = role
+        if exchange.ok():
+            self.floor_latency[service].append(exchange.latency_ms)
+        else:
+            self.floor_errors[service] += 1
+
+    def _floor(self) -> dict[str, Any]:
+        return {
+            service: {
+                "role": self.floor_roles[service],
+                "samples": len(self.floor_latency[service]),
+                "errors": self.floor_errors[service],
+                "p50": percentile(self.floor_latency[service], 0.5),
+                "p99": percentile(self.floor_latency[service], 0.99),
+            }
+            for service in sorted(self.floor_roles)
+        }
+
     def record_dataset(self, index: int, dataset: Any) -> None:
         path = self.root / "data" / f"round-{index:04d}.json.gz"
         with gzip.open(path, "wt", encoding="utf-8") as output:
@@ -354,6 +385,7 @@ class Recorder:
                 "outliers": len(self.outliers),
                 "top_outliers": outliers[:20],
             },
+            "floor": self._floor(),
             "families": families,
             "failures": self.failures[:100],
             "resources": resources,
@@ -416,6 +448,20 @@ def render_markdown(value: dict[str, Any]) -> str:
             for side, key in (("oracle", "oracle_ms"), ("implementation", "impl_ms"))
         ),
     ]
+    if floor := value.get("floor"):
+        lines += [
+            "",
+            "Request floor: a trivial readiness request to each service every "
+            "round, the cost no query can go below:",
+            "",
+            "| service | role | p50 ms | p99 ms | samples | errors |",
+            "| --- | --- | ---: | ---: | ---: | ---: |",
+            *(
+                f"| {service} | {stats['role']} | {_ms(stats['p50'])} | "
+                f"{_ms(stats['p99'])} | {stats['samples']} | {stats['errors']} |"
+                for service, stats in floor.items()
+            ),
+        ]
     lines += [
         "",
         "Query latency (implementation / oracle ratio p50 "

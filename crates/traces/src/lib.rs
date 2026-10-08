@@ -4,20 +4,24 @@
 //! with namespace/time-segment routing, direct trace locators, and exact typed
 //! scalar attribute posting fragments over SlateDB.
 
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
 mod codec;
 mod config;
 mod db;
 mod error;
+mod merge;
 mod model;
 mod otlp;
 mod page;
 pub mod routing;
 mod sharded;
+mod sidecar;
 pub mod traceql;
 
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
-pub use config::{Config, PageConfig};
-pub use db::{Durability, TraceDb, WriteReport};
+pub use config::{Config, DEFAULT_RETENTION, PageConfig};
+pub use db::{Durability, ReadCacheConfig, TraceDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{
     AttributeMatcher, AttributeScope, AttributeValue, SegmentId, Trace, TraceBatch, TraceId,
@@ -27,7 +31,7 @@ pub use page::{Page, PageBuilder, TraceDirectoryEntry};
 pub use sharded::ShardedTraces;
 pub use sharding::ShardingOptions;
 pub use traceql::{
-    MatchedSpan, QueryOptions, QueryPlan, StaticValue as TraceQlValue, TraceQlResult,
+    MatchedSpan, QueryOptions, QueryPlan, StaticValue as TraceQlValue, TraceQlResult, TraceSummary,
 };
 
 /// Persisted SlateDB segment extractor identifier.

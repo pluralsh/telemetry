@@ -218,7 +218,7 @@ load 5m
 
 eval instant at 10m
   metric
-    {} 3
+    metric 3
 "#;
 
         // when

@@ -1,0 +1,84 @@
+import { PageHeader } from "@/components/doc-page";
+import { SpaceIcon } from "@/components/icons";
+import { Callout } from "@/components/mdx-ui";
+import {
+  AccessSpec,
+  ClientConfigs,
+  InstallSpec,
+  NextSteps,
+  PasswordSecrets,
+  PodIdentitySetup,
+  ToolEndpoints,
+  VerifyInstall,
+} from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Traces installation" };
+
+<PageHeader
+  icon={<SpaceIcon space="traces" size={28} />}
+  eyebrow="Traces"
+  title="Installation"
+  lede="Run a Traces database on Kubernetes: grant it a bucket, declare it as a custom resource, and give each tenant namespace credentials."
+/>
+
+This guide assumes the operator is already installed; see [Installation](/installation/). Examples use the `telemetry` Kubernetes namespace and an S3 bucket named `acme-telemetry`.
+
+## Grant S3 access
+
+Traces authenticates to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). The operator creates a ServiceAccount named after the database, `traces`, so associate an IAM role with it:
+
+<PodIdentitySetup product="traces" />
+
+The role's trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` and `sts:TagSession`. No keys go in the spec.
+
+## Quick start
+
+A `Standalone` database is a single pod that ingests and queries, which is enough for development and small clusters. Every field not shown takes its default:
+
+<InstallSpec product="traces" variant="quickstart" />
+
+## Production
+
+A `Sharded` database runs writers and readers as separate StatefulSets. Hover a field, or its note, to see what it does:
+
+<InstallSpec product="traces" variant="production" />
+
+Apply it with `kubectl apply -f traces.yaml`. The operator renders the server config, then creates the ServiceAccount, StatefulSets, Services and Ingress. It rolls the pods whenever the spec changes.
+
+## Access
+
+Traces serves a tenant namespace only once it has credentials. Each `NamespaceAuthentication` creates its namespace if needed and grants one username `read` or `write`. Create the password Secrets first:
+
+<PasswordSecrets product="traces" />
+
+Then grant a writer for the collector and a reader for Grafana:
+
+<AccessSpec product="traces" />
+
+Clients send these as HTTP basic auth.
+
+## Connect your tools
+
+Writers serve ingest routes and readers serve queries. Inside the cluster:
+
+<ToolEndpoints product="traces" />
+
+Any writer accepts any span and forwards each trace to its shard's owner, so the plain `traces-writer` ClusterIP Service is all a client needs. For an OTel Collector and Grafana:
+
+<ClientConfigs product="traces" />
+
+<Callout title="OTLP/gRPC and Jaeger">
+  Writer pods also listen for OTLP/gRPC on `4317` and Jaeger gRPC on `14250`, but the operator's Service exposes only HTTP and internal gRPC. Expose those ports with your own Service, and pass the tenant namespace in `x-scope-orgid` metadata alongside basic auth.
+</Callout>
+
+## Verify
+
+<VerifyInstall product="traces" />
+
+## Scaling
+
+- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take traces from the next aligned hour, by each trace's earliest span. Scale-down is blocked. See [epoch sharding](/sharding/).
+- **Readers:** change `spec.reader.replicas` at any time. They hold no state beyond their cache.
+- **Large traces:** raise `request.maxSpansPerTrace` and reader memory together.
+
+<NextSteps product="traces" links={["architecture", "api", "benchmarks"]} />

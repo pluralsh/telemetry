@@ -1,0 +1,49 @@
+import { Hero, ProductCards, Stats, Stat, Callout } from "@/components/mdx-ui";
+import { StackDiagram } from "@/components/diagrams/stack-diagram";
+
+export const metadata = { title: "Introduction" };
+
+<Hero />
+
+## What's inside
+
+Plural Telemetry is three databases that share one storage engine, one sharding protocol, and one Kubernetes operator. Each one speaks the wire protocols and query language of the system it replaces, so agents, dashboards and alerts keep working when you switch.
+
+<ProductCards />
+
+<StackDiagram />
+
+### Built on SlateDB
+
+[SlateDB](https://slatedb.io) is an embedded LSM-tree key/value engine that writes its WAL and SSTs straight to object storage. It gives each Plural Telemetry database:
+
+- **Zero-disk durability.** Data is durable once it lands in S3, GCS or Azure Blob. Local NVMe is a disposable cache, not a replica.
+- **Single writer, many readers.** A fenced manifest guarantees one writer per database. Readers open the same data read-only and scale independently.
+- **Tunable cost and latency.** Batched WAL uploads trade per-request API cost against durability latency. Writes can acknowledge as `applied`, `written` or `durable`.
+- **Background compaction.** Sorted runs are merged off the hot path, so readers see a small number of large, cacheable objects.
+
+SlateDB is single-writer by design. Plural Telemetry adds the missing piece for observability workloads, which is many writers: [epoch-based sharding](/sharding/) routes every record to one of up to 4,096 storage shards, and each shard is its own SlateDB database.
+
+## By the numbers
+
+Differential fuzzing runs every product against its peer on the same data and queries. These figures come from the published runs. Methodology and per-run history are on each database's **Benchmarks** page.
+
+<Stats>
+  <Stat value="5×" label="faster median trace query vs Tempo" />
+  <Stat value="0.63×" label="median per-query latency vs Loki" />
+  <Stat value="1/18" label="of Mimir's CPU for the same workload" />
+  <Stat value="0" label="replicated disks, rings, or ZooKeeper" />
+</Stats>
+
+## Productionization
+
+On top of SlateDB, Plural Telemetry adds what a real observability backend needs:
+
+1. **Sharding.** Multiple writers, coordinated by Kubernetes `Lease` objects and a `ShardMap` custom resource. No etcd, ZooKeeper or memberlist to run.
+2. **Multi-tenancy.** Every route is namespaced (`/read/ns/{namespace}/…`), and tenant isolation is encoded in storage keys.
+3. **Authentication.** Basic auth per namespace through `NamespaceAuthentication` resources, or JWKS-verified RS256 JWTs.
+4. **Oracle testing.** Each database is continuously diffed against Prometheus, Mimir, Loki or Tempo on the same inputs.
+
+<Callout title="Where to next">
+  Start with the [installation overview](/installation/), read the [manifesto](/manifesto/) for the why, or jump straight into a database with the switcher in the top left.
+</Callout>

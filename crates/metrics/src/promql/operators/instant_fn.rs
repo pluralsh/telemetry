@@ -2,7 +2,7 @@
 //! `ln`, `round`, `clamp`, ...) — every function that takes one sample
 //! and produces one sample at the same `(step, series)` position. One
 //! operator type, with the specific function selected by an
-//! [`InstantFnKind`] enum; dispatch is a single `match` per cell.
+//! [`InstantFnKind`] enum; dispatch is a single `match` per batch.
 //!
 //! Because the transformation is cell-for-cell, the child's series schema
 //! and step grid pass through unchanged. The operator never rearranges
@@ -184,25 +184,14 @@ impl InstantFnKind {
             Self::Asinh => v.asinh(),
             Self::Acosh => v.acosh(),
             Self::Atanh => v.atanh(),
-            Self::Deg => v.to_degrees(),
-            Self::Rad => v.to_radians(),
-            Self::Sgn => {
-                // Prometheus semantics: -1, 0, +1; NaN passes through.
-                if v.is_nan() {
-                    f64::NAN
-                } else if v > 0.0 {
-                    1.0
-                } else if v < 0.0 {
-                    -1.0
-                } else {
-                    0.0
-                }
-            }
+            Self::Deg => deg(v),
+            Self::Rad => rad(v),
+            Self::Sgn => sgn(v),
             Self::Round { to_nearest } => round_to_nearest(v, to_nearest),
             Self::Clamp { min, max } => clamp_nan_aware(v, min, max),
             Self::ClampMin { min } => max_nan_aware(v, min),
             Self::ClampMax { max } => min_nan_aware(v, max),
-            Self::Timestamp => step_timestamp_ms as f64 / 1000.0,
+            Self::Timestamp => timestamp_seconds(step_timestamp_ms),
             Self::Year => datetime_from_seconds(v)
                 .map(|dt| dt.year() as f64)
                 .unwrap_or(f64::NAN),
@@ -265,6 +254,19 @@ fn days_in_month(dt: DateTime<Utc>) -> u32 {
         .num_days() as u32
 }
 
+/// Prometheus' `v * 180 / math.Pi`; `to_degrees` multiplies by the
+/// folded constant, which can round differently.
+#[inline]
+fn deg(v: f64) -> f64 {
+    v * 180.0 / std::f64::consts::PI
+}
+
+/// Prometheus' `v * math.Pi / 180`.
+#[inline]
+fn rad(v: f64) -> f64 {
+    v * std::f64::consts::PI / 180.0
+}
+
 /// `round(v, to_nearest)` — ported from
 /// `timeseries/src/promql/functions.rs:216-223`. Matches Prometheus'
 /// half-up rounding: `(v * inv + 0.5).floor() / inv`.
@@ -309,6 +311,100 @@ fn clamp_nan_aware(v: f64, min: f64, max: f64) -> f64 {
     max_nan_aware(min_nan_aware(v, max), min)
 }
 
+#[inline]
+fn timestamp_seconds(ms: i64) -> f64 {
+    ms as f64 / 1000.0
+}
+
+/// Prometheus semantics: -1, 0, +1; NaN passes through.
+#[inline]
+fn sgn(v: f64) -> f64 {
+    if v.is_nan() {
+        f64::NAN
+    } else if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// `kind` applied to every cell, valid or not, for kinds that are total
+/// over `f64` (no panics, no per-cell state). `None` for the calendar and
+/// histogram kinds, which must only see valid cells.
+fn map_total(
+    kind: InstantFnKind,
+    input: &[f64],
+    step_ts: &[i64],
+    source_ts: Option<&[i64]>,
+    series_count: usize,
+) -> Option<Vec<f64>> {
+    #[inline(always)]
+    fn map(input: &[f64], f: impl Fn(f64) -> f64) -> Vec<f64> {
+        input.iter().map(|&v| f(v)).collect()
+    }
+    use InstantFnKind as K;
+    Some(match kind {
+        K::Abs => map(input, f64::abs),
+        K::Ceil => map(input, f64::ceil),
+        K::Floor => map(input, f64::floor),
+        K::Exp => map(input, f64::exp),
+        K::Ln => map(input, f64::ln),
+        K::Log2 => map(input, f64::log2),
+        K::Log10 => map(input, f64::log10),
+        K::Sqrt => map(input, f64::sqrt),
+        K::Sin => map(input, f64::sin),
+        K::Cos => map(input, f64::cos),
+        K::Tan => map(input, f64::tan),
+        K::Asin => map(input, f64::asin),
+        K::Acos => map(input, f64::acos),
+        K::Atan => map(input, f64::atan),
+        K::Sinh => map(input, f64::sinh),
+        K::Cosh => map(input, f64::cosh),
+        K::Tanh => map(input, f64::tanh),
+        K::Asinh => map(input, f64::asinh),
+        K::Acosh => map(input, f64::acosh),
+        K::Atanh => map(input, f64::atanh),
+        K::Deg => map(input, deg),
+        K::Rad => map(input, rad),
+        K::Sgn => map(input, sgn),
+        K::Round { to_nearest } => map(input, |v| round_to_nearest(v, to_nearest)),
+        K::Clamp { min, max } => map(input, |v| clamp_nan_aware(v, min, max)),
+        K::ClampMin { min } => map(input, |v| max_nan_aware(v, min)),
+        K::ClampMax { max } => map(input, |v| min_nan_aware(v, max)),
+        K::Timestamp => match source_ts {
+            Some(ts) => ts[..input.len()]
+                .iter()
+                .map(|&ms| timestamp_seconds(ms))
+                .collect(),
+            None => {
+                let mut values = Vec::with_capacity(input.len());
+                for &step_ms in step_ts {
+                    values.extend(std::iter::repeat_n(
+                        timestamp_seconds(step_ms),
+                        series_count,
+                    ));
+                }
+                values
+            }
+        },
+        K::Year
+        | K::Month
+        | K::DayOfMonth
+        | K::DayOfYear
+        | K::DayOfWeek
+        | K::Hour
+        | K::Minute
+        | K::DaysInMonth
+        | K::HistogramCount
+        | K::HistogramSum
+        | K::HistogramAvg
+        | K::HistogramStddev
+        | K::HistogramStdvar => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Memory-accounted output buffer (values only — validity is pointer-cloned)
 // ---------------------------------------------------------------------------
@@ -330,14 +426,25 @@ struct OutValues {
 
 impl OutValues {
     fn allocate(reservation: &MemoryReservation, cells: usize) -> Result<Self, QueryError> {
-        let bytes = values_bytes(cells);
-        reservation.try_grow(bytes)?;
         // NaN-fill so accidental reads of invalid cells surface as NaN
         // rather than zero — matches the 3a.1 convention.
+        Self::with_values(reservation, cells, || vec![f64::NAN; cells])
+    }
+
+    /// Charges `cells` values before `build` allocates them.
+    fn with_values(
+        reservation: &MemoryReservation,
+        cells: usize,
+        build: impl FnOnce() -> Vec<f64>,
+    ) -> Result<Self, QueryError> {
+        let bytes = values_bytes(cells);
+        reservation.try_grow(bytes)?;
+        let values = build();
+        debug_assert_eq!(values.len(), cells);
         Ok(Self {
             reservation: reservation.clone(),
             bytes,
-            values: vec![f64::NAN; cells],
+            values,
         })
     }
 
@@ -402,12 +509,11 @@ impl<C: Operator> InstantFnOp<C> {
 
     fn apply_batch(&self, batch: StepBatch) -> Result<StepBatch, QueryError> {
         let cell_count = batch.len();
-        let mut out = OutValues::allocate(&self.reservation, cell_count)?;
 
         if let InstantFnKind::Clamp { min, max } = self.kind
             && min > max
         {
-            let values = out.finish();
+            let values = OutValues::allocate(&self.reservation, cell_count)?.finish();
             return Ok(StepBatch::new(
                 batch.step_timestamps.clone(),
                 batch.step_range.clone(),
@@ -419,6 +525,7 @@ impl<C: Operator> InstantFnOp<C> {
         }
 
         if self.kind.reads_histograms_only() {
+            let mut out = OutValues::allocate(&self.reservation, cell_count)?;
             let mut validity = BitSet::with_len(cell_count);
             if let Some(cells) = &batch.histograms {
                 for (idx, cell) in cells.iter().enumerate() {
@@ -444,25 +551,27 @@ impl<C: Operator> InstantFnOp<C> {
         let series_count = batch.series_count();
         let step_ts = batch.step_timestamps_slice();
 
-        // Iterate cells in row-major (step, series) order — matches
-        // `StepBatch`'s layout. Only touch valid cells; invalid cells
-        // keep the NaN fill and the pointer-cloned validity bit clear.
-        // `timestamp()` prefers the source-sample timestamp when the
-        // input batch carries one (RFC 0007 §6.3.7); all other kinds
-        // ignore the column.
+        // Total kinds run over every cell of the row-major `values` in one
+        // loop per kind; the rest (calendar functions) only touch valid
+        // cells. Either way invalid cells end up with the NaN fill and the
+        // pointer-cloned validity bit clear. `timestamp()` prefers the
+        // source-sample timestamp when the input batch carries one (RFC
+        // 0007 §6.3.7); all other kinds ignore the column.
         let source_ts: Option<&[i64]> = batch.source_timestamps.as_deref();
-        for (step_off, &step_ms) in step_ts.iter().enumerate().take(batch.step_count()) {
-            for series_off in 0..series_count {
-                let idx = step_off * series_count + series_off;
-                if batch.validity.get(idx) {
-                    let per_cell_ts = match (self.kind, source_ts) {
-                        (InstantFnKind::Timestamp, Some(ts)) => ts[idx],
-                        _ => step_ms,
-                    };
-                    out.values[idx] = self.kind.compute(batch.values[idx], per_cell_ts);
-                }
-            }
-        }
+        let input = &batch.values[..cell_count];
+        let kind = self.kind;
+        let mut out = OutValues::with_values(&self.reservation, cell_count, || {
+            map_total(kind, input, step_ts, source_ts, series_count).unwrap_or_else(|| {
+                let mut values = vec![f64::NAN; cell_count];
+                batch
+                    .validity
+                    .for_each_set(|idx| values[idx] = kind.compute(input[idx], 0));
+                values
+            })
+        })?;
+        batch
+            .validity
+            .for_each_clear(|idx| out.values[idx] = f64::NAN);
 
         // Only `timestamp()` accepts histogram samples; every other
         // function drops them, which clearing the column achieves.

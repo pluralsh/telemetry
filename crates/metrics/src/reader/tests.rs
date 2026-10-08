@@ -256,6 +256,7 @@ async fn slatedb_writer_and_reader_coexist_no_fencing() {
         flush_interval: Duration::from_secs(60),
         retention: None,
         write_buffer: Default::default(),
+        query_cache: Default::default(),
     })
     .await
     .unwrap();
@@ -389,6 +390,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         flush_interval: Duration::from_secs(60),
         retention: None,
         write_buffer: Default::default(),
+        query_cache: Default::default(),
     })
     .await
     .unwrap();
@@ -413,6 +415,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         flush_interval: Duration::from_secs(60),
         retention: None,
         write_buffer: Default::default(),
+        query_cache: Default::default(),
     })
     .await
     .unwrap();
@@ -573,6 +576,7 @@ async fn should_open_reader_pinned_to_checkpoint() {
         flush_interval: Duration::from_secs(60),
         retention: None,
         write_buffer: Default::default(),
+        query_cache: Default::default(),
     })
     .await
     .unwrap();
@@ -655,6 +659,148 @@ async fn should_open_reader_pinned_to_checkpoint() {
             assert_eq!(samples[0].timestamp_ms, 1700000002000);
         }
         _ => panic!("expected Vector, got {:?}", post),
+    }
+}
+
+#[tokio::test]
+async fn should_cache_found_forward_index_entries_across_queries() {
+    // given
+    let shared = create_shared_storage().await;
+    let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+    let series: Vec<Series> = (0..12)
+        .map(|i| {
+            Series::builder("cached_metric")
+                .label("instance", format!("i-{i}"))
+                .sample(1700000000000, i as f64)
+                .build()
+        })
+        .collect();
+    tsdb.ingest_samples(series, None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+    let ns = crate::Namespace::default();
+    let query_reader = reader
+        .make_query_reader_for_ranges(&ns, &[(1700000000, 1700000000)])
+        .await
+        .unwrap();
+    let bucket = query_reader.list_buckets().await.unwrap()[0];
+    let ids: Vec<SeriesId> = (0..12).collect();
+
+    // when
+    let first = query_reader
+        .forward_index_many(&bucket, &ids)
+        .await
+        .unwrap();
+    let missing = query_reader.forward_index_one(&bucket, 999).await.unwrap();
+    let second = query_reader
+        .forward_index_many(&bucket, &ids)
+        .await
+        .unwrap();
+
+    // then
+    let labels = |specs: &[Option<crate::index::SeriesSpec>]| -> Vec<crate::model::Labels> {
+        specs
+            .iter()
+            .map(|spec| spec.as_ref().expect("series spec").labels.clone())
+            .collect()
+    };
+    assert_eq!(labels(&first), labels(&second));
+    assert!(missing.is_none());
+    assert_eq!(reader.forward_cache.cached(&ns, bucket), ids);
+}
+
+#[tokio::test]
+async fn should_see_new_series_in_a_bucket_whose_postings_are_cached() {
+    // given: a reader that has cached the postings of a one-series metric
+    let shared = create_shared_storage().await;
+    let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+    let series = |instance: &str| {
+        Series::builder("cached_postings")
+            .label("instance", instance)
+            .sample(1700000000000, 1.0)
+            .build()
+    };
+    tsdb.ingest_samples(vec![series("a")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+    let ns = crate::Namespace::default();
+    let at = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000));
+    let count = || async {
+        match reader
+            .query(&ns, r#"count(cached_postings{instance!="z"})"#, at)
+            .await
+            .unwrap()
+        {
+            QueryValue::Vector(samples) => samples.first().map_or(0.0, |s| s.value),
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    };
+    assert_eq!(count().await, 1.0);
+
+    // when: a second series lands in the same bucket
+    tsdb.ingest_samples(vec![series("b")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    // then: it becomes visible once the reader's view advances
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while count().await != 2.0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "new series stayed hidden behind cached postings"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn should_cache_selector_results_and_drop_them_when_the_bucket_gains_series() {
+    // given: a reader that resolved a selector once
+    let shared = create_shared_storage().await;
+    let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+    let series = |instance: &str| {
+        Series::builder("cached_selector")
+            .label("instance", instance)
+            .sample(1700000000000, 1.0)
+            .build()
+    };
+    tsdb.ingest_samples(vec![series("a")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+    let reader = TimeSeriesDbReader::from_storage(shared.reader().await)
+        .with_matcher_cache_capacity(1024 * 1024);
+    let ns = crate::Namespace::default();
+    let at = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000));
+    let query = r#"count(cached_selector{instance=~"a|b"})"#;
+    let count = || async {
+        match reader.query(&ns, query, at).await.unwrap() {
+            QueryValue::Vector(samples) => samples.first().map_or(0.0, |s| s.value),
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    };
+    assert_eq!(count().await, 1.0);
+    let cache = reader.postings_caches.get(&ns).unwrap().clone();
+    let bucket =
+        TimeBucket::round_to_hour(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000))
+            .unwrap();
+    let key = crate::postings_cache::selector_key([
+        ("__name__", "=", "cached_selector"),
+        ("instance", "=~", "a|b"),
+    ]);
+    let hit = cache.selector(bucket, &key, cache.read_seq()).await;
+    assert_eq!(hit.map(|ids| ids.len()), Some(1));
+    assert_eq!(count().await, 1.0);
+
+    // when: a second matching series lands in the same bucket
+    tsdb.ingest_samples(vec![series("b")], None).await.unwrap();
+    tsdb.flush().await.unwrap();
+
+    // then: the reader's watermark probe invalidates the cached selector
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while count().await != 2.0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "new series stayed hidden behind the cached selector"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

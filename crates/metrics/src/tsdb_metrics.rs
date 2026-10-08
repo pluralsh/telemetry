@@ -16,14 +16,12 @@ pub(crate) const TSDB_ACTIVE_SERIES: &str = "tsdb_active_series";
 //
 // Existing `tsdb_flush_duration_seconds` covers the whole flush; the
 // constants below split it into its phases so a slow flush can be attributed
-// to a specific phase (op-building vs. SlateDB apply vs. snapshot refresh).
+// to a specific phase (op-building vs. SlateDB apply).
 
 pub(crate) const TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS: &str =
     "tsdb_flush_build_ops_duration_seconds";
 pub(crate) const TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS: &str =
     "tsdb_flush_storage_apply_duration_seconds";
-pub(crate) const TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS: &str =
-    "tsdb_flush_storage_snapshot_duration_seconds";
 
 pub(crate) const TSDB_FLUSH_OPS: &str = "tsdb_flush_ops";
 pub(crate) const TSDB_FLUSH_ESTIMATED_BYTES: &str = "tsdb_flush_estimated_bytes";
@@ -34,6 +32,7 @@ pub(crate) const TSDB_FLUSH_SAMPLES: &str = "tsdb_flush_samples";
 
 pub(crate) const TSDB_QUERIES: &str = "tsdb_queries_total";
 pub(crate) const TSDB_QUERY_DURATION_SECONDS: &str = "tsdb_query_duration_seconds";
+pub(crate) const TSDB_RESULT_CACHE_STEPS: &str = "tsdb_result_cache_steps_total";
 
 // ── Ingest consumer ──
 
@@ -75,10 +74,6 @@ pub(crate) fn describe_engine_metrics() {
         "Time spent in Storage::apply during a delta flush (seconds). Indicates SlateDB write backpressure."
     );
     metrics::describe_histogram!(
-        TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS,
-        "Time spent refreshing the post-apply storage snapshot (seconds)"
-    );
-    metrics::describe_histogram!(
         TSDB_FLUSH_OPS,
         "Number of storage ops produced by a single delta flush"
     );
@@ -98,6 +93,10 @@ pub(crate) fn describe_engine_metrics() {
     metrics::describe_histogram!(
         TSDB_QUERY_DURATION_SECONDS,
         "PromQL query evaluation duration in seconds"
+    );
+    metrics::describe_counter!(
+        TSDB_RESULT_CACHE_STEPS,
+        "Range-query steps served from the result cache (outcome=reused) or evaluated (outcome=computed)"
     );
     metrics::describe_counter!(
         TSDB_INGEST_ENTRIES_SKIPPED,

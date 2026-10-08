@@ -261,6 +261,10 @@ pub enum LogicalPlan {
     Absent {
         labels: Labels,
         child: Box<LogicalPlan>,
+        /// `absent_over_time`: the `count_over_time` child only stands in
+        /// for presence, so it keeps `__name__` and series that share a
+        /// labelset without it are not a collision.
+        over_time: bool,
     },
 
     /// `expr[range:step]` — re-grids the child onto an inner step.

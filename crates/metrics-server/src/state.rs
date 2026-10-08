@@ -467,6 +467,12 @@ pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {
         flush_interval: config.write.flush_interval(),
         retention: config.retention_seconds.map(Duration::from_secs),
         write_buffer: config.write.write_buffer(),
+        query_cache: plural_metrics::QueryCacheConfig {
+            matcher_capacity_bytes: config.matcher_cache_capacity_bytes,
+            series_capacity_bytes: config.reader_cache_capacity / 2,
+            result_cache_enabled: config.result_cache.enabled,
+            result_capacity_bytes: config.result_cache.capacity_bytes,
+        },
     }
 }
 

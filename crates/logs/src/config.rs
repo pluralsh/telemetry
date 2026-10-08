@@ -17,11 +17,23 @@ pub struct Config {
     /// requests for whole periods without walking their segments. A whole
     /// multiple of `segment_duration`; `None` disables it.
     pub discovery_rollup: Option<Duration>,
+    /// How long data is kept, counted from ingestion; `None` keeps it
+    /// forever.
     pub retention: Option<Duration>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
     pub write_buffer: WriteCoordinatorConfig,
+    /// Byte budget of the process's cross-query cache of object blocks,
+    /// which keeps each cached block's bodies once a query decompresses
+    /// them. Zero disables it.
+    pub block_cache_capacity_bytes: u64,
 }
+
+/// Default [`Config::block_cache_capacity_bytes`]: 256 MiB.
+pub const DEFAULT_BLOCK_CACHE_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default [`Config::retention`]: 14 days.
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Every write-buffer flush cuts at least one page per written stream; these
 /// limits split larger flushes further.
@@ -65,10 +77,11 @@ impl Default for Config {
             }),
             segment_duration: Duration::from_secs(60 * 60),
             discovery_rollup: Some(Duration::from_secs(24 * 60 * 60)),
-            retention: None,
+            retention: Some(DEFAULT_RETENTION),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),
+            block_cache_capacity_bytes: DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         }
     }
 }
