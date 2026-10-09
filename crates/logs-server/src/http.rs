@@ -23,6 +23,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
+use tower_http::compression::CompressionLayer;
 
 use crate::{AppState, config::NamespaceConfig};
 
@@ -38,7 +39,7 @@ pub fn router(state: AppState) -> Router {
             request.max_decoded_request_bytes,
         )
     };
-    let public = Router::new()
+    let reads = Router::new()
         .route(
             "/read/ns/{namespace}/loki/api/v1/query",
             get(query_get).post(query_post),
@@ -55,7 +56,9 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/read/ns/{namespace}/loki/api/v1/series",
             get(series_get).post(series_post),
-        )
+        );
+    let public = reads
+        .layer(CompressionLayer::new())
         .route(
             "/write/ns/{namespace}/elasticsearch",
             get(elasticsearch::info),

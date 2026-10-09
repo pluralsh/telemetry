@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ops::RangeInclusive,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
 use server_common::http::{check_content_encoding, check_snappy_size, content_type};
+use tower_http::compression::CompressionLayer;
 
 use crate::{config::ServerMode, state::AppState};
 
@@ -62,7 +63,8 @@ pub fn router(state: AppState) -> Router {
             .route("/api/v1/labels", get(labels))
             .route("/api/v1/label/{name}/values", get(label_values))
             .route("/api/v1/metadata", get(metadata))
-            .route("/federate", get(federate));
+            .route("/federate", get(federate))
+            .layer(CompressionLayer::new());
         app = app.nest(
             &format!("{}/read/ns/{{namespace}}", state.config.path_prefix),
             limits(read_routes),
@@ -254,7 +256,7 @@ async fn execute_query(
     .map_err(query_error)?;
     let mut response = plural_metrics::query_value_to_response(Ok(value));
     response.trace = trace;
-    prom_json(response)
+    prom_json(response, "instant")
 }
 
 #[derive(Deserialize)]
@@ -313,7 +315,7 @@ async fn execute_query_range(
     .map_err(query_error)?;
     let mut response = plural_metrics::range_result_to_response(Ok(values));
     response.trace = trace;
-    prom_json(response)
+    prom_json(response, "range")
 }
 
 #[derive(Default, Deserialize)]
@@ -596,8 +598,22 @@ fn time_range(
 /// histograms (`histogram` / `histograms`) and float spellings match upstream.
 /// Serialized straight to bytes: an intermediate `serde_json::Value` costs a
 /// map node and a `String` per point on large range results.
-fn prom_json(response: impl serde::Serialize) -> Result<Response, ApiError> {
+fn prom_json(
+    response: impl serde::Serialize,
+    query_type: &'static str,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
     let body = serde_json::to_vec(&response).map_err(ApiError::internal)?;
+    metrics::histogram!(
+        "telemetry_metrics_response_serialization_seconds",
+        "query_type" => query_type
+    )
+    .record(started.elapsed().as_secs_f64());
+    metrics::counter!(
+        "telemetry_metrics_response_bytes_total",
+        "query_type" => query_type
+    )
+    .increment(body.len() as u64);
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,

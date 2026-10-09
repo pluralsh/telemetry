@@ -11,9 +11,6 @@ import { REPO_URL } from "@/lib/nav";
 
 const SIDEBAR = 272;
 
-const RELEASE = process.env.NEXT_PUBLIC_DOCS_VERSION ?? "";
-const DOCS_VERSION = /^\d+\.\d+\.\d+/.test(RELEASE) ? `v${RELEASE}` : "dev";
-
 function Node({ style }: { style: React.CSSProperties }) {
   return <span aria-hidden className="node hidden lg:block" style={style} />;
 }
@@ -71,7 +68,6 @@ export function DocsShell({ apiNav, children }: { apiNav: ApiNav; children: Reac
             >
               <PluralMark size={20} className="shrink-0 text-ink" />
               <span className="whitespace-nowrap font-serif text-[18px] tracking-[-0.01em] text-ink">Plural Telemetry</span>
-              <span className="hidden whitespace-nowrap font-mono text-[10.5px] text-faint xl:inline">{DOCS_VERSION}</span>
             </Link>
           </div>
 

@@ -49,12 +49,14 @@ tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tonic-otlp = { package = "tonic", version = "0.12" }
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3.23"
 ulid.workspace = true
 utoipa = { version = "6.0.0", features = ["axum_extras"] }
 
 [dev-dependencies]
+flate2 = "1"
 http-body-util = "0.1.5"
 tempfile.workspace = true
 tokio-stream = { version = "0.1.19", features = ["net"] }

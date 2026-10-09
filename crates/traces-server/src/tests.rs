@@ -3,6 +3,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use common::storage::config::StorageConfig;
+use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest,
@@ -11,7 +12,7 @@ use opentelemetry_proto::tonic::{
     trace::v1::{ResourceSpans, ScopeSpans, Span},
 };
 use prost::Message;
-use std::time::Duration;
+use std::{io::Read, time::Duration};
 use tower::ServiceExt;
 
 use crate::{
@@ -73,6 +74,31 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
             .unwrap();
         assert_eq!(response.status(), expected, "{path}");
     }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_responses_support_gzip_compression() {
+    let state = state(ServerMode::Standalone, true).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::get("/read/ns/tenant/api/search")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+
+    let compressed = response.into_body().collect().await.unwrap().to_bytes();
+    let mut decoder = GzDecoder::new(compressed.as_ref());
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+    assert!(response["traces"].is_array());
     state.shutdown().await.unwrap();
 }
 

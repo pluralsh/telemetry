@@ -23,6 +23,7 @@ use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
+use tower_http::compression::CompressionLayer;
 
 use crate::{
     AppState,
@@ -39,8 +40,7 @@ pub fn router(state: AppState) -> Router {
         state.config.request.max_decoded_request_bytes,
     )
     .route_layer(state.ingest.http_layer());
-    let public = Router::new()
-        .merge(writes)
+    let reads = Router::new()
         .route(
             "/read/ns/{namespace}/api/traces/{trace_id}",
             get(trace_by_id),
@@ -69,7 +69,9 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/read/ns/{namespace}/api/metrics/query_range",
             get(metrics_unsupported),
-        );
+        )
+        .layer(CompressionLayer::new());
+    let public = Router::new().merge(writes).merge(reads);
     let app = Router::new()
         .route("/-/healthy", get(|| async { StatusCode::OK }))
         .route("/metrics", get(server_common::runtime::scrape_metrics))

@@ -508,6 +508,7 @@ async fn open(args: &Args) -> TimeSeriesDb {
     };
     TimeSeriesDb::open(Config {
         storage,
+        retention: None,
         ..Default::default()
     })
     .await

@@ -1,4 +1,7 @@
-use std::{io::Write, time::Duration};
+use std::{
+    io::{Read, Write},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -6,7 +9,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::storage::config::StorageConfig;
-use flate2::{Compression, write::GzEncoder};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use http_body_util::BodyExt;
 use opentelemetry_proto::tonic::{
     collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
@@ -87,6 +90,31 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
             .unwrap();
         assert_eq!(response.status(), expected, "{path}");
     }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_responses_support_gzip_compression() {
+    let state = state(vec![namespace("tenant")]).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::get("/read/ns/tenant/loki/api/v1/query?query=1")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+
+    let compressed = response.into_body().collect().await.unwrap().to_bytes();
+    let mut decoder = GzDecoder::new(compressed.as_ref());
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    let response: Value = serde_json::from_str(&decoded).unwrap();
+    assert_eq!(response["status"], "success");
     state.shutdown().await.unwrap();
 }
 

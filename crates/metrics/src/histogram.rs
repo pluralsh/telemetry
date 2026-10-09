@@ -654,23 +654,23 @@ impl FloatHistogram {
 
     /// Every bucket in ascending value order: negative, zero (if populated),
     /// positive.
+    pub(crate) fn buckets(&self) -> impl Iterator<Item = BoundedBucket> + '_ {
+        self.negative
+            .iter()
+            .rev()
+            .map(|b| self.clamp_to_zero_bucket(self.negative_bucket(b)))
+            .chain((self.zero_count > 0.0).then(|| self.zero_bucket()))
+            .chain(
+                self.positive
+                    .iter()
+                    .map(|b| self.clamp_to_zero_bucket(self.positive_bucket(b))),
+            )
+    }
+
+    /// Every bucket in ascending value order: negative, zero (if populated),
+    /// positive.
     pub fn all_buckets(&self) -> Vec<BoundedBucket> {
-        let mut out = Vec::with_capacity(self.negative.len() + self.positive.len() + 1);
-        out.extend(
-            self.negative
-                .iter()
-                .rev()
-                .map(|b| self.clamp_to_zero_bucket(self.negative_bucket(b))),
-        );
-        if self.zero_count > 0.0 {
-            out.push(self.zero_bucket());
-        }
-        out.extend(
-            self.positive
-                .iter()
-                .map(|b| self.clamp_to_zero_bucket(self.positive_bucket(b))),
-        );
-        out
+        self.buckets().collect()
     }
 
     /// Every bucket in descending value order.

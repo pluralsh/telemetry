@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
@@ -9,11 +10,12 @@ use axum::{
     body::Body,
     http::{
         Request as HttpRequest, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
     },
 };
 use base64::Engine;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use prost::Message as _;
 use proto::metrics::internal::v1::internal_writer_server::InternalWriter;
@@ -121,6 +123,33 @@ async fn routes_are_namespaced_and_health_is_not() {
         .status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn query_responses_support_gzip_compression() {
+    let state = AppState::open(test_config(ServerMode::Standalone))
+        .await
+        .unwrap();
+    let response = router(state.clone())
+        .oneshot(
+            HttpRequest::get("/read/ns/alpha/api/v1/query?query=1")
+                .header(ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+
+    let compressed = response.into_body().collect().await.unwrap().to_bytes();
+    let mut decoder = GzDecoder::new(compressed.as_ref());
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+    assert_eq!(response["status"], "success");
+    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]

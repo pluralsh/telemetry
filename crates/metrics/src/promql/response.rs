@@ -298,36 +298,38 @@ struct PromHistogram<'a>(&'a FloatHistogram);
 impl Serialize for PromHistogram<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let h = self.0;
-        let buckets: Vec<_> = h
-            .all_buckets()
-            .into_iter()
-            .filter(|b| b.count != 0.0)
-            .collect();
         let mut s = serializer.serialize_struct("Histogram", 3)?;
         s.serialize_field("count", &PromFloat(h.count))?;
         s.serialize_field("sum", &PromFloat(h.sum))?;
-        if !buckets.is_empty() {
-            let custom = h.uses_custom_buckets();
-            let wire: Vec<WireBucket> = buckets
-                .iter()
-                .map(|b| {
-                    let (lower_inclusive, upper_inclusive) = if custom {
-                        (b.lower == f64::NEG_INFINITY, true)
-                    } else {
-                        (b.lower <= 0.0, b.upper >= 0.0)
-                    };
-                    let rule = match (lower_inclusive, upper_inclusive) {
-                        (false, true) => 0,
-                        (true, false) => 1,
-                        (false, false) => 2,
-                        (true, true) => 3,
-                    };
-                    WireBucket(rule, b.lower, b.upper, b.count)
-                })
-                .collect();
-            s.serialize_field("buckets", &wire)?;
+        if h.buckets().any(|b| b.count != 0.0) {
+            s.serialize_field("buckets", &PromBuckets(h))?;
         }
         s.end()
+    }
+}
+
+struct PromBuckets<'a>(&'a FloatHistogram);
+
+impl Serialize for PromBuckets<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let h = self.0;
+        let custom = h.uses_custom_buckets();
+        let mut seq = serializer.serialize_seq(None)?;
+        for b in h.buckets().filter(|b| b.count != 0.0) {
+            let (lower_inclusive, upper_inclusive) = if custom {
+                (b.lower == f64::NEG_INFINITY, true)
+            } else {
+                (b.lower <= 0.0, b.upper >= 0.0)
+            };
+            let rule = match (lower_inclusive, upper_inclusive) {
+                (false, true) => 0,
+                (true, false) => 1,
+                (false, false) => 2,
+                (true, true) => 3,
+            };
+            seq.serialize_element(&WireBucket(rule, b.lower, b.upper, b.count))?;
+        }
+        seq.end()
     }
 }
 
