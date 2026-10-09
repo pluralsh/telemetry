@@ -508,6 +508,31 @@ func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
 	assertEmptyDir(t, statefulSet.Spec.Template.Spec.Volumes, "cache", cacheSize)
 }
 
+func TestCacheDiskCapacityTracksEffectiveVolume(t *testing.T) {
+	if got, want := CacheDiskCapacity(telemetryv1alpha1.WorkloadSpec{}), int64(18*1024*1024*1024); got != want {
+		t.Fatalf("default cache disk capacity = %d, want %d", got, want)
+	}
+
+	pvcSize := resource.MustParse("100Gi")
+	pvc := telemetryv1alpha1.WorkloadSpec{CacheVolume: &telemetryv1alpha1.VolumeSpec{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: pvcSize},
+			},
+		},
+	}}
+	if got, want := CacheDiskCapacity(pvc), int64(90*1024*1024*1024); got != want {
+		t.Fatalf("PVC cache disk capacity = %d, want %d", got, want)
+	}
+
+	unbounded := telemetryv1alpha1.WorkloadSpec{CacheVolume: &telemetryv1alpha1.VolumeSpec{
+		EmptyDir: &corev1.EmptyDirVolumeSource{},
+	}}
+	if got, want := CacheDiskCapacity(unbounded), int64(10*1024*1024*1024); got != want {
+		t.Fatalf("unbounded emptyDir cache disk capacity = %d, want %d", got, want)
+	}
+}
+
 func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 	metrics := &telemetryv1alpha1.Metrics{
 		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},

@@ -22,11 +22,11 @@ use crate::model::{Label, TimeBucket};
 /// Default weighted capacity of each of the term and label caches.
 const DEFAULT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Buckets expiring (per retention) within this margin are not cached, and
-/// entries live at most [`ENTRY_TTL`] (shorter than the margin), so a cached
-/// posting never outlives the forward-index entries it points at.
+/// Buckets expiring (per retention) within this margin are not cached or
+/// served, so a hot posting cannot remain visible past the records it points
+/// at.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60 * 60);
-const ENTRY_TTL: Duration = Duration::from_secs(30 * 60);
+const ENTRY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Every value of one label with its postings.
 type LabelPostings = Vec<(String, RoaringBitmap)>;
@@ -55,7 +55,7 @@ impl PostingsCache {
             stamps: DashMap::new(),
             terms: Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_live(ENTRY_TTL)
+                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, label): &(TimeBucket, Label), entry: &Versioned<Option<RoaringBitmap>>| {
                         let postings = entry
@@ -69,7 +69,7 @@ impl PostingsCache {
                 .build(),
             labels: Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_live(ENTRY_TTL)
+                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, name): &(TimeBucket, String), entry: &Versioned<LabelPostings>| {
                         let values: usize = entry
@@ -83,7 +83,7 @@ impl PostingsCache {
                 .build(),
             selectors: Cache::builder()
                 .max_capacity(selector_capacity_bytes)
-                .time_to_live(ENTRY_TTL)
+                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, key): &(TimeBucket, Arc<str>), entry: &Versioned<RoaringBitmap>| {
                         weight(key.len() + entry.value.serialized_size())
@@ -131,6 +131,10 @@ impl PostingsCache {
         bucket: TimeBucket,
         term: &Label,
     ) -> Option<Arc<Option<RoaringBitmap>>> {
+        if !self.cacheable(bucket) {
+            self.terms.invalidate(&(bucket, term.clone())).await;
+            return None;
+        }
         let entry = self.terms.get(&(bucket, term.clone())).await?;
         self.fresh(bucket, entry.read_at).then_some(entry.value)
     }
@@ -155,6 +159,12 @@ impl PostingsCache {
         bucket: TimeBucket,
         label_name: &str,
     ) -> Option<Arc<LabelPostings>> {
+        if !self.cacheable(bucket) {
+            self.labels
+                .invalidate(&(bucket, label_name.to_owned()))
+                .await;
+            return None;
+        }
         let entry = self.labels.get(&(bucket, label_name.to_owned())).await?;
         self.fresh(bucket, entry.read_at).then_some(entry.value)
     }
@@ -186,6 +196,10 @@ impl PostingsCache {
         key: &Arc<str>,
         read_at: u64,
     ) -> Option<Arc<RoaringBitmap>> {
+        if !self.cacheable(bucket) {
+            self.selectors.invalidate(&(bucket, Arc::clone(key))).await;
+            return None;
+        }
         let entry = self.selectors.get(&(bucket, Arc::clone(key))).await?;
         (entry.read_at <= read_at && self.fresh(bucket, entry.read_at)).then_some(entry.value)
     }

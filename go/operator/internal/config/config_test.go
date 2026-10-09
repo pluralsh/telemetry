@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
@@ -250,6 +252,32 @@ func TestRenderShardedRoles(t *testing.T) {
 	}
 }
 
+func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Mode: telemetryv1alpha1.MetricsModeSharded,
+			Writer: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+			}},
+			Reader: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+			}},
+		},
+	}
+
+	result, err := Render(Input{Metrics: metrics, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 192") {
+		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
+	}
+	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
+		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
+	}
+}
+
 func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 	logs := &telemetryv1alpha1.Logs{
 		ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
@@ -305,7 +333,8 @@ func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 }
 
 func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
-	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeWriter)
+	diskCapacity := resources.CacheDiskCapacity(telemetryv1alpha1.WorkloadSpec{})
+	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeWriter, diskCapacity)
 	if defaultWriter.BlockCache != nil {
 		t.Fatal("writer storage contains the default data cache")
 	}
@@ -316,13 +345,58 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	spec := telemetryv1alpha1.StorageSpec{
 		BlockCache: &telemetryv1alpha1.CacheSpec{Type: telemetryv1alpha1.CacheFoyerHybrid},
 	}
-	writer := renderStorageConfigForMode(spec, resources.MetricsDescriptor, modeWriter)
+	writer := renderStorageConfigForMode(spec, resources.MetricsDescriptor, modeWriter, diskCapacity)
 	if writer.BlockCache == nil {
 		t.Fatal("writer discarded an explicitly configured data cache")
 	}
-	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone)
+	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone, diskCapacity)
 	if standalone.BlockCache == nil {
 		t.Fatal("standalone storage is missing the default data cache")
+	}
+}
+
+func TestRenderDerivesFoyerCapacityFromReaderPVC(t *testing.T) {
+	size := resource.MustParse("100Gi")
+	metrics := &telemetryv1alpha1.Metrics{Spec: telemetryv1alpha1.MetricsSpec{
+		Mode: telemetryv1alpha1.MetricsModeSharded,
+		Reader: telemetryv1alpha1.WorkloadSpec{CacheVolume: &telemetryv1alpha1.VolumeSpec{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+				},
+			},
+		}},
+	}}
+	result, err := Render(Input{Metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered := string(result.Data[ReaderKey]); !strings.Contains(rendered, "disk_capacity: 96636764160") {
+		t.Fatalf("reader config did not use 90%% of its cache PVC:\n%s", rendered)
+	}
+}
+
+func TestRenderRejectsFoyerCapacityLargerThanVolume(t *testing.T) {
+	size := resource.MustParse("20Gi")
+	diskCapacity := int64(21 * 1024 * 1024 * 1024)
+	metrics := &telemetryv1alpha1.Metrics{Spec: telemetryv1alpha1.MetricsSpec{
+		Config: telemetryv1alpha1.MetricsConfigSpec{Storage: telemetryv1alpha1.StorageSpec{
+			BlockCache: &telemetryv1alpha1.CacheSpec{
+				Type:         telemetryv1alpha1.CacheFoyerHybrid,
+				DiskCapacity: &diskCapacity,
+			},
+		}},
+		Writer: telemetryv1alpha1.WorkloadSpec{CacheVolume: &telemetryv1alpha1.VolumeSpec{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+				},
+			},
+		}},
+	}}
+	_, err := Render(Input{Metrics: metrics})
+	if err == nil || !strings.Contains(err.Error(), "exceeds cache volume capacity") {
+		t.Fatalf("Render() error = %v, want cache volume capacity error", err)
 	}
 }
 

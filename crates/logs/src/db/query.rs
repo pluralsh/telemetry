@@ -611,7 +611,7 @@ impl LogDb {
             streams.retain(|stream| !stream.runs.is_empty());
         }
         let candidates = &candidates;
-        let units = plan_reads(&streams, reverse);
+        let units = plan_reads(&streams, reverse, COALESCE_GAP_BLOCKS);
         let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
         let mut decoded = futures::stream::iter(units)
             .map(move |unit| async move {
@@ -1262,7 +1262,7 @@ struct ReadUnit {
 const COALESCE_GAP_BLOCKS: u32 = 8;
 
 /// Read units of a segment's selected runs, in scan order of their bounds.
-fn plan_reads(streams: &[SegmentStream], reverse: bool) -> Vec<ReadUnit> {
+fn plan_reads(streams: &[SegmentStream], reverse: bool, max_gap_blocks: u32) -> Vec<ReadUnit> {
     let mut by_object = BTreeMap::<ObjectRef, Vec<UnitRun>>::new();
     for stream in streams {
         let fingerprint = stream.labels.fingerprint();
@@ -1298,7 +1298,7 @@ fn plan_reads(streams: &[SegmentStream], reverse: bool) -> Vec<ReadUnit> {
             let end_block = first_block.saturating_add(run.run.blocks);
             let bound = nearest(&run.run);
             match &mut current {
-                Some(unit) if first_block.saturating_sub(unit.end_block) <= COALESCE_GAP_BLOCKS => {
+                Some(unit) if first_block.saturating_sub(unit.end_block) <= max_gap_blocks => {
                     unit.end_block = unit.end_block.max(end_block);
                     unit.bound = if reverse {
                         unit.bound.max(bound)
@@ -1545,7 +1545,9 @@ impl LogDb {
         consume(batches)?;
         // Planned over every run, as the query's page estimate is: dropping
         // counted runs first could split one unit into two and overrun it.
-        let units = plan_reads(&streams, false)
+        // Sample-only metric queries skip line payloads, so one wider range
+        // per object is cheaper than many sparse object-store reads.
+        let units = plan_reads(&streams, false, u32::MAX)
             .into_iter()
             .filter_map(|mut unit| {
                 unit.runs.retain(|run| {
@@ -1774,13 +1776,25 @@ pub(crate) struct ScanTargets {
 }
 
 impl ScanTargets {
-    /// `pages` counts the read units a scan charges to its budget.
-    pub(crate) fn estimate(&self) -> QueryEstimate {
+    /// Estimates distinct objects, planned ranges, and selected run contents.
+    /// Lineless reads coalesce every selected range in an object.
+    pub(crate) fn estimate(&self, lineless: bool) -> QueryEstimate {
         let mut estimate = QueryEstimate::default();
         for (_, streams) in &self.segments {
-            estimate.pages = estimate
-                .pages
-                .saturating_add(plan_reads(streams, false).len());
+            let max_gap_blocks = if lineless {
+                u32::MAX
+            } else {
+                COALESCE_GAP_BLOCKS
+            };
+            let units = plan_reads(streams, false, max_gap_blocks);
+            estimate.read_units = estimate.read_units.saturating_add(units.len());
+            estimate.pages = estimate.pages.saturating_add(
+                units
+                    .iter()
+                    .map(|unit| unit.object)
+                    .collect::<HashSet<_>>()
+                    .len(),
+            );
             for (_, run) in streams.iter().flat_map(|stream| &stream.runs) {
                 estimate.compressed_bytes = estimate
                     .compressed_bytes

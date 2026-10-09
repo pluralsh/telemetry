@@ -133,6 +133,8 @@ impl QueryRequest {
 pub struct QueryOptions {
     pub limit: usize,
     pub direction: Direction,
+    /// Maximum distinct stored objects a planned query may touch. Sparse
+    /// ranges within one object do not each consume another page.
     pub max_pages: usize,
     pub max_concurrency: usize,
     pub max_in_flight_bytes: usize,
@@ -287,6 +289,10 @@ impl<'a> ScanPlan<'a> {
             _ => None,
         }
     }
+
+    pub(crate) fn is_lineless(&self) -> bool {
+        self.lineless.is_some()
+    }
 }
 
 pub(crate) async fn query_databases(
@@ -341,16 +347,22 @@ pub(crate) async fn query_databases(
         .await?;
     let estimates = targets
         .iter()
-        .map(|targets| targets.estimate())
+        .map(|targets| targets.estimate(plan.is_lineless()))
         .collect::<Vec<_>>();
     let total_pages = estimates
         .iter()
         .try_fold(0usize, |total, estimate| total.checked_add(estimate.pages))
         .ok_or_else(|| Error::Query("query page estimate overflow".into()))?;
+    let total_read_units = estimates.iter().try_fold(0usize, |total, estimate| {
+        total.checked_add(estimate.read_units)
+    });
+    let total_read_units =
+        total_read_units.ok_or_else(|| Error::Query("query read-unit estimate overflow".into()))?;
     if total_pages > options.max_pages {
         return Err(Error::Query(format!(
-            "query exceeded max_pages ({})",
-            options.max_pages
+            "query requires {total_pages} pages ({total_read_units} read ranges), exceeding \
+             max_pages ({})",
+            options.max_pages,
         )));
     }
     let stored = stream::iter(databases.into_iter().zip(targets).zip(estimates).map(
@@ -373,7 +385,7 @@ pub(crate) async fn query_databases(
                 plan.load(
                     &database,
                     namespace,
-                    &PageBudget::new(estimate.pages),
+                    &PageBudget::new(estimate.read_units),
                     Some(targets),
                 )
                 .await

@@ -23,9 +23,10 @@ use crate::tsdb::{duration_to_ms, step_read_offsets};
 use crate::{Namespace, tsdb_metrics};
 
 const HOUR_MS: i64 = 3_600_000;
-/// Generations catch every change to stored data; the TTL is a backstop
-/// bounding how long any entry is served.
-const ENTRY_TTL: Duration = Duration::from_secs(30 * 60);
+/// Inactive expressions leave the cache, while frequently reused expressions
+/// remain resident until weighted capacity eviction. Generations catch every
+/// change to the stored data.
+const ENTRY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ResultKey {
@@ -159,7 +160,7 @@ impl ResultCache {
         Self {
             entries: Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_live(ENTRY_TTL)
+                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(|key: &Arc<ResultKey>, entry: &Arc<ResultEntry>| {
                     let bytes = key.expression.len() + entry_bytes(entry);
                     u32::try_from(bytes).unwrap_or(u32::MAX)

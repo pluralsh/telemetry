@@ -1021,7 +1021,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `ioConcurrencyLimit` _integer_ | IOConcurrencyLimit bounds concurrent storage I/O operations per pod. | 128 | Minimum: 1 <br /> |
+| `ioConcurrencyLimit` _integer_ | IOConcurrencyLimit bounds concurrent storage I/O operations per pod. When<br />omitted, the operator infers it from the component's memory request at 96<br />permits per GiB, with a minimum of 128. |  | Minimum: 1 <br /> |
 | `leaseDurationSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
 | `renewIntervalSeconds` _integer_ |  | 5 | Minimum: 1 <br /> |
 

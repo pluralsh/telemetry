@@ -117,12 +117,24 @@ func Render(input Input) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if err := validateCacheVolume(input.Metrics.Spec.Config.Storage, input.Metrics.Spec.Writer, "writer"); err != nil {
+		return Result{}, err
+	}
+	if mode(input.Metrics) == telemetryv1alpha1.MetricsModeSharded {
+		if err := validateCacheVolume(input.Metrics.Spec.Config.Storage, input.Metrics.Spec.Reader, "reader"); err != nil {
+			return Result{}, err
+		}
+	}
 	makeConfig := func(mode string) ([]byte, error) {
+		workload := input.Metrics.Spec.Writer
+		if mode == "reader" {
+			workload = input.Metrics.Spec.Reader
+		}
 		return yaml.Marshal(renderConfig{
 			Mode:                mode,
 			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
 			PathPrefix:          input.Metrics.Spec.Ingress.PathPrefix,
-			Storage:             renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode),
+			Storage:             renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode, resources.CacheDiskCapacity(workload)),
 			RetentionSeconds:    retention,
 			ReaderCacheCapacity: int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, 268435456),
 			CacheWarmer:         renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
@@ -131,7 +143,7 @@ func Render(input Input) (Result, error) {
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
 			},
-			Sharding:   renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, grpcPort(input.Metrics), mode),
+			Sharding:   renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, workload, grpcPort(input.Metrics), mode),
 			Auth:       renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces: namespaces,
 		})
@@ -163,10 +175,13 @@ func Render(input Input) (Result, error) {
 
 func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 	spec := pseudofs.Spec.Config
+	if err := validateCacheVolume(spec.Storage, pseudofs.Spec.Workload, "workload"); err != nil {
+		return Result{}, err
+	}
 	rendered, err := yaml.Marshal(renderPseudoFSConfig{
 		Listener: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(pseudofs)),
 		Filesystem: renderPseudoFSFilesystem{
-			Storage:              renderStorageConfig(spec.Storage, resources.PseudoFSDescriptor),
+			Storage:              renderStorageConfig(spec.Storage, resources.PseudoFSDescriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload)),
 			ChunkSizeBytes:       int64Value(spec.ChunkSizeBytes, 1048576),
 			MaxFileSizeBytes:     int64Value(spec.MaxFileSizeBytes, 1073741824),
 			MaxAppendGenerations: int64Value(spec.MaxAppendGenerations, 64),
@@ -211,8 +226,20 @@ func renderLogs(input Input) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if err := validateCacheVolume(logs.Spec.Config.Storage, logs.Spec.Writer, "writer"); err != nil {
+		return Result{}, err
+	}
+	if resources.Mode(logs) == telemetryv1alpha1.ProductModeSharded {
+		if err := validateCacheVolume(logs.Spec.Config.Storage, logs.Spec.Reader, "reader"); err != nil {
+			return Result{}, err
+		}
+	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := logs.Spec.Config
+		workload := logs.Spec.Writer
+		if component == "reader" {
+			workload = logs.Spec.Reader
+		}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
 			PathPrefix: logs.Spec.Ingress.PathPrefix,
@@ -220,7 +247,7 @@ func renderLogs(input Input) (Result, error) {
 				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(logs)),
 				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(logs)),
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload)),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Page: renderLogsPage{
@@ -237,7 +264,7 @@ func renderLogs(input Input) (Result, error) {
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
-			Sharding: renderShardingConfig(logs.Name, logs.Namespace, spec.Sharding, resources.GRPCPort(logs), component),
+			Sharding: renderShardingConfig(logs.Name, logs.Namespace, spec.Sharding, workload, resources.GRPCPort(logs), component),
 			Request: renderLogsRequest{
 				MaxRequestBytes:             int64Value(spec.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes:      int64Value(spec.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
@@ -307,8 +334,20 @@ func renderTraces(input Input) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if err := validateCacheVolume(traces.Spec.Config.Storage, traces.Spec.Writer, "writer"); err != nil {
+		return Result{}, err
+	}
+	if resources.Mode(traces) == telemetryv1alpha1.ProductModeSharded {
+		if err := validateCacheVolume(traces.Spec.Config.Storage, traces.Spec.Reader, "reader"); err != nil {
+			return Result{}, err
+		}
+	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := traces.Spec.Config
+		workload := traces.Spec.Writer
+		if component == "reader" {
+			workload = traces.Spec.Reader
+		}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
 			PathPrefix: traces.Spec.Ingress.PathPrefix,
@@ -317,7 +356,7 @@ func renderTraces(input Input) (Result, error) {
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(traces)),
 				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload)),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
@@ -330,7 +369,7 @@ func renderTraces(input Input) (Result, error) {
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
-			Sharding:    renderShardingConfig(traces.Name, traces.Namespace, spec.Sharding, resources.GRPCPort(traces), component),
+			Sharding:    renderShardingConfig(traces.Name, traces.Namespace, spec.Sharding, workload, resources.GRPCPort(traces), component),
 			Request:     renderTracesRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, defaultMaxRequestBytes), MaxDecodedRequestBytes: int64Value(spec.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
 			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
 			Auth:        renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
@@ -387,7 +426,19 @@ func emptyAccess() renderAccess {
 	return renderAccess{Read: []renderCredential{}, Write: []renderCredential{}}
 }
 
-func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor) renderStorage {
+func validateCacheVolume(storage telemetryv1alpha1.StorageSpec, workload telemetryv1alpha1.WorkloadSpec, component string) error {
+	cache := storage.BlockCache
+	if cache == nil || cache.Type != telemetryv1alpha1.CacheFoyerHybrid || cache.DiskCapacity == nil {
+		return nil
+	}
+	volumeCapacity, bounded := resources.CacheVolumeCapacity(workload)
+	if bounded && *cache.DiskCapacity > volumeCapacity {
+		return fmt.Errorf("%s block cache diskCapacity %d exceeds cache volume capacity %d", component, *cache.DiskCapacity, volumeCapacity)
+	}
+	return nil
+}
+
+func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, diskCapacity int64) renderStorage {
 	objectType := lo.CoalesceOrEmpty(string(spec.ObjectStore.Type), string(telemetryv1alpha1.ObjectStoreLocal))
 	objectPath := spec.ObjectStore.Path
 	if objectType == string(telemetryv1alpha1.ObjectStoreLocal) {
@@ -400,20 +451,20 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 		ObjectStore:  renderObjectStoreConfig(spec.ObjectStore, objectType, objectPath),
 	}
 	if spec.BlockCache == nil {
-		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(int64(10737418240)), DiskPath: descriptor.CachePath}
+		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(diskCapacity), DiskPath: descriptor.CachePath}
 	} else {
-		result.BlockCache = renderCacheConfig(spec.BlockCache, descriptor.CachePath)
+		result.BlockCache = renderCacheConfig(spec.BlockCache, descriptor.CachePath, diskCapacity)
 	}
 	if spec.MetaCache == nil {
 		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(int64(134217728))}
 	} else {
-		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath)
+		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath, diskCapacity)
 	}
 	return result
 }
 
-func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, mode string) renderStorage {
-	result := renderStorageConfig(spec, descriptor)
+func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, mode string, diskCapacity int64) renderStorage {
+	result := renderStorageConfig(spec, descriptor, diskCapacity)
 	if mode == modeWriter && spec.BlockCache == nil {
 		result.BlockCache = nil
 	}
@@ -454,11 +505,11 @@ func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType,
 	return result
 }
 
-func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath string) *renderCache {
+func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath string, diskCapacity int64) *renderCache {
 	result := &renderCache{Type: string(spec.Type), MemoryCapacity: spec.MemoryCapacity, DiskCapacity: spec.DiskCapacity, DiskPath: spec.DiskPath, Capacity: spec.Capacity, Shards: spec.Shards, WritePolicy: spec.WritePolicy, Flushers: spec.Flushers, BufferPoolSize: spec.BufferPoolSize, SubmitQueueSizeThreshold: spec.SubmitQueueSizeThreshold}
 	if spec.Type == telemetryv1alpha1.CacheFoyerHybrid {
 		result.MemoryCapacity = lo.CoalesceOrEmpty(result.MemoryCapacity, lo.ToPtr(int64(536870912)))
-		result.DiskCapacity = lo.CoalesceOrEmpty(result.DiskCapacity, lo.ToPtr(int64(10737418240)))
+		result.DiskCapacity = lo.CoalesceOrEmpty(result.DiskCapacity, lo.ToPtr(diskCapacity))
 		result.DiskPath = lo.CoalesceOrEmpty(result.DiskPath, defaultCachePath)
 	}
 	if spec.Type == telemetryv1alpha1.CacheFoyerMemory {
@@ -479,8 +530,8 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	}
 }
 
-func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, grpcPort int32, component string) renderSharding {
-	ioConcurrencyLimit := int32Value(spec.IOConcurrencyLimit, 128)
+func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, workload telemetryv1alpha1.WorkloadSpec, grpcPort int32, component string) renderSharding {
+	ioConcurrencyLimit := inferredIOConcurrencyLimit(spec.IOConcurrencyLimit, workload)
 	if component == modeStandalone {
 		shards := int32(1)
 		return renderSharding{
@@ -498,6 +549,27 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 		LeaseDurationSeconds: int64Value(spec.LeaseDurationSeconds, 15),
 		RenewIntervalSeconds: int64Value(spec.RenewIntervalSeconds, 5),
 	}
+}
+
+func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.WorkloadSpec) int32 {
+	if configured != nil {
+		return *configured
+	}
+	const (
+		defaultLimit    = int64(128)
+		maxInt32        = int64(1<<31 - 1)
+		permitsPerGiB   = int64(96)
+		mebibytesPerGiB = int64(1024)
+	)
+	memoryMiB := workload.Resources.Requests.Memory().Value() / (1024 * 1024)
+	inferred := memoryMiB * permitsPerGiB / mebibytesPerGiB
+	if inferred < defaultLimit {
+		return int32(defaultLimit)
+	}
+	if inferred > maxInt32 {
+		return int32(maxInt32)
+	}
+	return int32(inferred)
 }
 
 func mode(metrics *telemetryv1alpha1.Metrics) telemetryv1alpha1.MetricsMode {

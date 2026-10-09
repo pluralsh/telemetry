@@ -102,7 +102,7 @@ impl<V: Clone> SeriesTable<V> {
     }
 }
 
-/// Byte-bounded, TTL-bounded cache of [`SeriesTable`]s.
+/// Byte-bounded cache of [`SeriesTable`]s whose hot entries remain resident.
 pub(crate) struct TableCache<K, V> {
     tables: moka::sync::Cache<K, Arc<SeriesTable<V>>>,
 }
@@ -112,11 +112,11 @@ where
     K: std::hash::Hash + Eq + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    fn new(capacity_bytes: u64, ttl: Duration) -> Self {
+    fn new(capacity_bytes: u64, idle_timeout: Duration) -> Self {
         Self {
             tables: moka::sync::Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_live(ttl)
+                .time_to_idle(idle_timeout)
                 .weigher(|_, table: &Arc<SeriesTable<V>>| {
                     let bytes = table.weighed.load(std::sync::atomic::Ordering::Relaxed);
                     u32::try_from(bytes.max(64)).unwrap_or(u32::MAX)
@@ -166,7 +166,7 @@ pub(crate) struct ForwardIndexCache {
 }
 
 const FORWARD_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
-const FORWARD_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const FORWARD_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn spec_bytes(spec: &SeriesSpec) -> u64 {
     let labels: usize = spec
@@ -180,7 +180,7 @@ fn spec_bytes(spec: &SeriesSpec) -> u64 {
 impl ForwardIndexCache {
     pub(crate) fn new() -> Self {
         Self {
-            specs: TableCache::new(FORWARD_CACHE_CAPACITY_BYTES, FORWARD_CACHE_TTL),
+            specs: TableCache::new(FORWARD_CACHE_CAPACITY_BYTES, FORWARD_CACHE_IDLE_TIMEOUT),
         }
     }
 
@@ -199,8 +199,9 @@ impl ForwardIndexCache {
 /// table per bucket generation. The generation is read before any of the
 /// query's samples, and every flush advances it in the batch that writes
 /// its samples, so an entry never holds data older than its generation's.
-/// Samples that retention drops change no generation; the TTL bounds how
-/// long an entry can still serve them.
+/// Samples are served only while their generation record remains visible, so
+/// retention still makes an expired bucket unreadable even if its decoded
+/// entry remains cached.
 /// Discovery's per-bucket series sets live here too, under the same keys.
 pub(crate) struct SeriesCache {
     series: TableCache<(Namespace, TimeBucket, u64), Arc<SeriesData>>,
@@ -209,7 +210,7 @@ pub(crate) struct SeriesCache {
 
 type SetCacheKey = (Namespace, TimeBucket, u64, Arc<str>);
 
-const SERIES_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const SERIES_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn series_bytes(data: &SeriesData) -> u64 {
     let histograms: usize = data
@@ -229,7 +230,7 @@ impl SeriesCache {
         Self {
             sets: moka::future::Cache::builder()
                 .max_capacity(sets_bytes)
-                .time_to_live(SERIES_CACHE_TTL)
+                .time_to_idle(SERIES_CACHE_IDLE_TIMEOUT)
                 .weigher(
                     |(_, _, _, key): &(_, _, _, Arc<str>), sets: &Arc<[Labels]>| {
                         let labels: usize = sets
@@ -241,7 +242,7 @@ impl SeriesCache {
                     },
                 )
                 .build(),
-            series: TableCache::new(capacity_bytes - sets_bytes, SERIES_CACHE_TTL),
+            series: TableCache::new(capacity_bytes - sets_bytes, SERIES_CACHE_IDLE_TIMEOUT),
         }
     }
 }

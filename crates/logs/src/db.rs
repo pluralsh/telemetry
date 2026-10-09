@@ -128,7 +128,11 @@ impl PageBudget {
 pub(crate) struct QueryEstimate {
     pub compressed_bytes: u64,
     pub lines: u64,
+    /// Distinct stored objects touched by the query.
     pub pages: usize,
+    /// Object block ranges planned for the selected streams. One page may
+    /// require several sparse ranges.
+    pub read_units: usize,
 }
 
 #[derive(Clone, Copy, Debug)]

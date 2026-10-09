@@ -74,6 +74,39 @@ var (
 	defaultMemoryLimit   = resource.MustParse("2Gi")
 )
 
+// CacheDiskCapacity returns the Foyer disk budget for a workload's effective
+// cache volume. Leave ten percent free for filesystem and cache-engine
+// overhead instead of allowing Foyer to fill the mounted volume completely.
+// An unbounded emptyDir has no capacity to derive, so it retains the historical
+// 10 GiB cache budget.
+func CacheDiskCapacity(workload telemetryv1alpha1.WorkloadSpec) int64 {
+	const fallback = int64(10 * 1024 * 1024 * 1024)
+	bytes, bounded := CacheVolumeCapacity(workload)
+	if !bounded {
+		return fallback
+	}
+	return bytes - bytes/10
+}
+
+// CacheVolumeCapacity returns the effective cache volume's configured byte
+// capacity. An emptyDir without a size limit is intentionally unbounded.
+func CacheVolumeCapacity(workload telemetryv1alpha1.WorkloadSpec) (int64, bool) {
+	spec := volumeSpec(workload.CacheVolume, defaultCacheSize)
+	var size *resource.Quantity
+	switch {
+	case spec.PersistentVolumeClaim != nil:
+		if quantity, ok := spec.PersistentVolumeClaim.Resources.Requests[corev1.ResourceStorage]; ok {
+			size = &quantity
+		}
+	case spec.EmptyDir != nil:
+		size = spec.EmptyDir.SizeLimit
+	}
+	if size == nil || size.Sign() <= 0 {
+		return 0, false
+	}
+	return size.Value(), true
+}
+
 type VolumeError struct {
 	Component Component
 	Volume    string

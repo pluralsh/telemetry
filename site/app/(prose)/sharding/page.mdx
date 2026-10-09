@@ -79,5 +79,5 @@ Kubernetes already gives you a CP datastore with watches and compare-and-swap. U
 ## Tuning
 
 - Keep `sharding.renewIntervalSeconds` well below `sharding.leaseDurationSeconds` (defaults 5 and 15).
-- `sharding.ioConcurrencyLimit` (default 128) is a per-pod storage I/O budget, independent of shard count.
+- `sharding.ioConcurrencyLimit` is a per-pod storage I/O budget, independent of shard count. The operator infers 96 permits per GiB of requested memory (minimum 128) unless you set it explicitly.
 - Every forwarding participant must share the internal auth token when `auth.internalTokenSecretRef` is set.

@@ -213,8 +213,9 @@ type WriteSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds < self.leaseDurationSeconds",message="renewIntervalSeconds must be less than leaseDurationSeconds"
 type ShardingSpec struct {
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=128
-	// IOConcurrencyLimit bounds concurrent storage I/O operations per pod.
+	// IOConcurrencyLimit bounds concurrent storage I/O operations per pod. When
+	// omitted, the operator infers it from the component's memory request at 96
+	// permits per GiB, with a minimum of 128.
 	IOConcurrencyLimit *int32 `json:"ioConcurrencyLimit,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=15

@@ -323,9 +323,10 @@ spec:
                   sharding:
                     properties:
                       ioConcurrencyLimit:
-                        default: 128
-                        description: IOConcurrencyLimit bounds concurrent storage
-                          I/O operations per pod.
+                        description: |-
+                          IOConcurrencyLimit bounds concurrent storage I/O operations per pod. When
+                          omitted, the operator infers it from the component's memory request at 96
+                          permits per GiB, with a minimum of 128.
                         format: int32
                         minimum: 1
                         type: integer

@@ -436,7 +436,7 @@ async fn replay_queries(db: &LogDb, namespace: &Namespace, queries: &[ReplayQuer
             .await
             .unwrap();
         let scan_t = started.elapsed();
-        let estimate = targets.estimate();
+        let estimate = targets.estimate(plan.is_lineless());
         let streams = targets
             .segments
             .iter()
@@ -449,7 +449,7 @@ async fn replay_queries(db: &LogDb, namespace: &Namespace, queries: &[ReplayQuer
             .unwrap();
         let read_t = started.elapsed();
         println!(
-            "{} total {:>7.1}ms (fuzz impl {:.0}ms, loki {:.0}ms) | scan_targets {:.1}ms read {:.1}ms rest {:.1}ms | segments {} streams {streams} pages {} ({} compressed bytes) rows {} steps {}",
+            "{} total {:>7.1}ms (fuzz impl {:.0}ms, loki {:.0}ms) | scan_targets {:.1}ms read {:.1}ms rest {:.1}ms | segments {} streams {streams} pages {} read-units {} ({} compressed bytes) rows {} steps {}",
             query.id,
             ms(total),
             query.impl_ms,
@@ -459,6 +459,7 @@ async fn replay_queries(db: &LogDb, namespace: &Namespace, queries: &[ReplayQuer
             ms(total.saturating_sub(scan_t + read_t)),
             plan_segments(db, plan.scan_start, request.end_ns),
             estimate.pages,
+            estimate.read_units,
             estimate.compressed_bytes,
             rows.len(),
             request

@@ -795,7 +795,7 @@ async fn logical_retention_filters_reads_estimates_and_bm25_before_compaction() 
         db.scan_targets(&namespace, 0, 2, &StreamFilter::exact(Vec::new()))
             .await
             .unwrap()
-            .estimate(),
+            .estimate(false),
         QueryEstimate::default()
     );
     let terms = vec!["needle".to_owned()];
@@ -2069,6 +2069,94 @@ async fn lineless_reads_stay_within_the_page_estimate() {
         );
         db.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn page_limit_counts_objects_instead_of_sparse_read_ranges() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    let db = LogDb::open(Config {
+        segment_duration: Duration::from_secs(60),
+        discovery_rollup: None,
+        retention: None,
+        page: PageConfig {
+            target_size_bytes: 1 << 20,
+            max_rows: 1_000,
+            rows_per_block: 1,
+        },
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    let namespace = Namespace::default();
+
+    // Pick labels whose fingerprint order is selected, unselected, selected.
+    // The middle twelve-block run forces two sparse read ranges in one object.
+    let mut candidates = (0..100)
+        .map(|index| {
+            labels(
+                &format!("s{index}"),
+                if index % 2 == 0 { "prod" } else { "dev" },
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(Labels::fingerprint);
+    let selected = candidates
+        .windows(3)
+        .find(|window| {
+            let environment = |labels: &Labels, wanted: &str| {
+                labels
+                    .iter()
+                    .any(|label| label.name == "environment" && label.value == wanted)
+            };
+            environment(&window[0], "prod")
+                && environment(&window[1], "dev")
+                && environment(&window[2], "prod")
+        })
+        .expect("candidate fingerprints contain prod/dev/prod")
+        .to_vec();
+    let batches = selected
+        .into_iter()
+        .map(|labels| {
+            LogBatch::new(
+                labels,
+                (1..=12)
+                    .map(|second| LogEntry::new(second * 1_000_000_000, "line"))
+                    .collect(),
+            )
+        })
+        .collect();
+    db.write(&namespace, batches).await.unwrap();
+
+    let targets = db
+        .scan_targets(
+            &namespace,
+            0,
+            20_000_000_000,
+            &StreamFilter::exact(vec![Label::new("environment", "prod")]),
+        )
+        .await
+        .unwrap();
+    let estimate = targets.estimate(false);
+    assert_eq!(estimate.pages, 1);
+    assert_eq!(estimate.read_units, 2);
+    assert_eq!(targets.estimate(true).read_units, 1);
+
+    let result = db
+        .query(
+            &namespace,
+            &QueryRequest::instant(
+                r#"sum(count_over_time({environment="prod"}[20s]))"#,
+                20_000_000_000,
+            ),
+            QueryOptions {
+                max_pages: 1,
+                ..QueryOptions::default()
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    db.close().await.unwrap();
 }
 
 /// A line of words from a small vocabulary plus a rare request ID, so some
