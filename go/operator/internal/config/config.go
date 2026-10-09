@@ -27,6 +27,7 @@ const (
 	defaultNamespace = "default"
 	modeStandalone   = "standalone"
 	modeWriter       = "writer"
+	modeReader       = "reader"
 )
 
 type Credential struct {
@@ -121,13 +122,13 @@ func Render(input Input) (Result, error) {
 		return Result{}, err
 	}
 	if mode(input.Metrics) == telemetryv1alpha1.MetricsModeSharded {
-		if err := validateCacheVolume(input.Metrics.Spec.Config.Storage, input.Metrics.Spec.Reader, "reader"); err != nil {
+		if err := validateCacheVolume(input.Metrics.Spec.Config.Storage, input.Metrics.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
 		}
 	}
 	makeConfig := func(mode string) ([]byte, error) {
 		workload := input.Metrics.Spec.Writer
-		if mode == "reader" {
+		if mode == modeReader {
 			workload = input.Metrics.Spec.Reader
 		}
 		return yaml.Marshal(renderConfig{
@@ -157,7 +158,7 @@ func Render(input Input) (Result, error) {
 		return Result{}, fmt.Errorf("render metrics config: %w", err)
 	}
 	if writerMode == modeWriter {
-		data[ReaderKey], err = makeConfig("reader")
+		data[ReaderKey], err = makeConfig(modeReader)
 		if err != nil {
 			return Result{}, fmt.Errorf("render reader config: %w", err)
 		}
@@ -230,14 +231,14 @@ func renderLogs(input Input) (Result, error) {
 		return Result{}, err
 	}
 	if resources.Mode(logs) == telemetryv1alpha1.ProductModeSharded {
-		if err := validateCacheVolume(logs.Spec.Config.Storage, logs.Spec.Reader, "reader"); err != nil {
+		if err := validateCacheVolume(logs.Spec.Config.Storage, logs.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
 		}
 	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := logs.Spec.Config
 		workload := logs.Spec.Writer
-		if component == "reader" {
+		if component == modeReader {
 			workload = logs.Spec.Reader
 		}
 		return yaml.Marshal(renderLogsConfig{
@@ -293,7 +294,7 @@ func renderLogs(input Input) (Result, error) {
 		return Result{}, fmt.Errorf("render Logs config: %w", err)
 	}
 	if writerMode == modeWriter {
-		data[ReaderKey], err = makeConfig("reader")
+		data[ReaderKey], err = makeConfig(modeReader)
 		if err != nil {
 			return Result{}, fmt.Errorf("render Logs reader config: %w", err)
 		}
@@ -338,14 +339,14 @@ func renderTraces(input Input) (Result, error) {
 		return Result{}, err
 	}
 	if resources.Mode(traces) == telemetryv1alpha1.ProductModeSharded {
-		if err := validateCacheVolume(traces.Spec.Config.Storage, traces.Spec.Reader, "reader"); err != nil {
+		if err := validateCacheVolume(traces.Spec.Config.Storage, traces.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
 		}
 	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := traces.Spec.Config
 		workload := traces.Spec.Writer
-		if component == "reader" {
+		if component == modeReader {
 			workload = traces.Spec.Reader
 		}
 		return yaml.Marshal(renderTracesConfig{
@@ -385,7 +386,7 @@ func renderTraces(input Input) (Result, error) {
 		return Result{}, fmt.Errorf("render Traces config: %w", err)
 	}
 	if writerMode == modeWriter {
-		data[ReaderKey], err = makeConfig("reader")
+		data[ReaderKey], err = makeConfig(modeReader)
 		if err != nil {
 			return Result{}, fmt.Errorf("render Traces reader config: %w", err)
 		}
