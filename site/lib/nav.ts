@@ -84,6 +84,7 @@ export const OVERVIEW_NAV: NavGroup[] = [
     items: [
       { title: "Architecture", href: "/architecture/" },
       { title: "Epoch sharding", href: "/sharding/" },
+      { title: "Verification", href: "/verification/" },
       { title: "Cost estimates", href: "/cost/" },
     ],
   },

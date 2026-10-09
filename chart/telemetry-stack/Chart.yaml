@@ -1,0 +1,16 @@
+apiVersion: v2
+name: telemetry-stack
+description: Plural Telemetry metrics, logs, traces, and namespace authentication resources
+appVersion: 0.2.0
+version: 0.1.0
+sources:
+  - https://github.com/pluralsh/telemetry
+type: application
+kubeVersion: '>=1.25.0-0'
+keywords:
+  - telemetry
+  - observability
+  - metrics
+  - logs
+  - traces
+home: https://github.com/pluralsh/telemetry

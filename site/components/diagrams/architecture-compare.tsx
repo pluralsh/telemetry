@@ -124,7 +124,7 @@ function Panel({ side, mode, level, q, color, accent }: { side: ArchSide; mode: 
 
 export function ArchitectureCompare({ product = "logs", caption }: { product?: ProductId; caption?: string }) {
   const cfg = ARCH[product];
-  const [mode, setMode] = useState<Mode | "both">("write");
+  const [mode, setMode] = useState<Mode | "both">("both");
   const [level, setLevel] = useState(cfg.defaultLevel);
   const [q, setQ] = useState<"1" | "2" | "3">("2");
   const color = `var(--${product})`;

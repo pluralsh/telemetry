@@ -7,31 +7,38 @@ export const metadata = { title: "Manifesto" };
 <PageHeader
   icon={<TelemetryIcon size={28} />}
   eyebrow="Manifesto · Draft"
-  title="Observability should be cheap and easy."
+  title="Observability should be Cheap"
   lede="Why we're building Plural Telemetry, and the principles every design decision is held to."
 />
 
-<Callout title="This is a living draft">
-  The principles below are settled. The prose around them is a scaffold and will keep evolving.
-</Callout>
+## Rethinking Observability in an Agentic Era
 
-> The most useful telemetry is the telemetry you can afford to keep. Today, most teams sample, drop and expire data because of what it costs, not because they no longer need it.
+Since I've operated significant cloud infrastructure, the most common painpoint were observability bills.  The standard tradeoff was between:
 
-## The bill is the bug
+1. extreme operational toil managing extreme high write throughput telemetry stacks
+2. extreme Datadog bills to manage it for you
 
-Observability spend now commonly rivals compute spend. Vendors price per gigabyte ingested and per million events indexed, which penalizes exactly the behavior you want: instrumenting more and keeping it longer. Self-hosting is supposed to be the escape hatch, but it trades the invoice for a pager. Running a production Loki, Mimir or Tempo means operating a dozen microservices, hash rings, replicated ingesters with write-ahead logs on persistent disks, and several caching tiers.
+Almost everyone picked 2 because not only do they do a great job, but they provided a great product on top.  We think that world has now changed.  There are a few key things that have happened:
 
-We think both options are the wrong shape. Plural Telemetry should cost about what the object storage underneath it costs, plus a small, predictable amount of compute.
+* Agents are going to be the primary consumers of observability data and they just need a programmable REST api to use.  The real value is at the data layer.
+* Observability shaped data is a perfect fit for the new breed of LSM tree backed, object storage native databases, making the prior operational toil much more tractable
 
-## Principles
+We've invested and will continue to invest in both.  [Plural](https://plural.sh) provides a full agentic solution for platform engineering, with observability being a core integration point.  But also
+the Plural Telemetry project is meant to fully push the boundaries of leveraging [Slatedb](https://slatedb.io/) to bring an operationally simple observability database toolkit on top of vanilla K8s and object storage.
+
+The goal is all you should need to get high quality, fast telemetry is 3 yaml blobs, an s3 bucket and a small AWS bill.
+
+## Key Design Principles
 
 ### 1. Object storage is the database
 
-S3-class storage is the cheapest, most durable, most scalable storage most organizations have. We treat it as the system of record, not a cold tier. Through [SlateDB](https://slatedb.io), writes go to a bucket, and local disks are disposable caches. There's no replication factor to tune and no cross-zone replication traffic to pay for.
+S3 provides infinite durable storage, and slatedb manages storage tiering into NVMe for warm caching.  This allows a simple reader/writer architecture, and infinite scalability. 
 
 ### 2. Fewer moving parts
 
-Every component is something you have to size, upgrade, monitor and debug at 3 a.m. Plural Telemetry has two: **writers** and **readers**. There is no distributor tier, no ingester ring, no query scheduler, and no memcached fleet. When you need more throughput you add writers. When you need more query capacity you add readers.
+The existing solutions all have operational warts, the LGTM stack has an seriously complex microservices architecture, need for external caching in memcached, and terrible tail latencies.  VictoriaMetrics still requires manually managing durable storage, alongside its own sharding complexities.
+
+Plural Telemetry is straightforward - you scale sharded writers to match ingest, and scale readers to match reads.  Everything else synchronizeed from a single s3 bucket.
 
 ### 3. Compatible by default
 

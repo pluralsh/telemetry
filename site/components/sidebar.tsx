@@ -22,18 +22,6 @@ export function Sidebar({ apiNav, onNavigate }: { apiNav: ApiNav; onNavigate?: (
 
   return (
     <nav className="flex flex-col text-[13.5px] tracking-[-0.2px]">
-      <div className="flex items-center gap-3 border-b border-line px-5 py-5">
-        <SpaceIcon space={space} size={28} />
-        <div className="min-w-0">
-          <div className="font-serif text-[17px] leading-tight text-ink">
-            {space === "overview" ? "Plural Telemetry" : PRODUCTS[space].name}
-          </div>
-          <div className="eyebrow mt-0.5 truncate">
-            {space === "overview" ? "Documentation" : `${PRODUCTS[space].peerLong}-compatible`}
-          </div>
-        </div>
-      </div>
-
       <div className="flex flex-col gap-7 px-5 py-6">
         {groups.map((g) => (
           <div key={g.title}>

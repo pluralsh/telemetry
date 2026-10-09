@@ -1,0 +1,27 @@
+{{- $root := . -}}
+{{- range $kind, $product := .Values.products }}
+{{- if $product.enabled }}
+{{- range $auth := $product.authentications }}
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: {{ required (printf "products.%s.authentications[].name is required" $kind) $auth.name }}
+  labels:
+    {{- include "telemetry-stack.labels" $root | nindent 4 }}
+spec:
+  dataStoreRef:
+    kind: {{ title $kind }}
+    name: {{ $product.name }}
+  namespace: {{ required (printf "products.%s.authentications[].namespace is required" $kind) $auth.namespace }}
+  username: {{ required (printf "products.%s.authentications[].username is required" $kind) $auth.username }}
+  permission: {{ required (printf "products.%s.authentications[].permission is required" $kind) $auth.permission }}
+  secretKeyRef:
+    name: {{ default $root.Values.authSecret.name (dig "secretKeyRef" "name" "" $auth) }}
+    key: {{ default $root.Values.authSecret.passwordKey (dig "secretKeyRef" "key" "" $auth) }}
+  {{- with $auth.usageReportingEndpoint }}
+  usageReportingEndpoint: {{ . }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

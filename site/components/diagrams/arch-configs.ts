@@ -173,7 +173,7 @@ export const ARCH: Record<ProductId, ArchConfig> = {
     levelLabel: "Ingest",
     levels: ["100 GB/day", "500 GB/day", "1 TB/day", "2 TB/day", "5 TB/day", "10 TB/day"],
     defaultLevel: 4,
-    ours: ours("logs", "Alloy · OTel · Fluent Bit", [1, 1, 1, 2, 5, 9], [1, 1, 2, 2, 3, 5]),
+    ours: ours("logs", "Alloy · OTel · Fluent Bit", [1, 1, 1, 1, 3, 5], [1, 1, 2, 2, 2, 3]),
     peer: peer({
       name: "Grafana Loki",
       subtitle: "microservices mode",

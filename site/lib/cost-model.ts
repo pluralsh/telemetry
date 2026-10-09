@@ -26,6 +26,10 @@ const SECONDS = HOURS * 3600;
 const PUT_PER_1K = 0.005;
 const GET_PER_1K = 0.0004;
 const GP3_GB_MONTH = 0.08;
+const WRITER_VCPU = 8;
+const READER_VCPU = 4;
+const WRITER_MIB_PER_SECOND = 40;
+const WRITER_UTILIZATION = 0.85;
 
 export type Line = { label: string; usd: number; detail: string };
 export type Estimate = { name: string; total: number; lines: Line[]; footprint?: string };
@@ -46,10 +50,12 @@ export function estimate(i: CostInputs): Estimate[] {
   const wireGbDay = i.gbPerDay / 3; // snappy/gzip on the wire
 
   // ---- Plural Telemetry ----
-  const writerMBs = 20 * 1.048576 * 0.65; // 20 MiB/s per 8-vCPU writer at 65% headroom
+  const writerMBs = WRITER_MIB_PER_SECOND * 1.048576 * WRITER_UTILIZATION;
   const writers = Math.max(1, Math.ceil(peakMBs / writerMBs));
-  const readers = Math.max(2, Math.ceil(writers / 2) + 1);
-  const oursVcpu = (writers + readers) * 8;
+  const readers = Math.max(2, Math.ceil(writers / 3));
+  const writerVcpu = writers * WRITER_VCPU;
+  const readerVcpu = readers * READER_VCPU;
+  const oursVcpu = writerVcpu + readerVcpu;
   const oursPuts = writers * 10 * SECONDS + ((storedGb / i.retentionDays) * DAYS * 1000 * 6) / 64; // WAL + SST/compaction
   const oursGets = readers * 50 * SECONDS;
   const fwdFraction = writers > 1 ? (writers - 1) / writers : 0;
@@ -57,9 +63,9 @@ export function estimate(i: CostInputs): Estimate[] {
 
   const ours: Estimate = {
     name: "Plural Telemetry",
-    footprint: `${writers} writers + ${readers} readers × 8 vCPU`,
+    footprint: `${writers} writers × ${WRITER_VCPU} vCPU + ${readers} readers × ${READER_VCPU} vCPU`,
     lines: [
-      { label: "Compute", usd: oursVcpu * vcpuMonth, detail: `${oursVcpu} vCPU` },
+      { label: "Compute", usd: oursVcpu * vcpuMonth, detail: `${writerVcpu} writer + ${readerVcpu} reader vCPU` },
       { label: "Object storage", usd: storedGb * 1.1 * i.s3GbMonth, detail: `${Math.round(storedGb * 1.1).toLocaleString()} GB incl. index` },
       { label: "Object requests", usd: (oursPuts / 1000) * PUT_PER_1K + (oursGets / 1000) * GET_PER_1K, detail: "WAL, SST, compaction, cache misses" },
       { label: "Cross-AZ traffic", usd: oursXaz, detail: "shard forwarding only" },

@@ -1,0 +1,21 @@
+{{- $root := . -}}
+{{- range $kind, $product := .Values.products }}
+{{- if $product.enabled }}
+{{- $spec := deepCopy $product.spec }}
+{{- $config := deepCopy (default dict (get $spec "config")) }}
+{{- $storage := mergeOverwrite (deepCopy $root.Values.global.storage) (deepCopy (default dict (get $config "storage"))) }}
+{{- $_ := set $config "storage" $storage }}
+{{- $_ := set $spec "config" $config }}
+{{- $ingress := mergeOverwrite (deepCopy $root.Values.global.ingress) (deepCopy (default dict (get $spec "ingress"))) }}
+{{- $_ := set $spec "ingress" $ingress }}
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: {{ title $kind }}
+metadata:
+  name: {{ $product.name }}
+  labels:
+    {{- include "telemetry-stack.labels" $root | nindent 4 }}
+spec:
+  {{- toYaml $spec | nindent 2 }}
+{{- end }}
+{{- end }}

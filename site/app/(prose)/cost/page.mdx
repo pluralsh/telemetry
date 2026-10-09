@@ -41,8 +41,8 @@ The default scenario is a mid-to-large platform team:
 | Input | Value | Source |
 | --- | --- | --- |
 | Compute | $0.0408 per vCPU-hour, memory included | m7g.2xlarge: 8 vCPU / 32 GiB at $0.3264/h |
-| Plural Telemetry writer throughput | 20 MiB/s per 8-vCPU writer, run at 65% | Midpoint of the [provisional envelope](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md) |
-| Plural Telemetry readers | ½ the writer count + 1, at least 2 | Moderate query load |
+| Plural Telemetry writer throughput | 40 MiB/s per 8-vCPU writer, sized at 85% of that rate at peak | One-third of SlateDB's [120 MiB/s sustained-ingest result](https://benchmark.slatedb.io/0.15.0/workload/sustained-ingest/), with 15% peak headroom |
+| Plural Telemetry readers | 4 vCPU each; 1 per 3 writers, at least 2 | Moderate query load; readers do not perform ingestion or compaction |
 | Loki distributor | 1 vCPU per 10 MB/s at peak | Grafana sizing guidance |
 | Loki ingester | 1 vCPU per 4 MB/s, ×3 replicas | RF=3 |
 | Loki query path | 60% of Plural Telemetry's total compute | Generous to Loki |

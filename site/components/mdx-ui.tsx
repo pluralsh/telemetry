@@ -54,25 +54,15 @@ export function ProductCards() {
 export function Hero() {
   return (
     <header className="not-prose relative mb-10">
-      <Link
-        href="/manifesto/"
-        className="mb-10 flex w-fit items-center gap-2 border-y border-line py-1.5 pr-1 text-[13.5px] tracking-[-0.2px] text-ink"
-        style={{ backgroundImage: "linear-gradient(90deg, color-mix(in srgb, var(--accent) 9%, transparent), transparent)" }}
-      >
-        <span className="pl-2 font-serif tracking-wide text-accent-text">Manifesto:</span>
-        <span className="font-serif">why observability should cost less than the thing it observes</span>
-        <ArrowRight />
-      </Link>
       <h1 className="font-serif text-[2.9rem] font-light leading-[1.08] tracking-[-0.025em] text-ink sm:text-[3.4rem]">
-        Observability should be{" "}
-        <em className="font-light text-accent-text">cheap</em> and <em className="font-light text-accent-text">easy</em>.
+        Unbelievably <em className="font-light text-accent-text">Simple</em> Observability
       </h1>
       <p className="mt-6 max-w-[600px] text-[16px] leading-[1.6] tracking-[-0.4px] text-fg">
-        Plural Telemetry is a Rust reimplementation of Prometheus, Loki and Tempo, built directly on object storage with{" "}
+        Plural Telemetry is a Rust reimplementation of Prometheus, Loki and Tempo, built with{" "}
         <a href="https://slatedb.io" className="text-ink underline decoration-line-strong underline-offset-4 hover:decoration-ink">
           SlateDB
         </a>
-        . You run two kinds of pods instead of ten, keep your Grafana dashboards, and the only stateful dependency is a bucket.
+        {" "}and designed to work seamlessly on Kubernetes at any scale.
       </p>
       <div className="mt-8 flex flex-wrap items-center gap-2.5">
         <Link href="/installation/" className="btn btn-primary">

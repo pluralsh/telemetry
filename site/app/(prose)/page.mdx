@@ -5,13 +5,9 @@ export const metadata = { title: "Introduction" };
 
 <Hero />
 
-## What's inside
-
-Plural Telemetry is three databases that share one storage engine, one sharding protocol, and one Kubernetes operator. Each one speaks the wire protocols and query language of the system it replaces, so agents, dashboards and alerts keep working when you switch.
-
 <ProductCards />
 
-<StackDiagram />
+<StackDiagram animated={false} showControls={false} />
 
 ### Built on SlateDB
 
@@ -26,7 +22,7 @@ SlateDB is single-writer by design. Plural Telemetry adds the missing piece for 
 
 ## By the numbers
 
-Differential fuzzing runs every product against its peer on the same data and queries. These figures come from the published runs. Methodology and per-run history are on each database's **Benchmarks** page.
+Differential fuzzing runs every product against its peer on the same data and queries. These figures come from the published runs. Read the [verification strategy](/verification/) or open any database's **Benchmarks** page for methodology and per-run history.
 
 <Stats>
   <Stat value="5×" label="faster median trace query vs Tempo" />

@@ -20,14 +20,14 @@ const SLATE_PARTS = [
   { label: "block cache", sub: "Foyer · RAM + NVMe" },
 ];
 
-export function StackDiagram() {
+export function StackDiagram({ animated = true, showControls = true }: { animated?: boolean; showControls?: boolean }) {
   const [mode, setMode] = useState<"write" | "read">("write");
   const write = mode === "write";
 
   return (
     <Figure
       label="Fig. 1 — Three databases, one storage engine"
-      controls={
+      controls={showControls ? (
         <Segmented
           value={mode}
           onChange={setMode}
@@ -36,9 +36,11 @@ export function StackDiagram() {
             { value: "read", label: "Read path" },
           ]}
         />
-      }
+      ) : undefined}
       caption={
-        write
+        !showControls
+          ? "Metrics, logs and traces share the same SlateDB storage layer and durable object store."
+          : write
           ? "Writes are batched into a WAL and memtable, flushed as SSTs to object storage, and compacted in the background. Each storage shard is its own SlateDB database owned by exactly one writer."
           : "Readers open every shard read-only, follow the manifest, and serve queries through a shared RAM + NVMe block cache, so hot data never round-trips to S3."
       }
@@ -94,11 +96,14 @@ export function StackDiagram() {
 
         {/* SlateDB band */}
         <rect x={40} y={262} width={800} height={136} rx={3} fill="var(--panel)" stroke="var(--ink)" strokeOpacity={0.55} />
-        <text x={62} y={292} className="fill-ink font-serif" fontSize={22}>
+        <text x={62} y={286} className="fill-ink font-serif" fontSize={22}>
           SlateDB
         </text>
-        <text x={152} y={292} className="fill-muted" fontSize={12} fontStyle="italic">
-          embedded LSM · one database per storage shard · single writer, many readers
+        <text x={152} y={286} className="fill-muted" fontSize={11.5} fontStyle="italic">
+          embedded LSM · one database per storage shard
+        </text>
+        <text x={62} y={307} className="fill-muted" fontSize={11.5} fontStyle="italic">
+          single writer · many readers
         </text>
         {SLATE_PARTS.map((p, i) => {
           const x = 62 + i * 128;
@@ -107,7 +112,7 @@ export function StackDiagram() {
             <g key={p.label}>
               <rect
                 x={x}
-                y={314}
+                y={324}
                 width={116}
                 height={62}
                 rx={2}
@@ -116,13 +121,13 @@ export function StackDiagram() {
                 strokeOpacity={lit ? 0.7 : 1}
                 style={{ transition: "all .4s" }}
               />
-              <text x={x + 58} y={341} textAnchor="middle" className="fill-ink font-mono" fontSize={12}>
+              <text x={x + 58} y={351} textAnchor="middle" className="fill-ink font-mono" fontSize={12}>
                 {p.label}
               </text>
-              <text x={x + 58} y={359} textAnchor="middle" className="fill-muted" fontSize={10.5}>
+              <text x={x + 58} y={369} textAnchor="middle" className="fill-muted" fontSize={10.5}>
                 {p.sub}
               </text>
-              {i < SLATE_PARTS.length - 1 && <path d={`M${x + 117} 345h10`} stroke="var(--line-strong)" markerEnd="url(#arrow)" />}
+              {i < SLATE_PARTS.length - 1 && <path d={`M${x + 117} 355h10`} stroke="var(--line-strong)" markerEnd="url(#arrow)" />}
             </g>
           );
         })}
@@ -152,18 +157,26 @@ export function StackDiagram() {
         {/* flows */}
         {COLS.map((c, ci) => {
           const cx = c.x + W / 2;
-          const down = `M${cx} 44 V82 M${cx} 206 V314 M${cx} 376 V446`;
+          const down = `M${cx} 44 V82 M${cx} 206 V324 M${cx} 386 V446`;
           const pathWrite = `M${cx} 44 L${cx} 482`;
           const pathRead = `M${cx} 482 L${cx} 44`;
           return (
             <g key={c.name + "flow"}>
-              <path d={down} stroke={c.color} strokeOpacity={0.55} strokeWidth={1.25} className="flow-dash" style={{ animationDirection: write ? "normal" : "reverse" }} />
-              {[0, 1, 2].map((k) => (
-                <rect key={`${mode}${k}`} x={-3.5} y={-3.5} width={7} height={7} fill={c.color}>
-                  <animateMotion dur="3.2s" begin={`${k * 1.05 + ci * 0.35}s`} repeatCount="indefinite" path={write ? pathWrite : pathRead} />
-                  <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.08;0.9;1" dur="3.2s" begin={`${k * 1.05 + ci * 0.35}s`} repeatCount="indefinite" />
-                </rect>
-              ))}
+              <path
+                d={down}
+                stroke={c.color}
+                strokeOpacity={0.55}
+                strokeWidth={1.25}
+                className={animated ? "flow-dash" : undefined}
+                style={animated ? { animationDirection: write ? "normal" : "reverse" } : undefined}
+              />
+              {animated &&
+                [0, 1, 2].map((k) => (
+                  <rect key={`${mode}${k}`} x={-3.5} y={-3.5} width={7} height={7} fill={c.color}>
+                    <animateMotion dur="3.2s" begin={`${k * 1.05 + ci * 0.35}s`} repeatCount="indefinite" path={write ? pathWrite : pathRead} />
+                    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.08;0.9;1" dur="3.2s" begin={`${k * 1.05 + ci * 0.35}s`} repeatCount="indefinite" />
+                  </rect>
+                ))}
             </g>
           );
         })}

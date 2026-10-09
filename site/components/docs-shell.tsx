@@ -67,11 +67,11 @@ export function DocsShell({ apiNav, children }: { apiNav: ApiNav; children: Reac
             <Link
               href="/"
               aria-label="Plural Telemetry home"
-              className="flex items-center gap-2"
+              className="flex min-w-0 items-center gap-2"
             >
-              <PluralMark size={20} className="text-ink" />
-              <span className="font-serif text-[18px] tracking-[-0.01em] text-ink">Plural Telemetry</span>
-              <span className="hidden font-mono text-[10.5px] text-faint sm:inline">{DOCS_VERSION}</span>
+              <PluralMark size={20} className="shrink-0 text-ink" />
+              <span className="whitespace-nowrap font-serif text-[18px] tracking-[-0.01em] text-ink">Plural Telemetry</span>
+              <span className="hidden whitespace-nowrap font-mono text-[10.5px] text-faint xl:inline">{DOCS_VERSION}</span>
             </Link>
           </div>
 

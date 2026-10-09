@@ -1,0 +1,106 @@
+global:
+  storage:
+    objectStore:
+      type: Aws
+      aws:
+        region: us-east-2
+        bucket: plrl-telemetry-demo
+  ingress:
+    enabled: true
+    hostname: telemetry.plrldemo.onplural.sh
+    ingressClass: nginx
+    tls:
+      enabled: true
+      secretName: telemetry-tls
+
+# Optionally create the Secret referenced by authentication entries. Passwords
+# are required when creating Secrets so chart rendering stays deterministic.
+authSecret:
+  create: false
+  name: plrl-telemetry-auth
+  username: plrl
+  password: ""
+  usernameKey: username
+  passwordKey: password
+
+# Additional Secrets managed by this release. Authentication entries can select
+# any of these (or any pre-existing Secret) through their secretKeyRef.
+authSecrets: []
+# - name: team-a-telemetry-auth
+#   username: team-a
+#   password: required-value
+#   usernameKey: username
+#   passwordKey: password
+# - name: team-b-telemetry-auth
+#   username: team-b
+#   password: required-value
+
+products:
+  metrics:
+    enabled: true
+    name: metrics
+    spec:
+      mode: Sharded
+      config:
+        storage:
+          path: metrics
+      ingress:
+        pathPrefix: /metrics
+        metadata:
+          annotations:
+            cert-manager.io/cluster-issuer: letsencrypt-prod
+      writer:
+        replicas: 1
+        resources:
+          limits:
+            memory: 4Gi
+      reader:
+        replicas: 1
+        resources:
+          limits:
+            memory: 4Gi
+    authentications: []
+    # - name: metrics-authz
+    #   namespace: default
+    #   username: plrl
+    #   permission: write
+
+  logs:
+    enabled: true
+    name: logs
+    spec:
+      mode: Sharded
+      config:
+        storage:
+          path: logs
+      ingress:
+        pathPrefix: /logs
+      writer:
+        replicas: 1
+      reader:
+        replicas: 1
+    authentications: []
+    # - name: logs-authz
+    #   namespace: default
+    #   username: plrl
+    #   permission: write
+
+  traces:
+    enabled: true
+    name: traces
+    spec:
+      mode: Sharded
+      config:
+        storage:
+          path: traces
+      ingress:
+        pathPrefix: /traces
+      writer:
+        replicas: 1
+      reader:
+        replicas: 1
+    authentications: []
+    # - name: traces-authz
+    #   namespace: default
+    #   username: plrl
+    #   permission: write

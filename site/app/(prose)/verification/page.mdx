@@ -1,0 +1,76 @@
+import { PageHeader } from "@/components/doc-page";
+import { Callout } from "@/components/mdx-ui";
+import { TelemetryIcon } from "@/components/icons";
+
+export const metadata = { title: "Verification" };
+
+<PageHeader
+  icon={<TelemetryIcon size={28} />}
+  eyebrow="Concepts"
+  title="Verification"
+  lede="We test compatibility against the systems we replace, search for semantic gaps with generated workloads, and publish the performance results rather than treating correctness and speed as separate claims."
+/>
+
+## Oracle compatibility testing
+
+Prometheus, Loki and Tempo are executable specifications for the behavior users
+already depend on. The live regression suite sends identical fixtures and
+queries to Plural Telemetry and its reference system, normalizes only documented
+wire-format differences, and compares the responses.
+
+The fixtures cover the ordinary API surface and difficult state transitions:
+out-of-order writes, sparse and high-cardinality data, native histograms,
+typed TraceQL values, sharded forwarding, authentication, namespace isolation,
+reader visibility, restart durability and retention.
+
+Read the [regression harness and product coverage](https://github.com/pluralsh/telemetry/tree/main/tests/regression)
+or inspect the [pull-request compatibility workflow](https://github.com/pluralsh/telemetry/blob/main/.github/workflows/regression.yml).
+
+## Differential fuzz testing
+
+Handwritten cases establish known behavior; differential fuzzing searches for
+behavior nobody thought to write down. Every round generates a randomized
+dataset, loads the same records into both implementations, waits for visibility,
+then recursively generates queries for both sides. Inputs include unusual
+Unicode and escaping, NaN and infinities, clock skew, fan-out traces, cardinality
+extremes, bursts and out-of-order timestamps.
+
+Runs are seed-based and record the generated data and every query, so a mismatch
+can be replayed. Fuzzing runs nightly for all three products with failures,
+timeouts, unstable answers and rejected writes treated as failures.
+
+See the [fuzzer design and local commands](https://github.com/pluralsh/telemetry/tree/main/tests/regression#differential-fuzzing),
+the [nightly GitHub workflow](https://github.com/pluralsh/telemetry/blob/main/.github/workflows/fuzz.yml),
+and the [checked-in run history](https://github.com/pluralsh/telemetry/tree/main/documentation/benchmarks/fuzz).
+
+## Comparative benchmarks
+
+The same differential runs also record latency for each query family, write
+latency, CPU and memory. Results retain their seed, commit, oracle version,
+storage mode, host details and workload configuration so unlike runs are not
+presented as interchangeable.
+
+Explore the published results for [Metrics](/metrics/benchmarks/),
+[Logs](/logs/benchmarks/) and [Traces](/traces/benchmarks/). The
+[benchmark methodology](https://github.com/pluralsh/telemetry/blob/main/documentation/benchmarks/README.md)
+explains outcome classification, resource sampling, reproducibility and how to
+read latency ratios.
+
+## Deployed scalability testing
+
+Compatibility benchmarks are intentionally controlled and do not establish a
+production capacity limit. The separate scalability runner sends product-shaped
+logs, remote-write samples or OTLP spans to a deployed installation at a target
+rate or to saturation. Sustained runs are correlated with writer CPU and memory,
+compaction backlog, visibility lag, cache behavior and object-store requests.
+
+Use the [deployed scalability runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability)
+and follow the [capacity-planning guidance](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md)
+before adopting a production limit.
+
+<Callout title="What these layers prove">
+  Oracle regressions protect known compatibility, differential fuzzing searches
+  for unknown semantic gaps, comparative benchmarks quantify the same workloads,
+  and deployed scalability tests establish capacity in the environment that will
+  actually run the system. No single layer substitutes for the others.
+</Callout>

@@ -39,6 +39,8 @@ jobs:
             path: chart/pseudofs
           - name: telemetry-operator
             path: chart/telemetry-operator
+          - name: telemetry-stack
+            path: chart/telemetry-stack
     steps:
       - uses: actions/checkout@v7
         with:
@@ -126,6 +128,11 @@ jobs:
         with:
           path: ./chart/telemetry-operator
           release: ${{ github.ref_name }}
+      - name: Bump telemetry stack chart
+        uses: pluralsh/chart-releaser@v0.1.3
+        with:
+          path: ./chart/telemetry-stack
+          release: ${{ github.ref_name }}
       - name: Verify chart application versions
         shell: bash
         run: |
@@ -134,9 +141,11 @@ jobs:
           metrics_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/metrics/Chart.yaml)
           pseudofs_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/pseudofs/Chart.yaml)
           operator_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-operator/Chart.yaml)
+          stack_app_version=$(awk -F': *' '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/telemetry-stack/Chart.yaml)
           test "$metrics_app_version" = "$release"
           test "$pseudofs_app_version" = "$release"
           test "$operator_app_version" = "$release"
+          test "$stack_app_version" = "$release"
       - name: Update README versions
         shell: bash
         run: |
@@ -177,6 +186,8 @@ jobs:
             path: chart/pseudofs
           - name: telemetry-operator
             path: chart/telemetry-operator
+          - name: telemetry-stack
+            path: chart/telemetry-stack
     steps:
       - uses: actions/checkout@v7
         with:
