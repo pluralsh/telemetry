@@ -205,6 +205,28 @@ impl QueryReader for ReaderQueryReader {
             mini.cache_series_set(key, series).await;
         }
     }
+
+    async fn cached_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<crate::query::CachedSeriesResolution>> {
+        self.mini_readers
+            .get(bucket)?
+            .cached_selector_resolution(key)
+            .await
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        resolution: Arc<crate::query::CachedSeriesResolution>,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_selector_resolution(key, resolution).await;
+        }
+    }
 }
 
 // ── TimeSeriesDbReader ───────────────────────────────────────────────
@@ -335,7 +357,9 @@ impl TimeSeriesDbReader {
         Self {
             storage,
             query_cache,
-            forward_cache: Arc::new(ForwardIndexCache::new()),
+            forward_cache: Arc::new(ForwardIndexCache::new(
+                crate::minitsdb::DEFAULT_FORWARD_CACHE_CAPACITY_BYTES,
+            )),
             series_cache: Arc::new(SeriesCache::new(cache_capacity / 2)),
             postings_caches: dashmap::DashMap::new(),
             matcher_cache_capacity_bytes: crate::config::QueryCacheConfig::default()
@@ -347,6 +371,12 @@ impl TimeSeriesDbReader {
     /// Sets the byte budget of each namespace's selector-matcher cache.
     pub fn with_matcher_cache_capacity(mut self, bytes: u64) -> Self {
         self.matcher_cache_capacity_bytes = bytes;
+        self
+    }
+
+    /// Sets the shared forward-index and resolved-selector cache budget.
+    pub fn with_forward_index_cache_capacity(mut self, bytes: u64) -> Self {
+        self.forward_cache = Arc::new(ForwardIndexCache::new(bytes));
         self
     }
 

@@ -138,8 +138,12 @@ func Render(input Input) (Result, error) {
 			Storage:             renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode, resources.CacheDiskCapacity(workload)),
 			RetentionSeconds:    retention,
 			ReaderCacheCapacity: int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, 268435456),
-			CacheWarmer:         renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
-			Write:               renderWriteConfig(input.Metrics.Spec.Config.Write),
+			ForwardIndexCacheCapacityBytes: inferredForwardIndexCacheCapacity(
+				input.Metrics.Spec.Config.ForwardIndexCacheCapacityBytes,
+				workload,
+			),
+			CacheWarmer: renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
+			Write:       renderWriteConfig(input.Metrics.Spec.Config.Write),
 			Request: renderMetricsRequest{
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
@@ -573,6 +577,24 @@ func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.Wo
 	return int32(inferred)
 }
 
+func inferredForwardIndexCacheCapacity(configured *int64, workload telemetryv1alpha1.WorkloadSpec) int64 {
+	if configured != nil {
+		return *configured
+	}
+	const (
+		bytesPerMiB           = int64(1024 * 1024)
+		mebibytesPerGiB       = int64(1024)
+		minimumMiB            = int64(64)
+		mebibytesPerGiBBudget = int64(64)
+	)
+	memoryMiB := workload.Resources.Requests.Memory().Value() / bytesPerMiB
+	inferredMiB := memoryMiB * mebibytesPerGiBBudget / mebibytesPerGiB
+	if inferredMiB < minimumMiB {
+		inferredMiB = minimumMiB
+	}
+	return inferredMiB * bytesPerMiB
+}
+
 func mode(metrics *telemetryv1alpha1.Metrics) telemetryv1alpha1.MetricsMode {
 	return lo.Ternary(metrics.Spec.Mode == "", telemetryv1alpha1.MetricsModeStandalone, metrics.Spec.Mode)
 }
@@ -620,18 +642,19 @@ func int32Value(value *int32, fallback int32) int32 { return lo.FromPtrOr(value,
 func boolValue(value *bool, fallback bool) bool     { return lo.FromPtrOr(value, fallback) }
 
 type renderConfig struct {
-	Mode                string               `json:"mode"`
-	Listeners           renderListeners      `json:"listeners"`
-	PathPrefix          string               `json:"path_prefix,omitempty"`
-	Storage             renderStorage        `json:"storage"`
-	RetentionSeconds    *int64               `json:"retention_seconds,omitempty"`
-	ReaderCacheCapacity int64                `json:"reader_cache_capacity"`
-	CacheWarmer         renderCacheWarmer    `json:"cache_warmer"`
-	Write               renderWrite          `json:"write"`
-	Request             renderMetricsRequest `json:"request"`
-	Sharding            renderSharding       `json:"sharding"`
-	Auth                renderAuth           `json:"auth"`
-	Namespaces          []renderNamespace    `json:"namespaces"`
+	Mode                           string               `json:"mode"`
+	Listeners                      renderListeners      `json:"listeners"`
+	PathPrefix                     string               `json:"path_prefix,omitempty"`
+	Storage                        renderStorage        `json:"storage"`
+	RetentionSeconds               *int64               `json:"retention_seconds,omitempty"`
+	ReaderCacheCapacity            int64                `json:"reader_cache_capacity"`
+	ForwardIndexCacheCapacityBytes int64                `json:"forward_index_cache_capacity_bytes"`
+	CacheWarmer                    renderCacheWarmer    `json:"cache_warmer"`
+	Write                          renderWrite          `json:"write"`
+	Request                        renderMetricsRequest `json:"request"`
+	Sharding                       renderSharding       `json:"sharding"`
+	Auth                           renderAuth           `json:"auth"`
+	Namespaces                     []renderNamespace    `json:"namespaces"`
 }
 type renderMetricsRequest struct {
 	MaxRequestBytes        int64 `json:"max_request_bytes"`

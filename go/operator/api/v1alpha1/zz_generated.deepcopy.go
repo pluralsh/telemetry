@@ -788,6 +788,11 @@ func (in *MetricsConfigSpec) DeepCopyInto(out *MetricsConfigSpec) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.ForwardIndexCacheCapacityBytes != nil {
+		in, out := &in.ForwardIndexCacheCapacityBytes, &out.ForwardIndexCacheCapacityBytes
+		*out = new(int64)
+		**out = **in
+	}
 	if in.CacheWarmer != nil {
 		in, out := &in.CacheWarmer, &out.CacheWarmer
 		*out = new(CacheWarmerSpec)

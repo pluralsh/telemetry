@@ -15,7 +15,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use promql_parser::parser::VectorSelector;
 
 use crate::model::{Label, Labels, SeriesData, SeriesId, TimeBucket};
-use crate::query::QueryReader;
+use crate::query::{CachedSeriesResolution, QueryReader};
 
 use super::index_cache::IndexCache;
 use super::memory::QueryError;
@@ -208,8 +208,23 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
+    let key = selector_util::selector_cache_key(selector);
+    if let Some(resolution) = reader.cached_selector_resolution(&bucket, &key).await {
+        return Ok(resolved_chunk(bucket, resolution));
+    }
+
     let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector).await?;
     if candidates.is_empty() {
+        reader
+            .cache_selector_resolution(
+                &bucket,
+                &key,
+                Arc::new(CachedSeriesResolution {
+                    series_ids: Arc::from([]),
+                    labels: Arc::from([]),
+                }),
+            )
+            .await;
         return Ok(None);
     }
 
@@ -220,12 +235,7 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
         .await
         .map_err(storage_err)?;
 
-    let bucket_id = encode_bucket(bucket);
     let mut labels_vec: Vec<Labels> = Vec::with_capacity(candidates.len());
-    let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(candidates.len());
-    // Candidates are ordered by series ID, so one metric's series tend to be
-    // adjacent and share a name allocation.
-    let mut metric_name: Arc<str> = Arc::from("");
     for (sid, slot) in candidates.iter().zip(&slots) {
         let spec = slot.as_ref().as_ref().ok_or_else(|| {
             internal_err(format!(
@@ -233,20 +243,47 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
                 sid, bucket
             ))
         })?;
-        let labs = spec.labels.clone();
-        let name = labs.metric_name();
+        labels_vec.push(spec.labels.clone());
+    }
+
+    let resolution = Arc::new(CachedSeriesResolution {
+        series_ids: Arc::from(candidates),
+        labels: Arc::from(labels_vec),
+    });
+    reader
+        .cache_selector_resolution(&bucket, &key, resolution.clone())
+        .await;
+    Ok(resolved_chunk(bucket, resolution))
+}
+
+fn resolved_chunk(
+    bucket: TimeBucket,
+    resolution: Arc<CachedSeriesResolution>,
+) -> Option<ResolvedSeriesChunk> {
+    if resolution.series_ids.is_empty() {
+        return None;
+    }
+    let bucket_id = encode_bucket(bucket);
+    let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(resolution.series_ids.len());
+    // Candidates are ordered by series ID, so one metric's series tend to be
+    // adjacent and share a name allocation.
+    let mut metric_name: Arc<str> = Arc::from("");
+    for (&series_id, labels) in resolution.series_ids.iter().zip(resolution.labels.iter()) {
+        let name = labels.metric_name();
         if *metric_name != *name {
             metric_name = Arc::from(name);
         }
-        labels_vec.push(labs);
-        handles.push(ResolvedSeriesRef::new(bucket_id, *sid, metric_name.clone()));
+        handles.push(ResolvedSeriesRef::new(
+            bucket_id,
+            series_id,
+            metric_name.clone(),
+        ));
     }
-
-    Ok(Some(ResolvedSeriesChunk {
+    Some(ResolvedSeriesChunk {
         bucket_id,
-        labels: Arc::from(labels_vec),
+        labels: resolution.labels.clone(),
         series: Arc::from(handles),
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +482,20 @@ pub(crate) mod selector_util {
     use regex_syntax::Parser;
     use regex_syntax::hir::{Class, Hir, HirKind};
     use roaring::RoaringBitmap;
+    use std::sync::Arc;
+
+    pub(crate) fn selector_cache_key(selector: &VectorSelector) -> Arc<str> {
+        let name_matcher = selector
+            .name
+            .as_deref()
+            .map(|name| Matcher::new(MatchOp::Equal, METRIC_NAME, name));
+        crate::postings_cache::selector_key(
+            name_matcher
+                .iter()
+                .chain(&selector.matchers.matchers)
+                .map(|m| (m.name.as_str(), match_op_symbol(&m.op), m.value.as_str())),
+        )
+    }
 
     /// The exact strings a regex matches when it is a literal alternation
     /// (`value1|value2|…`), letting a matcher fetch those postings directly
@@ -610,12 +661,7 @@ pub(crate) mod selector_util {
                 "vector selector must contain at least one non-empty matcher".to_string(),
             ));
         }
-        let key = crate::postings_cache::selector_key(
-            name_matcher
-                .iter()
-                .chain(&selector.matchers.matchers)
-                .map(|m| (m.name.as_str(), match_op_symbol(&m.op), m.value.as_str())),
-        );
+        let key = selector_cache_key(selector);
         if let Some(hit) = reader.cached_selector(bucket, &key).await {
             return Ok(hit.as_ref().clone());
         }

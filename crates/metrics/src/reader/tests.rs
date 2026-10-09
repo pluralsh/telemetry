@@ -736,6 +736,7 @@ async fn should_see_new_series_in_a_bucket_whose_postings_are_cached() {
         }
     };
     assert_eq!(count().await, 1.0);
+    assert_eq!(reader.forward_cache.resolution_count().await, 1);
 
     // when: a second series lands in the same bucket
     tsdb.ingest_samples(vec![series("b")], None).await.unwrap();

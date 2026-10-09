@@ -605,6 +605,7 @@ _Appears in:_
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:metrics \} |  |
 | `retention` _string_ | Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.<br />When unset, the server default of 60 days applies. |  | Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$` <br /> |
 | `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
+| `forwardIndexCacheCapacityBytes` _integer_ | ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved<br />selectors. When omitted, the operator infers 64 MiB per GiB of requested<br />memory, with a minimum of 64 MiB. |  | Minimum: 1 <br /> |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `request` _[MetricsRequestSpec](#metricsrequestspec)_ |  |  |  |

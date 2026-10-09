@@ -16,6 +16,15 @@ pub(crate) const SAMPLES_MANY_CONCURRENCY: usize = 8;
 /// In-flight per-series reads for the default `forward_index_many`.
 pub(crate) const FORWARD_INDEX_MANY_CONCURRENCY: usize = 64;
 
+/// A selector's fully resolved series within one bucket. Cross-query readers
+/// cache this by bucket generation so repeated range queries can skip both
+/// postings and forward-index work while retaining bucket-local series IDs.
+#[derive(Debug)]
+pub(crate) struct CachedSeriesResolution {
+    pub(crate) series_ids: Arc<[SeriesId]>,
+    pub(crate) labels: Arc<[Labels]>,
+}
+
 /// Trait for read-only queries within a single time bucket.
 /// This is the bucket-scoped interface that works with bucket-local series IDs.
 #[async_trait]
@@ -150,6 +159,22 @@ pub(crate) trait BucketQueryReader: Send + Sync {
     /// Offers a selector set's series from this reader's view for reuse by
     /// later queries.
     async fn cache_series_set(&self, _key: &Arc<str>, _series: Arc<[Labels]>) {}
+
+    /// A selector's bucket-local IDs and labels from this reader's generation.
+    async fn cached_selector_resolution(
+        &self,
+        _key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        None
+    }
+
+    /// Offers a selector resolution for reuse by later queries.
+    async fn cache_selector_resolution(
+        &self,
+        _key: &Arc<str>,
+        _resolution: Arc<CachedSeriesResolution>,
+    ) {
+    }
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -308,6 +333,24 @@ pub(crate) trait QueryReader: Send + Sync {
         _bucket: &TimeBucket,
         _key: &Arc<str>,
         _series: Arc<[Labels]>,
+    ) {
+    }
+
+    /// See [`BucketQueryReader::cached_selector_resolution`].
+    async fn cached_selector_resolution(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        None
+    }
+
+    /// See [`BucketQueryReader::cache_selector_resolution`].
+    async fn cache_selector_resolution(
+        &self,
+        _bucket: &TimeBucket,
+        _key: &Arc<str>,
+        _resolution: Arc<CachedSeriesResolution>,
     ) {
     }
 }
@@ -472,6 +515,25 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
 
     async fn cache_series_set(&self, bucket: &TimeBucket, key: &Arc<str>, series: Arc<[Labels]>) {
         self.inner.cache_series_set(bucket, key, series).await
+    }
+
+    async fn cached_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        self.inner.cached_selector_resolution(bucket, key).await
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        resolution: Arc<CachedSeriesResolution>,
+    ) {
+        self.inner
+            .cache_selector_resolution(bucket, key, resolution)
+            .await
     }
 }
 

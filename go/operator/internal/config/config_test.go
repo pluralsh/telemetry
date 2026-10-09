@@ -53,7 +53,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 268435456", testFlushIntervalConfig,
+		"reader_cache_capacity: 268435456", "forward_index_cache_capacity_bytes: 67108864", testFlushIntervalConfig,
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		"shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/metrics/data",
@@ -221,11 +221,13 @@ func TestRenderTracesShardedConfig(t *testing.T) {
 
 func TestRenderShardedRoles(t *testing.T) {
 	ioConcurrencyLimit := int32(96)
+	forwardIndexCapacity := int64(42)
 	metrics := &telemetryv1alpha1.Metrics{
 		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
 		Spec: telemetryv1alpha1.MetricsSpec{
 			Mode: telemetryv1alpha1.MetricsModeSharded,
 			Config: telemetryv1alpha1.MetricsConfigSpec{
+				ForwardIndexCacheCapacityBytes: &forwardIndexCapacity,
 				Sharding: telemetryv1alpha1.ShardingSpec{
 					IOConcurrencyLimit: &ioConcurrencyLimit,
 				},
@@ -240,6 +242,7 @@ func TestRenderShardedRoles(t *testing.T) {
 		!strings.Contains(string(result.Data[MetricsKey]), "backend: kubernetes") ||
 		!strings.Contains(string(result.Data[MetricsKey]), "shard_map: example-writer-shard-map") ||
 		!strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 96") ||
+		!strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 42") ||
 		strings.Contains(string(result.Data[MetricsKey]), "shards:") ||
 		!strings.Contains(string(result.Data[ReaderKey]), "mode: reader") {
 		t.Fatalf("unexpected sharded configs:\n%s\n%s", result.Data[MetricsKey], result.Data[ReaderKey])
@@ -273,8 +276,14 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 	if !strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 192") {
 		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
 	}
+	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 134217728") {
+		t.Fatalf("writer config did not infer forward-index capacity from its memory request:\n%s", result.Data[MetricsKey])
+	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
 		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
+	}
+	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 268435456") {
+		t.Fatalf("reader config did not infer forward-index capacity from its memory request:\n%s", result.Data[ReaderKey])
 	}
 }
 

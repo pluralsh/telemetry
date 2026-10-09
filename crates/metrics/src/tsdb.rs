@@ -328,7 +328,9 @@ impl Tsdb {
                 retention,
                 query_cache.matcher_capacity_bytes,
             )),
-            forward_cache: Arc::new(ForwardIndexCache::new()),
+            forward_cache: Arc::new(ForwardIndexCache::new(
+                query_cache.forward_index_capacity_bytes,
+            )),
             series_cache: Arc::new(SeriesCache::new(query_cache.series_capacity_bytes)),
         }
     }

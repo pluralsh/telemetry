@@ -234,6 +234,14 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                  forwardIndexCacheCapacityBytes:
+                    description: |-
+                      ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
+                      selectors. When omitted, the operator infers 64 MiB per GiB of requested
+                      memory, with a minimum of 64 MiB.
+                    format: int64
+                    minimum: 1
+                    type: integer
                   namespaces:
                     default:
                     - default

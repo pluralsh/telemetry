@@ -84,6 +84,10 @@ reader_cache_capacity: 268435456
 # Entries are dropped once their bucket gains series.
 matcher_cache_capacity_bytes: 67108864
 
+# Bytes shared by cached forward-index entries and generation-aware resolved
+# selectors on each storage shard; 64 MiB by default.
+forward_index_cache_capacity_bytes: 67108864
+
 # Range-query result cache. Steps are reused while the write generations of
 # every hour bucket they read are unchanged on every shard; `@` queries,
 # steps after now, and failed queries are never cached.

@@ -21,7 +21,7 @@ use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, Labels, Series, SeriesData, SeriesId, TimeBucket};
 use crate::postings_cache::PostingsCache;
-use crate::query::BucketQueryReader;
+use crate::query::{BucketQueryReader, CachedSeriesResolution};
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, TimeSeriesKey};
@@ -163,9 +163,12 @@ where
 /// visible later.
 pub(crate) struct ForwardIndexCache {
     specs: TableCache<(Namespace, TimeBucket), SeriesSpec>,
+    resolutions: moka::future::Cache<ResolutionCacheKey, Arc<CachedSeriesResolution>>,
 }
 
-const FORWARD_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+type ResolutionCacheKey = (Namespace, TimeBucket, u64, Arc<str>);
+
+pub(crate) const DEFAULT_FORWARD_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const FORWARD_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn spec_bytes(spec: &SeriesSpec) -> u64 {
@@ -178,9 +181,35 @@ fn spec_bytes(spec: &SeriesSpec) -> u64 {
 }
 
 impl ForwardIndexCache {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(capacity_bytes: u64) -> Self {
+        let resolution_bytes = capacity_bytes / 4;
         Self {
-            specs: TableCache::new(FORWARD_CACHE_CAPACITY_BYTES, FORWARD_CACHE_IDLE_TIMEOUT),
+            specs: TableCache::new(
+                capacity_bytes.saturating_sub(resolution_bytes),
+                FORWARD_CACHE_IDLE_TIMEOUT,
+            ),
+            resolutions: moka::future::Cache::builder()
+                .max_capacity(resolution_bytes)
+                .time_to_idle(FORWARD_CACHE_IDLE_TIMEOUT)
+                .weigher(
+                    |(_, _, _, key): &ResolutionCacheKey,
+                     resolution: &Arc<CachedSeriesResolution>| {
+                        let labels: usize = resolution
+                            .labels
+                            .iter()
+                            .flat_map(Labels::iter)
+                            .map(|label| 48 + label.name.len() + label.value.len())
+                            .sum();
+                        u32::try_from(
+                            64 + key.len()
+                                + 4 * resolution.series_ids.len()
+                                + 40 * resolution.labels.len()
+                                + labels,
+                        )
+                        .unwrap_or(u32::MAX)
+                    },
+                )
+                .build(),
         }
     }
 
@@ -192,6 +221,12 @@ impl ForwardIndexCache {
         let mut ids: Vec<SeriesId> = table.read().keys().copied().collect();
         ids.sort_unstable();
         ids
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resolution_count(&self) -> u64 {
+        self.resolutions.run_pending_tasks().await;
+        self.resolutions.entry_count()
     }
 }
 
@@ -607,6 +642,36 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
                 .insert(
                     (self.namespace.clone(), self.bucket, generation, key.clone()),
                     series,
+                )
+                .await;
+        }
+    }
+
+    async fn cached_selector_resolution(
+        &self,
+        key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        let cache = self.forward_cache.as_ref()?;
+        let generation = self.generation().await.ok()??;
+        cache
+            .resolutions
+            .get(&(self.namespace.clone(), self.bucket, generation, key.clone()))
+            .await
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        key: &Arc<str>,
+        resolution: Arc<CachedSeriesResolution>,
+    ) {
+        if let Some(cache) = &self.forward_cache
+            && let Ok(Some(generation)) = self.generation().await
+        {
+            cache
+                .resolutions
+                .insert(
+                    (self.namespace.clone(), self.bucket, generation, key.clone()),
+                    resolution,
                 )
                 .await;
         }

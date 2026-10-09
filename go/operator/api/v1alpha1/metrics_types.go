@@ -49,12 +49,17 @@ type MetricsConfigSpec struct {
 	Retention string `json:"retention,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=268435456
-	ReaderCacheCapacity *int64             `json:"readerCacheCapacity,omitempty"`
-	CacheWarmer         *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
-	Write               WriteSpec          `json:"write,omitempty"`
-	Request             MetricsRequestSpec `json:"request,omitempty"`
-	Sharding            ShardingSpec       `json:"sharding,omitempty"`
-	Auth                AuthSpec           `json:"auth,omitempty"`
+	ReaderCacheCapacity *int64 `json:"readerCacheCapacity,omitempty"`
+	// ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
+	// selectors. When omitted, the operator infers 64 MiB per GiB of requested
+	// memory, with a minimum of 64 MiB.
+	// +kubebuilder:validation:Minimum=1
+	ForwardIndexCacheCapacityBytes *int64             `json:"forwardIndexCacheCapacityBytes,omitempty"`
+	CacheWarmer                    *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
+	Write                          WriteSpec          `json:"write,omitempty"`
+	Request                        MetricsRequestSpec `json:"request,omitempty"`
+	Sharding                       ShardingSpec       `json:"sharding,omitempty"`
+	Auth                           AuthSpec           `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

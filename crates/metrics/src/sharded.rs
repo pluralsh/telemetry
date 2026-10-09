@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use common::SharedDbCache;
@@ -22,7 +22,7 @@ use crate::promql::source::{
     ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
 };
 use crate::promql::source_adapter::QueryReaderSource;
-use crate::query::{LimitedQueryReader, QueryLimits, QueryReader};
+use crate::query::{CachedSeriesResolution, LimitedQueryReader, QueryLimits, QueryReader};
 use crate::reader::ReaderQueryReader;
 use crate::result_cache::{CachePlan, Generations, ResultCache, has_duplicate_labels, merge};
 use crate::storage::{StorageRead, WarmStorage};
@@ -39,10 +39,13 @@ const SOURCE_BUCKET_BITS: u32 = 40;
 const SOURCE_BUCKET_MASK: u64 = (1 << SOURCE_BUCKET_BITS) - 1;
 
 async fn acquire_io_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
-    Arc::clone(permits)
+    let start = Instant::now();
+    let permit = Arc::clone(permits)
         .acquire_owned()
         .await
-        .map_err(|_| ShardSetError::Closed.into())
+        .map_err(|_| ShardSetError::Closed)?;
+    crate::promql::trace::record_io_concurrency_wait(start.elapsed().as_nanos() as u64);
+    Ok(permit)
 }
 
 /// One storage shard, opened either as the single writer or as a reader.
@@ -169,6 +172,7 @@ impl ShardedMetrics {
     ) -> Result<Self> {
         let caches = config.query_cache;
         let matcher_capacity = caches.matcher_capacity_bytes;
+        let forward_index_capacity = caches.forward_index_capacity_bytes;
         let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
         let shard_cache = block_cache.clone();
         let opener = shard_opener(move |shard| {
@@ -185,7 +189,10 @@ impl ShardedMetrics {
                 )
                 .await
                 .map(|db| {
-                    MetricsShard::Reader(Box::new(db.with_matcher_cache_capacity(matcher_capacity)))
+                    MetricsShard::Reader(Box::new(
+                        db.with_matcher_cache_capacity(matcher_capacity)
+                            .with_forward_index_cache_capacity(forward_index_capacity),
+                    ))
                 })
             }
         });
@@ -886,6 +893,37 @@ impl QueryReader for ShardQueryReader {
             Self::Reader(reader) => reader.cache_series_set(bucket, key, series).await,
         }
     }
+
+    async fn cached_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        match self {
+            Self::Writer(reader) => reader.cached_selector_resolution(bucket, key).await,
+            Self::Reader(reader) => reader.cached_selector_resolution(bucket, key).await,
+        }
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        resolution: Arc<CachedSeriesResolution>,
+    ) {
+        match self {
+            Self::Writer(reader) => {
+                reader
+                    .cache_selector_resolution(bucket, key, resolution)
+                    .await
+            }
+            Self::Reader(reader) => {
+                reader
+                    .cache_selector_resolution(bucket, key, resolution)
+                    .await
+            }
+        }
+    }
 }
 
 struct IoLimitedQueryReader<R> {
@@ -1027,6 +1065,25 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
 
     async fn cache_series_set(&self, bucket: &TimeBucket, key: &Arc<str>, series: Arc<[Labels]>) {
         self.inner.cache_series_set(bucket, key, series).await
+    }
+
+    async fn cached_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+    ) -> Option<Arc<CachedSeriesResolution>> {
+        self.inner.cached_selector_resolution(bucket, key).await
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &Arc<str>,
+        resolution: Arc<CachedSeriesResolution>,
+    ) {
+        self.inner
+            .cache_selector_resolution(bucket, key, resolution)
+            .await
     }
 }
 

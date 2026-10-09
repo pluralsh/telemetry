@@ -427,4 +427,26 @@ impl QueryReader for TsdbQueryReader {
             mini.cache_series_set(key, series).await;
         }
     }
+
+    async fn cached_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+    ) -> Option<std::sync::Arc<crate::query::CachedSeriesResolution>> {
+        self.mini_readers
+            .get(bucket)?
+            .cached_selector_resolution(key)
+            .await
+    }
+
+    async fn cache_selector_resolution(
+        &self,
+        bucket: &TimeBucket,
+        key: &std::sync::Arc<str>,
+        resolution: std::sync::Arc<crate::query::CachedSeriesResolution>,
+    ) {
+        if let Some(mini) = self.mini_readers.get(bucket) {
+            mini.cache_selector_resolution(key, resolution).await;
+        }
+    }
 }

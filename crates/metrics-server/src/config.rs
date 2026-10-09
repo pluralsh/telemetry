@@ -97,6 +97,8 @@ pub struct Config {
     pub reader_cache_capacity: u64,
     /// Byte budget of each namespace's selector-matcher cache, per shard.
     pub matcher_cache_capacity_bytes: u64,
+    /// Byte budget for forward-index entries and resolved selectors, per shard.
+    pub forward_index_cache_capacity_bytes: u64,
     pub result_cache: ResultCacheConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
@@ -118,6 +120,8 @@ impl Default for Config {
             reader_cache_capacity: 256 * 1024 * 1024,
             matcher_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
                 .matcher_capacity_bytes,
+            forward_index_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
+                .forward_index_capacity_bytes,
             result_cache: ResultCacheConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),

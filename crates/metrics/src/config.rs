@@ -74,6 +74,8 @@ pub struct QueryCacheConfig {
     /// Byte budget of each namespace's decoded-series cache, which keeps a
     /// bucket's decoded samples per series until the bucket is next flushed.
     pub series_capacity_bytes: u64,
+    /// Byte budget for forward-index entries and fully resolved selectors.
+    pub forward_index_capacity_bytes: u64,
     /// Whether [`ShardedMetrics`](crate::ShardedMetrics) reuses earlier
     /// range-query results whose dependent buckets are unchanged.
     pub result_cache_enabled: bool,
@@ -86,6 +88,7 @@ impl Default for QueryCacheConfig {
         Self {
             matcher_capacity_bytes: 64 * 1024 * 1024,
             series_capacity_bytes: 128 * 1024 * 1024,
+            forward_index_capacity_bytes: crate::minitsdb::DEFAULT_FORWARD_CACHE_CAPACITY_BYTES,
             result_cache_enabled: true,
             result_capacity_bytes: 128 * 1024 * 1024,
         }

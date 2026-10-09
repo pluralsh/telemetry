@@ -129,6 +129,8 @@ struct Inner {
     phase_ns: [u64; 8],
     operators: Vec<OperatorStatsInner>,
     io: BTreeMap<IoKind, IoAccum>,
+    io_concurrency_wait_ns: u64,
+    io_concurrency_wait_count: u64,
     /// Subphase samples taken with no operator on the stack (planner /
     /// reshape phases). Surface under the top-level `subphases` field.
     orphan_subphases: BTreeMap<&'static str, (u64, u64)>,
@@ -142,6 +144,8 @@ impl Default for Inner {
             phase_ns: [0; 8],
             operators: Vec::new(),
             io: BTreeMap::new(),
+            io_concurrency_wait_ns: 0,
+            io_concurrency_wait_count: 0,
             orphan_subphases: BTreeMap::new(),
             query_start: Instant::now(),
         }
@@ -298,6 +302,12 @@ impl TraceCollector {
         }
     }
 
+    pub fn record_io_concurrency_wait(&self, elapsed_ns: u64) {
+        let mut inner = self.lock();
+        inner.io_concurrency_wait_ns = inner.io_concurrency_wait_ns.saturating_add(elapsed_ns);
+        inner.io_concurrency_wait_count += 1;
+    }
+
     /// Counters are operator-scoped — no-op when no operator is on the stack.
     pub fn record_counter(&self, node_id: Option<usize>, label: &'static str, value: u64) {
         let Some(id) = node_id else { return };
@@ -350,6 +360,8 @@ impl TraceCollector {
         let orphan_subphases = subphase_vec(&inner.orphan_subphases);
         QueryTrace {
             total_ms: ns_to_ms(total_ns),
+            io_concurrency_wait_ms: ns_to_ms(inner.io_concurrency_wait_ns),
+            io_concurrency_wait_count: inner.io_concurrency_wait_count,
             phases,
             operators,
             io,
@@ -454,6 +466,8 @@ pub struct SubphaseStats {
 #[serde(rename_all = "camelCase")]
 pub struct QueryTrace {
     pub total_ms: f64,
+    pub io_concurrency_wait_ms: f64,
+    pub io_concurrency_wait_count: u64,
     pub phases: Vec<PhaseStats>,
     pub operators: Vec<OperatorStats>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -558,6 +572,12 @@ pub fn io_finished(kind: IoKind, start: Instant, elapsed_ns: u64) {
 /// No-op outside a [`with_trace`] scope — safe to call unconditionally.
 pub fn record_bytes(kind: IoKind, bytes: u64) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_bytes(kind, bytes));
+}
+
+/// Records time queued for the pod-wide storage I/O semaphore. No-op outside
+/// an inline query trace.
+pub fn record_io_concurrency_wait(elapsed_ns: u64) {
+    let _ = TRACE_COLLECTOR.try_with(|c| c.record_io_concurrency_wait(elapsed_ns));
 }
 
 /// RAII guard: holds `in_flight` for `kind` from `enter` until drop, then
@@ -824,6 +844,23 @@ mod tests {
         assert_eq!(t.subphases.len(), 1);
         assert_eq!(t.subphases[0].label, "loose");
         assert_eq!(t.subphases[0].call_count, 1);
+    }
+
+    #[test]
+    fn should_record_global_io_concurrency_wait() {
+        let c = TraceCollector::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        rt.block_on(with_trace(c.clone(), async {
+            record_io_concurrency_wait(1_250_000);
+            record_io_concurrency_wait(750_000);
+        }));
+
+        let t = c.finish();
+        assert_eq!(t.io_concurrency_wait_ms, 2.0);
+        assert_eq!(t.io_concurrency_wait_count, 2);
     }
 
     /// Operator records a counter from inside `next()`; it must land in
