@@ -1,8 +1,8 @@
 apiVersion: v2
 name: telemetry-stack
 description: Plural Telemetry metrics, logs, traces, and namespace authentication resources
-appVersion: 0.2.9
-version: 0.1.8
+appVersion: 0.2.10
+version: 0.1.9
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
