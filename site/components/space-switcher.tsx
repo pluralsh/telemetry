@@ -75,7 +75,7 @@ export function SpaceSwitcher() {
           <Dropdown.Content
             align="start"
             sideOffset={6}
-            className="z-50 w-72 rounded-sm border border-line-strong bg-panel p-1 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.25)]"
+            className="z-50 w-max min-w-72 max-w-[calc(100vw-1.5rem)] rounded-sm border border-line-strong bg-panel p-1 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.25)]"
           >
             {SPACES.map((s) => (
               <Dropdown.Item
@@ -83,12 +83,10 @@ export function SpaceSwitcher() {
                 onSelect={() => router.push(targetHref(pathname, active, s.id))}
                 className="flex cursor-pointer items-center gap-3 rounded-[2px] px-2 py-2 outline-none data-[highlighted]:bg-bg-subtle"
               >
-                <SpaceIcon space={s.id} size={20} />
-                <span className="flex flex-1 items-baseline gap-2">
-                  <span className="text-[13px] text-ink">{s.label}</span>
-                  <span className="leader" />
-                  <span className="eyebrow">{s.blurb}</span>
-                </span>
+                <SpaceIcon space={s.id} size={20} className="shrink-0" />
+                <span className="w-16 shrink-0 whitespace-nowrap text-[13px] text-ink">{s.label}</span>
+                <span className="leader" />
+                <span className="eyebrow whitespace-nowrap">{s.blurb}</span>
               </Dropdown.Item>
             ))}
           </Dropdown.Content>

@@ -221,13 +221,13 @@ spec:
                           after startup.
                         properties:
                           enabled:
-                            default: false
+                            default: true
                             type: boolean
                           includePayloads:
                             default: true
                             type: boolean
                           intervalSeconds:
-                            default: 15
+                            default: 10
                             format: int64
                             minimum: 1
                             type: integer
@@ -816,7 +816,7 @@ spec:
                         - durable
                         type: string
                       flushIntervalSeconds:
-                        default: 30
+                        default: 10
                         format: int64
                         minimum: 0
                         type: integer

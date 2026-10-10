@@ -38,7 +38,7 @@ compaction:
 write:
   durability: applied
   # Durable object-store flush and read-replica visibility interval.
-  flush_interval_seconds: 30
+  flush_interval_seconds: 10
   buffer_queue_capacity: 10000
   buffer_flush_interval_milliseconds: 30000
   buffer_size_threshold_bytes: 67108864
@@ -71,8 +71,8 @@ cache_warmer:
   concurrency: 2
   include_payloads: false
   continuous:
-    enabled: false
-    interval_seconds: 15
+    enabled: true
+    interval_seconds: 10
     warm_range_seconds: 7200
     include_payloads: true
 

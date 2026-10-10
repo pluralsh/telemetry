@@ -179,8 +179,8 @@ the SSTs already live, so enabling it never starts with a bulk warm of the whole
 use `cache_warmer.concurrency` and the same storage I/O budget as startup warming, and never
 affect readiness.
 
-- `cache_warmer.continuous.enabled`: enables continuous warming. Default `false`.
-- `cache_warmer.continuous.interval_seconds`: seconds between passes. Default `15`; must be greater
+- `cache_warmer.continuous.enabled`: enables continuous warming. Default `true`.
+- `cache_warmer.continuous.interval_seconds`: seconds between passes. Default `10`; must be greater
   than zero when enabled.
 - `cache_warmer.continuous.warm_range_seconds`: recent time range whose new SSTs are warmed.
   Default `7200`; must be greater than zero when enabled.

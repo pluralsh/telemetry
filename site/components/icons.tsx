@@ -1,36 +1,48 @@
 import type { SpaceId } from "@/lib/nav";
 
 export const SPACE_COLORS: Record<SpaceId, string> = {
-  overview: "var(--plural)",
-  metrics: "var(--metrics)",
-  logs: "var(--logs)",
-  traces: "var(--traces)",
+  overview: "var(--ink)",
+  metrics: "var(--ink)",
+  logs: "var(--ink)",
+  traces: "var(--ink)",
 };
 
 type IconProps = { size?: number; className?: string };
 
-const stroke = { stroke: "#fff", strokeWidth: 2.25, fill: "none", strokeLinecap: "square", strokeLinejoin: "miter" } as const;
+const stroke = {
+  stroke: "currentColor",
+  strokeWidth: 1.5,
+  fill: "none",
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+} as const;
 
-/** White glyphs drawn on a 24-unit grid, meant to sit on a solid tile. */
+/** Minimal monochrome glyphs drawn on a 24-unit grid. */
 export const GLYPHS: Record<SpaceId, React.ReactNode> = {
   metrics: (
     <>
-      <path d="M4 17.5 9 12.5l4 3 4.5-6" {...stroke} />
-      <rect x="16.5" y="5" width="4.5" height="4.5" fill="#fff" />
+      <path d="M3.5 17.5 8.5 12l4 3 7.5-9" {...stroke} />
+      <circle cx="3.5" cy="17.5" r="1.25" fill="currentColor" />
+      <circle cx="8.5" cy="12" r="1.25" fill="currentColor" />
+      <circle cx="12.5" cy="15" r="1.25" fill="currentColor" />
+      <circle cx="20" cy="6" r="1.25" fill="currentColor" />
     </>
   ),
   logs: (
     <>
-      <path d="M9 6h11M9 12h7.5M9 18h4" {...stroke} />
-      <rect x="3.5" y="4.25" width="3.5" height="3.5" fill="#fff" />
-      <rect x="3.5" y="10.25" width="3.5" height="3.5" fill="#fff" />
-      <rect x="3.5" y="16.25" width="3.5" height="3.5" fill="#fff" />
+      <path d="M7.5 6h13M7.5 12h10M7.5 18h7" {...stroke} />
+      <circle cx="3.5" cy="6" r="1.25" fill="currentColor" />
+      <circle cx="3.5" cy="12" r="1.25" fill="currentColor" />
+      <circle cx="3.5" cy="18" r="1.25" fill="currentColor" />
     </>
   ),
   traces: (
     <>
-      <path d="M4 5.5h16M7 5.5V12h11M11 12v6.5h4.5" {...stroke} />
-      <rect x="16" y="16.25" width="4.5" height="4.5" fill="#fff" />
+      <path d="M4 5.5h6M7 5.5V12h6M10 12v6.5h6" {...stroke} />
+      <circle cx="4" cy="5.5" r="1.25" fill="currentColor" />
+      <circle cx="10" cy="5.5" r="1.25" fill="currentColor" />
+      <circle cx="13" cy="12" r="1.25" fill="currentColor" />
+      <circle cx="16" cy="18.5" r="1.25" fill="currentColor" />
     </>
   ),
   overview: null,
@@ -47,10 +59,6 @@ function PluralPaths({ fill }: { fill: string }) {
   );
 }
 
-/**
- * A nested-square badge: Zed's concentric-square construction around Plural's
- * solid focal tile, carrying a white glyph.
- */
 export function Badge({ space, size = 20, className }: IconProps & { space: SpaceId }) {
   if (space === "overview") {
     return (
@@ -60,10 +68,15 @@ export function Badge({ space, size = 20, className }: IconProps & { space: Spac
     );
   }
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden className={className}>
-      <rect x="0.5" y="0.5" width="23" height="23" stroke="var(--ink)" strokeOpacity={0.28} vectorEffect="non-scaling-stroke" />
-      <rect x="3" y="3" width="18" height="18" fill={SPACE_COLORS[space]} />
-      <g transform="translate(5 5) scale(0.5833)">{GLYPHS[space]}</g>
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden
+      className={`text-ink ${className ?? ""}`}
+    >
+      {GLYPHS[space]}
     </svg>
   );
 }

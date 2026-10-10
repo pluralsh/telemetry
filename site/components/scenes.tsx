@@ -28,7 +28,7 @@ function Node({ at: [x, y], color, ring }: { at: Pt; color: string; ring?: boole
   );
 }
 
-/** The focal badge: concentric squares around a solid tile carrying the product glyph. */
+/** The focal badge: a monochrome tile carrying the product glyph. */
 function Badge({ product }: { product: ProductId }) {
   const { x, y } = BADGE;
   const color = SPACE_COLORS[product];
@@ -37,7 +37,9 @@ function Badge({ product }: { product: ProductId }) {
       <rect x={x - 26} y={y - 26} width={52} height={52} fill="none" stroke="var(--line)" strokeDasharray="2 3" />
       <rect x={x - 18} y={y - 18} width={36} height={36} fill="var(--bg)" stroke="var(--line-strong)" />
       <rect x={x - 13} y={y - 13} width={26} height={26} fill={color} />
-      <g transform={`translate(${x - 8} ${y - 8}) scale(${16 / 24})`}>{GLYPHS[product]}</g>
+      <g color="var(--bg)" transform={`translate(${x - 8} ${y - 8}) scale(${16 / 24})`}>
+        {GLYPHS[product]}
+      </g>
     </g>
   );
 }

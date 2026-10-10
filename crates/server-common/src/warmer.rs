@@ -195,10 +195,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn startup_only_warming_runs_once() {
-        let config = CacheWarmerConfig {
+        let mut config = CacheWarmerConfig {
             enabled: true,
             ..CacheWarmerConfig::default()
         };
+        config.continuous.enabled = false;
         let passes = Arc::new(Mutex::new(0));
         let cache_warmed = Arc::new(AtomicBool::new(false));
         let recorded = Arc::clone(&passes);

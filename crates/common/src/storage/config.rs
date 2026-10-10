@@ -6,6 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default cadence for durable writer flushes and continuous reader warming.
+pub const DEFAULT_FLUSH_INTERVAL_SECONDS: u64 = 10;
+
 /// Startup policy for preloading recent SlateDB blocks into configured caches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -87,8 +90,8 @@ pub struct ContinuousCacheWarmerConfig {
 impl Default for ContinuousCacheWarmerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            interval_seconds: 15,
+            enabled: true,
+            interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,
             warm_range_seconds: 7_200,
             include_payloads: true,
         }
@@ -361,7 +364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_warmer_is_safe_and_opt_in_by_default() {
+    fn cache_warmer_continuously_warms_by_default() {
         assert_eq!(
             CacheWarmerConfig::default(),
             CacheWarmerConfig {
@@ -371,8 +374,8 @@ mod tests {
                 concurrency: 2,
                 include_payloads: false,
                 continuous: ContinuousCacheWarmerConfig {
-                    enabled: false,
-                    interval_seconds: 15,
+                    enabled: true,
+                    interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,
                     warm_range_seconds: 7_200,
                     include_payloads: true,
                 },
@@ -389,7 +392,7 @@ mod tests {
         config.continuous.interval_seconds = 0;
         assert!(config.validate().unwrap_err().contains("interval_seconds"));
 
-        config.continuous.interval_seconds = 15;
+        config.continuous.interval_seconds = DEFAULT_FLUSH_INTERVAL_SECONDS;
         config.concurrency = 0;
         assert!(config.validate().unwrap_err().contains("concurrency"));
     }

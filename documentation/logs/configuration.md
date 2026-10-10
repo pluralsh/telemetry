@@ -107,7 +107,7 @@ write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: applied
   # Durable object-store flush and read-replica visibility interval; 0 disables it.
-  flush_interval_seconds: 30
+  flush_interval_seconds: 10
   # Per-storage-shard coordinator bounds. Memory can include the live delta,
   # up to two frozen deltas, and queued request payloads.
   buffer_queue_capacity: 10000

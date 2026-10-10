@@ -28,6 +28,8 @@ const (
 	modeStandalone   = "standalone"
 	modeWriter       = "writer"
 	modeReader       = "reader"
+
+	defaultFlushIntervalSeconds int64 = 10
 )
 
 type Credential struct {
@@ -262,7 +264,7 @@ func renderLogs(input Input) (Result, error) {
 			},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 30),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, defaultFlushIntervalSeconds),
 				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
 				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 30000),
 				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
@@ -367,7 +369,7 @@ func renderTraces(input Input) (Result, error) {
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 30),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, defaultFlushIntervalSeconds),
 				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
 				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 30000),
 				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
@@ -499,11 +501,11 @@ func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCach
 
 func renderContinuousCacheWarmerConfig(spec *telemetryv1alpha1.ContinuousCacheWarmerSpec) renderContinuousCacheWarmer {
 	if spec == nil {
-		return renderContinuousCacheWarmer{Enabled: false, IntervalSeconds: 15, WarmRangeSeconds: 7200, IncludePayloads: true}
+		return renderContinuousCacheWarmer{Enabled: true, IntervalSeconds: defaultFlushIntervalSeconds, WarmRangeSeconds: 7200, IncludePayloads: true}
 	}
 	return renderContinuousCacheWarmer{
-		Enabled:          boolValue(spec.Enabled, false),
-		IntervalSeconds:  int64Value(spec.IntervalSeconds, 15),
+		Enabled:          boolValue(spec.Enabled, true),
+		IntervalSeconds:  int64Value(spec.IntervalSeconds, defaultFlushIntervalSeconds),
 		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
 		IncludePayloads:  boolValue(spec.IncludePayloads, true),
 	}
@@ -546,7 +548,7 @@ func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath strin
 func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	return renderWrite{
 		Durability:                      lo.CoalesceOrEmpty(string(spec.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-		FlushIntervalSeconds:            int64Value(spec.FlushIntervalSeconds, 30),
+		FlushIntervalSeconds:            int64Value(spec.FlushIntervalSeconds, defaultFlushIntervalSeconds),
 		BufferQueueCapacity:             int32Value(spec.BufferQueueCapacity, 10000),
 		BufferFlushIntervalMilliseconds: int64Value(spec.BufferFlushIntervalMilliseconds, 30000),
 		BufferSizeThresholdBytes:        int64Value(spec.BufferSizeThresholdBytes, 67108864),

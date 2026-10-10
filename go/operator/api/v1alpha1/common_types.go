@@ -181,10 +181,10 @@ type CacheWarmerSpec struct {
 }
 
 type ContinuousCacheWarmerSpec struct {
-	// +kubebuilder:default=false
+	// +kubebuilder:default=true
 	Enabled *bool `json:"enabled,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=15
+	// +kubebuilder:default=10
 	IntervalSeconds *int64 `json:"intervalSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=7200
@@ -206,7 +206,7 @@ type WriteSpec struct {
 	// +kubebuilder:default=applied
 	Durability Durability `json:"durability,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=30
+	// +kubebuilder:default=10
 	FlushIntervalSeconds *int64 `json:"flushIntervalSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=10000

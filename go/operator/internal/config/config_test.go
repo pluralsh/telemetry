@@ -17,12 +17,14 @@ const (
 	testMetricsNamespace    = "test"
 	testBucket              = "metrics"
 	testTenantNamespace     = "tenant-a"
-	testFlushIntervalConfig = "flush_interval_seconds: 30"
+	testFlushIntervalConfig = "flush_interval_seconds: 10"
 	testCacheWarmerConfig   = "cache_warmer:"
 	testWarmRangeConfig     = "warm_range_seconds: 7200"
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
 	testWarmConcurrency     = "concurrency: 2"
 	testWarmPayloadsConfig  = "include_payloads: false"
+	testContinuousWarmer    = "continuous:"
+	testContinuousInterval  = "interval_seconds: 10"
 	testMetricsProduct      = "metrics"
 	testLogsProduct         = "logs"
 	testTracesProduct       = "traces"
@@ -55,6 +57,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
 		"reader_cache_capacity: 268435456", "forward_index_cache_capacity_bytes: 67108864", testFlushIntervalConfig,
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
+		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/metrics/data",
 		"path_prefix: /metrics",
@@ -198,6 +201,8 @@ func TestRenderTracesShardedConfig(t *testing.T) {
 		testWarmTimeoutConfig,
 		testWarmConcurrency,
 		testWarmPayloadsConfig,
+		testContinuousWarmer,
+		testContinuousInterval,
 		"name: tenant-a",
 		"path: /etc/traces/secrets/namespace-traces-auth-password",
 	} {
@@ -305,6 +310,7 @@ func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 		"type: SlateDb", "path: logs", "path: /var/lib/logs/data", "disk_path: /var/cache/logs",
 		"segment_duration_seconds: 3600", testFlushIntervalConfig,
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
+		testContinuousWarmer, testContinuousInterval,
 		"target_size_bytes: 1048576", "max_request_bytes: 33554432", "max_decoded_request_bytes: 134217728",
 		"elasticsearch:\n  message_fields:\n  - message\n  - log\n  - msg\n  stream_fields: []\n  time_field: '@timestamp'",
 		"path: /var/run/secrets/logs/internal-token", "name: tenant-a", "path_prefix: /logs",

@@ -14,8 +14,8 @@ pub use clock::Clock;
 pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, SequenceResult};
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
-    BlockCacheConfig, CacheWarmerConfig, ContinuousCacheWarmerConfig, FoyerHybridCacheConfig,
-    ObjectStoreConfig, StorageConfig,
+    BlockCacheConfig, CacheWarmerConfig, ContinuousCacheWarmerConfig,
+    DEFAULT_FLUSH_INTERVAL_SECONDS, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, SharedDbCache, StorageBuilder, StorageReaderRuntime,

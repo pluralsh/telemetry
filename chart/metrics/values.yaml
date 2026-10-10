@@ -71,7 +71,7 @@ config:
   readerCacheCapacity: 268435456
   write:
     durability: applied
-    flush_interval_seconds: 30
+    flush_interval_seconds: 10
     remote_concurrency: 16
     remote_retries: 2
   auth:
