@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -12,6 +13,7 @@ use proto::traces::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
+use server_common::reload::{self, Live, LiveConfig};
 use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
 use sharding::{
     AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
@@ -35,10 +37,12 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
+    /// The config the process started with; see `live` for reloaded settings.
     pub(crate) config: Arc<Config>,
     pub(crate) db: Arc<ShardedTraces>,
     pub(crate) jwt: Option<JwtAuthenticator>,
-    pub(crate) namespaces: Arc<HashMap<String, NamespaceConfig>>,
+    pub(crate) live: Arc<Live<LiveConfig<NamespaceConfig>>>,
+    warmer: Arc<Mutex<Option<CancellationToken>>>,
     pub(crate) router: Arc<WriteRouter>,
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(crate) request_limit: Arc<Semaphore>,
@@ -105,12 +109,6 @@ impl AppState {
             )
             .await?
         });
-        let namespaces = config
-            .namespaces
-            .iter()
-            .cloned()
-            .map(|value| (value.name.clone(), value))
-            .collect();
         let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
         let router = WriteRouter::new(
             local_owner,
@@ -134,10 +132,11 @@ impl AppState {
         let state = Self {
             request_limit: Arc::new(Semaphore::new(config.request.request_concurrency)),
             query_limit: Arc::new(Semaphore::new(config.request.query_concurrency)),
+            live: Arc::new(Live::new(live_config(&config))),
+            warmer: Arc::default(),
             config: Arc::new(config),
             db,
             jwt,
-            namespaces: Arc::new(namespaces),
             router: Arc::new(router),
             completed_requests: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             ingest,
@@ -170,9 +169,44 @@ impl AppState {
                 state.tasks.lock().await.extend(tasks);
             }
         }
-        state.start_cache_warmer().await;
+        state.start_cache_warmer(true).await;
         state.start_durable_flush_task().await;
         Ok(state)
+    }
+
+    pub(crate) fn live(&self) -> Arc<LiveConfig<NamespaceConfig>> {
+        self.live.load()
+    }
+
+    /// Applies new revisions of the config file at `path` until shutdown.
+    pub async fn watch_config(&self, path: PathBuf) {
+        let state = self.clone();
+        let task = reload::spawn_config_watcher(
+            "traces",
+            path,
+            reload::POLL_INTERVAL,
+            self.cancellation.clone(),
+            move |raw| {
+                let state = state.clone();
+                async move {
+                    let next = Config::from_yaml(&raw).map_err(|error| error.to_string())?;
+                    Ok(state.reload(&next).await)
+                }
+            },
+        );
+        self.tasks.lock().await.push(task);
+    }
+
+    /// Applies the live settings of `next` and returns the sections that
+    /// still differ from the running config until a restart.
+    pub(crate) async fn reload(&self, next: &Config) -> Vec<String> {
+        let live = live_config(next);
+        let restart_warmer = self.live().warms_differently(&live);
+        self.live.store(live);
+        if restart_warmer {
+            self.start_cache_warmer(false).await;
+        }
+        reload::restart_required(self.config.as_ref(), next)
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -195,22 +229,31 @@ impl AppState {
         }
     }
 
-    async fn start_cache_warmer(&self) {
+    /// (Re)starts the warmer from the live config, replacing any running one.
+    /// Only the first start runs the startup pass.
+    async fn start_cache_warmer(&self, startup: bool) {
+        if let Some(previous) = self.warmer.lock().expect("warmer lock").take() {
+            previous.cancel();
+        }
+        let live = self.live();
         let serves_reads = self.config.mode != ServerMode::Writer;
-        if !warming_enabled(&self.config.cache_warmer, serves_reads) {
+        if !warming_enabled(&live.cache_warmer, serves_reads) {
             return;
         }
-        let namespaces: Arc<[Namespace]> = self
-            .config
+        let mut config = live.cache_warmer.clone();
+        config.enabled &= startup;
+        let namespaces: Arc<[Namespace]> = live
             .namespaces
-            .iter()
-            .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
+            .keys()
+            .filter_map(|name| Namespace::new(name.clone()).ok())
             .collect();
+        let cancel = self.cancellation.child_token();
+        *self.warmer.lock().expect("warmer lock") = Some(cancel.clone());
         let database = Arc::clone(&self.db);
         let task = spawn_cache_warmer(
             "traces",
-            &self.config.cache_warmer,
-            self.cancellation.clone(),
+            &config,
+            cancel,
             Arc::clone(&self.cache_warmed),
             move |pass: WarmPass| {
                 let database = Arc::clone(&database);
@@ -401,6 +444,19 @@ impl AppState {
             }
         });
         self.tasks.lock().await.push(task);
+    }
+}
+
+pub(crate) fn live_config(config: &Config) -> LiveConfig<NamespaceConfig> {
+    LiveConfig {
+        namespaces: config
+            .namespaces
+            .iter()
+            .map(|namespace| (namespace.name.clone(), namespace.clone()))
+            .collect(),
+        unauthenticated: config.auth.unauthenticated,
+        global: config.auth.global.clone(),
+        cache_warmer: config.cache_warmer.clone(),
     }
 }
 

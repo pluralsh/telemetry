@@ -110,7 +110,7 @@ impl InternalWriter for AppState {
             .as_ref()
             .map(|namespace| namespace.name.as_str())
             .ok_or_else(|| Status::invalid_argument("namespace is required"))?;
-        if !self.namespaces.contains_key(namespace_name) {
+        if !self.live().namespaces.contains_key(namespace_name) {
             return Err(Status::not_found("unknown namespace"));
         }
         let namespace = Namespace::new(namespace_name)

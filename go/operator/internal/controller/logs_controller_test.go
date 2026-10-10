@@ -131,7 +131,7 @@ var _ = Describe("Logs Controller", func() {
 					HaveField("Name", "logs"),
 					HaveField("Image", "registry.example.com/telemetry/logs:2.3.4"),
 					HaveField("ImagePullPolicy", corev1.PullAlways),
-					HaveField("Args", []string{"--config", "/etc/logs/logs.yaml"}),
+					HaveField("Args", ConsistOf("--config", HavePrefix("/etc/logs/config/"))),
 				))
 				if component == name || component == name+"-writer" {
 					Expect(sts.Spec.Replicas).NotTo(BeNil())

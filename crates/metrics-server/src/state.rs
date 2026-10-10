@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
@@ -9,6 +10,7 @@ use plural_metrics::{Namespace, Series, ShardedMetrics, ShardingOptions, Visibil
 use proto::metrics::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
+use server_common::reload::{self, Live, LiveConfig};
 use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
 use sharding::{
     AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
@@ -32,7 +34,10 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
+    /// The config the process started with; see `live` for reloaded settings.
     pub(crate) config: Arc<Config>,
+    pub(crate) live: Arc<Live<LiveConfig<NamespaceConfig>>>,
+    pub(crate) warmer: Arc<Mutex<Option<CancellationToken>>>,
     pub(crate) jwt: Option<JwtAuthenticator>,
     pub(crate) writers: Option<Arc<ShardedMetrics>>,
     pub(crate) readers: Option<Arc<ShardedMetrics>>,
@@ -131,6 +136,8 @@ impl AppState {
             &cancellation,
         )?;
         let state = Self {
+            live: Arc::new(Live::new(live_config(&config))),
+            warmer: Arc::default(),
             config: Arc::new(config),
             jwt,
             writers,
@@ -174,7 +181,7 @@ impl AppState {
                 state.background_tasks.lock().await.extend(tasks);
             }
         }
-        state.start_cache_warmer().await;
+        state.start_cache_warmer(true).await;
         if state.config.mode != ServerMode::Reader && state.config.write.flush_interval_seconds > 0
         {
             let flush_state = state.clone();
@@ -228,11 +235,43 @@ impl AppState {
         Ok(())
     }
 
-    pub(crate) fn namespace(&self, name: &str) -> Option<&NamespaceConfig> {
-        self.config
-            .namespaces
-            .iter()
-            .find(|namespace| namespace.name == name)
+    pub(crate) fn live(&self) -> Arc<LiveConfig<NamespaceConfig>> {
+        self.live.load()
+    }
+
+    pub(crate) fn has_namespace(&self, name: &str) -> bool {
+        self.live().namespaces.contains_key(name)
+    }
+
+    /// Applies new revisions of the config file at `path` until shutdown.
+    pub async fn watch_config(&self, path: PathBuf) {
+        let state = self.clone();
+        let task = reload::spawn_config_watcher(
+            "metrics",
+            path,
+            reload::POLL_INTERVAL,
+            self.cancellation.clone(),
+            move |raw| {
+                let state = state.clone();
+                async move {
+                    let next = Config::from_yaml(&raw).map_err(|error| error.to_string())?;
+                    Ok(state.reload(&next).await)
+                }
+            },
+        );
+        self.background_tasks.lock().await.push(task);
+    }
+
+    /// Applies the live settings of `next` and returns the sections that
+    /// still differ from the running config until a restart.
+    pub(crate) async fn reload(&self, next: &Config) -> Vec<String> {
+        let live = live_config(next);
+        let restart_warmer = self.live().warms_differently(&live);
+        self.live.store(live);
+        if restart_warmer {
+            self.start_cache_warmer(false).await;
+        }
+        reload::restart_required(self.config.as_ref(), next)
     }
 
     pub(crate) async fn is_ready(&self) -> bool {
@@ -262,25 +301,34 @@ impl AppState {
         }
     }
 
-    async fn start_cache_warmer(&self) {
+    /// (Re)starts the warmer from the live config, replacing any running one.
+    /// Only the first start runs the startup pass.
+    async fn start_cache_warmer(&self, startup: bool) {
+        if let Some(previous) = self.warmer.lock().expect("warmer lock").take() {
+            previous.cancel();
+        }
         let Some(readers) = self.readers.clone() else {
             self.cache_warmed.store(true, Ordering::Release);
             return;
         };
+        let live = self.live();
         let serves_reads = self.config.mode != ServerMode::Writer;
-        if !warming_enabled(&self.config.cache_warmer, serves_reads) {
+        if !warming_enabled(&live.cache_warmer, serves_reads) {
             return;
         }
-        let namespaces: Arc<[Namespace]> = self
-            .config
+        let mut config = live.cache_warmer.clone();
+        config.enabled &= startup;
+        let namespaces: Arc<[Namespace]> = live
             .namespaces
-            .iter()
-            .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
+            .keys()
+            .filter_map(|name| Namespace::new(name.clone()).ok())
             .collect();
+        let cancel = self.cancellation.child_token();
+        *self.warmer.lock().expect("warmer lock") = Some(cancel.clone());
         let task = spawn_cache_warmer(
             "metrics",
-            &self.config.cache_warmer,
-            self.cancellation.clone(),
+            &config,
+            cancel,
             Arc::clone(&self.cache_warmed),
             move |pass: WarmPass| {
                 let readers = Arc::clone(&readers);
@@ -434,6 +482,19 @@ struct RemoteWrite<'a> {
     shard: ShardId,
     durability: Durability,
     request_id: &'a str,
+}
+
+pub(crate) fn live_config(config: &Config) -> LiveConfig<NamespaceConfig> {
+    LiveConfig {
+        namespaces: config
+            .namespaces
+            .iter()
+            .map(|namespace| (namespace.name.clone(), namespace.clone()))
+            .collect(),
+        unauthenticated: config.auth.unauthenticated,
+        global: config.auth.global.clone(),
+        cache_warmer: config.cache_warmer.clone(),
+    }
 }
 
 pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {

@@ -22,26 +22,14 @@ export function DocsShell({ apiNav, children }: { apiNav: ApiNav; children: Reac
 
   return (
     <div className="relative min-h-screen">
-      {/* outer gutters with ruler ticks against the frame */}
+      {/* outer gutters framing the page */}
       <span
         aria-hidden
         className="pointer-events-none absolute inset-y-0 left-0 hidden w-12 border-r border-line lg:block"
-        style={{
-          backgroundImage: "linear-gradient(var(--line-strong) 1px, transparent 1px)",
-          backgroundSize: "7px 8px",
-          backgroundRepeat: "repeat-y",
-          backgroundPosition: "right top",
-        }}
       />
       <span
         aria-hidden
         className="pointer-events-none absolute inset-y-0 right-0 hidden w-12 border-l border-line lg:block"
-        style={{
-          backgroundImage: "linear-gradient(var(--line-strong) 1px, transparent 1px)",
-          backgroundSize: "7px 8px",
-          backgroundRepeat: "repeat-y",
-          backgroundPosition: "left top",
-        }}
       />
 
       <header className="sticky top-0 z-40 h-[57px] border-b border-line bg-bg">

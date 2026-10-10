@@ -3,6 +3,7 @@ package resources
 import (
 	"fmt"
 	"maps"
+	"path/filepath"
 	"strings"
 
 	"github.com/samber/lo"
@@ -130,39 +131,42 @@ type StatefulSetInput struct {
 }
 
 type Descriptor struct {
-	Kind, Name, Image, ConfigKey, ConfigPath, SecretsPath, DataPath, CachePath, InternalTokenPath string
-	HTTPPort, GRPCPort                                                                            int32
-	ReadRoute, WriteRoute                                                                         string
-	NameAnnotation                                                                                string
-	SupportsPathPrefix                                                                            bool
-	GRPCOnly                                                                                      bool
+	Kind, Name, Image, ConfigKey, ConfigDir, SecretsPath, DataPath, CachePath, InternalTokenPath string
+	HTTPPort, GRPCPort                                                                           int32
+	ReadRoute, WriteRoute                                                                        string
+	NameAnnotation                                                                               string
+	SupportsPathPrefix                                                                           bool
+	GRPCOnly                                                                                     bool
+	// ReloadsConfig servers apply config file changes in place, so config
+	// changes don't roll their pods.
+	ReloadsConfig bool
 }
 
 var (
 	MetricsDescriptor = Descriptor{
 		Kind: "Metrics", Name: "metrics", Image: "ghcr.io/pluralsh/metrics", ConfigKey: "metrics.yaml",
-		ConfigPath: "/etc/metrics/metrics.yaml", SecretsPath: "/etc/metrics/secrets",
+		ConfigDir: "/etc/metrics/config", SecretsPath: "/etc/metrics/secrets",
 		DataPath: "/var/lib/metrics", CachePath: "/var/cache/metrics",
 		InternalTokenPath: InternalTokenPath, HTTPPort: 8080, GRPCPort: 9090,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: MetricsNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: MetricsNameAnnotation, SupportsPathPrefix: true, ReloadsConfig: true,
 	}
 	LogsDescriptor = Descriptor{
 		Kind: "Logs", Name: "logs", Image: "ghcr.io/pluralsh/logs", ConfigKey: "logs.yaml",
-		ConfigPath: "/etc/logs/logs.yaml", SecretsPath: "/etc/logs/secrets",
+		ConfigDir: "/etc/logs/config", SecretsPath: "/etc/logs/secrets",
 		DataPath: "/var/lib/logs", CachePath: "/var/cache/logs",
 		InternalTokenPath: "/var/run/secrets/logs/internal-token", HTTPPort: 3100, GRPCPort: 9091,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: LogsNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: LogsNameAnnotation, SupportsPathPrefix: true, ReloadsConfig: true,
 	}
 	TracesDescriptor = Descriptor{
 		Kind: "Traces", Name: "traces", Image: "ghcr.io/pluralsh/traces", ConfigKey: "traces.yaml",
-		ConfigPath: "/etc/traces/traces.yaml", SecretsPath: "/etc/traces/secrets",
+		ConfigDir: "/etc/traces/config", SecretsPath: "/etc/traces/secrets",
 		DataPath: "/var/lib/traces", CachePath: "/var/cache/traces",
 		InternalTokenPath: "/var/run/secrets/traces/internal-token", HTTPPort: 3200, GRPCPort: 9092,
-		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: TracesNameAnnotation, SupportsPathPrefix: true,
+		ReadRoute: routeRead, WriteRoute: routeWrite, NameAnnotation: TracesNameAnnotation, SupportsPathPrefix: true, ReloadsConfig: true,
 	}
 	PseudoFSDescriptor = Descriptor{
 		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",
-		ConfigPath: "/etc/pseudofs/pseudofs.yaml", DataPath: "/var/lib/pseudofs", CachePath: "/var/cache/pseudofs",
+		ConfigDir: "/etc/pseudofs/config", DataPath: "/var/lib/pseudofs", CachePath: "/var/cache/pseudofs",
 		GRPCPort: 9093, NameAnnotation: PseudoFSNameAnnotation, GRPCOnly: true,
 	}
 )
@@ -519,7 +523,9 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 	if template.Annotations == nil {
 		template.Annotations = map[string]string{}
 	}
-	template.Annotations[ConfigHashAnnotation] = metrics.ConfigHash
+	if !metrics.Descriptor.ReloadsConfig {
+		template.Annotations[ConfigHashAnnotation] = metrics.ConfigHash
+	}
 	spec := &template.Spec
 	applyPodDefaults(spec, metrics, component)
 
@@ -540,7 +546,7 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 	} else if metricsContainer.ImagePullPolicy == "" {
 		metricsContainer.ImagePullPolicy = corev1.PullIfNotPresent
 	}
-	metricsContainer.Args = []string{"--config", metrics.Descriptor.ConfigPath}
+	metricsContainer.Args = []string{"--config", filepath.Join(metrics.Descriptor.ConfigDir, ConfigKeyFor(metrics, component))}
 	requiredPorts := []corev1.ContainerPort{{Name: portGRPC, ContainerPort: GRPCPort(metrics), Protocol: corev1.ProtocolTCP}}
 	if !metrics.Descriptor.GRPCOnly {
 		requiredPorts = append([]corev1.ContainerPort{{Name: portHTTP, ContainerPort: HTTPPort(metrics), Protocol: corev1.ProtocolTCP}}, requiredPorts...)
@@ -551,7 +557,7 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
 	metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(metrics)...)
 	requiredMounts := []corev1.VolumeMount{
-		{Name: volumeConfig, MountPath: metrics.Descriptor.ConfigPath, SubPath: ConfigKeyFor(metrics, component), ReadOnly: true},
+		{Name: volumeConfig, MountPath: metrics.Descriptor.ConfigDir, ReadOnly: true},
 		{Name: volumeData, MountPath: metrics.Descriptor.DataPath},
 		{Name: volumeCache, MountPath: metrics.Descriptor.CachePath},
 	}

@@ -38,6 +38,26 @@ use static ownership for split deployments until the Traces Kubernetes lifecycle
 Defaults apply when a field or section is omitted. Fields described as required must be present
 when their containing section or tagged variant is present.
 
+## Live reload
+
+Metrics, Logs, and Traces check their config file every 10 seconds and apply a changed revision
+without restarting. The operator mounts the config Secret as a directory, which the kubelet
+refreshes in place, so a config change reaches running pods within about a minute and does not
+roll them. These settings take effect immediately:
+
+- `namespaces`: adding or removing namespaces and changing their `auth`.
+- `auth.unauthenticated` and `auth.global`. Credential files are reread on every request, so
+  rotating a referenced secret needs no reload at all.
+- `cache_warmer`, including `continuous`. A reload restarts the warmer without rerunning the
+  startup pass.
+
+Every other change, including namespace `usage_reporting_endpoint`, `auth.jwt`, and
+`auth.internal`, takes effect only after the process restarts. The server logs the affected
+sections and sets `telemetry_config_restart_required{product}` to `1` until a restart or a revert.
+An invalid revision is rejected and the running config stays;
+`telemetry_config_reloads_total{product,outcome="applied|invalid"}` counts both. PseudoFS does not
+reload, so the operator still rolls its pod when its config changes.
+
 ## Server and listeners
 
 - `mode`: server role. Valid values are `standalone` (default), `writer`, and `reader`.

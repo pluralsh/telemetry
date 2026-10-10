@@ -253,7 +253,7 @@ var _ = Describe("Metrics Controller", func() {
 		for _, name := range []string{metrics.Name + "-writer", metrics.Name + "-reader"} {
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sts)).To(Succeed())
-			Expect(sts.Spec.Template.Annotations[configHashAnnotation]).To(Equal(current.Status.ConfigHash))
+			Expect(sts.Spec.Template.Annotations).NotTo(HaveKey(configHashAnnotation))
 		}
 	})
 
@@ -562,13 +562,13 @@ func assertStatefulSet(ctx context.Context, name string, kind component, config 
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, sts)).To(Succeed())
 	Expect(sts.Spec.ServiceName).To(Equal(name + "-headless"))
 	Expect(sts.Spec.Template.Spec.ServiceAccountName).To(Equal(strings.TrimSuffix(strings.TrimSuffix(name, "-writer"), "-reader")))
-	Expect(sts.Spec.Template.Annotations[configHashAnnotation]).NotTo(BeEmpty())
+	Expect(sts.Spec.Template.Annotations).NotTo(HaveKey(configHashAnnotation))
 	Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
-	Expect(sts.Spec.Template.Spec.Containers[0].Args).To(ContainElement("/etc/metrics/metrics.yaml"))
+	Expect(sts.Spec.Template.Spec.Containers[0].Args).To(ContainElement("/etc/metrics/config/" + configKey(kind)))
 	Expect(sts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(SatisfyAll(
 		HaveField("Name", "config"),
-		HaveField("MountPath", "/etc/metrics/metrics.yaml"),
-		HaveField("SubPath", configKey(kind)),
+		HaveField("MountPath", "/etc/metrics/config"),
+		HaveField("SubPath", ""),
 	)))
 	Expect(config.Data[configKey(kind)]).NotTo(BeEmpty())
 	return sts

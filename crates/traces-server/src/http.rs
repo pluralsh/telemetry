@@ -618,15 +618,16 @@ async fn authorize_namespace(
     headers: &HeaderMap,
     permission: Permission,
 ) -> Result<NamespaceConfig, ApiError> {
-    let config = state
+    let live = state.live();
+    let config = live
         .namespaces
         .get(namespace)
         .cloned()
         .ok_or_else(|| ApiError::not_found("unknown namespace"))?;
     if authorize(
         headers,
-        state.config.auth.unauthenticated,
-        &state.config.auth.global,
+        live.unauthenticated,
+        &live.global,
         &config.auth,
         state.jwt.as_ref(),
         namespace,

@@ -1,6 +1,7 @@
 package resources
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/samber/lo"
@@ -275,9 +276,12 @@ func TestLogsResourcesUseProductDefaultsAndNamespaceRoutes(t *testing.T) {
 		t.Fatalf("unexpected Logs ports: %#v", container.Ports)
 	}
 	if !lo.ContainsBy(container.VolumeMounts, func(mount corev1.VolumeMount) bool {
-		return mount.Name == volumeConfig && mount.MountPath == "/etc/logs/logs.yaml" && mount.SubPath == "logs.yaml"
+		return mount.Name == volumeConfig && mount.MountPath == "/etc/logs/config" && mount.SubPath == ""
 	}) {
 		t.Fatalf("Logs config mount is missing: %#v", container.VolumeMounts)
+	}
+	if !slices.Equal(container.Args, []string{"--config", "/etc/logs/config/logs.yaml"}) {
+		t.Fatalf("unexpected Logs args: %#v", container.Args)
 	}
 	paths := Ingress(logs).Spec.Rules[0].HTTP.Paths
 	assertIngressPath(t, paths, "/logs/write", logs.Name)
@@ -324,6 +328,9 @@ func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
 	}
 	assertClaim(t, statefulSet.Spec.VolumeClaimTemplates, "data", "10Gi")
 	assertClaim(t, statefulSet.Spec.VolumeClaimTemplates, "cache", "20Gi")
+	if statefulSet.Spec.Template.Annotations[ConfigHashAnnotation] != testConfigHash {
+		t.Fatal("PseudoFS cannot reload config, so config changes must roll its pod")
+	}
 	container := statefulSet.Spec.Template.Spec.Containers[0]
 	if container.Name != "pseudofs" || container.Image != "ghcr.io/pluralsh/pseudofs:0.1.0" {
 		t.Fatalf("unexpected PseudoFS container: %#v", container)
@@ -570,10 +577,12 @@ func TestStatefulSetMergesPodSecurityDefaults(t *testing.T) {
 			t.Fatalf("container %q did not receive secure defaults: %#v", secured.Name, context)
 		}
 	}
-	if template.Annotations[ConfigHashAnnotation] != testConfigHash ||
-		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "CUSTOM" }) ||
+	if _, rolls := template.Annotations[ConfigHashAnnotation]; rolls {
+		t.Fatal("config changes should reload in place rather than roll metrics pods")
+	}
+	if !lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "CUSTOM" }) ||
 		!lo.ContainsBy(container.Env, func(value corev1.EnvVar) bool { return value.Name == "POD_NAME" }) {
-		t.Fatal("pod template merge lost annotations or environment")
+		t.Fatal("pod template merge lost environment")
 	}
 }
 

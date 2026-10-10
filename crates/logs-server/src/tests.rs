@@ -413,6 +413,31 @@ async fn elasticsearch_rejects_malformed_bulk_and_answers_handshakes() {
     protected.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn reload_applies_auth_namespaces_and_warming_without_a_restart() {
+    let state = authenticated_state(vec![namespace("tenant")]).await;
+    let labels = "/read/ns/tenant/loki/api/v1/labels";
+    assert_eq!(
+        query(&state, labels).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let mut next = (*state.config).clone();
+    next.auth.unauthenticated = true;
+    next.namespaces.push(namespace("other"));
+    next.cache_warmer.continuous.enabled = true;
+    assert!(state.reload(&next).await.is_empty());
+
+    assert_eq!(query(&state, labels).await.status(), StatusCode::OK);
+    assert_eq!(
+        query(&state, "/read/ns/other/loki/api/v1/labels")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    state.shutdown().await.unwrap();
+}
+
 fn namespace(name: &str) -> NamespaceConfig {
     NamespaceConfig {
         name: name.to_owned(),

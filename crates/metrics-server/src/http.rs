@@ -529,7 +529,7 @@ fn format_prometheus_labels(labels: &plural_metrics::Labels) -> String {
 }
 
 async fn reader(state: &AppState, namespace: &str) -> Result<Arc<ShardedMetrics>, ApiError> {
-    if state.namespace(namespace).is_none() {
+    if !state.has_namespace(namespace) {
         return Err(ApiError::not_found("namespace is not readable"));
     }
     state
@@ -545,13 +545,15 @@ async fn authorize_namespace(
     headers: &HeaderMap,
     permission: Permission,
 ) -> Result<(), ApiError> {
-    let config = state
-        .namespace(namespace)
+    let live = state.live();
+    let config = live
+        .namespaces
+        .get(namespace)
         .ok_or_else(|| ApiError::not_found("unknown namespace"))?;
     if authorize(
         headers,
-        state.config.auth.unauthenticated,
-        &state.config.auth.global,
+        live.unauthenticated,
+        &live.global,
         &config.auth,
         state.jwt.as_ref(),
         namespace,

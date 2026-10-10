@@ -140,8 +140,11 @@ impl Default for Config {
 
 impl Config {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let raw = fs::read_to_string(path).map_err(ConfigError::Io)?;
-        let config: Self = serde_yaml::from_str(&raw).map_err(ConfigError::Yaml)?;
+        Self::from_yaml(&fs::read_to_string(path).map_err(ConfigError::Io)?)
+    }
+
+    pub fn from_yaml(raw: &str) -> Result<Self, ConfigError> {
+        let config: Self = serde_yaml::from_str(raw).map_err(ConfigError::Yaml)?;
         config.validate()?;
         Ok(config)
     }

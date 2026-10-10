@@ -73,6 +73,10 @@ fn state(mode: ServerMode) -> AppState {
             },
         )),
         channels: Arc::new(server_common::internal_rpc::ChannelPool::default()),
+        live: Arc::new(server_common::reload::Live::new(crate::state::live_config(
+            &config,
+        ))),
+        warmer: Arc::default(),
         config: Arc::new(config),
         jwt: None,
         writers: None,
@@ -207,6 +211,32 @@ async fn unknown_namespace_cannot_cross_tenant_boundary() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reload_applies_namespaces_live_and_reports_static_changes() {
+    let state = state(ServerMode::Standalone);
+    let app = router(state.clone());
+    let write_gamma = || {
+        HttpRequest::post("/write/ns/gamma/api/v1/write")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let before = app.clone().oneshot(write_gamma()).await.unwrap();
+    assert_eq!(before.status(), StatusCode::NOT_FOUND);
+
+    let mut next = (*state.config).clone();
+    next.namespaces.push(NamespaceConfig {
+        name: "gamma".to_owned(),
+        auth: Default::default(),
+        usage_reporting_endpoint: None,
+    });
+    next.storage.path = "elsewhere".to_owned();
+    assert_eq!(state.reload(&next).await, ["storage"]);
+
+    let after = app.oneshot(write_gamma()).await.unwrap();
+    assert_ne!(after.status(), StatusCode::NOT_FOUND);
+    assert_eq!(state.config.storage.path, "metrics-tests");
 }
 
 #[tokio::test]

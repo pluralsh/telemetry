@@ -33,7 +33,8 @@ impl CollectorService for AppState {
             .get("x-scope-orgid")
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| GrpcStatus::invalid_argument("x-scope-orgid metadata is required"))?;
-        let namespace_config = self
+        let live = self.live();
+        let namespace_config = live
             .namespaces
             .get(namespace)
             .ok_or_else(|| GrpcStatus::not_found("unknown namespace"))?;
@@ -51,8 +52,8 @@ impl CollectorService for AppState {
         }
         if !authorize(
             &headers,
-            self.config.auth.unauthenticated,
-            &self.config.auth.global,
+            live.unauthenticated,
+            &live.global,
             &namespace_config.auth,
             self.jwt.as_ref(),
             namespace,

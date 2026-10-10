@@ -25,10 +25,11 @@ async fn main() -> anyhow::Result<()> {
     server_common::runtime::install_metrics_recorder()?;
     metrics::gauge!("telemetry_server_up", "product" => "metrics").set(1.0);
     let args = Args::parse();
-    let config = Config::from_path(args.config)?;
+    let config = Config::from_path(&args.config)?;
     let http_addr = config.listeners.http;
     let grpc_addr = config.listeners.grpc;
     let state = AppState::open(config).await?;
+    state.watch_config(args.config).await;
     let cancellation = CancellationToken::new();
     let http_cancel = cancellation.clone();
     let grpc_cancel = cancellation.clone();

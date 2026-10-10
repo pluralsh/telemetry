@@ -171,7 +171,7 @@ impl InternalWriter for AppState {
             .as_ref()
             .map(|namespace| namespace.name.as_str())
             .ok_or_else(|| Status::invalid_argument("namespace is required"))?;
-        if self.namespace(namespace).is_none() {
+        if !self.has_namespace(namespace) {
             return Err(Status::not_found("unknown namespace"));
         }
         let shard = internal_rpc::shard_id(request.shard_id)?;

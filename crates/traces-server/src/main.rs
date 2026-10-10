@@ -26,12 +26,14 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     server_common::runtime::install_metrics_recorder()?;
     metrics::gauge!("telemetry_server_up", "product" => "traces").set(1.0);
-    let config = Config::from_path(Args::parse().config)?;
+    let path = Args::parse().config;
+    let config = Config::from_path(&path)?;
     let http_address = config.listeners.http;
     let grpc_address = config.listeners.grpc;
     let otlp_address = config.listeners.otlp_grpc;
     let jaeger_address = config.listeners.jaeger_grpc;
     let state = AppState::open(config).await?;
+    state.watch_config(path).await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let http = axum::serve(
         TcpListener::bind(http_address).await?,

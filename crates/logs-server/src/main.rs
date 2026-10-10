@@ -23,10 +23,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     server_common::runtime::install_metrics_recorder()?;
     metrics::gauge!("telemetry_server_up", "product" => "logs").set(1.0);
-    let config = Config::from_path(Args::parse().config)?;
+    let path = Args::parse().config;
+    let config = Config::from_path(&path)?;
     let address = config.listeners.http;
     let grpc_address = config.listeners.grpc;
     let state = AppState::open(config).await?;
+    state.watch_config(path).await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let server = axum::serve(TcpListener::bind(address).await?, router(state.clone()))
         .with_graceful_shutdown(cancellation.clone().cancelled_owned());
