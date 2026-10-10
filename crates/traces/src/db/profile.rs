@@ -161,6 +161,7 @@ fn config(path: &std::path::Path) -> Config {
                 capacity: 16 << 20,
                 shards: None,
             })),
+            disk: Default::default(),
         }),
         segment_duration: Duration::from_secs(3600),
         retention: None,

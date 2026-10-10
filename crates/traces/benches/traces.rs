@@ -377,6 +377,7 @@ fn end_to_end_benches(c: &mut Criterion, traces: &[Trace]) {
                 settings_path: None,
                 block_cache: None,
                 meta_cache: None,
+                disk: Default::default(),
             }),
             segment_duration: Duration::from_secs(3_600),
             retention: None,

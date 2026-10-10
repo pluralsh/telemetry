@@ -6,12 +6,14 @@
 use std::sync::Arc;
 
 use super::coalescing::CoalescingObjectStore;
-use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+use super::config::{
+    BlockCacheConfig, DiskPerformance, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
+};
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
-use slatedb::config::Settings;
+use slatedb::config::{Settings, SstBlockSize};
 pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
@@ -94,7 +96,8 @@ impl StorageBuilder {
                 let cache = cache.cache();
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store.clone())
-                        .with_settings(settings);
+                        .with_settings(settings)
+                        .with_sst_block_size(sst_block_size(&slate_config.disk));
                 if let Some(cache) = cache.clone() {
                     db_builder = db_builder.with_db_cache(cache);
                 }
@@ -325,6 +328,18 @@ pub fn new_slatedb_compactor_builder(
                 None => Ok(None),
             }
         }
+    }
+}
+
+/// [`DiskPerformance::sst_block_bytes`] as SlateDB's block size, for every
+/// builder that writes SSTs.
+pub fn sst_block_size(disk: &DiskPerformance) -> SstBlockSize {
+    match disk.sst_block_bytes() {
+        ..=4096 => SstBlockSize::Block4Kib,
+        4097..=8192 => SstBlockSize::Block8Kib,
+        8193..=16384 => SstBlockSize::Block16Kib,
+        16385..=32768 => SstBlockSize::Block32Kib,
+        _ => SstBlockSize::Block64Kib,
     }
 }
 
@@ -760,6 +775,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         })
     }
 
@@ -781,6 +797,7 @@ mod tests {
                 cache_dir.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         });
 
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
@@ -813,6 +830,7 @@ mod tests {
                 capacity: 1024 * 1024,
                 shards: None,
             })),
+            disk: Default::default(),
         });
 
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
@@ -850,6 +868,7 @@ mod tests {
                 cache_dir.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         };
 
         // First open a writer so the reader has a manifest to read
@@ -909,6 +928,7 @@ mod tests {
                 bad_disk_path.to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         })
     }
 
@@ -956,6 +976,7 @@ mod tests {
                 bad_path.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         };
 
         // First open a writer (without cache) so the reader has a manifest
@@ -1005,6 +1026,7 @@ mod tests {
                 bad_path.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         };
 
         // First open a writer (without cache) so the reader has a manifest
@@ -1060,6 +1082,7 @@ mod tests {
                     cache_dir.to_str().unwrap().to_string(),
                 ))),
                 meta_cache: None,
+                disk: Default::default(),
             })
         };
         let cache = SharedDbCache::from_config(&config("shard-0000"))

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::SharedDbCache;
+use common::storage::factory::{SharedDbCache, sst_block_size};
 use common::storage::metrics_recorder::MetricsRsRecorder;
 use common::storage::slate::warm::{SstWarmTracker, warm_ssts};
 use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
@@ -480,6 +480,7 @@ impl Storage {
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
         let mut builder = DbBuilder::new(slate_config.path.clone(), object_store)
             .with_settings(settings)
+            .with_sst_block_size(sst_block_size(&slate_config.disk))
             .with_merge_operator(Arc::new(adapter))
             .with_segment_extractor(TimeseriesSegmentExtractor::shared())
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));

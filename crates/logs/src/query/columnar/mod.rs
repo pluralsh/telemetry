@@ -8,10 +8,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot;
 
 use super::parallel::{BATCH_ROWS, panicked, pool};
 use super::*;
+use crate::db::SEGMENT_READ_CONCURRENCY;
 
 mod batch;
 mod sink;
@@ -63,16 +65,10 @@ pub(super) async fn load<'a>(
                 .await?
         }
     };
-    let mut sink = ColumnarSink::new(plan, 0)?;
-    if let Some(read) = &plan.lineless {
-        database
-            .read_samples(namespace, targets, budget, read, |slices| {
-                slices.into_iter().try_for_each(|slice| sink.push(slice))
-            })
-            .await?;
-        return sink.finish().await;
-    }
-    if let Some(terms) = &plan.indexed_terms {
+    if plan.lineless.is_none()
+        && let Some(terms) = &plan.indexed_terms
+    {
+        let mut sink = ColumnarSink::new(plan, 0)?;
         let index_top_k = direct_index_top_k(plan.query, plan.limit);
         if let Some(rows) = database
             .read_match_bounded(namespace, &targets, (terms, index_top_k), budget.limit())
@@ -101,12 +97,38 @@ pub(super) async fn load<'a>(
             return sink.finish().await;
         }
     }
-    database
-        .read_bounded_columns(namespace, targets, budget, |slices| {
-            slices.into_iter().try_for_each(|slice| sink.push(slice))
+    // Duplicates share a timestamp, so never span segments: each segment is
+    // read into a sink of its own and the sinks merged in read order.
+    let sinks = futures::stream::iter(targets.split())
+        .map(|targets| async move {
+            let mut sink = ColumnarSink::new(plan, 0)?;
+            let consume =
+                |slices: Vec<BatchSlice>| slices.into_iter().try_for_each(|slice| sink.push(slice));
+            match &plan.lineless {
+                Some(read) => {
+                    database
+                        .read_samples(namespace, targets, budget, read, consume)
+                        .await?
+                }
+                None => {
+                    database
+                        .read_bounded_columns(namespace, targets, budget, consume)
+                        .await?
+                }
+            }
+            sink.finish().await
         })
+        .buffered(SEGMENT_READ_CONCURRENCY)
+        .try_collect::<Vec<_>>()
         .await?;
-    sink.finish().await
+    let mut sinks = sinks.into_iter();
+    let Some(mut merged) = sinks.next() else {
+        return ColumnarSink::new(plan, 0);
+    };
+    for sink in sinks {
+        merged.outputs.extend(sink.outputs);
+    }
+    Ok(merged)
 }
 
 /// Merges each database's outputs, in database order, and evaluates.

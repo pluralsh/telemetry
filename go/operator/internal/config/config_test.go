@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -367,6 +368,21 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone, diskCapacity)
 	if standalone.BlockCache == nil {
 		t.Fatal("standalone storage is missing the default data cache")
+	}
+}
+
+func TestStorageRendersDiskPerformanceInBytes(t *testing.T) {
+	diskCapacity := resources.CacheDiskCapacity(telemetryv1alpha1.WorkloadSpec{})
+	if storage := renderStorageConfig(telemetryv1alpha1.StorageSpec{}, resources.LogsDescriptor, diskCapacity); storage.Disk != nil {
+		t.Fatalf("unset disk rendered %+v, want the storage default", storage.Disk)
+	}
+
+	spec := telemetryv1alpha1.StorageSpec{Disk: &telemetryv1alpha1.DiskSpec{ThroughputMiBps: lo.ToPtr(int64(1000)), IOPS: lo.ToPtr(int64(16000))}}
+	for _, mode := range []string{modeWriter, modeReader} {
+		disk := renderStorageConfigForMode(spec, resources.LogsDescriptor, mode, diskCapacity).Disk
+		if disk == nil || *disk.ThroughputBytesPerSecond != 1000<<20 || *disk.IOPS != 16000 {
+			t.Fatalf("%s rendered disk %+v", mode, disk)
+		}
 	}
 }
 

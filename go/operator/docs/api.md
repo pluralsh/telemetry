@@ -257,6 +257,23 @@ _Appears in:_
 | `name` _string_ |  |  | MinLength: 1 <br /> |
 
 
+#### DiskSpec
+
+
+
+DiskSpec is a disk's provisioned performance, as its provider advertises it.
+
+
+
+_Appears in:_
+- [StorageSpec](#storagespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `throughputMiBps` _integer_ |  | 125 | Minimum: 1 <br /> |
+| `iops` _integer_ |  | 3000 | Minimum: 1 <br /> |
+
+
 #### Durability
 
 _Underlying type:_ _string_
@@ -1068,6 +1085,7 @@ _Appears in:_
 | `objectStore` _[ObjectStoreSpec](#objectstorespec)_ |  |  |  |
 | `blockCache` _[CacheSpec](#cachespec)_ |  |  |  |
 | `metaCache` _[CacheSpec](#cachespec)_ |  |  |  |
+| `disk` _[DiskSpec](#diskspec)_ | Disk describes the performance specs of the disks used for block and meta caches. This is used to<br />optimize caches and defaults to common block store specs as a reasonable baseline. |  |  |
 
 
 #### Traces

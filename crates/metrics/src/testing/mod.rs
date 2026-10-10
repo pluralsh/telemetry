@@ -78,6 +78,7 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     };
     let storage = Arc::new(Storage::try_new(&config).await.unwrap());
     TestTsdb {

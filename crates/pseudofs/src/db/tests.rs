@@ -269,6 +269,7 @@ async fn persists_across_local_slatedb_reopen() {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         chunk_size_bytes: 3,
         max_file_size_bytes: 1024,

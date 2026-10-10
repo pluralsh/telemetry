@@ -122,6 +122,7 @@ impl Default for StorageConfig {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         })
     }
 }
@@ -167,6 +168,49 @@ pub struct SlateDbStorageConfig {
     /// caches nothing for that class of block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_cache: Option<BlockCacheConfig>,
+
+    /// The disk readers serve cached blocks from, which sizes the SST blocks
+    /// writers and compactors produce: see [`DiskPerformance::sst_block_bytes`].
+    /// Writers and readers of one database should describe the same disk.
+    #[serde(default)]
+    pub disk: DiskPerformance,
+}
+
+/// What a disk sustains, as its provider advertises it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskPerformance {
+    pub throughput_bytes_per_second: u64,
+    pub iops: u64,
+}
+
+/// AWS EBS gp3's baseline: 125 MiB/s and 3,000 IOPS.
+impl Default for DiskPerformance {
+    fn default() -> Self {
+        Self {
+            throughput_bytes_per_second: 125 * 1024 * 1024,
+            iops: 3_000,
+        }
+    }
+}
+
+impl DiskPerformance {
+    pub const MIN_SST_BLOCK_BYTES: usize = 4 * 1024;
+    pub const MAX_SST_BLOCK_BYTES: usize = 64 * 1024;
+
+    /// The smallest power-of-two block at which a scan exhausts the disk's
+    /// throughput before its IOPS: below `throughput / iops` reads are IOPS
+    /// bound, so a scan runs slower than the disk can stream. Larger blocks
+    /// scan no faster and cost selective reads more, so the smallest such
+    /// block is chosen, within what SlateDB supports.
+    pub fn sst_block_bytes(&self) -> usize {
+        let knee = self.throughput_bytes_per_second / self.iops.max(1);
+        usize::try_from(knee)
+            .unwrap_or(usize::MAX)
+            .checked_next_power_of_two()
+            .unwrap_or(Self::MAX_SST_BLOCK_BYTES)
+            .clamp(Self::MIN_SST_BLOCK_BYTES, Self::MAX_SST_BLOCK_BYTES)
+    }
 }
 
 /// Cache configuration for SlateDB. Used for both the data-block cache
@@ -257,6 +301,7 @@ impl Default for SlateDbStorageConfig {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: DiskPerformance::default(),
         }
     }
 }
@@ -275,6 +320,7 @@ impl StorageConfig {
                 settings_path: config.settings_path.clone(),
                 block_cache: config.block_cache.clone(),
                 meta_cache: config.meta_cache.clone(),
+                disk: config.disk,
             }),
         }
     }
@@ -362,6 +408,35 @@ pub struct LocalObjectStoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sst_blocks_are_the_smallest_that_exhaust_disk_throughput() {
+        let disk = |throughput_bytes_per_second, iops| DiskPerformance {
+            throughput_bytes_per_second,
+            iops,
+        };
+        assert_eq!(DiskPerformance::default().sst_block_bytes(), 64 * 1024);
+        assert_eq!(disk(2_000_000_000, 400_000).sst_block_bytes(), 8 * 1024);
+        assert_eq!(
+            disk(1_000 * 1024 * 1024, 16_000).sst_block_bytes(),
+            64 * 1024
+        );
+        assert_eq!(disk(250 * 1024 * 1024, 16_000).sst_block_bytes(), 16 * 1024);
+        assert_eq!(disk(1, 1_000_000).sst_block_bytes(), 4 * 1024);
+        assert_eq!(disk(u64::MAX, 0).sst_block_bytes(), 64 * 1024);
+
+        let parsed: SlateDbStorageConfig = serde_yaml::from_str(
+            "path: data\nobject_store:\n  type: InMemory\ndisk:\n  iops: 16000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.disk,
+            disk(
+                DiskPerformance::default().throughput_bytes_per_second,
+                16_000
+            )
+        );
+    }
 
     #[test]
     fn cache_warmer_continuously_warms_by_default() {
@@ -568,6 +643,7 @@ object_store:
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         });
 
         // when
@@ -757,6 +833,7 @@ meta_cache:
                 capacity: 16 * 1024 * 1024,
                 shards: None,
             })),
+            disk: Default::default(),
         });
 
         // when

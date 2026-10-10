@@ -116,6 +116,7 @@ fn default_storage() -> SlateDbStorageConfig {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     }
 }
 

@@ -192,6 +192,7 @@ fn storage(path: &Path) -> SlateDbStorageConfig {
             capacity: 16 << 20,
             shards: None,
         })),
+        disk: Default::default(),
     }
 }
 

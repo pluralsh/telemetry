@@ -418,6 +418,7 @@ mod tests {
                 settings_path: None,
                 block_cache: None,
                 meta_cache: None,
+                disk: Default::default(),
             },
             ..Default::default()
         };
@@ -471,6 +472,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         };
 
         // Write a series and close without calling flush()
@@ -532,6 +534,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         };
         let namespace = Namespace::new("durable-discovery").unwrap();
         let timestamp = 1_700_000_000_000;
@@ -599,6 +602,7 @@ mod tests {
                 settings_path: None,
                 block_cache: None,
                 meta_cache: None,
+                disk: Default::default(),
             },
             ..Default::default()
         })

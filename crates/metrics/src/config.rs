@@ -109,6 +109,7 @@ impl Default for Config {
                 settings_path: None,
                 block_cache: None,
                 meta_cache: None,
+                disk: Default::default(),
             },
             flush_interval: Duration::from_secs(60),
             retention: Some(DEFAULT_RETENTION),

@@ -405,6 +405,22 @@ spec:
                         required:
                         - type
                         type: object
+                      disk:
+                        description: |-
+                          Disk describes the performance specs of the disks used for block and meta caches. This is used to
+                          optimize caches and defaults to common block store specs as a reasonable baseline.
+                        properties:
+                          iops:
+                            default: 3000
+                            format: int64
+                            minimum: 1
+                            type: integer
+                          throughputMiBps:
+                            default: 125
+                            format: int64
+                            minimum: 1
+                            type: integer
+                        type: object
                       metaCache:
                         properties:
                           bufferPoolSize:

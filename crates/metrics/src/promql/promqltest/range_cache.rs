@@ -28,6 +28,7 @@ async fn open(path: &str, result_cache_enabled: bool) -> ShardedMetrics {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         },
         query_cache: QueryCacheConfig {
             result_cache_enabled,

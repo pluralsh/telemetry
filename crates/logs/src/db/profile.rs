@@ -65,6 +65,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
             settings_path: None,
             block_cache: cache(64 << 20),
             meta_cache: cache(16 << 20),
+            disk: Default::default(),
         }),
         segment_duration: Duration::from_secs(if production { 3600 } else { 60 }),
         discovery_rollup: Some(Duration::from_secs(24 * 3600)),

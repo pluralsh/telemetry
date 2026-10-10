@@ -467,6 +467,12 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 	} else {
 		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath, diskCapacity)
 	}
+	if spec.Disk != nil {
+		result.Disk = &renderDisk{IOPS: spec.Disk.IOPS}
+		if spec.Disk.ThroughputMiBps != nil {
+			result.Disk.ThroughputBytesPerSecond = lo.ToPtr(*spec.Disk.ThroughputMiBps << 20)
+		}
+	}
 	return result
 }
 
@@ -786,6 +792,11 @@ type renderStorage struct {
 	SettingsPath string            `json:"settings_path,omitempty"`
 	BlockCache   *renderCache      `json:"block_cache,omitempty"`
 	MetaCache    *renderCache      `json:"meta_cache,omitempty"`
+	Disk         *renderDisk       `json:"disk,omitempty"`
+}
+type renderDisk struct {
+	ThroughputBytesPerSecond *int64 `json:"throughput_bytes_per_second,omitempty"`
+	IOPS                     *int64 `json:"iops,omitempty"`
 }
 type renderObjectStore struct {
 	Type               string `json:"type"`

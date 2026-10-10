@@ -447,6 +447,7 @@ mod tests {
                     submit_queue_size_threshold: 1 << 20,
                 })),
                 meta_cache: None,
+                disk: Default::default(),
             }),
             ..Config::default()
         };

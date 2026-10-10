@@ -74,6 +74,7 @@ impl Default for Config {
                 settings_path: None,
                 block_cache: None,
                 meta_cache: None,
+                disk: Default::default(),
             }),
             segment_duration: Duration::from_secs(60 * 60),
             discovery_rollup: Some(Duration::from_secs(24 * 60 * 60)),

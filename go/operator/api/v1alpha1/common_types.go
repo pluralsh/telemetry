@@ -199,6 +199,19 @@ type StorageSpec struct {
 	ObjectStore  ObjectStoreSpec `json:"objectStore,omitempty"`
 	BlockCache   *CacheSpec      `json:"blockCache,omitempty"`
 	MetaCache    *CacheSpec      `json:"metaCache,omitempty"`
+	// Disk describes the performance specs of the disks used for block and meta caches. This is used to
+	// optimize caches and defaults to common block store specs as a reasonable baseline.
+	Disk *DiskSpec `json:"disk,omitempty"`
+}
+
+// DiskSpec is a disk's provisioned performance, as its provider advertises it.
+type DiskSpec struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=125
+	ThroughputMiBps *int64 `json:"throughputMiBps,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=3000
+	IOPS *int64 `json:"iops,omitempty"`
 }
 
 type WriteSpec struct {

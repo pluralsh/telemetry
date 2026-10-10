@@ -14,6 +14,7 @@ async fn test_databases() -> (ShardedMetrics, TimeSeriesDb) {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         },
         ..Default::default()
     };
@@ -71,6 +72,7 @@ async fn reader_reconciliation_opens_new_shards() {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         },
         ..Default::default()
     };

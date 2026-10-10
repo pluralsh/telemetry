@@ -505,6 +505,7 @@ async fn open(args: &Args) -> TimeSeriesDb {
         settings_path: Some(settings_file(args)),
         block_cache: args.block_cache.then(|| cache(512 << 20)),
         meta_cache: args.block_cache.then(|| cache(128 << 20)),
+        disk: Default::default(),
     };
     TimeSeriesDb::open(Config {
         storage,

@@ -248,6 +248,7 @@ async fn slatedb_writer_and_reader_coexist_no_fencing() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     };
 
     // 1. Open writer and write data
@@ -383,6 +384,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     };
 
     let writer = TimeSeriesDb::open(Config {
@@ -569,6 +571,7 @@ async fn should_open_reader_pinned_to_checkpoint() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     };
 
     let writer = TimeSeriesDb::open(Config {

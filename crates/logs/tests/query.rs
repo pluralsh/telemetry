@@ -17,6 +17,7 @@ fn config(path: &str) -> Config {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),

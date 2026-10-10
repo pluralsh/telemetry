@@ -21,6 +21,7 @@ fn test_config() -> Config {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),
@@ -650,6 +651,7 @@ async fn written_and_durable_force_the_expected_flushes() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::new("durability").unwrap();
     let db = LogDb::open(config.clone()).await.unwrap();
@@ -827,6 +829,7 @@ async fn reopened_writers_resume_stream_and_object_ids() {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         ..test_config()
     };
@@ -914,6 +917,7 @@ async fn persisted_logical_expiry_survives_reopen_without_physical_ttl() {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         ..test_config()
     };
@@ -1013,6 +1017,7 @@ fn local_storage(directory: &tempfile::TempDir, path: &str) -> StorageConfig {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     })
 }
 

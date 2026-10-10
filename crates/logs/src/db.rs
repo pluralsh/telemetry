@@ -27,7 +27,7 @@ use common::{
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use slatedb::config::DbReaderOptions;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 use crate::Namespace;
@@ -73,6 +73,13 @@ const SPAN_SCAN_MIN_STREAMS: usize = 8;
 const SPAN_SCAN_MAX_SPREAD: usize = 4;
 /// Segments whose stream metadata is listed concurrently by `scan_targets`.
 const SEGMENT_LIST_CONCURRENCY: usize = 4;
+/// Segments a query reads at once, each fetching up to
+/// [`PAGE_READ_CONCURRENCY`] units: a lone segment's reads can't keep a disk
+/// busy as it drains, and small segments drain often.
+pub(crate) const SEGMENT_READ_CONCURRENCY: usize = 4;
+/// Estimated decoded bytes a budget's read units may hold at once, which
+/// bounds the memory concurrent segments add.
+const DECODE_BYTES_IN_FLIGHT: u32 = 256 << 20;
 /// Segments whose discovery catalogs are scanned concurrently.
 const SEGMENT_DISCOVERY_CONCURRENCY: usize = 16;
 /// Larger per-segment stream sets are recomputed rather than cached, which
@@ -100,6 +107,7 @@ pub enum Durability {
 pub(crate) struct PageBudget {
     limit: usize,
     remaining: AtomicUsize,
+    decoding: Semaphore,
 }
 
 impl PageBudget {
@@ -107,7 +115,20 @@ impl PageBudget {
         Self {
             limit,
             remaining: AtomicUsize::new(limit),
+            decoding: Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize),
         }
+    }
+
+    /// Holds `bytes` of decoding until the permit drops. A unit larger than
+    /// the whole allowance waits for it all rather than forever.
+    async fn decode(&self, bytes: u64) -> Result<SemaphorePermit<'_>> {
+        let weight = u32::try_from(bytes)
+            .unwrap_or(u32::MAX)
+            .clamp(1, DECODE_BYTES_IN_FLIGHT);
+        self.decoding
+            .acquire_many(weight)
+            .await
+            .map_err(|_| Error::Query("decode budget closed".into()))
     }
 
     pub(crate) fn limit(&self) -> usize {

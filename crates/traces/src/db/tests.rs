@@ -25,6 +25,7 @@ fn test_config() -> Config {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }),
         segment_duration: Duration::from_secs(10),
         retention: Some(Duration::from_secs(60)),
@@ -272,6 +273,7 @@ async fn durable_write_is_visible_to_a_new_storage_reader() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::new("durable").unwrap();
     let original = trace(1, 1, "durable", Vec::new(), Vec::new());
@@ -312,6 +314,7 @@ async fn close_drains_applied_delta_before_storage_shutdown() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::new("shutdown").unwrap();
     let original = trace(1, 1, "pending", Vec::new(), Vec::new());
@@ -668,6 +671,7 @@ async fn reader_catalog_sees_late_writes_to_closed_segments() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::new("late-catalog").unwrap();
     let service = |name: &str| {
@@ -867,6 +871,7 @@ async fn persists_across_reopen() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::default();
     let original = trace(1, 1, "persistent", Vec::new(), Vec::new());
@@ -903,6 +908,7 @@ async fn should_not_pin_retention_barrier_with_idle_coordinator() {
         settings_path: Some(settings.to_string_lossy().into_owned()),
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     });
     let namespace = Namespace::default();
     let original = trace(1, 1, "idle", Vec::new(), Vec::new());

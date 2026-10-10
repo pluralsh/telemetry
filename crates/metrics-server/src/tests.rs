@@ -40,6 +40,7 @@ fn test_config(mode: ServerMode) -> Config {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         },
         namespaces: vec![
             NamespaceConfig {
@@ -909,6 +910,7 @@ async fn periodic_flush_makes_metadata_visible_to_db_reader() {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     };
     let state = AppState::open(config.clone()).await.unwrap();
     let mut item = Series::new(

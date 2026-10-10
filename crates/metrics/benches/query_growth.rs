@@ -132,6 +132,7 @@ async fn main() {
             capacity: 16 * 1024 * 1024,
             shards: None,
         })),
+        disk: Default::default(),
     };
     let writer = TimeSeriesDb::open(Config {
         storage: storage.clone(),

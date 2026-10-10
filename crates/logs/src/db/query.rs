@@ -401,6 +401,7 @@ impl LogDb {
             range: (start_ns, end_ns),
             segments,
             line_terms: filter.line_terms.clone(),
+            first_ordinal: 0,
         })
     }
 
@@ -478,7 +479,7 @@ impl LogDb {
             consume(chunk)?;
             Ok(ControlFlow::Continue(()))
         };
-        for (ordinal, (segment, streams)) in targets.segments.into_iter().enumerate() {
+        for (ordinal, (segment, streams)) in (targets.first_ordinal..).zip(targets.segments) {
             let _: ControlFlow<()> = self
                 .read_segment_pages::<P>(
                     namespace,
@@ -616,6 +617,10 @@ impl LogDb {
         let mut decoded = futures::stream::iter(units)
             .map(move |unit| async move {
                 budget.take()?;
+                // Held until the unit's rows are pending. Units ask the fair
+                // semaphore in read order, so a segment's earliest holder
+                // never waits behind a later one.
+                let decoding = budget.decode(unit.decode_bytes(true)).await?;
                 let blocks = self
                     .load_blocks(
                         namespace,
@@ -635,16 +640,17 @@ impl LogDb {
                     let decoded = P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
                     runs.push((run, decoded));
                 }
-                Ok::<_, Error>(runs)
+                Ok::<_, Error>((decoding, runs))
             })
             .buffered(PAGE_READ_CONCURRENCY);
         let mut pending = P::new(reverse);
         let mut fetched = 0;
-        while let Some(runs) = decoded.try_next().await? {
+        while let Some((decoding, runs)) = decoded.try_next().await? {
             fetched += 1;
             for (run, decoded) in runs {
                 pending.push(run, decoded);
             }
+            drop(decoding);
             if let Some(ready) = pending.release(bounds.get(fetched).copied())
                 && consume(ready)?.is_break()
             {
@@ -1259,6 +1265,27 @@ struct ReadUnit {
     runs: Vec<UnitRun>,
 }
 
+impl ReadUnit {
+    /// Estimated bytes its blocks and what they decode to hold: encoded
+    /// blocks, spread over the unselected ones it spans, plus their meta
+    /// and, when read, lines.
+    fn decode_bytes(&self, lines: bool) -> u64 {
+        let (bytes, blocks, line_bytes) =
+            self.runs
+                .iter()
+                .fold((0u64, 0u64, 0u64), |(bytes, blocks, line_bytes), run| {
+                    (
+                        bytes + u64::from(run.run.bytes),
+                        blocks + u64::from(run.run.blocks),
+                        line_bytes + run.run.line_bytes,
+                    )
+                });
+        let span = u64::from(self.end_block.saturating_sub(self.first_block));
+        let encoded = bytes.saturating_mul(span) / blocks.max(1);
+        encoded.saturating_mul(2) + if lines { line_bytes } else { 0 }
+    }
+}
+
 /// Unselected blocks a read unit may span between two selected runs: a
 /// scanned block costs far less than a separate read.
 const COALESCE_GAP_BLOCKS: u32 = 8;
@@ -1569,6 +1596,7 @@ impl LogDb {
         let mut loaded = futures::stream::iter(units)
             .map(|unit| async move {
                 budget.take()?;
+                let decoding = budget.decode(unit.decode_bytes(false)).await?;
                 let blocks = self
                     .load_blocks(
                         namespace,
@@ -1587,11 +1615,11 @@ impl LogDb {
                         (run, blocks)
                     })
                     .collect::<Vec<_>>();
-                Ok::<_, Error>(runs)
+                Ok::<_, Error>((decoding, runs))
             })
             .buffer_unordered(PAGE_READ_CONCURRENCY);
         let mut unsure = HashMap::<StreamId, Vec<(UnitRun, Vec<RowSample>)>>::new();
-        while let Some(runs) = loaded.try_next().await? {
+        while let Some((_decoding, runs)) = loaded.try_next().await? {
             for (run, blocks) in runs {
                 let metadata = with_metadata.contains(&run.stream_id);
                 if isolated.contains(&(run.stream_id, run.object_id)) {
@@ -1807,9 +1835,31 @@ pub(crate) struct ScanTargets {
     segments: Vec<(SegmentId, Vec<SegmentStream>)>,
     /// See [`StreamFilter`].
     line_terms: Option<Vec<String>>,
+    /// Position in the whole read of the first of `segments`.
+    first_ordinal: usize,
 }
 
 impl ScanTargets {
+    /// One target per segment, each keeping its segment's position in the
+    /// read, so reading them apart breaks ties as reading them together does.
+    pub(crate) fn split(self) -> Vec<ScanTargets> {
+        let Self {
+            range,
+            segments,
+            line_terms,
+            first_ordinal,
+        } = self;
+        (first_ordinal..)
+            .zip(segments)
+            .map(|(ordinal, segment)| ScanTargets {
+                range,
+                segments: vec![segment],
+                line_terms: line_terms.clone(),
+                first_ordinal: ordinal,
+            })
+            .collect()
+    }
+
     /// Estimates distinct objects, planned ranges, and selected run contents.
     /// Lineless reads coalesce every selected range in an object.
     pub(crate) fn estimate(&self, lineless: bool) -> QueryEstimate {

@@ -19,6 +19,7 @@ fn in_memory_config() -> common::storage::config::SlateDbStorageConfig {
         settings_path: None,
         block_cache: None,
         meta_cache: None,
+        disk: Default::default(),
     }
 }
 
@@ -309,6 +310,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
+            disk: Default::default(),
         }
     }
 
@@ -330,6 +332,7 @@ mod tests {
                 cache_dir.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         };
 
         let storage = Storage::try_new(&config).await;
@@ -363,6 +366,7 @@ mod tests {
                 cache_dir.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         };
 
         // Open a writer first so the reader has a manifest to read, then drop it
@@ -409,6 +413,7 @@ mod tests {
                 bad_disk_path.to_string(),
             ))),
             meta_cache: None,
+            disk: Default::default(),
         }
     }
 

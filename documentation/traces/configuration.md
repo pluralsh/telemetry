@@ -72,6 +72,14 @@ storage:
     capacity: 134217728 # Bytes; 128 MiB.
     shards: 8 # Optional.
 
+  # The disk readers cache blocks on; SST blocks are sized to throughput / iops
+  # (a power of two, 4-64 KiB) so scans stream the disk rather than exhaust its
+  # IOPS. Defaults to an AWS EBS gp3 volume's baseline, giving 64 KiB blocks.
+  # Writers and readers of one database should describe the same disk.
+  disk:
+    throughput_bytes_per_second: 131072000 # 125 MiB/s.
+    iops: 3000
+
 # Entire storage alternative for ephemeral development and tests:
 # storage:
 #   type: InMemory
