@@ -174,7 +174,9 @@ impl<'a> ColumnarSink<'a> {
     fn push(&mut self, slice: BatchSlice) -> Result<()> {
         if self.shared.is_none() || self.inline > 0 {
             self.inline = self.inline.saturating_sub(slice.len());
-            return self.plan.run(&slice, &mut self.outputs);
+            self.plan.run(&slice, &mut self.outputs)?;
+            self.outputs.settle();
+            return Ok(());
         }
         self.pending_rows += slice.len();
         self.pending.push(slice);
@@ -199,7 +201,7 @@ impl<'a> ColumnarSink<'a> {
                 self.plan.run(batch, &mut outputs)?;
             }
             self.jobs.push_back(Job::Done(outputs));
-            return Ok(());
+            return self.merge_ready();
         }
         let (sender, receiver) = oneshot::channel();
         let (shared, running, preselect) = (
@@ -214,7 +216,9 @@ impl<'a> ColumnarSink<'a> {
             let _ = sender.send(outputs);
         });
         self.jobs.push_back(Job::Running(receiver));
-        Ok(())
+        // Finished jobs' outputs fold into this one now rather than
+        // queueing until the read ends.
+        self.merge_ready()
     }
 
     /// Merges the jobs that have finished ahead of any still running.
@@ -250,6 +254,7 @@ impl<'a> ColumnarSink<'a> {
                 for batch in std::mem::take(&mut self.pending) {
                     self.plan.run(&batch, &mut self.outputs)?;
                 }
+                self.outputs.settle();
             } else {
                 self.dispatch()?;
             }

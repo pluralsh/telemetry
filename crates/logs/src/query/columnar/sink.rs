@@ -14,6 +14,9 @@ enum Output<'a> {
         unwraps: bool,
         /// The unwrapped label, which the series drops.
         dropped: Option<&'a str>,
+        /// Set when only window totals are needed, which are then summed as
+        /// rows are read instead of keeping each row.
+        windows: Option<Windows>,
     },
     Labels {
         field: &'a str,
@@ -59,29 +62,34 @@ impl<'a> Plan<'a> {
                         _ => None,
                     });
                     let drops = grouping.is_none_or(|grouping| grouping.without);
-                    return Output::Range {
+                    return Ok(Output::Range {
                         op: *op,
                         grouping: *grouping,
                         unwraps: unwrap.is_some(),
                         dropped: unwrap.filter(|_| drops),
-                    };
+                        windows: sums_windows(*op, unwrap.is_some())
+                            .then(|| Windows::new(log, request))
+                            .transpose()?,
+                    });
                 }
                 if let Some((field, _, grouping)) = labels
                     .iter()
                     .find(|(_, aggregated, _)| std::ptr::eq(*aggregated, *log))
                 {
-                    return Output::Labels {
+                    return Ok(Output::Labels {
                         field,
                         grouping: *grouping,
-                    };
+                    });
                 }
-                if matches!(&query.value, Expr::Log(root) if std::ptr::eq(root, *log)) {
-                    Output::Logs
-                } else {
-                    Output::Unused
-                }
+                Ok(
+                    if matches!(&query.value, Expr::Log(root) if std::ptr::eq(root, *log)) {
+                        Output::Logs
+                    } else {
+                        Output::Unused
+                    },
+                )
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(Self {
             filters_on_error: pipelines
                 .logs
@@ -99,6 +107,9 @@ impl<'a> Plan<'a> {
             self.outputs
                 .iter()
                 .map(|output| match output {
+                    Output::Range {
+                        windows: Some(_), ..
+                    } => ExprOutput::Totals(Box::default(), SeriesTable::default()),
                     Output::Range { .. } => ExprOutput::Range(Vec::new(), SeriesTable::default()),
                     Output::Labels { .. } => ExprOutput::Labels(Vec::new(), SeriesTable::default()),
                     Output::Logs => ExprOutput::Logs(Vec::new()),
@@ -161,6 +172,28 @@ impl<'a> Plan<'a> {
                     slice.rows.clone().map(|row| batch.identity(row)).collect()
                 })[row as usize - base]
             };
+            let range_series = |series: &mut SeriesTable,
+                                at: usize,
+                                grouping: Option<&Grouping>,
+                                dropped: Option<&str>| {
+                let errored = work.has_error(at);
+                series.intern(&work, at, |name| {
+                    ((errored && is_error_label(name))
+                        || grouping.is_none_or(|grouping| {
+                            grouping.labels.iter().any(|label| label == name) != grouping.without
+                        }))
+                        && dropped != Some(name)
+                })
+            };
+            let range_value = |op, unwraps, at: usize| {
+                sample_value(
+                    op,
+                    unwraps,
+                    batch.weights.as_ref().map(|weights| weights[at]),
+                    work.line(at).len(),
+                    work.value(at),
+                )
+            };
             match (&self.outputs[index], &mut outputs.0[index]) {
                 (
                     Output::Range {
@@ -168,28 +201,49 @@ impl<'a> Plan<'a> {
                         grouping,
                         unwraps,
                         dropped,
+                        windows: Some(windows),
+                    },
+                    ExprOutput::Totals(totals, series),
+                ) => {
+                    for &row in &selected {
+                        let at = row as usize;
+                        let timestamp = batch.timestamps[at];
+                        let Some(bucket) = windows.bucket(timestamp) else {
+                            continue;
+                        };
+                        let value = range_value(*op, *unwraps, at);
+                        let row = TotalRow {
+                            order: (timestamp, batch.stream, batch.tie(at)),
+                            bucket,
+                            series: match value {
+                                Some(_) => range_series(series, at, *grouping, *dropped),
+                                None => u32::MAX,
+                            },
+                            value: value.map(|value| value as u64),
+                            failure: pipeline_error(|name| work.label(name, at)),
+                        };
+                        if !pipelines.lineless && batch.may_repeat(at) {
+                            totals.pending.push((batch.identity(at), row));
+                        } else {
+                            totals.add(row);
+                        }
+                    }
+                }
+                (
+                    Output::Range {
+                        op,
+                        grouping,
+                        unwraps,
+                        dropped,
+                        windows: None,
                     },
                     ExprOutput::Range(rows, series),
                 ) => {
                     for &row in &selected {
                         let at = row as usize;
-                        let value = sample_value(
-                            *op,
-                            *unwraps,
-                            batch.weights.as_ref().map(|weights| weights[at]),
-                            work.line(at).len(),
-                            work.value(at),
-                        );
-                        let errored = work.has_error(at);
+                        let value = range_value(*op, *unwraps, at);
                         let series = match value {
-                            Some(_) => series.intern(&work, at, |name| {
-                                ((errored && is_error_label(name))
-                                    || grouping.is_none_or(|grouping| {
-                                        grouping.labels.iter().any(|label| label == name)
-                                            != grouping.without
-                                    }))
-                                    && *dropped != Some(name)
-                            }),
+                            Some(_) => range_series(series, at, *grouping, *dropped),
                             None => u32::MAX,
                         };
                         rows.push(RangeRow {
@@ -440,10 +494,127 @@ impl SeriesTable {
     }
 }
 
+/// One row's contribution to a range aggregation's window totals.
+struct TotalRow {
+    /// Timestamp, stream and tie: Loki's merge order.
+    order: (i64, u64, Tie),
+    bucket: i64,
+    /// Index of the row's series labels; meaningless without a value.
+    series: u32,
+    value: Option<u64>,
+    failure: Option<String>,
+}
+
+/// A range aggregation's rows summed per series and window bucket as they
+/// are read, so it holds memory for its series and steps, not its rows.
+#[derive(Default)]
+struct Totals {
+    sums: HashMap<(u32, i64), u64>,
+    /// Per bucket, its first failing row in merge order and the failure.
+    failures: HashMap<i64, ((i64, u64, Tie), String)>,
+    /// Rows that may repeat a stored row of another batch, with their
+    /// identity, in read order; compared once merged in read order.
+    pending: Vec<(u64, TotalRow)>,
+    /// Rows that may repeat another, of the segment last compared. A
+    /// duplicate shares its timestamp, so never spans segments, which are
+    /// read one after another.
+    seen: HashSet<(i64, u64, u64)>,
+    seen_segment: Option<(u32, u32)>,
+}
+
+impl Totals {
+    fn add(&mut self, row: TotalRow) {
+        self.fail(row.bucket, row.order, row.failure);
+        if let Some(value) = row.value {
+            *self.sums.entry((row.series, row.bucket)).or_default() += value;
+        }
+    }
+
+    fn fail(&mut self, bucket: i64, order: (i64, u64, Tie), failure: Option<String>) {
+        let Some(message) = failure else {
+            return;
+        };
+        match self.failures.entry(bucket) {
+            std::collections::hash_map::Entry::Occupied(mut first) => {
+                if order < first.get().0 {
+                    first.insert((order, message));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(first) => {
+                first.insert((order, message));
+            }
+        }
+    }
+
+    /// Counts pending rows that repeat no row counted before them.
+    fn settle(&mut self) {
+        for (identity, row) in std::mem::take(&mut self.pending) {
+            let (timestamp, stream, tie) = row.order;
+            let segment = (tie.database, tie.segment);
+            if self.seen_segment != Some(segment) {
+                self.seen.clear();
+                self.seen_segment = Some(segment);
+            }
+            if self.seen.insert((timestamp, stream, identity)) {
+                self.add(row);
+            } else {
+                // Duplicates fail alike; the first in merge order names it.
+                self.fail(row.bucket, row.order, row.failure);
+            }
+        }
+    }
+
+    /// Adds what a later batch summed, whose series `ids` renumbers.
+    fn extend(&mut self, other: Totals, ids: &[u32]) {
+        self.settle();
+        for ((series, bucket), value) in other.sums {
+            *self.sums.entry((ids[series as usize], bucket)).or_default() += value;
+        }
+        for (bucket, (order, message)) in other.failures {
+            self.fail(bucket, order, Some(message));
+        }
+        self.pending
+            .extend(other.pending.into_iter().map(|(identity, mut row)| {
+                if row.value.is_some() {
+                    row.series = ids[row.series as usize];
+                }
+                (identity, row)
+            }));
+        self.settle();
+    }
+
+    fn set_database(&mut self, database: u32) {
+        for ((_, _, tie), _) in self.failures.values_mut() {
+            tie.database = database;
+        }
+        for (_, row) in &mut self.pending {
+            row.order.2.database = database;
+        }
+    }
+
+    fn into_series(mut self, labels: &[LabelMap]) -> RangeSeries {
+        self.settle();
+        let mut sums = self
+            .sums
+            .into_iter()
+            .map(|((series, bucket), value)| (bucket, series, value))
+            .collect::<Vec<_>>();
+        sums.sort_unstable();
+        let mut failures = self
+            .failures
+            .into_iter()
+            .map(|(bucket, (_, message))| (bucket, message))
+            .collect::<Vec<_>>();
+        failures.sort_unstable_by_key(|(bucket, _)| *bucket);
+        RangeSeries::from_totals(sums, failures, labels)
+    }
+}
+
 /// Per log expression, what its pipeline kept.
 pub(super) struct Outputs(Vec<ExprOutput>);
 
 enum ExprOutput {
+    Totals(Box<Totals>, SeriesTable),
     Range(Vec<RangeRow>, SeriesTable),
     Labels(Vec<LabelRow>, SeriesTable),
     Logs(Vec<LogLine>),
@@ -459,6 +630,10 @@ impl Outputs {
     pub(super) fn extend(&mut self, other: Outputs) {
         for (output, other) in self.0.iter_mut().zip(other.0) {
             match (output, other) {
+                (ExprOutput::Totals(totals, series), ExprOutput::Totals(more, theirs)) => {
+                    let ids = series.absorb(&theirs);
+                    totals.extend(*more, &ids);
+                }
                 (ExprOutput::Range(rows, series), ExprOutput::Range(more, theirs)) => {
                     let ids = series.absorb(&theirs);
                     rows.extend(more.into_iter().map(|mut row| {
@@ -483,10 +658,21 @@ impl Outputs {
         }
     }
 
+    /// Compares rows that may repeat others with those counted so far; only
+    /// for outputs that rows are merged into in read order.
+    pub(super) fn settle(&mut self) {
+        for output in &mut self.0 {
+            if let ExprOutput::Totals(totals, _) = output {
+                totals.settle();
+            }
+        }
+    }
+
     /// Marks every row as read from the `database`th database.
     pub(super) fn set_database(&mut self, database: u32) {
         for output in &mut self.0 {
             match output {
+                ExprOutput::Totals(totals, _) => totals.set_database(database),
                 ExprOutput::Range(rows, _) => {
                     rows.iter_mut().for_each(|row| row.tie.database = database)
                 }
@@ -530,6 +716,9 @@ impl Outputs {
         for ((log, output), produced) in plan.pipelines.logs.iter().zip(&plan.outputs).zip(self.0) {
             let key = *log as *const LogExpr as usize;
             match (output, produced) {
+                (Output::Range { .. }, ExprOutput::Totals(totals, series)) => {
+                    ranges.insert(key, totals.into_series(&series.labels));
+                }
                 (Output::Range { op, .. }, ExprOutput::Range(mut rows, series)) => {
                     merge_order(&mut rows, lineless, |row| {
                         (row.timestamp_ns, row.stream, row.tie, row.identity)

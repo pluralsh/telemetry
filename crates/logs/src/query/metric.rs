@@ -196,6 +196,68 @@ pub(super) fn sample_value(
     }
 }
 
+/// Whether a range aggregation needs only each window's total of its rows'
+/// whole-number values, or, for `absent_over_time`, whether it has any.
+pub(super) fn sums_windows(op: RangeOp, unwraps: bool) -> bool {
+    match op {
+        RangeOp::Count | RangeOp::Bytes | RangeOp::BytesRate | RangeOp::Absent => true,
+        RangeOp::Rate => !unwraps,
+        _ => false,
+    }
+}
+
+/// A range aggregation's evaluation windows `(t − range − offset, t − offset]`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Windows {
+    /// The first window's start and end; later ones follow by `step`.
+    start: i64,
+    end: i64,
+    step: i64,
+    count: u64,
+}
+
+impl Windows {
+    pub(super) fn new(log: &LogExpr, request: &QueryRequest) -> Result<Self> {
+        let range = log
+            .range
+            .as_ref()
+            .ok_or_else(|| Error::Query("range aggregation requires a range".into()))
+            .and_then(|value| parse_duration_ns(&value.value))?;
+        let offset = log_offset(log)?;
+        let (first, step, count) = evaluation_steps(request);
+        Ok(Self {
+            start: first.saturating_sub(range).saturating_sub(offset),
+            end: first.saturating_sub(offset),
+            step: step.max(1),
+            count,
+        })
+    }
+
+    /// The earliest window boundary at or after `timestamp`. A window holds
+    /// that boundary exactly when it holds `timestamp`, so rows can be summed
+    /// per boundary. `None` when no window can hold `timestamp`.
+    pub(super) fn bucket(&self, timestamp: i64) -> Option<i64> {
+        if timestamp <= self.start {
+            return None;
+        }
+        let next = |first: i64| {
+            let (first, step, at) = (
+                i128::from(first),
+                i128::from(self.step),
+                i128::from(timestamp),
+            );
+            let k = if at <= first {
+                0
+            } else {
+                (at - first + step - 1) / step
+            };
+            (k < i128::from(self.count)).then(|| (first + k * step) as i64)
+        };
+        let end = next(self.end)?;
+        Some(next(self.start).map_or(end, |start| start.min(end)))
+    }
+}
+
 /// One row's contribution to a range aggregation.
 pub(super) struct RangeRow {
     pub(super) timestamp_ns: i64,
@@ -333,6 +395,39 @@ impl RangeSeries {
                 let total = group.totals.last().copied().unwrap_or(0);
                 group.totals.push(total.saturating_add(value as u64));
             }
+        }
+        Self::ordered(timestamps, failures, groups, members)
+    }
+
+    /// From totals per window bucket, as [`Windows::bucket`] numbers them,
+    /// and series, ascending by bucket; `failures` hold each bucket's first
+    /// failing row, ascending.
+    pub(super) fn from_totals(
+        totals: Vec<(i64, u32, u64)>,
+        failures: Vec<(i64, String)>,
+        labels: &[LabelMap],
+    ) -> Self {
+        let timestamps = totals.iter().map(|(bucket, ..)| *bucket).collect();
+        let mut ids = vec![u32::MAX; labels.len()];
+        let mut groups: Vec<RangeGroup> = Vec::new();
+        let mut members = Vec::with_capacity(totals.len());
+        for (bucket, series, total) in totals {
+            let id = &mut ids[series as usize];
+            if *id == u32::MAX {
+                *id = u32::try_from(groups.len()).expect("fewer than u32::MAX groups");
+                groups.push(RangeGroup {
+                    labels: Arc::clone(&labels[series as usize]),
+                    timestamps: Vec::new(),
+                    values: Vec::new(),
+                    totals: vec![0],
+                });
+            }
+            members.push((bucket, *id));
+            let group = &mut groups[*id as usize];
+            group.timestamps.push(bucket);
+            group.values.push(total as f64);
+            let running = group.totals.last().copied().unwrap_or(0);
+            group.totals.push(running.saturating_add(total));
         }
         Self::ordered(timestamps, failures, groups, members)
     }
@@ -986,7 +1081,37 @@ pub(super) fn extrapolated_counter_rate(
 
 #[cfg(test)]
 mod tests {
-    use super::variance;
+    use super::{Windows, variance};
+
+    #[test]
+    fn rows_land_in_the_windows_of_their_bucket() {
+        // Overlapping, tiling and gapped windows.
+        for (range, step) in [(25, 10), (10, 10), (4, 10)] {
+            let windows = Windows {
+                start: 100 - range,
+                end: 100,
+                step,
+                count: 5,
+            };
+            let holding = |at: i64| {
+                (0..5)
+                    .filter(|k| {
+                        let end = 100 + k * step;
+                        end - range < at && at <= end
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for at in 50..160 {
+                match windows.bucket(at) {
+                    Some(bucket) => {
+                        assert!(bucket >= at);
+                        assert_eq!(holding(bucket), holding(at), "range {range} at {at}");
+                    }
+                    None => assert!(holding(at).is_empty(), "range {range} at {at}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn should_give_zero_variance_for_equal_values() {

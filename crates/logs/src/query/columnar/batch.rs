@@ -43,6 +43,9 @@ pub(crate) struct ColumnBatch {
     pub(super) weights: Option<Vec<(u32, u64)>>,
     /// The first row's tie; row `i` follows it by `i`.
     tie: Tie,
+    /// Inclusive time ranges, ascending and disjoint, outside which no row
+    /// repeats a stored row read elsewhere; `None` when any row may.
+    repeats: Option<Arc<[(i64, i64)]>>,
 }
 
 impl ColumnBatch {
@@ -58,7 +61,23 @@ impl ColumnBatch {
             names: Vec::new(),
             weights: lineless.then(Vec::new),
             tie,
+            // Lineless reads are deduplicated as they are read.
+            repeats: lineless.then(|| Arc::from([])),
         }
+    }
+
+    pub(crate) fn set_repeats(&mut self, repeats: Arc<[(i64, i64)]>) {
+        self.repeats = Some(repeats);
+    }
+
+    /// Whether the row may repeat a stored row read elsewhere, which
+    /// deduplication must then compare it with.
+    pub(super) fn may_repeat(&self, row: usize) -> bool {
+        let timestamp = self.timestamps[row];
+        self.repeats.as_ref().is_none_or(|repeats| {
+            let index = repeats.partition_point(|&(_, max)| max < timestamp);
+            repeats.get(index).is_some_and(|&(min, _)| min <= timestamp)
+        })
     }
 
     /// An empty batch of a stored stream's rows.

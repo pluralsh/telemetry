@@ -1034,6 +1034,18 @@ fn log_offset(log: &LogExpr) -> Result<i64> {
         .unwrap_or(0))
 }
 
+/// The first evaluation timestamp, the step between them and their count.
+fn evaluation_steps(request: &QueryRequest) -> (i64, i64, u64) {
+    match request.step_ns {
+        Some(step) => (
+            request.start_ns,
+            step,
+            u64::try_from((request.end_ns - request.start_ns) / step).unwrap_or(0) + 1,
+        ),
+        None => (request.end_ns, 1, 1),
+    }
+}
+
 /// The read of a metric query no stage of which sees a line: every log
 /// expression is the input of a `count_over_time`, `rate`, `bytes_over_time`
 /// or `bytes_rate` with no pipeline stages, so each row contributes only its
@@ -1060,14 +1072,7 @@ fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleR
     let metadata = !aggregations.iter().all(|(_, _, grouping)| {
         grouping.is_some_and(|grouping| !grouping.without && grouping.labels.is_empty())
     });
-    let (first, step, count) = match request.step_ns {
-        Some(step) => (
-            request.start_ns,
-            step,
-            u64::try_from((request.end_ns - request.start_ns) / step).unwrap_or(0) + 1,
-        ),
-        None => (request.end_ns, 1, 1),
-    };
+    let (first, step, count) = evaluation_steps(request);
     let mut boundaries = Vec::with_capacity(logs.len() * 2);
     for log in logs {
         let range = log

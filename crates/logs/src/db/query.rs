@@ -1243,6 +1243,8 @@ struct UnitRun {
     fingerprint: StreamFingerprint,
     object_id: u64,
     run: StoredRun,
+    /// See [`repeat_ranges`]; shared by the stream's runs in the read.
+    repeats: Arc<[(i64, i64)]>,
 }
 
 /// Blocks `[first_block, end_block)` of one object, covering every run in
@@ -1266,6 +1268,7 @@ fn plan_reads(streams: &[SegmentStream], reverse: bool, max_gap_blocks: u32) -> 
     let mut by_object = BTreeMap::<ObjectRef, Vec<UnitRun>>::new();
     for stream in streams {
         let fingerprint = stream.labels.fingerprint();
+        let repeats = repeat_ranges(&stream.runs);
         for &(object_id, run) in &stream.runs {
             by_object
                 .entry(ObjectRef {
@@ -1279,6 +1282,7 @@ fn plan_reads(streams: &[SegmentStream], reverse: bool, max_gap_blocks: u32) -> 
                     fingerprint,
                     object_id,
                     run,
+                    repeats: Arc::clone(&repeats),
                 });
         }
     }
@@ -1711,6 +1715,36 @@ fn isolated_runs(runs: &[(u64, StoredRun)]) -> Vec<bool> {
     isolated
 }
 
+/// Inclusive time ranges, ascending and disjoint, outside which no row of a
+/// stream's `runs` repeats another of their rows: where two runs' time ranges
+/// meet, and the whole range of a run not flagged duplicate-free.
+pub(super) fn repeat_ranges(runs: &[(u64, StoredRun)]) -> Arc<[(i64, i64)]> {
+    let mut order = runs.iter().map(|(_, run)| run).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|run| run.min_timestamp_ns);
+    let mut ranges = Vec::new();
+    let mut reached: Option<i64> = None;
+    for run in order {
+        if !run.duplicate_free {
+            ranges.push((run.min_timestamp_ns, run.max_timestamp_ns));
+        }
+        if let Some(reached) = reached
+            && reached >= run.min_timestamp_ns
+        {
+            ranges.push((run.min_timestamp_ns, reached.min(run.max_timestamp_ns)));
+        }
+        reached = Some(reached.map_or(run.max_timestamp_ns, |at| at.max(run.max_timestamp_ns)));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    for (min, max) in ranges {
+        match merged.last_mut() {
+            Some(last) if min <= last.1 => last.1 = last.1.max(max),
+            _ => merged.push((min, max)),
+        }
+    }
+    merged.into()
+}
+
 /// Samples of an isolated run's blocks in `range`: a block no window
 /// boundary splits is counted from its header, others from their meta value.
 fn isolated_samples(
@@ -2039,6 +2073,7 @@ impl PendingReads for PendingBatches {
         // A merged run concatenates its leaves; a stable sort keeps write
         // order among equal timestamps.
         batch.sort_by_timestamp();
+        batch.set_repeats(Arc::clone(&run.repeats));
         Ok(batch)
     }
 

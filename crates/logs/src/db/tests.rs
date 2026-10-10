@@ -10,7 +10,7 @@ use common::storage::config::{
 };
 
 use super::*;
-use crate::codec::{decode_run, encode_run, segment_run_prefix, stream_run_prefix};
+use crate::codec::{StoredRun, decode_run, encode_run, segment_run_prefix, stream_run_prefix};
 use crate::config::{CompactionConfig, PageConfig};
 
 fn test_config() -> Config {
@@ -1874,6 +1874,39 @@ fn window_boundaries_split_only_the_spans_they_fall_inside() {
     assert!(!near_max.splits(i64::MIN, i64::MAX - 1));
 }
 
+#[test]
+fn rows_repeat_only_where_runs_meet_or_may_hold_duplicates() {
+    let run = |min, max, duplicate_free| StoredRun {
+        level: 0,
+        expires_at_unix_ms: None,
+        min_timestamp_ns: min,
+        max_timestamp_ns: max,
+        rows: 1,
+        bytes: 1,
+        line_bytes: 1,
+        duplicate_free,
+        error_metadata: false,
+        first_block: 0,
+        blocks: 1,
+    };
+    let repeats = |runs: &[StoredRun]| {
+        let runs = runs.iter().map(|run| (0, *run)).collect::<Vec<_>>();
+        query::repeat_ranges(&runs).to_vec()
+    };
+    assert!(repeats(&[run(0, 10, true), run(11, 20, true)]).is_empty());
+    assert_eq!(repeats(&[run(0, 10, true), run(10, 20, true)]), [(10, 10)]);
+    // A run nested in a wider one, and a third meeting only the wider one.
+    assert_eq!(
+        repeats(&[run(25, 40, true), run(0, 30, true), run(5, 8, true)]),
+        [(5, 8), (25, 30)]
+    );
+    assert_eq!(
+        repeats(&[run(0, 10, true), run(20, 30, false), run(29, 35, true)]),
+        [(20, 30)]
+    );
+    assert_eq!(repeats(&[run(0, 10, false)]), [(0, 10)]);
+}
+
 /// Writes of two streams over three segments, with lines of equal length,
 /// repeated timestamps and structured metadata on some rows; a repeated
 /// write duplicates rows across objects. With `errors`, a rare row carries
@@ -1998,6 +2031,20 @@ async fn lineless_metric_reads_match_full_row_reads() {
                 result(&slow).await,
                 "seed {seed}: {fast:?}"
             );
+            // Counts are summed per window as rows are read; summing an
+            // unwrapped 1 keeps every row until evaluation.
+            if op == "count_over_time" {
+                let mut rows = slow.clone();
+                rows.query = slow.query.replace(
+                    &format!("{op}({selector}"),
+                    &format!(r#"sum_over_time({selector} | label_format one="1" | unwrap one"#),
+                );
+                assert_eq!(
+                    result(&slow).await,
+                    result(&rows).await,
+                    "seed {seed}: {rows:?}"
+                );
+            }
         }
         db.close().await.unwrap();
     }
