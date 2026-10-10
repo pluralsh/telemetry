@@ -14,17 +14,20 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
 use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ReadOptions, ScanOptions};
 use slatedb::manifest::VersionedManifest;
 use slatedb::{
-    CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbSnapshot, FilterContext,
+    CacheTarget, Db, DbIterator, DbReader, DbSnapshot, FilterContext,
     MergeOperator as SlateDbMergeOperator, MergeOperatorError, SstReader, WriteBatch,
     config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+pub mod warm;
+
+pub use warm::SstWarmTracker;
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -148,7 +151,8 @@ impl SlateReadHandle {
     /// When `include_data` is true, every data block in the matching segment
     /// keyspace is also warmed. Metadata-only warming intentionally avoids
     /// catalog data blocks so it cannot displace payloads from the data cache.
-    /// Backends without a configured cache treat warming as a no-op.
+    /// Backends without a configured cache treat warming as a no-op. With a
+    /// `tracker`, SSTs it has already warmed are skipped.
     pub async fn warm_prefixes(
         &self,
         product: &'static str,
@@ -156,6 +160,7 @@ impl SlateReadHandle {
         include_data: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> StorageResult<()> {
         let manifest = self.source.manifest();
         let work = manifest
@@ -190,27 +195,33 @@ impl SlateReadHandle {
             .flatten()
             .collect::<Vec<_>>();
 
-        futures::stream::iter(work)
-            .map(|(id, targets)| async move {
-                let result = match &self.source {
-                    ManifestSource::Db(db) => db.warm_sst(id, &targets).await,
-                    ManifestSource::Reader(reader) => reader.warm_sst(id, &targets).await,
-                };
-                metrics::counter!(
-                    "telemetry_cache_warmer_ssts_total",
-                    "product" => product,
-                    "status" => if result.is_ok() { "success" } else { "error" },
-                    "payloads" => if include_data { "included" } else { "excluded" }
+        match &self.source {
+            ManifestSource::Db(db) => {
+                warm::warm_ssts(
+                    db.as_ref(),
+                    product,
+                    work,
+                    include_data,
+                    concurrency,
+                    cancel,
+                    tracker,
                 )
-                .increment(1);
-                result
-            })
-            .buffer_unordered(concurrency.max(1))
-            .take_until(cancel.cancelled())
-            .try_collect::<Vec<()>>()
-            .await
-            .map_err(StorageError::from_storage)?;
-        Ok(())
+                .await
+            }
+            ManifestSource::Reader(reader) => {
+                warm::warm_ssts(
+                    reader.as_ref(),
+                    product,
+                    work,
+                    include_data,
+                    concurrency,
+                    cancel,
+                    tracker,
+                )
+                .await
+            }
+        }
+        .map_err(StorageError::from_storage)
     }
 }
 

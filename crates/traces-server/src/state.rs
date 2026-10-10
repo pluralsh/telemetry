@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use plural_traces::{Namespace, ShardedTraces, ShardingOptions, Trace, TraceBatch};
@@ -12,6 +12,7 @@ use proto::traces::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
+use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
 use sharding::{
     AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
     server::owned_shards, shard_request_id,
@@ -195,65 +196,39 @@ impl AppState {
     }
 
     async fn start_cache_warmer(&self) {
-        if self.cache_warmed.load(Ordering::Acquire) {
+        let serves_reads = self.config.mode != ServerMode::Writer;
+        if !warming_enabled(&self.config.cache_warmer, serves_reads) {
             return;
         }
-        let namespaces = self
+        let namespaces: Arc<[Namespace]> = self
             .config
             .namespaces
             .iter()
             .filter_map(|namespace| Namespace::new(namespace.name.clone()).ok())
-            .collect::<Vec<_>>();
-        let warm_range = Duration::from_secs(self.config.cache_warmer.warm_range_seconds);
-        let warm_timeout = Duration::from_secs(self.config.cache_warmer.timeout_seconds);
-        let concurrency = self.config.cache_warmer.concurrency;
-        let include_payloads = self.config.cache_warmer.include_payloads;
+            .collect();
         let database = Arc::clone(&self.db);
-        let cancellation = self.cancellation.clone();
-        let cache_warmed = Arc::clone(&self.cache_warmed);
-        let task = tokio::spawn(async move {
-            let started = Instant::now();
-            metrics::gauge!("telemetry_cache_warmer_active", "product" => "traces").set(1.0);
-            let status = match tokio::time::timeout(
-                warm_timeout,
-                database.warm_recent(
-                    &namespaces,
-                    warm_range,
-                    include_payloads,
-                    concurrency,
-                    &cancellation,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => "success",
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "traces cache warming failed");
-                    "error"
+        let task = spawn_cache_warmer(
+            "traces",
+            &self.config.cache_warmer,
+            self.cancellation.clone(),
+            Arc::clone(&self.cache_warmed),
+            move |pass: WarmPass| {
+                let database = Arc::clone(&database);
+                let namespaces = Arc::clone(&namespaces);
+                async move {
+                    database
+                        .warm_recent(
+                            &namespaces,
+                            pass.range,
+                            pass.include_payloads,
+                            pass.concurrency,
+                            &pass.cancel,
+                            pass.tracker.as_deref(),
+                        )
+                        .await
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_seconds = warm_timeout.as_secs(),
-                        "traces cache warming timed out"
-                    );
-                    "timeout"
-                }
-            };
-            metrics::gauge!("telemetry_cache_warmer_active", "product" => "traces").set(0.0);
-            metrics::counter!(
-                "telemetry_cache_warmer_runs_total",
-                "product" => "traces",
-                "status" => status
-            )
-            .increment(1);
-            metrics::histogram!(
-                "telemetry_cache_warmer_duration_seconds",
-                "product" => "traces",
-                "status" => status
-            )
-            .record(started.elapsed().as_secs_f64());
-            cache_warmed.store(true, Ordering::Release);
-        });
+            },
+        );
         self.tasks.lock().await.push(task);
     }
 

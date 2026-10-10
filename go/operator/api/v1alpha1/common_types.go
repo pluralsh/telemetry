@@ -176,6 +176,21 @@ type CacheWarmerSpec struct {
 	Concurrency *int32 `json:"concurrency,omitempty"`
 	// +kubebuilder:default=false
 	IncludePayloads *bool `json:"includePayloads,omitempty"`
+	// Continuous warms SSTs that appear in reader manifests after startup.
+	Continuous *ContinuousCacheWarmerSpec `json:"continuous,omitempty"`
+}
+
+type ContinuousCacheWarmerSpec struct {
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=15
+	IntervalSeconds *int64 `json:"intervalSeconds,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=7200
+	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
+	// +kubebuilder:default=true
+	IncludePayloads *bool `json:"includePayloads,omitempty"`
 }
 
 type StorageSpec struct {
@@ -191,13 +206,13 @@ type WriteSpec struct {
 	// +kubebuilder:default=applied
 	Durability Durability `json:"durability,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=10
+	// +kubebuilder:default=30
 	FlushIntervalSeconds *int64 `json:"flushIntervalSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=10000
 	BufferQueueCapacity *int32 `json:"bufferQueueCapacity,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=10000
+	// +kubebuilder:default=30000
 	BufferFlushIntervalMilliseconds *int64 `json:"bufferFlushIntervalMilliseconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=67108864

@@ -5,8 +5,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use common::SharedDbCache;
 use common::discovery::DiscoveryValue;
+use common::{SharedDbCache, SstWarmTracker};
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
     shard_opener,
@@ -111,7 +111,8 @@ impl ShardedTraces {
         &self.shards
     }
 
-    /// Warms recent cache blocks for every open shard and namespace.
+    /// Warms recent cache blocks for every open shard and namespace, skipping
+    /// SSTs `tracker` has already warmed.
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
@@ -119,6 +120,7 @@ impl ShardedTraces {
         include_payloads: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> Result<()> {
         self.shards
             .warm(concurrency, cancel, |database, concurrency| async move {
@@ -127,7 +129,14 @@ impl ShardedTraces {
                         return Ok(());
                     }
                     database
-                        .warm_recent(namespace, warm_range, include_payloads, concurrency, cancel)
+                        .warm_recent(
+                            namespace,
+                            warm_range,
+                            include_payloads,
+                            concurrency,
+                            cancel,
+                            tracker,
+                        )
                         .await?;
                 }
                 Ok(())

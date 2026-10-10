@@ -514,15 +514,28 @@ async fn should_warm_buckets_resolved_from_segments() {
     // config has no block cache.
     let cancel = CancellationToken::new();
     storage
-        .warm(&namespace, buckets.clone(), true, 2, &cancel)
+        .warm(&namespace, buckets.clone(), true, 2, &cancel, None)
+        .await
+        .unwrap();
+    let tracker = common::SstWarmTracker::new(true);
+    storage
+        .warm(
+            &namespace,
+            buckets.clone(),
+            true,
+            2,
+            &cancel,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+    tracker.finish_pass();
+    storage
+        .warm(&namespace, buckets, false, 2, &cancel, Some(&tracker))
         .await
         .unwrap();
     storage
-        .warm(&namespace, buckets, false, 2, &cancel)
-        .await
-        .unwrap();
-    storage
-        .warm(&namespace, vec![], true, 2, &cancel)
+        .warm(&namespace, vec![], true, 2, &cancel, None)
         .await
         .unwrap();
     storage
@@ -535,6 +548,7 @@ async fn should_warm_buckets_resolved_from_segments() {
             false,
             2,
             &cancel,
+            None,
         )
         .await
         .unwrap();
@@ -548,7 +562,7 @@ async fn should_warm_buckets_resolved_from_segments() {
         .await
         .unwrap();
     storage
-        .warm(&namespace, buckets, true, 2, &cancelled)
+        .warm(&namespace, buckets, true, 2, &cancelled, None)
         .await
         .unwrap();
 

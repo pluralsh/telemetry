@@ -218,6 +218,26 @@ _Appears in:_
 | `timeoutSeconds` _integer_ |  | 30 | Minimum: 1 <br /> |
 | `concurrency` _integer_ |  | 2 | Minimum: 1 <br /> |
 | `includePayloads` _boolean_ |  | false |  |
+| `continuous` _[ContinuousCacheWarmerSpec](#continuouscachewarmerspec)_ | Continuous warms SSTs that appear in reader manifests after startup. |  |  |
+
+
+#### ContinuousCacheWarmerSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [CacheWarmerSpec](#cachewarmerspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ |  | false |  |
+| `intervalSeconds` _integer_ |  | 15 | Minimum: 1 <br /> |
+| `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
+| `includePayloads` _boolean_ |  | true |  |
 
 
 #### DataStoreReference
@@ -1221,9 +1241,9 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `durability` _[Durability](#durability)_ |  | applied | Enum: [applied written durable] <br /> |
-| `flushIntervalSeconds` _integer_ |  | 10 | Minimum: 0 <br /> |
+| `flushIntervalSeconds` _integer_ |  | 30 | Minimum: 0 <br /> |
 | `bufferQueueCapacity` _integer_ |  | 10000 | Minimum: 1 <br /> |
-| `bufferFlushIntervalMilliseconds` _integer_ |  | 10000 | Minimum: 1 <br /> |
+| `bufferFlushIntervalMilliseconds` _integer_ |  | 30000 | Minimum: 1 <br /> |
 | `bufferSizeThresholdBytes` _integer_ |  | 67108864 | Minimum: 1 <br /> |
 | `remoteConcurrency` _integer_ |  | 16 | Minimum: 1 <br /> |
 | `remoteRetries` _integer_ |  | 2 | Minimum: 0 <br /> |

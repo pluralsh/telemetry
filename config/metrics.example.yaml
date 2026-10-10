@@ -93,16 +93,21 @@ cache_warmer:
   timeout_seconds: 30
   concurrency: 2
   include_payloads: false
+  continuous:
+    enabled: false
+    interval_seconds: 15
+    warm_range_seconds: 7200
+    include_payloads: true
 
 write:
   # applied: in-memory delta; written: SlateDB mutable state/fresh snapshot;
   # durable: object-store flush before acknowledgement. Default: written.
   durability: applied
-  # Seconds between durable writer flushes. Default 60; 0 disables the task.
-  flush_interval_seconds: 10
+  # Seconds between durable writer flushes. Default 30; 0 disables the task.
+  flush_interval_seconds: 30
   # Per-bucket/routing-slot in-memory write coordinator limits.
   buffer_queue_capacity: 10000
-  buffer_flush_interval_milliseconds: 10000
+  buffer_flush_interval_milliseconds: 30000
   buffer_size_threshold_bytes: 67108864
   # Maximum concurrent shard-forwarding batches. Default 16.
   remote_concurrency: 16

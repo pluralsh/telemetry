@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use common::SharedDbCache;
+use common::{SharedDbCache, SstWarmTracker};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use sharding::{
@@ -92,6 +92,7 @@ async fn warm_storage<S: StorageRead + WarmStorage>(
     include_samples: bool,
     concurrency: usize,
     cancel: &CancellationToken,
+    tracker: Option<&SstWarmTracker>,
 ) -> Result<()> {
     for namespace in namespaces {
         if cancel.is_cancelled() {
@@ -101,7 +102,14 @@ async fn warm_storage<S: StorageRead + WarmStorage>(
             .get_buckets_in_range(namespace, Some(start), Some(end))
             .await?;
         storage
-            .warm(namespace, buckets, include_samples, concurrency, cancel)
+            .warm(
+                namespace,
+                buckets,
+                include_samples,
+                concurrency,
+                cancel,
+                tracker,
+            )
             .await?;
     }
     Ok(())
@@ -205,7 +213,8 @@ impl ShardedMetrics {
         &self.shards
     }
 
-    /// Warms recent cache blocks for every open shard and namespace.
+    /// Warms recent cache blocks for every open shard and namespace, skipping
+    /// SSTs `tracker` has already warmed.
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
@@ -213,6 +222,7 @@ impl ShardedMetrics {
         include_samples: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> Result<()> {
         let end = common::time::now_secs();
         let start = end.saturating_sub(i64::try_from(warm_range.as_secs()).unwrap_or(i64::MAX));
@@ -229,6 +239,7 @@ impl ShardedMetrics {
                             include_samples,
                             concurrency,
                             cancel,
+                            tracker,
                         )
                         .await
                     }
@@ -241,6 +252,7 @@ impl ShardedMetrics {
                             include_samples,
                             concurrency,
                             cancel,
+                            tracker,
                         )
                         .await
                     }

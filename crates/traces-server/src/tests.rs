@@ -12,7 +12,7 @@ use opentelemetry_proto::tonic::{
     trace::v1::{ResourceSpans, ScopeSpans, Span},
 };
 use prost::Message;
-use std::{io::Read, time::Duration};
+use std::io::Read;
 use tower::ServiceExt;
 
 use crate::{
@@ -278,7 +278,7 @@ async fn periodic_durable_flushes_accepted_writes() {
     assert!(state.has_pending_visibility());
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(server_common::config::WriteConfig::default().flush_interval()).await;
     for _ in 0..100 {
         if !state.has_pending_visibility() {
             break;

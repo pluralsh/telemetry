@@ -1,3 +1,4 @@
+pub mod coalescing;
 pub mod config;
 #[cfg(feature = "test-utils")]
 pub mod counting;

@@ -404,7 +404,8 @@ where
     ///
     /// SSTs are warmed up to the caller-provided concurrency. Warming is a
     /// no-op for buckets with no live segment, and SlateDB itself treats
-    /// `warm_sst` as a no-op when no block cache is configured.
+    /// `warm_sst` as a no-op when no block cache is configured. With a
+    /// `tracker`, SSTs it has already warmed are skipped.
     ///
     /// If `cancel` fires the warm stops promptly, dropping (and thereby
     /// cancelling) any in-flight per-SST warms, and returns `Ok(())` with
@@ -418,6 +419,7 @@ where
         include_samples: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> StorageResult<()> {
         let wanted: HashSet<TimeBucket> = buckets.into_iter().collect();
 
@@ -452,28 +454,17 @@ where
             .flatten()
             .collect();
 
-        futures::stream::iter(work)
-            .map(|(sst_id, targets)| async move {
-                let result = self.db.warm_sst(sst_id, &targets).await;
-                metrics::counter!(
-                    "telemetry_cache_warmer_ssts_total",
-                    "product" => "metrics",
-                    "status" => if result.is_ok() { "success" } else { "error" },
-                    "payloads" => if include_samples {
-                        "included"
-                    } else {
-                        "excluded"
-                    }
-                )
-                .increment(1);
-                result
-            })
-            .buffer_unordered(concurrency.max(1))
-            .take_until(cancel.cancelled())
-            .try_collect::<Vec<()>>()
-            .await
-            .map_err(StorageError::from_storage)?;
-        Ok(())
+        warm_ssts(
+            self.db.as_ref(),
+            "metrics",
+            work,
+            include_samples,
+            concurrency,
+            cancel,
+            tracker,
+        )
+        .await
+        .map_err(StorageError::from_storage)
     }
 }
 

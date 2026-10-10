@@ -23,6 +23,7 @@ use bytes::Bytes;
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::SharedDbCache;
 use common::storage::metrics_recorder::MetricsRsRecorder;
+use common::storage::slate::warm::{SstWarmTracker, warm_ssts};
 use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
 use common::storage::{
     CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
@@ -351,6 +352,7 @@ pub(crate) trait WarmStorage: StorageRead {
         include_samples: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> StorageResult<()>;
 }
 
@@ -367,9 +369,17 @@ where
         include_samples: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> StorageResult<()> {
         self.reader()
-            .warm(namespace, buckets, include_samples, concurrency, cancel)
+            .warm(
+                namespace,
+                buckets,
+                include_samples,
+                concurrency,
+                cancel,
+                tracker,
+            )
             .await
     }
 }

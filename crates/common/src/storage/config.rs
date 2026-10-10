@@ -20,6 +20,8 @@ pub struct CacheWarmerConfig {
     pub concurrency: usize,
     /// Whether to warm payload/sample blocks in addition to indexes and metadata.
     pub include_payloads: bool,
+    /// Periodic warming of SSTs that appear after startup.
+    pub continuous: ContinuousCacheWarmerConfig,
 }
 
 impl Default for CacheWarmerConfig {
@@ -30,6 +32,65 @@ impl Default for CacheWarmerConfig {
             timeout_seconds: 30,
             concurrency: 2,
             include_payloads: false,
+            continuous: ContinuousCacheWarmerConfig::default(),
+        }
+    }
+}
+
+impl CacheWarmerConfig {
+    /// Rejects zero ranges, timeouts, intervals and concurrency for enabled warmers.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.warm_range_seconds == 0 {
+            return Err(
+                "cache_warmer.warm_range_seconds must be greater than zero when enabled".to_owned(),
+            );
+        }
+        if self.enabled && self.timeout_seconds == 0 {
+            return Err(
+                "cache_warmer.timeout_seconds must be greater than zero when enabled".to_owned(),
+            );
+        }
+        if (self.enabled || self.continuous.enabled) && self.concurrency == 0 {
+            return Err(
+                "cache_warmer.concurrency must be greater than zero when enabled".to_owned(),
+            );
+        }
+        if self.continuous.enabled && self.continuous.interval_seconds == 0 {
+            return Err(
+                "cache_warmer.continuous.interval_seconds must be greater than zero when enabled"
+                    .to_owned(),
+            );
+        }
+        if self.continuous.enabled && self.continuous.warm_range_seconds == 0 {
+            return Err(
+                "cache_warmer.continuous.warm_range_seconds must be greater than zero when enabled"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Readers poll their in-memory manifest every `interval_seconds` and warm
+/// only SSTs they have not seen before, so each pass costs roughly the bytes
+/// flushed or compacted since the previous one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuousCacheWarmerConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    /// Recent wall-clock window whose new SSTs are warmed.
+    pub warm_range_seconds: u64,
+    pub include_payloads: bool,
+}
+
+impl Default for ContinuousCacheWarmerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 15,
+            warm_range_seconds: 7_200,
+            include_payloads: true,
         }
     }
 }
@@ -309,8 +370,28 @@ mod tests {
                 timeout_seconds: 30,
                 concurrency: 2,
                 include_payloads: false,
+                continuous: ContinuousCacheWarmerConfig {
+                    enabled: false,
+                    interval_seconds: 15,
+                    warm_range_seconds: 7_200,
+                    include_payloads: true,
+                },
             }
         );
+    }
+
+    #[test]
+    fn continuous_cache_warmer_requires_positive_interval_and_concurrency() {
+        let mut config = CacheWarmerConfig::default();
+        config.continuous.enabled = true;
+        assert!(config.validate().is_ok());
+
+        config.continuous.interval_seconds = 0;
+        assert!(config.validate().unwrap_err().contains("interval_seconds"));
+
+        config.continuous.interval_seconds = 15;
+        config.concurrency = 0;
+        assert!(config.validate().unwrap_err().contains("concurrency"));
     }
 
     #[test]

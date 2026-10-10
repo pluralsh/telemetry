@@ -17,7 +17,7 @@ const (
 	testMetricsNamespace    = "test"
 	testBucket              = "metrics"
 	testTenantNamespace     = "tenant-a"
-	testFlushIntervalConfig = "flush_interval_seconds: 10"
+	testFlushIntervalConfig = "flush_interval_seconds: 30"
 	testCacheWarmerConfig   = "cache_warmer:"
 	testWarmRangeConfig     = "warm_range_seconds: 7200"
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
@@ -414,12 +414,20 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 	warmRangeSeconds := int64(3600)
 	timeoutSeconds := int64(15)
 	concurrency := int32(4)
+	continuousInterval, continuousRange := int64(20), int64(5400)
+	continuousPayloads := false
 	cacheWarmer := &telemetryv1alpha1.CacheWarmerSpec{
 		Enabled:          &enabled,
 		WarmRangeSeconds: &warmRangeSeconds,
 		TimeoutSeconds:   &timeoutSeconds,
 		Concurrency:      &concurrency,
 		IncludePayloads:  &includePayloads,
+		Continuous: &telemetryv1alpha1.ContinuousCacheWarmerSpec{
+			Enabled:          &enabled,
+			IntervalSeconds:  &continuousInterval,
+			WarmRangeSeconds: &continuousRange,
+			IncludePayloads:  &continuousPayloads,
+		},
 	}
 	products := []struct {
 		name  string
@@ -468,6 +476,10 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 				"timeout_seconds: 15",
 				"concurrency: 4",
 				"include_payloads: true",
+				"continuous:",
+				"interval_seconds: 20",
+				"warm_range_seconds: 5400",
+				"include_payloads: false",
 			} {
 				if !strings.Contains(rendered, expected) {
 					t.Errorf("rendered config missing %q:\n%s", expected, rendered)

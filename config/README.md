@@ -91,6 +91,11 @@ Metrics always uses SlateDB. If the whole section is omitted, it defaults to `pa
   - `type: Gcp`: Google Cloud Storage; requires `bucket` and optionally accepts `base_url`.
     Service-account JSON, bearer tokens, and application default credentials are supported
     through the standard `GOOGLE_*` object-store environment variables.
+
+  For `Aws`, `Azure`, and `Gcp`, identical range reads that are in flight at the same time share
+  one request across every shard, database, query, and cache-warming pass in the process. Nothing
+  is cached at this layer; `telemetry_object_store_coalesced_gets_total{outcome="issued|shared"}`
+  counts requests sent versus joined.
 - `storage.block_cache`: optional SlateDB SST data-block cache.
 - `storage.meta_cache`: optional SlateDB index/filter/stats cache. Either cache may use either
   cache variant; leaving one side absent disables caching for that block class.
@@ -144,6 +149,23 @@ metadata cache and cannot evict payload blocks from the data cache.
   from the pod-wide storage I/O budget. Default `2`; must be greater than zero when warming is enabled.
 - `cache_warmer.include_payloads`: also warms metric samples, log pages, and trace pages. When
   false, only SlateDB filters and SST indexes are warmed. Default `false`.
+
+Readers learn about new L0 SSTs and compaction outputs from manifest polls but only fetch their
+blocks on the first query that touches them, so the newest data is always read cold from object
+storage. Continuous warming closes that gap: every interval it lists the live SSTs in the recent
+window and warms only those it has not warmed before, so each pass costs roughly the bytes flushed
+or compacted since the previous one. When startup warming is disabled, the first pass only records
+the SSTs already live, so enabling it never starts with a bulk warm of the whole window. Passes
+use `cache_warmer.concurrency` and the same storage I/O budget as startup warming, and never
+affect readiness.
+
+- `cache_warmer.continuous.enabled`: enables continuous warming. Default `false`.
+- `cache_warmer.continuous.interval_seconds`: seconds between passes. Default `15`; must be greater
+  than zero when enabled.
+- `cache_warmer.continuous.warm_range_seconds`: recent time range whose new SSTs are warmed.
+  Default `7200`; must be greater than zero when enabled.
+- `cache_warmer.continuous.include_payloads`: also warms metric samples, log pages, and trace
+  pages. Default `true`.
 
 ## `write`
 

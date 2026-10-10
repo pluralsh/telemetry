@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use super::coalescing::CoalescingObjectStore;
 use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
@@ -343,7 +344,34 @@ fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<S
 ///
 /// This is useful for cleanup operations where you need to access the object store
 /// after the database has been closed.
+///
+/// Cloud stores share in-flight range reads with every other store created
+/// for the same bucket in this process; see [`CoalescingObjectStore`].
 pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
+    let store = create_raw_object_store(config)?;
+    let scope = match config {
+        ObjectStoreConfig::Aws(aws) => format!(
+            "s3:{}:{}",
+            aws.endpoint.as_deref().unwrap_or_default(),
+            aws.bucket
+        ),
+        ObjectStoreConfig::Azure(azure) => format!(
+            "azure:{}:{}/{}",
+            azure.endpoint.as_deref().unwrap_or_default(),
+            azure.account,
+            azure.container
+        ),
+        ObjectStoreConfig::Gcp(gcp) => format!(
+            "gcs:{}:{}",
+            gcp.base_url.as_deref().unwrap_or_default(),
+            gcp.bucket
+        ),
+        ObjectStoreConfig::InMemory | ObjectStoreConfig::Local(_) => return Ok(store),
+    };
+    Ok(Arc::new(CoalescingObjectStore::new(store, scope)))
+}
+
+fn create_raw_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
     match config {
         ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
         ObjectStoreConfig::Aws(aws_config) => {

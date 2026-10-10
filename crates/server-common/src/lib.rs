@@ -7,6 +7,7 @@ pub mod ingest;
 pub mod internal_rpc;
 pub mod runtime;
 pub mod usage;
+pub mod warmer;
 
 pub use http::ApiError;
 

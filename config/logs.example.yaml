@@ -38,9 +38,9 @@ compaction:
 write:
   durability: applied
   # Durable object-store flush and read-replica visibility interval.
-  flush_interval_seconds: 10
+  flush_interval_seconds: 30
   buffer_queue_capacity: 10000
-  buffer_flush_interval_milliseconds: 10000
+  buffer_flush_interval_milliseconds: 30000
   buffer_size_threshold_bytes: 67108864
   remote_concurrency: 16
   remote_retries: 2
@@ -70,6 +70,11 @@ cache_warmer:
   timeout_seconds: 30
   concurrency: 2
   include_payloads: false
+  continuous:
+    enabled: false
+    interval_seconds: 15
+    warm_range_seconds: 7200
+    include_payloads: true
 
 auth:
   # Namespace HTTP APIs require valid credentials unless this is explicitly true.

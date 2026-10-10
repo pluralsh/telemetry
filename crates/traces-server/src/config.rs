@@ -213,21 +213,9 @@ impl Config {
                 "page target_size_bytes cannot exceed max_size_bytes".into(),
             ));
         }
-        if self.cache_warmer.enabled && self.cache_warmer.warm_range_seconds == 0 {
-            return Err(ConfigError::Validation(
-                "cache_warmer.warm_range_seconds must be greater than zero when enabled".into(),
-            ));
-        }
-        if self.cache_warmer.enabled && self.cache_warmer.timeout_seconds == 0 {
-            return Err(ConfigError::Validation(
-                "cache_warmer.timeout_seconds must be greater than zero when enabled".into(),
-            ));
-        }
-        if self.cache_warmer.enabled && self.cache_warmer.concurrency == 0 {
-            return Err(ConfigError::Validation(
-                "cache_warmer.concurrency must be greater than zero when enabled".into(),
-            ));
-        }
+        self.cache_warmer
+            .validate()
+            .map_err(ConfigError::Validation)?;
         if self.namespaces.is_empty() {
             return Err(ConfigError::Validation(
                 "at least one namespace is required".into(),

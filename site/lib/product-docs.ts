@@ -52,7 +52,7 @@ export function productionSpec(p: ProductId) {
 ${objectStore.replace("PRODUCT", p)}
     write:
       durability: applied
-      flushIntervalSeconds: 10
+      flushIntervalSeconds: 30
     sharding:
       leaseDurationSeconds: 15
 ${PRODUCT_CONFIG[p]}
@@ -90,7 +90,7 @@ export function specNotes(p: ProductId): Record<string, string> {
     "spec.config.storage.objectStore.aws.region": "Bucket region. Add `endpoint` (and `allowHTTP` if needed) for S3-compatible stores such as MinIO.",
     "spec.config.storage.objectStore.aws.bucket": "Can be shared by all three databases, as long as their `path` prefixes differ.",
     "spec.config.write.durability": "When a write is acknowledged: `applied` (default) once in memory, `written` once in SlateDB's mutable state, `durable` once uploaded to object storage.",
-    "spec.config.write.flushIntervalSeconds": "How often writers flush to object storage, and so how far readers can lag behind. Default `10`.",
+    "spec.config.write.flushIntervalSeconds": "How often writers flush to object storage, and so how far readers can lag behind. Default `30`.",
     "spec.config.sharding.leaseDurationSeconds": "How long a shard Lease survives without renewal before another writer may take the shard over. Default `15`; `renewIntervalSeconds` (default `5`) must be lower.",
     "spec.writer.replicas": "Writer count, which is also the storage shard count. Raise it at any time; new shards take writes from the next aligned hour. It cannot be lowered.",
     "spec.writer.resources": "Defaults to 250m CPU and 512Mi memory requests with a 2Gi limit. Budget for the write buffer: 64 MiB per shard, plus up to two frozen buffers being flushed.",

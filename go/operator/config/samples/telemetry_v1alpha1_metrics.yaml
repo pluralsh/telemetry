@@ -34,7 +34,7 @@ spec:
         capacity: 134217728
     write:
       durability: applied
-      flushIntervalSeconds: 10
+      flushIntervalSeconds: 30
       remoteConcurrency: 16
     namespaces:
       - default

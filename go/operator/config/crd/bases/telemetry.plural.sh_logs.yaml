@@ -216,6 +216,27 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                      continuous:
+                        description: Continuous warms SSTs that appear in reader manifests
+                          after startup.
+                        properties:
+                          enabled:
+                            default: false
+                            type: boolean
+                          includePayloads:
+                            default: true
+                            type: boolean
+                          intervalSeconds:
+                            default: 15
+                            format: int64
+                            minimum: 1
+                            type: integer
+                          warmRangeSeconds:
+                            default: 7200
+                            format: int64
+                            minimum: 1
+                            type: integer
+                        type: object
                       enabled:
                         default: false
                         type: boolean
@@ -804,7 +825,7 @@ spec:
                   write:
                     properties:
                       bufferFlushIntervalMilliseconds:
-                        default: 10000
+                        default: 30000
                         format: int64
                         minimum: 1
                         type: integer
@@ -826,7 +847,7 @@ spec:
                         - durable
                         type: string
                       flushIntervalSeconds:
-                        default: 10
+                        default: 30
                         format: int64
                         minimum: 0
                         type: integer

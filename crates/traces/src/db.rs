@@ -17,8 +17,8 @@ use common::coordinator::{
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
-    BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_storage_read,
+    BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
+    StorageSemantics, create_storage_read,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use opentelemetry_proto::tonic::{
@@ -131,7 +131,8 @@ pub struct TraceDb {
 }
 
 impl TraceDb {
-    /// Warms SlateDB caches for recent trace segments in this shard.
+    /// Warms SlateDB caches for recent trace segments in this shard, skipping
+    /// SSTs `tracker` has already warmed.
     pub async fn warm_recent(
         &self,
         namespace: &Namespace,
@@ -139,6 +140,7 @@ impl TraceDb {
         include_payloads: bool,
         concurrency: usize,
         cancel: &CancellationToken,
+        tracker: Option<&SstWarmTracker>,
     ) -> Result<()> {
         let Some(slate) = self.storage.slate_read() else {
             return Ok(());
@@ -153,7 +155,14 @@ impl TraceDb {
             .collect::<Vec<_>>();
         prefixes.push(segment_prefix(namespace, LOCATOR_SEGMENT));
         slate
-            .warm_prefixes("traces", &prefixes, include_payloads, concurrency, cancel)
+            .warm_prefixes(
+                "traces",
+                &prefixes,
+                include_payloads,
+                concurrency,
+                cancel,
+                tracker,
+            )
             .await?;
         Ok(())
     }

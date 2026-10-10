@@ -14,14 +14,15 @@ pub use clock::Clock;
 pub use sequence::{DEFAULT_BLOCK_SIZE, SequenceAllocator, SequenceError, SequenceResult};
 pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
-    BlockCacheConfig, CacheWarmerConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
+    BlockCacheConfig, CacheWarmerConfig, ContinuousCacheWarmerConfig, FoyerHybridCacheConfig,
+    ObjectStoreConfig, StorageConfig,
 };
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, SharedDbCache, StorageBuilder, StorageReaderRuntime,
     StorageSemantics, create_object_store, create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
-pub use storage::slate::SlateReadHandle;
+pub use storage::slate::{SlateReadHandle, SstWarmTracker};
 pub use storage::sst_blocks::{
     BlockOpCounts, CountResult, L0Stats, SortedRunStats, WalkStats, count_in_range,
 };

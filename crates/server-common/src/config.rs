@@ -32,9 +32,9 @@ impl Default for WriteConfig {
     fn default() -> Self {
         Self {
             durability: Durability::Applied,
-            flush_interval_seconds: 10,
+            flush_interval_seconds: 30,
             buffer_queue_capacity: 10_000,
-            buffer_flush_interval_milliseconds: 10_000,
+            buffer_flush_interval_milliseconds: 30_000,
             buffer_size_threshold_bytes: 64 * 1024 * 1024,
             remote_concurrency: 16,
             remote_retries: 2,

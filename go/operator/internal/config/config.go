@@ -262,9 +262,9 @@ func renderLogs(input Input) (Result, error) {
 			},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 10),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 30),
 				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
-				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 10000),
+				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 30000),
 				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
@@ -367,9 +367,9 @@ func renderTraces(input Input) (Result, error) {
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 10),
+				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, 30),
 				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
-				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 10000),
+				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 30000),
 				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
@@ -478,7 +478,14 @@ func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor r
 
 func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCacheWarmer {
 	if spec == nil {
-		return renderCacheWarmer{Enabled: false, WarmRangeSeconds: 7200, TimeoutSeconds: 30, Concurrency: 2, IncludePayloads: false}
+		return renderCacheWarmer{
+			Enabled:          false,
+			WarmRangeSeconds: 7200,
+			TimeoutSeconds:   30,
+			Concurrency:      2,
+			IncludePayloads:  false,
+			Continuous:       renderContinuousCacheWarmerConfig(nil),
+		}
 	}
 	return renderCacheWarmer{
 		Enabled:          boolValue(spec.Enabled, false),
@@ -486,6 +493,19 @@ func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCach
 		TimeoutSeconds:   int64Value(spec.TimeoutSeconds, 30),
 		Concurrency:      int32Value(spec.Concurrency, 2),
 		IncludePayloads:  boolValue(spec.IncludePayloads, false),
+		Continuous:       renderContinuousCacheWarmerConfig(spec.Continuous),
+	}
+}
+
+func renderContinuousCacheWarmerConfig(spec *telemetryv1alpha1.ContinuousCacheWarmerSpec) renderContinuousCacheWarmer {
+	if spec == nil {
+		return renderContinuousCacheWarmer{Enabled: false, IntervalSeconds: 15, WarmRangeSeconds: 7200, IncludePayloads: true}
+	}
+	return renderContinuousCacheWarmer{
+		Enabled:          boolValue(spec.Enabled, false),
+		IntervalSeconds:  int64Value(spec.IntervalSeconds, 15),
+		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
+		IncludePayloads:  boolValue(spec.IncludePayloads, true),
 	}
 }
 
@@ -526,9 +546,9 @@ func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath strin
 func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	return renderWrite{
 		Durability:                      lo.CoalesceOrEmpty(string(spec.Durability), string(telemetryv1alpha1.DurabilityApplied)),
-		FlushIntervalSeconds:            int64Value(spec.FlushIntervalSeconds, 10),
+		FlushIntervalSeconds:            int64Value(spec.FlushIntervalSeconds, 30),
 		BufferQueueCapacity:             int32Value(spec.BufferQueueCapacity, 10000),
-		BufferFlushIntervalMilliseconds: int64Value(spec.BufferFlushIntervalMilliseconds, 10000),
+		BufferFlushIntervalMilliseconds: int64Value(spec.BufferFlushIntervalMilliseconds, 30000),
 		BufferSizeThresholdBytes:        int64Value(spec.BufferSizeThresholdBytes, 67108864),
 		RemoteConcurrency:               int32Value(spec.RemoteConcurrency, 16),
 		RemoteRetries:                   int32Value(spec.RemoteRetries, 2),
@@ -742,6 +762,13 @@ type renderCacheWarmer struct {
 	WarmRangeSeconds int64 `json:"warm_range_seconds"`
 	TimeoutSeconds   int64 `json:"timeout_seconds"`
 	Concurrency      int32 `json:"concurrency"`
+	IncludePayloads  bool  `json:"include_payloads"`
+	Continuous       renderContinuousCacheWarmer `json:"continuous"`
+}
+type renderContinuousCacheWarmer struct {
+	Enabled          bool  `json:"enabled"`
+	IntervalSeconds  int64 `json:"interval_seconds"`
+	WarmRangeSeconds int64 `json:"warm_range_seconds"`
 	IncludePayloads  bool  `json:"include_payloads"`
 }
 type renderListeners struct {

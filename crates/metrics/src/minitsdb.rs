@@ -434,30 +434,55 @@ impl<R: StorageRead> MiniQueryReader<R> {
         Ok(replica.cache.read_seq())
     }
 
-    /// The first series ID at or after `from` with no forward-index entry,
-    /// found by galloping from `from` then bisecting.
+    /// The first series ID at or after `from` with no forward-index entry.
+    ///
+    /// Series IDs are dense, so this brackets the boundary by probing `from`
+    /// plus every power-of-two offset at once, then narrows it with rounds of
+    /// [`PROBE_WIDTH`] evenly spaced probes. Each round is one object-store
+    /// round trip on a cold cache, against about two per doubling of the gap
+    /// for a sequential gallop and bisect.
     async fn first_unseen_series(&self, from: SeriesId) -> Result<SeriesId> {
-        if !self.series_exists(from).await? {
-            return Ok(from);
+        const PROBE_WIDTH: u64 = 16;
+        let max = u64::from(SeriesId::MAX);
+        let from = u64::from(from);
+        let mut gallop: Vec<u64> = std::iter::once(from)
+            .chain((0..u64::BITS).map_while(|shift| {
+                let probe = from.checked_add(1 << shift)?;
+                (probe <= max).then_some(probe)
+            }))
+            .collect();
+        if gallop.last() != Some(&max) {
+            gallop.push(max);
         }
-        let (mut seen, mut step) = (u64::from(from), 1u64);
-        let mut unseen = loop {
-            let probe = (seen + step).min(u64::from(SeriesId::MAX));
-            if probe == seen || !self.series_exists(probe as SeriesId).await? {
-                break probe.max(seen + 1);
-            }
-            seen = probe;
-            step *= 2;
+        let exists = self.series_exist(&gallop).await?;
+        let Some(first_missing) = exists.iter().position(|exists| !exists) else {
+            return Ok(SeriesId::MAX);
         };
+        if first_missing == 0 {
+            return Ok(from as SeriesId);
+        }
+        let (mut seen, mut unseen) = (gallop[first_missing - 1], gallop[first_missing]);
         while unseen - seen > 1 {
-            let mid = seen + (unseen - seen) / 2;
-            if self.series_exists(mid as SeriesId).await? {
-                seen = mid;
-            } else {
-                unseen = mid;
+            let gap = unseen - seen;
+            let probes: Vec<u64> = (1..PROBE_WIDTH.min(gap))
+                .map(|i| seen + gap * i / PROBE_WIDTH.min(gap))
+                .collect();
+            let exists = self.series_exist(&probes).await?;
+            for (&probe, exists) in probes.iter().zip(exists) {
+                if exists {
+                    seen = probe;
+                } else {
+                    unseen = probe;
+                    break;
+                }
             }
         }
         Ok(unseen as SeriesId)
+    }
+
+    async fn series_exist(&self, ids: &[u64]) -> Result<Vec<bool>> {
+        futures::future::try_join_all(ids.iter().map(|&id| self.series_exists(id as SeriesId)))
+            .await
     }
 
     async fn series_exists(&self, series_id: SeriesId) -> Result<bool> {
@@ -1391,6 +1416,33 @@ mod tests {
 
         // then
         assert_eq!(found, vec![37, 37, 37, 37, 37, 40]);
+    }
+
+    #[tokio::test]
+    async fn should_find_the_first_unseen_series_id_across_wide_gaps() {
+        // given - 1000 series, so the boundary sits far from every gallop probe
+        let bucket = TimeBucket::hour(60);
+        let storage = test_storage().await;
+        let mini = load_with_config(bucket, storage.clone(), 16).await;
+        let batch: Vec<Series> = (0..1000)
+            .map(|host| host_series("m", host, 3_700_000))
+            .collect();
+        mini.ingest_batch(&batch, None).await.unwrap();
+        mini.flush_written().await.unwrap();
+        let reader = MiniQueryReader::new(
+            Namespace::default(),
+            bucket,
+            storage.snapshot().await.unwrap(),
+        );
+
+        // when
+        let mut found = Vec::new();
+        for from in [0, 3, 511, 512, 999, 1000] {
+            found.push(reader.first_unseen_series(from).await.unwrap());
+        }
+
+        // then
+        assert_eq!(found, vec![1000, 1000, 1000, 1000, 1000, 1000]);
     }
 
     #[tokio::test]
