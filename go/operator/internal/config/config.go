@@ -758,11 +758,11 @@ type renderLogsRequest struct {
 	MaxInFlightQueryBytes       int64 `json:"max_in_flight_query_bytes"`
 }
 type renderCacheWarmer struct {
-	Enabled          bool  `json:"enabled"`
-	WarmRangeSeconds int64 `json:"warm_range_seconds"`
-	TimeoutSeconds   int64 `json:"timeout_seconds"`
-	Concurrency      int32 `json:"concurrency"`
-	IncludePayloads  bool  `json:"include_payloads"`
+	Enabled          bool                        `json:"enabled"`
+	WarmRangeSeconds int64                       `json:"warm_range_seconds"`
+	TimeoutSeconds   int64                       `json:"timeout_seconds"`
+	Concurrency      int32                       `json:"concurrency"`
+	IncludePayloads  bool                        `json:"include_payloads"`
 	Continuous       renderContinuousCacheWarmer `json:"continuous"`
 }
 type renderContinuousCacheWarmer struct {
