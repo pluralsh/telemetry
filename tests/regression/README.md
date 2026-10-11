@@ -83,7 +83,8 @@ Host ports are Loki `13100`, Logs `13101`, retention Logs `13102`, Prometheus
 Metrics fuzz target `18083`, and Metrics MinIO
 `19000`. Traces uses Tempo `13200`, writers `13201`/`13202`, reader `13203`,
 retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
-Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`.
+Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`. The PseudoFS fuzz
+stack serves gRPC on `19093`.
 
 ## Differential fuzzing
 
@@ -98,6 +99,22 @@ shape: wide and deep cardinality, bursts, sparse data, out-of-order timestamps,
 odd Unicode and escaping, NaN and ±Inf, broken and native histograms, and
 clock-skewed or fan-out traces. Queries are generated recursively, so the
 fuzzer can surface degenerate behaviour in ingestion as well as in queries.
+
+`pseudofs.py` has no external oracle: it checks PseudoFS over gRPC against an
+in-process reference model (`harness/pseudofs/model.py`) of the filesystem,
+glob, and grep semantics, so its reports carry implementation latency only.
+Rounds build trees with odd names, inline/blob/streamed files of every
+durability, binary and image signatures, append logs that compact, renames,
+deletes, cross-tenant writes, and invalid mutations; every mutation's result is
+checked against the model as it is applied. Some rounds also run race
+scenarios in a scratch tenant (overwrites, appends, unlink and replacing
+renames against concurrent readers), which must never expose torn content,
+lost appends, or errors other than `NOT_FOUND`. Every
+`FUZZ_PSEUDOFS_CRASH_EVERY` rounds the server is SIGKILLed and restarted after a
+`WRITTEN` write, and later queries check that everything acknowledged
+survived. Grep results past `max_matches` may legally come from any files the
+concurrent search reached, so they are accepted when they keep walk order and
+each file's matches are a prefix of the model's.
 
 Fuzzing is opt-in and too heavy for pull requests. `.github/workflows/fuzz.yml`
 runs it nightly per product with a 30 minute budget, and it can also be started
@@ -152,6 +169,11 @@ the seed, although wall-clock time still shifts the data windows.
 | `FUZZ_METRICS_ORACLE` | `prometheus` | Metrics oracle: `prometheus` (local-disk TSDB), `mimir` (Mimir 3.2.1 on the shared MinIO, stock read path serving recent data from ingester memory), or `mimir-blocks` (flushes each round to MinIO and reads only through the store-gateway, the like-for-like object-store comparison; adds ~30s of visibility wait per round). Mimir runs with its ingester postings-for-matchers caches off, since with query sharding they hide series created within the last 10s. Where MQE answers a query Prometheus rejects for duplicate series, the case is `inconclusive`. `MIMIR_QUERY_ENGINE=prometheus` swaps Mimir's default MQE engine for the Prometheus engine |
 | `FUZZ_METRICS_STORAGE` | `s3` | Metrics under test: `s3` (two writers and a reader over MinIO) or `local` (one standalone process on a local-disk volume with the same caches, durability, and flush interval, so a Prometheus comparison leaves out the object store) |
 | `FUZZ_METRICS_CONFIG` | `regression` | Metrics implementation (S3 storage only): `regression` (two writers and a reader with 64 MiB caches and durable writes flushed every second, to exercise sharding) or `production` (one standalone process and shard over MinIO, like the single-process oracles, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s and a 256 MiB reader cache) |
+| `FUZZ_PSEUDOFS_CONFIG` | `regression` | PseudoFS implementation: `regression` (4 KiB inline threshold, 64 KiB chunks, 64 MiB blob cache, 2 upload workers, compaction every 8 appends, to exercise inline/blob, eviction and compaction boundaries), `production` (the operator's defaults over MinIO), or `local` (production settings on a local-disk object store, without MinIO) |
+| `FUZZ_PSEUDOFS_CRASH_EVERY` | `4` (compose), `0` (external) | SIGKILL and restart the server after every this many rounds; `0` disables |
+| `FUZZ_PSEUDOFS_RACE_RATE` | `0.5` | Fraction of rounds that also run a race scenario |
+| `FUZZ_PSEUDOFS_CONCURRENCY` | `8` | Concurrent writers in parallel load batches |
+| `FUZZ_PSEUDOFS_MAX_FILE_MIB`, `FUZZ_PSEUDOFS_MAX_DATA_MIB` | 24/1536 (regression), 96/3072 (production) | Largest generated file, and the dataset size past which a round prunes the oldest trees |
 | `FUZZ_METRICS_STRICT_NAME` | `0` | Compare `__name__` even where Prometheus drops it after functions (Metrics keeps it; the live suite ignores this too) |
 
 Each run writes `summary.md` and `summary.json`, which contain per-family

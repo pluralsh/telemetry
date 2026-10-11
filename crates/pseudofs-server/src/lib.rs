@@ -14,6 +14,6 @@ pub async fn open(config: &config::Config) -> pseudofs::Result<(pseudofs::Pseudo
     let fs = pseudofs::PseudoFs::open(config.filesystem.clone()).await?;
     Ok((
         fs.clone(),
-        Service::new(fs, config.max_unary_file_size_bytes),
+        Service::new(fs, config.max_unary_file_size_bytes, config.search.clone()),
     ))
 }

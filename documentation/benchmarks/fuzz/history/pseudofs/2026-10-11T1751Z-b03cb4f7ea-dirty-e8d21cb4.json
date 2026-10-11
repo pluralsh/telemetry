@@ -1,0 +1,752 @@
+{
+  "schema_version": 1,
+  "name": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
+  "product": "pseudofs",
+  "run_id": "20261011T175052Z-e8d21cb4",
+  "batch": null,
+  "started_at": "2026-10-11T17:51:06Z",
+  "finished_at": "2026-10-11T18:00:45Z",
+  "git": {
+    "commit": "b03cb4f7eac0a781fd8d4c4d4687af573414d570",
+    "short": "b03cb4f7ea",
+    "branch": "main",
+    "dirty": true
+  },
+  "host": {
+    "label": "mbp-local",
+    "os": "Darwin",
+    "os_release": "23.4.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 12,
+    "memory_gib": 18.0,
+    "python": "3.13.7",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 600.0,
+    "seed": 3906084020,
+    "scale": 1.0,
+    "window_s": 60.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 30.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "recent",
+    "isolated": true
+  },
+  "settings": {
+    "concurrency": 8,
+    "crash_every": 4,
+    "impl_config": "production",
+    "max_file_bytes": 100663296,
+    "race_rate": 0.5,
+    "tenant": "fuzz-e8d21cb4"
+  },
+  "environment": {
+    "REGRESSION_BUILD": "0"
+  },
+  "images": {
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    },
+    "pseudofs": {
+      "image": "telemetry-regression/plural-pseudofs-server:local",
+      "id": "580e8f420824"
+    }
+  },
+  "layout": {
+    "network": "host-ports",
+    "cpus": {
+      "docker_cpus": 12,
+      "pinned": true,
+      "cpusets": {
+        "shared": "0",
+        "impl": "1-5",
+        "oracle": "6-10"
+      }
+    }
+  },
+  "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned",
+  "results": {
+    "status": "passed",
+    "reasons": [],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 579.1,
+    "rounds": 70,
+    "invisible_rounds": 0,
+    "cases": 6417,
+    "non_match": 0,
+    "outcomes": {
+      "match": 6417
+    },
+    "ingest": {
+      "batches": 149,
+      "outcomes": {
+        "ok": 149
+      },
+      "oracle_ms": {
+        "p50": null,
+        "p90": null,
+        "p99": null,
+        "max": null
+      },
+      "impl_ms": {
+        "p50": 320.988,
+        "p90": 2066.051,
+        "p99": 4368.942,
+        "max": 12480.668
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": null,
+        "p90": null,
+        "p99": null,
+        "p99.9": null,
+        "max": null
+      },
+      "impl_ms": {
+        "p50": 1.454,
+        "p90": 26.721,
+        "p99": 258.588,
+        "p99.9": 1129.385,
+        "max": 8596.568
+      },
+      "ratio": {
+        "p50": null,
+        "p90": null,
+        "p99": null
+      },
+      "outliers": 0
+    },
+    "families": {
+      "append": {
+        "cases": 227,
+        "non_match": 0,
+        "outcomes": {
+          "match": 227
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 8.649,
+          "p90": 32.785,
+          "p99": 148.662
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "edge": {
+        "cases": 146,
+        "non_match": 0,
+        "outcomes": {
+          "match": 146
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.443,
+          "p90": 1.272,
+          "p99": 4.07
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "exists": {
+        "cases": 323,
+        "non_match": 0,
+        "outcomes": {
+          "match": 323
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.527,
+          "p90": 1.827,
+          "p99": 8.938
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "glob": {
+        "cases": 822,
+        "non_match": 0,
+        "outcomes": {
+          "match": 822
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 1.108,
+          "p90": 20.816,
+          "p99": 59.909
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "grep": {
+        "cases": 883,
+        "non_match": 0,
+        "outcomes": {
+          "match": 883
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 5.152,
+          "p90": 77.443,
+          "p99": 866.526
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "iterdir": {
+        "cases": 411,
+        "non_match": 0,
+        "outcomes": {
+          "match": 411
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.849,
+          "p90": 3.221,
+          "p99": 15.36
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "mkdir": {
+        "cases": 57,
+        "non_match": 0,
+        "outcomes": {
+          "match": 57
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 6.33,
+          "p90": 21.823,
+          "p99": 40.72
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "open": {
+        "cases": 82,
+        "non_match": 0,
+        "outcomes": {
+          "match": 82
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.82,
+          "p90": 11.306,
+          "p99": 109.911
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "read.bytes": {
+        "cases": 518,
+        "non_match": 0,
+        "outcomes": {
+          "match": 518
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 1.518,
+          "p90": 14.421,
+          "p99": 52.744
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "read.range": {
+        "cases": 665,
+        "non_match": 0,
+        "outcomes": {
+          "match": 665
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.884,
+          "p90": 5.618,
+          "p99": 61.302
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "read.stream": {
+        "cases": 231,
+        "non_match": 0,
+        "outcomes": {
+          "match": 231
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 9.176,
+          "p90": 44.455,
+          "p99": 189.0
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "read.text": {
+        "cases": 171,
+        "non_match": 0,
+        "outcomes": {
+          "match": 171
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 1.92,
+          "p90": 12.087,
+          "p99": 69.707
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "rename": {
+        "cases": 152,
+        "non_match": 0,
+        "outcomes": {
+          "match": 152
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 4.362,
+          "p90": 15.546,
+          "p99": 38.955
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "resolve": {
+        "cases": 165,
+        "non_match": 0,
+        "outcomes": {
+          "match": 165
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.364,
+          "p90": 0.918,
+          "p99": 6.326
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "rmdir": {
+        "cases": 94,
+        "non_match": 0,
+        "outcomes": {
+          "match": 94
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 1.461,
+          "p90": 22.86,
+          "p99": 61.638
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "stat": {
+        "cases": 660,
+        "non_match": 0,
+        "outcomes": {
+          "match": 660
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 0.58,
+          "p90": 1.959,
+          "p99": 7.433
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "unlink": {
+        "cases": 136,
+        "non_match": 0,
+        "outcomes": {
+          "match": 136
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 6.876,
+          "p90": 18.77,
+          "p99": 57.856
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.blob.applied": {
+        "cases": 85,
+        "non_match": 0,
+        "outcomes": {
+          "match": 85
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 17.933,
+          "p90": 53.393,
+          "p99": 689.302
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.blob.durable": {
+        "cases": 25,
+        "non_match": 0,
+        "outcomes": {
+          "match": 25
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 41.013,
+          "p90": 120.52,
+          "p99": 209.661
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.blob.written": {
+        "cases": 106,
+        "non_match": 0,
+        "outcomes": {
+          "match": 106
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 24.326,
+          "p90": 53.203,
+          "p99": 178.151
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.inline.applied": {
+        "cases": 121,
+        "non_match": 0,
+        "outcomes": {
+          "match": 121
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 2.195,
+          "p90": 4.71,
+          "p99": 9.255
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.inline.durable": {
+        "cases": 50,
+        "non_match": 0,
+        "outcomes": {
+          "match": 50
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 10.712,
+          "p90": 36.768,
+          "p99": 127.972
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.inline.written": {
+        "cases": 199,
+        "non_match": 0,
+        "outcomes": {
+          "match": 199
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 12.245,
+          "p90": 35.013,
+          "p99": 220.065
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.stream.applied": {
+        "cases": 32,
+        "non_match": 0,
+        "outcomes": {
+          "match": 32
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 55.291,
+          "p90": 301.89,
+          "p99": 1202.309
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.stream.durable": {
+        "cases": 6,
+        "non_match": 0,
+        "outcomes": {
+          "match": 6
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 151.67,
+          "p90": 323.985,
+          "p99": 323.985
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      },
+      "write.stream.written": {
+        "cases": 50,
+        "non_match": 0,
+        "outcomes": {
+          "match": 50
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "impl_ms": {
+          "p50": 54.372,
+          "p90": 227.239,
+          "p99": 329.225
+        },
+        "ratio": {
+          "p50": null,
+          "p90": null
+        }
+      }
+    },
+    "floor": {
+      "pseudofs": {
+        "role": "impl",
+        "p50": 0.642,
+        "p99": 5.282
+      }
+    },
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 579.3,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "pseudofs"
+          ],
+          "cpu_seconds": 161.0,
+          "cpu_cores": {
+            "mean": 0.278,
+            "p95": 0.966,
+            "max": 2.146
+          },
+          "memory_mib": {
+            "mean": 122.2,
+            "p95": 280.7,
+            "max": 425.2
+          }
+        },
+        "shared": {
+          "services": [
+            "minio"
+          ],
+          "cpu_seconds": 103.9,
+          "cpu_cores": {
+            "mean": 0.179,
+            "p95": 0.569,
+            "max": 1.051
+          },
+          "memory_mib": {
+            "mean": 352.3,
+            "p95": 417.4,
+            "max": 430.9
+          }
+        }
+      },
+      "services": {
+        "minio": {
+          "cpu_seconds": 103.9,
+          "peak_memory_mib": 430.9
+        },
+        "pseudofs": {
+          "cpu_seconds": 161.0,
+          "peak_memory_mib": 425.2
+        }
+      }
+    }
+  }
+}

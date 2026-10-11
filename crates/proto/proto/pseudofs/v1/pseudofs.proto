@@ -22,8 +22,10 @@ service PseudoFS {
   rpc Rename(RenameRequest) returns (PathResponse);
   rpc Resolve(PathRequest) returns (PathResponse);
   rpc Absolute(PathRequest) returns (PathResponse);
-  rpc StreamFile(PathRequest) returns (stream FileChunk);
+  rpc StreamFile(StreamFileRequest) returns (stream FileChunk);
   rpc WriteFile(stream WriteFileRequest) returns (WriteResponse);
+  rpc Glob(GlobRequest) returns (stream DirectoryEntry);
+  rpc Grep(GrepRequest) returns (stream GrepMatch);
 }
 
 enum Durability {
@@ -126,6 +128,57 @@ message WriteFileRequest {
     WriteFileStart start = 1;
     bytes chunk = 2;
   }
+}
+
+// Field numbers 1 and 2 match PathRequest, so older clients that send a
+// PathRequest still read the whole file.
+message StreamFileRequest {
+  string path = 1;
+  string tenant = 2;
+  // Byte offset to start reading from. Offsets past the end yield no chunks.
+  uint64 offset = 3;
+  // Maximum bytes to read. Unset reads to the end of the file.
+  optional uint64 length = 4;
+}
+
+message GlobRequest {
+  string tenant = 1;
+  // Absolute pattern. Supports *, ?, [...], [!...], {a,b}, ** (any number of
+  // directories), and backslash escapes. Matches are streamed depth-first.
+  string pattern = 2;
+  // Zero uses the server default; larger values are capped.
+  uint32 max_results = 3;
+}
+
+message GrepRequest {
+  string tenant = 1;
+  // A file, a directory (searched recursively), or a glob pattern.
+  string path = 2;
+  // Rust regex syntax unless fixed_string is set.
+  string pattern = 3;
+  bool fixed_string = 4;
+  bool case_insensitive = 5;
+  uint32 before_context = 6;
+  uint32 after_context = 7;
+  // Maximum matching lines across all files. Zero uses the server default;
+  // larger values are capped.
+  uint32 max_matches = 8;
+  // Files larger than this are skipped. Zero uses the server default; larger
+  // values are capped.
+  uint64 max_file_size_bytes = 9;
+}
+
+message GrepLine {
+  uint64 line_number = 1;
+  string text = 2;
+}
+
+message GrepMatch {
+  string path = 1;
+  uint64 line_number = 2;
+  string line = 3;
+  repeated GrepLine before = 4;
+  repeated GrepLine after = 5;
 }
 
 message ErrorDetail {

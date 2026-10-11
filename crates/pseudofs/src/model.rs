@@ -24,7 +24,6 @@ pub(crate) struct Inode {
     pub mtime: f64,
     pub ctime: f64,
     pub head: Option<Uuid>,
-    #[serde(default = "default_generation_count")]
     pub generation_count: u64,
 }
 
@@ -44,41 +43,52 @@ impl Inode {
         }
     }
 
-    pub(crate) fn file(id: Uuid, tenant: String, size: u64, head: Uuid, now: f64) -> Self {
+    pub(crate) fn file(id: Uuid, tenant: String, now: f64) -> Self {
         Self {
             id,
             tenant,
             kind: FileKind::File,
             mode: 0o100_644,
-            size,
+            size: 0,
             atime: now,
             mtime: now,
             ctime: now,
-            head: Some(head),
-            generation_count: 1,
+            head: None,
+            generation_count: 0,
         }
     }
 }
 
-fn default_generation_count() -> u64 {
-    1
-}
-
+/// An immutable slice of file content. A file is the concatenation of its
+/// generation chain, oldest first.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Generation {
     pub inode_id: Uuid,
     pub id: Uuid,
     pub previous: Option<Uuid>,
-    pub chunk_count: u64,
     pub byte_len: u64,
+    pub content: Content,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum Content {
+    /// Bytes live in the metastore under the generation's content key.
+    Inline,
+    /// Bytes live in the blob store.
+    Blob { id: Uuid },
+}
+
+/// A blob committed locally that has not reached the remote store yet.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct UploadMarker {
-    pub inode_id: Uuid,
-    pub generation_id: Uuid,
-    pub chunk_count: u64,
-    pub started_at: f64,
+pub(crate) struct PendingBlob {
+    pub size: u64,
+}
+
+/// A blob no generation references any more, deleted after the grace period.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct DeadBlob {
+    pub deleted_at: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -112,10 +122,15 @@ pub struct FileHandle {
     pub position: u64,
 }
 
+/// Acknowledgement level for mutations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
+    /// Applied in memory; blob bytes are written but not fsynced.
     Applied,
+    /// Blob bytes are fsynced locally and the metastore WAL is flushed (to
+    /// local disk when `metastore_wal_path` is set).
     #[default]
     Written,
+    /// As `Written`, and blob bytes have been uploaded to the remote store.
     Durable,
 }

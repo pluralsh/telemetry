@@ -9,10 +9,14 @@ import sys
 
 from .logs import LogsFuzz
 from .metrics import MetricsFuzz
+from .pseudofs import PseudofsFuzz
 from .runner import run_fuzz
 from .traces import TracesFuzz
 
-PRODUCTS = {product.name: product for product in (LogsFuzz, MetricsFuzz, TracesFuzz)}
+PRODUCTS = {
+    product.name: product
+    for product in (LogsFuzz, MetricsFuzz, TracesFuzz, PseudofsFuzz)
+}
 
 
 def main(argv: list[str]) -> int:

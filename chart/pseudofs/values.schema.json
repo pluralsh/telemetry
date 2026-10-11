@@ -49,6 +49,21 @@
           "required": ["storage", "chunk_size_bytes", "max_file_size_bytes", "max_append_generations"],
           "properties": {
             "storage": {"type": "object"},
+            "metastore_wal_path": {"type": "string", "minLength": 1},
+            "blobs": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["local_path"],
+              "properties": {
+                "object_store": {"type": "object"},
+                "path": {"type": "string"},
+                "local_path": {"type": "string", "minLength": 1},
+                "cache_capacity_bytes": {"type": "integer", "minimum": 1},
+                "upload_concurrency": {"type": "integer", "minimum": 1},
+                "gc_grace_seconds": {"type": "integer", "minimum": 0}
+              }
+            },
+            "inline_threshold_bytes": {"type": "integer", "minimum": 0, "maximum": 16777216},
             "chunk_size_bytes": {"type": "integer", "minimum": 1},
             "max_file_size_bytes": {"type": "integer", "minimum": 1},
             "max_append_generations": {"type": "integer", "minimum": 2}
@@ -56,7 +71,22 @@
         },
         "maxUnaryFileSizeBytes": {"type": "integer", "minimum": 1},
         "maxDecodingMessageBytes": {"type": "integer", "minimum": 1},
-        "maxEncodingMessageBytes": {"type": "integer", "minimum": 1}
+        "maxEncodingMessageBytes": {"type": "integer", "minimum": 1},
+        "search": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default_glob_results": {"type": "integer", "minimum": 1},
+            "max_glob_results": {"type": "integer", "minimum": 1},
+            "default_grep_matches": {"type": "integer", "minimum": 1},
+            "max_grep_matches": {"type": "integer", "minimum": 1},
+            "max_grep_context_lines": {"type": "integer", "minimum": 0},
+            "default_grep_file_size_bytes": {"type": "integer", "minimum": 1},
+            "max_grep_file_size_bytes": {"type": "integer", "minimum": 1},
+            "grep_concurrency": {"type": "integer", "minimum": 1},
+            "max_scanned_entries": {"type": "integer", "minimum": 1}
+          }
+        }
       }
     },
     "persistence": {"$ref": "#/definitions/persistence"},

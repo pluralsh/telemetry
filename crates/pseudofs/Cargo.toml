@@ -15,11 +15,14 @@ blake3.workspace = true
 bytes.workspace = true
 common = { version = "0.1.0", path = "../common" }
 futures.workspace = true
+memchr.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slatedb.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 
 [dev-dependencies]

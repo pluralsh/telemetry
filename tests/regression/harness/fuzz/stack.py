@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 
 from ..compose import ComposeProject
 from .config import HISTORICAL_ENVIRONMENT, FuzzConfig
@@ -26,6 +29,34 @@ def fuzz_stack(
         yield None
         return
     compose = project()
+    with _exclusive(compose.name):
+        yield from _managed(config, compose, roles, after_start)
+
+
+@contextmanager
+def _exclusive(name: str) -> Iterator[None]:
+    """Two runs sharing a compose project restart and wipe each other's
+    containers and volumes, which reads as data loss in the target."""
+    path = Path(tempfile.gettempdir()) / f"fuzz-{name}.lock"
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(
+                f"another fuzz run is using compose project {name!r} ({path})"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _managed(
+    config: FuzzConfig,
+    compose: ComposeProject,
+    roles: Mapping[str, str],
+    after_start: Callable[[ComposeProject], None] | None,
+) -> Iterator[ComposeProject]:
     if config.historical:
         os.environ.update(HISTORICAL_ENVIRONMENT)
         compose.services += ("minio-latency",)

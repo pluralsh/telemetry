@@ -12,3 +12,7 @@ data:
     max_unary_file_size_bytes: {{ printf "%.0f" .Values.config.maxUnaryFileSizeBytes }}
     max_decoding_message_bytes: {{ printf "%.0f" .Values.config.maxDecodingMessageBytes }}
     max_encoding_message_bytes: {{ printf "%.0f" .Values.config.maxEncodingMessageBytes }}
+    {{- with .Values.config.search }}
+    search:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}

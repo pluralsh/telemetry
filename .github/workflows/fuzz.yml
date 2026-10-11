@@ -13,7 +13,7 @@ on:
         default: ""
       products:
         description: JSON list of products to fuzz
-        default: '["logs", "metrics", "traces"]'
+        default: '["logs", "metrics", "traces", "pseudofs"]'
       logs_storage:
         description: Logs implementation backend (s3 or local)
         default: s3
@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        product: ${{ fromJSON(inputs.products || '["logs", "metrics", "traces"]') }}
+        product: ${{ fromJSON(inputs.products || '["logs", "metrics", "traces", "pseudofs"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v4

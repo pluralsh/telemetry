@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,11 +70,22 @@ class Exchange:
         }
 
 
+Handler = Callable[[Endpoint, Request], Exchange]
+
+
 class Transport:
-    def __init__(self, *, timeout_s: float) -> None:
+    def __init__(
+        self, *, timeout_s: float, handlers: Mapping[str, Handler] | None = None
+    ) -> None:
         self.timeout_s = timeout_s
+        # URL scheme -> sender for endpoints that are not HTTP, such as an
+        # in-process reference model or a gRPC service.
+        self.handlers = dict(handlers or {})
 
     def send(self, endpoint: Endpoint, request: Request) -> Exchange:
+        scheme = endpoint.url.partition("://")[0]
+        if handler := self.handlers.get(scheme):
+            return handler(endpoint, request)
         headers = dict(endpoint.headers)
         headers.update(request.headers)
         if endpoint.authorization:

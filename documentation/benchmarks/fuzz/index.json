@@ -11,6 +11,11 @@
       "latest": "2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1",
       "readme": "history/metrics/README.md"
     },
+    "pseudofs": {
+      "runs": 1,
+      "latest": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
+      "readme": "history/pseudofs/README.md"
+    },
     "traces": {
       "runs": 2,
       "latest": "2026-10-08T0424Z-0b54fe965a-64799c3c",
@@ -529,6 +534,74 @@
         "shared": {
           "cpu_cores_mean": 0.071,
           "memory_mib_p95": 342.4
+        }
+      }
+    },
+    {
+      "name": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
+      "product": "pseudofs",
+      "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned",
+      "batch": null,
+      "started_at": "2026-10-11T17:51:06Z",
+      "finished_at": "2026-10-11T18:00:45Z",
+      "json": "history/pseudofs/2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4.json",
+      "markdown": "history/pseudofs/2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4.md",
+      "git": {
+        "commit": "b03cb4f7eac0a781fd8d4c4d4687af573414d570",
+        "short": "b03cb4f7ea",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": "mbp-local",
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 600.0,
+        "seed": 3906084020,
+        "scale": 1.0
+      },
+      "settings": {
+        "concurrency": 8,
+        "crash_every": 4,
+        "impl_config": "production",
+        "max_file_bytes": 100663296,
+        "race_rate": 0.5,
+        "tenant": "fuzz-e8d21cb4"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 70,
+      "cases": 6417,
+      "mismatch": 0,
+      "non_match": 0,
+      "outcomes": {
+        "match": 6417
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 1.454,
+          "p90": 26.721,
+          "p99": 258.588
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "ratio_p50": null
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.278,
+          "memory_mib_p95": 280.7
+        },
+        "shared": {
+          "cpu_cores_mean": 0.179,
+          "memory_mib_p95": 417.4
         }
       }
     },

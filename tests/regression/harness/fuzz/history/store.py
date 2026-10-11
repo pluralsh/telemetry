@@ -18,7 +18,7 @@ from typing import Any
 from .entry import SCHEMA_VERSION
 from .render import index_json, render_entry, render_index, render_product
 
-PRODUCTS = ("logs", "metrics", "traces")
+PRODUCTS = ("logs", "metrics", "traces", "pseudofs")
 
 
 def dumps(value: Any) -> str:

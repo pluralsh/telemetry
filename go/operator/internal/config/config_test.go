@@ -29,6 +29,7 @@ const (
 	testMetricsProduct      = "metrics"
 	testLogsProduct         = "logs"
 	testTracesProduct       = "traces"
+	testPseudoFSName        = "files"
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
@@ -515,11 +516,19 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 	chunkSize, maxFileSize := int64(2097152), int64(2147483648)
 	maxAppendGenerations, maxUnaryFileSize := int64(32), int64(4194304)
 	pseudofs := &telemetryv1alpha1.PseudoFS{
-		ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testMetricsNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testPseudoFSName, Namespace: testMetricsNamespace},
 		Spec: telemetryv1alpha1.PseudoFSSpec{
 			Config: telemetryv1alpha1.PseudoFSConfigSpec{
 				ChunkSizeBytes: &chunkSize, MaxFileSizeBytes: &maxFileSize,
 				MaxAppendGenerations: &maxAppendGenerations, MaxUnaryFileSizeBytes: &maxUnaryFileSize,
+				InlineThresholdBytes: lo.ToPtr(int64(4096)),
+				Blobs: telemetryv1alpha1.PseudoFSBlobsSpec{
+					Path: "files-blobs", CacheCapacityBytes: lo.ToPtr(int64(1073741824)),
+					UploadConcurrency: lo.ToPtr(int32(2)), GCGraceSeconds: lo.ToPtr(int64(60)),
+				},
+				Search: telemetryv1alpha1.PseudoFSSearchSpec{
+					GrepConcurrency: lo.ToPtr(int32(16)), MaxScannedEntries: lo.ToPtr(int64(5000)),
+				},
 			},
 		},
 	}
@@ -542,18 +551,86 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 		"max_unary_file_size_bytes: 4194304",
 		"max_decoding_message_bytes: 16777216",
 		"max_encoding_message_bytes: 16777216",
+		"local_path: /var/lib/pseudofs/blobs",
+		"path: files-blobs",
+		"cache_capacity_bytes: 1073741824",
+		"upload_concurrency: 2",
+		"gc_grace_seconds: 60",
+		"inline_threshold_bytes: 4096",
+		"grep_concurrency: 16",
+		"max_scanned_entries: 5000",
+		"default_glob_results: 1000",
+		"max_grep_file_size_bytes: 67108864",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Errorf("rendered PseudoFS config missing %q:\n%s", expected, rendered)
 		}
 	}
-	for _, invalid := range []string{"mode:", "auth:", "namespaces:", "http:"} {
+	for _, invalid := range []string{"mode:", "auth:", "namespaces:", "http:", "metastore_wal_path:"} {
 		if strings.Contains(rendered, invalid) {
 			t.Errorf("rendered PseudoFS config contains unsupported field %q:\n%s", invalid, rendered)
 		}
 	}
 	if result.Hash == "" {
 		t.Fatal("hash was not generated")
+	}
+}
+
+func TestRenderPseudoFSRemoteStoreUsesLocalWAL(t *testing.T) {
+	pseudofs := &telemetryv1alpha1.PseudoFS{
+		ObjectMeta: metav1.ObjectMeta{Name: testPseudoFSName, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.PseudoFSSpec{
+			Config: telemetryv1alpha1.PseudoFSConfigSpec{
+				Storage: telemetryv1alpha1.StorageSpec{ObjectStore: telemetryv1alpha1.ObjectStoreSpec{
+					Type: telemetryv1alpha1.ObjectStoreAWS,
+					AWS:  &telemetryv1alpha1.AWSObjectStoreSpec{Region: "us-east-1", Bucket: testBucket},
+				}},
+			},
+		},
+	}
+	result, err := Render(Input{PseudoFS: pseudofs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(result.Data[PseudoFSKey])
+	for _, expected := range []string{
+		"type: Aws",
+		"metastore_wal_path: /var/lib/pseudofs/wal",
+		"local_path: /var/lib/pseudofs/blobs",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("rendered PseudoFS config missing %q:\n%s", expected, rendered)
+		}
+	}
+}
+
+func TestRenderPseudoFSRejectsUnsatisfiableLimits(t *testing.T) {
+	dataSize := resource.MustParse("2Gi")
+	tests := map[string]telemetryv1alpha1.PseudoFSSpec{
+		"blob cache exceeds data volume": {
+			Config: telemetryv1alpha1.PseudoFSConfigSpec{Blobs: telemetryv1alpha1.PseudoFSBlobsSpec{
+				CacheCapacityBytes: lo.ToPtr(int64(2 * 1024 * 1024 * 1024)),
+			}},
+			Workload: telemetryv1alpha1.WorkloadSpec{
+				DataVolume: &telemetryv1alpha1.VolumeSpec{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &dataSize}},
+			},
+		},
+		"search default exceeds implicit max": {
+			Config: telemetryv1alpha1.PseudoFSConfigSpec{Search: telemetryv1alpha1.PseudoFSSearchSpec{
+				DefaultGlobResults: lo.ToPtr(int64(20000)),
+			}},
+		},
+	}
+	for name, spec := range tests {
+		t.Run(name, func(t *testing.T) {
+			pseudofs := &telemetryv1alpha1.PseudoFS{
+				ObjectMeta: metav1.ObjectMeta{Name: testPseudoFSName, Namespace: testMetricsNamespace},
+				Spec:       spec,
+			}
+			if _, err := Render(Input{PseudoFS: pseudofs}); err == nil {
+				t.Fatal("expected render to fail")
+			}
+		})
 	}
 }
 

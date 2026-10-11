@@ -92,7 +92,16 @@ func CacheDiskCapacity(workload telemetryv1alpha1.WorkloadSpec) int64 {
 // CacheVolumeCapacity returns the effective cache volume's configured byte
 // capacity. An emptyDir without a size limit is intentionally unbounded.
 func CacheVolumeCapacity(workload telemetryv1alpha1.WorkloadSpec) (int64, bool) {
-	spec := volumeSpec(workload.CacheVolume, defaultCacheSize)
+	return volumeCapacity(volumeSpec(workload.CacheVolume, defaultCacheSize))
+}
+
+// DataVolumeCapacity returns the effective data volume's configured byte
+// capacity. An emptyDir without a size limit is intentionally unbounded.
+func DataVolumeCapacity(workload telemetryv1alpha1.WorkloadSpec) (int64, bool) {
+	return volumeCapacity(volumeSpec(workload.DataVolume, defaultDataSize))
+}
+
+func volumeCapacity(spec telemetryv1alpha1.VolumeSpec) (int64, bool) {
 	var size *resource.Quantity
 	switch {
 	case spec.PersistentVolumeClaim != nil:

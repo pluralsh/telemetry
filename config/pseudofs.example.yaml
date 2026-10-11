@@ -16,6 +16,24 @@ filesystem:
     meta_cache:
       type: FoyerMemory
       capacity: 134217728
+  # With a remote object store, put the metastore WAL on local disk so WRITTEN
+  # acknowledgements don't wait on the bucket:
+  # metastore_wal_path: /var/lib/pseudofs/wal
+  blobs:
+    # Remote blob store; defaults to storage.object_store under
+    # "<storage.path>-blobs".
+    # object_store:
+    #   type: Aws
+    #   region: us-east-1
+    #   bucket: pseudofs-blobs
+    # path: pseudofs-blobs
+    # Staged uploads, blobs awaiting upload, and the read cache. Must be
+    # persistent: blobs are acknowledged before they reach the remote store.
+    local_path: /var/lib/pseudofs/blobs
+    cache_capacity_bytes: 4294967296
+    upload_concurrency: 4
+    gc_grace_seconds: 300
+  inline_threshold_bytes: 65536
   chunk_size_bytes: 1048576
   max_file_size_bytes: 1073741824
   max_append_generations: 64
@@ -23,3 +41,14 @@ filesystem:
 max_unary_file_size_bytes: 8388608
 max_decoding_message_bytes: 16777216
 max_encoding_message_bytes: 16777216
+
+search:
+  default_glob_results: 1000
+  max_glob_results: 10000
+  default_grep_matches: 100
+  max_grep_matches: 1000
+  max_grep_context_lines: 100
+  default_grep_file_size_bytes: 16777216
+  max_grep_file_size_bytes: 67108864
+  grep_concurrency: 8
+  max_scanned_entries: 1000000

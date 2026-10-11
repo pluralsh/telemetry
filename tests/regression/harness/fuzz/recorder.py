@@ -123,8 +123,10 @@ class Recorder:
         config: FuzzConfig,
         endpoints: dict[str, object],
         layout: dict[str, Any] | None = None,
+        reference_latency: bool = True,
     ) -> None:
         self.config = config
+        self.reference_latency = reference_latency
         self.root = config.output_dir
         (self.root / "artifacts").mkdir(parents=True, exist_ok=True)
         if config.record_data:
@@ -167,7 +169,7 @@ class Recorder:
         self.notes.append(message)
 
     def _is_outlier(self, oracle: Exchange, impl: Exchange) -> bool:
-        if oracle.status is None or impl.status is None:
+        if not self.reference_latency or oracle.status is None or impl.status is None:
             return False
         return (
             impl.latency_ms > self.config.latency_ratio * max(oracle.latency_ms, 1.0)
@@ -179,11 +181,12 @@ class Recorder:
         self.families[record.family][record.outcome] += 1
         outlier = self._is_outlier(record.oracle, record.impl)
         if record.oracle.status is not None and record.impl.status is not None:
-            self.oracle_latency[record.family].append(record.oracle.latency_ms)
             self.impl_latency[record.family].append(record.impl.latency_ms)
-            self.ratios[record.family].append(
-                record.impl.latency_ms / max(record.oracle.latency_ms, 0.001)
-            )
+            if self.reference_latency:
+                self.oracle_latency[record.family].append(record.oracle.latency_ms)
+                self.ratios[record.family].append(
+                    record.impl.latency_ms / max(record.oracle.latency_ms, 0.001)
+                )
         line: dict[str, Any] = {
             "id": record.id,
             "round": record.round,
@@ -248,7 +251,20 @@ class Recorder:
     def record_ingest(self, record: IngestRecord) -> None:
         outcome = record.outcome
         self.ingest_outcomes[outcome] += 1
-        if record.oracle.status is not None:
+        if outcome == "impl_error" and "ingest" in self.config.fail_on:
+            self.failures.append(
+                {
+                    "id": f"r{record.round:04d}-{record.batch}",
+                    "family": "ingest",
+                    "query": record.batch,
+                    "oracle_ms": round(record.oracle.latency_ms, 1),
+                    "impl_ms": round(record.impl.latency_ms, 1),
+                    "outcome": "ingest",
+                    "detail": record.impl.error
+                    or record.impl.body[:1000].decode(errors="replace"),
+                }
+            )
+        if record.oracle.status is not None and self.reference_latency:
             self.ingest_latency["oracle"].append(record.oracle.latency_ms)
         if record.impl.status is not None:
             self.ingest_latency["impl"].append(record.impl.latency_ms)

@@ -13,18 +13,20 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
-pub(crate) const KEY_VERSION: u8 = 2;
+pub(crate) const KEY_VERSION: u8 = 3;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::PSEUDOFS;
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "pseudofs/v2";
-const SEGMENT_PREFIX_LEN: usize = 2;
-const TENANT_PREFIX_LEN: usize = SEGMENT_PREFIX_LEN + 1 + 16;
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "pseudofs/v3";
+const SEGMENT_PREFIX_LEN: usize = 3;
+const TENANT_PREFIX_LEN: usize = SEGMENT_PREFIX_LEN + 16;
 const DIRECTORY_NAME_OFFSET: usize = TENANT_PREFIX_LEN + 16;
+const BLOB_ID_OFFSET: usize = TENANT_PREFIX_LEN;
 
 const INODE: u8 = b'i';
 const DIRECTORY_ENTRY: u8 = b'd';
 const GENERATION: u8 = b'g';
-const CHUNK: u8 = b'c';
-const UPLOAD: u8 = b'u';
+const CONTENT: u8 = b'c';
+const PENDING_BLOB: u8 = b'p';
+const DEAD_BLOB: u8 = b'r';
 const GARBAGE: u8 = b'x';
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +34,8 @@ pub(crate) struct TenantScope {
     pub(crate) root_id: Uuid,
 }
 
+/// Places every record family in its own SlateDB segment, so inline content
+/// and blob bookkeeping compact independently of inodes and directory entries.
 pub(crate) struct PseudofsSegmentExtractor;
 
 impl PseudofsSegmentExtractor {
@@ -91,20 +95,30 @@ pub(crate) fn generation_key(scope: TenantScope, inode: Uuid, generation: Uuid) 
     tagged_two_uuids(scope, GENERATION, inode, generation)
 }
 
-pub(crate) fn chunk_key(scope: TenantScope, inode: Uuid, generation: Uuid, index: u64) -> Bytes {
-    let mut key = record_prefix(scope, CHUNK, 40);
-    key.extend_from_slice(inode.as_bytes());
-    key.extend_from_slice(generation.as_bytes());
-    key.put_u64(index);
-    key.freeze()
+pub(crate) fn content_key(scope: TenantScope, inode: Uuid, generation: Uuid) -> Bytes {
+    tagged_two_uuids(scope, CONTENT, inode, generation)
 }
 
-pub(crate) fn upload_key(scope: TenantScope, generation: Uuid) -> Bytes {
-    tagged_uuid(scope, UPLOAD, generation)
+pub(crate) fn pending_blob_key(scope: TenantScope, blob: Uuid) -> Bytes {
+    tagged_uuid(scope, PENDING_BLOB, blob)
 }
 
-pub(crate) fn upload_prefix() -> Bytes {
-    family_prefix(UPLOAD)
+pub(crate) fn pending_blob_prefix() -> Bytes {
+    family_prefix(PENDING_BLOB)
+}
+
+pub(crate) fn dead_blob_key(scope: TenantScope, blob: Uuid) -> Bytes {
+    tagged_uuid(scope, DEAD_BLOB, blob)
+}
+
+pub(crate) fn dead_blob_prefix() -> Bytes {
+    family_prefix(DEAD_BLOB)
+}
+
+pub(crate) fn blob_id_from_key(key: &[u8]) -> Result<Uuid> {
+    key.get(BLOB_ID_OFFSET..BLOB_ID_OFFSET + 16)
+        .and_then(|raw| Uuid::from_slice(raw).ok())
+        .ok_or_else(|| Error::Corrupt("malformed blob record key".to_owned()))
 }
 
 pub(crate) fn garbage_key(scope: TenantScope, head: Uuid) -> Bytes {
@@ -119,7 +133,7 @@ pub(crate) fn tenant_scope_from_key(key: &[u8]) -> Result<TenantScope> {
     if key.len() < TENANT_PREFIX_LEN || key[0] != SUBSYSTEM || key[1] != KEY_VERSION {
         return Err(Error::Corrupt("malformed PseudoFS record key".to_owned()));
     }
-    let root_id = Uuid::from_slice(&key[SEGMENT_PREFIX_LEN + 1..TENANT_PREFIX_LEN])
+    let root_id = Uuid::from_slice(&key[SEGMENT_PREFIX_LEN..TENANT_PREFIX_LEN])
         .map_err(|error| Error::Corrupt(format!("invalid tenant root ID: {error}")))?;
     Ok(TenantScope { root_id })
 }
@@ -181,15 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_indices_sort_lexicographically() {
-        let inode = Uuid::new_v4();
-        let generation = Uuid::new_v4();
-        let scope = scope(1);
-        assert!(chunk_key(scope, inode, generation, 1) < chunk_key(scope, inode, generation, 2));
-    }
-
-    #[test]
-    fn record_family_follows_segment_prefix_and_scope_round_trips() {
+    fn record_family_follows_version_and_scope_round_trips() {
         let scope = scope(0x0123);
         let inode = Uuid::new_v4();
         let generation = Uuid::new_v4();
@@ -197,8 +203,9 @@ mod tests {
             inode_key(scope, inode),
             directory_entry_key(scope, inode, "name"),
             generation_key(scope, inode, generation),
-            chunk_key(scope, inode, generation, 0),
-            upload_key(scope, generation),
+            content_key(scope, inode, generation),
+            pending_blob_key(scope, generation),
+            dead_blob_key(scope, generation),
             garbage_key(scope, generation),
         ];
         for key in keys {
@@ -208,12 +215,33 @@ mod tests {
     }
 
     #[test]
-    fn family_prefixes_cover_every_tenant() {
+    fn blob_keys_round_trip_and_family_prefixes_cover_every_tenant() {
         for root in [0, 1, u128::MAX] {
-            let generation = Uuid::from_u128(7);
-            assert!(upload_key(scope(root), generation).starts_with(&upload_prefix()));
-            assert!(garbage_key(scope(root), generation).starts_with(&garbage_prefix()));
+            let blob = Uuid::from_u128(7);
+            let pending = pending_blob_key(scope(root), blob);
+            let dead = dead_blob_key(scope(root), blob);
+            assert!(pending.starts_with(&pending_blob_prefix()));
+            assert!(dead.starts_with(&dead_blob_prefix()));
+            assert_eq!(blob_id_from_key(&pending).unwrap(), blob);
+            assert_eq!(blob_id_from_key(&dead).unwrap(), blob);
+            assert!(garbage_key(scope(root), blob).starts_with(&garbage_prefix()));
         }
-        assert!(!chunk_key(scope(1), Uuid::nil(), Uuid::nil(), 0).starts_with(&upload_prefix()));
+    }
+
+    #[test]
+    fn segments_split_by_record_family() {
+        let extractor = PseudofsSegmentExtractor;
+        let key = inode_key(scope(1), Uuid::nil());
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Point(key.clone())),
+            Some(3)
+        );
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Prefix(Bytes::from(vec![
+                SUBSYSTEM,
+                KEY_VERSION
+            ]))),
+            None
+        );
     }
 }

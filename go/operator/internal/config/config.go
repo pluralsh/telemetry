@@ -185,10 +185,35 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 	if err := validateCacheVolume(spec.Storage, pseudofs.Spec.Workload, "workload"); err != nil {
 		return Result{}, err
 	}
+	blobCapacity := int64Value(spec.Blobs.CacheCapacityBytes, 4294967296)
+	if volume, bounded := resources.DataVolumeCapacity(pseudofs.Spec.Workload); bounded && blobCapacity > volume-volume/10 {
+		return Result{}, fmt.Errorf("blobs cacheCapacityBytes %d must leave ten percent of the %d byte data volume free", blobCapacity, volume)
+	}
+	search, err := renderPseudoFSSearchConfig(spec.Search)
+	if err != nil {
+		return Result{}, err
+	}
+	descriptor := resources.PseudoFSDescriptor
+	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload))
+	walPath := ""
+	switch telemetryv1alpha1.ObjectStoreType(storage.ObjectStore.Type) {
+	case telemetryv1alpha1.ObjectStoreLocal, telemetryv1alpha1.ObjectStoreInMemory:
+	default:
+		walPath = descriptor.DataPath + "/wal"
+	}
 	rendered, err := yaml.Marshal(renderPseudoFSConfig{
 		Listener: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(pseudofs)),
 		Filesystem: renderPseudoFSFilesystem{
-			Storage:              renderStorageConfig(spec.Storage, resources.PseudoFSDescriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload)),
+			Storage:          storage,
+			MetastoreWALPath: walPath,
+			Blobs: renderPseudoFSBlobs{
+				Path:               spec.Blobs.Path,
+				LocalPath:          descriptor.DataPath + "/blobs",
+				CacheCapacityBytes: blobCapacity,
+				UploadConcurrency:  int32Value(spec.Blobs.UploadConcurrency, 4),
+				GCGraceSeconds:     int64Value(spec.Blobs.GCGraceSeconds, 300),
+			},
+			InlineThresholdBytes: int64Value(spec.InlineThresholdBytes, 65536),
 			ChunkSizeBytes:       int64Value(spec.ChunkSizeBytes, 1048576),
 			MaxFileSizeBytes:     int64Value(spec.MaxFileSizeBytes, 1073741824),
 			MaxAppendGenerations: int64Value(spec.MaxAppendGenerations, 64),
@@ -196,12 +221,41 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 		MaxUnaryFileSizeBytes:   int64Value(spec.MaxUnaryFileSizeBytes, 8388608),
 		MaxDecodingMessageBytes: int64Value(spec.MaxDecodingMessageBytes, 16777216),
 		MaxEncodingMessageBytes: int64Value(spec.MaxEncodingMessageBytes, 16777216),
+		Search:                  search,
 	})
 	if err != nil {
 		return Result{}, fmt.Errorf("render PseudoFS config: %w", err)
 	}
 	sum := sha256.Sum256(rendered)
 	return Result{Data: map[string][]byte{PseudoFSKey: rendered}, Hash: hex.EncodeToString(sum[:])}, nil
+}
+
+func renderPseudoFSSearchConfig(spec telemetryv1alpha1.PseudoFSSearchSpec) (renderPseudoFSSearch, error) {
+	search := renderPseudoFSSearch{
+		DefaultGlobResults:       int64Value(spec.DefaultGlobResults, 1000),
+		MaxGlobResults:           int64Value(spec.MaxGlobResults, 10000),
+		DefaultGrepMatches:       int64Value(spec.DefaultGrepMatches, 100),
+		MaxGrepMatches:           int64Value(spec.MaxGrepMatches, 1000),
+		MaxGrepContextLines:      int64Value(spec.MaxGrepContextLines, 100),
+		DefaultGrepFileSizeBytes: int64Value(spec.DefaultGrepFileSizeBytes, 16777216),
+		MaxGrepFileSizeBytes:     int64Value(spec.MaxGrepFileSizeBytes, 67108864),
+		GrepConcurrency:          int32Value(spec.GrepConcurrency, 8),
+		MaxScannedEntries:        int64Value(spec.MaxScannedEntries, 1000000),
+	}
+	for _, limit := range []struct {
+		name         string
+		defaultValue int64
+		maxValue     int64
+	}{
+		{"GlobResults", search.DefaultGlobResults, search.MaxGlobResults},
+		{"GrepMatches", search.DefaultGrepMatches, search.MaxGrepMatches},
+		{"GrepFileSizeBytes", search.DefaultGrepFileSizeBytes, search.MaxGrepFileSizeBytes},
+	} {
+		if limit.defaultValue > limit.maxValue {
+			return renderPseudoFSSearch{}, fmt.Errorf("search default%s %d exceeds max%s %d", limit.name, limit.defaultValue, limit.name, limit.maxValue)
+		}
+	}
+	return search, nil
 }
 
 func renderLogs(input Input) (Result, error) {
@@ -730,12 +784,34 @@ type renderPseudoFSConfig struct {
 	MaxUnaryFileSizeBytes   int64                    `json:"max_unary_file_size_bytes"`
 	MaxDecodingMessageBytes int64                    `json:"max_decoding_message_bytes"`
 	MaxEncodingMessageBytes int64                    `json:"max_encoding_message_bytes"`
+	Search                  renderPseudoFSSearch     `json:"search"`
 }
 type renderPseudoFSFilesystem struct {
-	Storage              renderStorage `json:"storage"`
-	ChunkSizeBytes       int64         `json:"chunk_size_bytes"`
-	MaxFileSizeBytes     int64         `json:"max_file_size_bytes"`
-	MaxAppendGenerations int64         `json:"max_append_generations"`
+	Storage              renderStorage       `json:"storage"`
+	MetastoreWALPath     string              `json:"metastore_wal_path,omitempty"`
+	Blobs                renderPseudoFSBlobs `json:"blobs"`
+	InlineThresholdBytes int64               `json:"inline_threshold_bytes"`
+	ChunkSizeBytes       int64               `json:"chunk_size_bytes"`
+	MaxFileSizeBytes     int64               `json:"max_file_size_bytes"`
+	MaxAppendGenerations int64               `json:"max_append_generations"`
+}
+type renderPseudoFSBlobs struct {
+	Path               string `json:"path,omitempty"`
+	LocalPath          string `json:"local_path"`
+	CacheCapacityBytes int64  `json:"cache_capacity_bytes"`
+	UploadConcurrency  int32  `json:"upload_concurrency"`
+	GCGraceSeconds     int64  `json:"gc_grace_seconds"`
+}
+type renderPseudoFSSearch struct {
+	DefaultGlobResults       int64 `json:"default_glob_results"`
+	MaxGlobResults           int64 `json:"max_glob_results"`
+	DefaultGrepMatches       int64 `json:"default_grep_matches"`
+	MaxGrepMatches           int64 `json:"max_grep_matches"`
+	MaxGrepContextLines      int64 `json:"max_grep_context_lines"`
+	DefaultGrepFileSizeBytes int64 `json:"default_grep_file_size_bytes"`
+	MaxGrepFileSizeBytes     int64 `json:"max_grep_file_size_bytes"`
+	GrepConcurrency          int32 `json:"grep_concurrency"`
+	MaxScannedEntries        int64 `json:"max_scanned_entries"`
 }
 type renderTracesPage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`

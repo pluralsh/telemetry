@@ -10,46 +10,39 @@ use prost::Message;
 use proto::pseudofs::v1::pseudo_fs_server::{PseudoFs as PseudoFsApi, PseudoFsServer};
 use proto::pseudofs::v1::{
     BoolResponse, BytesResponse, DirectoryEntry, Empty, ErrorDetail, FileChunk, FileHandle,
-    FileKind, MkdirRequest, MutationPathRequest, OpenRequest, PathRequest, PathResponse,
-    RenameRequest, StatResponse, TextResponse, WriteBytesRequest, WriteFileRequest, WriteResponse,
-    WriteTextRequest, write_file_request,
+    FileKind, GlobRequest, GrepLine, GrepMatch, GrepRequest, MkdirRequest, MutationPathRequest,
+    OpenRequest, PathRequest, PathResponse, RenameRequest, StatResponse, StreamFileRequest,
+    TextResponse, WriteBytesRequest, WriteFileRequest, WriteResponse, WriteTextRequest,
+    write_file_request,
 };
-use pseudofs::{Durability, Error, PseudoFs};
+use pseudofs::{Durability, Error, GlobOptions, GrepOptions, PseudoFs};
 use tonic::{Code, Request, Response, Status, Streaming};
+
+use crate::config::SearchLimits;
 
 #[derive(Clone)]
 pub struct Service {
     fs: PseudoFs,
     max_unary_file_size_bytes: u64,
+    search: SearchLimits,
 }
 
 impl Service {
-    pub fn new(fs: PseudoFs, max_unary_file_size_bytes: u64) -> Self {
+    pub fn new(fs: PseudoFs, max_unary_file_size_bytes: u64, search: SearchLimits) -> Self {
         Self {
             fs,
             max_unary_file_size_bytes,
+            search,
         }
-    }
-
-    #[allow(clippy::result_large_err)]
-    async fn ensure_unary_read(&self, tenant: &str, path: &str) -> Result<(), Status> {
-        let size = self.fs.stat(tenant, path).await.map_err(status)?.size;
-        if size > self.max_unary_file_size_bytes {
-            return Err(Status::resource_exhausted(format!(
-                "file size {size} exceeds unary limit {}; use StreamFile",
-                self.max_unary_file_size_bytes
-            )));
-        }
-        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
     fn ensure_unary_write(&self, size: usize) -> Result<(), Status> {
         if size as u64 > self.max_unary_file_size_bytes {
-            return Err(Status::resource_exhausted(format!(
+            return Err(status(Error::ResourceExhausted(format!(
                 "payload size {size} exceeds unary limit {}; use WriteFile",
                 self.max_unary_file_size_bytes
-            )));
+            ))));
         }
         Ok(())
     }
@@ -67,11 +60,14 @@ impl Service {
 
 type FileStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send + 'static>>;
 type DirectoryStream = Pin<Box<dyn Stream<Item = Result<DirectoryEntry, Status>> + Send + 'static>>;
+type GrepStream = Pin<Box<dyn Stream<Item = Result<GrepMatch, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl PseudoFsApi for Service {
     type StreamFileStream = FileStream;
     type IterdirStream = DirectoryStream;
+    type GlobStream = DirectoryStream;
+    type GrepStream = GrepStream;
 
     async fn exists(
         &self,
@@ -129,12 +125,14 @@ impl PseudoFsApi for Service {
         &self,
         request: Request<PathRequest>,
     ) -> Result<Response<TextResponse>, Status> {
-        self.ensure_unary_read(&request.get_ref().tenant, &request.get_ref().path)
-            .await?;
         let request = request.into_inner();
         let value = self
             .fs
-            .read_text(&request.tenant, &request.path)
+            .read_text_within(
+                &request.tenant,
+                &request.path,
+                self.max_unary_file_size_bytes,
+            )
             .await
             .map_err(status)?;
         Ok(Response::new(TextResponse { value }))
@@ -144,12 +142,14 @@ impl PseudoFsApi for Service {
         &self,
         request: Request<PathRequest>,
     ) -> Result<Response<BytesResponse>, Status> {
-        self.ensure_unary_read(&request.get_ref().tenant, &request.get_ref().path)
-            .await?;
         let request = request.into_inner();
         let value = self
             .fs
-            .read_bytes(&request.tenant, &request.path)
+            .read_bytes_within(
+                &request.tenant,
+                &request.path,
+                self.max_unary_file_size_bytes,
+            )
             .await
             .map_err(status)?;
         Ok(Response::new(BytesResponse { value }))
@@ -308,12 +308,72 @@ impl PseudoFsApi for Service {
             .stream_dir(&request.tenant, &request.path)
             .await
             .map_err(status)?;
-        let stream = tokio_stream::wrappers::ReceiverStream::new(entries).map(|result| {
+        Ok(Response::new(directory_stream(entries)))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn glob(
+        &self,
+        request: Request<GlobRequest>,
+    ) -> Result<Response<Self::GlobStream>, Status> {
+        let request = request.into_inner();
+        let max_results = limit(
+            request.max_results.into(),
+            self.search.default_glob_results.into(),
+            self.search.max_glob_results.into(),
+        );
+        let options = GlobOptions {
+            max_results: max_results as usize,
+            max_scanned_entries: self.search.max_scanned_entries as usize,
+        };
+        let entries = self
+            .fs
+            .glob(&request.tenant, &request.pattern, options)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(directory_stream(entries)))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn grep(
+        &self,
+        request: Request<GrepRequest>,
+    ) -> Result<Response<Self::GrepStream>, Status> {
+        let request = request.into_inner();
+        let search = &self.search;
+        let context = search.max_grep_context_lines;
+        let options = GrepOptions {
+            pattern: request.pattern,
+            fixed_string: request.fixed_string,
+            case_insensitive: request.case_insensitive,
+            before_context: request.before_context.min(context) as usize,
+            after_context: request.after_context.min(context) as usize,
+            max_matches: limit(
+                request.max_matches.into(),
+                search.default_grep_matches.into(),
+                search.max_grep_matches.into(),
+            ) as usize,
+            max_file_size_bytes: limit(
+                request.max_file_size_bytes,
+                search.default_grep_file_size_bytes,
+                search.max_grep_file_size_bytes,
+            ),
+            concurrency: search.grep_concurrency as usize,
+            max_scanned_entries: search.max_scanned_entries as usize,
+        };
+        let matches = self
+            .fs
+            .grep(&request.tenant, &request.path, options)
+            .await
+            .map_err(status)?;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(matches).map(|result| {
             result
-                .map(|entry| DirectoryEntry {
-                    path: entry.path,
-                    name: entry.name,
-                    kind: file_kind(entry.kind),
+                .map(|found| GrepMatch {
+                    path: found.path,
+                    line_number: found.line_number,
+                    line: found.line,
+                    before: found.before.into_iter().map(grep_line).collect(),
+                    after: found.after.into_iter().map(grep_line).collect(),
                 })
                 .map_err(status)
         });
@@ -382,12 +442,17 @@ impl PseudoFsApi for Service {
     #[allow(clippy::result_large_err)]
     async fn stream_file(
         &self,
-        request: Request<PathRequest>,
+        request: Request<StreamFileRequest>,
     ) -> Result<Response<Self::StreamFileStream>, Status> {
         let request = request.into_inner();
         let chunks = self
             .fs
-            .stream_chunks(&request.tenant, &request.path)
+            .stream_range(
+                &request.tenant,
+                &request.path,
+                request.offset,
+                request.length,
+            )
             .await
             .map_err(status)?;
         let stream = tokio_stream::wrappers::ReceiverStream::new(chunks)
@@ -459,6 +524,38 @@ fn durability(value: i32) -> Durability {
     }
 }
 
+/// Applies a request limit where zero means "use the default".
+fn limit(requested: u64, default: u64, max: u64) -> u64 {
+    if requested == 0 {
+        default
+    } else {
+        requested.min(max)
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn directory_stream(
+    entries: tokio::sync::mpsc::Receiver<pseudofs::Result<pseudofs::DirectoryEntry>>,
+) -> DirectoryStream {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(entries).map(|result| {
+        result
+            .map(|entry| DirectoryEntry {
+                path: entry.path,
+                name: entry.name,
+                kind: file_kind(entry.kind),
+            })
+            .map_err(status)
+    });
+    Box::pin(stream)
+}
+
+fn grep_line(line: pseudofs::GrepLine) -> GrepLine {
+    GrepLine {
+        line_number: line.line_number,
+        text: line.text,
+    }
+}
+
 fn file_kind(kind: pseudofs::FileKind) -> i32 {
     match kind {
         pseudofs::FileKind::File => FileKind::File as i32,
@@ -478,7 +575,10 @@ fn status(error: Error) -> Status {
             path.as_str(),
         ),
         Error::InvalidPath(path) => (Code::InvalidArgument, "invalid_path", path.as_str()),
+        Error::InvalidPattern(_) => (Code::InvalidArgument, "invalid_pattern", ""),
         Error::InvalidMode(mode) => (Code::InvalidArgument, "invalid_mode", mode.as_str()),
+        Error::ResourceExhausted(_) => (Code::ResourceExhausted, "resource_exhausted", ""),
+        Error::Blob(_) => (Code::Unavailable, "blob", ""),
         Error::InvalidUtf8(path) => (Code::DataLoss, "invalid_utf8", path.as_str()),
         Error::Conflict(path) => (Code::Aborted, "conflict", path.as_str()),
         Error::RootOperation => (Code::PermissionDenied, "root_operation", "/"),
@@ -497,7 +597,8 @@ mod tests {
     use common::storage::config::StorageConfig;
     use proto::pseudofs::v1::pseudo_fs_client::PseudoFsClient;
     use proto::pseudofs::v1::{
-        PathRequest, WriteBytesRequest, WriteFileRequest, WriteFileStart, write_file_request,
+        GlobRequest, GrepRequest, PathRequest, StreamFileRequest, WriteBytesRequest,
+        WriteFileRequest, WriteFileStart, WriteTextRequest, write_file_request,
     };
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -505,15 +606,33 @@ mod tests {
 
     use super::*;
 
-    async fn test_server() -> (String, tokio::task::JoinHandle<()>) {
+    struct TestServer {
+        endpoint: String,
+        handle: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn test_server(max_unary_file_size_bytes: u64) -> TestServer {
+        let dir = tempfile::tempdir().unwrap();
         let fs = PseudoFs::open(pseudofs::Config {
             storage: StorageConfig::InMemory,
+            blobs: pseudofs::BlobConfig {
+                local_path: dir.path().display().to_string(),
+                ..pseudofs::BlobConfig::default()
+            },
             chunk_size_bytes: 3,
+            inline_threshold_bytes: 4,
             max_file_size_bytes: 1024,
             max_append_generations: 4,
+            ..pseudofs::Config::default()
         })
         .await
         .unwrap();
+        let search = SearchLimits {
+            default_glob_results: 2,
+            max_glob_results: 3,
+            ..SearchLimits::default()
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -522,18 +641,50 @@ mod tests {
             .await;
         let server = Server::builder()
             .add_service(health_service)
-            .add_service(Service::new(fs, 4).into_server(1024, 1024))
+            .add_service(
+                Service::new(fs, max_unary_file_size_bytes, search).into_server(1024, 1024),
+            )
             .serve_with_incoming(TcpListenerStream::new(listener));
         let handle = tokio::spawn(async move {
             server.await.unwrap();
         });
-        (format!("http://{address}"), handle)
+        TestServer {
+            endpoint: format!("http://{address}"),
+            handle,
+            _dir: dir,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn read_stream(
+        client: &mut PseudoFsClient<tonic::transport::Channel>,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<Vec<u8>, Status> {
+        let mut stream = client
+            .stream_file(StreamFileRequest {
+                path: "/download.bin".to_owned(),
+                tenant: "tenant-a".to_owned(),
+                offset,
+                length,
+            })
+            .await?
+            .into_inner();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            bytes.extend_from_slice(&chunk.data);
+        }
+        Ok(bytes)
     }
 
     #[tokio::test]
     async fn streams_writes_and_reads_over_grpc() {
         const TENANT: &str = "tenant-a";
-        let (endpoint, server) = test_server().await;
+        let TestServer {
+            endpoint,
+            handle: server,
+            _dir,
+        } = test_server(4).await;
         let mut client = PseudoFsClient::connect(endpoint.clone()).await.unwrap();
         let messages = vec![
             WriteFileRequest {
@@ -561,19 +712,10 @@ mod tests {
             .into_inner();
         assert_eq!(result.size, 6);
 
-        let mut stream = client
-            .stream_file(PathRequest {
-                path: "/download.bin".to_owned(),
-                tenant: TENANT.to_owned(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.message().await.unwrap() {
-            bytes.extend_from_slice(&chunk.data);
-        }
-        assert_eq!(bytes, b"abcdef");
+        assert_eq!(read_stream(&mut client, 0, None).await.unwrap(), b"abcdef");
+        assert_eq!(read_stream(&mut client, 2, Some(3)).await.unwrap(), b"cde");
+        assert_eq!(read_stream(&mut client, 4, None).await.unwrap(), b"ef");
+        assert!(read_stream(&mut client, 10, None).await.unwrap().is_empty());
 
         let error = client
             .read_bytes(PathRequest {
@@ -683,6 +825,101 @@ mod tests {
         assert_eq!(
             response.status,
             tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn globs_and_greps_over_grpc() {
+        const TENANT: &str = "tenant-a";
+        let TestServer {
+            endpoint,
+            handle: server,
+            _dir,
+        } = test_server(512).await;
+        let mut client = PseudoFsClient::connect(endpoint).await.unwrap();
+        for (path, value) in [
+            ("/dir/a/subfolder/one.txt", "alpha\nneedle one\nomega\n"),
+            ("/dir/b/c/subfolder/two.txt", "NEEDLE two\n"),
+            ("/dir/d/subfolder/three.txt", "none\n"),
+            ("/dir/e/subfolder/four.txt", "needle four\n"),
+            ("/dir/other/five.txt", "needle five\n"),
+        ] {
+            client
+                .write_text(WriteTextRequest {
+                    path: path.to_owned(),
+                    value: value.to_owned(),
+                    durability: proto::pseudofs::v1::Durability::Applied as i32,
+                    tenant: TENANT.to_owned(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let glob = |max_results| GlobRequest {
+            tenant: TENANT.to_owned(),
+            pattern: "/dir/**/subfolder".to_owned(),
+            max_results,
+        };
+        let mut paths = Vec::new();
+        let mut entries = client.glob(glob(0)).await.unwrap().into_inner();
+        while let Some(entry) = entries.message().await.unwrap() {
+            assert_eq!(entry.kind, FileKind::Directory as i32);
+            paths.push(entry.path);
+        }
+        assert_eq!(paths, vec!["/dir/a/subfolder", "/dir/b/c/subfolder"]);
+        let mut count = 0;
+        let mut entries = client.glob(glob(100)).await.unwrap().into_inner();
+        while entries.message().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        let mut matches = client
+            .grep(GrepRequest {
+                tenant: TENANT.to_owned(),
+                path: "/dir/**/subfolder/*.txt".to_owned(),
+                pattern: "needle".to_owned(),
+                case_insensitive: true,
+                before_context: 1,
+                after_context: 1,
+                ..GrepRequest::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut found = Vec::new();
+        while let Some(found_match) = matches.message().await.unwrap() {
+            found.push(found_match);
+        }
+        let summary: Vec<_> = found
+            .iter()
+            .map(|found| (found.path.as_str(), found.line_number, found.line.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("/dir/a/subfolder/one.txt", 2, "needle one"),
+                ("/dir/b/c/subfolder/two.txt", 1, "NEEDLE two"),
+                ("/dir/e/subfolder/four.txt", 1, "needle four"),
+            ]
+        );
+        assert_eq!(found[0].before[0].text, "alpha");
+        assert_eq!(found[0].after[0].text, "omega");
+
+        let error = client
+            .grep(GrepRequest {
+                tenant: TENANT.to_owned(),
+                path: "/dir".to_owned(),
+                pattern: "(".to_owned(),
+                ..GrepRequest::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            ErrorDetail::decode(error.details()).unwrap().kind,
+            "invalid_pattern"
         );
         server.abort();
     }

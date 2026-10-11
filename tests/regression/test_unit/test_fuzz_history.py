@@ -274,6 +274,7 @@ def test_rebuild_of_an_empty_directory_says_no_runs(tmp_path: Path) -> None:
         "history/logs/README.md",
         "history/metrics/README.md",
         "history/traces/README.md",
+        "history/pseudofs/README.md",
     }
     assert "No runs recorded yet." in (tmp_path / "README.md").read_text()
     assert json.loads((tmp_path / "index.json").read_text())["entries"] == []
@@ -459,9 +460,11 @@ def test_bench_continues_after_a_failure(
         ("metrics", "prometheus"),
         ("metrics", "mimir"),
         ("traces", None),
+        ("pseudofs", None),
     ]
     assert [outcome.status for outcome in outcomes] == [
         "failed",
+        "passed",
         "passed",
         "passed",
         "passed",

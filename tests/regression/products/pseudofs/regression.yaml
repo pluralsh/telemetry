@@ -1,0 +1,42 @@
+# Small thresholds so fuzzed files cross the inline/blob boundary, the blob
+# cache evicts and re-reads from MinIO, and appends compact. Limits must match
+# IMPL_CONFIGS["regression"] in harness/fuzz/pseudofs.py.
+listener: 0.0.0.0:9093
+
+filesystem:
+  storage:
+    type: SlateDb
+    path: pseudofs
+    object_store:
+      type: Aws
+      region: us-east-1
+      bucket: pseudofs-regression
+      endpoint: http://minio:9000
+      allow_http: true
+    block_cache: { type: FoyerMemory, capacity: 67108864 }
+    meta_cache: { type: FoyerMemory, capacity: 16777216 }
+  metastore_wal_path: /var/lib/pseudofs/wal
+  blobs:
+    local_path: /var/lib/pseudofs/blobs
+    cache_capacity_bytes: 67108864
+    upload_concurrency: 2
+    gc_grace_seconds: 2
+  inline_threshold_bytes: 4096
+  chunk_size_bytes: 65536
+  max_file_size_bytes: 268435456
+  max_append_generations: 8
+
+max_unary_file_size_bytes: 8388608
+max_decoding_message_bytes: 16777216
+max_encoding_message_bytes: 16777216
+
+search:
+  default_glob_results: 1000
+  max_glob_results: 10000
+  default_grep_matches: 100
+  max_grep_matches: 1000
+  max_grep_context_lines: 100
+  default_grep_file_size_bytes: 16777216
+  max_grep_file_size_bytes: 67108864
+  grep_concurrency: 4
+  max_scanned_entries: 50000

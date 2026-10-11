@@ -17,6 +17,7 @@ Newest run per product and variant. Latency is per answered query; CPU is mean c
 | metrics | 2026-10-08 03:24Z | `97bdc82e99` (dirty) | impl_config=production, oracle=mimir, storage=s3, network=compose, pinned | **FAILED** (2) | 30m | 15604 | 14 | 328 | 2.7 / 4.9 | 112.2 / 178.6 | 0.62x | 0.10 / 0.15 | 996 / 466 | [2026-10-08T0324Z-97bdc82e99-dirty-53205f4d](history/metrics/2026-10-08T0324Z-97bdc82e99-dirty-53205f4d.md) |
 | metrics | 2026-10-08 03:54Z | `97bdc82e99` (dirty) | impl_config=production, oracle=mimir-blocks, storage=s3, scenario=historical, network=compose, pinned | **FAILED** (1) | 30m | 3647 | 1 | 66 | 2.3 / 27.3 | 55.2 / 341.7 | 0.10x | 0.03 / 0.53 | 379 / 1271 | [2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1](history/metrics/2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1.md) |
 | metrics | 2026-10-08 02:54Z | `97bdc82e99` (dirty) | impl_config=production, oracle=prometheus, storage=s3, network=compose, pinned | **FAILED** (1) | 30m | 17201 | 1 | 314 | 2.4 / 1.6 | 92.2 / 134.9 | 1.30x | 0.10 / 0.10 | 751 / 336 | [2026-10-08T0254Z-97bdc82e99-dirty-deb2606f](history/metrics/2026-10-08T0254Z-97bdc82e99-dirty-deb2606f.md) |
+| pseudofs | 2026-10-11 17:51Z | `b03cb4f7ea` (dirty) | concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned | passed | 10m | 6417 | 0 | 0 | 1.5 / - | 258.6 / - | - | 0.28 / - | 281 / - | [2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4](history/pseudofs/2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4.md) |
 | traces | 2026-10-08 03:24Z | `97bdc82e99` (dirty) | impl_config=production, oracle=tempo, network=compose, pinned | passed | 30m | 14064 | 0 | 2418 | 3.1 / 37.3 | 61.9 / 268.5 | 0.12x | 0.09 / 0.70 | 468 / 1112 | [2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e](history/traces/2026-10-08T0324Z-97bdc82e99-dirty-f434ef5e.md) |
 | traces | 2026-10-08 04:24Z | `0b54fe965a` | impl_config=production, oracle=tempo-s3, scenario=historical, network=compose, pinned | **FAILED** (1) | 30m | 3461 | 1 | 368 | 5.9 / 409.6 | 51.8 / 796.9 | 0.02x | 0.03 / 0.15 | 125 / 492 | [2026-10-08T0424Z-0b54fe965a-64799c3c](history/traces/2026-10-08T0424Z-0b54fe965a-64799c3c.md) |
 
@@ -40,6 +41,14 @@ Newest run per product and variant. Latency is per answered query; CPU is mean c
 | 2026-10-08 03:54Z | `97bdc82e99` (dirty) | impl_config=production, oracle=mimir-blocks, storage=s3, scenario=historical, network=compose, pinned | **FAILED** (1) | 30m | 3647 | 1 | 66 | 2.3 / 27.3 | 55.2 / 341.7 | 0.10x | 0.03 / 0.53 | 379 / 1271 | [2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1](history/metrics/2026-10-08T0354Z-97bdc82e99-dirty-0e4b98d1.md) |
 | 2026-10-08 03:24Z | `97bdc82e99` (dirty) | impl_config=production, oracle=mimir, storage=s3, network=compose, pinned | **FAILED** (2) | 30m | 15604 | 14 | 328 | 2.7 / 4.9 | 112.2 / 178.6 | 0.62x | 0.10 / 0.15 | 996 / 466 | [2026-10-08T0324Z-97bdc82e99-dirty-53205f4d](history/metrics/2026-10-08T0324Z-97bdc82e99-dirty-53205f4d.md) |
 | 2026-10-08 02:54Z | `97bdc82e99` (dirty) | impl_config=production, oracle=prometheus, storage=s3, network=compose, pinned | **FAILED** (1) | 30m | 17201 | 1 | 314 | 2.4 / 1.6 | 92.2 / 134.9 | 1.30x | 0.10 / 0.10 | 751 / 336 | [2026-10-08T0254Z-97bdc82e99-dirty-deb2606f](history/metrics/2026-10-08T0254Z-97bdc82e99-dirty-deb2606f.md) |
+
+## pseudofs
+
+[Full history](history/pseudofs/README.md) (1 run).
+
+| started | commit | variant | status | budget | cases | mismatch | non-match | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 | CPU cores impl / oracle | memory p95 MiB impl / oracle | entry |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-11 17:51Z | `b03cb4f7ea` (dirty) | concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned | passed | 10m | 6417 | 0 | 0 | 1.5 / - | 258.6 / - | - | 0.28 / - | 281 / - | [2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4](history/pseudofs/2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4.md) |
 
 ## traces
 

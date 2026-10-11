@@ -52,10 +52,54 @@ spec:
             properties:
               config:
                 properties:
+                  blobs:
+                    default: {}
+                    description: |-
+                      PseudoFSBlobsSpec configures file content stored outside the metastore.
+                      Blobs are kept on the data volume until uploaded and then cached there, and
+                      are uploaded to the storage object store with the same credentials.
+                    properties:
+                      cacheCapacityBytes:
+                        default: 4294967296
+                        description: |-
+                          CacheCapacityBytes bounds blob usage of the data volume, including
+                          blobs awaiting upload. Keep it well below the volume size.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      gcGraceSeconds:
+                        default: 300
+                        description: |-
+                          GCGraceSeconds is how long unreferenced blobs are kept so in-flight
+                          reads of replaced files can finish.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      path:
+                        description: |-
+                          Path is the object-store prefix for blobs. Defaults to
+                          "<storage.path>-blobs".
+                        minLength: 1
+                        type: string
+                      uploadConcurrency:
+                        default: 4
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                   chunkSizeBytes:
                     default: 1048576
                     format: int64
                     minimum: 1
+                    type: integer
+                  inlineThresholdBytes:
+                    default: 65536
+                    description: |-
+                      InlineThresholdBytes is the largest write stored in the metastore
+                      rather than as a blob.
+                    format: int64
+                    maximum: 16777216
+                    minimum: 0
                     type: integer
                   maxAppendGenerations:
                     default: 64
@@ -82,6 +126,73 @@ spec:
                     format: int64
                     minimum: 1
                     type: integer
+                  search:
+                    default: {}
+                    description: |-
+                      PseudoFSSearchSpec bounds Glob and Grep requests. Requests that leave a
+                      limit unset use its default; larger requested values are capped.
+                    properties:
+                      defaultGlobResults:
+                        default: 1000
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      defaultGrepFileSizeBytes:
+                        default: 16777216
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      defaultGrepMatches:
+                        default: 100
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      grepConcurrency:
+                        default: 8
+                        description: GrepConcurrency is how many files one Grep request
+                          searches at once.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxGlobResults:
+                        default: 10000
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      maxGrepContextLines:
+                        default: 100
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      maxGrepFileSizeBytes:
+                        default: 67108864
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      maxGrepMatches:
+                        default: 1000
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      maxScannedEntries:
+                        default: 1000000
+                        description: |-
+                          MaxScannedEntries is how many directory entries one Glob or Grep walk
+                          may read before failing with RESOURCE_EXHAUSTED.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    type: object
+                    x-kubernetes-validations:
+                    - message: defaultGlobResults must not exceed maxGlobResults
+                      rule: '!has(self.defaultGlobResults) || !has(self.maxGlobResults)
+                        || self.defaultGlobResults <= self.maxGlobResults'
+                    - message: defaultGrepMatches must not exceed maxGrepMatches
+                      rule: '!has(self.defaultGrepMatches) || !has(self.maxGrepMatches)
+                        || self.defaultGrepMatches <= self.maxGrepMatches'
+                    - message: defaultGrepFileSizeBytes must not exceed maxGrepFileSizeBytes
+                      rule: '!has(self.defaultGrepFileSizeBytes) || !has(self.maxGrepFileSizeBytes)
+                        || self.defaultGrepFileSizeBytes <= self.maxGrepFileSizeBytes'
                   storage:
                     default:
                       path: pseudofs

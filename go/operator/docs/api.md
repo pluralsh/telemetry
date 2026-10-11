@@ -831,6 +831,27 @@ _Appears in:_
 | `spec` _[PseudoFSSpec](#pseudofsspec)_ |  |  |  |
 
 
+#### PseudoFSBlobsSpec
+
+
+
+PseudoFSBlobsSpec configures file content stored outside the metastore.
+Blobs are kept on the data volume until uploaded and then cached there, and
+are uploaded to the storage object store with the same credentials.
+
+
+
+_Appears in:_
+- [PseudoFSConfigSpec](#pseudofsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `path` _string_ | Path is the object-store prefix for blobs. Defaults to<br />"<storage.path>-blobs". |  | MinLength: 1 <br /> |
+| `cacheCapacityBytes` _integer_ | CacheCapacityBytes bounds blob usage of the data volume, including<br />blobs awaiting upload. Keep it well below the volume size. | 4294967296 | Minimum: 1 <br /> |
+| `uploadConcurrency` _integer_ |  | 4 | Minimum: 1 <br /> |
+| `gcGraceSeconds` _integer_ | GCGraceSeconds is how long unreferenced blobs are kept so in-flight<br />reads of replaced files can finish. | 300 | Minimum: 0 <br /> |
+
+
 #### PseudoFSConfigSpec
 
 
@@ -851,6 +872,34 @@ _Appears in:_
 | `maxUnaryFileSizeBytes` _integer_ |  | 8388608 | Minimum: 1 <br /> |
 | `maxDecodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
 | `maxEncodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
+| `inlineThresholdBytes` _integer_ | InlineThresholdBytes is the largest write stored in the metastore<br />rather than as a blob. | 65536 | Maximum: 1.6777216e+07 <br />Minimum: 0 <br /> |
+| `blobs` _[PseudoFSBlobsSpec](#pseudofsblobsspec)_ |  | \{  \} |  |
+| `search` _[PseudoFSSearchSpec](#pseudofssearchspec)_ |  | \{  \} |  |
+
+
+#### PseudoFSSearchSpec
+
+
+
+PseudoFSSearchSpec bounds Glob and Grep requests. Requests that leave a
+limit unset use its default; larger requested values are capped.
+
+
+
+_Appears in:_
+- [PseudoFSConfigSpec](#pseudofsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `defaultGlobResults` _integer_ |  | 1000 | Minimum: 1 <br /> |
+| `maxGlobResults` _integer_ |  | 10000 | Minimum: 1 <br /> |
+| `defaultGrepMatches` _integer_ |  | 100 | Minimum: 1 <br /> |
+| `maxGrepMatches` _integer_ |  | 1000 | Minimum: 1 <br /> |
+| `maxGrepContextLines` _integer_ |  | 100 | Minimum: 0 <br /> |
+| `defaultGrepFileSizeBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
+| `maxGrepFileSizeBytes` _integer_ |  | 67108864 | Minimum: 1 <br /> |
+| `grepConcurrency` _integer_ | GrepConcurrency is how many files one Grep request searches at once. | 8 | Minimum: 1 <br /> |
+| `maxScannedEntries` _integer_ | MaxScannedEntries is how many directory entries one Glob or Grep walk<br />may read before failing with RESOURCE_EXHAUSTED. | 1000000 | Minimum: 1 <br /> |
 
 
 #### PseudoFSServiceSpec

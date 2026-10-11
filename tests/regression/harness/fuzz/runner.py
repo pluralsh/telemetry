@@ -19,7 +19,7 @@ from .history.environment import collect_docker
 from .rand import derive
 from .recorder import CaseRecord, IngestRecord, Recorder, RoundRecord, Summary
 from .resources import DockerApi, ResourceSampler, docker_socket
-from .transport import SUCCESS, Exchange, Request, Transport
+from .transport import SUCCESS, Exchange, Handler, Request, Transport
 
 
 class Mismatch(Exception):
@@ -43,6 +43,8 @@ class Case:
     # Returns why an implementation error is a documented oracle quirk when
     # the oracle answered; the case is then inconclusive instead of failing.
     oracle_quirk: Callable[[Exchange, Exchange], str | None] | None = None
+    # Mutating cases are never re-sent to recheck a mismatch or a slow answer.
+    idempotent: bool = True
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,9 @@ class FuzzProduct(ABC):
     # Compose service -> `impl` or `oracle` for resource sampling; unlisted
     # services such as object storage count as `shared`.
     resource_roles: dict[str, str] = {}
+    # False when the oracle is an in-process model whose latency means nothing,
+    # so reports leave out oracle latency and ratios.
+    reference_latency: bool = True
     oracle_read: Endpoint
     oracle_write: Endpoint
     impl_read: Endpoint
@@ -105,6 +110,10 @@ class FuzzProduct(ABC):
 
     def floor_urls(self) -> dict[str, str]:
         """Compose service -> a trivial URL (readiness) timed every round."""
+        return {}
+
+    def handlers(self) -> dict[str, Handler]:
+        """URL scheme -> sender for this product's non-HTTP endpoints."""
         return {}
 
     def describe(self) -> dict[str, object]:
@@ -179,11 +188,18 @@ class Runner:
         self.product = product
         self.config = config
         self.sampler = sampler
-        self.transport = Transport(timeout_s=config.request_timeout_s)
+        self.transport = Transport(
+            timeout_s=config.request_timeout_s, handlers=product.handlers()
+        )
         self.budget = Budget(config.duration_s)
         # Leave room to write the report even when a request is mid-flight.
         self.reserve = min(30.0, max(2.0, config.duration_s * 0.05))
-        self.recorder = Recorder(config, product.describe(), layout=layout)
+        self.recorder = Recorder(
+            config,
+            product.describe(),
+            layout=layout,
+            reference_latency=product.reference_latency,
+        )
         self.order = derive(config.seed, "order")
         self._last_progress = time.monotonic()
 
@@ -315,14 +331,15 @@ class Runner:
         oracle, impl = self._pair(case)
         outcome, detail = classify(case, oracle, impl)
         recheck = None
-        if outcome == "mismatch" and self.config.recheck:
+        recheck_allowed = self.config.recheck and case.idempotent
+        if outcome == "mismatch" and recheck_allowed:
             oracle_again, impl_again = self._pair(case)
             recheck = (oracle_again, impl_again)
             if not _stable(case, oracle, oracle_again):
                 outcome = "unstable_oracle"
             elif not _stable(case, impl, impl_again):
                 outcome = "unstable_impl"
-        elif self.config.recheck and _slow(oracle, impl):
+        elif recheck_allowed and self.product.reference_latency and _slow(oracle, impl):
             # Tells transient stalls apart from consistently slow queries.
             recheck = self._pair(case)
         self.recorder.record_case(

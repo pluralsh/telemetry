@@ -4327,13 +4327,16 @@ dependencies = [
  "bytes",
  "common",
  "futures",
+ "memchr",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "slatedb",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

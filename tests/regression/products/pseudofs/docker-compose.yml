@@ -1,0 +1,66 @@
+name: pseudofs-regression
+
+services:
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    command: server /data --address ${MINIO_ADDRESS:-:9000} --console-address :9001
+    environment:
+      MINIO_ROOT_USER: pseudofs
+      MINIO_ROOT_PASSWORD: pseudofs-regression-secret
+    volumes: ["minio-data:/data"]
+
+  # Historical scenario only: owns MinIO's address inside MinIO's network
+  # namespace and forwards to MinIO on :9010 with a fixed first-byte delay.
+  minio-latency:
+    profiles: ["historical"]
+    image: python:3.13-slim
+    network_mode: service:minio
+    command:
+      - python
+      - /proxy.py
+      - --listen=9000
+      - --upstream=9010
+      - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+    volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
+    depends_on: [minio]
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+    environment:
+      MC_HOST_local: http://pseudofs:pseudofs-regression-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_started
+    command: ["mb", "--ignore-existing", "local/pseudofs-regression"]
+    restart: on-failure
+
+  # `PSEUDOFS_CONFIG` picks regression.yaml (small thresholds and cache, so
+  # tests cross inline/blob, eviction, and append-compaction boundaries),
+  # production.yaml (the operator's defaults), or local.yaml (no MinIO).
+  pseudofs:
+    # CI preloads this tag from a cached buildx build; see fuzz.yml.
+    image: telemetry-regression/plural-pseudofs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/pseudofs-server/Dockerfile
+    # The data volume is created root-owned.
+    user: "0:0"
+    # Retries until minio-init has created the bucket; without a dependency
+    # so local.yaml can run without MinIO.
+    restart: on-failure
+    command: ["--config", "/app/regression/pseudofs.yaml"]
+    environment:
+      AWS_ACCESS_KEY_ID: pseudofs
+      AWS_SECRET_ACCESS_KEY: pseudofs-regression-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      RUST_LOG: ${PSEUDOFS_LOG:-info}
+    volumes:
+      - ./${PSEUDOFS_CONFIG:-regression.yaml}:/app/regression/pseudofs.yaml:ro
+      - pseudofs-data:/var/lib/pseudofs
+    ports: ["19093:9093"]
+
+volumes:
+  minio-data:
+  pseudofs-data:

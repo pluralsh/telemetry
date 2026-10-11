@@ -33,6 +33,77 @@ type PseudoFSConfigSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=16777216
 	MaxEncodingMessageBytes *int64 `json:"maxEncodingMessageBytes,omitempty"`
+	// InlineThresholdBytes is the largest write stored in the metastore
+	// rather than as a blob.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=16777216
+	// +kubebuilder:default=65536
+	InlineThresholdBytes *int64 `json:"inlineThresholdBytes,omitempty"`
+	// +kubebuilder:default={}
+	Blobs PseudoFSBlobsSpec `json:"blobs,omitempty"`
+	// +kubebuilder:default={}
+	Search PseudoFSSearchSpec `json:"search,omitempty"`
+}
+
+// PseudoFSBlobsSpec configures file content stored outside the metastore.
+// Blobs are kept on the data volume until uploaded and then cached there, and
+// are uploaded to the storage object store with the same credentials.
+type PseudoFSBlobsSpec struct {
+	// Path is the object-store prefix for blobs. Defaults to
+	// "<storage.path>-blobs".
+	// +kubebuilder:validation:MinLength=1
+	Path string `json:"path,omitempty"`
+	// CacheCapacityBytes bounds blob usage of the data volume, including
+	// blobs awaiting upload. Keep it well below the volume size.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=4294967296
+	CacheCapacityBytes *int64 `json:"cacheCapacityBytes,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=4
+	UploadConcurrency *int32 `json:"uploadConcurrency,omitempty"`
+	// GCGraceSeconds is how long unreferenced blobs are kept so in-flight
+	// reads of replaced files can finish.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=300
+	GCGraceSeconds *int64 `json:"gcGraceSeconds,omitempty"`
+}
+
+// PseudoFSSearchSpec bounds Glob and Grep requests. Requests that leave a
+// limit unset use its default; larger requested values are capped.
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultGlobResults) || !has(self.maxGlobResults) || self.defaultGlobResults <= self.maxGlobResults",message="defaultGlobResults must not exceed maxGlobResults"
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultGrepMatches) || !has(self.maxGrepMatches) || self.defaultGrepMatches <= self.maxGrepMatches",message="defaultGrepMatches must not exceed maxGrepMatches"
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultGrepFileSizeBytes) || !has(self.maxGrepFileSizeBytes) || self.defaultGrepFileSizeBytes <= self.maxGrepFileSizeBytes",message="defaultGrepFileSizeBytes must not exceed maxGrepFileSizeBytes"
+type PseudoFSSearchSpec struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1000
+	DefaultGlobResults *int64 `json:"defaultGlobResults,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=10000
+	MaxGlobResults *int64 `json:"maxGlobResults,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=100
+	DefaultGrepMatches *int64 `json:"defaultGrepMatches,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1000
+	MaxGrepMatches *int64 `json:"maxGrepMatches,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=100
+	MaxGrepContextLines *int64 `json:"maxGrepContextLines,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=16777216
+	DefaultGrepFileSizeBytes *int64 `json:"defaultGrepFileSizeBytes,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=67108864
+	MaxGrepFileSizeBytes *int64 `json:"maxGrepFileSizeBytes,omitempty"`
+	// GrepConcurrency is how many files one Grep request searches at once.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=8
+	GrepConcurrency *int32 `json:"grepConcurrency,omitempty"`
+	// MaxScannedEntries is how many directory entries one Glob or Grep walk
+	// may read before failing with RESOURCE_EXHAUSTED.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1000000
+	MaxScannedEntries *int64 `json:"maxScannedEntries,omitempty"`
 }
 
 type PseudoFSServiceSpec struct {

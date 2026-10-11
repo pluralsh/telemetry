@@ -21,6 +21,8 @@ pub enum Error {
     DirectoryNotEmpty(String),
     #[error("invalid path: {0}")]
     InvalidPath(String),
+    #[error("invalid pattern: {0}")]
+    InvalidPattern(String),
     #[error("invalid open mode: '{0}'")]
     InvalidMode(String),
     #[error("invalid UTF-8 in file '{0}'")]
@@ -29,8 +31,24 @@ pub enum Error {
     Conflict(String),
     #[error("operation is not permitted on the root directory")]
     RootOperation,
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
     #[error("corrupt filesystem: {0}")]
     Corrupt(String),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("blob store error: {0}")]
+    Blob(String),
+}
+
+impl From<slatedb::object_store::Error> for Error {
+    fn from(error: slatedb::object_store::Error) -> Self {
+        Self::Blob(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Blob(error.to_string())
+    }
 }
