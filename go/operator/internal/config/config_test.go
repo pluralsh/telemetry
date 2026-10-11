@@ -523,8 +523,8 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 				MaxAppendGenerations: &maxAppendGenerations, MaxUnaryFileSizeBytes: &maxUnaryFileSize,
 				InlineThresholdBytes: lo.ToPtr(int64(4096)),
 				Blobs: telemetryv1alpha1.PseudoFSBlobsSpec{
-					Path: "files-blobs", CacheCapacityBytes: lo.ToPtr(int64(1073741824)),
-					UploadConcurrency: lo.ToPtr(int32(2)), GCGraceSeconds: lo.ToPtr(int64(60)),
+					CacheCapacityBytes: lo.ToPtr(int64(1073741824)),
+					UploadConcurrency:  lo.ToPtr(int32(2)), GCGraceSeconds: lo.ToPtr(int64(60)),
 				},
 				Search: telemetryv1alpha1.PseudoFSSearchSpec{
 					GrepConcurrency: lo.ToPtr(int32(16)), MaxScannedEntries: lo.ToPtr(int64(5000)),
@@ -545,6 +545,7 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 		"path: pseudofs",
 		"path: /var/lib/pseudofs/data",
 		"disk_path: /var/cache/pseudofs",
+		"write_policy: WriteOnEviction",
 		"chunk_size_bytes: 2097152",
 		"max_file_size_bytes: 2147483648",
 		"max_append_generations: 32",
@@ -552,7 +553,6 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 		"max_decoding_message_bytes: 16777216",
 		"max_encoding_message_bytes: 16777216",
 		"local_path: /var/lib/pseudofs/blobs",
-		"path: files-blobs",
 		"cache_capacity_bytes: 1073741824",
 		"upload_concurrency: 2",
 		"gc_grace_seconds: 60",
@@ -561,6 +561,7 @@ func TestRenderPseudoFSConfig(t *testing.T) {
 		"max_scanned_entries: 5000",
 		"default_glob_results: 1000",
 		"max_grep_file_size_bytes: 67108864",
+		"max_grep_seconds: 30",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Errorf("rendered PseudoFS config missing %q:\n%s", expected, rendered)

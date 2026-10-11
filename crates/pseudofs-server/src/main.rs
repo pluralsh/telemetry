@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let cancellation = tokio_util::sync::CancellationToken::new();
     let shutdown = cancellation.clone();
     let address = config.listener;
+    tracing::info!(%address, "pseudofs serving");
     let server = Server::builder()
         .add_service(health_service)
         .add_service(reflection)

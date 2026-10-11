@@ -12,8 +12,8 @@
       "readme": "history/metrics/README.md"
     },
     "pseudofs": {
-      "runs": 1,
-      "latest": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
+      "runs": 3,
+      "latest": "2026-10-11T2016Z-eecaba2c39-dirty-170204da",
       "readme": "history/pseudofs/README.md"
     },
     "traces": {
@@ -602,6 +602,142 @@
         "shared": {
           "cpu_cores_mean": 0.179,
           "memory_mib_p95": 417.4
+        }
+      }
+    },
+    {
+      "name": "2026-10-11T1902Z-eecaba2c39-dirty-170204da",
+      "product": "pseudofs",
+      "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-170204da, pinned",
+      "batch": null,
+      "started_at": "2026-10-11T19:02:51Z",
+      "finished_at": "2026-10-11T19:12:21Z",
+      "json": "history/pseudofs/2026-10-11T1902Z-eecaba2c39-dirty-170204da.json",
+      "markdown": "history/pseudofs/2026-10-11T1902Z-eecaba2c39-dirty-170204da.md",
+      "git": {
+        "commit": "eecaba2c391d4bc6c0bff8dee164babf4376ba82",
+        "short": "eecaba2c39",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": "mbp-local",
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 600.0,
+        "seed": 386008282,
+        "scale": 1.0
+      },
+      "settings": {
+        "concurrency": 8,
+        "crash_every": 4,
+        "impl_config": "production",
+        "max_file_bytes": 100663296,
+        "race_rate": 0.5,
+        "tenant": "fuzz-170204da"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 71,
+      "cases": 6697,
+      "mismatch": 0,
+      "non_match": 0,
+      "outcomes": {
+        "match": 6697
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 1.488,
+          "p90": 28.057,
+          "p99": 237.978
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "ratio_p50": null
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.422,
+          "memory_mib_p95": 156.3
+        },
+        "shared": {
+          "cpu_cores_mean": 0.151,
+          "memory_mib_p95": 403.9
+        }
+      }
+    },
+    {
+      "name": "2026-10-11T2016Z-eecaba2c39-dirty-170204da",
+      "product": "pseudofs",
+      "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-170204da, pinned",
+      "batch": null,
+      "started_at": "2026-10-11T20:16:05Z",
+      "finished_at": "2026-10-11T20:25:36Z",
+      "json": "history/pseudofs/2026-10-11T2016Z-eecaba2c39-dirty-170204da.json",
+      "markdown": "history/pseudofs/2026-10-11T2016Z-eecaba2c39-dirty-170204da.md",
+      "git": {
+        "commit": "eecaba2c391d4bc6c0bff8dee164babf4376ba82",
+        "short": "eecaba2c39",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": "mbp-local",
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 600.0,
+        "seed": 386008282,
+        "scale": 1.0
+      },
+      "settings": {
+        "concurrency": 8,
+        "crash_every": 4,
+        "impl_config": "production",
+        "max_file_bytes": 100663296,
+        "race_rate": 0.5,
+        "tenant": "fuzz-170204da"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 76,
+      "cases": 7118,
+      "mismatch": 0,
+      "non_match": 0,
+      "outcomes": {
+        "match": 7118
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 1.326,
+          "p90": 23.528,
+          "p99": 189.024
+        },
+        "oracle_ms": {
+          "p50": null,
+          "p90": null,
+          "p99": null
+        },
+        "ratio_p50": null
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.283,
+          "memory_mib_p95": 157.2
+        },
+        "shared": {
+          "cpu_cores_mean": 0.193,
+          "memory_mib_p95": 444.0
         }
       }
     },

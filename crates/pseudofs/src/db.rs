@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,10 +19,10 @@ use slatedb::object_store::ObjectStore;
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use uuid::Uuid;
 
-use crate::blob::{BlobStore, StagedBlob};
+use crate::blob::{BlobDownload, BlobStore, Fetch, StagedBlob};
 use crate::codec::{
     PseudofsSegmentExtractor, TenantScope, blob_id_from_key, content_key, dead_blob_key,
     dead_blob_prefix, decode, directory_entry_key, directory_entry_name, directory_prefix, encode,
@@ -39,11 +39,20 @@ use crate::model::{
 mod upload;
 
 pub use upload::FileUpload;
+use upload::TailCompaction;
 
 const DELETE_BATCH_OPS: usize = 512;
 const MAX_GENERATION_CHAIN: u64 = 1_000_000;
 const BLOB_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const BLOB_SCAN_BATCH: usize = 1024;
+const MUTATION_LOCK_STRIPES: usize = 64;
+const COMPACTION_ATTEMPTS: usize = 3;
+/// Partial reads fill the cache in the background only for blobs at most
+/// this fraction of its capacity, so one large blob cannot flush it.
+const BACKGROUND_FILL_FRACTION: u64 = 8;
+const MAX_BACKGROUND_FILLS: usize = 4;
+const METASTORE_DIR: &str = "metastore";
+const BLOBS_DIR: &str = "blobs";
 
 #[derive(Clone)]
 pub struct PseudoFs {
@@ -54,8 +63,16 @@ pub(crate) struct Inner {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) blobs: BlobStore,
     pub(crate) config: Config,
-    mutation_lock: Mutex<()>,
+    /// Striped by tenant: tenants share no metadata keys, so only
+    /// mutations within one tenant need to serialize.
+    mutation_locks: Box<[Mutex<()>]>,
+    /// Group commit for [`PseudoFs::finish_durability`]: tickets taken after
+    /// each write is applied, and the highest ticket a finished flush covers.
+    applied_writes: AtomicU64,
+    flushed_writes: Mutex<u64>,
     compaction_tx: mpsc::Sender<CompactionRequest>,
+    compaction_queued: std::sync::Mutex<HashSet<CompactionRequest>>,
+    background_fills: Arc<Semaphore>,
     blob_notify: Arc<Notify>,
     /// Serializes maintenance passes so an upload and a deletion never run for
     /// the same blob at once.
@@ -63,6 +80,7 @@ pub(crate) struct Inner {
     closed: AtomicBool,
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct CompactionRequest {
     tenant: String,
     path: String,
@@ -73,7 +91,7 @@ impl PseudoFs {
         config.validate().map_err(Error::InvalidPath)?;
         let semantics =
             StorageSemantics::new().with_segment_extractor(PseudofsSegmentExtractor::shared());
-        let mut builder = StorageBuilder::new(&config.storage)
+        let mut builder = StorageBuilder::new(&metastore_storage(&config.storage))
             .await?
             .with_semantics(semantics);
         if let Some(path) = &config.metastore_wal_path {
@@ -98,14 +116,17 @@ impl PseudoFs {
                 storage,
                 blobs,
                 config,
-                mutation_lock: Mutex::new(()),
+                mutation_locks: (0..MUTATION_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+                applied_writes: AtomicU64::new(0),
+                flushed_writes: Mutex::new(0),
                 compaction_tx,
+                compaction_queued: std::sync::Mutex::default(),
+                background_fills: Arc::new(Semaphore::new(MAX_BACKGROUND_FILLS)),
                 blob_notify: Arc::clone(&blob_notify),
                 maintenance_lock: Mutex::new(()),
                 closed: AtomicBool::new(false),
             }),
         };
-        fs.cleanup_garbage().await?;
 
         let compactor = Arc::downgrade(&fs.inner);
         tokio::spawn(async move {
@@ -114,6 +135,11 @@ impl PseudoFs {
                     break;
                 };
                 let fs = PseudoFs { inner };
+                fs.inner
+                    .compaction_queued
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&request);
                 if let Err(error) = fs.compact_file(&request.tenant, &request.path).await {
                     tracing::warn!(path = %request.path, "append compaction failed: {error}");
                 }
@@ -259,7 +285,14 @@ impl PseudoFs {
         let fs = self.clone();
         tokio::spawn(async move {
             if let Err(error) = fs
-                .send_content(snapshot, scope, &generations, offset..end, &sender)
+                .send_content(
+                    snapshot,
+                    scope,
+                    &generations,
+                    offset..end,
+                    &sender,
+                    Caching::Fill,
+                )
                 .await
             {
                 let _ = sender.send(Err(error)).await;
@@ -352,7 +385,7 @@ impl PseudoFs {
                 Err(Error::AlreadyExists(path))
             };
         }
-        let _guard = self.inner.mutation_lock.lock().await;
+        let _guard = self.mutation_guard(scope).await;
         if let Ok(inode) = self.resolve_from_storage(tenant, scope, &path).await {
             return if inode.kind == FileKind::Directory && exist_ok {
                 Ok(())
@@ -391,7 +424,7 @@ impl PseudoFs {
         if path == "/" {
             return Err(Error::RootOperation);
         }
-        let _guard = self.inner.mutation_lock.lock().await;
+        let _guard = self.mutation_guard(scope).await;
         let inode = self.resolve_from_storage(tenant, scope, &path).await?;
         if inode.kind == FileKind::Directory {
             return Err(Error::IsDirectory(path));
@@ -400,10 +433,7 @@ impl PseudoFs {
         let parent = self
             .resolve_from_storage(tenant, scope, &parent_path)
             .await?;
-        let garbage = inode.head.map(|head| GarbageMarker {
-            inode_id: inode.id,
-            head,
-        });
+        let garbage = GarbageMarker::chain(&inode);
         let mut ops = vec![
             RecordOp::Delete(directory_entry_key(scope, parent.id, &name)),
             RecordOp::Delete(inode_key(scope, inode.id)),
@@ -414,8 +444,8 @@ impl PseudoFs {
         self.inner.storage.apply(ops).await?;
         drop(_guard);
         self.finish_durability(durability).await?;
-        if let Some(marker) = garbage {
-            self.collect_generation_chain(scope, &marker).await;
+        if garbage.is_some() {
+            self.notify_garbage_worker();
         }
         Ok(())
     }
@@ -426,7 +456,7 @@ impl PseudoFs {
         if path == "/" {
             return Err(Error::RootOperation);
         }
-        let _guard = self.inner.mutation_lock.lock().await;
+        let _guard = self.mutation_guard(scope).await;
         let inode = self.resolve_from_storage(tenant, scope, &path).await?;
         if inode.kind != FileKind::Directory {
             return Err(Error::NotDirectory(path));
@@ -538,7 +568,7 @@ impl PseudoFs {
                 "cannot move a directory inside itself".to_owned(),
             ));
         }
-        let _guard = self.inner.mutation_lock.lock().await;
+        let _guard = self.mutation_guard(scope).await;
         let source_inode = self.resolve_from_storage(tenant, scope, &source).await?;
         let (source_parent_path, source_name) = parent_and_name(&source)?;
         let source_parent = self
@@ -564,10 +594,7 @@ impl PseudoFs {
                 });
             }
             ops.push(RecordOp::Delete(inode_key(scope, existing.id)));
-            garbage = existing.head.map(|head| GarbageMarker {
-                inode_id: existing.id,
-                head,
-            });
+            garbage = GarbageMarker::chain(&existing);
             if let Some(marker) = &garbage {
                 ops.push(put_op(garbage_key(scope, marker.head), encode(marker)?));
             }
@@ -584,8 +611,8 @@ impl PseudoFs {
         self.inner.storage.apply(ops).await?;
         drop(_guard);
         self.finish_durability(durability).await?;
-        if let Some(marker) = garbage {
-            self.collect_generation_chain(scope, &marker).await;
+        if garbage.is_some() {
+            self.notify_garbage_worker();
         }
         Ok(target)
     }
@@ -642,14 +669,15 @@ impl PseudoFs {
         Ok(())
     }
 
-    /// Uploads pending blobs and deletes expired dead blobs now, rather than
-    /// waiting for the background worker.
+    /// Deletes unreferenced generations, uploads pending blobs, and deletes
+    /// expired dead blobs now, rather than waiting for the background worker.
     pub async fn run_blob_maintenance(&self) -> Result<()> {
         let _guard = self.inner.maintenance_lock.lock().await;
-        // One failing upload must not stop the other uploads or GC.
+        // One failing step must not stop the others.
+        let cleaned = self.cleanup_garbage().await;
         let uploaded = self.upload_pending_blobs().await;
         let collected = self.collect_dead_blobs().await;
-        uploaded.and(collected)
+        cleaned.and(uploaded).and(collected)
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -658,10 +686,23 @@ impl PseudoFs {
         Ok(())
     }
 
-    /// Rewrites a long append chain as one generation. The rewrite reads the
-    /// chain from one snapshot and commits only if the file still has that
-    /// head, so concurrent appends are never lost.
+    /// Merges the recent end of a long append chain into one generation,
+    /// retrying when an overwrite or rename wins the race.
     async fn compact_file(&self, tenant: &str, path: &str) -> Result<()> {
+        for _ in 0..COMPACTION_ATTEMPTS {
+            match self.compact_tail(tenant, path).await {
+                Err(Error::Conflict(_)) => continue,
+                result => return result,
+            }
+        }
+        Ok(())
+    }
+
+    /// Merges a size-tiered tail: each generation left behind is larger than
+    /// everything merged after it, so a file of `n` bytes keeps O(log n)
+    /// generations and each byte is rewritten O(log n) times, instead of the
+    /// whole file being rewritten every `max_append_generations` appends.
+    async fn compact_tail(&self, tenant: &str, path: &str) -> Result<()> {
         let scope = self.ensure_tenant(tenant).await?;
         let snapshot = self.inner.storage.snapshot().await?;
         let inode = match self
@@ -672,12 +713,18 @@ impl PseudoFs {
             Err(Error::NotFound(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
-        if inode.kind != FileKind::File || inode.generation_count < 2 {
+        let max = self.inner.config.max_append_generations;
+        let Some(old_head) = inode.head else {
+            return Ok(());
+        };
+        if inode.kind != FileKind::File || inode.generation_count < max {
             return Ok(());
         }
         let generations = self
             .generation_chain(snapshot.as_ref(), scope, inode.id, inode.head)
             .await?;
+        let start = tail_start(&generations, (max / 2).max(1) as usize);
+        let tail = generations[start..].to_vec();
         let mut upload = FileUpload::new(
             self.clone(),
             tenant.to_owned(),
@@ -686,12 +733,24 @@ impl PseudoFs {
             false,
             0,
         )
-        .expecting(inode.id, inode.head);
+        .compacting(TailCompaction {
+            inode_id: inode.id,
+            old_head,
+            prefix: tail[0].previous,
+            generations: tail.len() as u64,
+        });
         let (sender, mut receiver) = mpsc::channel(2);
         let reader = self.clone();
         tokio::spawn(async move {
             if let Err(error) = reader
-                .send_content(snapshot, scope, &generations, 0..u64::MAX, &sender)
+                .send_content(
+                    snapshot,
+                    scope,
+                    &tail,
+                    0..u64::MAX,
+                    &sender,
+                    Caching::Bypass,
+                )
                 .await
             {
                 let _ = sender.send(Err(error)).await;
@@ -700,10 +759,7 @@ impl PseudoFs {
         while let Some(chunk) = receiver.recv().await {
             upload.push(chunk?).await?;
         }
-        match upload.finish(Durability::Applied).await {
-            Ok(_) | Err(Error::Conflict(_)) => Ok(()),
-            Err(error) => Err(error),
-        }
+        upload.finish(Durability::Applied).await.map(|_| ())
     }
 
     pub(crate) async fn ensure_tenant(&self, tenant: &str) -> Result<TenantScope> {
@@ -714,7 +770,7 @@ impl PseudoFs {
             return Ok(scope);
         }
 
-        let _guard = self.inner.mutation_lock.lock().await;
+        let _guard = self.mutation_guard(scope).await;
         if let Some(root) = self.get_inode(scope, scope.root_id).await? {
             ensure_inode_tenant(&root, tenant)?;
             return Ok(scope);
@@ -762,6 +818,7 @@ impl PseudoFs {
         generations: &[Generation],
         range: Range<u64>,
         sender: &mpsc::Sender<Result<Bytes>>,
+        caching: Caching,
     ) -> Result<()> {
         let mut position = 0_u64;
         for generation in generations {
@@ -798,7 +855,7 @@ impl PseudoFs {
                         .await
                 }
                 Content::Blob { id } => {
-                    self.send_blob(id, generation.byte_len, local, sender)
+                    self.send_blob(id, generation.byte_len, local, sender, caching)
                         .await?
                 }
             };
@@ -822,74 +879,149 @@ impl PseudoFs {
         true
     }
 
+    /// Sends `range` of a blob from the local cache or the remote store. With
+    /// [`Caching::Fill`], a whole-blob miss is downloaded into the cache once
+    /// while streaming, and a partial miss on a small blob fills the cache in
+    /// the background so later reads are local.
     async fn send_blob(
         &self,
         id: Uuid,
         size: u64,
         range: Range<u64>,
         sender: &mpsc::Sender<Result<Bytes>>,
+        caching: Caching,
+    ) -> Result<bool> {
+        let blobs = &self.inner.blobs;
+        let local = match caching {
+            Caching::Fill => blobs.open_local(id).await?,
+            Caching::Bypass => blobs.peek_local(id).await?,
+        };
+        if let Some(file) = local {
+            return self.send_file(file, range, sender).await;
+        }
+        if caching == Caching::Fill && size <= blobs.capacity() {
+            if range.start == 0 && range.end == size {
+                return match blobs.fetch(id).await? {
+                    Fetch::Local(file) => self.send_file(file, range, sender).await,
+                    Fetch::Download(download) => self.send_downloading(id, download, sender).await,
+                };
+            }
+            if size <= blobs.capacity() / BACKGROUND_FILL_FRACTION {
+                self.fill_in_background(id);
+            }
+        }
+        let mut pieces = Pieces::new(self.inner.config.chunk_size_bytes, sender);
+        let mut stream = blobs.remote_range(id, range).await?;
+        while let Some(bytes) = stream.next().await {
+            if !pieces.push(&bytes?).await {
+                return Ok(false);
+            }
+        }
+        Ok(pieces.finish().await)
+    }
+
+    async fn send_file(
+        &self,
+        mut file: tokio::fs::File,
+        range: Range<u64>,
+        sender: &mpsc::Sender<Result<Bytes>>,
     ) -> Result<bool> {
         let chunk = self.inner.config.chunk_size_bytes as u64;
-        let blobs = &self.inner.blobs;
-        let mut file = blobs.open_local(id).await?;
-        if file.is_none() && range.start == 0 && range.end == size && size <= blobs.capacity() {
-            file = Some(blobs.fetch(id).await?);
-        }
-        if let Some(mut file) = file {
-            file.seek(SeekFrom::Start(range.start)).await?;
-            let mut remaining = range.end - range.start;
-            while remaining > 0 {
-                let length = remaining.min(chunk) as usize;
-                let mut buffer = vec![0_u8; length];
-                file.read_exact(&mut buffer).await?;
-                remaining -= length as u64;
-                if sender.send(Ok(Bytes::from(buffer))).await.is_err() {
-                    return Ok(false);
-                }
+        file.seek(SeekFrom::Start(range.start)).await?;
+        let mut remaining = range.end - range.start;
+        while remaining > 0 {
+            let length = remaining.min(chunk) as usize;
+            let mut buffer = vec![0_u8; length];
+            file.read_exact(&mut buffer).await?;
+            remaining -= length as u64;
+            if sender.send(Ok(Bytes::from(buffer))).await.is_err() {
+                return Ok(false);
             }
-            return Ok(true);
-        }
-        let mut stream = blobs.remote_range(id, range).await?;
-        let mut buffer = BytesMut::new();
-        while let Some(bytes) = stream.next().await {
-            buffer.extend_from_slice(&bytes?);
-            while buffer.len() as u64 >= chunk {
-                let piece = buffer.split_to(chunk as usize).freeze();
-                if sender.send(Ok(piece)).await.is_err() {
-                    return Ok(false);
-                }
-            }
-        }
-        if !buffer.is_empty() && sender.send(Ok(buffer.freeze())).await.is_err() {
-            return Ok(false);
         }
         Ok(true)
     }
 
+    /// Streams a whole blob from the remote store to `sender` while writing
+    /// it into the cache. A reader that goes away abandons the download.
+    async fn send_downloading(
+        &self,
+        id: Uuid,
+        mut download: BlobDownload,
+        sender: &mpsc::Sender<Result<Bytes>>,
+    ) -> Result<bool> {
+        let blobs = &self.inner.blobs;
+        let mut pieces = Pieces::new(self.inner.config.chunk_size_bytes, sender);
+        let mut stream = blobs.remote_stream(id).await?;
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes?;
+            download.write(&bytes).await?;
+            if !pieces.push(&bytes).await {
+                return Ok(false);
+            }
+        }
+        if !pieces.finish().await {
+            return Ok(false);
+        }
+        if let Err(error) = blobs.finish_download(download).await {
+            tracing::warn!(blob = %id, "caching a downloaded blob failed: {error}");
+        }
+        Ok(true)
+    }
+
+    fn fill_in_background(&self, id: Uuid) {
+        let Ok(permit) = Arc::clone(&self.inner.background_fills).try_acquire_owned() else {
+            return;
+        };
+        let fs = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let blobs = &fs.inner.blobs;
+            let filled = async {
+                let Some(mut download) = blobs.try_fetch(id).await? else {
+                    return Ok(());
+                };
+                let mut stream = blobs.remote_stream(id).await?;
+                while let Some(bytes) = stream.next().await {
+                    download.write(&bytes?).await?;
+                }
+                blobs.finish_download(download).await
+            }
+            .await;
+            if let Err(error) = filled {
+                tracing::debug!(blob = %id, "background cache fill failed: {error}");
+            }
+        });
+    }
+
+    /// Deletes every generation run behind a garbage marker. A failing marker
+    /// is left for the next pass rather than blocking the others.
     async fn cleanup_garbage(&self) -> Result<()> {
         let snapshot = self.inner.storage.snapshot().await?;
         let mut iter = snapshot
             .scan_prefix_iter(garbage_prefix(), BytesRange::unbounded(), None)
             .await?;
+        let mut first_error = None;
         while let Some(record) = iter.next().await? {
-            let scope = tenant_scope_from_key(&record.key)?;
-            let marker = decode::<GarbageMarker>(&record.value)?;
-            self.cleanup_generation_chain(scope, &marker).await?;
+            let cleaned = async {
+                let scope = tenant_scope_from_key(&record.key)?;
+                let marker = decode::<GarbageMarker>(&record.value)?;
+                self.cleanup_generation_chain(scope, &marker).await
+            }
+            .await;
+            if let Err(error) = cleaned {
+                tracing::warn!("generation cleanup failed; will retry: {error}");
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) async fn collect_generation_chain(
-        &self,
-        scope: TenantScope,
-        marker: &GarbageMarker,
-    ) {
-        if let Err(error) = self.cleanup_generation_chain(scope, marker).await {
-            tracing::warn!("generation cleanup failed; retrying at next start: {error}");
-        }
+    /// Generation cleanup runs at the start of each blob maintenance pass.
+    pub(crate) fn notify_garbage_worker(&self) {
+        self.inner.blob_notify.notify_one();
     }
 
-    /// Deletes an unreferenced generation chain. Inline content is deleted
+    /// Deletes an unreferenced generation run. Inline content is deleted
     /// immediately; blobs are queued for deletion after the grace period.
     async fn cleanup_generation_chain(
         &self,
@@ -901,7 +1033,7 @@ impl PseudoFs {
         let mut traversed = 0_u64;
         let dead = encode(&DeadBlob { deleted_at: now() })?;
         let mut queued_blobs = false;
-        while let Some(id) = cursor {
+        while let Some(id) = cursor.filter(|id| Some(*id) != marker.stop) {
             traversed += 1;
             if traversed > MAX_GENERATION_CHAIN {
                 return Err(Error::Corrupt(
@@ -1154,15 +1286,31 @@ impl PseudoFs {
         Ok(iter.next().await?.is_some())
     }
 
+    /// Flushes the metastore WAL for writes already applied. Concurrent
+    /// callers share flushes: whoever takes the lock flushes for every write
+    /// applied before it, and callers covered by that flush return without
+    /// flushing again.
     pub(crate) async fn finish_durability(&self, durability: Durability) -> Result<()> {
-        if durability != Durability::Applied {
-            self.inner.storage.flush().await?;
+        if durability == Durability::Applied {
+            return Ok(());
         }
+        let ticket = self.inner.applied_writes.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut flushed = self.inner.flushed_writes.lock().await;
+        if *flushed >= ticket {
+            return Ok(());
+        }
+        let covered = self.inner.applied_writes.load(Ordering::Acquire);
+        self.inner.storage.flush().await?;
+        *flushed = covered;
         Ok(())
     }
 
-    pub(crate) async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.inner.mutation_lock.lock().await
+    pub(crate) async fn mutation_guard(
+        &self,
+        scope: TenantScope,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        let stripe = scope.root_id.as_u128() as usize % self.inner.mutation_locks.len();
+        self.inner.mutation_locks[stripe].lock().await
     }
 
     pub(crate) async fn resolve_for_mutation(
@@ -1178,11 +1326,25 @@ impl PseudoFs {
         }
     }
 
+    /// Queues a compaction unless one is already queued for the file. Every
+    /// append past the threshold asks again, so a request dropped on a full
+    /// queue is retried by the next append.
     pub(crate) fn request_compaction(&self, tenant: &str, path: &str) {
-        let _ = self.inner.compaction_tx.try_send(CompactionRequest {
+        let request = CompactionRequest {
             tenant: tenant.to_owned(),
             path: path.to_owned(),
-        });
+        };
+        let mut queued = self
+            .inner
+            .compaction_queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queued.contains(&request) {
+            return;
+        }
+        if self.inner.compaction_tx.try_send(request.clone()).is_ok() {
+            queued.insert(request);
+        }
     }
 
     pub(crate) async fn stage_blob(&self) -> Result<StagedBlob> {
@@ -1247,21 +1409,73 @@ fn local_object_store(path: &str) -> Result<Arc<dyn ObjectStore>> {
     ))
 }
 
-fn blob_remote(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
-    let (default_store, default_prefix) = match &config.storage {
-        StorageConfig::SlateDb(slate) => (
-            Some(slate.object_store.clone()),
-            format!("{}-blobs", slate.path),
-        ),
-        StorageConfig::InMemory => (None, "blobs".to_owned()),
-    };
-    let prefix = config.blobs.path.clone().unwrap_or(default_prefix);
-    let store = match config.blobs.object_store.clone().or(default_store) {
+/// `storage.path` is the root prefix: the metastore lives under
+/// `<path>/metastore` and blobs under `<path>/blobs`.
+fn metastore_storage(storage: &StorageConfig) -> StorageConfig {
+    storage.with_path_suffix(METASTORE_DIR)
+}
+
+fn object_store(config: Option<&ObjectStoreConfig>) -> Result<Arc<dyn ObjectStore>> {
+    Ok(match config {
         Some(ObjectStoreConfig::Local(local)) => local_object_store(&local.path)?,
         Some(ObjectStoreConfig::InMemory) | None => Arc::new(InMemory::new()),
-        Some(other) => common::create_object_store(&other)?,
+        Some(other) => common::create_object_store(other)?,
+    })
+}
+
+fn blob_remote(config: &Config) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let (default_store, prefix) = match &config.storage {
+        StorageConfig::SlateDb(slate) => (
+            Some(&slate.object_store),
+            format!("{}/{BLOBS_DIR}", slate.path),
+        ),
+        StorageConfig::InMemory => (None, BLOBS_DIR.to_owned()),
     };
+    let store = object_store(config.blobs.object_store.as_ref().or(default_store))?;
     Ok((store, prefix))
+}
+
+/// Whether a read may add blobs to the local cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Caching {
+    /// Client reads: misses fill the cache and hits refresh it.
+    Fill,
+    /// Scans (grep, compaction): read cached copies without refreshing them
+    /// and stream misses without caching, so a scan cannot evict hot blobs.
+    Bypass,
+}
+
+/// Re-chunks a byte stream into `chunk`-sized pieces for a reader.
+struct Pieces<'a> {
+    chunk: usize,
+    buffer: BytesMut,
+    sender: &'a mpsc::Sender<Result<Bytes>>,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(chunk: usize, sender: &'a mpsc::Sender<Result<Bytes>>) -> Self {
+        Self {
+            chunk,
+            buffer: BytesMut::new(),
+            sender,
+        }
+    }
+
+    /// Returns false once the reader has gone away.
+    async fn push(&mut self, bytes: &[u8]) -> bool {
+        self.buffer.extend_from_slice(bytes);
+        while self.buffer.len() >= self.chunk {
+            let piece = self.buffer.split_to(self.chunk).freeze();
+            if self.sender.send(Ok(piece)).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn finish(self) -> bool {
+        self.buffer.is_empty() || self.sender.send(Ok(self.buffer.freeze())).await.is_ok()
+    }
 }
 
 pub(crate) struct Child {
@@ -1353,6 +1567,25 @@ fn ensure_inode_tenant(inode: &Inode, tenant: &str) -> Result<()> {
             "inode crosses a tenant filesystem boundary".to_owned(),
         ))
     }
+}
+
+/// Where the tail merged by [`PseudoFs::compact_tail`] starts in
+/// `generations` (oldest first): at least the newest two, then each older
+/// generation no larger than everything newer, and as many more as it takes
+/// to leave at most `target` generations.
+fn tail_start(generations: &[Generation], target: usize) -> usize {
+    let mut start = generations.len();
+    let mut merged_bytes = 0_u64;
+    while start > 0 {
+        let candidate = generations[start - 1].byte_len;
+        let required = generations.len() - start < 2 || start >= target;
+        if !required && candidate > merged_bytes {
+            break;
+        }
+        merged_bytes += candidate;
+        start -= 1;
+    }
+    start
 }
 
 pub(crate) fn components(path: &str) -> impl Iterator<Item = &str> {

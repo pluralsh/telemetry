@@ -12,7 +12,12 @@ filesystem:
       bucket: pseudofs-regression
       endpoint: http://minio:9000
       allow_http: true
-    block_cache: { type: FoyerMemory, capacity: 536870912 }
+    block_cache:
+      type: FoyerHybrid
+      memory_capacity: 536870912
+      disk_capacity: 10737418240
+      disk_path: /var/cache/pseudofs
+      write_policy: WriteOnEviction
     meta_cache: { type: FoyerMemory, capacity: 134217728 }
   metastore_wal_path: /var/lib/pseudofs/wal
   blobs:
@@ -20,7 +25,7 @@ filesystem:
     cache_capacity_bytes: 4294967296
     upload_concurrency: 4
     gc_grace_seconds: 300
-  inline_threshold_bytes: 65536
+  inline_threshold_bytes: 16384
   chunk_size_bytes: 1048576
   max_file_size_bytes: 1073741824
   max_append_generations: 64
@@ -39,3 +44,4 @@ search:
   max_grep_file_size_bytes: 67108864
   grep_concurrency: 8
   max_scanned_entries: 1000000
+  max_grep_seconds: 30

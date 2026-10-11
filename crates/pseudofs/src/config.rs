@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// SlateDB metastore holding inodes, directory entries, generations, and
-    /// inline content.
+    /// Object store and caches for the SlateDB metastore holding inodes,
+    /// directory entries, generations, and inline content. `storage.path` is
+    /// the root prefix of the filesystem: the metastore is kept under
+    /// `<path>/metastore` and blobs under `<path>/blobs`.
     pub storage: StorageConfig,
     /// Local directory for the metastore write-ahead log. When set, the WAL is
     /// written to this fsynced local directory instead of the storage object
@@ -35,7 +37,7 @@ impl Default for Config {
             metastore_wal_path: None,
             blobs: BlobConfig::default(),
             chunk_size_bytes: 1024 * 1024,
-            inline_threshold_bytes: 64 * 1024,
+            inline_threshold_bytes: 16 * 1024,
             max_file_size_bytes: 1024 * 1024 * 1024,
             max_append_generations: 64,
         }
@@ -45,12 +47,10 @@ impl Default for Config {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlobConfig {
-    /// Remote blob store. Defaults to the metastore's object store.
+    /// Remote blob store. Defaults to the metastore's object store; blobs are
+    /// kept under `<storage.path>/blobs` in either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_store: Option<ObjectStoreConfig>,
-    /// Remote key prefix. Defaults to `<storage.path>-blobs`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
     /// Local directory holding staged uploads, blobs awaiting upload, and the
     /// blob read cache. Must be persistent: blobs are acknowledged before they
     /// reach the remote store.
@@ -69,7 +69,6 @@ impl Default for BlobConfig {
     fn default() -> Self {
         Self {
             object_store: None,
-            path: None,
             local_path: ".data/pseudofs-blobs".to_owned(),
             cache_capacity_bytes: 4 * 1024 * 1024 * 1024,
             upload_concurrency: 4,
@@ -80,6 +79,17 @@ impl Default for BlobConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        if let StorageConfig::SlateDb(slate) = &self.storage
+            && (slate.path.is_empty()
+                || slate.path.starts_with('/')
+                || slate.path.ends_with('/')
+                || slate.path.contains("//"))
+        {
+            return Err(format!(
+                "storage.path '{}' must be a non-empty object-store prefix without leading, trailing, or repeated '/'",
+                slate.path
+            ));
+        }
         if self.chunk_size_bytes == 0 {
             return Err("chunk_size_bytes must be greater than zero".to_owned());
         }

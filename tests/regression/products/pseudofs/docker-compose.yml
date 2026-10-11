@@ -59,8 +59,11 @@ services:
     volumes:
       - ./${PSEUDOFS_CONFIG:-regression.yaml}:/app/regression/pseudofs.yaml:ro
       - pseudofs-data:/var/lib/pseudofs
+      # Separate from the data volume, as the chart and operator mount it.
+      - pseudofs-cache:/var/cache/pseudofs
     ports: ["19093:9093"]
 
 volumes:
   minio-data:
   pseudofs-data:
+  pseudofs-cache:

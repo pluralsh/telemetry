@@ -54,9 +54,12 @@ UTF-8 and truncated to 4 KiB. Files are searched concurrently (up to the
 server's `grep_concurrency`), but results stream in walk order. `max_matches`
 bounds matching lines across all files; when the limit is reached, which
 matches from concurrently searched files are returned can vary between runs.
-The walk is subject to the same `max_scanned_entries` budget as `Glob`, and a
+The walk is subject to the same `max_scanned_entries` budget as `Glob`. A
 search stops scanning within 256 KiB of file content once the client
-disconnects or its deadline passes, so set a deadline on broad searches.
+disconnects or its deadline passes, and fails with `RESOURCE_EXHAUSTED`, after
+the matches already sent, once it has searched for the server's
+`max_grep_seconds`. Searches read uncached blobs from the remote store without
+adding them to the local cache.
 Patterns run on a linear-time engine with a 16 MiB lazy DFA cache per search;
 very large counted repetitions (such as `x{10000}`) can still exceed it and
 scan orders of magnitude more slowly.

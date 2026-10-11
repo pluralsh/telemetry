@@ -91,10 +91,24 @@ pub(crate) struct DeadBlob {
     pub deleted_at: f64,
 }
 
+/// An unreferenced run of a generation chain: `head` back to, but not
+/// including, `stop` (the rest of the chain when `stop` is `None`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GarbageMarker {
     pub inode_id: Uuid,
     pub head: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Uuid>,
+}
+
+impl GarbageMarker {
+    pub(crate) fn chain(inode: &Inode) -> Option<Self> {
+        inode.head.map(|head| Self {
+            inode_id: inode.id,
+            head,
+            stop: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

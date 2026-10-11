@@ -6,4 +6,6 @@
 
 | started | commit | variant | status | budget | cases | mismatch | non-match | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 | CPU cores impl / oracle | memory p95 MiB impl / oracle | entry |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-11 20:16Z | `eecaba2c39` (dirty) | concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-170204da, pinned | passed | 10m | 7118 | 0 | 0 | 1.3 / - | 189.0 / - | - | 0.28 / - | 157 / - | [2026-10-11T2016Z-eecaba2c39-dirty-170204da](2026-10-11T2016Z-eecaba2c39-dirty-170204da.md) |
+| 2026-10-11 19:02Z | `eecaba2c39` (dirty) | concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-170204da, pinned | passed | 10m | 6697 | 0 | 0 | 1.5 / - | 238.0 / - | - | 0.42 / - | 156 / - | [2026-10-11T1902Z-eecaba2c39-dirty-170204da](2026-10-11T1902Z-eecaba2c39-dirty-170204da.md) |
 | 2026-10-11 17:51Z | `b03cb4f7ea` (dirty) | concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned | passed | 10m | 6417 | 0 | 0 | 1.5 / - | 258.6 / - | - | 0.28 / - | 281 / - | [2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4](2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4.md) |

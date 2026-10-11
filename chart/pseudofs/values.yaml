@@ -22,6 +22,8 @@ config:
   filesystem:
     storage:
       type: SlateDb
+      # Root prefix in the object store: the metastore is kept under
+      # <path>/metastore and blobs under <path>/blobs.
       path: pseudofs
       object_store:
         type: Local
@@ -31,11 +33,13 @@ config:
         memory_capacity: 536870912
         disk_capacity: 10737418240
         disk_path: /var/cache/pseudofs
+        write_policy: WriteOnEviction
       meta_cache:
         type: FoyerMemory
         capacity: 134217728
-    # Uncomment when storage.object_store is remote (S3, GCS, Azure) so
-    # WRITTEN acknowledgements wait on the local volume instead of the bucket.
+    # With a remote storage.object_store (Aws, Azure, Gcp) the chart defaults
+    # this to <persistence.mountPath>/wal, so WRITTEN acknowledgements wait on
+    # the local volume instead of the bucket. Set "" to keep the WAL remote.
     # metastore_wal_path: /var/lib/pseudofs/wal
     blobs:
       # Must be on the persistent volume: blobs are acknowledged before they
@@ -44,7 +48,7 @@ config:
       cache_capacity_bytes: 4294967296
       upload_concurrency: 4
       gc_grace_seconds: 300
-    inline_threshold_bytes: 65536
+    inline_threshold_bytes: 16384
     chunk_size_bytes: 1048576
     max_file_size_bytes: 1073741824
     max_append_generations: 64

@@ -4,6 +4,7 @@
 // you may not use this file except in compliance with the License.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use prost::Message;
@@ -360,6 +361,7 @@ impl PseudoFsApi for Service {
             ),
             concurrency: search.grep_concurrency as usize,
             max_scanned_entries: search.max_scanned_entries as usize,
+            timeout: Duration::from_secs(search.max_grep_seconds.into()),
         };
         let matches = self
             .fs

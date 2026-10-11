@@ -13,6 +13,7 @@ filesystem:
       memory_capacity: 536870912
       disk_capacity: 10737418240
       disk_path: /var/cache/pseudofs
+      write_policy: WriteOnEviction
     meta_cache:
       type: FoyerMemory
       capacity: 134217728
@@ -20,20 +21,19 @@ filesystem:
   # acknowledgements don't wait on the bucket:
   # metastore_wal_path: /var/lib/pseudofs/wal
   blobs:
-    # Remote blob store; defaults to storage.object_store under
-    # "<storage.path>-blobs".
+    # Remote blob store; defaults to storage.object_store. Blobs are kept
+    # under "<storage.path>/blobs" in either.
     # object_store:
     #   type: Aws
     #   region: us-east-1
     #   bucket: pseudofs-blobs
-    # path: pseudofs-blobs
     # Staged uploads, blobs awaiting upload, and the read cache. Must be
     # persistent: blobs are acknowledged before they reach the remote store.
     local_path: /var/lib/pseudofs/blobs
     cache_capacity_bytes: 4294967296
     upload_concurrency: 4
     gc_grace_seconds: 300
-  inline_threshold_bytes: 65536
+  inline_threshold_bytes: 16384
   chunk_size_bytes: 1048576
   max_file_size_bytes: 1073741824
   max_append_generations: 64
@@ -52,3 +52,4 @@ search:
   max_grep_file_size_bytes: 67108864
   grep_concurrency: 8
   max_scanned_entries: 1000000
+  max_grep_seconds: 30

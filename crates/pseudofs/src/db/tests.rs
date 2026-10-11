@@ -26,7 +26,6 @@ fn config(dir: &TempDir, storage: StorageConfig) -> Config {
             object_store: Some(ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: dir.path().join("remote").display().to_string(),
             })),
-            path: Some("blobs".to_owned()),
             local_path: dir.path().join("local").display().to_string(),
             cache_capacity_bytes: 1024 * 1024,
             upload_concurrency: 2,
@@ -262,6 +261,90 @@ async fn append_chain_is_compacted_without_changing_content() {
     );
 }
 
+#[tokio::test]
+async fn compaction_merges_only_the_tail_and_cleans_only_what_it_replaced() {
+    let harness = harness().await;
+    let fs = &harness.fs;
+    let base = vec![b'x'; 100];
+    fs.write_bytes(
+        TENANT,
+        "/log",
+        Bytes::from(base.clone()),
+        Durability::Applied,
+    )
+    .await
+    .unwrap();
+    let chain = |fs: PseudoFs| async move {
+        let scope = tenant_scope(TENANT);
+        let inode = fs.resolve(TENANT, "/log").await.unwrap();
+        fs.generation_chain(fs.inner.storage.as_ref(), scope, inode.id, inode.head)
+            .await
+            .unwrap()
+    };
+    let base_generation = chain(fs.clone()).await[0].id;
+    for _ in 0..3 {
+        fs.append_text(TENANT, "/log", "a".to_owned(), Durability::Applied)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while chain(fs.clone()).await.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("append compaction did not finish");
+
+    let generations = chain(fs.clone()).await;
+    assert_eq!(generations[0].id, base_generation);
+    assert_eq!(generations[1].byte_len, 3);
+    fs.run_blob_maintenance().await.unwrap();
+    assert_eq!(remote_blobs(&harness), 1);
+    let mut expected = base;
+    expected.extend_from_slice(b"aaa");
+    assert_eq!(fs.read_bytes(TENANT, "/log").await.unwrap(), expected);
+}
+
+#[test]
+fn tail_start_keeps_generations_larger_than_everything_newer() {
+    let generations = |sizes: &[u64]| -> Vec<Generation> {
+        sizes
+            .iter()
+            .map(|&byte_len| Generation {
+                inode_id: Uuid::nil(),
+                id: Uuid::new_v4(),
+                previous: None,
+                byte_len,
+                content: Content::Inline,
+            })
+            .collect()
+    };
+    assert_eq!(tail_start(&generations(&[100, 1, 1, 1]), 32), 1);
+    assert_eq!(tail_start(&generations(&[100, 50, 20, 1, 1]), 32), 3);
+    assert_eq!(tail_start(&generations(&[1, 1, 1, 1]), 32), 0);
+    assert_eq!(tail_start(&generations(&[100, 50, 20, 9, 5]), 2), 1);
+}
+
+#[tokio::test]
+async fn tenants_on_different_lock_stripes_do_not_block_each_other() {
+    let Harness { fs, _dir, .. } = harness().await;
+    let stripe =
+        |tenant: &str| tenant_scope(tenant).root_id.as_u128() % MUTATION_LOCK_STRIPES as u128;
+    let other = (0..)
+        .map(|index| format!("tenant-{index}"))
+        .find(|tenant| stripe(tenant) != stripe(TENANT))
+        .unwrap();
+    fs.ensure_tenant(&other).await.unwrap();
+    let _held = fs.mutation_guard(tenant_scope(TENANT)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fs.write_text(&other, "/free", "ok".to_owned(), Durability::Applied),
+    )
+    .await
+    .expect("a write in another tenant waited for this tenant's lock")
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_racing_compaction_are_never_lost() {
     let Harness { fs, _dir, .. } = harness_with(|config| {
@@ -276,6 +359,7 @@ async fn appends_racing_compaction_are_never_lost() {
             .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
+    fs.run_blob_maintenance().await.unwrap();
     let text = fs.read_text(TENANT, "/log").await.unwrap();
     let expected: String = (0..appends).map(|index| format!("<{index}>")).collect();
     assert_eq!(text, expected);
@@ -358,6 +442,61 @@ async fn evicted_blobs_are_read_back_from_the_remote_store() {
     assert_eq!(std::fs::read_dir(&local).unwrap().count(), 0);
     assert_eq!(fs.read_bytes(TENANT, "/second").await.unwrap(), second);
     assert_eq!(fs.read_bytes(TENANT, "/first").await.unwrap(), first);
+}
+
+async fn blob_id(fs: &PseudoFs, path: &str) -> Uuid {
+    let inode = fs.resolve(TENANT, path).await.unwrap();
+    let chain = fs
+        .generation_chain(
+            fs.inner.storage.as_ref(),
+            tenant_scope(TENANT),
+            inode.id,
+            inode.head,
+        )
+        .await
+        .unwrap();
+    match chain[0].content {
+        Content::Blob { id } => id,
+        Content::Inline => panic!("{path} is inline"),
+    }
+}
+
+#[tokio::test]
+async fn scans_bypass_the_blob_cache_and_partial_reads_fill_it_in_the_background() {
+    let harness = harness_with(|config| config.blobs.cache_capacity_bytes = 1000).await;
+    let fs = &harness.fs;
+    let content = |index: usize| format!("{index:02} needle{}\n", "-".repeat(89));
+    for index in 0..11 {
+        fs.write_text(
+            TENANT,
+            &format!("/f{index}"),
+            content(index),
+            Durability::Durable,
+        )
+        .await
+        .unwrap();
+    }
+    let evicted = blob_id(fs, "/f0").await;
+    assert!(!fs.inner.blobs.has_local(evicted).await.unwrap());
+
+    let found = collect(
+        fs.grep(TENANT, "/f0", grep_options("needle"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(found.len(), 1);
+    assert!(!fs.inner.blobs.has_local(evicted).await.unwrap());
+
+    assert_eq!(range(fs, "/f0", 3, Some(6)).await, b"needle");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fs.inner.blobs.has_local(evicted).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("partial read did not fill the cache");
+    assert_eq!(fs.read_text(TENANT, "/f0").await.unwrap(), content(0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -648,19 +787,7 @@ async fn isolates_tenant_roots_and_rejects_boundary_traversal() {
 #[tokio::test]
 async fn persists_metadata_and_pending_blobs_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = config(
-        &dir,
-        StorageConfig::SlateDb(SlateDbStorageConfig {
-            path: "pseudofs".to_owned(),
-            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                path: dir.path().join("metastore").display().to_string(),
-            }),
-            settings_path: None,
-            block_cache: None,
-            meta_cache: None,
-            disk: Default::default(),
-        }),
-    );
+    let mut config = bucket_config(&dir, "teams/agents/pseudofs");
     config.metastore_wal_path = Some(dir.path().join("wal").display().to_string());
     let large = Bytes::from(vec![3_u8; 64]);
     let fs = PseudoFs::open(config.clone()).await.unwrap();
@@ -692,13 +819,46 @@ async fn persists_metadata_and_pending_blobs_across_reopen() {
     );
     reopened.run_blob_maintenance().await.unwrap();
     assert_eq!(pending_blobs(&reopened).await, 0);
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("remote").join("blobs"))
-            .unwrap()
-            .count(),
-        1
-    );
+    let root = dir.path().join("bucket/teams/agents/pseudofs");
+    assert_eq!(std::fs::read_dir(root.join("blobs")).unwrap().count(), 1);
+    assert!(root.join("metastore/manifest").is_dir());
+    let mut top: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    top.sort();
+    assert_eq!(top, ["blobs", "metastore"]);
     reopened.close().await.unwrap();
+}
+
+/// The metastore and blobs share the storage object store under one root.
+fn bucket_config(dir: &TempDir, root: &str) -> Config {
+    let mut config = config(
+        dir,
+        StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: root.to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: dir.path().join("bucket").display().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+            disk: Default::default(),
+        }),
+    );
+    config.blobs.object_store = None;
+    config
+}
+
+#[test]
+fn storage_path_must_be_a_clean_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    for path in ["", "/pseudofs", "pseudofs/", "a//b"] {
+        assert!(bucket_config(&dir, path).validate().is_err(), "{path:?}");
+    }
+    bucket_config(&dir, "teams/agents/pseudofs")
+        .validate()
+        .unwrap();
 }
 
 async fn tree(fs: &PseudoFs) {
@@ -849,6 +1009,32 @@ async fn parallel_grep_keeps_walk_order_and_match_budget() {
     )
     .await;
     assert_eq!(limited.len(), 7);
+}
+
+#[tokio::test]
+async fn grep_fails_once_it_exceeds_its_time_budget() {
+    let Harness { fs, _dir, .. } = harness_with(|config| config.chunk_size_bytes = 64 * 1024).await;
+    let line = "no match on this line\n";
+    let content = line.repeat(600 * 1024 / line.len());
+    fs.write_text(TENANT, "/big.log", content, Durability::Applied)
+        .await
+        .unwrap();
+    let mut results = fs
+        .grep(
+            TENANT,
+            "/",
+            GrepOptions {
+                timeout: Duration::from_nanos(1),
+                ..grep_options("needle")
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results.recv().await,
+        Some(Err(Error::ResourceExhausted(_)))
+    ));
+    assert!(results.recv().await.is_none());
 }
 
 fn grep_options(pattern: &str) -> GrepOptions {

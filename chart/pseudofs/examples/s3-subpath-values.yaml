@@ -1,0 +1,38 @@
+# Minimal PseudoFS on S3 under one prefix of a shared bucket. storage.path is
+# the filesystem's root; PseudoFS keeps everything beneath it:
+#
+#   s3://my-bucket/teams/agents/pseudofs/metastore/  SlateDB metastore
+#   s3://my-bucket/teams/agents/pseudofs/blobs/      file content blobs
+#
+#   helm install pseudofs oci://ghcr.io/pluralsh/charts/pseudofs \
+#     --namespace telemetry -f s3-subpath-values.yaml
+#
+# The IAM role needs s3:GetObject, s3:PutObject, and s3:DeleteObject on
+# arn:aws:s3:::my-bucket/teams/agents/pseudofs/* and s3:ListBucket on
+# arn:aws:s3:::my-bucket with the condition s3:prefix = teams/agents/pseudofs/*.
+config:
+  filesystem:
+    storage:
+      path: teams/agents/pseudofs
+      object_store:
+        type: Aws
+        region: us-east-1
+        bucket: my-bucket
+    # metastore_wal_path defaults to /var/lib/pseudofs/wal for remote stores,
+    # so WRITTEN acknowledgements wait on the data volume, not on S3.
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/pseudofs
+
+# Without IRSA or EKS Pod Identity, drop the annotation above and read static
+# credentials from a Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+# extraEnvFrom:
+#   - secretRef:
+#       name: pseudofs-s3
+
+# Blobs and the WAL are acknowledged before they reach S3, so the data volume
+# must be persistent (the default). It holds the WAL and up to
+# blobs.cache_capacity_bytes (4 GiB) of blobs.
+persistence:
+  size: 10Gi

@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::BytesRange;
@@ -19,7 +20,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::codec::{TenantScope, directory_entry_key, directory_prefix, inode_key};
-use crate::db::{Child, PseudoFs, components, decode_child, join_path, normalize_path};
+use crate::db::{Caching, Child, PseudoFs, components, decode_child, join_path, normalize_path};
 use crate::error::{Error, Result};
 use crate::model::{DirectoryEntry, FileKind, Generation, Inode};
 
@@ -194,6 +195,9 @@ pub struct GrepOptions {
     /// Fail with [`Error::ResourceExhausted`] after the file walk reads this
     /// many directory entries.
     pub max_scanned_entries: usize,
+    /// Fail with [`Error::ResourceExhausted`] after searching this long. Time
+    /// spent waiting for the receiver to take matches does not count.
+    pub timeout: Duration,
 }
 
 impl Default for GrepOptions {
@@ -208,6 +212,7 @@ impl Default for GrepOptions {
             max_file_size_bytes: 16 * 1024 * 1024,
             concurrency: 8,
             max_scanned_entries: 1_000_000,
+            timeout: Duration::from_secs(30),
         }
     }
 }
@@ -470,6 +475,7 @@ impl PseudoFs {
                 return;
             }
             let concurrency = options.concurrency.max(1);
+            let timeout = options.timeout;
             let budget = Arc::new(AtomicUsize::new(remaining));
             let options = Arc::new(options);
             let receiver_gone = sender.clone();
@@ -500,7 +506,21 @@ impl PseudoFs {
                 })
                 .buffered(concurrency);
             let mut searches = std::pin::pin!(searches);
-            while let Some(searched) = searches.next().await {
+            let mut searching = timeout;
+            loop {
+                let started = tokio::time::Instant::now();
+                let Ok(next) = tokio::time::timeout(searching, searches.next()).await else {
+                    let _ = sender
+                        .send(Err(Error::ResourceExhausted(format!(
+                            "grep searched for longer than {timeout:?}; narrow the path or pattern"
+                        ))))
+                        .await;
+                    return;
+                };
+                searching = searching.saturating_sub(started.elapsed());
+                let Some(searched) = next else {
+                    return;
+                };
                 let matches = match searched {
                     Ok(matches) => matches,
                     Err(error) => {
@@ -668,7 +688,14 @@ impl PseudoFs {
         let reader = self.clone();
         tokio::spawn(async move {
             if let Err(error) = reader
-                .send_content(snapshot, scope, &generations, range, &sender)
+                .send_content(
+                    snapshot,
+                    scope,
+                    &generations,
+                    range,
+                    &sender,
+                    Caching::Bypass,
+                )
                 .await
             {
                 let _ = sender.send(Err(error)).await;

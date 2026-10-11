@@ -57,7 +57,8 @@ spec:
                     description: |-
                       PseudoFSBlobsSpec configures file content stored outside the metastore.
                       Blobs are kept on the data volume until uploaded and then cached there, and
-                      are uploaded to the storage object store with the same credentials.
+                      are uploaded to the storage object store with the same credentials, under
+                      "<storage.path>/blobs".
                     properties:
                       cacheCapacityBytes:
                         default: 4294967296
@@ -75,12 +76,6 @@ spec:
                         format: int64
                         minimum: 0
                         type: integer
-                      path:
-                        description: |-
-                          Path is the object-store prefix for blobs. Defaults to
-                          "<storage.path>-blobs".
-                        minLength: 1
-                        type: string
                       uploadConcurrency:
                         default: 4
                         format: int32
@@ -93,10 +88,11 @@ spec:
                     minimum: 1
                     type: integer
                   inlineThresholdBytes:
-                    default: 65536
+                    default: 16384
                     description: |-
                       InlineThresholdBytes is the largest write stored in the metastore
-                      rather than as a blob.
+                      rather than as a blob. Inline bytes pass through the metastore's WAL and
+                      compactions, so raising this trades metastore write load for fewer blobs.
                     format: int64
                     maximum: 16777216
                     minimum: 0
@@ -174,6 +170,14 @@ spec:
                         format: int64
                         minimum: 1
                         type: integer
+                      maxGrepSeconds:
+                        default: 30
+                        description: |-
+                          MaxGrepSeconds is how long one Grep request may search before failing
+                          with RESOURCE_EXHAUSTED after the matches already sent.
+                        format: int32
+                        minimum: 1
+                        type: integer
                       maxScannedEntries:
                         default: 1000000
                         description: |-
@@ -196,6 +200,10 @@ spec:
                   storage:
                     default:
                       path: pseudofs
+                    description: |-
+                      Storage.Path is the filesystem's root prefix in the object store: the
+                      metastore is kept under "<path>/metastore" and blobs under
+                      "<path>/blobs".
                     properties:
                       blockCache:
                         properties:
@@ -635,6 +643,10 @@ spec:
                         type: string
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: storage.path must be an object-store prefix without leading,
+                    trailing, or repeated '/'
+                  rule: '!has(self.storage) || !has(self.storage.path) || self.storage.path.matches(''^[^/]+(/[^/]+)*$'')'
               image:
                 default:
                   pullPolicy: IfNotPresent

@@ -48,15 +48,33 @@
           "additionalProperties": false,
           "required": ["storage", "chunk_size_bytes", "max_file_size_bytes", "max_append_generations"],
           "properties": {
-            "storage": {"type": "object"},
-            "metastore_wal_path": {"type": "string", "minLength": 1},
+            "storage": {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": {"type": "string", "enum": ["SlateDb", "InMemory"]},
+                "path": {"type": "string", "pattern": "^[^/]+(/[^/]+)*$"},
+                "settings_path": {"type": "string", "minLength": 1},
+                "object_store": {"$ref": "#/definitions/objectStore"},
+                "block_cache": {"$ref": "#/definitions/blockCache"},
+                "meta_cache": {"$ref": "#/definitions/blockCache"},
+                "disk": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "throughput_bytes_per_second": {"type": "integer", "minimum": 1},
+                    "iops": {"type": "integer", "minimum": 1}
+                  }
+                }
+              }
+            },
+            "metastore_wal_path": {"type": "string"},
             "blobs": {
               "type": "object",
               "additionalProperties": false,
               "required": ["local_path"],
               "properties": {
-                "object_store": {"type": "object"},
-                "path": {"type": "string"},
+                "object_store": {"$ref": "#/definitions/objectStore"},
                 "local_path": {"type": "string", "minLength": 1},
                 "cache_capacity_bytes": {"type": "integer", "minimum": 1},
                 "upload_concurrency": {"type": "integer", "minimum": 1},
@@ -84,7 +102,8 @@
             "default_grep_file_size_bytes": {"type": "integer", "minimum": 1},
             "max_grep_file_size_bytes": {"type": "integer", "minimum": 1},
             "grep_concurrency": {"type": "integer", "minimum": 1},
-            "max_scanned_entries": {"type": "integer", "minimum": 1}
+            "max_scanned_entries": {"type": "integer", "minimum": 1},
+            "max_grep_seconds": {"type": "integer", "minimum": 1}
           }
         }
       }
@@ -135,6 +154,39 @@
     "extraVolumeMounts": {"type": "array"}
   },
   "definitions": {
+    "objectStore": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"type": "string", "enum": ["InMemory", "Local", "Aws", "Azure", "Gcp"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "Local"}}}, "then": {"required": ["path"]}},
+        {"if": {"properties": {"type": {"const": "Aws"}}}, "then": {"required": ["region", "bucket"]}},
+        {"if": {"properties": {"type": {"const": "Azure"}}}, "then": {"required": ["account", "container"]}},
+        {"if": {"properties": {"type": {"const": "Gcp"}}}, "then": {"required": ["bucket"]}}
+      ]
+    },
+    "blockCache": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"type": "string", "enum": ["FoyerHybrid", "FoyerMemory"]},
+        "memory_capacity": {"type": "integer", "minimum": 1},
+        "disk_capacity": {"type": "integer", "minimum": 1},
+        "disk_path": {"type": "string", "pattern": "^/"},
+        "write_policy": {"type": "string", "enum": ["WriteOnInsertion", "WriteOnEviction"]},
+        "flushers": {"type": "integer", "minimum": 1},
+        "buffer_pool_size": {"type": "integer", "minimum": 1},
+        "submit_queue_size_threshold": {"type": "integer", "minimum": 1},
+        "capacity": {"type": "integer", "minimum": 1},
+        "shards": {"type": "integer", "minimum": 1}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "FoyerHybrid"}}}, "then": {"required": ["memory_capacity", "disk_capacity", "disk_path"]}},
+        {"if": {"properties": {"type": {"const": "FoyerMemory"}}}, "then": {"required": ["capacity"]}}
+      ]
+    },
     "persistence": {
       "type": "object",
       "additionalProperties": false,

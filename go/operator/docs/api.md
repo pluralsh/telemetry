@@ -837,7 +837,8 @@ _Appears in:_
 
 PseudoFSBlobsSpec configures file content stored outside the metastore.
 Blobs are kept on the data volume until uploaded and then cached there, and
-are uploaded to the storage object store with the same credentials.
+are uploaded to the storage object store with the same credentials, under
+"<storage.path>/blobs".
 
 
 
@@ -846,7 +847,6 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `path` _string_ | Path is the object-store prefix for blobs. Defaults to<br />"<storage.path>-blobs". |  | MinLength: 1 <br /> |
 | `cacheCapacityBytes` _integer_ | CacheCapacityBytes bounds blob usage of the data volume, including<br />blobs awaiting upload. Keep it well below the volume size. | 4294967296 | Minimum: 1 <br /> |
 | `uploadConcurrency` _integer_ |  | 4 | Minimum: 1 <br /> |
 | `gcGraceSeconds` _integer_ | GCGraceSeconds is how long unreferenced blobs are kept so in-flight<br />reads of replaced files can finish. | 300 | Minimum: 0 <br /> |
@@ -865,14 +865,14 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:pseudofs \} |  |
+| `storage` _[StorageSpec](#storagespec)_ | Storage.Path is the filesystem's root prefix in the object store: the<br />metastore is kept under "<path>/metastore" and blobs under<br />"<path>/blobs". | \{ path:pseudofs \} |  |
 | `chunkSizeBytes` _integer_ |  | 1048576 | Minimum: 1 <br /> |
 | `maxFileSizeBytes` _integer_ |  | 1073741824 | Minimum: 1 <br /> |
 | `maxAppendGenerations` _integer_ |  | 64 | Minimum: 2 <br /> |
 | `maxUnaryFileSizeBytes` _integer_ |  | 8388608 | Minimum: 1 <br /> |
 | `maxDecodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
 | `maxEncodingMessageBytes` _integer_ |  | 16777216 | Minimum: 1 <br /> |
-| `inlineThresholdBytes` _integer_ | InlineThresholdBytes is the largest write stored in the metastore<br />rather than as a blob. | 65536 | Maximum: 1.6777216e+07 <br />Minimum: 0 <br /> |
+| `inlineThresholdBytes` _integer_ | InlineThresholdBytes is the largest write stored in the metastore<br />rather than as a blob. Inline bytes pass through the metastore's WAL and<br />compactions, so raising this trades metastore write load for fewer blobs. | 16384 | Maximum: 1.6777216e+07 <br />Minimum: 0 <br /> |
 | `blobs` _[PseudoFSBlobsSpec](#pseudofsblobsspec)_ |  | \{  \} |  |
 | `search` _[PseudoFSSearchSpec](#pseudofssearchspec)_ |  | \{  \} |  |
 
@@ -900,6 +900,7 @@ _Appears in:_
 | `maxGrepFileSizeBytes` _integer_ |  | 67108864 | Minimum: 1 <br /> |
 | `grepConcurrency` _integer_ | GrepConcurrency is how many files one Grep request searches at once. | 8 | Minimum: 1 <br /> |
 | `maxScannedEntries` _integer_ | MaxScannedEntries is how many directory entries one Glob or Grep walk<br />may read before failing with RESOURCE_EXHAUSTED. | 1000000 | Minimum: 1 <br /> |
+| `maxGrepSeconds` _integer_ | MaxGrepSeconds is how long one Grep request may search before failing<br />with RESOURCE_EXHAUSTED after the matches already sent. | 30 | Minimum: 1 <br /> |
 
 
 #### PseudoFSServiceSpec

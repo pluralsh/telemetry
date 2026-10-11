@@ -50,6 +50,9 @@ pub struct SearchLimits {
     /// Directory entries one Glob or Grep walk may read before failing with
     /// RESOURCE_EXHAUSTED.
     pub max_scanned_entries: u64,
+    /// Seconds one Grep request may spend searching before failing with
+    /// RESOURCE_EXHAUSTED after the matches already sent.
+    pub max_grep_seconds: u32,
 }
 
 impl Default for SearchLimits {
@@ -64,15 +67,17 @@ impl Default for SearchLimits {
             max_grep_file_size_bytes: 64 * 1024 * 1024,
             grep_concurrency: 8,
             max_scanned_entries: 1_000_000,
+            max_grep_seconds: 30,
         }
     }
 }
 
 impl SearchLimits {
     fn validate(&self) -> Result<(), String> {
-        if self.grep_concurrency == 0 || self.max_scanned_entries == 0 {
+        if self.grep_concurrency == 0 || self.max_scanned_entries == 0 || self.max_grep_seconds == 0
+        {
             return Err(
-                "search.grep_concurrency and search.max_scanned_entries must be positive"
+                "search.grep_concurrency, search.max_scanned_entries, and search.max_grep_seconds must be positive"
                     .to_owned(),
             );
         }

@@ -9,9 +9,10 @@
 //! Blobs are written to `staging/`, fsynced, and renamed into `blobs/` before
 //! any metadata references them. A blob stays pinned on local disk until the
 //! uploader copies it to the remote store; after that its local copy is an
-//! ordinary least-recently-used cache entry. Cache misses either download the
-//! whole blob into the cache or, for partial reads, stream the requested range
-//! straight from the remote store.
+//! ordinary least-recently-used cache entry. A whole-blob miss downloads the
+//! blob once, however many readers miss at the same time, streaming it to the
+//! first reader while the cache fills. Partial reads stream the requested
+//! range straight from the remote store.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
@@ -49,6 +50,7 @@ pub(crate) struct BlobStore {
     capacity: u64,
     state: Mutex<CacheState>,
     staging: Arc<Staging>,
+    flights: Flights,
 }
 
 /// Bytes in staged blobs, released when a staged blob is committed or dropped.
@@ -111,6 +113,63 @@ impl Drop for StagedBlob {
     }
 }
 
+pub(crate) enum Fetch {
+    Local(tokio::fs::File),
+    Download(BlobDownload),
+}
+
+/// A cache fill in progress, finished by [`BlobStore::finish_download`].
+/// Other misses for the blob wait until it is finished or dropped; dropping
+/// it removes the partial file.
+pub(crate) struct BlobDownload {
+    path: Option<PathBuf>,
+    writer: BufWriter<tokio::fs::File>,
+    len: u64,
+    _flight: Flight,
+}
+
+impl BlobDownload {
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes).await?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+impl Drop for BlobDownload {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+type Flights = Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Exclusive right to download one blob. The map entry is removed once no
+/// other miss is waiting on it.
+struct Flight {
+    id: Uuid,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    flights: Flights,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut flights = lock(&self.flights);
+        // The map and this guard hold one reference each; any more are waiters.
+        if Arc::strong_count(tokio::sync::OwnedMutexGuard::mutex(&self.guard)) <= 2 {
+            flights.remove(&self.id);
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl BlobStore {
     /// Opens the local directory, discarding unfinished staged files and
     /// pinning every local blob in `pending` until it is uploaded.
@@ -137,6 +196,7 @@ impl BlobStore {
             capacity,
             state: Mutex::new(CacheState::default()),
             staging: Arc::default(),
+            flights: Flights::default(),
         };
         let mut entries = tokio::fs::read_dir(&store.blobs_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -332,41 +392,127 @@ impl BlobStore {
         }
     }
 
-    /// Downloads a whole blob into the local cache and returns an open handle,
-    /// which stays readable even if the cache evicts the blob immediately.
-    pub(crate) async fn fetch(&self, id: Uuid) -> Result<tokio::fs::File> {
-        let staging = self.staging_dir.join(format!("fetch-{}", Uuid::new_v4()));
+    /// Opens the local copy of a blob, if one exists, without refreshing its
+    /// place in the cache, so scans do not keep blobs cached.
+    pub(crate) async fn peek_local(&self, id: Uuid) -> Result<Option<tokio::fs::File>> {
+        if !self.lock().entries.contains_key(&id) {
+            return Ok(None);
+        }
+        match tokio::fs::File::open(self.local_path(id)).await {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Waits for any download of `id` already in flight, then returns the
+    /// local copy if there is one, or a download for the caller to drive.
+    /// Concurrent misses for one blob therefore download it once.
+    pub(crate) async fn fetch(&self, id: Uuid) -> Result<Fetch> {
+        let flight = {
+            let mut flights = lock(&self.flights);
+            Arc::clone(flights.entry(id).or_default())
+        };
+        let flight = Flight {
+            id,
+            guard: flight.lock_owned().await,
+            flights: Arc::clone(&self.flights),
+        };
+        if let Some(file) = self.open_local(id).await? {
+            return Ok(Fetch::Local(file));
+        }
+        self.start_download(flight).await.map(Fetch::Download)
+    }
+
+    /// Starts a download of `id` unless it is cached or already downloading.
+    pub(crate) async fn try_fetch(&self, id: Uuid) -> Result<Option<BlobDownload>> {
+        if lock(&self.state).entries.contains_key(&id) {
+            return Ok(None);
+        }
+        let guard = {
+            let mut flights = lock(&self.flights);
+            if flights.contains_key(&id) {
+                return Ok(None);
+            }
+            let flight = Arc::new(tokio::sync::Mutex::new(()));
+            let Ok(guard) = Arc::clone(&flight).try_lock_owned() else {
+                return Ok(None);
+            };
+            flights.insert(id, flight);
+            guard
+        };
+        let flight = Flight {
+            id,
+            guard,
+            flights: Arc::clone(&self.flights),
+        };
+        self.start_download(flight).await.map(Some)
+    }
+
+    async fn start_download(&self, flight: Flight) -> Result<BlobDownload> {
+        let path = self.staging_dir.join(format!("fetch-{}", Uuid::new_v4()));
+        let file = tokio::fs::File::create(&path)
+            .await
+            .map_err(io_error("create fetched blob", &path))?;
+        Ok(BlobDownload {
+            path: Some(path),
+            writer: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
+            len: 0,
+            _flight: flight,
+        })
+    }
+
+    /// Fsyncs a finished download and adds it to the cache.
+    pub(crate) async fn finish_download(&self, mut download: BlobDownload) -> Result<()> {
+        download.writer.flush().await?;
+        download.writer.get_ref().sync_all().await?;
+        let id = download._flight.id;
         let target = self.local_path(id);
-        let fetched: Result<(u64, tokio::fs::File)> = async {
-            let mut stream = self.remote.get(&self.remote_path(id)).await?.into_stream();
-            let mut writer =
-                BufWriter::with_capacity(IO_BUFFER_BYTES, tokio::fs::File::create(&staging).await?);
-            let mut size = 0;
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                size += bytes.len() as u64;
-                writer.write_all(&bytes).await?;
-            }
-            writer.flush().await?;
-            writer.get_ref().sync_all().await?;
-            tokio::fs::rename(&staging, &target).await?;
-            let file = tokio::fs::File::open(&target)
-                .await
-                .map_err(io_error("open fetched blob", &target))?;
-            Ok((size, file))
+        let path = download
+            .path
+            .take()
+            .ok_or_else(|| Error::Blob("download already finished".to_owned()))?;
+        if let Err(error) = tokio::fs::rename(&path, &target).await {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(io_error("cache fetched blob", &target)(error));
         }
-        .await;
-        match fetched {
-            Ok((size, file)) => {
-                self.register(id, size, false);
-                self.evict().await;
-                Ok(file)
-            }
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&staging).await;
-                Err(error)
-            }
+        self.register(id, download.len, false);
+        self.evict().await;
+        Ok(())
+    }
+
+    /// Downloads a whole blob into the cache, or waits for a download already
+    /// in flight, and returns an open handle that stays readable even if the
+    /// cache evicts the blob immediately.
+    #[cfg(test)]
+    pub(crate) async fn download(&self, id: Uuid) -> Result<tokio::fs::File> {
+        let mut download = match self.fetch(id).await? {
+            Fetch::Local(file) => return Ok(file),
+            Fetch::Download(download) => download,
+        };
+        let mut stream = self.remote_stream(id).await?;
+        while let Some(bytes) = stream.next().await {
+            download.write(&bytes?).await?;
         }
+        let reader = match &download.path {
+            Some(path) => tokio::fs::File::open(path).await?,
+            None => return Err(Error::Blob("download already finished".to_owned())),
+        };
+        self.finish_download(download).await?;
+        Ok(reader)
+    }
+
+    pub(crate) async fn remote_stream(
+        &self,
+        id: Uuid,
+    ) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let stream = self
+            .remote
+            .get(&self.remote_path(id))
+            .await?
+            .into_stream()
+            .map(|bytes| bytes.map_err(Error::from));
+        Ok(stream.boxed())
     }
 
     pub(crate) async fn remote_range(
@@ -396,9 +542,7 @@ impl BlobStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock(&self.state)
     }
 
     fn register(&self, id: Uuid, size: u64, pinned: bool) {
@@ -529,7 +673,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         store
-            .fetch(first)
+            .download(first)
             .await
             .unwrap()
             .read_to_end(&mut bytes)
@@ -540,9 +684,52 @@ mod tests {
 
         store.upload(second).await.unwrap();
         store.mark_uploaded(second).await;
-        store.fetch(first).await.unwrap();
+        store.download(first).await.unwrap();
         assert!(store.open_local(first).await.unwrap().is_some());
         assert!(store.open_local(second).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path(), 1024).await;
+        let id = write(&store, b"shared").await;
+        store.upload(id).await.unwrap();
+        store.mark_uploaded(id).await;
+        store.forget(id);
+        tokio::fs::remove_file(store.local_path(id)).await.unwrap();
+
+        let Fetch::Download(abandoned) = store.fetch(id).await.unwrap() else {
+            panic!("expected a download");
+        };
+        assert!(store.try_fetch(id).await.unwrap().is_none());
+        drop(abandoned);
+        assert!(lock(&store.flights).is_empty());
+        let fetches = std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count();
+        assert_eq!(fetches, 0);
+
+        let Fetch::Download(mut download) = store.fetch(id).await.unwrap() else {
+            panic!("expected a download");
+        };
+        let waiter = store.fetch(id);
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "a second miss must wait for the download in flight"
+        );
+        download.write(b"shared").await.unwrap();
+        store.finish_download(download).await.unwrap();
+        let Fetch::Local(mut file) = waiter.await.unwrap() else {
+            panic!("the waiter should find the cached copy");
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"shared");
+        assert!(lock(&store.flights).is_empty());
     }
 
     #[tokio::test]
@@ -563,7 +750,7 @@ mod tests {
 
         store.delete(id).await.unwrap();
         assert!(store.open_local(id).await.unwrap().is_none());
-        assert!(store.fetch(id).await.is_err());
+        assert!(store.download(id).await.is_err());
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ pub struct FileUpload {
     byte_len: u64,
     inline: BytesMut,
     staged: Option<StagedBlob>,
-    expected: Option<(Uuid, Option<Uuid>)>,
+    compaction: Option<TailCompaction>,
     finished: bool,
 }
 
@@ -43,15 +43,15 @@ impl FileUpload {
             byte_len: 0,
             inline: BytesMut::new(),
             staged: None,
-            expected: None,
+            compaction: None,
             finished: false,
         }
     }
 
-    /// Commits only if the file is still `inode` at `head`, preserving its
-    /// timestamps. Used to rewrite content without changing it.
-    pub(crate) fn expecting(mut self, inode: Uuid, head: Option<Uuid>) -> Self {
-        self.expected = Some((inode, head));
+    /// Commits the uploaded bytes as the merged replacement for `tail`,
+    /// leaving the file's size and timestamps unchanged.
+    pub(crate) fn compacting(mut self, tail: TailCompaction) -> Self {
+        self.compaction = Some(tail);
         self
     }
 
@@ -128,7 +128,11 @@ impl FileUpload {
             }
             None => Content::Inline,
         };
-        match self.commit(content, durability).await {
+        let committed = match self.compaction {
+            Some(tail) => self.commit_compaction(content, tail).await,
+            None => self.commit(content, durability).await,
+        };
+        match committed {
             Ok(size) => Ok(size),
             Err(error) => {
                 if let Content::Blob { id } = content {
@@ -149,7 +153,7 @@ impl FileUpload {
     async fn commit(&mut self, content: Content, durability: Durability) -> Result<u64> {
         let fs = self.fs.clone();
         let scope = self.scope;
-        let guard = fs.mutation_guard().await;
+        let guard = fs.mutation_guard(scope).await;
         let current = fs
             .resolve_for_mutation(&self.tenant, scope, &self.path)
             .await?;
@@ -158,11 +162,6 @@ impl FileUpload {
             .is_some_and(|inode| inode.kind == FileKind::Directory)
         {
             return Err(Error::IsDirectory(self.path.clone()));
-        }
-        if let Some(expected) = self.expected
-            && current.as_ref().map(|inode| (inode.id, inode.head)) != Some(expected)
-        {
-            return Err(Error::Conflict(self.path.clone()));
         }
         if self.append
             && self.byte_len == 0
@@ -189,13 +188,18 @@ impl FileUpload {
                 "file exceeds max_file_size_bytes ({max_size})"
             )));
         }
+        let max_chain = append_generation_cap(fs.inner.config.max_append_generations);
+        if self.append && inode.generation_count >= max_chain {
+            fs.request_compaction(&self.tenant, &self.path);
+            return Err(Error::ResourceExhausted(format!(
+                "'{}' has {} unmerged appends; retry once compaction catches up",
+                self.path, inode.generation_count
+            )));
+        }
         let garbage = if self.append {
             None
         } else {
-            inode.head.map(|head| GarbageMarker {
-                inode_id: inode.id,
-                head,
-            })
+            GarbageMarker::chain(&inode)
         };
         let generation = Generation {
             inode_id: inode.id,
@@ -224,10 +228,8 @@ impl FileUpload {
         }
         inode.kind = FileKind::File;
         inode.size = size;
-        if self.expected.is_none() {
-            inode.mtime = timestamp;
-            inode.ctime = timestamp;
-        }
+        inode.mtime = timestamp;
+        inode.ctime = timestamp;
         inode.head = Some(generation.id);
         inode.generation_count = if self.append {
             inode.generation_count + 1
@@ -248,20 +250,113 @@ impl FileUpload {
         }
         fs.inner.storage.apply(ops).await?;
         drop(guard);
-        fs.finish_durability(durability).await?;
-        if let Some(marker) = garbage {
-            fs.collect_generation_chain(scope, &marker).await;
-        }
-        if pending_upload {
-            fs.notify_blob_worker();
-        }
-        if self.append
-            && inode
-                .generation_count
-                .is_multiple_of(fs.inner.config.max_append_generations)
-        {
+        if self.append && inode.generation_count >= fs.inner.config.max_append_generations {
             fs.request_compaction(&self.tenant, &self.path);
+        }
+        fs.finish_durability(durability).await?;
+        if garbage.is_some() || pending_upload {
+            fs.notify_blob_worker();
         }
         Ok(size)
     }
+
+    /// Commits a merged copy of the generations after `prefix` through
+    /// `old_head`. Appends committed since the merge was read stay on top: the
+    /// generation that pointed at `old_head` is repointed at the merged one.
+    async fn commit_compaction(&mut self, content: Content, tail: TailCompaction) -> Result<u64> {
+        let fs = self.fs.clone();
+        let scope = self.scope;
+        let _guard = fs.mutation_guard(scope).await;
+        let conflict = || Error::Conflict(self.path.clone());
+        let mut inode = fs
+            .resolve_for_mutation(&self.tenant, scope, &self.path)
+            .await?
+            .filter(|inode| inode.id == tail.inode_id && inode.kind == FileKind::File)
+            .ok_or_else(conflict)?;
+        let generation = Generation {
+            inode_id: inode.id,
+            id: Uuid::new_v4(),
+            previous: tail.prefix,
+            byte_len: self.byte_len,
+            content,
+        };
+        let mut ops = Vec::new();
+        if inode.head == Some(tail.old_head) {
+            inode.head = Some(generation.id);
+        } else {
+            let mut cursor = inode.head;
+            let mut steps = 0;
+            let newer = loop {
+                let id = cursor
+                    .filter(|_| steps < inode.generation_count)
+                    .ok_or_else(conflict)?;
+                steps += 1;
+                let key = generation_key(scope, inode.id, id);
+                let newer: Generation = fs
+                    .get_json(key.clone())
+                    .await?
+                    .ok_or_else(|| Error::Corrupt(format!("missing generation {id}")))?;
+                if newer.previous == Some(tail.old_head) {
+                    break (key, newer);
+                }
+                cursor = newer.previous;
+            };
+            let (key, mut newer) = newer;
+            newer.previous = Some(generation.id);
+            ops.push(put_op(key, encode(&newer)?));
+        }
+        let pending_upload = match content {
+            Content::Inline if self.byte_len > 0 => {
+                ops.push(put_op(
+                    content_key(scope, inode.id, generation.id),
+                    std::mem::take(&mut self.inline).freeze(),
+                ));
+                false
+            }
+            Content::Inline => false,
+            Content::Blob { id } => {
+                ops.push(put_op(
+                    pending_blob_key(scope, id),
+                    encode(&PendingBlob {
+                        size: self.byte_len,
+                    })?,
+                ));
+                true
+            }
+        };
+        inode.generation_count = inode.generation_count + 1 - tail.generations;
+        let marker = GarbageMarker {
+            inode_id: inode.id,
+            head: tail.old_head,
+            stop: tail.prefix,
+        };
+        ops.push(put_op(
+            generation_key(scope, inode.id, generation.id),
+            encode(&generation)?,
+        ));
+        ops.push(put_op(inode_key(scope, inode.id), encode(&inode)?));
+        ops.push(put_op(garbage_key(scope, marker.head), encode(&marker)?));
+        fs.inner.storage.apply(ops).await?;
+        fs.notify_garbage_worker();
+        if pending_upload {
+            fs.notify_blob_worker();
+        }
+        Ok(inode.size)
+    }
+}
+
+/// The run of an append chain a compaction replaces: `generations`
+/// generations from `old_head` back to, but not including, `prefix`.
+#[derive(Clone, Copy)]
+pub(crate) struct TailCompaction {
+    pub(crate) inode_id: Uuid,
+    pub(crate) old_head: Uuid,
+    pub(crate) prefix: Option<Uuid>,
+    pub(crate) generations: u64,
+}
+
+/// Appends fail past this many unmerged generations, bounding read cost when
+/// compaction falls behind.
+pub(crate) fn append_generation_cap(max_append_generations: u64) -> u64 {
+    max_append_generations.saturating_mul(16).max(1024)
 }

@@ -1,3 +1,17 @@
+{{- $filesystem := deepCopy .Values.config.filesystem }}
+{{- $objectStore := dig "storage" "object_store" (dict) $filesystem }}
+{{- $remote := not (has (get $objectStore "type" | default "Local") (list "Local" "InMemory")) }}
+{{- /* Overriding the default Local store keeps its merged-in path. */}}
+{{- if $remote }}
+{{- $_ := unset $objectStore "path" }}
+{{- end }}
+{{- if not (hasKey $filesystem "metastore_wal_path") }}
+{{- if $remote }}
+{{- $_ := set $filesystem "metastore_wal_path" (printf "%s/wal" .Values.persistence.mountPath) }}
+{{- end }}
+{{- else if eq (toString $filesystem.metastore_wal_path) "" }}
+{{- $_ := unset $filesystem "metastore_wal_path" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,7 +22,7 @@ data:
   pseudofs.yaml: |
     listener: 0.0.0.0:{{ .Values.service.port }}
     filesystem:
-      {{- toYaml .Values.config.filesystem | nindent 6 }}
+      {{- toYaml $filesystem | nindent 6 }}
     max_unary_file_size_bytes: {{ printf "%.0f" .Values.config.maxUnaryFileSizeBytes }}
     max_decoding_message_bytes: {{ printf "%.0f" .Values.config.maxDecodingMessageBytes }}
     max_encoding_message_bytes: {{ printf "%.0f" .Values.config.maxEncodingMessageBytes }}

@@ -195,6 +195,11 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 	}
 	descriptor := resources.PseudoFSDescriptor
 	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload))
+	// PseudoFS metadata usually fits in memory; writing every inserted block
+	// to disk costs direct I/O on the request path for no hit-rate gain.
+	if cache := storage.BlockCache; cache != nil && cache.Type == string(telemetryv1alpha1.CacheFoyerHybrid) {
+		cache.WritePolicy = lo.CoalesceOrEmpty(cache.WritePolicy, "WriteOnEviction")
+	}
 	walPath := ""
 	switch telemetryv1alpha1.ObjectStoreType(storage.ObjectStore.Type) {
 	case telemetryv1alpha1.ObjectStoreLocal, telemetryv1alpha1.ObjectStoreInMemory:
@@ -207,13 +212,12 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 			Storage:          storage,
 			MetastoreWALPath: walPath,
 			Blobs: renderPseudoFSBlobs{
-				Path:               spec.Blobs.Path,
 				LocalPath:          descriptor.DataPath + "/blobs",
 				CacheCapacityBytes: blobCapacity,
 				UploadConcurrency:  int32Value(spec.Blobs.UploadConcurrency, 4),
 				GCGraceSeconds:     int64Value(spec.Blobs.GCGraceSeconds, 300),
 			},
-			InlineThresholdBytes: int64Value(spec.InlineThresholdBytes, 65536),
+			InlineThresholdBytes: int64Value(spec.InlineThresholdBytes, 16384),
 			ChunkSizeBytes:       int64Value(spec.ChunkSizeBytes, 1048576),
 			MaxFileSizeBytes:     int64Value(spec.MaxFileSizeBytes, 1073741824),
 			MaxAppendGenerations: int64Value(spec.MaxAppendGenerations, 64),
@@ -241,6 +245,7 @@ func renderPseudoFSSearchConfig(spec telemetryv1alpha1.PseudoFSSearchSpec) (rend
 		MaxGrepFileSizeBytes:     int64Value(spec.MaxGrepFileSizeBytes, 67108864),
 		GrepConcurrency:          int32Value(spec.GrepConcurrency, 8),
 		MaxScannedEntries:        int64Value(spec.MaxScannedEntries, 1000000),
+		MaxGrepSeconds:           int32Value(spec.MaxGrepSeconds, 30),
 	}
 	for _, limit := range []struct {
 		name         string
@@ -796,7 +801,6 @@ type renderPseudoFSFilesystem struct {
 	MaxAppendGenerations int64               `json:"max_append_generations"`
 }
 type renderPseudoFSBlobs struct {
-	Path               string `json:"path,omitempty"`
 	LocalPath          string `json:"local_path"`
 	CacheCapacityBytes int64  `json:"cache_capacity_bytes"`
 	UploadConcurrency  int32  `json:"upload_concurrency"`
@@ -812,6 +816,7 @@ type renderPseudoFSSearch struct {
 	MaxGrepFileSizeBytes     int64 `json:"max_grep_file_size_bytes"`
 	GrepConcurrency          int32 `json:"grep_concurrency"`
 	MaxScannedEntries        int64 `json:"max_scanned_entries"`
+	MaxGrepSeconds           int32 `json:"max_grep_seconds"`
 }
 type renderTracesPage struct {
 	TargetSizeBytes int64 `json:"target_size_bytes"`

@@ -67,7 +67,7 @@ IMPL_CONFIGS: dict[str, dict[str, Any]] = {
         "max_data_mib": 1536,
     },
     "production": {
-        "inline_threshold": 64 * 1024,
+        "inline_threshold": 16 * 1024,
         "max_file_mib": 96,
         "limits": Limits(max_unary_bytes=8 * MIB, grep_concurrency=8),
         "max_data_mib": 3072,

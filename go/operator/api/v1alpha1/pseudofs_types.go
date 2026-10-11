@@ -12,7 +12,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:validation:XValidation:rule="!has(self.storage) || !has(self.storage.path) || self.storage.path.matches('^[^/]+(/[^/]+)*$')",message="storage.path must be an object-store prefix without leading, trailing, or repeated '/'"
 type PseudoFSConfigSpec struct {
+	// Storage.Path is the filesystem's root prefix in the object store: the
+	// metastore is kept under "<path>/metastore" and blobs under
+	// "<path>/blobs".
 	// +kubebuilder:default={"path":"pseudofs"}
 	Storage StorageSpec `json:"storage,omitempty"`
 	// +kubebuilder:validation:Minimum=1
@@ -34,10 +38,11 @@ type PseudoFSConfigSpec struct {
 	// +kubebuilder:default=16777216
 	MaxEncodingMessageBytes *int64 `json:"maxEncodingMessageBytes,omitempty"`
 	// InlineThresholdBytes is the largest write stored in the metastore
-	// rather than as a blob.
+	// rather than as a blob. Inline bytes pass through the metastore's WAL and
+	// compactions, so raising this trades metastore write load for fewer blobs.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=16777216
-	// +kubebuilder:default=65536
+	// +kubebuilder:default=16384
 	InlineThresholdBytes *int64 `json:"inlineThresholdBytes,omitempty"`
 	// +kubebuilder:default={}
 	Blobs PseudoFSBlobsSpec `json:"blobs,omitempty"`
@@ -47,12 +52,9 @@ type PseudoFSConfigSpec struct {
 
 // PseudoFSBlobsSpec configures file content stored outside the metastore.
 // Blobs are kept on the data volume until uploaded and then cached there, and
-// are uploaded to the storage object store with the same credentials.
+// are uploaded to the storage object store with the same credentials, under
+// "<storage.path>/blobs".
 type PseudoFSBlobsSpec struct {
-	// Path is the object-store prefix for blobs. Defaults to
-	// "<storage.path>-blobs".
-	// +kubebuilder:validation:MinLength=1
-	Path string `json:"path,omitempty"`
 	// CacheCapacityBytes bounds blob usage of the data volume, including
 	// blobs awaiting upload. Keep it well below the volume size.
 	// +kubebuilder:validation:Minimum=1
@@ -104,6 +106,11 @@ type PseudoFSSearchSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1000000
 	MaxScannedEntries *int64 `json:"maxScannedEntries,omitempty"`
+	// MaxGrepSeconds is how long one Grep request may search before failing
+	// with RESOURCE_EXHAUSTED after the matches already sent.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=30
+	MaxGrepSeconds *int32 `json:"maxGrepSeconds,omitempty"`
 }
 
 type PseudoFSServiceSpec struct {
