@@ -12,6 +12,7 @@ import struct
 import time
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -450,6 +451,49 @@ class MetricsFuzz(FuzzProduct):
         )
         with urllib.request.urlopen(request, timeout=300):
             pass
+
+    def diagnose_invisible(
+        self, index: int, probes: list[Probe], send: Callable[[Request], Exchange]
+    ) -> dict[str, Exchange]:
+        """The sentinel probe traced, then rephrased past each read-path cache:
+        a regex round matcher misses the term and selector postings entries,
+        the per-round breakdown and series API take other plans, and the
+        round's data series share no selector with the sentinels."""
+        probe = next(probe for probe in probes if probe.name == "sentinel")
+        at = dict(probe.request.params)["time"]
+        run = quote(self.config.run_id)
+        sentinel = f'fuzz_sentinel{{fuzz_run={run}, fuzz_round="{index}"}}'
+        end_s = float(at)
+
+        def query(expr: str, *extra: tuple[str, str]) -> Exchange:
+            return send(
+                Request("GET", "/api/v1/query", (("query", expr), ("time", at), *extra))
+            )
+
+        return {
+            "probe_traced": query(f"count({sentinel})", ("trace", "true")),
+            "probe_regex": query(
+                f'count(fuzz_sentinel{{fuzz_run={run}, fuzz_round=~"{index}|"}})'
+            ),
+            "sentinels_by_round": query(
+                f"count by (fuzz_round) (fuzz_sentinel{{fuzz_run={run}}})"
+            ),
+            "round_data": query(
+                f'count({{fuzz_run={run}, fuzz_round="{index}", '
+                f'__name__!="fuzz_sentinel"}})'
+            ),
+            "series_api": send(
+                Request(
+                    "GET",
+                    "/api/v1/series",
+                    (
+                        ("match[]", sentinel),
+                        ("start", f"{end_s - 3600:.3f}"),
+                        ("end", f"{end_s + 60:.3f}"),
+                    ),
+                )
+            ),
+        }
 
     def describe(self) -> dict[str, object]:
         return {

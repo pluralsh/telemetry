@@ -21,6 +21,16 @@ from .recorder import CaseRecord, IngestRecord, Recorder, RoundRecord, Summary
 from .resources import DockerApi, ResourceSampler, docker_socket
 from .transport import SUCCESS, Exchange, Handler, Request, Transport
 
+# How long a round the implementation never showed is polled further, to
+# tell a late round from a lost one.
+DIAGNOSE_WAIT_S = 120.0
+DIAGNOSTIC_BODY_BYTES = 16384
+
+
+def describe(exchange: Exchange) -> dict[str, object]:
+    body = exchange.body[:DIAGNOSTIC_BODY_BYTES].decode("utf-8", "replace")
+    return {**exchange.describe(), "body": body}
+
 
 class Mismatch(Exception):
     """Both sides answered successfully but semantically differently."""
@@ -107,6 +117,13 @@ class FuzzProduct(ABC):
     def after_ingest(self, index: int) -> None:
         """Called once a round's writes are sent, before visibility polling."""
         return None
+
+    def diagnose_invisible(
+        self, index: int, probes: list[Probe], send: Callable[[Request], Exchange]
+    ) -> dict[str, Exchange]:
+        """Requests that narrow down why `probes` never held on the
+        implementation, sent there through `send` and keyed by description."""
+        return {}
 
     def floor_urls(self) -> dict[str, str]:
         """Compose service -> a trivial URL (readiness) timed every round."""
@@ -270,6 +287,8 @@ class Runner:
             "oracle": self._wait(self.product.oracle_read, generated.probes),
             "impl": self._wait(self.product.impl_read, generated.probes),
         }
+        if visible["oracle"] and not visible["impl"] and not self._out_of_time():
+            self._diagnose(index, generated.probes)
         if all(visible.values()) and self.config.settle_s:
             time.sleep(min(self.config.settle_s, self.budget.remaining()))
         self.recorder.record_round(
@@ -296,9 +315,35 @@ class Runner:
                 exchange = self.transport.send(endpoint, FLOOR_REQUEST)
                 self.recorder.record_floor(service, role, exchange)
 
-    def _wait(self, endpoint: Endpoint, probes: list[Probe]) -> bool:
+    def _diagnose(self, index: int, probes: list[Probe]) -> None:
+        """Records what the implementation serves for a round it never showed,
+        then how much longer the round takes to appear, if it does."""
+
+        def send(request: Request) -> Exchange:
+            return self.transport.send(self.product.impl_read, request)
+
+        diagnostics = self.product.diagnose_invisible(index, probes, send)
+        started = time.monotonic()
+        late = self._wait(self.product.impl_read, probes, DIAGNOSE_WAIT_S)
+        self.recorder.record_diagnostic(
+            index,
+            {
+                "requests": {
+                    name: describe(exchange) for name, exchange in diagnostics.items()
+                },
+                "visible_after_s": round(time.monotonic() - started, 3)
+                if late
+                else None,
+                "waited_s": round(time.monotonic() - started, 3),
+            },
+        )
+
+    def _wait(
+        self, endpoint: Endpoint, probes: list[Probe], timeout_s: float | None = None
+    ) -> bool:
         deadline = time.monotonic() + min(
-            self.config.visibility_timeout_s, self.budget.remaining()
+            self.config.visibility_timeout_s if timeout_s is None else timeout_s,
+            self.budget.remaining(),
         )
         pending = list(probes)
         while pending:

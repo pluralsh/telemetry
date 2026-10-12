@@ -168,6 +168,22 @@ class Recorder:
         print(f"fuzz {self.config.product}: {message}", flush=True)
         self.notes.append(message)
 
+    def record_diagnostic(self, index: int, diagnostic: dict[str, Any]) -> None:
+        directory = self.root / "diagnostics"
+        directory.mkdir(exist_ok=True)
+        (directory / f"round-{index:04d}.json").write_text(
+            json.dumps(diagnostic, indent=2)
+        )
+        late = diagnostic.get("visible_after_s")
+        self.note(
+            f"round {index} diagnostics: "
+            + (
+                f"visible {late}s after the timeout"
+                if late is not None
+                else "still invisible"
+            )
+        )
+
     def _is_outlier(self, oracle: Exchange, impl: Exchange) -> bool:
         if not self.reference_latency or oracle.status is None or impl.status is None:
             return False

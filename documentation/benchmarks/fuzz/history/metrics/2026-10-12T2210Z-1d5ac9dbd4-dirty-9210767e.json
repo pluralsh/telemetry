@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "name": "2026-10-12T2210Z-1d5ac9dbd4-dirty-9210767e",
+  "product": "metrics",
+  "run_id": "20261012T220956Z-9210767e",
+  "batch": "bench-20261012T220956Z",
+  "started_at": "2026-10-12T22:10:07Z",
+  "finished_at": "2026-10-12T22:39:40Z",
+  "git": {
+    "commit": "1d5ac9dbd48677087f5392fbdd438e4ad26e206a",
+    "short": "1d5ac9dbd4",
+    "branch": "main",
+    "dirty": true
+  },
+  "host": {
+    "label": null,
+    "os": "Darwin",
+    "os_release": "23.4.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 12,
+    "memory_gib": 18.0,
+    "python": "3.13.7",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 1800.0,
+    "seed": 2450552446,
+    "scale": 1.0,
+    "window_s": 1800.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 30.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "recent",
+    "isolated": true
+  },
+  "settings": {
+    "impl_config": "production",
+    "oracle": "prometheus",
+    "storage": "s3"
+  },
+  "environment": {
+    "FUZZ_METRICS_CONFIG": "production",
+    "FUZZ_METRICS_ORACLE": "prometheus",
+    "FUZZ_SCENARIO": "recent"
+  },
+  "images": {
+    "metrics-s3": {
+      "image": "telemetry-regression/plural-metrics-server:local",
+      "id": "51bcb85139da"
+    },
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    },
+    "prometheus": {
+      "image": "prom/prometheus:v3.14.0",
+      "id": "deeef2470dab"
+    }
+  },
+  "layout": {
+    "network": "host-ports",
+    "cpus": {
+      "docker_cpus": 12,
+      "pinned": true,
+      "cpusets": {
+        "shared": "0",
+        "impl": "1-5",
+        "oracle": "6-10"
+      }
+    }
+  },
+  "variant": "impl_config=production, oracle=prometheus, storage=s3, pinned",
+  "results": {
+    "status": "failed",
+    "reasons": [
+      "1 mismatch case(s)"
+    ],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 1772.1,
+    "rounds": 172,
+    "invisible_rounds": 0,
+    "cases": 16797,
+    "non_match": 317,
+    "outcomes": {
+      "match": 16480,
+      "mismatch": 1,
+      "inconclusive": 8,
+      "both_error": 307,
+      "unstable_oracle": 1
+    },
+    "ingest": {
+      "batches": 344,
+      "outcomes": {
+        "ok": 344
+      },
+      "oracle_ms": {
+        "p50": 1.853,
+        "p90": 6.964,
+        "p99": 24.436,
+        "max": 39.45
+      },
+      "impl_ms": {
+        "p50": 1.225,
+        "p90": 3.589,
+        "p99": 9.21,
+        "max": 13.22
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": 1.935,
+        "p90": 12.388,
+        "p99": 109.817,
+        "p99.9": 490.183,
+        "max": 8202.633
+      },
+      "impl_ms": {
+        "p50": 2.686,
+        "p90": 14.297,
+        "p99": 81.557,
+        "p99.9": 299.642,
+        "max": 1617.798
+      },
+      "ratio": {
+        "p50": 1.287,
+        "p90": 2.546,
+        "p99": 7.072
+      },
+      "outliers": 5
+    },
+    "families": {
+      "promql.instant": {
+        "cases": 7622,
+        "non_match": 125,
+        "outcomes": {
+          "match": 7497,
+          "mismatch": 1,
+          "both_error": 124
+        },
+        "oracle_ms": {
+          "p50": 1.6,
+          "p90": 4.482,
+          "p99": 19.893
+        },
+        "impl_ms": {
+          "p50": 2.108,
+          "p90": 7.898,
+          "p99": 34.484
+        },
+        "ratio": {
+          "p50": 1.322,
+          "p90": 2.61
+        }
+      },
+      "promql.label_values": {
+        "cases": 671,
+        "non_match": 0,
+        "outcomes": {
+          "match": 671
+        },
+        "oracle_ms": {
+          "p50": 1.088,
+          "p90": 2.797,
+          "p99": 15.186
+        },
+        "impl_ms": {
+          "p50": 1.804,
+          "p90": 6.274,
+          "p99": 23.496
+        },
+        "ratio": {
+          "p50": 1.683,
+          "p90": 3.116
+        }
+      },
+      "promql.labels": {
+        "cases": 79,
+        "non_match": 0,
+        "outcomes": {
+          "match": 79
+        },
+        "oracle_ms": {
+          "p50": 1.571,
+          "p90": 3.345,
+          "p99": 14.426
+        },
+        "impl_ms": {
+          "p50": 2.391,
+          "p90": 7.74,
+          "p99": 17.952
+        },
+        "ratio": {
+          "p50": 1.564,
+          "p90": 3.166
+        }
+      },
+      "promql.range": {
+        "cases": 7647,
+        "non_match": 192,
+        "outcomes": {
+          "match": 7455,
+          "inconclusive": 8,
+          "both_error": 183,
+          "unstable_oracle": 1
+        },
+        "oracle_ms": {
+          "p50": 2.824,
+          "p90": 25.872,
+          "p99": 200.069
+        },
+        "impl_ms": {
+          "p50": 3.777,
+          "p90": 22.293,
+          "p99": 125.899
+        },
+        "ratio": {
+          "p50": 1.178,
+          "p90": 2.441
+        }
+      },
+      "promql.series": {
+        "cases": 778,
+        "non_match": 0,
+        "outcomes": {
+          "match": 778
+        },
+        "oracle_ms": {
+          "p50": 2.404,
+          "p90": 8.582,
+          "p99": 25.1
+        },
+        "impl_ms": {
+          "p50": 3.795,
+          "p90": 13.09,
+          "p99": 40.146
+        },
+        "ratio": {
+          "p50": 1.517,
+          "p90": 2.53
+        }
+      }
+    },
+    "floor": {
+      "metrics-s3": {
+        "role": "impl",
+        "p50": 1.605,
+        "p99": 6.395
+      },
+      "minio": {
+        "role": "shared",
+        "p50": 2.02,
+        "p99": 18.313
+      },
+      "prometheus": {
+        "role": "oracle",
+        "p50": 2.404,
+        "p99": 10.927
+      }
+    },
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 1772.1,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "metrics-s3"
+          ],
+          "cpu_seconds": 193.8,
+          "cpu_cores": {
+            "mean": 0.109,
+            "p95": 0.332,
+            "max": 2.144
+          },
+          "memory_mib": {
+            "mean": 569.3,
+            "p95": 765.7,
+            "max": 1132.7
+          }
+        },
+        "oracle": {
+          "services": [
+            "prometheus"
+          ],
+          "cpu_seconds": 197.2,
+          "cpu_cores": {
+            "mean": 0.111,
+            "p95": 0.362,
+            "max": 2.552
+          },
+          "memory_mib": {
+            "mean": 148.6,
+            "p95": 279.3,
+            "max": 472.8
+          }
+        },
+        "shared": {
+          "services": [
+            "minio"
+          ],
+          "cpu_seconds": 58.4,
+          "cpu_cores": {
+            "mean": 0.033,
+            "p95": 0.115,
+            "max": 1.016
+          },
+          "memory_mib": {
+            "mean": 180.4,
+            "p95": 215.0,
+            "max": 228.5
+          }
+        }
+      },
+      "services": {
+        "metrics-s3": {
+          "cpu_seconds": 193.8,
+          "peak_memory_mib": 1132.7
+        },
+        "minio": {
+          "cpu_seconds": 58.4,
+          "peak_memory_mib": 228.5
+        },
+        "prometheus": {
+          "cpu_seconds": 197.2,
+          "peak_memory_mib": 472.8
+        }
+      }
+    }
+  }
+}
