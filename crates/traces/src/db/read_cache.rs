@@ -111,9 +111,7 @@ impl ReadCache {
             pages: build(config.pages_bytes).map(|capacity| {
                 Cache::builder()
                     .max_capacity(capacity)
-                    .weigher(|_, page: &Arc<Page>| {
-                        weight(128 + page.bytes().len() + page.directory().len() * 64)
-                    })
+                    .weigher(|_, page: &Arc<Page>| weight(page.weigh()))
                     .build()
             }),
             postings: build(config.postings_bytes).map(|capacity| {
@@ -260,6 +258,27 @@ impl ReadCache {
             cache
                 .insert((namespace.clone(), segment, sequence), Arc::clone(page))
                 .await;
+        }
+    }
+
+    /// Re-weighs `page` if it is still the cached page: queries decode its
+    /// columns after it is cached, which the weight it was cached with misses.
+    pub(crate) async fn reweigh_page(
+        &self,
+        namespace: &Namespace,
+        (segment, sequence): (SegmentId, u64),
+        page: &Arc<Page>,
+    ) {
+        let Some(cache) = &self.pages else {
+            return;
+        };
+        let key = (namespace.clone(), segment, sequence);
+        if cache
+            .get(&key)
+            .await
+            .is_some_and(|cached| Arc::ptr_eq(&cached, page))
+        {
+            cache.insert(key, Arc::clone(page)).await;
         }
     }
 

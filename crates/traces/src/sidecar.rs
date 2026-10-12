@@ -8,8 +8,10 @@
 //! touching any trace payload.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::BytesMut;
 use common::serde::varint::{var_u32, var_u64};
@@ -61,6 +63,8 @@ pub(crate) struct PageColumns {
     /// Index-aligned with [`DEDICATED_COLUMNS`]: each column's bytes within
     /// `dedicated_bytes`, and the column once decoded.
     dedicated: Vec<(Range<usize>, OnceLock<Dedicated>)>,
+    /// Heap bytes held, grown as attribute columns are decoded.
+    heap_bytes: AtomicUsize,
 }
 
 /// A trace's search summary from page columns.
@@ -82,6 +86,24 @@ enum Dedicated {
     },
     /// `values` holds each span's integer, or zero without one.
     Int { codes: Vec<u8>, values: Vec<i64> },
+}
+
+impl Dedicated {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Missing => 0,
+            Self::String { values, codes } => strings_bytes(values) + vec_bytes(codes),
+            Self::Int { codes, values } => vec_bytes(codes) + vec_bytes(values),
+        }
+    }
+}
+
+fn vec_bytes<T>(values: &Vec<T>) -> usize {
+    values.capacity() * size_of::<T>()
+}
+
+fn strings_bytes(values: &Vec<String>) -> usize {
+    vec_bytes(values) + values.iter().map(String::capacity).sum::<usize>()
 }
 
 /// A dedicated column as it is built.
@@ -433,6 +455,19 @@ impl PageColumns {
         if !buf.is_empty() {
             return Err(corrupt("trailing bytes"));
         }
+        let heap_bytes = vec_bytes(&trace_ends)
+            + vec_bytes(&trace_flags)
+            + vec_bytes(&start_offsets)
+            + vec_bytes(&parents)
+            + vec_bytes(&durations)
+            + vec_bytes(&statuses)
+            + vec_bytes(&kinds)
+            + strings_bytes(&names)
+            + vec_bytes(&name_ids)
+            + strings_bytes(&services)
+            + vec_bytes(&service_codes)
+            + dedicated_bytes.len()
+            + vec_bytes(&dedicated);
         Ok(Self {
             trace_ends,
             trace_flags,
@@ -447,7 +482,13 @@ impl PageColumns {
             service_codes,
             dedicated_bytes,
             dedicated,
+            heap_bytes: AtomicUsize::new(heap_bytes),
         })
+    }
+
+    /// Memory the columns hold, including attribute columns decoded so far.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>() + self.heap_bytes.load(Ordering::Relaxed)
     }
 
     /// The attribute column at `column` of [`DEDICATED_COLUMNS`], decoded
@@ -462,7 +503,11 @@ impl PageColumns {
             self.durations.len(),
             DEDICATED_COLUMNS[column].kind,
         )?;
-        Ok(decoded.get_or_init(|| found))
+        let bytes = found.heap_bytes();
+        if decoded.set(found).is_ok() {
+            self.heap_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        Ok(decoded.get().expect("dedicated column was just set"))
     }
 
     pub(crate) fn trace_spans(&self, trace: usize) -> Range<usize> {

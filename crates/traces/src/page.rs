@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -40,6 +41,18 @@ pub struct Page {
     directory: Vec<TraceDirectoryEntry>,
     sidecar: SidecarBounds,
     columns: OnceLock<Arc<PageColumns>>,
+    /// [`Page::retained_bytes`] when a cache last weighed the page; columns
+    /// decoded after that grow the page past its weight.
+    weighed: Weighed,
+}
+
+#[derive(Debug, Default)]
+struct Weighed(AtomicUsize);
+
+impl Clone for Weighed {
+    fn clone(&self) -> Self {
+        Self(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +203,7 @@ impl Page {
                 directory,
                 sidecar,
                 columns: OnceLock::new(),
+                weighed: Weighed::default(),
             },
             ordered,
         ))
@@ -280,11 +294,35 @@ impl Page {
             directory,
             sidecar,
             columns: OnceLock::new(),
+            weighed: Weighed::default(),
         })
     }
 
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
+    }
+
+    /// Memory the page holds, including columns decoded so far.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.bytes.len()
+            + self.directory.capacity() * std::mem::size_of::<TraceDirectoryEntry>()
+            + self
+                .columns
+                .get()
+                .map_or(0, |columns| columns.retained_bytes())
+    }
+
+    /// [`Self::retained_bytes`], recorded as the page's weight in a cache.
+    pub(crate) fn weigh(&self) -> usize {
+        let bytes = self.retained_bytes();
+        self.weighed.0.store(bytes, Ordering::Relaxed);
+        bytes
+    }
+
+    /// Whether decoding has grown the page past its recorded weight.
+    pub(crate) fn outgrew_weight(&self) -> bool {
+        self.retained_bytes() > self.weighed.0.load(Ordering::Relaxed)
     }
 
     /// Compressed sidecar bytes, including their length header.
@@ -613,6 +651,18 @@ mod tests {
             );
             assert_eq!(columns.trace_spans(index), index..index + 1);
         }
+    }
+
+    #[test]
+    fn decoding_columns_outgrows_the_cached_weight() {
+        let traces = vec![trace(1, 10, "one"), trace(2, 20, "two")];
+        let page = Page::decode(Page::from_traces(&traces, 64 * 1024).unwrap().bytes()).unwrap();
+        let weighed = page.weigh();
+        assert!(!page.outgrew_weight());
+        page.columns().unwrap();
+        assert!(page.outgrew_weight());
+        assert!(page.weigh() > weighed);
+        assert!(!page.outgrew_weight());
     }
 
     #[test]

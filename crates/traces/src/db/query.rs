@@ -1022,37 +1022,52 @@ impl TraceDb {
                 memo,
             )
             .await?;
-        let mut decided = HashMap::<PageRef, Vec<bool>>::new();
-        let mut matched = HashSet::new();
-        for (trace_id, locators) in live {
-            for locator in locators {
-                let page = &pages[&locator.page()];
-                let index = locator.trace_index as usize;
-                if page
-                    .directory()
-                    .get(index)
-                    .is_none_or(|entry| entry.trace_id != trace_id)
-                {
-                    return Err(Error::Corrupt(
-                        "trace locator points to a different trace".to_owned(),
-                    ));
-                }
-                let traces = match decided.entry(locator.page()) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        match page.columns()?.decide(decider)? {
-                            Some(traces) => entry.insert(traces),
-                            None => return Ok(None),
-                        }
+        let matched = (|| {
+            let mut decided = HashMap::<PageRef, Vec<bool>>::new();
+            let mut matched = HashSet::new();
+            for (trace_id, locators) in live {
+                for locator in locators {
+                    let page = &pages[&locator.page()];
+                    let index = locator.trace_index as usize;
+                    if page
+                        .directory()
+                        .get(index)
+                        .is_none_or(|entry| entry.trace_id != trace_id)
+                    {
+                        return Err(Error::Corrupt(
+                            "trace locator points to a different trace".to_owned(),
+                        ));
                     }
-                };
-                if traces[index] {
-                    matched.insert(trace_id);
-                    break;
+                    let traces = match decided.entry(locator.page()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            match page.columns()?.decide(decider)? {
+                                Some(traces) => entry.insert(traces),
+                                None => return Ok(None),
+                            }
+                        }
+                    };
+                    if traces[index] {
+                        matched.insert(trace_id);
+                        break;
+                    }
                 }
             }
+            Ok(Some(matched))
+        })();
+        self.reweigh_pages(namespace, &pages).await;
+        matched
+    }
+
+    /// Re-weighs the cached pages among `pages` whose columns grew them.
+    async fn reweigh_pages(&self, namespace: &Namespace, pages: &HashMap<PageRef, Arc<Page>>) {
+        for (&page_ref, page) in pages {
+            if page.outgrew_weight() {
+                self.read_cache
+                    .reweigh_page(namespace, page_ref, page)
+                    .await;
+            }
         }
-        Ok(Some(matched))
     }
 
     /// Summaries, from page columns, of those `trace_ids` wholly on one live
@@ -1091,47 +1106,51 @@ impl TraceDb {
         let pages = self
             .fetch_pages(namespace, by_page.keys().copied().collect(), memo)
             .await?;
-        let mut summaries = Vec::new();
-        for (page, traces) in by_page {
-            let page = &pages[&page];
-            for &(trace_id, index) in &traces {
-                if page
-                    .directory()
-                    .get(index)
-                    .is_none_or(|entry| entry.trace_id != trace_id)
-                {
-                    return Err(Error::Corrupt(
-                        "trace locator points to a different trace".to_owned(),
+        let summaries = (|| {
+            let mut summaries = Vec::new();
+            for (page, traces) in by_page {
+                let page = &pages[&page];
+                for &(trace_id, index) in &traces {
+                    if page
+                        .directory()
+                        .get(index)
+                        .is_none_or(|entry| entry.trace_id != trace_id)
+                    {
+                        return Err(Error::Corrupt(
+                            "trace locator points to a different trace".to_owned(),
+                        ));
+                    }
+                }
+                let columns = page.columns()?;
+                let indexes = traces.iter().map(|&(_, index)| index).collect::<Vec<_>>();
+                let Some(found) = columns.summaries(&indexes, decider)? else {
+                    continue;
+                };
+                for ((trace_id, index), summary) in traces.into_iter().zip(found) {
+                    let Some(summary) = summary else {
+                        continue;
+                    };
+                    if columns.trace_spans(index).len() > max_spans || summary.matched == 0 {
+                        continue;
+                    }
+                    let entry = &page.directory()[index];
+                    summaries.push((
+                        trace_id,
+                        TraceSummary {
+                            trace_id,
+                            start_ns: entry.min_timestamp_ns,
+                            end_ns: entry.max_timestamp_ns,
+                            root_service_name: summary.root_service_name,
+                            root_span_name: summary.root_span_name,
+                            matched_spans: summary.matched,
+                        },
                     ));
                 }
             }
-            let columns = page.columns()?;
-            let indexes = traces.iter().map(|&(_, index)| index).collect::<Vec<_>>();
-            let Some(found) = columns.summaries(&indexes, decider)? else {
-                continue;
-            };
-            for ((trace_id, index), summary) in traces.into_iter().zip(found) {
-                let Some(summary) = summary else {
-                    continue;
-                };
-                if columns.trace_spans(index).len() > max_spans || summary.matched == 0 {
-                    continue;
-                }
-                let entry = &page.directory()[index];
-                summaries.push((
-                    trace_id,
-                    TraceSummary {
-                        trace_id,
-                        start_ns: entry.min_timestamp_ns,
-                        end_ns: entry.max_timestamp_ns,
-                        root_service_name: summary.root_service_name,
-                        root_span_name: summary.root_span_name,
-                        matched_spans: summary.matched,
-                    },
-                ));
-            }
-        }
-        Ok(summaries)
+            Ok(summaries)
+        })();
+        self.reweigh_pages(namespace, &pages).await;
+        summaries
     }
 
     /// Fetches each referenced page once per query, then decodes and merges
@@ -1153,19 +1172,24 @@ impl TraceDb {
                 memo,
             )
             .await?;
-        let mut kept = Vec::with_capacity(located.len());
-        let mut page_matches = HashMap::new();
-        for (trace_id, locators) in located {
-            if locators.is_empty() {
-                continue;
+        let kept = (|| {
+            let mut kept = Vec::with_capacity(located.len());
+            let mut page_matches = HashMap::new();
+            for (trace_id, locators) in located {
+                if locators.is_empty() {
+                    continue;
+                }
+                if let Some(prune) = prune
+                    && prune.ruled_out(trace_id, &locators, &pages, &mut page_matches)?
+                {
+                    continue;
+                }
+                kept.push((trace_id, locators));
             }
-            if let Some(prune) = prune
-                && prune.ruled_out(trace_id, &locators, &pages, &mut page_matches)?
-            {
-                continue;
-            }
-            kept.push((trace_id, locators));
-        }
+            Ok::<_, Error>(kept)
+        })();
+        self.reweigh_pages(namespace, &pages).await;
+        let kept = kept?;
         // Decoded in chunks on tasks of their own: polled here, every trace
         // would decode on the query's one task, and a task per trace would
         // mostly measure scheduling.
