@@ -611,36 +611,47 @@ impl LogDb {
             }
             streams.retain(|stream| !stream.runs.is_empty());
         }
-        let candidates = &candidates;
+        let candidates = Arc::new(candidates);
         let units = plan_reads(&streams, reverse, COALESCE_GAP_BLOCKS);
         let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
         let mut decoded = futures::stream::iter(units)
-            .map(move |unit| async move {
-                budget.take()?;
-                // Held until the unit's rows are pending. Units ask the fair
-                // semaphore in read order, so a segment's earliest holder
-                // never waits behind a later one.
-                let decoding = budget.decode(unit.decode_bytes(true)).await?;
-                let blocks = self
-                    .load_blocks(
-                        namespace,
-                        segment,
-                        unit.object,
-                        unit.first_block..unit.end_block,
-                        ReadNeeds { lines: true },
-                    )
-                    .await?;
-                let mut runs = Vec::with_capacity(unit.runs.len());
-                for run in unit.runs {
-                    let first = (run.run.first_block - unit.first_block) as usize;
-                    let blocks = &blocks[first..first + run.run.blocks as usize];
-                    let rows = candidates
-                        .as_ref()
-                        .and_then(|candidates| candidates.get(&(run.stream_id, run.object_id)));
-                    let decoded = P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
-                    runs.push((run, decoded));
+            .map(move |unit| {
+                let candidates = Arc::clone(&candidates);
+                async move {
+                    budget.take()?;
+                    // Held until the unit's rows are pending. Units ask the fair
+                    // semaphore in read order, so a segment's earliest holder
+                    // never waits behind a later one.
+                    let decoding = budget.decode(unit.decode_bytes(true)).await?;
+                    let blocks = self
+                        .load_blocks(
+                            namespace,
+                            segment,
+                            unit.object,
+                            unit.first_block..unit.end_block,
+                            ReadNeeds { lines: true },
+                        )
+                        .await?;
+                    // Decoded on a task of its own: polled here, every unit of
+                    // every segment would decode on the query's one task.
+                    let runs = tokio::spawn(async move {
+                        let mut runs = Vec::with_capacity(unit.runs.len());
+                        for run in unit.runs {
+                            let first = (run.run.first_block - unit.first_block) as usize;
+                            let blocks = &blocks[first..first + run.run.blocks as usize];
+                            let rows = candidates.as_ref().as_ref().and_then(|candidates| {
+                                candidates.get(&(run.stream_id, run.object_id))
+                            });
+                            let decoded =
+                                P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
+                            runs.push((run, decoded));
+                        }
+                        Ok::<_, Error>(runs)
+                    })
+                    .await
+                    .map_err(|error| Error::Invalid(format!("page decode task failed: {error}")))??;
+                    Ok::<_, Error>((decoding, runs))
                 }
-                Ok::<_, Error>((decoding, runs))
             })
             .buffered(PAGE_READ_CONCURRENCY);
         let mut pending = P::new(reverse);
@@ -1050,7 +1061,7 @@ impl LogDb {
         (start_ns, end_ns): (i64, i64),
         now_unix_ms: u64,
     ) -> Result<Vec<SegmentStream>> {
-        let live = |run: &StoredRun| {
+        let live = move |run: &StoredRun| {
             !run.is_expired_at(now_unix_ms)
                 && run.max_timestamp_ns >= start_ns
                 && run.min_timestamp_ns <= end_ns
@@ -1066,7 +1077,7 @@ impl LogDb {
         let stream_ids = labelled.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         if let Some(span) = self.span_scan(&stream_ids) {
             let mut runs = self
-                .spanned_runs(namespace, segment, span, &stream_ids, live)
+                .spanned_runs(namespace, segment, span, stream_ids, live)
                 .await?;
             return Ok(labelled
                 .into_iter()
@@ -1130,31 +1141,36 @@ impl LogDb {
     }
 
     /// Runs of `stream_ids` (ascending) passing `keep`, from one scan over
-    /// `span` of the segment's run records.
+    /// `span` of the segment's run records. Iterating a wide span is
+    /// CPU-bound, so it runs as its own task: polled inside the query's task,
+    /// every segment's scan would share one core.
     async fn spanned_runs(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         span: BytesRange,
-        stream_ids: &[StreamId],
-        keep: impl Fn(&StoredRun) -> bool,
+        stream_ids: Vec<StreamId>,
+        keep: impl Fn(&StoredRun) -> bool + Send + 'static,
     ) -> Result<HashMap<StreamId, Vec<(u64, StoredRun)>>> {
-        let mut runs = HashMap::<StreamId, Vec<_>>::new();
-        let mut records = self
-            .storage
-            .scan_prefix_iter(segment_run_prefix(namespace, segment), span, None)
-            .await?;
-        while let Some(record) = records.next().await? {
-            let (stream_id, object_id) = decode_run_key(&record.key)?;
-            if stream_ids.binary_search(&stream_id).is_err() {
-                continue;
+        let storage = Arc::clone(&self.storage);
+        let prefix = segment_run_prefix(namespace, segment);
+        tokio::spawn(async move {
+            let mut runs = HashMap::<StreamId, Vec<_>>::new();
+            let mut records = storage.scan_prefix_iter(prefix, span, None).await?;
+            while let Some(record) = records.next().await? {
+                let (stream_id, object_id) = decode_run_key(&record.key)?;
+                if stream_ids.binary_search(&stream_id).is_err() {
+                    continue;
+                }
+                let run = decode_run(&record.value)?;
+                if keep(&run) {
+                    runs.entry(stream_id).or_default().push((object_id, run));
+                }
             }
-            let run = decode_run(&record.value)?;
-            if keep(&run) {
-                runs.entry(stream_id).or_default().push((object_id, run));
-            }
-        }
-        Ok(runs)
+            Ok(runs)
+        })
+        .await
+        .map_err(|error| Error::Invalid(format!("run scan task failed: {error}")))?
     }
 
     /// Runs of one stream passing `keep`, in object order.
@@ -1212,7 +1228,7 @@ impl LogDb {
         let (&first, &last) = (stream_ids.first()?, stream_ids.last()?);
         let spread = (last - first) as usize + 1;
         if stream_ids.len() < self.span_scan_min_streams
-            || spread > stream_ids.len().saturating_mul(SPAN_SCAN_MAX_SPREAD)
+            || spread > stream_ids.len().saturating_mul(self.span_scan_max_spread)
         {
             return None;
         }
@@ -1593,43 +1609,78 @@ impl LogDb {
                 Some(unit)
             })
             .collect::<Vec<_>>();
+        let shared_read = Arc::new(read.clone());
+        let (isolated, with_metadata) = (&isolated, &with_metadata);
         let mut loaded = futures::stream::iter(units)
-            .map(|unit| async move {
-                budget.take()?;
-                let decoding = budget.decode(unit.decode_bytes(false)).await?;
-                let blocks = self
-                    .load_blocks(
-                        namespace,
-                        segment,
-                        unit.object,
-                        unit.first_block..unit.end_block,
-                        ReadNeeds { lines: false },
-                    )
-                    .await?;
-                let runs = unit
-                    .runs
-                    .into_iter()
-                    .map(|run| {
-                        let first = (run.run.first_block - unit.first_block) as usize;
-                        let blocks = blocks[first..first + run.run.blocks as usize].to_vec();
-                        (run, blocks)
+            .map(|unit| {
+                let read = Arc::clone(&shared_read);
+                async move {
+                    budget.take()?;
+                    let decoding = budget.decode(unit.decode_bytes(false)).await?;
+                    let blocks = self
+                        .load_blocks(
+                            namespace,
+                            segment,
+                            unit.object,
+                            unit.first_block..unit.end_block,
+                            ReadNeeds { lines: false },
+                        )
+                        .await?;
+                    let runs = unit
+                        .runs
+                        .into_iter()
+                        .map(|run| {
+                            let metadata = with_metadata.contains(&run.stream_id);
+                            let alone = isolated.contains(&(run.stream_id, run.object_id));
+                            (run, metadata, alone)
+                        })
+                        .collect::<Vec<_>>();
+                    // Decoded on a task of its own: polled here, every unit of
+                    // every segment would decode on the query's one task.
+                    let first_block = unit.first_block;
+                    let runs = tokio::spawn(async move {
+                        runs.into_iter()
+                            .map(|(run, metadata, alone)| {
+                                let first = (run.run.first_block - first_block) as usize;
+                                let blocks = &blocks[first..first + run.run.blocks as usize];
+                                let samples = if alone {
+                                    RunSamples::Isolated(isolated_samples(
+                                        blocks, range, &read, metadata,
+                                    )?)
+                                } else {
+                                    RunSamples::Unsure(run_samples(blocks, range, metadata)?)
+                                };
+                                Ok::<_, Error>((run, samples))
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })
-                    .collect::<Vec<_>>();
-                Ok::<_, Error>((decoding, runs))
+                    .await
+                    .map_err(|error| {
+                        Error::Invalid(format!("sample decode task failed: {error}"))
+                    })??;
+                    Ok::<_, Error>((decoding, runs))
+                }
             })
             .buffer_unordered(PAGE_READ_CONCURRENCY);
         let mut unsure = HashMap::<StreamId, Vec<(UnitRun, Vec<RowSample>)>>::new();
         while let Some((_decoding, runs)) = loaded.try_next().await? {
-            for (run, blocks) in runs {
-                let metadata = with_metadata.contains(&run.stream_id);
-                if isolated.contains(&(run.stream_id, run.object_id)) {
-                    isolated_samples(&run.labels, &blocks, range, read, metadata, batches)?;
-                } else {
-                    let samples = run_samples(&blocks, range, metadata)?;
-                    unsure
+            for (run, samples) in runs {
+                match samples {
+                    RunSamples::Isolated(samples) => {
+                        for sample in samples {
+                            push_sample(
+                                batches,
+                                &run.labels,
+                                sample.timestamp_ns,
+                                sample.weight,
+                                &sample.metadata,
+                            );
+                        }
+                    }
+                    RunSamples::Unsure(samples) => unsure
                         .entry(run.stream_id)
                         .or_default()
-                        .push((run, samples));
+                        .push((run, samples)),
                 }
             }
             consume(batches)?;
@@ -1776,26 +1827,23 @@ pub(super) fn repeat_ranges(runs: &[(u64, StoredRun)]) -> Arc<[(i64, i64)]> {
 /// Samples of an isolated run's blocks in `range`: a block no window
 /// boundary splits is counted from its header, others from their meta value.
 fn isolated_samples(
-    labels: &Arc<Labels>,
     blocks: &[Block],
     range: (i64, i64),
     read: &SampleRead,
     metadata: bool,
-    batches: &mut StreamBatches,
-) -> Result<()> {
+) -> Result<Vec<WeightedSample>> {
+    let mut samples = Vec::new();
     for block in blocks {
         let header = block_header(&block.meta)?;
         if !header.overlaps(range.0, range.1) {
             continue;
         }
         if !metadata && !read.splits(header.min_timestamp_ns, header.max_timestamp_ns) {
-            push_sample(
-                batches,
-                labels,
-                header.min_timestamp_ns,
-                (header.rows, header.line_bytes.into()),
-                &crate::Fields::default(),
-            );
+            samples.push(WeightedSample {
+                timestamp_ns: header.min_timestamp_ns,
+                weight: (header.rows, header.line_bytes.into()),
+                metadata: crate::Fields::default(),
+            });
             continue;
         }
         decode_samples_where(
@@ -1803,10 +1851,30 @@ fn isolated_samples(
             range,
             |_| true,
             metadata,
-            |_, sample| push_row_sample(batches, labels, &sample),
+            |_, sample| {
+                samples.push(WeightedSample {
+                    timestamp_ns: sample.timestamp_ns,
+                    weight: (1, sample.line_len.into()),
+                    metadata: sample.structured_metadata,
+                })
+            },
         )?;
     }
-    Ok(())
+    Ok(samples)
+}
+
+/// `weight` stored rows from `timestamp_ns` on, as [`push_sample`] takes them.
+struct WeightedSample {
+    timestamp_ns: i64,
+    weight: (u32, u64),
+    metadata: crate::Fields,
+}
+
+/// A run's decoded samples: an isolated run's are final, others may repeat
+/// rows of another run of the stream.
+enum RunSamples {
+    Isolated(Vec<WeightedSample>),
+    Unsure(Vec<RowSample>),
 }
 
 /// Every row sample of a run's blocks in `range`, from their meta values.
@@ -2022,8 +2090,8 @@ impl PendingRows {
 
 /// How [`LogDb::read_segment_pages`] decodes runs and holds them until no
 /// unread page can precede their rows.
-trait PendingReads {
-    type Run: Send;
+trait PendingReads: 'static {
+    type Run: Send + 'static;
     /// Rows released together, all strictly after (or, reversed, before)
     /// every row released earlier.
     type Chunk;

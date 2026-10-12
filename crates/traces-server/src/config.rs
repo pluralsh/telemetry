@@ -104,6 +104,9 @@ pub struct RequestConfig {
     pub max_candidates: usize,
     pub max_spans_per_trace: usize,
     pub max_query_limit: usize,
+    /// Cap on the value bytes one tag-values response returns, as Tempo's
+    /// `max_bytes_per_tag_values_query`; values past it are left out.
+    pub max_tag_values_bytes: usize,
 }
 
 impl Default for RequestConfig {
@@ -116,6 +119,7 @@ impl Default for RequestConfig {
             max_candidates: 10_000,
             max_spans_per_trace: 100_000,
             max_query_limit: 1_000,
+            max_tag_values_bytes: 5_000_000,
         }
     }
 }
@@ -201,6 +205,7 @@ impl Config {
             || self.request.max_candidates == 0
             || self.request.max_spans_per_trace == 0
             || self.request.max_query_limit == 0
+            || self.request.max_tag_values_bytes == 0
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".into(),

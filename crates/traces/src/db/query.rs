@@ -606,7 +606,11 @@ impl TraceDb {
             None => &[AttributeScope::Resource, AttributeScope::Span],
         };
         let mut values = BTreeSet::new();
+        let mut bytes = 0usize;
         for (segment, through) in self.written_segments(namespace, segments).await? {
+            if bytes > CATALOG_VALUES_MAX_BYTES {
+                break;
+            }
             let key = (namespace.clone(), segment, scope, name.to_owned());
             let segment_values = match self.catalog_values_cache.get(&key) {
                 Some(cached) if cached.0 == through => cached,
@@ -615,11 +619,12 @@ impl TraceDb {
                     let mut found = BTreeSet::new();
                     for scope in scopes {
                         found.extend(
-                            discovery::values(
+                            discovery::values_within(
                                 self.storage.as_ref(),
                                 &prefix,
                                 catalog_scope(*scope),
                                 name,
+                                CATALOG_VALUES_MAX_BYTES,
                             )
                             .await?,
                         );
@@ -631,7 +636,11 @@ impl TraceDb {
                     )
                 }
             };
-            values.extend(segment_values.1.iter().cloned());
+            for value in segment_values.1.iter() {
+                if values.insert(value.clone()) {
+                    bytes = bytes.saturating_add(value.weight());
+                }
+            }
         }
         Ok(values.into_iter().collect())
     }
@@ -974,7 +983,12 @@ impl TraceDb {
                     .ok_or_else(|| {
                         Error::Corrupt("trace locator references a missing page".to_owned())
                     })?;
-                let decoded = Arc::new(Page::decode(payload.value)?);
+                // Decoded on a task of its own: polled here, every page of the
+                // query would decode on one task.
+                let decoded = tokio::spawn(async move { Page::decode(payload.value) })
+                    .await
+                    .map_err(|error| Error::Invalid(format!("page decode task failed: {error}")))?;
+                let decoded = Arc::new(decoded?);
                 memo.insert(page, &decoded);
                 self.read_cache.insert_page(namespace, page, &decoded).await;
                 Ok::<_, Error>((page, decoded))
@@ -1139,7 +1153,7 @@ impl TraceDb {
                 memo,
             )
             .await?;
-        let mut traces = Vec::with_capacity(located.len());
+        let mut kept = Vec::with_capacity(located.len());
         let mut page_matches = HashMap::new();
         for (trace_id, locators) in located {
             if locators.is_empty() {
@@ -1150,23 +1164,60 @@ impl TraceDb {
             {
                 continue;
             }
-            let continuations = locators
-                .iter()
-                .map(|locator| {
-                    let trace =
-                        pages[&locator.page()].decode_trace(locator.trace_index as usize)?;
-                    if trace.trace_id != trace_id {
-                        return Err(Error::Corrupt(
-                            "trace locator points to a different trace".to_owned(),
-                        ));
-                    }
-                    Ok(trace)
+            kept.push((trace_id, locators));
+        }
+        // Decoded in chunks on tasks of their own: polled here, every trace
+        // would decode on the query's one task, and a task per trace would
+        // mostly measure scheduling.
+        let pages = Arc::new(pages);
+        let width = std::thread::available_parallelism().map_or(1, usize::from);
+        let chunk_len = kept.len().div_ceil(width).max(1);
+        let mut chunks = Vec::new();
+        let mut kept = kept.into_iter().peekable();
+        while kept.peek().is_some() {
+            chunks.push(kept.by_ref().take(chunk_len).collect::<Vec<_>>());
+        }
+        let decoded = stream::iter(chunks)
+            .map(|chunk| {
+                let pages = Arc::clone(&pages);
+                tokio::spawn(async move {
+                    chunk
+                        .into_iter()
+                        .map(|(trace_id, locators)| decode_located(&pages, trace_id, &locators))
+                        .collect::<Result<Vec<_>>>()
                 })
-                .collect::<Result<Vec<_>>>()?;
-            traces.push(merge_continuations(trace_id, continuations)?);
+            })
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Invalid(format!("trace decode task failed: {error}")))?;
+        let mut traces = Vec::new();
+        for chunk in decoded {
+            traces.extend(chunk?);
         }
         Ok(traces)
     }
+}
+
+/// The trace `trace_id`, merged from its continuations at `locators`.
+fn decode_located(
+    pages: &HashMap<PageRef, Arc<Page>>,
+    trace_id: TraceId,
+    locators: &[TraceLocator],
+) -> Result<Trace> {
+    let continuations = locators
+        .iter()
+        .map(|locator| {
+            let trace = pages[&locator.page()].decode_trace(locator.trace_index as usize)?;
+            if trace.trace_id != trace_id {
+                return Err(Error::Corrupt(
+                    "trace locator points to a different trace".to_owned(),
+                ));
+            }
+            Ok(trace)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    merge_continuations(trace_id, continuations)
 }
 
 /// The posting records under `prefix`, or only those within its inclusive

@@ -30,6 +30,8 @@ fn config(path: &str, enabled: bool) -> Config {
         },
         compaction: CompactionConfig {
             enabled,
+            max_object_bytes: 64 * 1024,
+            max_object_rows: 1024,
             ..CompactionConfig::default()
         },
     }

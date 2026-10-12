@@ -1003,6 +1003,8 @@ fn compacting_config() -> Config {
             finalize_after: Duration::from_secs(3600),
             delete_delay: Duration::ZERO,
             max_merges_per_flush: 256,
+            max_object_bytes: 4096,
+            max_object_rows: 64,
         },
         ..test_config()
     }
@@ -1203,6 +1205,48 @@ async fn open_segments_merge_runs_the_page_limits_cut_short() {
     );
     let end = segment + 100;
     assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn merges_grow_past_the_page_limits_flushes_cut_at() {
+    use crate::codec::RecordType;
+
+    let mut config = compacting_config();
+    config.compaction.fan_in = 4;
+    config.compaction.max_object_bytes = 1 << 20;
+    config.compaction.max_object_rows = 256;
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("past-page").unwrap();
+    let segment = current_segment();
+    // Each flush cuts a twenty-row page; four merge into one eighty-row run,
+    // past the page's sixty-four row limit.
+    let expected = (0..80)
+        .map(|index| format!("needle {index}"))
+        .collect::<Vec<_>>();
+    for (batch, lines) in (0..).zip(expected.chunks(20)) {
+        let entries = (0..)
+            .zip(lines)
+            .map(|(offset, line)| LogEntry::new(segment + batch * 20 + offset, line))
+            .collect();
+        db.write(
+            &namespace,
+            vec![LogBatch::new(labels("api", "prod"), entries)],
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        count_records(&db, &namespace, segment, RecordType::Run).await,
+        1
+    );
+    let end = segment + 100;
+    assert_eq!(lines(&db, &namespace, segment, end).await, expected);
+    assert_eq!(
+        match_lines(&db, &namespace, segment, end, 1).await.unwrap(),
+        expected
+    );
     db.close().await.unwrap();
 }
 

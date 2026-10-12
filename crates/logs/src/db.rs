@@ -68,9 +68,9 @@ const STREAM_METADATA_CONCURRENCY: usize = 32;
 /// Fewest selected streams read by one range scan over their ID span instead
 /// of an operation per stream: below it, both cost a few point operations.
 const SPAN_SCAN_MIN_STREAMS: usize = 8;
-/// Widest span, relative to the selected stream count, still read by one
-/// range scan; past it most scanned records would be unselected streams.
-const SPAN_SCAN_MAX_SPREAD: usize = 4;
+/// Widest span, relative to the selected stream count, still read by range
+/// scans; past it unselected streams' records outweigh the point operations.
+const SPAN_SCAN_MAX_SPREAD: usize = 16;
 /// Segments whose stream metadata is listed concurrently by `scan_targets`.
 const SEGMENT_LIST_CONCURRENCY: usize = 4;
 /// Segments a query reads at once, each fetching up to
@@ -178,6 +178,8 @@ pub struct LogDb {
     database_id: u64,
     /// [`SPAN_SCAN_MIN_STREAMS`], overridable so tests cover both read paths.
     span_scan_min_streams: usize,
+    /// [`SPAN_SCAN_MAX_SPREAD`], overridable for profiling.
+    span_scan_max_spread: usize,
 }
 
 /// Where discovery reads one slice of a time range from.
@@ -223,7 +225,12 @@ impl DiscoveryCaches {
         // Entries are inserted as closed, so the TTL is never consulted.
         Self {
             label_names: DiscoveryCache::new(4_096, Duration::ZERO),
-            label_values: DiscoveryCache::new(16_384, Duration::ZERO),
+            label_values: DiscoveryCache::weighted(
+                16_384,
+                Duration::ZERO,
+                64 << 20,
+                |(_, values)| common::discovery::strings_weight(values),
+            ),
             series: DiscoveryCache::new(1_024, Duration::ZERO),
             streams: moka::sync::Cache::builder()
                 .max_capacity(STREAMS_CACHE_BYTES)
@@ -306,6 +313,7 @@ impl LogDb {
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
+            span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
         })
     }
 
@@ -401,6 +409,7 @@ impl LogDb {
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
+            span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
         })
     }
 

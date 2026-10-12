@@ -387,6 +387,7 @@ async fn tag_names(
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
     let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let _permit = query_permit(&state).await?;
     let names = if params.scope.as_deref() == Some("intrinsic") {
         intrinsic_tag_names()
     } else {
@@ -413,6 +414,7 @@ async fn tag_names_v2(
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
     let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let _permit = query_permit(&state).await?;
     let mut scopes = Vec::new();
     if params
         .scope
@@ -457,6 +459,7 @@ async fn tag_values(
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
     let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let _permit = query_permit(&state).await?;
     let (scope, name) = scoped_name(&name, params.scope.as_deref());
     let values = state
         .db
@@ -466,6 +469,9 @@ async fn tag_values(
         .into_iter()
         .map(|value| discovery_value_parts(value).1)
         .collect::<BTreeSet<_>>();
+    let values = within_bytes(values, state.config.request.max_tag_values_bytes, |value| {
+        value.len()
+    });
     Ok(Json(json!({"tagValues": values})))
 }
 
@@ -476,6 +482,7 @@ async fn tag_values_v2(
     Query(params): Query<TagParams>,
 ) -> Result<Json<Value>, ApiError> {
     let namespace = catalog_namespace(&state, &namespace, &headers).await?;
+    let _permit = query_permit(&state).await?;
     let (scope, name) = scoped_name(&name, params.scope.as_deref());
     let values = state
         .db
@@ -483,9 +490,15 @@ async fn tag_values_v2(
         .await
         .map_err(ApiError::internal)?
         .into_iter()
-        .map(discovery_value_parts)
-        .map(|(kind, value)| json!({"type": kind, "value": value}))
-        .collect::<Vec<_>>();
+        .map(discovery_value_parts);
+    let values = within_bytes(
+        values,
+        state.config.request.max_tag_values_bytes,
+        |(_, value)| value.len(),
+    )
+    .into_iter()
+    .map(|(kind, value)| json!({"type": kind, "value": value}))
+    .collect::<Vec<_>>();
     Ok(Json(json!({"tagValues": values})))
 }
 
@@ -508,6 +521,30 @@ impl TagParams {
             .unwrap_or(u64::MAX / 1_000_000_000)
             .saturating_mul(1_000_000_000)
     }
+}
+
+async fn query_permit(state: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, ApiError> {
+    state
+        .query_limit
+        .acquire()
+        .await
+        .map_err(|_| ApiError::unavailable("server is shutting down"))
+}
+
+/// The leading `values` whose `size`s sum to at most `max_bytes`.
+fn within_bytes<T>(
+    values: impl IntoIterator<Item = T>,
+    max_bytes: usize,
+    size: impl Fn(&T) -> usize,
+) -> Vec<T> {
+    let mut total = 0usize;
+    values
+        .into_iter()
+        .take_while(|value| {
+            total = total.saturating_add(size(value));
+            total <= max_bytes
+        })
+        .collect()
 }
 
 async fn catalog_namespace(

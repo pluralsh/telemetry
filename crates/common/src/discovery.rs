@@ -28,6 +28,32 @@ const METADATA_RECORD: u8 = 3;
 struct CacheEntry<V> {
     value: Arc<V>,
     expires_at: Option<Instant>,
+    weight: usize,
+}
+
+struct Entries<K, V> {
+    map: HashMap<K, CacheEntry<V>>,
+    bytes: usize,
+}
+
+impl<K: Eq + Hash, V> Entries<K, V> {
+    fn remove(&mut self, key: &K) {
+        if let Some(entry) = self.map.remove(key) {
+            self.bytes -= entry.weight;
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &CacheEntry<V>) -> bool) {
+        let mut freed = 0;
+        self.map.retain(|key, entry| {
+            let kept = keep(key, entry);
+            if !kept {
+                freed += entry.weight;
+            }
+            kept
+        });
+        self.bytes -= freed;
+    }
 }
 
 /// Small per-reader cache for immutable partition catalog scans.
@@ -35,10 +61,12 @@ struct CacheEntry<V> {
 /// Closed partitions can be retained until capacity eviction. Active
 /// partitions use a short TTL so newly written terms become visible.
 pub struct DiscoveryCache<K, V> {
-    entries: Mutex<HashMap<K, CacheEntry<V>>>,
+    entries: Mutex<Entries<K, V>>,
     generation: AtomicU64,
     capacity: usize,
     active_ttl: Duration,
+    max_bytes: usize,
+    weigh: fn(&V) -> usize,
 }
 
 impl<K, V> DiscoveryCache<K, V>
@@ -46,11 +74,27 @@ where
     K: Clone + Eq + Hash,
 {
     pub fn new(capacity: usize, active_ttl: Duration) -> Self {
+        Self::weighted(capacity, active_ttl, usize::MAX, |_| 0)
+    }
+
+    /// A cache also bounded to `max_bytes` of values as `weigh` estimates
+    /// them, for values whose size the entry count does not bound.
+    pub fn weighted(
+        capacity: usize,
+        active_ttl: Duration,
+        max_bytes: usize,
+        weigh: fn(&V) -> usize,
+    ) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(Entries {
+                map: HashMap::new(),
+                bytes: 0,
+            }),
             generation: AtomicU64::new(0),
             capacity: capacity.max(1),
             active_ttl,
+            max_bytes,
+            weigh,
         }
     }
 
@@ -64,12 +108,13 @@ where
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let expired = entries
+            .map
             .get(key)
             .is_some_and(|entry| entry.expires_at.is_some_and(|expiry| expiry <= now));
         if expired {
             entries.remove(key);
         }
-        let value = entries.get(key).map(|entry| entry.value.clone());
+        let value = entries.map.get(key).map(|entry| entry.value.clone());
         metrics::counter!(
             "telemetry_discovery_cache_requests_total",
             "result" => if value.is_some() { "hit" } else { "miss" }
@@ -87,22 +132,32 @@ where
     /// was taken, so a read that raced a write cannot pin stale results.
     pub fn insert_since(&self, generation: u64, key: K, value: V, active: bool) -> Arc<V> {
         let now = Instant::now();
+        let weight = (self.weigh)(&value);
         let value = Arc::new(value);
+        if weight > self.max_bytes {
+            return value;
+        }
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if self.generation.load(Ordering::Acquire) != generation {
             return value;
         }
         entries.retain(|_, entry| entry.expires_at.is_none_or(|expiry| expiry > now));
-        if entries.len() >= self.capacity
-            && let Some(oldest) = entries.keys().next().cloned()
+        entries.remove(&key);
+        while entries.map.len() >= self.capacity
+            || entries.bytes.saturating_add(weight) > self.max_bytes
         {
+            let Some(oldest) = entries.map.keys().next().cloned() else {
+                break;
+            };
             entries.remove(&oldest);
         }
-        entries.insert(
+        entries.bytes += weight;
+        entries.map.insert(
             key,
             CacheEntry {
                 value: value.clone(),
                 expires_at: active.then(|| now + self.active_ttl),
+                weight,
             },
         );
         value
@@ -137,6 +192,25 @@ pub enum DiscoveryValue {
     Bool(bool),
     Int(i64),
     Double(f64),
+}
+
+impl DiscoveryValue {
+    /// Approximate bytes this value holds in memory.
+    pub fn weight(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::String(value) => value.len(),
+                _ => 0,
+            }
+    }
+}
+
+/// Approximate bytes `strings` hold in memory, for weighted caches of them.
+pub fn strings_weight(strings: &[String]) -> usize {
+    strings
+        .iter()
+        .map(|string| std::mem::size_of::<String>() + string.len())
+        .sum()
 }
 
 impl PartialEq for DiscoveryValue {
@@ -356,13 +430,30 @@ pub async fn values(
     scope: &str,
     name: &str,
 ) -> StorageResult<Vec<DiscoveryValue>> {
+    values_within(storage, partition_prefix, scope, name, usize::MAX).await
+}
+
+/// [`values`], stopping before the encoded values pass `max_bytes`, so a
+/// high-cardinality name cannot be materialized whole.
+pub async fn values_within(
+    storage: &dyn StorageRead,
+    partition_prefix: &[u8],
+    scope: &str,
+    name: &str,
+    max_bytes: usize,
+) -> StorageResult<Vec<DiscoveryValue>> {
     let started = std::time::Instant::now();
     let prefix = value_prefix(partition_prefix, scope, name);
     let mut iter = storage
         .scan_prefix_iter(prefix.clone(), BytesRange::unbounded(), None)
         .await?;
     let mut values = BTreeSet::new();
+    let mut bytes = 0usize;
     while let Some(record) = iter.next().await? {
+        bytes = bytes.saturating_add(record.key.len() - prefix.len());
+        if bytes > max_bytes {
+            break;
+        }
         let mut suffix = &record.key[prefix.len()..];
         let value = DiscoveryValue::decode(&mut suffix)?;
         if !suffix.is_empty() {
@@ -588,6 +679,29 @@ mod tests {
 
         assert_eq!(cache.get(&"closed").unwrap().as_slice(), &["stable"]);
         assert!(cache.get(&"active").is_none());
+    }
+
+    #[test]
+    fn weighted_discovery_cache_stays_within_its_byte_budget() {
+        let cache = DiscoveryCache::weighted(16, Duration::ZERO, 10, |value: &usize| *value);
+        cache.insert("a", 4, false);
+        cache.insert("b", 4, false);
+        cache.insert("c", 4, false);
+        let held = ["a", "b", "c"]
+            .iter()
+            .filter_map(|key| cache.get(key).map(|value| *value))
+            .sum::<usize>();
+        assert_eq!(held, 8);
+        assert!(cache.get(&"c").is_some());
+
+        // A value over the whole budget is returned but never cached.
+        assert_eq!(*cache.insert("huge", 11, false), 11);
+        assert!(cache.get(&"huge").is_none());
+        assert!(cache.get(&"c").is_some());
+
+        // Replacing a key frees its old weight first.
+        cache.insert("c", 6, false);
+        assert_eq!(*cache.get(&"c").unwrap(), 6);
     }
 
     #[test]

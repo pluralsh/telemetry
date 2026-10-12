@@ -61,6 +61,12 @@ pub struct CompactionConfig {
     pub delete_delay: Duration,
     /// Upper bound on merges performed after one flush.
     pub max_merges_per_flush: usize,
+    /// Limits of a page merges produce, apart from the [`PageConfig`] limits
+    /// flushes cut pages at. Every flush writes a run for each stream it
+    /// holds and merges keep one per stream, so these bound how many runs a
+    /// stream has per segment, which queries list one by one.
+    pub max_object_bytes: usize,
+    pub max_object_rows: usize,
 }
 
 impl Default for Config {
@@ -106,6 +112,8 @@ impl Default for CompactionConfig {
             finalize_after: Duration::from_secs(5 * 60),
             delete_delay: Duration::from_secs(10 * 60),
             max_merges_per_flush: 256,
+            max_object_bytes: 32 * 1024 * 1024,
+            max_object_rows: 262_144,
         }
     }
 }
@@ -140,6 +148,13 @@ impl Config {
         {
             return Err(crate::Error::Invalid(
                 "compaction fan_in must be at least 2 and max_merges_per_flush positive".to_owned(),
+            ));
+        }
+        if self.compaction.enabled
+            && (self.compaction.max_object_bytes == 0 || self.compaction.max_object_rows == 0)
+        {
+            return Err(crate::Error::Invalid(
+                "compaction max_object_bytes and max_object_rows must be positive".to_owned(),
             ));
         }
         Ok(())

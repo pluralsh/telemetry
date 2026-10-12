@@ -75,6 +75,8 @@ pub struct CompactionConfig {
     pub finalize_after_seconds: u64,
     pub delete_delay_seconds: u64,
     pub max_merges_per_flush: usize,
+    pub max_object_bytes: usize,
+    pub max_object_rows: usize,
 }
 
 impl Default for CompactionConfig {
@@ -87,6 +89,8 @@ impl Default for CompactionConfig {
             finalize_after_seconds: compaction.finalize_after.as_secs(),
             delete_delay_seconds: compaction.delete_delay.as_secs(),
             max_merges_per_flush: compaction.max_merges_per_flush,
+            max_object_bytes: compaction.max_object_bytes,
+            max_object_rows: compaction.max_object_rows,
         }
     }
 }
@@ -272,6 +276,14 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if self.compaction.enabled
+            && (self.compaction.max_object_bytes == 0 || self.compaction.max_object_rows == 0)
+        {
+            return Err(ConfigError::Validation(
+                "compaction.max_object_bytes and compaction.max_object_rows must be positive"
+                    .to_owned(),
+            ));
+        }
         self.cache_warmer
             .validate()
             .map_err(ConfigError::Validation)?;
@@ -330,6 +342,8 @@ impl Config {
                 finalize_after: Duration::from_secs(self.compaction.finalize_after_seconds),
                 delete_delay: Duration::from_secs(self.compaction.delete_delay_seconds),
                 max_merges_per_flush: self.compaction.max_merges_per_flush,
+                max_object_bytes: self.compaction.max_object_bytes,
+                max_object_rows: self.compaction.max_object_rows,
             },
             write_buffer: self.write.write_buffer(),
             block_cache_capacity_bytes: self.reader_cache_capacity,

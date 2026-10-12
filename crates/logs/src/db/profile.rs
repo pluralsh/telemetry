@@ -807,6 +807,451 @@ async fn profile_store_shape() {
     db.close().await.unwrap();
 }
 
+/// Clusters of [`profile_cluster_day`]: name, streams and lines per day, shaped
+/// like the demo deployment's.
+const CLUSTERS: [(&str, usize, u64); 7] = [
+    ("mgmt", 900, 5_600_000),
+    ("demo-prod", 960, 4_600_000),
+    ("demo-dev01", 700, 2_800_000),
+    ("demo-dev", 700, 2_500_000),
+    ("gke-fleet-prod", 600, 1_900_000),
+    ("gke-fleet-dev", 600, 1_850_000),
+    ("k3s-jetson", 200, 300_000),
+];
+const FLUSH_SECONDS: i64 = 10;
+
+/// The operator's production logs config, without retention.
+fn production_config(store: &std::path::Path) -> Config {
+    let mut config = Config {
+        storage: config(store, true).storage,
+        retention: None,
+        page: PageConfig {
+            target_size_bytes: 1 << 20,
+            max_rows: 8192,
+            rows_per_block: 256,
+        },
+        ..Config::default()
+    };
+    if let Ok(bytes) = std::env::var("PROFILE_OBJECT_BYTES") {
+        config.compaction.max_object_bytes = bytes.parse().unwrap();
+    }
+    if let Ok(rows) = std::env::var("PROFILE_OBJECT_ROWS") {
+        config.compaction.max_object_rows = rows.parse().unwrap();
+    }
+    config.compaction.min_age = Duration::ZERO;
+    config.write_buffer.flush_interval = Duration::from_secs(3600);
+    // The operator's reader caches: 512 MiB of SST blocks, 128 MiB of
+    // indexes and filters.
+    let cache = |name: &str, default: u64| {
+        Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+            capacity: std::env::var(name).map_or(default, |value| value.parse().unwrap()),
+            shards: None,
+        }))
+    };
+    if let StorageConfig::SlateDb(storage) = &mut config.storage {
+        storage.settings_path = std::env::var("PROFILE_SLATEDB_SETTINGS").ok();
+        storage.block_cache = cache("PROFILE_SST_CACHE", 512 << 20);
+        storage.meta_cache = cache("PROFILE_META_CACHE", 128 << 20);
+    }
+    config
+}
+
+/// Writes `hours` of every cluster's streams, one flush per
+/// [`FLUSH_SECONDS`] of data as the production writer flushes, ending now.
+async fn ingest_clusters(config: &Config, namespace: &Namespace, hours: i64) {
+    struct Synth {
+        labels: Labels,
+        per_flush: f64,
+        owed: f64,
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut streams = Vec::new();
+    for (cluster, count, daily) in CLUSTERS {
+        let weights = (0..count)
+            .map(|rank| 1.0 / ((rank + 1) as f64).powf(1.1))
+            .collect::<Vec<_>>();
+        let total: f64 = weights.iter().sum();
+        for (rank, weight) in weights.into_iter().enumerate() {
+            let labels = Labels::new(vec![
+                Label::new("cluster", cluster),
+                Label::new("namespace", format!("ns-{}", rank % 40)),
+                Label::new("pod", format!("{cluster}-pod-{rank}")),
+                Label::new("container", format!("c-{}", rank % 3)),
+                Label::new("job", format!("ns-{}/{cluster}-pod-{rank}", rank % 40)),
+            ])
+            .unwrap();
+            streams.push(Synth {
+                labels,
+                per_flush: daily as f64 * weight / total * FLUSH_SECONDS as f64 / 86_400.0,
+                owed: rng.below(1000) as f64 / 1000.0,
+            });
+        }
+    }
+    let writer = LogDb::open(config.clone()).await.unwrap();
+    let end = common::time::now_ns() / (FLUSH_SECONDS * SECOND) * (FLUSH_SECONDS * SECOND);
+    let flushes = hours * 3600 / FLUSH_SECONDS;
+    let started = Instant::now();
+    let mut rows = 0usize;
+    for flush in 0..flushes {
+        let at = end - (flushes - flush) * FLUSH_SECONDS * SECOND;
+        let mut batches = Vec::new();
+        for stream in &mut streams {
+            stream.owed += stream.per_flush;
+            let count = stream.owed as usize;
+            if count == 0 {
+                continue;
+            }
+            stream.owed -= count as f64;
+            let mut timestamps = (0..count)
+                .map(|_| at + rng.below((FLUSH_SECONDS * SECOND) as u64) as i64)
+                .collect::<Vec<_>>();
+            timestamps.sort_unstable();
+            let entries = timestamps
+                .into_iter()
+                .map(|ts| {
+                    let word = WORDS[rng.below(WORDS.len() as u64) as usize];
+                    LogEntry::new(
+                        ts,
+                        format!(
+                            "ts={ts} level=info caller=handler.go:{} msg=\"{word}\" trace_id={:016x} span_id={:08x} duration_ms={} status={}",
+                            rng.below(900),
+                            rng.next(),
+                            rng.next() as u32,
+                            rng.below(5000),
+                            200 + rng.below(4) * 100,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows += entries.len();
+            batches.push(LogBatch::new(stream.labels.clone(), entries));
+        }
+        writer
+            .write_with_durability(namespace, batches, Durability::Written)
+            .await
+            .unwrap();
+        if flush % 360 == 359 {
+            println!(
+                "ingested hour {} rows {rows} in {:.0}s",
+                (flush + 1) / 360,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    writer.flush().await.unwrap();
+    // Lets the last segments' finalizing merges run.
+    for _ in 0..64 {
+        writer
+            .write_with_durability(namespace, Vec::new(), Durability::Written)
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+}
+
+/// An object store that sleeps before every read, as S3's first-byte latency
+/// does, and counts them.
+static GET_KEYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Distinct object-store reads since the last call, and the most repeated.
+fn take_get_keys() -> String {
+    let keys = std::mem::take(&mut *GET_KEYS.lock().unwrap());
+    if std::env::var("PROFILE_GET_KEYS").is_ok() {
+        eprintln!("gets: {keys:#?}");
+    }
+    let mut counts = HashMap::<String, usize>::new();
+    for key in keys {
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut repeated = counts.iter().filter(|(_, n)| **n > 1).collect::<Vec<_>>();
+    repeated.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    format!(
+        "distinct {} repeated {} top {:?}",
+        counts.len(),
+        repeated.len(),
+        repeated
+            .iter()
+            .take(3)
+            .map(|(k, n)| (k.as_str(), **n))
+            .collect::<Vec<_>>()
+    )
+}
+
+#[derive(Debug)]
+struct SlowStore {
+    inner: Arc<dyn slatedb::object_store::ObjectStore>,
+    latency: Duration,
+    gets: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Display for SlowStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl slatedb::object_store::ObjectStore for SlowStore {
+    async fn put_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        payload: slatedb::object_store::PutPayload,
+        opts: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        opts: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        GET_KEYS
+            .lock()
+            .unwrap()
+            .push(format!("{location} {:?}", options.range));
+        tokio::time::sleep(self.latency).await;
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::path::Path>,
+    > {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::ObjectMeta>,
+    > {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &slatedb::object_store::path::Path,
+        to: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A reader with empty caches whose object store sleeps `latency` per
+/// request, as a cold read against S3 does.
+async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>) -> LogDb {
+    let StorageConfig::SlateDb(slate) = &config.storage else {
+        unreachable!("profiles run on SlateDB");
+    };
+    let inner = common::storage::factory::create_object_store(&slate.object_store).unwrap();
+    let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(SlowStore {
+        inner,
+        latency,
+        gets: Arc::clone(gets),
+    });
+    let cache = SharedDbCache::from_config(&config.storage).await.unwrap();
+    let storage = create_storage_read(
+        &config.storage,
+        StorageReaderRuntime::new()
+            .with_shared_cache(&cache)
+            .with_object_store(store),
+        storage_semantics(),
+        DbReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    LogDb {
+        storage,
+        writer: None,
+        segment_ns: duration_ns(config.segment_duration).unwrap(),
+        rollup_ns: config
+            .discovery_rollup
+            .map(duration_ns)
+            .transpose()
+            .unwrap(),
+        write_handle: None,
+        write_coordinator: Mutex::new(None),
+        caches: DiscoveryCaches::new(),
+        blocks: BlockCache::new(config.block_cache_capacity_bytes),
+        database_id: block_cache::next_database_id(),
+        span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
+        span_scan_max_spread: std::env::var("PROFILE_SPAN_SPREAD")
+            .map_or(SPAN_SCAN_MAX_SPREAD, |value| value.parse().unwrap()),
+    }
+}
+
+/// Times a day-long per-cluster log metric query, as Console's log chart
+/// sends it, against a day of production-shaped data at `PROFILE_STORE`
+/// (ingested once), cold with `PROFILE_LATENCY_MS` of object-store latency
+/// and then warm, with storage reads by record type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_cluster_day() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let hours: i64 = std::env::var("PROFILE_HOURS").map_or(25, |value| value.parse().unwrap());
+    let latency = Duration::from_millis(
+        std::env::var("PROFILE_LATENCY_MS").map_or(20, |value| value.parse().unwrap()),
+    );
+    let cluster = std::env::var("PROFILE_CLUSTER").unwrap_or_else(|_| "mgmt".to_owned());
+    let step: i64 = std::env::var("PROFILE_STEP").map_or(1800, |value| value.parse().unwrap());
+    let namespace = Namespace::new("default").unwrap();
+    let config = production_config(&store);
+    let marker = store.join("ingested");
+    if !marker.exists() {
+        std::fs::create_dir_all(&store).unwrap();
+        ingest_clusters(&config, &namespace, hours).await;
+        std::fs::write(&marker, b"").unwrap();
+    }
+
+    let end = common::time::now_ns() / (step * SECOND) * (step * SECOND);
+    let start = end - 86_400 * SECOND;
+    let request = QueryRequest::range(
+        format!(r#"sum(count_over_time({{cluster="{cluster}"}} [{step}s]))"#),
+        start,
+        end,
+        step * SECOND,
+    )
+    .frontend_step_aligned();
+    let options = QueryOptions::default();
+
+    let gets = Arc::new(AtomicUsize::new(0));
+    let mut db = cold_reader(&config, latency, &gets).await;
+    let counting = Arc::new(common::storage::counting::CountingStorage::new(
+        db.storage.clone(),
+        classify_key,
+    ));
+    db.storage = counting.clone();
+    gets.store(0, Ordering::Relaxed);
+    take_get_keys();
+    let report = |label: &str, elapsed: Duration| {
+        let mut io = counting.take().into_iter().collect::<Vec<_>>();
+        io.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.elapsed));
+        println!(
+            "{label}: {:.0}ms object-store gets {} ({})",
+            ms(elapsed),
+            gets.swap(0, Ordering::Relaxed),
+            take_get_keys()
+        );
+        for ((op, class), stats) in io {
+            println!(
+                "    {op}/{class}: calls {} records {} bytes {} summed {:.0}ms",
+                stats.calls,
+                stats.records,
+                stats.bytes,
+                ms(stats.elapsed)
+            );
+        }
+    };
+    let started = Instant::now();
+    let result = db
+        .query(&namespace, &request, options.clone())
+        .await
+        .unwrap();
+    report("query cold", started.elapsed());
+    if let crate::QueryResult::Matrix(series) = &result {
+        let rows: f64 = series
+            .iter()
+            .flat_map(|series| &series.samples)
+            .map(|sample| sample.value)
+            .sum();
+        println!("  counted rows {rows}");
+    }
+    let warm_runs: usize =
+        std::env::var("PROFILE_WARM_RUNS").map_or(3, |value| value.parse().unwrap());
+    for run in 0..warm_runs {
+        let started = Instant::now();
+        db.query(&namespace, &request, options.clone())
+            .await
+            .unwrap();
+        report(&format!("query warm {run}"), started.elapsed());
+    }
+
+    let parsed = crate::logql::parse(&request.query).unwrap();
+    let plan = crate::query::ScanPlan::new(&request, &parsed, &options).unwrap();
+    let started = Instant::now();
+    let targets = db
+        .scan_targets(&namespace, plan.scan_start, request.end_ns, &plan.streams)
+        .await
+        .unwrap();
+    report("scan_targets warm", started.elapsed());
+    let (mut streams, mut runs, mut isolated, mut rows) = (0, 0, 0, 0u64);
+    let spreads = targets
+        .segments
+        .iter()
+        .filter_map(|(_, segment_streams)| {
+            let first = segment_streams.first()?.stream_id;
+            let last = segment_streams.last()?.stream_id;
+            Some(format!("{}/{}", segment_streams.len(), last - first + 1))
+        })
+        .collect::<Vec<_>>();
+    println!("  selected/spread per segment: {}", spreads.join(" "));
+    for (_, segment_streams) in &targets.segments {
+        streams += segment_streams.len();
+        for stream in segment_streams {
+            runs += stream.runs.len();
+            isolated += isolated_runs(&stream.runs)
+                .into_iter()
+                .filter(|alone| *alone)
+                .count();
+            rows += stream
+                .runs
+                .iter()
+                .map(|(_, run)| u64::from(run.rows))
+                .sum::<u64>();
+        }
+    }
+    let estimate = targets.estimate(true);
+    println!(
+        "  segments {} stream-segments {streams} runs {runs} (isolated {isolated}) rows {rows} rows/run {:.1} read-units {} compressed bytes {}",
+        targets.segments.len(),
+        rows as f64 / runs.max(1) as f64,
+        estimate.read_units,
+        estimate.compressed_bytes,
+    );
+
+    let cold_gets = Arc::new(AtomicUsize::new(0));
+    let cold = cold_reader(&config, latency, &cold_gets).await;
+    cold_gets.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    cold.scan_targets(&namespace, plan.scan_start, request.end_ns, &plan.streams)
+        .await
+        .unwrap();
+    println!(
+        "scan_targets cold: {:.0}ms object-store gets {}",
+        ms(started.elapsed()),
+        cold_gets.load(Ordering::Relaxed)
+    );
+    db.close().await.unwrap();
+    cold.close().await.unwrap();
+}
+
 fn plan_segments(db: &LogDb, start: i64, end: i64) -> usize {
     db.segment_ids((start, end), false).unwrap().len()
 }

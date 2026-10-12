@@ -96,8 +96,13 @@ page:
 compaction:
   enabled: true
   # Adjacent same-level objects merged into one; at least 2. Fewer merge when
-  # the next would push the result past the page limits.
+  # the next would push the result past the merge limits below.
   fan_in: 8
+  # Largest object a merge produces, independent of the page limits flushes
+  # cut at. Merges run one at a time, holding their inputs and output in
+  # memory, so the writer needs a few times this much headroom.
+  max_object_bytes: 33554432 # 32 MiB.
+  max_object_rows: 262144
   min_age_seconds: 30 # Age of a flushed object before its first merge.
   # After a segment ends, merge its remaining small objects regardless of fan_in.
   finalize_after_seconds: 300

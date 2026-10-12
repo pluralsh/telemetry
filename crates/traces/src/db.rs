@@ -46,6 +46,11 @@ const READ_CONCURRENCY: usize = 32;
 const MATERIALIZE_BATCH: usize = 256;
 /// Segments whose metadata or postings are scanned concurrently.
 const SEGMENT_SCAN_CONCURRENCY: usize = 8;
+/// Encoded value bytes one tag-values lookup reads, per segment and across
+/// segments, so a high-cardinality attribute is never listed whole.
+const CATALOG_VALUES_MAX_BYTES: usize = 8 << 20;
+/// Bytes of catalog values a shard keeps cached.
+const CATALOG_VALUES_CACHE_BYTES: usize = 32 << 20;
 /// Most unwanted pages a metadata scan steps over between two wanted ones.
 /// A point get costs about as much as reading seven adjacent small records,
 /// so wider gaps are cheaper as separate reads.
@@ -113,6 +118,10 @@ struct Retention {
 /// A segment catalog scan tagged with the segment's next page sequence when
 /// it was taken; it is current only while that sequence is unchanged.
 type SequencedCatalog<K, V> = DiscoveryCache<K, (u64, Vec<V>)>;
+
+fn catalog_values_weight((_, values): &(u64, Vec<DiscoveryValue>)) -> usize {
+    values.iter().map(DiscoveryValue::weight).sum()
+}
 
 /// Single-node OTLP trace database over the common SlateDB abstraction.
 pub struct TraceDb {
@@ -207,7 +216,12 @@ impl TraceDb {
             write_coordinator: Mutex::new(Some(write_coordinator)),
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
-            catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+            catalog_values_cache: DiscoveryCache::weighted(
+                4_096,
+                Duration::from_secs(5),
+                CATALOG_VALUES_CACHE_BYTES,
+                catalog_values_weight,
+            ),
             read_cache,
             expiring: config.retention.is_some(),
         })
@@ -245,7 +259,12 @@ impl TraceDb {
             write_coordinator: Mutex::new(None),
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
-            catalog_values_cache: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+            catalog_values_cache: DiscoveryCache::weighted(
+                4_096,
+                Duration::from_secs(5),
+                CATALOG_VALUES_CACHE_BYTES,
+                catalog_values_weight,
+            ),
             read_cache: Arc::new(ReadCache::new(&config.read_cache, false)),
             expiring: config.retention.is_some(),
         })

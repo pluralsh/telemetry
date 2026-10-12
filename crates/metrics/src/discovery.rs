@@ -26,7 +26,12 @@ impl MetricsDiscoveryCache {
     pub(crate) fn new() -> Self {
         Self {
             names: DiscoveryCache::new(1_024, Duration::from_secs(5)),
-            values: DiscoveryCache::new(4_096, Duration::from_secs(5)),
+            values: DiscoveryCache::weighted(
+                4_096,
+                Duration::from_secs(5),
+                32 << 20,
+                |values| discovery::strings_weight(values),
+            ),
             metadata: DiscoveryCache::new(1_024, Duration::from_secs(5)),
         }
     }

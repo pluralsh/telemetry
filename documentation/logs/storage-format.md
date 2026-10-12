@@ -248,10 +248,10 @@ order within a stream.
 
 Each flush writes one or more level-0 objects per segment it touches, so a
 segment receiving a trickle of writes accumulates many small objects. An
-object is small while it is under half of both `page.target_size_bytes` and
-`page.max_rows`. The writer merges runs of `compaction.fan_in` adjacent
-same-level small objects into one object one level higher. A run cut short
-because the next object would push it past the page limits merges as soon as
+object is small while it is under half of both `compaction.max_object_bytes`
+and `compaction.max_object_rows`. The writer merges runs of `compaction.fan_in`
+adjacent same-level small objects into one object one level higher. A run cut
+short because the next object would push it past those limits merges as soon as
 it has two objects: its inputs are each under half the limits, so the result
 is no longer small, and waiting for `fan_in` inputs that cannot fit would
 leave them unmerged until the segment settles. Once
@@ -260,7 +260,11 @@ whatever small objects remain (with a balance rule so each row is rewritten a
 logarithmic number of times). Two objects are adjacent when the first's ID
 plus its span is the second's ID. Merging only adjacent objects keeps every
 stream's rows in write order across merges. The result must stay within the
-page size and row limits.
+compaction size and row limits. These are separate from the page limits a
+flush cuts at: a stream contributes one run per object, so merges capped at
+flush-sized objects would leave a frequently flushed segment with many objects
+and a few rows per run, and a query's run listing, not its block decoding,
+would dominate.
 
 A merge concatenates each stream's blocks in input order and lays the
 streams out in stream order. A block already holding `page.rows_per_block`

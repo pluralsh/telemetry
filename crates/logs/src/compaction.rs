@@ -159,7 +159,7 @@ impl Compactor {
         let key = (written.namespace, written.segment);
         if let Some(state) = self.segments.get_mut(&key) {
             state.touched = now;
-            if is_small(&self.page, &written.stored) {
+            if is_small(&self.config, &written.stored) {
                 let at = state
                     .objects
                     .partition_point(|tracked| tracked.object.id < written.object.id);
@@ -227,7 +227,7 @@ impl Compactor {
                 continue;
             }
             let stored = decode_object(&record.value)?;
-            if is_small(&self.page, &stored) && !stored.is_expired_at(now_unix_ms) {
+            if is_small(&self.config, &stored) && !stored.is_expired_at(now_unix_ms) {
                 objects.push(Tracked { object, stored });
             }
         }
@@ -279,7 +279,7 @@ impl Compactor {
                 )
                 .await?;
             deletes.extend(replaced);
-            let replacement = is_small(&self.page, &merged.stored).then_some(merged);
+            let replacement = is_small(&self.config, &merged.stored).then_some(merged);
             state.objects.splice(range, replacement);
             *budget -= 1;
         }
@@ -301,7 +301,7 @@ impl Compactor {
     }
 
     /// The next run of `objects` to merge: `fan_in` adjacent same-level
-    /// objects, fewer when the next one would exceed the page limits, or when
+    /// objects, fewer when the next one would exceed the merge limits, or when
     /// `finalize` is set the longest mergeable run of at
     /// least two objects whose largest is at most half of it, so late writes
     /// to a settled segment rewrite each row a logarithmic number of times.
@@ -336,7 +336,9 @@ impl Compactor {
                 {
                     break;
                 }
-                if rows > self.page.max_rows as u64 || bytes > self.page.target_size_bytes as u64 {
+                if rows > self.config.max_object_rows as u64
+                    || bytes > self.config.max_object_bytes as u64
+                {
                     full = true;
                     break;
                 }
@@ -537,10 +539,10 @@ fn balanced(run: &[Tracked]) -> bool {
     sizes.clone().max().unwrap_or(0).saturating_mul(2) <= sizes.sum::<u64>()
 }
 
-/// Objects under half of both limits are worth merging.
-fn is_small(page: &PageConfig, stored: &StoredObject) -> bool {
-    (stored.bytes() as usize).saturating_mul(2) < page.target_size_bytes
-        && (stored.rows() as usize).saturating_mul(2) < page.max_rows
+/// Objects under half of both merge limits are worth merging.
+fn is_small(config: &CompactionConfig, stored: &StoredObject) -> bool {
+    (stored.bytes() as usize).saturating_mul(2) < config.max_object_bytes
+        && (stored.rows() as usize).saturating_mul(2) < config.max_object_rows
 }
 
 fn unix_time_ms() -> Result<u64> {

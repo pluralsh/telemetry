@@ -272,7 +272,9 @@ pub struct FoyerHybridCacheConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_pool_size: Option<u64>,
     /// Submit queue size threshold in bytes. Entries are dropped when
-    /// the queue exceeds this limit. Default: 1 GiB.
+    /// the queue exceeds this limit. Queued entries are held in memory
+    /// outside `memory_capacity`, so this adds to the process footprint.
+    /// Default: 64 MiB.
     #[serde(default = "default_submit_queue_size_threshold")]
     pub submit_queue_size_threshold: u64,
 }
@@ -282,7 +284,7 @@ fn default_flushers() -> usize {
 }
 
 fn default_submit_queue_size_threshold() -> u64 {
-    1024 * 1024 * 1024 // 1 GiB
+    64 * 1024 * 1024
 }
 
 impl FoyerHybridCacheConfig {
@@ -685,7 +687,7 @@ block_cache:
                         assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnInsertion);
                         assert_eq!(foyer.flushers, 4);
                         assert!(foyer.buffer_pool_size.is_none());
-                        assert_eq!(foyer.submit_queue_size_threshold, 1024 * 1024 * 1024);
+                        assert_eq!(foyer.submit_queue_size_threshold, 64 * 1024 * 1024);
                         // effective buffer pool = memory_capacity / 32
                         assert_eq!(foyer.effective_buffer_pool_size(), 8589934592 / 32);
                     }
