@@ -14,6 +14,7 @@ mod merge;
 mod model;
 mod otlp;
 mod page;
+mod remote;
 pub mod routing;
 mod sharded;
 mod sidecar;
@@ -28,6 +29,7 @@ pub use model::{
 };
 pub use otlp::{trace_batches, trace_batches_from_resource_spans};
 pub use page::{Page, PageBuilder, TraceDirectoryEntry};
+pub use remote::TracesShardClient;
 pub use sharded::ShardedTraces;
 pub use sharding::ShardingOptions;
 pub use traceql::{

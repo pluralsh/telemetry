@@ -10,7 +10,7 @@ pub enum Error {
     Invalid(String),
     #[error("write buffer is full")]
     Backpressure,
-    #[error("Logs writer is temporarily unavailable: {0}")]
+    #[error("Logs is temporarily unavailable: {0}")]
     Unavailable(String),
     #[error("corrupt Logs record: {0}")]
     Corrupt(String),

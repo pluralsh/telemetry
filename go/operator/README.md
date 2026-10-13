@@ -43,6 +43,26 @@ and `WriterScaling` / `WriterScalingBlocked` conditions.
 A sharded product is not `Ready` until writer intent equals the authoritative
 shard count.
 
+Sharded readers run as reader groups by default: one `<name>-reader-<k>`
+StatefulSet and `<name>-reader-<k>-headless` Service per storage shard `k`,
+whose pods receive `READER_SHARD=k` and open only that shard. The rendered
+reader configuration points `sharding.read_groups.endpoint` at those headless
+Services, so a reader fetches other shards from their groups over gRPC. The
+shared `<name>-reader` Service and the read Ingress route still balance HTTP
+queries across every group. The group count follows the larger of the writer
+StatefulSet replicas and the ShardMap shard count, so groups are added when
+writers scale up. `spec.reader.readGroups` sets `hedgeAfterMilliseconds`
+(default 250) and `requestTimeoutSeconds` (default 120); `enabled: false`
+returns to a single `<name>-reader` StatefulSet whose pods open every shard.
+The operator removes the reader objects of whichever topology is not in use.
+
+`spec.reader.autoscaling` adds a CPU-targeted (70% by default)
+HorizontalPodAutoscaler per reader StatefulSet, with an optional memory
+target and `autoscaling/v2` behavior. The operator stops setting replicas on
+autoscaled StatefulSets. Every reader StatefulSet has a PodDisruptionBudget
+with `maxUnavailable: 1`. See
+[reader groups and cost](../../documentation/common/scaling.md#reader-groups-and-cost).
+
 The operator intentionally does not inject a writer `preStop` drain command.
 The products currently expose health/readiness endpoints and coordinate
 per-shard drain through ShardMap and Lease transitions, but do not expose a

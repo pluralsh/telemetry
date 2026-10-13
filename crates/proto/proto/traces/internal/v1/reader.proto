@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package traces.internal.v1;
+
+import "traces/internal/v1/writer.proto";
+
+// Reads one storage shard on behalf of a reader coordinating a query over
+// every shard. Each call is served from the shard the receiving reader
+// group opens locally; nothing is forwarded further.
+service ShardReader {
+  // The parts of one trace stored on the shard.
+  rpc GetTrace(GetTraceRequest) returns (TracesResponse);
+  rpc Search(SearchRequest) returns (stream TracesResponse);
+  // The shard's first traces by trace ID.
+  rpc Scan(ScanRequest) returns (TracesResponse);
+  rpc CatalogNames(CatalogNamesRequest) returns (StringsResponse);
+  rpc CatalogValues(CatalogValuesRequest) returns (CatalogValuesResponse);
+  // The query's first hits on this shard alone, in (start, trace ID) order.
+  rpc TraceQl(TraceQlRequest) returns (TraceQlResponse);
+}
+
+message ShardRead {
+  uint32 shard = 1;
+  Namespace namespace = 2;
+}
+
+// A trace, or the part of one a shard holds. Each entry is an
+// independently prost-encoded opentelemetry.proto.trace.v1.ResourceSpans.
+message TracePart {
+  bytes trace_id = 1;
+  repeated bytes resource_spans = 2;
+}
+
+message TracesResponse {
+  repeated TracePart traces = 1;
+}
+
+message GetTraceRequest {
+  ShardRead read = 1;
+  bytes trace_id = 2;
+}
+
+enum AttributeScope {
+  ATTRIBUTE_SCOPE_UNSPECIFIED = 0;
+  ATTRIBUTE_SCOPE_RESOURCE = 1;
+  ATTRIBUTE_SCOPE_SPAN = 2;
+}
+
+message AttributeValue {
+  oneof value {
+    string string = 1;
+    bool bool = 2;
+    int64 int = 3;
+    double double = 4;
+  }
+}
+
+message AttributeMatcher {
+  AttributeScope scope = 1;
+  string name = 2;
+  AttributeValue value = 3;
+}
+
+message SearchRequest {
+  ShardRead read = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  repeated AttributeMatcher matchers = 4;
+}
+
+message ScanRequest {
+  ShardRead read = 1;
+  uint64 limit = 2;
+}
+
+message CatalogNamesRequest {
+  ShardRead read = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  // Unspecified for every scope.
+  AttributeScope scope = 4;
+}
+
+message CatalogValuesRequest {
+  ShardRead read = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  AttributeScope scope = 4;
+  string name = 5;
+}
+
+message StringsResponse {
+  repeated string values = 1;
+}
+
+message CatalogValuesResponse {
+  repeated AttributeValue values = 1;
+}
+
+message TraceQlRequest {
+  ShardRead read = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  string query = 4;
+  uint64 limit = 5;
+  // Applies to this shard alone.
+  uint64 max_candidate_traces = 6;
+  uint64 max_spans_per_trace = 7;
+  uint64 max_concurrency = 8;
+  // Hits without their matched spans, as a search response lists them.
+  bool summaries = 9;
+}
+
+enum SpanStatus {
+  SPAN_STATUS_UNSET = 0;
+  SPAN_STATUS_OK = 1;
+  SPAN_STATUS_ERROR = 2;
+}
+
+enum SpanKind {
+  SPAN_KIND_UNSPECIFIED = 0;
+  SPAN_KIND_INTERNAL = 1;
+  SPAN_KIND_SERVER = 2;
+  SPAN_KIND_CLIENT = 3;
+  SPAN_KIND_PRODUCER = 4;
+  SPAN_KIND_CONSUMER = 5;
+}
+
+message TraceQlValue {
+  oneof value {
+    bool nil = 1;
+    string string = 2;
+    bool bool = 3;
+    int64 int = 4;
+    double float = 5;
+    int64 duration_ns = 6;
+    SpanStatus status = 7;
+    SpanKind kind = 8;
+  }
+}
+
+message SelectedValue {
+  string name = 1;
+  TraceQlValue value = 2;
+}
+
+message MatchedSpan {
+  bytes span_id = 1;
+  bytes parent_span_id = 2;
+  string name = 3;
+  uint64 start_ns = 4;
+  uint64 end_ns = 5;
+  repeated SelectedValue selected = 6;
+}
+
+message TraceQlHit {
+  bytes trace_id = 1;
+  uint64 start_ns = 2;
+  uint64 end_ns = 3;
+  optional string root_service_name = 4;
+  optional string root_span_name = 5;
+  // Spansets of a full hit; matched spans of a summary.
+  uint64 count = 6;
+  repeated MatchedSpan matched_spans = 7;
+}
+
+message TraceQlResponse {
+  repeated TraceQlHit hits = 1;
+}

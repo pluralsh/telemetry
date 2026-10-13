@@ -18,6 +18,7 @@ mod merge;
 mod model;
 mod object;
 mod query;
+mod remote;
 pub mod routing;
 mod search;
 mod sharded;
@@ -34,6 +35,7 @@ pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,
     QueryRequest, QueryResult, Sample, VectorSample,
 };
+pub use remote::LogsShardClient;
 pub use sharded::ShardedLogs;
 pub use sharding::ShardingOptions;
 

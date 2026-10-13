@@ -1,11 +1,13 @@
 package resources
 
 import (
+	"maps"
 	"slices"
 	"testing"
 
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -751,4 +753,51 @@ func assertIngressPath(t *testing.T, paths []networkingv1.HTTPIngressPath, path,
 
 func hasVolume(volumes []corev1.Volume, name string) bool {
 	return lo.ContainsBy(volumes, func(volume corev1.Volume) bool { return volume.Name == name })
+}
+
+func TestReaderAutoscalerTargets(t *testing.T) {
+	autoscaled := func(spec telemetryv1alpha1.AutoscalingSpec) *telemetryv1alpha1.Metrics {
+		return &telemetryv1alpha1.Metrics{
+			ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.MetricsSpec{
+				Mode:   telemetryv1alpha1.MetricsModeSharded,
+				Reader: telemetryv1alpha1.WorkloadSpec{Replicas: lo.ToPtr(int32(3)), Autoscaling: &spec},
+			},
+		}
+	}
+	targets := func(metrics *telemetryv1alpha1.Metrics) map[corev1.ResourceName]int32 {
+		autoscaler := HorizontalPodAutoscaler(metrics, ReaderTargets(metrics, 1)[0])
+		if autoscaler == nil {
+			return nil
+		}
+		return lo.SliceToMap(autoscaler.Spec.Metrics, func(metric autoscalingv2.MetricSpec) (corev1.ResourceName, int32) {
+			return metric.Resource.Name, *metric.Resource.Target.AverageUtilization
+		})
+	}
+
+	if got := targets(autoscaled(telemetryv1alpha1.AutoscalingSpec{Enabled: false, MaxReplicas: 4})); got != nil {
+		t.Fatalf("disabled autoscaling targets = %v, want no autoscaler", got)
+	}
+	if got := targets(autoscaled(telemetryv1alpha1.AutoscalingSpec{Enabled: true, MaxReplicas: 4})); !maps.Equal(got, map[corev1.ResourceName]int32{corev1.ResourceCPU: 70}) {
+		t.Fatalf("default targets = %v, want 70%% CPU", got)
+	}
+	memory := autoscaled(telemetryv1alpha1.AutoscalingSpec{Enabled: true, MaxReplicas: 4, TargetMemoryUtilizationPercentage: lo.ToPtr(int32(80))})
+	if got := targets(memory); !maps.Equal(got, map[corev1.ResourceName]int32{corev1.ResourceMemory: 80}) {
+		t.Fatalf("memory targets = %v, want only 80%% memory", got)
+	}
+	both := autoscaled(telemetryv1alpha1.AutoscalingSpec{
+		Enabled: true, MaxReplicas: 4,
+		TargetCPUUtilizationPercentage: lo.ToPtr(int32(60)), TargetMemoryUtilizationPercentage: lo.ToPtr(int32(85)),
+	})
+	if got := targets(both); !maps.Equal(got, map[corev1.ResourceName]int32{corev1.ResourceCPU: 60, corev1.ResourceMemory: 85}) {
+		t.Fatalf("combined targets = %v, want 60%% CPU and 85%% memory", got)
+	}
+
+	autoscaler := HorizontalPodAutoscaler(memory, ReaderTargets(memory, 1)[0])
+	if autoscaler.Spec.ScaleTargetRef.Name != testMetricsName+"-reader-0" || *autoscaler.Spec.MinReplicas != 3 {
+		t.Fatalf("autoscaler targets %s from %d replicas, want %s-reader-0 from the 3 configured", autoscaler.Spec.ScaleTargetRef.Name, *autoscaler.Spec.MinReplicas, testMetricsName)
+	}
+	if replicas := lo.FromPtr(Replicas(memory, ComponentReader)); replicas != 3 {
+		t.Fatalf("autoscaled reader replicas = %d, want the 3 minimum", replicas)
+	}
 }

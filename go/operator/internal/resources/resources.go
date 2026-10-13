@@ -8,8 +8,10 @@ import (
 
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,7 +35,13 @@ const (
 	TracesNameAnnotation   = "telemetry.plural.sh/traces-name"
 	PseudoFSNameAnnotation = "telemetry.plural.sh/pseudofs-name"
 	TokenKey               = "internal-token"
-	InternalTokenPath      = "/var/run/secrets/metrics/internal-token"
+	// ShardLabel marks a reader group's workload with the storage shard it
+	// serves.
+	ShardLabel     = "telemetry.plural.sh/shard"
+	envReaderShard = "READER_SHARD"
+	// maxShardDigits bounds the shard ids reader group names must fit.
+	maxShardDigits    = 5
+	InternalTokenPath = "/var/run/secrets/metrics/internal-token"
 
 	volumeConfig              = "config"
 	volumeSecrets             = "secrets"
@@ -137,6 +145,8 @@ type StatefulSetInput struct {
 	InternalTokenSecretName string
 	InternalTokenSecretKey  string
 	DefaultProductVersion   string
+	// Shard makes a reader StatefulSet the group serving this storage shard.
+	Shard *int32
 }
 
 type Descriptor struct {
@@ -299,10 +309,173 @@ func Replicas(value any, component Component) *int32 {
 	if component == ComponentStandalone {
 		return lo.ToPtr(int32(1))
 	}
+	if autoscaling := Autoscaling(metrics, component); autoscaling != nil {
+		return lo.ToPtr(minReplicas(metrics, autoscaling))
+	}
 	if value := workloadFor(metrics, component).Replicas; value != nil {
 		return value
 	}
 	return lo.ToPtr(lo.Ternary(component == ComponentWriter, int32(1), int32(2)))
+}
+
+// ReadGroupsEnabled reports whether sharded readers run as one group per
+// storage shard, the default.
+func ReadGroupsEnabled(value any) bool {
+	instance := product(value)
+	if Mode(instance) != telemetryv1alpha1.ProductModeSharded {
+		return false
+	}
+	groups := instance.Reader.ReadGroups
+	return groups == nil || lo.FromPtrOr(groups.Enabled, true)
+}
+
+// ReaderGroupName is the StatefulSet of the reader group serving shard.
+func ReaderGroupName(value any, shard int32) string {
+	return Name(product(value).Name, fmt.Sprintf("%s-%d", ComponentReader, shard))
+}
+
+func ReaderGroupSelectorLabels(value any, shard int32) map[string]string {
+	result := SelectorLabels(value, ComponentReader)
+	result[ShardLabel] = fmt.Sprint(shard)
+	return result
+}
+
+func ReaderGroupLabels(value any, shard int32) map[string]string {
+	result := Labels(value, ComponentReader)
+	result[ShardLabel] = fmt.Sprint(shard)
+	return result
+}
+
+// ValidateReaderGroupNames rejects product names too long for every reader
+// group's headless Service name to follow the endpoint template.
+func ValidateReaderGroupNames(name string) error {
+	base := Name(name, "")
+	longest := len(base) + len("-"+string(ComponentReader)+"-") + maxShardDigits + len("-headless")
+	if longest > 63 {
+		return fmt.Errorf("name %q is too long for per-shard reader groups: it must be at most %d characters", name, len(base)-(longest-63))
+	}
+	return nil
+}
+
+// ReadGroupsEndpoint is the gRPC address of the reader group serving
+// `{shard}`: its headless Service, which resolves to every ready replica.
+func ReadGroupsEndpoint(name, namespace string, grpcPort int32) string {
+	return fmt.Sprintf("%s-%s-{shard}-headless.%s.svc:%d", Name(name, ""), ComponentReader, namespace, grpcPort)
+}
+
+// ReaderGroupService is the headless Service a reader group's peers resolve
+// to reach its replicas.
+func ReaderGroupService(value any, shard int32) *corev1.Service {
+	instance := product(value)
+	service := Service(instance, ComponentReader, true)
+	service.Name = Name(ReaderGroupName(instance, shard), "headless")
+	service.Labels = ReaderGroupLabels(instance, shard)
+	service.Spec.Selector = ReaderGroupSelectorLabels(instance, shard)
+	return service
+}
+
+// Autoscaling is the component's enabled autoscaling, which only readers of
+// a sharded product support.
+func Autoscaling(value any, component Component) *telemetryv1alpha1.AutoscalingSpec {
+	instance := product(value)
+	if component != ComponentReader || Mode(instance) != telemetryv1alpha1.ProductModeSharded {
+		return nil
+	}
+	if autoscaling := instance.Reader.Autoscaling; autoscaling != nil && autoscaling.Enabled {
+		return autoscaling
+	}
+	return nil
+}
+
+func minReplicas(instance *Product, autoscaling *telemetryv1alpha1.AutoscalingSpec) int32 {
+	if autoscaling.MinReplicas != nil {
+		return *autoscaling.MinReplicas
+	}
+	return min(lo.FromPtrOr(instance.Reader.Replicas, int32(2)), autoscaling.MaxReplicas)
+}
+
+// PodDisruptionBudget keeps all but one replica of a reader StatefulSet up
+// through voluntary disruptions, so a group always has a replica serving
+// its shard while it has more than one.
+func PodDisruptionBudget(value any, target ReaderTarget) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: target.Name, Namespace: product(value).Namespace, Labels: copyMap(target.Labels)},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: lo.ToPtr(intstr.FromInt32(1)),
+			Selector:       &metav1.LabelSelector{MatchLabels: copyMap(target.Selector)},
+		},
+	}
+}
+
+// ReaderTarget is one reader StatefulSet: a reader group's, or the one
+// whose readers open every shard.
+type ReaderTarget struct {
+	Name             string
+	Shard            *int32
+	Labels, Selector map[string]string
+}
+
+// ReaderTargets are the reader StatefulSets of a sharded product whose
+// readers form `groups` shard groups when read groups are enabled.
+func ReaderTargets(value any, groups int32) []ReaderTarget {
+	instance := product(value)
+	if !ReadGroupsEnabled(instance) {
+		return []ReaderTarget{{
+			Name:     ComponentName(instance, ComponentReader),
+			Labels:   Labels(instance, ComponentReader),
+			Selector: SelectorLabels(instance, ComponentReader),
+		}}
+	}
+	targets := make([]ReaderTarget, 0, groups)
+	for shard := range max(groups, 1) {
+		targets = append(targets, ReaderTarget{
+			Name:     ReaderGroupName(instance, shard),
+			Shard:    lo.ToPtr(shard),
+			Labels:   ReaderGroupLabels(instance, shard),
+			Selector: ReaderGroupSelectorLabels(instance, shard),
+		})
+	}
+	return targets
+}
+
+// HorizontalPodAutoscaler scales a reader StatefulSet on CPU utilization by
+// default, or on memory, or both.
+func HorizontalPodAutoscaler(value any, target ReaderTarget) *autoscalingv2.HorizontalPodAutoscaler {
+	instance := product(value)
+	autoscaling := Autoscaling(instance, ComponentReader)
+	if autoscaling == nil {
+		return nil
+	}
+	utilization := func(name corev1.ResourceName, target int32) autoscalingv2.MetricSpec {
+		return autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name:   name,
+				Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType, AverageUtilization: lo.ToPtr(target)},
+			},
+		}
+	}
+	var metrics []autoscalingv2.MetricSpec
+	cpu := autoscaling.TargetCPUUtilizationPercentage
+	if cpu == nil && autoscaling.TargetMemoryUtilizationPercentage == nil {
+		cpu = lo.ToPtr(int32(70))
+	}
+	if cpu != nil {
+		metrics = append(metrics, utilization(corev1.ResourceCPU, *cpu))
+	}
+	if memory := autoscaling.TargetMemoryUtilizationPercentage; memory != nil {
+		metrics = append(metrics, utilization(corev1.ResourceMemory, *memory))
+	}
+	return &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Name: target.Name, Namespace: instance.Namespace, Labels: copyMap(target.Labels)},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: target.Name},
+			MinReplicas:    lo.ToPtr(minReplicas(instance, autoscaling)),
+			MaxReplicas:    autoscaling.MaxReplicas,
+			Metrics:        metrics,
+			Behavior:       autoscaling.Behavior.DeepCopy(),
+		},
+	}
 }
 
 func ServiceAccount(value any) *corev1.ServiceAccount {
@@ -435,6 +608,13 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	}
 	component := input.Component
 	name := ComponentName(metrics, component)
+	selector := SelectorLabels(metrics, component)
+	labels := Labels(metrics, component)
+	if input.Shard != nil {
+		name = ReaderGroupName(metrics, *input.Shard)
+		selector = ReaderGroupSelectorLabels(metrics, *input.Shard)
+		labels = ReaderGroupLabels(metrics, *input.Shard)
+	}
 	workload := workloadFor(metrics, component)
 	dataVolume := volumeSpec(workload.DataVolume, defaultDataSize)
 	cacheVolume := volumeSpec(workload.CacheVolume, defaultCacheSize)
@@ -447,7 +627,7 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 			return nil, err
 		}
 		if claim := claimTemplate(item.name, item.spec); claim != nil {
-			claim.Labels = Labels(metrics, component)
+			claim.Labels = copyMap(labels)
 			claim.Annotations = map[string]string{metrics.Descriptor.NameAnnotation: metrics.Name}
 			claims = append(claims, *claim)
 		}
@@ -458,12 +638,12 @@ func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	}
 	template = podTemplate(metrics, input, template, dataVolume, cacheVolume)
 	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, component)},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: lo.Ternary(metrics.Descriptor.GRPCOnly, name, Name(name, "headless")), Replicas: Replicas(metrics, component),
 			PodManagementPolicy:                  appsv1.ParallelPodManagement,
 			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			Selector:                             &metav1.LabelSelector{MatchLabels: SelectorLabels(metrics, component)},
+			Selector:                             &metav1.LabelSelector{MatchLabels: selector},
 			Template:                             template,
 			VolumeClaimTemplates:                 claims,
 			PersistentVolumeClaimRetentionPolicy: persistentVolumeClaimRetentionPolicy(metrics, workload),
@@ -529,6 +709,9 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 	for key, value := range SelectorLabels(metrics, component) {
 		template.Labels[key] = value
 	}
+	if input.Shard != nil {
+		template.Labels[ShardLabel] = fmt.Sprint(*input.Shard)
+	}
 	if template.Annotations == nil {
 		template.Annotations = map[string]string{}
 	}
@@ -565,6 +748,10 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 		corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 		corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}})
 	metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name }, objectStoreEnv(metrics)...)
+	if input.Shard != nil {
+		metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name },
+			corev1.EnvVar{Name: envReaderShard, Value: fmt.Sprint(*input.Shard)})
+	}
 	requiredMounts := []corev1.VolumeMount{
 		{Name: volumeConfig, MountPath: metrics.Descriptor.ConfigDir, ReadOnly: true},
 		{Name: volumeData, MountPath: metrics.Descriptor.DataPath},

@@ -61,4 +61,5 @@ utoipa = { version = "6.0.0", features = ["axum_extras"] }
 base64 = "0.23.1"
 flate2 = "1"
 tempfile.workspace = true
+tokio-stream = { version = "0.1.19", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }

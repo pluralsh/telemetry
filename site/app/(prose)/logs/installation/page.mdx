@@ -80,7 +80,7 @@ An empty `data` array is expected until the collector has sent something.
 ## Scaling
 
 - **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take writes from the next aligned hour. Existing data stays where it is, so scale-down is blocked until it expires. See [epoch sharding](/sharding/).
-- **Readers:** change `spec.reader.replicas` at any time. They hold no state beyond their cache.
+- **Readers:** each storage shard has its own reader group, and `spec.reader.replicas` sets the replicas per group. Change it at any time, since readers hold no state beyond their cache, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
 - **Heavy queries:** raise `request.queryConcurrency` and `request.maxInFlightQueryBytes` together with reader memory.
 
 <NextSteps product="logs" links={["architecture", "api", "benchmarks"]} />

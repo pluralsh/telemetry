@@ -80,6 +80,6 @@ For Prometheus or Alloy, add a `remote_write` entry with the writer URL above an
 ## Scaling
 
 - **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take samples from the next aligned hour. Series written across the cutover appear in both shards and are joined at query time. Scale-down is blocked. See [epoch sharding](/sharding/).
-- **Readers:** change `spec.reader.replicas` at any time. They hold no state beyond their cache.
+- **Readers:** each storage shard has its own reader group, and `spec.reader.replicas` sets the replicas per group. Change it at any time, since readers hold no state beyond their cache, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
 
 <NextSteps product="metrics" links={["architecture", "api", "benchmarks"]} />

@@ -177,6 +177,22 @@ pub(super) struct ColumnarSink<'a> {
 }
 
 impl<'a> ColumnarSink<'a> {
+    /// What another reader group's shard kept, as [`Self::into_wire`] sent it.
+    pub(super) fn from_wire(
+        plan: &ScanPlan<'a>,
+        messages: Vec<proto::logs::internal::v1::ShardOutput>,
+    ) -> Result<Self> {
+        let mut sink = Self::new(plan, 0)?;
+        for message in messages {
+            sink.outputs.merge_wire(&sink.plan, message)?;
+        }
+        Ok(sink)
+    }
+
+    pub(super) fn into_wire(self) -> Vec<proto::logs::internal::v1::ShardOutput> {
+        self.outputs.into_wire()
+    }
+
     fn new(plan: &ScanPlan<'a>, inline: usize) -> Result<Self> {
         let preselect = (plan.indexed_terms.is_none()).then_some((plan.limit, plan.direction));
         let pipelines = Plan::new(plan.query, plan.request, preselect)?;

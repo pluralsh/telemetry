@@ -42,4 +42,7 @@ pub enum QueryError {
     Unsupported(String),
     #[error("TraceQL query limit exceeded: {0}")]
     Limit(String),
+    /// A query error a reader serving another shard returned.
+    #[error("{0}")]
+    Remote(String),
 }

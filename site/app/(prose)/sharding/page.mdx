@@ -58,13 +58,38 @@ Repeated scale requests before a cutover replace the pending epoch instead of st
 
 ## Reads
 
-Readers open every storage shard `[0, shard_count)` and merge:
+The reader that receives a query coordinates it over every storage shard `[0, shard_count)` and merges:
 
 - **Metrics** deduplicates series by fingerprint across shards.
 - **Logs** merges streams with equal labels.
 - **Traces** merges partial traces from every shard a trace ID may have been routed to.
 
-Every shard opened by a process shares one block cache and one meta cache, so reader cache memory stays flat as the shard count grows.
+### Reader groups
+
+Readers are partitioned into one group per storage shard, and each group's replicas open only that shard. Any reader still answers any query: it reads its own shard in process, and asks each other shard's group over the internal `ShardReader` gRPC service.
+
+```text
+Grafana ─► reader-1 (any group)
+              ├── shard 1 ─► in process, never over gRPC
+              ├── shard 0 ─► gRPC stream ─► reader-0 group
+              └── shard 2 ─► gRPC stream ─► reader-2 group
+           merge ─► Prometheus / Loki / Tempo JSON
+```
+
+Shard responses are compact protobuf streams: Metrics sends chunk-encoded samples for the coordinator's PromQL engine, Logs sends each shard's partial LogQL output, and Traces sends matching traces and TraceQL hits. Only the coordinating reader converts the merged result to the public API's JSON. A shard-scoped call is never forwarded again, so a query makes at most one hop per remote shard.
+
+Each group sits behind a headless Service. A reader spreads calls across the group's replicas, fails over when one is down, and hedges to a second replica if the first hasn't answered within 250 ms. A query fails rather than returning partial results when a group has no reachable replica.
+
+| Without groups | With groups |
+| --- | --- |
+| Every reader opens every shard | Each reader opens one shard |
+| Reader memory and cache working set grow with shard count | Per-pod footprint stays one shard's worth |
+| Readers scale only as whole-dataset copies | Each group scales on its own, with a per-group HPA |
+| No query traffic between readers | Remote shards' partial results cross the network |
+
+Per-shard limits apply per shard: Logs `maxPages` and Traces `maxCandidateTraces` bound each shard's work. A trace can only be split across shards when its spans run across a cutover that moves its ID. Hits within an hour of such a cutover are fetched and re-evaluated whole; every other hit is used as its shard returned it. A structural TraceQL query can still miss a split trace when no single shard's part matches it.
+
+The operator runs one reader StatefulSet per shard and adds groups as writers scale up. Set `spec.reader.readGroups.enabled: false` to return to readers that each open every shard. See [cost estimates](/cost/#reader-groups) for what groups change in your bill.
 
 ## Why Kubernetes
 

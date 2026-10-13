@@ -16,7 +16,10 @@ limitations under the License.
 
 package v1alpha1
 
-import corev1 "k8s.io/api/core/v1"
+import (
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
+)
 
 type ProductMode string
 
@@ -317,6 +320,57 @@ type WorkloadSpec struct {
 	// When omitted, remote and in-memory object stores default to Delete while
 	// Local object stores default to Retain because the data PVC is authoritative.
 	PersistentVolumeClaimRetentionPolicy *PersistentVolumeClaimRetentionPolicySpec `json:"persistentVolumeClaimRetentionPolicy,omitempty"`
+	// ReadGroups configures per-shard reader groups. Readers only; ignored
+	// for writers and in standalone mode.
+	ReadGroups *ReadGroupsSpec `json:"readGroups,omitempty"`
+	// Autoscaling adds a HorizontalPodAutoscaler per reader StatefulSet, one
+	// per reader group. Readers only; ignored for writers and in standalone
+	// mode.
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
+}
+
+// ReadGroupsSpec splits sharded readers into one group per storage shard.
+// Each group is a StatefulSet that opens only its own shard; a query sent
+// to any reader reads its own shard in process and every other shard from
+// that shard's group over gRPC. Replicas, resources, and autoscaling apply
+// to each group.
+type ReadGroupsSpec struct {
+	// Enabled defaults to true. When false, every reader opens every shard.
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+	// HedgeAfterMilliseconds starts a second copy of a shard read on another
+	// replica of its group when the first has not answered in time. Zero
+	// disables hedging.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=250
+	HedgeAfterMilliseconds *int64 `json:"hedgeAfterMilliseconds,omitempty"`
+	// RequestTimeoutSeconds bounds one shard read.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=120
+	RequestTimeoutSeconds *int64 `json:"requestTimeoutSeconds,omitempty"`
+}
+
+// AutoscalingSpec scales reader replicas on resource utilization. While
+// enabled the HorizontalPodAutoscaler owns replica counts and the
+// workload's replicas field only seeds a new StatefulSet.
+// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
+type AutoscalingSpec struct {
+	Enabled bool `json:"enabled"`
+	// MinReplicas defaults to the workload's replicas, or 2.
+	// +kubebuilder:validation:Minimum=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas int32 `json:"maxReplicas"`
+	// TargetCPUUtilizationPercentage is average CPU usage relative to the
+	// container's CPU request. Defaults to 70 when no memory target is set.
+	// +kubebuilder:validation:Minimum=1
+	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage,omitempty"`
+	// TargetMemoryUtilizationPercentage is average memory usage relative to
+	// the container's memory request.
+	// +kubebuilder:validation:Minimum=1
+	TargetMemoryUtilizationPercentage *int32 `json:"targetMemoryUtilizationPercentage,omitempty"`
+	// Behavior is passed through to the HorizontalPodAutoscaler.
+	Behavior *autoscalingv2.HorizontalPodAutoscalerBehavior `json:"behavior,omitempty"`
 }
 
 type PersistentVolumeClaimRetentionPolicyType string

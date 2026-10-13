@@ -3,6 +3,7 @@ pub mod openapi;
 
 mod http;
 mod internal_writer;
+mod shard_reader;
 mod state;
 
 pub use http::router;

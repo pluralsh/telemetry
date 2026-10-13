@@ -16,11 +16,11 @@ import (
 	k8sutils "github.com/pluralsh/telemetry/go/operator/internal/utils"
 )
 
-func (r *TracesReconciler) reconcileStatefulSet(ctx context.Context, traces *telemetryv1alpha1.Traces, component resources.Component, secretName, internalSecretName, internalSecretKey string) (ctrl.Result, error) {
+func (r *TracesReconciler) reconcileStatefulSet(ctx context.Context, traces *telemetryv1alpha1.Traces, component resources.Component, shard *int32, secretName, internalSecretName, internalSecretKey string) (ctrl.Result, error) {
 	desired, err := resources.StatefulSet(resources.StatefulSetInput{
 		Traces: traces, Component: component, ConfigSecretName: secretName,
 		InternalTokenSecretName: internalSecretName, InternalTokenSecretKey: internalSecretKey,
-		DefaultProductVersion: r.DefaultProductVersion,
+		DefaultProductVersion: r.DefaultProductVersion, Shard: shard,
 	})
 	if err != nil {
 		var volumeErr *resources.VolumeError
@@ -48,6 +48,7 @@ func (r *TracesReconciler) reconcileStatefulSet(ctx context.Context, traces *tel
 		}
 		return r.resizeResult(ctx, desired)
 	}
+	keepAutoscaledReplicas(traces, component, current, desired)
 	resizing, err := r.prepareStorageExpansion(ctx, component, current, desired)
 	if err != nil {
 		return ctrl.Result{}, err

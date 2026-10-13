@@ -22,12 +22,12 @@ The **telemetry-operator** watches these custom resources in the `telemetry.plur
 | `Traces` | A Tempo-compatible trace database |
 | `NamespaceAuthentication` | A read or write credential for one tenant namespace of one database |
 
-For each database the operator renders configuration, then creates a ServiceAccount, writer and reader StatefulSets, Services, an optional Ingress, and PVCs for cache volumes. It also handles rolling restarts on config changes and PVC resizing.
+For each database the operator renders configuration, then creates a ServiceAccount, a writer StatefulSet, one reader StatefulSet per storage shard, Services, PodDisruptionBudgets, optional reader HorizontalPodAutoscalers, an optional Ingress, and PVCs for cache volumes. It also handles rolling restarts on config changes and PVC resizing.
 
 Every database runs in one of two modes:
 
 - **`Standalone`**: a single pod that both reads and writes. Good for development, small clusters, and edge sites.
-- **`Sharded`**: separate writer and reader StatefulSets that scale independently. Writer replicas equal storage shards.
+- **`Sharded`**: writers and readers scale independently. Writer replicas equal storage shards, and each shard gets a [reader group](/sharding/#reader-groups) that serves it.
 
 ## 1. Install the operator
 
@@ -74,7 +74,7 @@ Its trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` an
 
 ## 3. Declare a database
 
-This creates a sharded log database with three writers (and so three storage shards) and two readers, on S3. No credentials appear in the spec:
+This creates a sharded log database with three writers (and so three storage shards) and a reader group of two replicas for each shard, on S3. No credentials appear in the spec:
 
 ```yaml
 apiVersion: telemetry.plural.sh/v1alpha1
@@ -168,4 +168,4 @@ Any writer accepts any record and forwards it over internal gRPC to the shard's 
 
 ## Scaling later
 
-Raise `spec.writer.replicas` and the operator adds pods first; the new shards start taking writes at the next aligned hour. Readers can be scaled at any time. Scale-down of writers is intentionally blocked, because existing shards must stay writable until their data expires. See [epoch sharding](/sharding/).
+Raise `spec.writer.replicas` and the operator adds pods first; the new shards start taking writes at the next aligned hour. Readers can be scaled at any time, per group or with `spec.reader.autoscaling`, and a new reader group is added for each new shard. Scale-down of writers is intentionally blocked, because existing shards must stay writable until their data expires. See [epoch sharding](/sharding/).

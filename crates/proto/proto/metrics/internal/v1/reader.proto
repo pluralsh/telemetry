@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package metrics.internal.v1;
+
+import "metrics/internal/v1/writer.proto";
+
+// Reads one storage shard on behalf of a reader coordinating a query over
+// every shard. Each call is served from the shard the receiving reader
+// group opens locally; nothing is forwarded further.
+service ShardReader {
+  // One message per resolved time bucket, oldest first.
+  rpc Resolve(ResolveRequest) returns (stream ResolvedChunk);
+  // Raw samples for series an earlier Resolve returned, in request order.
+  rpc Samples(ReadSamplesRequest) returns (stream SampleBatch);
+  rpc Series(SeriesRequest) returns (SeriesResponse);
+  rpc LabelNames(LabelNamesRequest) returns (StringsResponse);
+  rpc LabelValues(LabelValuesRequest) returns (StringsResponse);
+  rpc Metadata(MetadataRequest) returns (MetadataResponse);
+  rpc BucketGenerations(BucketGenerationsRequest) returns (BucketGenerationsResponse);
+}
+
+// The shard and namespace a call reads, plus the query's preload ranges in
+// Unix seconds, which pick the buckets the shard's query reader covers.
+message ShardRead {
+  uint32 shard = 1;
+  Namespace namespace = 2;
+  repeated SecondsRange ranges = 3;
+}
+
+message SecondsRange {
+  int64 start = 1;
+  int64 end = 2;
+}
+
+message Matcher {
+  enum Op {
+    OP_EQUAL = 0;
+    OP_NOT_EQUAL = 1;
+    OP_REGEX = 2;
+    OP_NOT_REGEX = 3;
+  }
+
+  Op op = 1;
+  string name = 2;
+  // The regex source as written, unanchored.
+  string value = 3;
+}
+
+message MatcherGroup {
+  repeated Matcher matchers = 1;
+}
+
+message Selector {
+  optional string name = 1;
+  repeated Matcher matchers = 2;
+  repeated MatcherGroup or_matchers = 3;
+}
+
+message ResolveRequest {
+  ShardRead read = 1;
+  Selector selector = 2;
+  int64 start_ms = 3;
+  int64 end_ms_exclusive = 4;
+}
+
+message LabelSet {
+  repeated Label labels = 1;
+}
+
+// `labels`, `series_ids` and `metric_names` are parallel.
+message ResolvedChunk {
+  uint64 bucket_id = 1;
+  repeated LabelSet labels = 2;
+  repeated uint32 series_ids = 3;
+  repeated string metric_names = 4;
+}
+
+message SeriesRef {
+  uint64 bucket_id = 1;
+  uint32 series_id = 2;
+  string metric_name = 3;
+}
+
+message ReadSamplesRequest {
+  ShardRead read = 1;
+  repeated SeriesRef series = 2;
+  int64 start_ms = 3;
+  int64 end_ms_exclusive = 4;
+}
+
+// Float samples are a section of chunk-encoded timestamps and values, the
+// encoding sample storage uses.
+message SeriesSamples {
+  bytes chunks = 1;
+  repeated HistogramSample histograms = 2;
+}
+
+// Covers request series `series_start .. series_start + len(series)`.
+message SampleBatch {
+  uint32 series_start = 1;
+  repeated SeriesSamples series = 2;
+}
+
+message SeriesRequest {
+  ShardRead read = 1;
+  repeated string matchers = 2;
+}
+
+message SeriesResponse {
+  repeated LabelSet series = 1;
+}
+
+message LabelNamesRequest {
+  ShardRead read = 1;
+  repeated string matchers = 2;
+}
+
+message LabelValuesRequest {
+  ShardRead read = 1;
+  string label_name = 2;
+  repeated string matchers = 3;
+}
+
+message StringsResponse {
+  repeated string values = 1;
+}
+
+message MetadataRequest {
+  ShardRead read = 1;
+  optional string metric = 2;
+}
+
+message ReadMetricMetadata {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_GAUGE = 1;
+    KIND_SUM = 2;
+    KIND_HISTOGRAM = 3;
+    KIND_EXPONENTIAL_HISTOGRAM = 4;
+    KIND_SUMMARY = 5;
+  }
+  enum Temporality {
+    TEMPORALITY_UNSPECIFIED = 0;
+    TEMPORALITY_CUMULATIVE = 1;
+    TEMPORALITY_DELTA = 2;
+  }
+
+  string metric_name = 1;
+  Kind kind = 2;
+  bool monotonic = 3;
+  Temporality temporality = 4;
+  optional string description = 5;
+  optional string unit = 6;
+}
+
+message MetadataResponse {
+  repeated ReadMetricMetadata metadata = 1;
+}
+
+message BucketGenerationsRequest {
+  ShardRead read = 1;
+  repeated uint64 bucket_ids = 2;
+}
+
+message Generation {
+  optional uint64 value = 1;
+}
+
+// Parallel to the request's `bucket_ids`.
+message BucketGenerationsResponse {
+  repeated Generation generations = 1;
+}

@@ -27,7 +27,12 @@ const PUT_PER_1K = 0.005;
 const GET_PER_1K = 0.0004;
 const GP3_GB_MONTH = 0.08;
 const WRITER_VCPU = 8;
-const READER_VCPU = 4;
+const READER_VCPU = 2;
+const READER_REPLICAS_PER_GROUP = 2;
+// Cache-miss and manifest GETs per second for each (reader pod, opened shard) pair.
+const GETS_PER_READER_SHARD = 17;
+// Remote-shard query responses per day, as a fraction of raw ingest.
+const QUERY_FANOUT_FRACTION = 0.01;
 const WRITER_MIB_PER_SECOND = 40;
 const WRITER_UTILIZATION = 0.85;
 
@@ -52,23 +57,26 @@ export function estimate(i: CostInputs): Estimate[] {
   // ---- Plural Telemetry ----
   const writerMBs = WRITER_MIB_PER_SECOND * 1.048576 * WRITER_UTILIZATION;
   const writers = Math.max(1, Math.ceil(peakMBs / writerMBs));
-  const readers = Math.max(2, Math.ceil(writers / 3));
+  // One reader group per storage shard; each pod opens only its own shard.
+  const readers = writers * READER_REPLICAS_PER_GROUP;
   const writerVcpu = writers * WRITER_VCPU;
   const readerVcpu = readers * READER_VCPU;
   const oursVcpu = writerVcpu + readerVcpu;
   const oursPuts = writers * 10 * SECONDS + ((storedGb / i.retentionDays) * DAYS * 1000 * 6) / 64; // WAL + SST/compaction
-  const oursGets = readers * 50 * SECONDS;
+  const oursGets = readers * GETS_PER_READER_SHARD * SECONDS;
   const fwdFraction = writers > 1 ? (writers - 1) / writers : 0;
-  const oursXaz = wireGbDay * fwdFraction * (2 / 3) * DAYS * i.crossAzGb;
+  const forwardXaz = wireGbDay * fwdFraction * (2 / 3) * DAYS * i.crossAzGb;
+  const fanoutXaz = i.gbPerDay * QUERY_FANOUT_FRACTION * fwdFraction * (2 / 3) * DAYS * i.crossAzGb;
+  const oursXaz = forwardXaz + fanoutXaz;
 
   const ours: Estimate = {
     name: "Plural Telemetry",
-    footprint: `${writers} writers × ${WRITER_VCPU} vCPU + ${readers} readers × ${READER_VCPU} vCPU`,
+    footprint: `${writers} writers × ${WRITER_VCPU} vCPU + ${writers} reader groups × ${READER_REPLICAS_PER_GROUP} × ${READER_VCPU} vCPU`,
     lines: [
       { label: "Compute", usd: oursVcpu * vcpuMonth, detail: `${writerVcpu} writer + ${readerVcpu} reader vCPU` },
       { label: "Object storage", usd: storedGb * 1.1 * i.s3GbMonth, detail: `${Math.round(storedGb * 1.1).toLocaleString()} GB incl. index` },
       { label: "Object requests", usd: (oursPuts / 1000) * PUT_PER_1K + (oursGets / 1000) * GET_PER_1K, detail: "WAL, SST, compaction, cache misses" },
-      { label: "Cross-AZ traffic", usd: oursXaz, detail: "shard forwarding only" },
+      { label: "Cross-AZ traffic", usd: oursXaz, detail: "write forwarding + query fan-out" },
     ],
     total: 0,
   };

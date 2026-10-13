@@ -38,6 +38,7 @@ moka.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 promql-parser.workspace = true
+proto = { path = "../proto" }
 regex.workspace = true
 regex-syntax.workspace = true
 roaring.workspace = true

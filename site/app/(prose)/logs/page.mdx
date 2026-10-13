@@ -24,7 +24,7 @@ export const metadata = { title: "Logs architecture" };
 
 ## Read path
 
-1. Grafana sends LogQL to **any reader**. Readers open every shard read-only and share one block cache.
+1. Grafana sends LogQL to **any reader**. It runs the query on its own shard in process and merges each other shard's partial result, streamed from that shard's [reader group](/sharding/#reader-groups) over gRPC.
 2. For each time segment in range, label matchers intersect Roaring-bitmap postings to find stream IDs.
 3. Each stream's runs carry their min and max timestamps, so out-of-range objects are rejected before any block is read.
 4. The surviving blocks are range-read through the RAM + NVMe cache and decoded, then the LogQL pipeline runs over the rows.
@@ -47,7 +47,7 @@ Rows of one stream are stored as independently decoded blocks of 256 rows. Repla
 | Recent data | Replicated ingester memory and WAL | Writer buffer, then SlateDB on object storage |
 | Write fan-out | 3× to ingesters via the hash ring | 1× to the shard owner |
 | Index | TSDB index, index gateways, compactor | Per-segment postings in the same SlateDB keyspace |
-| Query tiers | Frontend, scheduler, queriers, three caches | Readers with one block cache |
+| Query tiers | Frontend, scheduler, queriers, three caches | Reader groups, one per shard, each with one block cache |
 | Full-text search | Line filters only | Line filters, plus indexed `\| match` |
 
 The [overview architecture guide](/architecture/) walks through each Loki component and the failure modes on both sides.

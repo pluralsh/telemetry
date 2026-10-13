@@ -190,8 +190,8 @@ export function EpochSharding() {
         <>
           {reading ? (
             <>
-              Readers never consult routing to find data. They open every shard that has ever existed, scan each one for the query&apos;s time range, and
-              merge the results. Because epochs only add shards, a shard created by a scale-up simply has nothing to return for hours before its cutover.
+              Queries never consult routing to find data. The receiving reader scans every shard that has ever existed for the query&apos;s time range:
+              its own in process and the rest through their reader groups over gRPC. Then it merges the results. Because epochs only add shards, a shard created by a scale-up simply has nothing to return for hours before its cutover.
             </>
           ) : (
             <>

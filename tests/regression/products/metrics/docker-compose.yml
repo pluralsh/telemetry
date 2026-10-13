@@ -152,6 +152,32 @@ services:
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18082:8080"]
 
+  # Reader group 0: opens shard 0 and reads the other shard from its group.
+  metrics-reader-0:
+    <<: *metrics
+    profiles: ["reader-groups"]
+    command: ["--config", "/app/regression/reader-group.yaml"]
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "0"
+    volumes:
+      - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18085:8080"]
+
+  # Reader group 1: opens shard 1 and reads the other shard from its group.
+  metrics-reader-1:
+    <<: *metrics
+    profiles: ["reader-groups"]
+    command: ["--config", "/app/regression/reader-group.yaml"]
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "1"
+    volumes:
+      - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["18086:8080"]
+
   # One process and shard over MinIO, the shape of the single-binary oracles;
   # benchmarks use it so reads skip the split topology's per-shard fan-out.
   metrics-s3:

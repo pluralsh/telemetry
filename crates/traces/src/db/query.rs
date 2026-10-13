@@ -1555,6 +1555,13 @@ pub(crate) trait Hit: Sized + Send + 'static {
     fn from_columns(summary: TraceSummary) -> Option<Self>;
 
     fn order(&self) -> (u64, TraceId);
+
+    /// Start and end of the trace's spans this hit was evaluated over.
+    fn span_range(&self) -> (u64, u64);
+
+    fn to_wire(self) -> proto::traces::internal::v1::TraceQlHit;
+
+    fn from_wire(hit: proto::traces::internal::v1::TraceQlHit) -> Result<Self>;
 }
 
 impl Hit for TraceQlResult {
@@ -1574,6 +1581,18 @@ impl Hit for TraceQlResult {
 
     fn order(&self) -> (u64, TraceId) {
         (self.start_ns, self.trace_id)
+    }
+
+    fn span_range(&self) -> (u64, u64) {
+        (self.start_ns, self.end_ns)
+    }
+
+    fn to_wire(self) -> proto::traces::internal::v1::TraceQlHit {
+        crate::remote::result_to_wire(self)
+    }
+
+    fn from_wire(hit: proto::traces::internal::v1::TraceQlHit) -> Result<Self> {
+        crate::remote::result_from_wire(hit)
     }
 }
 
@@ -1595,6 +1614,33 @@ impl Hit for TraceSummary {
     fn order(&self) -> (u64, TraceId) {
         (self.start_ns, self.trace_id)
     }
+
+    fn span_range(&self) -> (u64, u64) {
+        (self.start_ns, self.end_ns)
+    }
+
+    fn to_wire(self) -> proto::traces::internal::v1::TraceQlHit {
+        crate::remote::summary_to_wire(self)
+    }
+
+    fn from_wire(hit: proto::traces::internal::v1::TraceQlHit) -> Result<Self> {
+        crate::remote::summary_from_wire(hit)
+    }
+}
+
+/// `trace` evaluated alone against `source`, as [`execute_traceql`] would
+/// evaluate it once loaded.
+pub(crate) fn evaluate_traceql<T: Hit>(
+    trace: &Trace,
+    source: &str,
+    options: &QueryOptions,
+) -> Result<Option<T>> {
+    let plan = crate::traceql::plan(crate::traceql::parse(source)?)?;
+    if !satisfies(trace, &plan.pushdown) {
+        return Ok(None);
+    }
+    let compiled = crate::traceql::CompiledQuery::new(plan.query.clone());
+    Ok(T::evaluate(trace, &compiled, options.max_spans_per_trace)?)
 }
 
 /// Executes a non-metrics TraceQL query over one or more shards.

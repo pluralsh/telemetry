@@ -20,16 +20,16 @@ Use the controls to switch between the write and read paths, and drag the ingest
 
 ## The Plural Telemetry shape
 
-A sharded Logs deployment is two StatefulSets and a bucket:
+A sharded Logs deployment is a writer StatefulSet, one reader StatefulSet per shard, and a bucket:
 
 - **Writers** each own one storage shard, which is a SlateDB database. A Kubernetes `Lease` guarantees one owner per shard.
-- **Readers** open every shard read-only and merge the results.
+- **Readers** form one [reader group](/sharding/#reader-groups) per shard. Each group opens its shard read-only, and any reader can answer a query over all of them.
 
 Durability comes from object storage, not replicas. If a writer dies, another pod takes its Lease and reopens the shard from the bucket.
 
 **Writes.** An agent sends a batch to any writer. Each entry is hashed to a shard ([epoch sharding](/sharding/)), forwarded to its owner, and committed to SlateDB, which uploads to object storage. Readers see it within about 10 seconds.
 
-**Reads.** Grafana sends LogQL to any reader. The reader prunes by labels and time, fetches only the blocks it needs through a RAM + NVMe cache, and merges streams across shards.
+**Reads.** Grafana sends LogQL to any reader. The reader runs the query on its own shard in process, and streams each other shard's partial result from that shard's group over gRPC. Every group prunes by labels and time and fetches only the blocks it needs through a RAM + NVMe cache. The receiving reader merges streams across shards.
 
 ## The Loki shape
 
@@ -55,7 +55,7 @@ None of these are bad decisions. They follow from Loki's design: recent data liv
   Raising `writer.replicas` from 3 to 5 adds two pods and two empty shards. From the next hour on, new entries spread across five shards; older entries stay where they are. No data is copied and no ring is rebalanced.
 </Callout>
 
-Reads scale by adding readers, which are stateless views over the bucket and need no coordination.
+Reads scale by adding readers, which are stateless views over the bucket. Each shard's group scales on its own, by hand or with a CPU-targeted HorizontalPodAutoscaler, and new groups appear as writers add shards.
 
 With Loki, adding ingesters triggers a ring rebalance and changes which three replicas own each stream. Removing ingesters requires flushing their in-memory chunks first. Read capacity scales across several tiers: frontend, scheduler, queriers, index gateways, and caches.
 
@@ -66,6 +66,6 @@ With Loki, adding ingesters triggers a ring rebalance and changes which three re
 | Writer / ingester crash | Lease expires, another writer reopens the shard from S3. Unflushed `applied` writes in the delta are lost; use `written` or `durable` if that matters | Replicas keep serving; WAL replays on restart |
 | Zone outage | Pods reschedule and reopen shards from the bucket | Survives if replicas are spread across zones |
 | Object store slowdown | Write latency grows and backpressure returns `429` with `Retry-After` | Flushes back up and ingester memory grows |
-| Bad rollout | Two StatefulSets to roll back | Up to nine components with version-skew rules |
+| Bad rollout | One product CR to roll back; the operator rolls writer and reader StatefulSets | Up to nine components with version-skew rules |
 
 Plural Telemetry trades in-cluster replication for object-store durability. That's the right trade for most observability data, and the [cost estimates](/cost/) show what it's worth.

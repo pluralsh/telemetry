@@ -37,12 +37,13 @@ export type ArchConfig = {
 
 const at = (arr: number[]) => (l: number) => arr[Math.min(l, arr.length - 1)];
 
-function ours(product: ProductId, agents: string, writers: number[], readers: number[]): ArchSide {
+function ours(product: ProductId, agents: string, writers: number[]): ArchSide {
   const w = at(writers);
-  const r = at(readers);
+  // One reader group per shard; query load sets the replicas in each group.
+  const r = (l: number, q: number) => w(l) * q;
   return {
     title: `Plural ${product[0].toUpperCase()}${product.slice(1)}`,
-    subtitle: "two StatefulSets on SlateDB",
+    subtitle: "writers and per-shard reader groups on SlateDB",
     nodes: [
       { id: "agents", label: "Agents", sub: agents, x: 20, y: 14, w: 200, h: 42, tone: "client", modes: ["write"] },
       { id: "grafana", label: "Grafana", sub: "queries", x: 240, y: 14, w: 200, h: 42, tone: "client", modes: ["read"] },
@@ -61,12 +62,12 @@ function ours(product: ProductId, agents: string, writers: number[], readers: nu
       {
         id: "readers",
         label: "reader",
-        sub: "reads every shard",
+        sub: "1 group / shard",
         x: 240,
         y: 90,
         w: 200,
         h: 150,
-        pods: (l, q) => r(l) * q,
+        pods: (l, q) => r(l, q),
         tone: "ours",
         modes: ["read"],
       },
@@ -79,15 +80,16 @@ function ours(product: ProductId, agents: string, writers: number[], readers: nu
       { mode: "write", d: "M58 182 C 80 150, 160 150, 182 182", color: "var(--ink)", dur: 1.6, count: 1 },
       { mode: "read", d: "M332 56 V380", count: 2 },
       { mode: "read", d: "M348 380 V56", color: "var(--accent-text)", count: 2 },
+      { mode: "read", d: "M278 182 C 300 150, 380 150, 402 182", color: "var(--ink)", dur: 1.6, count: 1 },
     ],
     stats: (l, q) => [
       { label: "component kinds", value: "2" },
-      { label: "pods", value: String(w(l) + r(l) * q) },
+      { label: "pods", value: String(w(l) + r(l, q)) },
       { label: "replicated disks", value: "0" },
       { label: "hash rings", value: "0" },
     ],
     scaleNote:
-      "More writers means more shards from the next hour on. Nothing is copied or rebalanced, and readers scale on their own.",
+      "More writers means more shards from the next hour on, and a reader group for each. Nothing is copied or rebalanced; each group scales on its own, and any reader merges every shard over gRPC.",
   };
 }
 
@@ -173,7 +175,7 @@ export const ARCH: Record<ProductId, ArchConfig> = {
     levelLabel: "Ingest",
     levels: ["100 GB/day", "500 GB/day", "1 TB/day", "2 TB/day", "5 TB/day", "10 TB/day"],
     defaultLevel: 4,
-    ours: ours("logs", "Alloy · OTel · Fluent Bit", [1, 1, 1, 1, 3, 5], [1, 1, 2, 2, 2, 3]),
+    ours: ours("logs", "Alloy · OTel · Fluent Bit", [1, 1, 1, 1, 3, 5]),
     peer: peer({
       name: "Grafana Loki",
       subtitle: "microservices mode",
@@ -200,7 +202,7 @@ export const ARCH: Record<ProductId, ArchConfig> = {
     levelLabel: "Active series",
     levels: ["100k", "1M", "4M", "8M", "16M", "32M"],
     defaultLevel: 3,
-    ours: ours("metrics", "Prometheus · Alloy · OTel", [1, 1, 1, 2, 4, 8], [1, 1, 2, 2, 3, 4]),
+    ours: ours("metrics", "Prometheus · Alloy · OTel", [1, 1, 1, 2, 4, 8]),
     peer: peer({
       name: "Grafana Mimir",
       subtitle: "microservices mode",
@@ -227,7 +229,7 @@ export const ARCH: Record<ProductId, ArchConfig> = {
     levelLabel: "Spans/s",
     levels: ["5k", "20k", "50k", "100k", "250k", "500k"],
     defaultLevel: 3,
-    ours: ours("traces", "OTel Collector · Alloy", [1, 1, 1, 2, 5, 10], [1, 1, 2, 2, 3, 5]),
+    ours: ours("traces", "OTel Collector · Alloy", [1, 1, 1, 2, 5, 10]),
     peer: peer({
       name: "Grafana Tempo",
       subtitle: "microservices mode",

@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -118,7 +119,12 @@ var _ = Describe("Logs Controller", func() {
 
 			components := []string{name}
 			if test.mode == telemetryv1alpha1.LogsModeSharded {
-				components = []string{name + "-writer", name + "-reader"}
+				components = make([]string, 0, 1+writerReplicas)
+				components = append(components, name+"-writer")
+				for shard := range writerReplicas {
+					components = append(components, fmt.Sprintf("%s-reader-%d", name, shard))
+				}
+				created = append(created, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name + "-reader", Namespace: testNamespace}})
 				role := &rbacv1.Role{}
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name + "-sharding"}, role)).To(Succeed())
 				created = append(created, role, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name + "-sharding", Namespace: testNamespace}})

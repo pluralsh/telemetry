@@ -5,6 +5,7 @@ mod http;
 mod internal_writer;
 mod jaeger_grpc;
 mod otlp_grpc;
+mod shard_reader;
 mod state;
 
 pub mod jaeger {

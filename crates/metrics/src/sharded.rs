@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::ops::RangeBounds;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use common::{SharedDbCache, SstWarmTracker};
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::future::BoxFuture;
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardSetError,
@@ -24,6 +25,7 @@ use crate::promql::source::{
 use crate::promql::source_adapter::QueryReaderSource;
 use crate::query::{CachedSeriesResolution, LimitedQueryReader, QueryLimits, QueryReader};
 use crate::reader::ReaderQueryReader;
+use crate::remote::{MetricsShardClient, RemoteShard, RemoteShardSource};
 use crate::result_cache::{CachePlan, Generations, ResultCache, has_duplicate_labels, merge};
 use crate::storage::{StorageRead, WarmStorage};
 use crate::tsdb::{
@@ -123,6 +125,9 @@ pub struct ShardedMetrics {
     shards: Arc<ShardSet<MetricsShard>>,
     block_cache: SharedDbCache,
     result_cache: Option<ResultCache>,
+    /// Reads the shards other reader groups serve; unset outside reader
+    /// groups, where every shard is open locally.
+    remote: OnceLock<Arc<dyn MetricsShardClient>>,
 }
 
 pub type ShardedTimeseries = ShardedMetrics;
@@ -146,6 +151,7 @@ impl ShardedMetrics {
             result_cache: caches
                 .result_cache_enabled
                 .then(|| ResultCache::new(caches.result_capacity_bytes)),
+            remote: OnceLock::new(),
         })
     }
 
@@ -211,6 +217,28 @@ impl ShardedMetrics {
     /// The open storage shards, for ownership lifecycle management.
     pub fn shards(&self) -> &Arc<ShardSet<MetricsShard>> {
         &self.shards
+    }
+
+    /// Reads every shard outside this reader's scope through `client`.
+    /// Returns false when a client was already connected.
+    pub fn connect_remote_shards(&self, client: Arc<dyn MetricsShardClient>) -> bool {
+        self.remote.set(client).is_ok()
+    }
+
+    /// The shards this reader reads remotely. Never includes an open shard:
+    /// a local shard is always read in process.
+    pub(crate) fn remote_shards(&self) -> Vec<RemoteShard> {
+        let Some(client) = self.remote.get() else {
+            return Vec::new();
+        };
+        self.shards
+            .remote_shards()
+            .into_iter()
+            .map(|shard| RemoteShard {
+                shard,
+                client: Arc::clone(client),
+            })
+            .collect()
     }
 
     /// Warms recent cache blocks for every open shard and namespace, skipping
@@ -556,12 +584,22 @@ impl ShardedMetrics {
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<Labels>, QueryError> {
         let handles = self.shards.databases().await;
-        let width = handles.len().max(1);
-        let mut pending = Vec::with_capacity(handles.len());
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let range = start..=end;
+        let remote = self.remote_shards();
+        let remote_range = remote_range(&remote, range.clone())?;
+        let width = (handles.len() + remote.len()).max(1);
+        let mut pending: Vec<BoxFuture<'_, std::result::Result<Vec<Labels>, QueryError>>> =
+            Vec::with_capacity(width);
         for reader in handles {
             let permits = self.shards.io_permits();
             let range = range.clone();
-            pending.push(async move { reader.series(namespace, matchers, range, permits).await });
+            pending.push(
+                async move { reader.series(namespace, matchers, range, permits).await }.boxed(),
+            );
+        }
+        for shard in &remote {
+            pending.push(shard.series(namespace, matchers, remote_range).boxed());
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -583,12 +621,22 @@ impl ShardedMetrics {
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
         let handles = self.shards.databases().await;
-        let width = handles.len().max(1);
-        let mut pending = Vec::with_capacity(handles.len());
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let range = start..=end;
+        let remote = self.remote_shards();
+        let remote_range = remote_range(&remote, range.clone())?;
+        let width = (handles.len() + remote.len()).max(1);
+        let mut pending: Vec<BoxFuture<'_, std::result::Result<Vec<String>, QueryError>>> =
+            Vec::with_capacity(width);
         for reader in handles {
             let permits = self.shards.io_permits();
             let range = range.clone();
-            pending.push(async move { reader.labels(namespace, matchers, range, permits).await });
+            pending.push(
+                async move { reader.labels(namespace, matchers, range, permits).await }.boxed(),
+            );
+        }
+        for shard in &remote {
+            pending.push(shard.labels(namespace, matchers, remote_range).boxed());
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -611,16 +659,31 @@ impl ShardedMetrics {
         range: impl RangeBounds<SystemTime> + Clone,
     ) -> std::result::Result<Vec<String>, QueryError> {
         let handles = self.shards.databases().await;
-        let width = handles.len().max(1);
-        let mut pending = Vec::with_capacity(handles.len());
+        let (start, end) = crate::util::range_bounds_to_system_time(range);
+        let range = start..=end;
+        let remote = self.remote_shards();
+        let remote_range = remote_range(&remote, range.clone())?;
+        let width = (handles.len() + remote.len()).max(1);
+        let mut pending: Vec<BoxFuture<'_, std::result::Result<Vec<String>, QueryError>>> =
+            Vec::with_capacity(width);
         for reader in handles {
             let permits = self.shards.io_permits();
             let range = range.clone();
-            pending.push(async move {
-                reader
-                    .label_values(namespace, label_name, matchers, range, permits)
-                    .await
-            });
+            pending.push(
+                async move {
+                    reader
+                        .label_values(namespace, label_name, matchers, range, permits)
+                        .await
+                }
+                .boxed(),
+            );
+        }
+        for shard in &remote {
+            pending.push(
+                shard
+                    .label_values(namespace, label_name, matchers, remote_range)
+                    .boxed(),
+            );
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -641,14 +704,22 @@ impl ShardedMetrics {
         metric: Option<&str>,
     ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
         let handles = self.shards.databases().await;
-        let width = handles.len().max(1);
-        let mut pending = Vec::with_capacity(handles.len());
+        let remote = self.remote_shards();
+        let width = (handles.len() + remote.len()).max(1);
+        let mut pending: Vec<BoxFuture<'_, std::result::Result<Vec<MetricMetadata>, QueryError>>> =
+            Vec::with_capacity(width);
         for reader in handles {
             let permits = self.shards.io_permits();
-            pending.push(async move {
-                let _permit = acquire_io_permit(&permits).await?;
-                reader.metadata(namespace, metric).await
-            });
+            pending.push(
+                async move {
+                    let _permit = acquire_io_permit(&permits).await?;
+                    reader.metadata(namespace, metric).await
+                }
+                .boxed(),
+            );
+        }
+        for shard in &remote {
+            pending.push(shard.metadata(namespace, metric).boxed());
         }
         let results = stream::iter(pending)
             .buffered(width)
@@ -667,18 +738,26 @@ impl ShardedMetrics {
         namespace: &Namespace,
         buckets: &[TimeBucket],
     ) -> Result<Vec<(ShardId, Vec<Option<u64>>)>> {
-        let mut generations = futures::future::try_join_all(
-            self.shards.entries().await.into_iter().map(|(id, shard)| {
-                self.shards.with_io(async move {
+        let remote = self.remote_shards();
+        let local = self.shards.entries().await.into_iter().map(|(id, shard)| {
+            self.shards
+                .with_io(async move {
                     let generations = match &*shard {
                         MetricsShard::Writer(db) => db.bucket_generations(namespace, buckets).await,
                         MetricsShard::Reader(db) => db.bucket_generations(namespace, buckets).await,
                     }?;
                     Ok::<_, Error>((id, generations))
                 })
-            }),
-        )
-        .await?;
+                .boxed()
+        });
+        let remote = remote.iter().map(|shard| {
+            async move {
+                let generations = shard.bucket_generations(namespace, buckets).await?;
+                Ok::<_, Error>((shard.shard, generations))
+            }
+            .boxed()
+        });
+        let mut generations = futures::future::try_join_all(local.chain(remote)).await?;
         generations.sort_unstable_by_key(|(id, _)| *id);
         Ok(generations)
     }
@@ -689,29 +768,131 @@ impl ShardedMetrics {
         ranges: &[(i64, i64)],
         options: &crate::QueryOptions,
     ) -> Result<MultiShardSeriesSource> {
-        let databases = self.shards.databases().await;
-        let readers = futures::future::try_join_all(databases.into_iter().map(|shard| {
+        let entries = self.shards.entries().await;
+        let readers = futures::future::try_join_all(entries.into_iter().map(|(id, shard)| {
             self.shards.with_io(async move {
-                match &*shard {
-                    MetricsShard::Writer(db) => db
-                        .read_engine(namespace)
-                        .await
-                        .make_query_reader_for_ranges(ranges)
-                        .await
-                        .map(ShardQueryReader::Writer),
-                    MetricsShard::Reader(db) => db
-                        .make_query_reader_for_ranges(namespace, ranges)
-                        .await
-                        .map(ShardQueryReader::Reader),
-                }
+                shard_query_reader(&shard, namespace, ranges)
+                    .await
+                    .map(|reader| (id, reader))
             })
         }))
         .await?;
+        let limits = QueryLimits::new(options);
+        let mut sources: Vec<(ShardId, ShardSource)> = readers
+            .into_iter()
+            .map(|(id, reader)| {
+                let source = local_source(reader, self.shards.io_permits(), limits.clone());
+                (id, ShardSource::Local(source))
+            })
+            .collect();
+        sources.extend(self.remote_shards().into_iter().map(|shard| {
+            (
+                shard.shard,
+                ShardSource::Remote(shard.source(namespace, ranges)),
+            )
+        }));
+        sources.sort_unstable_by_key(|(id, _)| *id);
         Ok(MultiShardSeriesSource::new(
-            readers,
-            self.shards.io_permits(),
-            QueryLimits::new(options),
+            sources.into_iter().map(|(_, source)| source).collect(),
         ))
+    }
+
+    /// The local shard `shard`, which must be open here.
+    async fn local_shard(&self, shard: ShardId) -> Result<Arc<MetricsShard>> {
+        Ok(self.shards.require(shard).await?)
+    }
+
+    /// A query source over the local shard `shard` alone.
+    pub(crate) async fn local_source(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        ranges: &[(i64, i64)],
+    ) -> Result<QueryReaderSource<ShardSourceReader>> {
+        let database = self.local_shard(shard).await?;
+        let reader = self
+            .shards
+            .with_io(shard_query_reader(&database, namespace, ranges))
+            .await?;
+        Ok(local_source(
+            reader,
+            self.shards.io_permits(),
+            QueryLimits::new(&crate::QueryOptions::default()),
+        ))
+    }
+
+    pub(crate) async fn local_series(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        matchers: &[&str],
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<Labels>, QueryError> {
+        let database = self.local_shard(shard).await?;
+        database
+            .series(namespace, matchers, range, self.shards.io_permits())
+            .await
+    }
+
+    pub(crate) async fn local_labels(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let database = self.local_shard(shard).await?;
+        database
+            .labels(namespace, matchers, range, self.shards.io_permits())
+            .await
+    }
+
+    pub(crate) async fn local_label_values(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        label_name: &str,
+        matchers: Option<&[&str]>,
+        range: impl RangeBounds<SystemTime>,
+    ) -> std::result::Result<Vec<String>, QueryError> {
+        let database = self.local_shard(shard).await?;
+        database
+            .label_values(
+                namespace,
+                label_name,
+                matchers,
+                range,
+                self.shards.io_permits(),
+            )
+            .await
+    }
+
+    pub(crate) async fn local_metadata(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        metric: Option<&str>,
+    ) -> std::result::Result<Vec<MetricMetadata>, QueryError> {
+        let database = self.local_shard(shard).await?;
+        let _permit = acquire_io_permit(&self.shards.io_permits()).await?;
+        database.metadata(namespace, metric).await
+    }
+
+    pub(crate) async fn local_bucket_generations(
+        &self,
+        shard: ShardId,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Result<Vec<Option<u64>>> {
+        let database = self.local_shard(shard).await?;
+        self.shards
+            .with_io(async move {
+                match &*database {
+                    MetricsShard::Writer(db) => db.bucket_generations(namespace, buckets).await,
+                    MetricsShard::Reader(db) => db.bucket_generations(namespace, buckets).await,
+                }
+            })
+            .await
     }
 }
 
@@ -725,11 +906,53 @@ impl ReaderShardLifecycle for ShardedMetrics {
     }
 }
 
+/// The time range remote shards read, in Unix seconds; unused (and not
+/// validated) when every shard is local.
+fn remote_range(
+    remote: &[RemoteShard],
+    range: impl RangeBounds<SystemTime>,
+) -> std::result::Result<(i64, i64), QueryError> {
+    if remote.is_empty() {
+        return Ok((0, 0));
+    }
+    crate::util::range_bounds_to_secs(range)
+}
+
+async fn shard_query_reader(
+    shard: &MetricsShard,
+    namespace: &Namespace,
+    ranges: &[(i64, i64)],
+) -> Result<ShardQueryReader> {
+    match shard {
+        MetricsShard::Writer(db) => db
+            .read_engine(namespace)
+            .await
+            .make_query_reader_for_ranges(ranges)
+            .await
+            .map(ShardQueryReader::Writer),
+        MetricsShard::Reader(db) => db
+            .make_query_reader_for_ranges(namespace, ranges)
+            .await
+            .map(ShardQueryReader::Reader),
+    }
+}
+
+fn local_source(
+    reader: ShardQueryReader,
+    permits: Arc<Semaphore>,
+    limits: QueryLimits,
+) -> QueryReaderSource<ShardSourceReader> {
+    QueryReaderSource::new(Arc::new(LimitedQueryReader::new(
+        IoLimitedQueryReader::new(reader, permits),
+        limits,
+    )))
+}
+
 fn trace_json(trace: Option<crate::promql::trace::QueryTrace>) -> Option<serde_json::Value> {
     trace.and_then(|trace| serde_json::to_value(trace).ok())
 }
 
-enum ShardQueryReader {
+pub(crate) enum ShardQueryReader {
     Writer(TsdbQueryReader),
     Reader(ReaderQueryReader),
 }
@@ -938,7 +1161,7 @@ impl QueryReader for ShardQueryReader {
     }
 }
 
-struct IoLimitedQueryReader<R> {
+pub(crate) struct IoLimitedQueryReader<R> {
     inner: R,
     permits: Arc<Semaphore>,
 }
@@ -1101,25 +1324,48 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
 
 /// Query limits are taken before the pod-wide I/O permit so a query waiting
 /// on its own cap never holds shared I/O capacity.
-type ShardSourceReader = LimitedQueryReader<IoLimitedQueryReader<ShardQueryReader>>;
+pub(crate) type ShardSourceReader = LimitedQueryReader<IoLimitedQueryReader<ShardQueryReader>>;
+
+/// One shard of a query: read in process when open here, otherwise through
+/// the reader group serving it.
+enum ShardSource {
+    Local(QueryReaderSource<ShardSourceReader>),
+    Remote(RemoteShardSource),
+}
+
+impl ShardSource {
+    async fn resolve_all(
+        &self,
+        selector: &promql_parser::parser::VectorSelector,
+        time_range: TimeRange,
+    ) -> Vec<std::result::Result<ResolvedSeriesChunk, SourceQueryError>> {
+        match self {
+            Self::Local(source) => source.resolve(selector, time_range).collect().await,
+            Self::Remote(source) => source.resolve(selector, time_range).collect().await,
+        }
+    }
+
+    async fn samples_all(
+        &self,
+        request: SamplesRequest,
+    ) -> Vec<std::result::Result<SampleBatch, SourceQueryError>> {
+        match self {
+            Self::Local(source) => source.samples(request).collect().await,
+            Self::Remote(source) => source.samples(request).collect().await,
+        }
+    }
+}
 
 struct MultiShardSeriesSource {
-    sources: Arc<[Arc<QueryReaderSource<ShardSourceReader>>]>,
+    sources: Arc<[Arc<ShardSource>]>,
 }
 
 impl MultiShardSeriesSource {
-    /// Query limits are shared by every shard, so they cap the whole query.
-    fn new(readers: Vec<ShardQueryReader>, permits: Arc<Semaphore>, limits: QueryLimits) -> Self {
+    /// Local shards share one set of query limits, so they cap the whole
+    /// query's local reads.
+    fn new(sources: Vec<ShardSource>) -> Self {
         Self {
-            sources: readers
-                .into_iter()
-                .map(|reader| {
-                    Arc::new(QueryReaderSource::new(Arc::new(LimitedQueryReader::new(
-                        IoLimitedQueryReader::new(reader, Arc::clone(&permits)),
-                        limits.clone(),
-                    ))))
-                })
-                .collect(),
+            sources: sources.into_iter().map(Arc::new).collect(),
         }
     }
 
@@ -1149,25 +1395,28 @@ impl SeriesSource for MultiShardSeriesSource {
             let selector = selector.clone();
             async move {
                 source
-                    .resolve(&selector, time_range)
-                    .map_ok(move |chunk| {
-                        let bucket_id = Self::encode_bucket(source_index, chunk.bucket_id);
-                        ResolvedSeriesChunk {
-                            bucket_id,
-                            labels: chunk.labels,
-                            series: chunk
-                                .series
-                                .iter()
-                                .map(|series| ResolvedSeriesRef {
-                                    bucket_id,
-                                    series_id: series.series_id,
-                                    metric_name: Arc::clone(&series.metric_name),
-                                })
-                                .collect(),
-                        }
+                    .resolve_all(&selector, time_range)
+                    .await
+                    .into_iter()
+                    .map(move |chunk| {
+                        chunk.map(|chunk| {
+                            let bucket_id = Self::encode_bucket(source_index, chunk.bucket_id);
+                            ResolvedSeriesChunk {
+                                bucket_id,
+                                labels: chunk.labels,
+                                series: chunk
+                                    .series
+                                    .iter()
+                                    .map(|series| ResolvedSeriesRef {
+                                        bucket_id,
+                                        series_id: series.series_id,
+                                        metric_name: Arc::clone(&series.metric_name),
+                                    })
+                                    .collect(),
+                            }
+                        })
                     })
                     .collect::<Vec<_>>()
-                    .await
             }
         }))
         .buffered(width)
@@ -1214,14 +1463,17 @@ impl SeriesSource for MultiShardSeriesSource {
                     )))];
                 };
                 source
-                    .samples(SamplesRequest::new(series, request.time_range))
-                    .map_ok(move |batch| SampleBatch {
-                        series_range: (batch.series_range.start + range.start)
-                            ..(batch.series_range.end + range.start),
-                        samples: batch.samples,
+                    .samples_all(SamplesRequest::new(series, request.time_range))
+                    .await
+                    .into_iter()
+                    .map(|batch| {
+                        batch.map(|batch| SampleBatch {
+                            series_range: (batch.series_range.start + range.start)
+                                ..(batch.series_range.end + range.start),
+                            samples: batch.samples,
+                        })
                     })
                     .collect::<Vec<_>>()
-                    .await
             }
         }))
         .buffered(width)

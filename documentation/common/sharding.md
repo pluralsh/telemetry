@@ -14,7 +14,9 @@ routing epoch at record time ─► 128-bit hash range ─► stable storage sha
     ├── local owner ─► SlateDB write
     └── remote owner ─► internal gRPC ─► SlateDB write
 
-reader ─► opens every storage shard and merges results
+query ─► any reader ─┬─ its own shard ─► in process
+                     └─ other shards ─► their reader groups over internal gRPC
+                     merge ─► Prometheus / Loki / Tempo response
 ```
 
 SlateDB is single-writer/multi-reader, so exactly one writer owns a storage
@@ -49,16 +51,79 @@ The record's identity still selects the shard within an epoch; time only
 selects which epoch applies. Epochs only grow, so every shard referenced by an
 older epoch still exists and remains readable.
 
-Readers open every storage shard `[0, shard_count)` and merge results. Metrics
-deduplicates series by fingerprint across shards, Logs merges streams with
-equal labels, and Traces merges the partial traces returned by each shard a
-trace ID may have been routed to.
+The reader that receives a query coordinates it over every storage shard
+`[0, shard_count)` and merges the results. Metrics deduplicates series by
+fingerprint across shards, Logs merges streams with equal labels, and Traces
+merges the partial traces returned by each shard a trace ID may have been
+routed to. How a reader reaches each shard depends on whether it belongs to a
+reader group; see [Reader groups](#reader-groups).
 
 All shards opened by one process share a single SlateDB block cache and meta
 cache, so `storage.block_cache` and `storage.meta_cache` capacities are
-per-process budgets. A reader's cache memory therefore stays flat as the shard
-count grows, although each shard still holds its own SlateDB reader state and
-WAL replay buffer.
+per-process budgets. Each opened shard still holds its own SlateDB reader
+state and WAL replay buffer.
+
+## Reader groups
+
+Without reader groups, every reader opens every storage shard. Its fixed
+memory, manifest polling, and cache working set therefore grow with the
+shard count, and adding readers only replicates that whole-dataset footprint.
+
+With `sharding.read_groups`, readers are partitioned by storage shard: the
+replicas of group `k` open only shard `k`. Any reader can still answer any
+query. It reads its own shard in process and fetches every other shard from
+that shard's group through the product's internal `ShardReader` gRPC service:
+
+- Metrics resolves series on each shard, then streams their samples in the
+  chunk encoding sample storage uses. PromQL is evaluated by the coordinating
+  reader.
+- Logs runs each LogQL expression per shard and streams the shard's partial
+  output: matched lines, or the series and sample totals of a metric query.
+  The coordinator merges them exactly as it merges local shards.
+- Traces streams search results, partial traces, catalog values, and
+  per-shard TraceQL hits.
+
+The local shard is never read over gRPC, and a reader serving a shard-scoped
+call never forwards it again, so a query costs at most one hop per remote
+shard. Responses are converted to Prometheus, Loki, or Tempo JSON only by the
+coordinating reader.
+
+Each group's endpoint is a headless Service that resolves to every replica of
+the group. A reader spreads calls across those replicas, fails over to
+another replica when one is unavailable, and starts the same call on a second
+replica when the first has not answered within `hedge_after_ms` (250 ms by
+default; zero disables hedging). Follow-up calls of one query, such as
+Metrics sample reads after series resolution, stay on the replica that
+answered first. Calls are bounded by `request_timeout_seconds` and carry the
+`auth.internal` credential.
+
+A reader that belongs to a group reports ready once its own shard is open; it
+does not wait for other groups. A query whose remote shard has no reachable
+replica fails rather than returning partial results: Logs and Traces respond
+`503`, and Metrics returns a Prometheus `internal` error. A group for a
+shard that the ShardMap does not include yet opens nothing until a scale-up
+adds that shard.
+
+Per-shard limits apply per shard rather than per query when shards are read
+remotely:
+
+- Logs `max_pages` is checked by each shard against the pages that shard
+  reads.
+- Traces `max_candidate_traces` bounds each shard's TraceQL candidates.
+  Each shard evaluates TraceQL itself and the coordinator merges hits by start
+  time and trace ID before applying the limit. A trace can be split across
+  shards only when its spans run across a routing-epoch cutover that moves
+  its trace ID, because each part routes by its own earliest span. A hit
+  whose spans lie within an hour of such a cutover is fetched and
+  re-evaluated as a whole trace; other hits are used as each shard returned
+  them, so queries over time ranges away from cutovers pay nothing extra.
+  A structural query can still miss a split trace when no single shard's
+  part matches it.
+
+In Kubernetes the operator creates one reader StatefulSet per storage shard
+and keeps the group count equal to the shard count; see
+[Capacity planning and scaling](scaling.md#reader-groups-and-cost) for sizing
+and cost.
 
 ## Backends
 

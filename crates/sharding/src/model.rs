@@ -352,6 +352,17 @@ impl ShardMap {
         shards
     }
 
+    /// Whether `key` changes shard at a cutover in `(from_ns, to_ns]`.
+    pub fn key_moves_within(&self, key: &[u8], from_ns: i64, to_ns: i64) -> bool {
+        let hash = hash_routing_key(key);
+        self.epochs.windows(2).any(|pair| {
+            let cutover = pair[1].effective_from_ns;
+            from_ns < cutover
+                && cutover <= to_ns
+                && pair[0].routing.route(hash) != pair[1].routing.route(hash)
+        })
+    }
+
     /// Epochs after scaling to `shards`. A pending epoch (not yet effective at
     /// `now_ns`) is replaced rather than stacked, so repeated scale requests
     /// before a cutover collapse into one epoch.

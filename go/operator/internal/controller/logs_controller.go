@@ -21,8 +21,10 @@ import (
 
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -97,6 +99,8 @@ func (r *LogsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&networkingv1.Ingress{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
@@ -153,12 +157,22 @@ func (r *LogsReconciler) reconcile(ctx context.Context, logs *telemetryv1alpha1.
 		}
 	}
 	for _, component := range resources.Components(logs) {
-		for _, headless := range []bool{false, true} {
-			if err := r.reconcileService(ctx, logs, component, headless); err != nil {
-				return ctrl.Result{}, err
-			}
+		if err := r.reconcileService(ctx, logs, component, false); err != nil {
+			return ctrl.Result{}, err
 		}
-		result, err := r.reconcileStatefulSet(ctx, logs, component, configName, tokenName, tokenKey)
+		if component == resources.ComponentReader {
+			result, err := reconcileReaders(ctx, r.Client, r.Scheme, logs, dataStoreLogs, func(shard *int32) (ctrl.Result, error) {
+				return r.reconcileStatefulSet(ctx, logs, component, shard, configName, tokenName, tokenKey)
+			})
+			if err != nil || !result.IsZero() {
+				return result, err
+			}
+			continue
+		}
+		if err := r.reconcileService(ctx, logs, component, true); err != nil {
+			return ctrl.Result{}, err
+		}
+		result, err := r.reconcileStatefulSet(ctx, logs, component, nil, configName, tokenName, tokenKey)
 		if err != nil || !result.IsZero() {
 			return result, err
 		}
@@ -341,14 +355,18 @@ func logsSecretNames(logs *telemetryv1alpha1.Logs) []string {
 }
 
 func (r *LogsReconciler) workloadsReady(ctx context.Context, logs *telemetryv1alpha1.Logs) (bool, string, error) {
-	for _, component := range resources.Components(logs) {
+	names, err := workloadStatefulSets(ctx, r.Client, logs, dataStoreLogs)
+	if err != nil {
+		return false, "", err
+	}
+	for _, name := range names {
 		sts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: logs.Namespace, Name: resources.ComponentName(logs, component)}, sts); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Namespace: logs.Namespace, Name: name}, sts); err != nil {
 			return false, "", err
 		}
 		desired := lo.FromPtrOr(sts.Spec.Replicas, int32(1))
 		if sts.Status.ReadyReplicas < desired || sts.Status.ObservedGeneration < sts.Generation {
-			return false, fmt.Sprintf("%s has %d/%d ready replicas", component, sts.Status.ReadyReplicas, desired), nil
+			return false, fmt.Sprintf("%s has %d/%d ready replicas", name, sts.Status.ReadyReplicas, desired), nil
 		}
 	}
 	return true, messageWorkloadsReady, nil

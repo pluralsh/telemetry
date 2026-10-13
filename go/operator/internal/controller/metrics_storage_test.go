@@ -43,7 +43,7 @@ func TestStorageExpansionPatchesPVCAndOrphanDeletesStatefulSet(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(current, pvc).Build()
 	reconciler := &MetricsReconciler{Client: c, Scheme: scheme}
-	result, err := reconciler.reconcileStatefulSet(context.Background(), metrics, resources.ComponentStandalone, "config", "token", resources.TokenKey)
+	result, err := reconciler.reconcileStatefulSet(context.Background(), metrics, resources.ComponentStandalone, nil, "config", "token", resources.TokenKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestStorageErrorsMapToMetricsStatusErrors(t *testing.T) {
 		}},
 	}
 	reconciler := &MetricsReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
-	_, err := reconciler.reconcileStatefulSet(context.Background(), metrics, resources.ComponentStandalone, "config", "token", resources.TokenKey)
+	_, err := reconciler.reconcileStatefulSet(context.Background(), metrics, resources.ComponentStandalone, nil, "config", "token", resources.TokenKey)
 	var storageErr *StorageChangeError
 	if !errors.As(err, &storageErr) || !strings.Contains(err.Error(), "must be greater than zero") {
 		t.Fatalf("expected mapped storage error, got %v", err)

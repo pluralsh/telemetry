@@ -86,6 +86,22 @@ retention `13204`, OTLP gRPC `14317`/`14318`/`14319`, Tempo OTLP HTTP `14320`,
 Zipkin `19411`, and Jaeger collector gRPC `14251`/`14252`. The PseudoFS fuzz
 stack serves gRPC on `19093`.
 
+## Reader groups
+
+Each live suite also runs readers as reader groups: one reader per storage
+shard that opens only that shard and reads the other one from its group over
+the internal `ShardReader` gRPC service. Metrics and Traces start
+`<product>-reader-0` and `<product>-reader-1` (profile `reader-groups`) next to
+the reader that opens every shard, then send the full oracle comparison
+through both groups. `test_logs_sharded.py` runs Logs as two static-shard
+writers over MinIO with two reader groups (profile `sharded`) and compares
+log, limit and direction, metric, and metadata queries with Loki. Each suite
+also stops one group and checks that the other fails the query instead of
+returning partial results, then recovers.
+
+Reader-group ports are Metrics `18085`/`18086`, Traces `13205`/`13206`, and
+Logs writers `13103`/`13104` and readers `13105`/`13106`.
+
 ## Differential fuzzing
 
 `harness/fuzz/` is a time-boxed differential fuzzer that runs alongside the

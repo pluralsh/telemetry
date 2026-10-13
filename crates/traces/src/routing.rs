@@ -37,6 +37,28 @@ pub fn route_trace(assignment: &ShardMap, namespace: &Namespace, trace: &Trace) 
     )
 }
 
+/// How far a trace's other spans may lie outside the spans one shard saw.
+/// Parts of a trace route by their own earliest span, so a trace splits only
+/// when it runs across a cutover that moves its ID.
+pub const SPLIT_TRACE_SLACK_NS: u64 = 3_600_000_000_000;
+
+/// Whether a trace whose spans seen on one shard cover `start_ns..=end_ns`
+/// may have parts on another shard.
+pub fn may_be_split(
+    assignment: &ShardMap,
+    namespace: &Namespace,
+    trace_id: TraceId,
+    start_ns: u64,
+    end_ns: u64,
+) -> bool {
+    let bound = |ns: u64| i64::try_from(ns).unwrap_or(i64::MAX);
+    assignment.key_moves_within(
+        &canonical_routing_key(namespace, trace_id),
+        bound(start_ns.saturating_sub(SPLIT_TRACE_SLACK_NS)),
+        bound(end_ns.saturating_add(SPLIT_TRACE_SLACK_NS)),
+    )
+}
+
 /// Every shard that may hold spans of `trace_id` across routing epochs.
 pub fn trace_shards(
     assignment: &ShardMap,

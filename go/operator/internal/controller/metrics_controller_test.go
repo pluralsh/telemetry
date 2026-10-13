@@ -18,15 +18,19 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -190,28 +194,49 @@ var _ = Describe("Metrics Controller", func() {
 		assertServiceAccount(ctx, metrics.Name)
 		created = append(created, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name, Namespace: namespace}})
 
-		for _, kind := range []component{componentWriter, componentReader} {
-			name := metrics.Name + "-" + string(kind)
-			assertService(ctx, name, false)
+		writerName := metrics.Name + "-writer"
+		assertService(ctx, writerName, false)
+		assertService(ctx, writerName+"-headless", true)
+		writer := assertStatefulSet(ctx, writerName, componentWriter, config)
+		Expect(writer.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
+			HaveField("Image", "registry.example.com/telemetry/metrics:1.2.3"),
+			HaveField("ImagePullPolicy", corev1.PullAlways),
+		))
+		Expect(writer.Spec.Replicas).NotTo(BeNil())
+		Expect(*writer.Spec.Replicas).To(Equal(int32(4)))
+		Expect(writer.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("kubernetes.io/arch", "arm64"))
+		Expect(writer.Spec.Template.Spec.Tolerations).To(ContainElement(HaveField("Key", "dedicated")))
+		created = append(created,
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: writerName, Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: writerName + "-headless", Namespace: namespace}},
+			writer,
+		)
+
+		Expect(string(config.Data["reader.yaml"])).To(SatisfyAll(
+			ContainSubstring("read_groups:"),
+			ContainSubstring("endpoint: "+metrics.Name+"-reader-{shard}-headless."+namespace+".svc:9090"),
+		))
+		assertService(ctx, metrics.Name+"-reader", false)
+		created = append(created, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}})
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-reader-headless"}, &corev1.Service{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		for shard := range 4 {
+			name := fmt.Sprintf("%s-reader-%d", metrics.Name, shard)
 			assertService(ctx, name+"-headless", true)
-			sts := assertStatefulSet(ctx, name, kind, config)
-			Expect(sts.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
-				HaveField("Image", "registry.example.com/telemetry/metrics:1.2.3"),
-				HaveField("ImagePullPolicy", corev1.PullAlways),
-			))
-			if kind == componentWriter {
-				Expect(sts.Spec.Replicas).NotTo(BeNil())
-				Expect(*sts.Spec.Replicas).To(Equal(int32(4)))
-				Expect(sts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("kubernetes.io/arch", "arm64"))
-				Expect(sts.Spec.Template.Spec.Tolerations).To(ContainElement(HaveField("Key", "dedicated")))
-			} else {
-				Expect(sts.Spec.Replicas).NotTo(BeNil())
-				Expect(*sts.Spec.Replicas).To(Equal(int32(2)))
-			}
+			sts := assertStatefulSet(ctx, name, componentReader, config)
+			Expect(sts.Spec.Replicas).NotTo(BeNil())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(2)))
+			Expect(sts.Spec.Selector.MatchLabels).To(HaveKeyWithValue("telemetry.plural.sh/shard", fmt.Sprint(shard)))
+			Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "READER_SHARD", Value: fmt.Sprint(shard)}))
+			budget := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, budget)).To(Succeed())
+			Expect(budget.Spec.MaxUnavailable.IntValue()).To(Equal(1))
+			Expect(budget.Spec.Selector.MatchLabels).To(Equal(sts.Spec.Selector.MatchLabels))
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &autoscalingv2.HorizontalPodAutoscaler{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			created = append(created,
-				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name + "-headless", Namespace: namespace}},
-				sts,
+				sts, budget,
 			)
 		}
 		ingress := assertIngress(ctx, metrics.Name)
@@ -250,11 +275,94 @@ var _ = Describe("Metrics Controller", func() {
 		Expect(current.Status.ConfigHash).NotTo(Equal(originalHash))
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(config), config)).To(Succeed())
 		Expect(config.Data["namespace-"+auth.Name+"-password"]).To(Equal([]byte("rotated-password")))
-		for _, name := range []string{metrics.Name + "-writer", metrics.Name + "-reader"} {
+		for _, name := range []string{metrics.Name + "-writer", metrics.Name + "-reader-0"} {
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Annotations).NotTo(HaveKey(configHashAnnotation))
 		}
+	})
+
+	It("autoscales reader groups and folds them back into one reader when groups are disabled", func() {
+		metrics, auth, password := createMetricsFixture(ctx, "reader-groups-envtest", telemetryv1alpha1.MetricsModeSharded)
+		created = append(created, metrics, auth, password)
+		metrics.Spec.Writer.Replicas = lo.ToPtr(int32(2))
+		metrics.Spec.Reader.Autoscaling = &telemetryv1alpha1.AutoscalingSpec{Enabled: true, MinReplicas: lo.ToPtr(int32(2)), MaxReplicas: 6}
+		Expect(k8sClient.Update(ctx, metrics)).To(Succeed())
+		key := client.ObjectKeyFromObject(metrics)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		groups := []string{metrics.Name + "-reader-0", metrics.Name + "-reader-1"}
+		for _, name := range groups {
+			autoscaler := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, autoscaler)).To(Succeed())
+			Expect(autoscaler.Spec.ScaleTargetRef).To(Equal(autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: name}))
+			Expect(*autoscaler.Spec.MinReplicas).To(Equal(int32(2)))
+			Expect(autoscaler.Spec.MaxReplicas).To(Equal(int32(6)))
+			Expect(autoscaler.Spec.Metrics).To(ConsistOf(SatisfyAll(
+				HaveField("Resource.Name", corev1.ResourceCPU),
+				HaveField("Resource.Target.AverageUtilization", HaveValue(Equal(int32(70)))),
+			)))
+		}
+
+		scaled := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: groups[0]}, scaled)).To(Succeed())
+		scaled.Spec.Replicas = lo.ToPtr(int32(5))
+		Expect(k8sClient.Update(ctx, scaled)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(scaled), scaled)).To(Succeed())
+		Expect(*scaled.Spec.Replicas).To(Equal(int32(5)))
+
+		Expect(k8sClient.Get(ctx, key, metrics)).To(Succeed())
+		metrics.Spec.Reader.ReadGroups = &telemetryv1alpha1.ReadGroupsSpec{Enabled: lo.ToPtr(false)}
+		Expect(k8sClient.Update(ctx, metrics)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		reader := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-reader"}, reader)).To(Succeed())
+		Expect(reader.Spec.Template.Spec.Containers[0].Env).NotTo(ContainElement(HaveField("Name", "READER_SHARD")))
+		for _, name := range groups {
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &appsv1.StatefulSet{})).To(Succeed(),
+				"reader groups keep serving until the reader opening every shard is ready")
+		}
+		reader.Status.Replicas = *reader.Spec.Replicas
+		reader.Status.ReadyReplicas = *reader.Spec.Replicas
+		reader.Status.ObservedGeneration = reader.Generation
+		Expect(k8sClient.Status().Update(ctx, reader)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		assertService(ctx, metrics.Name+"-reader-headless", true)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-reader"}, &autoscalingv2.HorizontalPodAutoscaler{})).To(Succeed())
+		for _, name := range groups {
+			for _, object := range []client.Object{
+				&appsv1.StatefulSet{}, &policyv1.PodDisruptionBudget{}, &autoscalingv2.HorizontalPodAutoscaler{},
+			} {
+				err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, object)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%T %s", object, name)
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-headless"}, &corev1.Service{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}
+		config := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-config"}, config)).To(Succeed())
+		Expect(string(config.Data["reader.yaml"])).NotTo(ContainSubstring("read_groups"))
+
+		created = append(created, config, reader,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-internal-token", Namespace: namespace}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name, Namespace: namespace}},
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-writer", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-writer", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-writer-headless", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader-headless", Namespace: namespace}},
+			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}},
+			&autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}},
+			&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name, Namespace: namespace}},
+			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-sharding", Namespace: namespace}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-sharding", Namespace: namespace}},
+		)
 	})
 
 	It("passes scale-up through and blocks unsafe writer scale-down from ShardMap state", func() {
@@ -274,8 +382,8 @@ var _ = Describe("Metrics Controller", func() {
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-writer", Namespace: namespace}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-writer-headless", Namespace: namespace}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}},
-			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader-headless", Namespace: namespace}},
-			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader", Namespace: namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader-0-headless", Namespace: namespace}},
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-reader-0", Namespace: namespace}},
 			&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name, Namespace: namespace}},
 			&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-sharding", Namespace: namespace}},
 			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-sharding", Namespace: namespace}},
@@ -557,11 +665,13 @@ func assertService(ctx context.Context, name string, headless bool) {
 	}
 }
 
+var componentSuffix = regexp.MustCompile(`-(writer|reader(-\d+)?)$`)
+
 func assertStatefulSet(ctx context.Context, name string, kind component, config *corev1.Secret) *appsv1.StatefulSet {
 	sts := &appsv1.StatefulSet{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: name}, sts)).To(Succeed())
 	Expect(sts.Spec.ServiceName).To(Equal(name + "-headless"))
-	Expect(sts.Spec.Template.Spec.ServiceAccountName).To(Equal(strings.TrimSuffix(strings.TrimSuffix(name, "-writer"), "-reader")))
+	Expect(sts.Spec.Template.Spec.ServiceAccountName).To(Equal(componentSuffix.ReplaceAllString(name, "")))
 	Expect(sts.Spec.Template.Annotations).NotTo(HaveKey(configHashAnnotation))
 	Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 	Expect(sts.Spec.Template.Spec.Containers[0].Args).To(ContainElement("/etc/metrics/config/" + configKey(kind)))

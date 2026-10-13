@@ -60,7 +60,7 @@ jobs:
       - name: Run Docker compatibility regression
         env:
           REGRESSION_BUILD: "0"
-        run: mise exec -- python -m pytest tests/regression/test_live/test_${{ matrix.product }}.py
+        run: mise exec -- python -m pytest tests/regression/test_live/test_${{ matrix.product }}*.py
 
   kind:
     name: Kubernetes handoff regression

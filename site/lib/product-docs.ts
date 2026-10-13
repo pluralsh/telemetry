@@ -82,7 +82,7 @@ export function specNotes(p: ProductId): Record<string, string> {
   const common: Record<string, string> = {
     "metadata.name": `Also names the ServiceAccount the IAM role binds to, and the \`${p}-writer\` and \`${p}-reader\` Services (just \`${p}\` in Standalone mode).`,
     "metadata.namespace": `The Kubernetes namespace the pods run in. Tenant namespaces for your data are separate and come from [NamespaceAuthentication](#access) resources.`,
-    "spec.mode": "`Standalone` (the default) runs one pod that reads and writes. `Sharded` runs writer and reader StatefulSets that scale independently.",
+    "spec.mode": "`Standalone` (the default) runs one pod that reads and writes. `Sharded` runs a writer StatefulSet and one reader StatefulSet per storage shard, which scale independently.",
     "spec.config": "Rendered into the server's config file. The operator rolls the pods when it changes.",
     "spec.config.retention": `How long data is kept, counted from ingestion, as \`${P.retentionDefault}\`, \`2w\` or \`36h\`. Default \`${P.retentionDefault}\`.`,
     "spec.config.storage.path": `Object-key prefix inside the bucket; shard suffixes are appended. Must match the prefix in the IAM policy. Default \`${p}\`.`,
@@ -95,7 +95,7 @@ export function specNotes(p: ProductId): Record<string, string> {
     "spec.writer.replicas": "Writer count, which is also the storage shard count. Raise it at any time; new shards take writes from the next aligned hour. It cannot be lowered.",
     "spec.writer.resources": "Defaults to 250m CPU and 512Mi memory requests with a 2Gi limit. Budget for the write buffer: 64 MiB per shard, plus up to two frozen buffers being flushed.",
     "spec.writer.cacheVolume": `Mounted at \`${cachePath}\` as the disk tier of the block cache (512 MiB RAM and 10 GiB disk by default). A PVC keeps it warm across restarts. Set exactly one of \`emptyDir\` or \`persistentVolumeClaim\`.`,
-    "spec.reader.replicas": "Readers are stateless; each opens every shard read-only and shares one cache across them. Default `2` in Sharded mode. Scale freely.",
+    "spec.reader.replicas": "Replicas per reader group. Each storage shard gets its own group, which opens only that shard; any reader answers any query by asking the other groups over gRPC. Default `2` in Sharded mode. Scale freely, or set `autoscaling` to scale each group on CPU.",
     "spec.reader.cacheVolume": "An `emptyDir` is enough: a restarted reader refills its cache from the bucket.",
     "spec.ingress": "Optional. One hostname that routes `/write` to the writers and `/read` to the readers. Add `tls` and `pathPrefix` as needed.",
   };

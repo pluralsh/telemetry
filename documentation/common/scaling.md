@@ -34,7 +34,9 @@ its original shards. Scale-down remains blocked.
 
 Scale readers independently from writers. Query concurrency, cache hit rate,
 scan width, and object-store GET latency determine reader count and are not
-covered by the ingestion estimates on this page.
+covered by the ingestion estimates on this page. With
+[reader groups](sharding.md#reader-groups), readers scale per storage shard:
+see [Reader groups and cost](#reader-groups-and-cost).
 
 ## What limits a SlateDB writer
 
@@ -332,6 +334,99 @@ alone understates required network capacity.
 
 Do not use these profiles as Kubernetes defaults until the product benchmarks
 pass on S3 Standard and the intended cache configuration.
+
+## Reader groups and cost
+
+Kubernetes sharded deployments run one reader group per storage shard by
+default. For `S` storage shards and `r` replicas per group, the reader tier
+is `S × r` pods, and each pod opens one shard. Without groups, `R` reader pods
+each open all `S` shards.
+
+What changes for the same per-shard availability (`r = R`):
+
+- **Pods and fixed memory.** Groups run `S` times as many reader pods, so the
+  process baseline (runtime, connection pools, and the configured block and
+  meta cache budgets) is paid `S × r` times instead of `R` times. Per-shard
+  SlateDB reader state and WAL replay buffers are the same in total
+  (`r × S` copies either way), but each group pod holds only one.
+- **Cache efficiency.** A group pod's cache serves one shard's working set
+  rather than the whole dataset's. A per-pod cache of about `1 / S` of the
+  former size gives a similar hit rate, which offsets most of the extra
+  baseline. Size `storage.block_cache` for one shard's hot data, not the
+  dataset's.
+- **Object-store requests.** Manifest polling scales with the number of
+  (pod, shard) pairs, `r × S`, which is unchanged at `r = R`. Cache-miss GETs
+  per shard scale with that shard's group size, and better hit rates
+  usually lower them.
+- **Network transfer.** A query moves the partial results of `S - 1` remote
+  shards to the coordinating reader: Metrics moves the selected series'
+  chunk-encoded samples, Logs moves matched lines or per-shard aggregates,
+  and Traces moves matching traces and hits. Reading the local shard costs
+  nothing. When groups span availability zones, most remote traffic crosses a
+  zone, which cloud providers bill per GiB in each direction (for example
+  $0.01/GiB each way between AWS zones in one region):
+
+  ```text
+  monthly cross-zone cost ≈
+      queries per month
+      × average remote response bytes per query
+      × (S - 1) / S
+      × fraction of peers in another zone (≈ 2/3 across three zones)
+      × billed price per GiB (both directions)
+  ```
+
+  Metrics range queries over many series move the most bytes, because PromQL
+  runs on the coordinator. Aggregating Logs metric queries move the least.
+- **CPU.** Shard work runs in parallel across groups rather than in one
+  process, which lowers latency for wide queries. Total CPU is about the
+  same plus protobuf encoding and decoding of remote results.
+- **Hedging.** A call that has not answered after `hedge_after_ms` is started
+  on a second replica, so the slowest calls can run twice. With the 250 ms
+  default this is usually a small fraction of calls; raise the delay or set
+  it to zero to trade tail latency for less duplicate work.
+
+Groups pay off when the dataset, shard count, or query load is large enough
+that one process cannot open, cache, and scan every shard efficiently. With
+one storage shard, groups only change resource names. Small deployments can
+set `spec.reader.readGroups.enabled: false` to keep a single reader
+StatefulSet whose pods open every shard.
+
+### Reader autoscaling
+
+`spec.reader.autoscaling` creates one `HorizontalPodAutoscaler` per reader
+StatefulSet, one per group when groups are enabled. A hot shard's group
+therefore scales without scaling the others:
+
+```yaml
+spec:
+  reader:
+    replicas: 2 # Used as minReplicas when autoscaling omits it.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70 # Default when no target is set.
+      # targetMemoryUtilizationPercentage: 80
+      # behavior: {} # autoscaling/v2 scale-up and scale-down policies.
+    podTemplate:
+      spec:
+        containers:
+          - name: metrics
+            resources:
+              requests: { cpu: "2", memory: 8Gi }
+```
+
+CPU is the default target because query load is CPU-bound once the cache is
+warm. A memory target is optional and is combined with the CPU target when
+both are set. Utilization is relative to the container's requests, so the
+reader container must request the targeted resources. The operator leaves the
+replica count of an autoscaled StatefulSet to its HorizontalPodAutoscaler.
+Every reader StatefulSet also gets a PodDisruptionBudget with
+`maxUnavailable: 1`.
+
+The floor of the reader tier is `S × minReplicas` pods. Keep `minReplicas` at
+two or more where a shard must stay readable during node drains, because a
+group with one replica cannot serve its shard while that pod restarts.
 
 ## Required benchmark matrix
 

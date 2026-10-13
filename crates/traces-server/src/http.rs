@@ -290,7 +290,7 @@ async fn trace_by_id(
         .db
         .get_trace(&assignment, &namespace, trace_id)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(traces_error)?
         .ok_or_else(|| ApiError::not_found("trace not found"))?;
     let data = TracesData {
         resource_spans: trace.resource_spans,
@@ -343,9 +343,11 @@ async fn search(
         .or_else(|| params.tags.map(|tags| legacy_tags_query(&tags)))
         .unwrap_or_else(|| "{}".into());
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    let assignment = state.router.assignment().read().await.clone();
     let results = state
         .db
         .search_traceql(
+            &assignment,
             &namespace,
             params.start.unwrap_or(0).saturating_mul(1_000_000_000),
             params
@@ -400,7 +402,7 @@ async fn tag_names(
                 attribute_scope(params.scope.as_deref()),
             )
             .await
-            .map_err(ApiError::internal)?
+            .map_err(traces_error)?
             .into_iter()
             .collect()
     };
@@ -430,7 +432,7 @@ async fn tag_names_v2(
                 Some(AttributeScope::Resource),
             )
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(traces_error)?;
         scopes.push(json!({"name": "resource", "tags": resource}));
     }
     if params.scope.as_deref().is_none_or(|scope| scope == "span") {
@@ -443,7 +445,7 @@ async fn tag_names_v2(
                 Some(AttributeScope::Span),
             )
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(traces_error)?;
         scopes.push(json!({"name": "span", "tags": span}));
     }
     if params.scope.as_deref() == Some("intrinsic") {
@@ -465,7 +467,7 @@ async fn tag_values(
         .db
         .catalog_values(&namespace, params.start_ns(), params.end_ns(), scope, name)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(traces_error)?
         .into_iter()
         .map(|value| discovery_value_parts(value).1)
         .collect::<BTreeSet<_>>();
@@ -488,7 +490,7 @@ async fn tag_values_v2(
         .db
         .catalog_values(&namespace, params.start_ns(), params.end_ns(), scope, name)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(traces_error)?
         .into_iter()
         .map(discovery_value_parts);
     let values = within_bytes(

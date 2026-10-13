@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -32,14 +33,30 @@ def traces() -> tuple[TracesSuite, ComposeProject]:
             "http://localhost:13201/-/ready",
             "http://localhost:13202/-/ready",
         ),
+        profiles=("reader-groups",),
     )
     with project:
         suite = TracesSuite.create()
         suite.seed()
-        project.up("traces-reader")
-        wait_http("http://localhost:13203/-/ready")
+        project.up("traces-reader", "traces-reader-0", "traces-reader-1")
+        for port in (13203, 13205, 13206):
+            wait_http(f"http://localhost:{port}/-/ready")
         suite.wait_for_reader()
+        for shard in (0, 1):
+            reader_group(suite, shard).wait_for_reader()
         yield suite, project
+
+
+READER_GROUP_URLS = ("http://localhost:13205", "http://localhost:13206")
+
+
+def reader_group(suite: TracesSuite, shard: int) -> TracesSuite:
+    """`suite` querying the reader group serving `shard`, which reads the
+    other shard from its group over gRPC."""
+    return replace(
+        suite,
+        reader=replace(suite.reader, base_url=READER_GROUP_URLS[shard]),
+    )
 
 
 @pytest.mark.docker
@@ -98,6 +115,38 @@ def test_auth_namespace_isolation_and_reader_mode(
     suite, _ = traces
     suite.check_auth_and_namespace_isolation()
     suite.check_reader_rejects_writes()
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize("shard", (0, 1))
+def test_reader_groups_match_tempo(
+    traces: tuple[TracesSuite, ComposeProject], shard: int
+) -> None:
+    suite = reader_group(traces[0], shard)
+    for trace_id in (*TRACE_IDS, JAEGER_TRACE_ID):
+        suite.compare_trace(trace_id)
+    for _, query, expected_ids in TRACEQL_CASES:
+        suite.compare_search(query, expected_ids)
+    suite.compare_tags()
+    suite.check_auth_and_namespace_isolation()
+
+
+@pytest.mark.docker
+def test_reader_group_fails_closed_without_its_peer(
+    traces: tuple[TracesSuite, ComposeProject],
+) -> None:
+    suite, project = traces
+    group = reader_group(suite, 0)
+    project.execute("stop", "traces-reader-1", timeout=120)
+    try:
+        response = group.client.request(
+            "GET", group.reader, "/api/v2/search/tags", read=True
+        )
+        assert response.status == 503, response.body
+    finally:
+        project.up("traces-reader-1")
+        wait_http("http://localhost:13206/-/ready")
+    group.compare_tags()
 
 
 @pytest.mark.docker

@@ -42,7 +42,7 @@ export function StackDiagram({ animated = true, showControls = true }: { animate
           ? "Metrics, logs and traces share the same SlateDB storage layer and durable object store."
           : write
           ? "Writes are batched into a WAL and memtable, flushed as SSTs to object storage, and compacted in the background. Each storage shard is its own SlateDB database owned by exactly one writer."
-          : "Readers open every shard read-only, follow the manifest, and serve queries through a shared RAM + NVMe block cache, so hot data never round-trips to S3."
+          : "Each reader group opens one shard read-only, follows its manifest, and serves it through a RAM + NVMe block cache, so hot data never round-trips to S3. Any reader merges every shard's results for a query."
       }
       bodyClassName="px-2 py-4"
     >

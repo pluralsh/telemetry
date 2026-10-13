@@ -295,8 +295,49 @@ impl<'a> ScanPlan<'a> {
     }
 }
 
+/// A storage shard a query reads: opened here, or served by another reader
+/// group.
+pub(crate) enum ShardSource {
+    Local(Arc<LogDb>),
+    Remote(crate::remote::RemoteShard),
+}
+
+impl ShardSource {
+    async fn load_remote<'a>(
+        remote: &crate::remote::RemoteShard,
+        plan: &ScanPlan<'a>,
+        namespace: &Namespace,
+        request: &QueryRequest,
+        options: &QueryOptions,
+    ) -> Result<columnar::ColumnarSink<'a>> {
+        let messages = remote
+            .client
+            .query(crate::remote::query_request(
+                remote.shard,
+                namespace,
+                request,
+                options,
+            ))
+            .await?;
+        columnar::ColumnarSink::from_wire(plan, messages)
+    }
+}
+
+fn scheduler_closed() -> Error {
+    Error::Query("global query scheduler closed".into())
+}
+
+fn exceeds_max_pages(pages: usize, read_units: usize, max_pages: usize) -> Error {
+    Error::Query(format!(
+        "query requires {pages} pages ({read_units} read ranges), exceeding max_pages \
+         ({max_pages})",
+    ))
+}
+
+/// Queries `sources`, in shard order. A remote shard checks `max_pages`
+/// against its own pages alone.
 pub(crate) async fn query_databases(
-    databases: Vec<Arc<LogDb>>,
+    sources: Vec<ShardSource>,
     namespace: &Namespace,
     request: &QueryRequest,
     options: QueryOptions,
@@ -312,15 +353,22 @@ pub(crate) async fn query_databases(
     // per page actually read.
     if plan.early_stop_log().is_some() {
         let shared_budget = PageBudget::new(options.max_pages);
-        let rows = stream::iter(databases.into_iter().map(|database| {
+        let rows = stream::iter(sources.into_iter().map(|source| {
             let global_permits = Arc::clone(&global_permits);
-            let (plan, shared_budget) = (&plan, &shared_budget);
+            let (plan, shared_budget, options) = (&plan, &shared_budget, &options);
             async move {
-                let _global_permit = global_permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
-                plan.load(&database, namespace, shared_budget, None).await
+                match source {
+                    ShardSource::Local(database) => {
+                        let _global_permit = global_permits
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| scheduler_closed())?;
+                        plan.load(&database, namespace, shared_budget, None).await
+                    }
+                    ShardSource::Remote(remote) => {
+                        ShardSource::load_remote(&remote, plan, namespace, request, options).await
+                    }
+                }
             }
         }))
         .buffered(options.max_concurrency)
@@ -328,18 +376,29 @@ pub(crate) async fn query_databases(
         .await?;
         return plan.finish(rows, options);
     }
-    let targets = stream::iter(databases.iter().cloned())
+    let locals = sources
+        .iter()
+        .map(|source| match source {
+            ShardSource::Local(database) => Some(Arc::clone(database)),
+            ShardSource::Remote(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let targets = stream::iter(locals)
         .map(|database| {
             let global_permits = Arc::clone(&global_permits);
             let plan = &plan;
             async move {
+                let Some(database) = database else {
+                    return Ok(None);
+                };
                 let _permit = global_permits
                     .acquire_owned()
                     .await
-                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
+                    .map_err(|_| scheduler_closed())?;
                 database
                     .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
                     .await
+                    .map(Some)
             }
         })
         .buffered(options.max_concurrency)
@@ -347,30 +406,47 @@ pub(crate) async fn query_databases(
         .await?;
     let estimates = targets
         .iter()
-        .map(|targets| targets.estimate(plan.is_lineless()))
+        .map(|targets| {
+            targets
+                .as_ref()
+                .map(|targets| targets.estimate(plan.is_lineless()))
+        })
         .collect::<Vec<_>>();
     let total_pages = estimates
         .iter()
+        .flatten()
         .try_fold(0usize, |total, estimate| total.checked_add(estimate.pages))
         .ok_or_else(|| Error::Query("query page estimate overflow".into()))?;
-    let total_read_units = estimates.iter().try_fold(0usize, |total, estimate| {
-        total.checked_add(estimate.read_units)
-    });
+    let total_read_units = estimates
+        .iter()
+        .flatten()
+        .try_fold(0usize, |total, estimate| {
+            total.checked_add(estimate.read_units)
+        });
     let total_read_units =
         total_read_units.ok_or_else(|| Error::Query("query read-unit estimate overflow".into()))?;
     if total_pages > options.max_pages {
-        return Err(Error::Query(format!(
-            "query requires {total_pages} pages ({total_read_units} read ranges), exceeding \
-             max_pages ({})",
+        return Err(exceeds_max_pages(
+            total_pages,
+            total_read_units,
             options.max_pages,
-        )));
+        ));
     }
-    let stored = stream::iter(databases.into_iter().zip(targets).zip(estimates).map(
-        |((database, targets), estimate)| {
+    let stored = stream::iter(sources.into_iter().zip(targets).zip(estimates).map(
+        |((source, targets), estimate)| {
             let permits = Arc::clone(&permits);
             let global_permits = Arc::clone(&global_permits);
-            let plan = &plan;
+            let (plan, options) = (&plan, &options);
             async move {
+                let (ShardSource::Local(database), Some(targets), Some(estimate)) =
+                    (&source, targets, estimate)
+                else {
+                    let ShardSource::Remote(remote) = &source else {
+                        unreachable!("local shards have scan targets");
+                    };
+                    return ShardSource::load_remote(remote, plan, namespace, request, options)
+                        .await;
+                };
                 let weight =
                     u32::try_from(estimate.compressed_bytes.max(1).min(byte_budget as u64))
                         .unwrap_or(u32::MAX);
@@ -381,9 +457,9 @@ pub(crate) async fn query_databases(
                 let _global_permit = global_permits
                     .acquire_owned()
                     .await
-                    .map_err(|_| Error::Query("global query scheduler closed".into()))?;
+                    .map_err(|_| scheduler_closed())?;
                 plan.load(
-                    &database,
+                    database,
                     namespace,
                     &PageBudget::new(estimate.read_units),
                     Some(targets),
@@ -398,6 +474,53 @@ pub(crate) async fn query_databases(
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
     plan.finish(stored, options)
+}
+
+/// Runs a query's pipelines over one shard for the reader coordinating it,
+/// returning what they kept as [`query_databases`] would merge it.
+pub(crate) async fn serve_shard_query(
+    database: &LogDb,
+    namespace: &Namespace,
+    request: &QueryRequest,
+    options: QueryOptions,
+    global_permits: &Semaphore,
+) -> Result<Vec<proto::logs::internal::v1::ShardOutput>> {
+    validate_request(request, &options)?;
+    let query = logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
+    let plan = ScanPlan::new(request, &query, &options)?;
+    let _permit = global_permits
+        .acquire()
+        .await
+        .map_err(|_| scheduler_closed())?;
+    let sink = if plan.early_stop_log().is_some() {
+        plan.load(
+            database,
+            namespace,
+            &PageBudget::new(options.max_pages),
+            None,
+        )
+        .await?
+    } else {
+        let targets = database
+            .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
+            .await?;
+        let estimate = targets.estimate(plan.is_lineless());
+        if estimate.pages > options.max_pages {
+            return Err(exceeds_max_pages(
+                estimate.pages,
+                estimate.read_units,
+                options.max_pages,
+            ));
+        }
+        plan.load(
+            database,
+            namespace,
+            &PageBudget::new(estimate.read_units),
+            Some(targets),
+        )
+        .await?
+    };
+    Ok(sink.into_wire())
 }
 
 /// A row's or point's labels; shared, since many rows and steps carry the

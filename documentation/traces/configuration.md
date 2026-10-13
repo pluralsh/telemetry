@@ -141,6 +141,15 @@ sharding:
   # lease_duration_seconds: 15
   # renew_interval_seconds: 5 # Must be shorter than the lease duration.
 
+  # Reader groups (reader mode only). The reader serves one storage shard and
+  # reads every other shard from that shard's group over internal gRPC.
+  # read_groups:
+  #   shard: 0             # Defaults to the READER_SHARD environment variable.
+  #   endpoint: traces-reader-{shard}-headless.default.svc:9092
+  #   hedge_after_ms: 250  # Second replica after this delay; 0 disables hedging.
+  #   request_timeout_seconds: 120
+  #   resolve_interval_seconds: 5 # Re-resolve each group's replica addresses.
+
 request:
   max_request_bytes: 33554432 # Maximum request body as received; 32 MiB.
   max_decoded_request_bytes: 134217728 # Maximum write body after gzip, and maximum OTLP/Jaeger gRPC message; 128 MiB. At least max_request_bytes.

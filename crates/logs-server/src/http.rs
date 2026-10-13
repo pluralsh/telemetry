@@ -378,7 +378,7 @@ async fn query_response(
         .db
         .query(&namespace, &request, options)
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(query_error)?;
     Ok(Json(LokiResponse {
         result,
         categorized,
@@ -856,6 +856,17 @@ mod elasticsearch;
 mod push;
 
 use push::*;
+
+/// Rejected LogQL is a client error, as in Loki; a shard that cannot be
+/// read, locally or through its reader group, is not.
+fn query_error(error: plural_logs::Error) -> ApiError {
+    match error {
+        plural_logs::Error::Query(_)
+        | plural_logs::Error::Regex(_)
+        | plural_logs::Error::Invalid(_) => ApiError::bad_request(error),
+        error => logs_error(error),
+    }
+}
 
 pub(crate) fn logs_error(error: plural_logs::Error) -> ApiError {
     match error {

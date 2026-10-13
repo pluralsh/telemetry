@@ -9,7 +9,7 @@ pub enum Error {
     Invalid(String),
     #[error("write buffer is full")]
     Backpressure,
-    #[error("Traces writer is temporarily unavailable: {0}")]
+    #[error("Traces is temporarily unavailable: {0}")]
     Unavailable(String),
     #[error("corrupt Traces record: {0}")]
     Corrupt(String),

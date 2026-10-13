@@ -682,3 +682,248 @@ async fn binary_join_across_shards_matches_unsharded_database() {
     )
     .await;
 }
+
+/// Serves remote shard reads from in-process readers, recording every shard
+/// asked for.
+#[derive(Clone, Default)]
+struct InProcessShards {
+    peers: Arc<std::sync::OnceLock<std::collections::BTreeMap<ShardId, Arc<ShardedMetrics>>>>,
+    requested: Arc<std::sync::Mutex<Vec<ShardId>>>,
+}
+
+impl InProcessShards {
+    fn peer(&self, read: Option<&proto::metrics::internal::v1::ShardRead>) -> Arc<ShardedMetrics> {
+        let shard = ShardId::new(read.unwrap().shard);
+        self.requested.lock().unwrap().push(shard);
+        Arc::clone(&self.peers.get().unwrap()[&shard])
+    }
+}
+
+impl crate::MetricsShardQuery for InProcessShards {
+    fn resolve(
+        &self,
+        request: proto::metrics::internal::v1::ResolveRequest,
+    ) -> crate::WireStream<proto::metrics::internal::v1::ResolvedChunk> {
+        let peer = self.peer(request.read.as_ref());
+        stream::once(async move { peer.serve_resolve(request).await })
+            .try_flatten()
+            .boxed()
+    }
+
+    fn samples(
+        &self,
+        request: proto::metrics::internal::v1::ReadSamplesRequest,
+    ) -> crate::WireStream<proto::metrics::internal::v1::SampleBatch> {
+        let peer = self.peer(request.read.as_ref());
+        stream::once(async move { peer.serve_samples(request).await })
+            .try_flatten()
+            .boxed()
+    }
+}
+
+#[async_trait]
+impl crate::MetricsShardClient for InProcessShards {
+    fn query(&self, _shard: ShardId) -> Arc<dyn crate::MetricsShardQuery> {
+        Arc::new(self.clone())
+    }
+
+    async fn series(
+        &self,
+        request: proto::metrics::internal::v1::SeriesRequest,
+    ) -> std::result::Result<proto::metrics::internal::v1::SeriesResponse, QueryError> {
+        self.peer(request.read.as_ref()).serve_series(request).await
+    }
+
+    async fn label_names(
+        &self,
+        request: proto::metrics::internal::v1::LabelNamesRequest,
+    ) -> std::result::Result<proto::metrics::internal::v1::StringsResponse, QueryError> {
+        self.peer(request.read.as_ref())
+            .serve_label_names(request)
+            .await
+    }
+
+    async fn label_values(
+        &self,
+        request: proto::metrics::internal::v1::LabelValuesRequest,
+    ) -> std::result::Result<proto::metrics::internal::v1::StringsResponse, QueryError> {
+        self.peer(request.read.as_ref())
+            .serve_label_values(request)
+            .await
+    }
+
+    async fn metadata(
+        &self,
+        request: proto::metrics::internal::v1::MetadataRequest,
+    ) -> std::result::Result<proto::metrics::internal::v1::MetadataResponse, QueryError> {
+        self.peer(request.read.as_ref())
+            .serve_metadata(request)
+            .await
+    }
+
+    async fn bucket_generations(
+        &self,
+        request: proto::metrics::internal::v1::BucketGenerationsRequest,
+    ) -> std::result::Result<proto::metrics::internal::v1::BucketGenerationsResponse, QueryError>
+    {
+        self.peer(request.read.as_ref())
+            .serve_bucket_generations(request)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn reader_groups_answer_like_a_reader_with_every_shard_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: SlateDbStorageConfig {
+            path: "reader-groups".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+            disk: Default::default(),
+        },
+        ..Default::default()
+    };
+    let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+    let namespace = Namespace::new("global-query-regression").unwrap();
+    let writers =
+        ShardedMetrics::open_writers(config.clone(), options, [ShardId::new(0), ShardId::new(1)])
+            .await
+            .unwrap();
+    // Recent enough that retention has not expired the samples.
+    let now = common::time::now_ms() / 60_000 * 60_000;
+    let samples = minutely(now - 30 * 60_000, now);
+    let mut series = vec![
+        series_on_shard(
+            &writers,
+            "requests_total",
+            0,
+            &[("job", "api")],
+            samples.clone(),
+        ),
+        series_on_shard(
+            &writers,
+            "requests_total",
+            1,
+            &[("job", "api")],
+            samples.clone(),
+        ),
+        series_on_shard(&writers, "requests_total", 1, &[("job", "web")], samples),
+    ];
+    let (mut left, mut right) = binary_join_series(&writers);
+    left.samples = vec![Sample::new(now - 60_000, 2.0)];
+    right.samples = vec![Sample::new(now - 60_000, 3.0)];
+    series.extend([left, right]);
+    writers
+        .write(&assignment(2), &namespace, series, Visibility::Durable)
+        .await
+        .unwrap();
+    writers.close().await.unwrap();
+
+    let open = |shards: Vec<ShardId>| {
+        ShardedMetrics::open_readers(
+            config.clone(),
+            options,
+            shards,
+            DbReaderOptions {
+                skip_wal_replay: false,
+                ..DbReaderOptions::default()
+            },
+            64 * 1024 * 1024,
+        )
+    };
+    let everything = open(vec![ShardId::new(0), ShardId::new(1)]).await.unwrap();
+    let transport = InProcessShards::default();
+    let mut groups = std::collections::BTreeMap::new();
+    for shard in [ShardId::new(0), ShardId::new(1)] {
+        let group = open(vec![shard]).await.unwrap();
+        assert!(group.shards().scope_readers_to(shard));
+        assert!(group.connect_remote_shards(Arc::new(transport.clone())));
+        groups.insert(shard, Arc::new(group));
+    }
+    assert!(transport.peers.set(groups.clone()).is_ok());
+    let coordinator = &groups[&ShardId::new(0)];
+
+    let time = Some(at(now));
+    for query in [
+        "sum(requests_total)",
+        "sum by (job) (rate(requests_total[5m]))",
+        "requests_total",
+        "left_metric * on(instance) right_metric",
+    ] {
+        let expected = normalized(everything.query(&namespace, query, time).await.unwrap());
+        let actual = normalized(coordinator.query(&namespace, query, time).await.unwrap());
+        assert!(!expected.is_empty(), "query: {query}");
+        assert_eq!(actual, expected, "query: {query}");
+    }
+    let (start, end) = (now - 20 * 60_000, now);
+    async fn rate_range(
+        db: &ShardedMetrics,
+        namespace: &Namespace,
+        start: i64,
+        end: i64,
+    ) -> Vec<RangeSample> {
+        db.query_range(
+            namespace,
+            "sum(rate(requests_total[5m]))",
+            at(start)..=at(end),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    }
+    assert_eq!(
+        range_normalized(rate_range(coordinator, &namespace, start, end).await),
+        range_normalized(rate_range(&everything, &namespace, start, end).await)
+    );
+    let window = at(now - HOUR_MS)..=at(now);
+    assert_eq!(
+        coordinator
+            .series(&namespace, &["requests_total"], window.clone())
+            .await
+            .unwrap(),
+        everything
+            .series(&namespace, &["requests_total"], window.clone())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        coordinator
+            .label_values(&namespace, "job", None, window.clone())
+            .await
+            .unwrap(),
+        everything
+            .label_values(&namespace, "job", None, window.clone())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        coordinator
+            .label_values(&namespace, "job", Some(&["requests_total"]), window.clone())
+            .await
+            .unwrap(),
+        vec!["api".to_owned(), "web".to_owned()]
+    );
+    assert_eq!(
+        coordinator
+            .series(&namespace, &["requests_total"], window.clone())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    let requested = transport.requested.lock().unwrap().clone();
+    assert!(!requested.is_empty());
+    assert!(
+        requested.iter().all(|shard| *shard == ShardId::new(1)),
+        "the coordinator's own shard went over the transport: {requested:?}"
+    );
+    everything.close().await.unwrap();
+    for group in groups.values() {
+        group.close().await.unwrap();
+    }
+}

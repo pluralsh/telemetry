@@ -649,7 +649,9 @@ impl LogDb {
                         Ok::<_, Error>(runs)
                     })
                     .await
-                    .map_err(|error| Error::Invalid(format!("page decode task failed: {error}")))??;
+                    .map_err(|error| {
+                        Error::Invalid(format!("page decode task failed: {error}"))
+                    })??;
                     Ok::<_, Error>((decoding, runs))
                 }
             })

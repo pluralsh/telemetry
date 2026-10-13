@@ -72,7 +72,7 @@ mod write;
 pub use read_cache::ReadCacheConfig;
 use read_cache::{PostingEntry, ReadCache, SegmentPostings, TraceLocators};
 
-pub(crate) use query::{execute_traceql, merge_traces};
+pub(crate) use query::{Hit, evaluate_traceql, execute_traceql, merge_traces};
 use write::*;
 
 const WRITE_CHANNEL: &str = "write";

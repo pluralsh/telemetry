@@ -34,7 +34,18 @@ The default scenario is a mid-to-large platform team:
 2. **Cross-AZ traffic.** Two of the three replicas sit in other zones, and AWS charges $0.01/GB in each direction. At 5 TB/day that's around $2,000/month that does nothing but move bytes.
 3. **Component sprawl.** Frontends, schedulers, index gateways, rulers and three memcached fleets all need baseline capacity.
 
-**Plural Telemetry** writes each record once, to one shard owner, and lets S3 provide durability. Its cross-AZ cost comes only from forwarding a request to the shard owner when an agent hits a different writer. An ingest buffer partitioned by shard would remove even that.
+**Plural Telemetry** writes each record once, to one shard owner, and lets S3 provide durability. Its cross-AZ cost comes from forwarding a request to the shard owner when an agent hits a different writer, and from queries reading other shards' [reader groups](/sharding/#reader-groups). An ingest buffer partitioned by shard would remove the first. The second carries only query results, not ingest volume, so it stays small.
+
+### Reader groups
+
+Each storage shard gets its own group of readers, two replicas by default, and each reader opens only its shard. The reader tier grows with the shard count, but each pod is smaller: its cache holds one shard's working set, and it scans one shard per query. Reads from other shards go over gRPC to their groups:
+
+- **Compute.** Pods per shard replace a few large readers. Total reader vCPU is similar for the same query load, but the floor is `shards × minReplicas` pods.
+- **Object requests.** Manifest polling and cache misses scale with (reader pod, shard) pairs, which is the same as when every reader opens every shard.
+- **Cross-AZ traffic.** A query moves the partial results of every remote shard to the reader that received it, and about two-thirds of that traffic crosses a zone.
+- **Autoscaling.** A CPU-targeted HorizontalPodAutoscaler per group scales a hot shard's readers without scaling the rest, so you pay for query headroom only where it's used.
+
+See [capacity planning](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md#reader-groups-and-cost) for the formulas.
 
 ## Assumptions
 
@@ -42,7 +53,9 @@ The default scenario is a mid-to-large platform team:
 | --- | --- | --- |
 | Compute | $0.0408 per vCPU-hour, memory included | m7g.2xlarge: 8 vCPU / 32 GiB at $0.3264/h |
 | Plural Telemetry writer throughput | 40 MiB/s per 8-vCPU writer, sized at 85% of that rate at peak | One-third of SlateDB's [120 MiB/s sustained-ingest result](https://benchmark.slatedb.io/0.15.0/workload/sustained-ingest/), with 15% peak headroom |
-| Plural Telemetry readers | 4 vCPU each; 1 per 3 writers, at least 2 | Moderate query load; readers do not perform ingestion or compaction |
+| Plural Telemetry readers | One group per storage shard, 2 replicas × 2 vCPU | Moderate query load; readers do not perform ingestion or compaction |
+| Plural Telemetry reader GETs | 17 / s per (reader pod, opened shard) | Manifest polling and cache misses |
+| Plural Telemetry query fan-out | 1% of raw ingest per day returned by remote shards | Query results only; two-thirds cross a zone |
 | Loki distributor | 1 vCPU per 10 MB/s at peak | Grafana sizing guidance |
 | Loki ingester | 1 vCPU per 4 MB/s, ×3 replicas | RF=3 |
 | Loki query path | 60% of Plural Telemetry's total compute | Generous to Loki |

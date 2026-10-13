@@ -127,6 +127,11 @@ func Render(input Input) (Result, error) {
 		if err := validateCacheVolume(input.Metrics.Spec.Config.Storage, input.Metrics.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
 		}
+		if resources.ReadGroupsEnabled(input.Metrics) {
+			if err := resources.ValidateReaderGroupNames(input.Metrics.Name); err != nil {
+				return Result{}, err
+			}
+		}
 	}
 	makeConfig := func(mode string) ([]byte, error) {
 		workload := input.Metrics.Spec.Writer
@@ -299,6 +304,11 @@ func renderLogs(input Input) (Result, error) {
 		if err := validateCacheVolume(logs.Spec.Config.Storage, logs.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
 		}
+		if resources.ReadGroupsEnabled(logs) {
+			if err := resources.ValidateReaderGroupNames(logs.Name); err != nil {
+				return Result{}, err
+			}
+		}
 	}
 	makeConfig := func(component string) ([]byte, error) {
 		spec := logs.Spec.Config
@@ -406,6 +416,11 @@ func renderTraces(input Input) (Result, error) {
 	if resources.Mode(traces) == telemetryv1alpha1.ProductModeSharded {
 		if err := validateCacheVolume(traces.Spec.Config.Storage, traces.Spec.Reader, modeReader); err != nil {
 			return Result{}, err
+		}
+		if resources.ReadGroupsEnabled(traces) {
+			if err := resources.ValidateReaderGroupNames(traces.Name); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 	makeConfig := func(component string) ([]byte, error) {
@@ -632,7 +647,20 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 		}
 	}
 	writer := resourceName(name, modeWriter)
+	var readGroups *renderReadGroups
+	if component == modeReader && (workload.ReadGroups == nil || lo.FromPtrOr(workload.ReadGroups.Enabled, true)) {
+		readGroups = &renderReadGroups{
+			Endpoint:              resources.ReadGroupsEndpoint(name, namespace, grpcPort),
+			HedgeAfterMs:          int64(250),
+			RequestTimeoutSeconds: int64(120),
+		}
+		if spec := workload.ReadGroups; spec != nil {
+			readGroups.HedgeAfterMs = int64Value(spec.HedgeAfterMilliseconds, readGroups.HedgeAfterMs)
+			readGroups.RequestTimeoutSeconds = int64Value(spec.RequestTimeoutSeconds, readGroups.RequestTimeoutSeconds)
+		}
+	}
 	return renderSharding{
+		ReadGroups:         readGroups,
 		IOConcurrencyLimit: ioConcurrencyLimit,
 		Backend:            "kubernetes", Database: resourceName(name, ""), Namespace: namespace,
 		StatefulSet: writer, HeadlessService: resourceName(writer, "headless"),
@@ -912,20 +940,26 @@ type renderWrite struct {
 	RemoteConcurrency               int32  `json:"remote_concurrency"`
 	RemoteRetries                   int32  `json:"remote_retries"`
 }
+type renderReadGroups struct {
+	Endpoint              string `json:"endpoint"`
+	HedgeAfterMs          int64  `json:"hedge_after_ms"`
+	RequestTimeoutSeconds int64  `json:"request_timeout_seconds"`
+}
 type renderSharding struct {
-	Shards               *int32 `json:"shards,omitempty"`
-	IOConcurrencyLimit   int32  `json:"io_concurrency_limit"`
-	Backend              string `json:"backend"`
-	Database             string `json:"database,omitempty"`
-	Namespace            string `json:"namespace,omitempty"`
-	StatefulSet          string `json:"stateful_set,omitempty"`
-	HeadlessService      string `json:"headless_service,omitempty"`
-	OwnerPort            int32  `json:"owner_port,omitempty"`
-	ShardMap             string `json:"shard_map,omitempty"`
-	CoordinatorLease     string `json:"coordinator_lease,omitempty"`
-	ShardLeasePrefix     string `json:"shard_lease_prefix,omitempty"`
-	LeaseDurationSeconds int64  `json:"lease_duration_seconds,omitempty"`
-	RenewIntervalSeconds int64  `json:"renew_interval_seconds,omitempty"`
+	Shards               *int32            `json:"shards,omitempty"`
+	ReadGroups           *renderReadGroups `json:"read_groups,omitempty"`
+	IOConcurrencyLimit   int32             `json:"io_concurrency_limit"`
+	Backend              string            `json:"backend"`
+	Database             string            `json:"database,omitempty"`
+	Namespace            string            `json:"namespace,omitempty"`
+	StatefulSet          string            `json:"stateful_set,omitempty"`
+	HeadlessService      string            `json:"headless_service,omitempty"`
+	OwnerPort            int32             `json:"owner_port,omitempty"`
+	ShardMap             string            `json:"shard_map,omitempty"`
+	CoordinatorLease     string            `json:"coordinator_lease,omitempty"`
+	ShardLeasePrefix     string            `json:"shard_lease_prefix,omitempty"`
+	LeaseDurationSeconds int64             `json:"lease_duration_seconds,omitempty"`
+	RenewIntervalSeconds int64             `json:"renew_interval_seconds,omitempty"`
 }
 type renderFileSecret struct {
 	Source string `json:"source"`

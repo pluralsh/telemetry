@@ -24,7 +24,7 @@ export const metadata = { title: "Metrics architecture" };
 
 ## Read path
 
-1. Grafana sends PromQL to **any reader**. Readers open every shard read-only.
+1. Grafana sends PromQL to **any reader**. It reads its own shard in process and streams series samples from the other shards' [reader groups](/sharding/#reader-groups) over gRPC, then evaluates PromQL.
 2. The planner narrows the hour buckets by time, then resolves label matchers against each bucket's Roaring-bitmap postings, smallest first. Resolved matchers are cached per bucket.
 3. Only the matching series' sample records are loaded, through the block cache.
 4. Series are joined across shards by label fingerprint and evaluated.
@@ -44,7 +44,7 @@ Indexes are bucket-local. A query over a long range repeats lookups per bucket, 
 | --- | --- | --- |
 | Recent data | TSDB head in ingester memory, 3× replicated, cut into 2-hour blocks | Writer buffer, then SlateDB on object storage |
 | Write fan-out | 3× to ingesters via the hash ring | 1× to the shard owner |
-| Historical reads | Store-gateways shard blocks via their own ring | Readers open every shard; one block cache |
+| Historical reads | Store-gateways shard blocks via their own ring | One reader group per shard, each with its own block cache |
 | Compaction | Separate compactor ring, block splitting | SlateDB's built-in compactor, per shard |
 | Query tiers | Frontend, scheduler, queriers, store-gateways, caches | Readers |
 

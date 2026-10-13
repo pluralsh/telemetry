@@ -79,6 +79,29 @@ _Appears in:_
 | `internalTokenSecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 
 
+#### AutoscalingSpec
+
+
+
+AutoscalingSpec scales reader replicas on resource utilization. While
+enabled the HorizontalPodAutoscaler owns replica counts and the
+workload's replicas field only seeds a new StatefulSet.
+
+
+
+_Appears in:_
+- [WorkloadSpec](#workloadspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ |  |  |  |
+| `minReplicas` _integer_ | MinReplicas defaults to the workload's replicas, or 2. |  | Minimum: 1 <br /> |
+| `maxReplicas` _integer_ |  |  | Minimum: 1 <br /> |
+| `targetCPUUtilizationPercentage` _integer_ | TargetCPUUtilizationPercentage is average CPU usage relative to the<br />container's CPU request. Defaults to 70 when no memory target is set. |  | Minimum: 1 <br /> |
+| `targetMemoryUtilizationPercentage` _integer_ | TargetMemoryUtilizationPercentage is average memory usage relative to<br />the container's memory request. |  | Minimum: 1 <br /> |
+| `behavior` _[HorizontalPodAutoscalerBehavior](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#horizontalpodautoscalerbehavior-v2-autoscaling)_ | Behavior is passed through to the HorizontalPodAutoscaler. |  |  |
+
+
 #### AzureClientSecretAuthSpec
 
 
@@ -944,6 +967,28 @@ _Appears in:_
 
 
 
+#### ReadGroupsSpec
+
+
+
+ReadGroupsSpec splits sharded readers into one group per storage shard.
+Each group is a StatefulSet that opens only its own shard; a query sent
+to any reader reads its own shard in process and every other shard from
+that shard's group over gRPC. Replicas, resources, and autoscaling apply
+to each group.
+
+
+
+_Appears in:_
+- [WorkloadSpec](#workloadspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ | Enabled defaults to true. When false, every reader opens every shard. | true |  |
+| `hedgeAfterMilliseconds` _integer_ | HedgeAfterMilliseconds starts a second copy of a shard read on another<br />replica of its group when the first has not answered in time. Zero<br />disables hedging. | 250 | Minimum: 0 <br /> |
+| `requestTimeoutSeconds` _integer_ | RequestTimeoutSeconds bounds one shard read. | 120 | Minimum: 1 <br /> |
+
+
 #### RoutingEpoch
 
 
@@ -1291,6 +1336,8 @@ _Appears in:_
 | `dataVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `cacheVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `persistentVolumeClaimRetentionPolicy` _[PersistentVolumeClaimRetentionPolicySpec](#persistentvolumeclaimretentionpolicyspec)_ | PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs<br />are retained or deleted when the workload is deleted or scaled down.<br />When omitted, remote and in-memory object stores default to Delete while<br />Local object stores default to Retain because the data PVC is authoritative. |  |  |
+| `readGroups` _[ReadGroupsSpec](#readgroupsspec)_ | ReadGroups configures per-shard reader groups. Readers only; ignored<br />for writers and in standalone mode. |  |  |
+| `autoscaling` _[AutoscalingSpec](#autoscalingspec)_ | Autoscaling adds a HorizontalPodAutoscaler per reader StatefulSet, one<br />per reader group. Readers only; ignored for writers and in standalone<br />mode. |  |  |
 
 
 #### WriteSpec

@@ -31,6 +31,10 @@ pub enum ServerMode {
 pub struct ShardingConfig<P: Product> {
     pub shards: u32,
     pub io_concurrency_limit: u32,
+    /// Per-shard reader groups. A reader with this set opens only its own
+    /// shard and reads every other shard from that shard's group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_groups: Option<ReadGroupsConfig>,
     #[serde(flatten)]
     pub kind: ShardingBackend<P>,
 }
@@ -40,8 +44,76 @@ impl<P: Product> Default for ShardingConfig<P> {
         Self {
             shards: DEFAULT_SHARDS,
             io_concurrency_limit: DEFAULT_IO_CONCURRENCY_LIMIT,
+            read_groups: None,
             kind: ShardingBackend::Standalone,
         }
+    }
+}
+
+/// Environment variable naming the shard a reader group pod serves when
+/// [`ReadGroupsConfig::shard`] is unset.
+pub const READER_SHARD_ENV: &str = "READER_SHARD";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReadGroupsConfig {
+    /// The storage shard this reader serves; `READER_SHARD` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard: Option<u32>,
+    /// gRPC `host:port` of a shard's group, with `{shard}` replaced by the
+    /// shard id. The host should resolve to every replica of the group (a
+    /// headless Service) so requests can pick and hedge between them.
+    pub endpoint: String,
+    /// Starts the same request on a second replica when the first has not
+    /// answered within this long; zero disables hedging.
+    pub hedge_after_ms: u64,
+    pub request_timeout_seconds: u64,
+    /// How often a group's replica addresses are re-resolved.
+    pub resolve_interval_seconds: u64,
+}
+
+impl Default for ReadGroupsConfig {
+    fn default() -> Self {
+        Self {
+            shard: None,
+            endpoint: String::new(),
+            hedge_after_ms: 250,
+            request_timeout_seconds: 120,
+            resolve_interval_seconds: 5,
+        }
+    }
+}
+
+impl ReadGroupsConfig {
+    /// The shard this reader serves.
+    pub fn local_shard(&self) -> Result<ShardId, String> {
+        match self.shard {
+            Some(shard) => Ok(ShardId::new(shard)),
+            None => std::env::var(READER_SHARD_ENV)
+                .map_err(|_| {
+                    format!("sharding.read_groups.shard is unset and {READER_SHARD_ENV} is missing")
+                })?
+                .parse()
+                .map(ShardId::new)
+                .map_err(|_| format!("{READER_SHARD_ENV} must be a shard id")),
+        }
+    }
+
+    pub fn endpoint_for(&self, shard: ShardId) -> String {
+        self.endpoint.replace("{shard}", &shard.to_string())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !self.endpoint.contains("{shard}") {
+            return Err("sharding.read_groups.endpoint must contain {shard}".to_owned());
+        }
+        if self.request_timeout_seconds == 0 || self.resolve_interval_seconds == 0 {
+            return Err(
+                "sharding.read_groups request_timeout_seconds and resolve_interval_seconds must be greater than zero"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -160,6 +232,12 @@ impl<P: Product> ShardingConfig<P> {
         if mode == ServerMode::Standalone && !matches!(self.kind, ShardingBackend::Standalone) {
             return Err("standalone mode requires the standalone sharding backend".to_owned());
         }
+        if let Some(groups) = &self.read_groups {
+            if mode != ServerMode::Reader {
+                return Err("sharding.read_groups is only valid in reader mode".to_owned());
+            }
+            groups.validate()?;
+        }
         match &self.kind {
             ShardingBackend::Standalone => {}
             ShardingBackend::Static { owner_id, owners } => {
@@ -275,12 +353,20 @@ impl<P: Product> ShardingConfig<P> {
         assignment: &ShardMap,
         local_owner: &str,
     ) -> Vec<ShardId> {
-        match mode {
-            ServerMode::Standalone | ServerMode::Reader => {
+        match (mode, &self.read_groups) {
+            (ServerMode::Reader, Some(groups)) => groups
+                .local_shard()
+                .ok()
+                .filter(|shard| shard.get() < assignment.shard_count)
+                .into_iter()
+                .collect(),
+            (ServerMode::Standalone | ServerMode::Reader, _) => {
                 (0..assignment.shard_count).map(ShardId::new).collect()
             }
-            ServerMode::Writer if matches!(self.kind, ShardingBackend::Kubernetes(_)) => Vec::new(),
-            ServerMode::Writer => owned_shards(assignment, local_owner).collect(),
+            (ServerMode::Writer, _) if matches!(self.kind, ShardingBackend::Kubernetes(_)) => {
+                Vec::new()
+            }
+            (ServerMode::Writer, _) => owned_shards(assignment, local_owner).collect(),
         }
     }
 }
@@ -517,6 +603,7 @@ mod tests {
         ShardingConfig {
             shards: 8,
             io_concurrency_limit: 64,
+            read_groups: None,
             kind: ShardingBackend::Static {
                 owner_id: "owner-0".to_owned(),
                 owners: owners
@@ -548,6 +635,7 @@ mod tests {
         let config = |database: &str| ShardingConfig::<Demo> {
             shards: 8,
             io_concurrency_limit: 64,
+            read_groups: None,
             kind: ShardingBackend::Kubernetes(KubernetesShardingConfig {
                 database: database.to_owned(),
                 ..KubernetesShardingConfig::default()

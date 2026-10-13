@@ -24,7 +24,7 @@ export const metadata = { title: "Traces architecture" };
 
 ## Read path
 
-1. Grafana sends a trace ID or a TraceQL search to **any reader**. Readers open every shard read-only.
+1. Grafana sends a trace ID or a TraceQL search to **any reader**. It searches its own shard in process and the other shards through their [reader groups](/sharding/#reader-groups) over gRPC, then merges partial traces.
 2. **By ID:** the trace head points at the trace's first page and page count, so a lookup reads exactly those pages and assembles one trace.
 3. **TraceQL:** equality predicates on typed attributes are resolved against postings to find candidate pages. Searches with no usable predicate prune pages by the per-trace time summaries in page metadata.
 4. Candidates are decoded and the complete TraceQL expression is evaluated, so the index never changes query semantics.

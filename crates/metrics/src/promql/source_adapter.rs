@@ -52,13 +52,13 @@ const INDEX_PER_KEY_CONCURRENCY: usize = 64;
 /// Pack `(start, size)` into the opaque `u64` carried by
 /// [`ResolvedSeriesRef::bucket_id`].
 #[inline]
-fn encode_bucket(bucket: TimeBucket) -> u64 {
+pub(crate) fn encode_bucket(bucket: TimeBucket) -> u64 {
     ((bucket.start as u64) << 8) | (bucket.size as u64)
 }
 
 /// Inverse of [`encode_bucket`]. `None` only on defensive size=0 guard.
 #[inline]
-fn decode_bucket(bucket_id: u64) -> Option<TimeBucket> {
+pub(crate) fn decode_bucket(bucket_id: u64) -> Option<TimeBucket> {
     let size_bits = (bucket_id & 0xFF) as u8;
     let start = (bucket_id >> 8) as u32;
     if size_bits == 0 {

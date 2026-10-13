@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(http_cancel.cancelled_owned());
     let grpc = Server::builder()
         .add_service(grpc_service(state.clone()))
+        .add_optional_service(state.shard_reader_service()?)
         .serve_with_shutdown(grpc_addr, grpc_cancel.cancelled_owned());
 
     tokio::select! {

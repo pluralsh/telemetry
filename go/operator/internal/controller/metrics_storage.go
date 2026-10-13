@@ -26,11 +26,11 @@ func (e *StorageChangeError) Error() string {
 	return fmt.Sprintf("%s storage %q cannot be changed: %s", e.Component, e.Volume, e.Reason)
 }
 
-func (r *MetricsReconciler) reconcileStatefulSet(ctx context.Context, metrics *telemetryv1alpha1.Metrics, component resources.Component, secretName, internalSecretName, internalSecretKey string) (ctrl.Result, error) {
+func (r *MetricsReconciler) reconcileStatefulSet(ctx context.Context, metrics *telemetryv1alpha1.Metrics, component resources.Component, shard *int32, secretName, internalSecretName, internalSecretKey string) (ctrl.Result, error) {
 	desired, err := resources.StatefulSet(resources.StatefulSetInput{
 		Metrics: metrics, Component: component, ConfigSecretName: secretName,
 		InternalTokenSecretName: internalSecretName, InternalTokenSecretKey: internalSecretKey,
-		DefaultProductVersion: r.DefaultProductVersion,
+		DefaultProductVersion: r.DefaultProductVersion, Shard: shard,
 	})
 	if err != nil {
 		var volumeErr *resources.VolumeError
@@ -59,6 +59,7 @@ func (r *MetricsReconciler) reconcileStatefulSet(ctx context.Context, metrics *t
 		}
 		return r.resizeResult(ctx, desired)
 	}
+	keepAutoscaledReplicas(metrics, component, current, desired)
 	resizing, err := r.prepareStorageExpansion(ctx, component, current, desired)
 	if err != nil {
 		return ctrl.Result{}, err

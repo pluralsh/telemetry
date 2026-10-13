@@ -30,7 +30,9 @@ use crate::{
     config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
     http::ApiError,
     internal_writer::to_proto_request,
+    shard_reader::GrpcMetricsShards,
 };
+use server_common::read_groups::ReadGroups;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -96,6 +98,22 @@ impl AppState {
         } else {
             None
         };
+        let read_group = match (&config.mode, &config.sharding.read_groups) {
+            (ServerMode::Reader, Some(groups)) => Some((
+                groups.clone(),
+                groups
+                    .local_shard()
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            )),
+            _ => None,
+        };
+        let reader_shards = match &read_group {
+            Some((_, local)) => vec![*local]
+                .into_iter()
+                .filter(|shard| shard.get() < shard_count)
+                .collect(),
+            None => (0..shard_count).map(ShardId::new).collect::<Vec<_>>(),
+        };
         let readers = if config.mode == ServerMode::Standalone {
             writers.clone()
         } else if config.mode != ServerMode::Writer {
@@ -103,7 +121,7 @@ impl AppState {
                 ShardedMetrics::open_readers(
                     metrics_config,
                     options,
-                    (0..shard_count).map(ShardId::new),
+                    reader_shards,
                     slatedb::config::DbReaderOptions {
                         skip_wal_replay: false,
                         ..slatedb::config::DbReaderOptions::default()
@@ -115,6 +133,18 @@ impl AppState {
         } else {
             None
         };
+        if let (Some((groups, local)), Some(readers)) = (read_group, &readers) {
+            let token = config
+                .auth
+                .internal
+                .as_ref()
+                .map(|secret| secret.expose())
+                .transpose()?;
+            readers.shards().scope_readers_to(local);
+            readers.connect_remote_shards(Arc::new(GrpcMetricsShards::new(Arc::new(
+                ReadGroups::new(groups, local, token),
+            ))));
+        }
         let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
         let router = WriteRouter::new(
             local_owner,
@@ -211,6 +241,36 @@ impl AppState {
         &self.config
     }
 
+    /// The `ShardReader` service of a reader group member, which serves its
+    /// shard to the other groups' coordinators.
+    pub fn shard_reader_service(
+        &self,
+    ) -> anyhow::Result<
+        Option<
+            proto::metrics::internal::v1::shard_reader_server::ShardReaderServer<
+                crate::shard_reader::ShardReaderService,
+            >,
+        >,
+    > {
+        let Some(readers) = &self.readers else {
+            return Ok(None);
+        };
+        if self.config.mode != ServerMode::Reader || self.config.sharding.read_groups.is_none() {
+            return Ok(None);
+        }
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()?;
+        Ok(Some(crate::shard_reader::shard_reader_service(
+            Arc::clone(readers),
+            token,
+        )))
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancellation.cancel();
         let tasks = std::mem::take(&mut *self.background_tasks.lock().await);
@@ -281,8 +341,14 @@ impl AppState {
         match self.config.mode {
             ServerMode::Standalone => self.readers.is_some(),
             ServerMode::Reader => {
-                let expected = (0..self.router.assignment().read().await.shard_count)
+                let shard_count = self.router.assignment().read().await.shard_count;
+                let scope = self
+                    .readers
+                    .as_ref()
+                    .and_then(|readers| readers.shards().reader_scope());
+                let expected = (0..shard_count)
                     .map(ShardId::new)
+                    .filter(|shard| scope.is_none_or(|scope| scope == *shard))
                     .collect::<Vec<_>>();
                 match &self.readers {
                     Some(readers) => readers.shards().ids().await == expected,

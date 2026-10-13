@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package logs.internal.v1;
+
+import "logs/internal/v1/writer.proto";
+
+// Reads one storage shard on behalf of a reader coordinating a query over
+// every shard. Each call is served from the shard the receiving reader
+// group opens locally; nothing is forwarded further.
+service ShardReader {
+  // Runs the query's pipelines over the shard and streams what they kept,
+  // which the coordinator merges with every other shard's and evaluates.
+  rpc Query(QueryShardRequest) returns (stream ShardOutput);
+  rpc LabelNames(LabelNamesRequest) returns (StringsResponse);
+  rpc LabelValues(LabelValuesRequest) returns (StringsResponse);
+  rpc Series(SeriesRequest) returns (SeriesResponse);
+}
+
+message ShardRead {
+  uint32 shard = 1;
+  Namespace namespace = 2;
+}
+
+message QueryShardRequest {
+  ShardRead read = 1;
+  string query = 2;
+  int64 start_ns = 3;
+  int64 end_ns = 4;
+  optional int64 step_ns = 5;
+  uint64 limit = 6;
+  bool backward = 7;
+  // Applies to this shard alone.
+  uint64 max_pages = 8;
+  uint64 max_concurrency = 9;
+  uint64 max_in_flight_bytes = 10;
+}
+
+message LabelSet {
+  repeated Label labels = 1;
+}
+
+// A row's position in Loki's merge order within its shard.
+message Tie {
+  uint32 segment = 1;
+  uint64 object = 2;
+  uint64 row = 3;
+}
+
+message RangeRow {
+  int64 timestamp_ns = 1;
+  uint64 stream = 2;
+  uint64 identity = 3;
+  Tie tie = 4;
+  optional double value = 5;
+  uint32 series = 6;
+  optional string failure = 7;
+}
+
+message LabelRow {
+  int64 timestamp_ns = 1;
+  uint64 stream = 2;
+  uint64 identity = 3;
+  Tie tie = 4;
+  optional string failure = 5;
+  optional string value = 6;
+  uint32 group = 7;
+}
+
+message LogLine {
+  int64 timestamp_ns = 1;
+  string line = 2;
+  uint32 labels = 3;
+  repeated Field metadata = 4;
+  uint64 stream = 5;
+}
+
+message TotalSum {
+  uint32 series = 1;
+  int64 bucket = 2;
+  uint64 value = 3;
+}
+
+message TotalFailure {
+  int64 bucket = 1;
+  int64 timestamp_ns = 2;
+  uint64 stream = 3;
+  Tie tie = 4;
+  string message = 5;
+}
+
+message TotalRow {
+  uint64 identity = 1;
+  int64 timestamp_ns = 2;
+  uint64 stream = 3;
+  Tie tie = 4;
+  int64 bucket = 5;
+  uint32 series = 6;
+  optional uint64 value = 7;
+  optional string failure = 8;
+}
+
+message Totals {
+  repeated TotalSum sums = 1;
+  repeated TotalFailure failures = 2;
+  repeated TotalRow pending = 3;
+}
+
+message RangeRows {
+  repeated RangeRow rows = 1;
+}
+
+message LabelRows {
+  repeated LabelRow rows = 1;
+}
+
+message LogLines {
+  repeated LogLine lines = 1;
+}
+
+// What one log expression of the query kept, or a part of it; row label
+// indexes refer to this message's `series`.
+message ShardOutput {
+  uint32 expr = 1;
+  repeated LabelSet series = 2;
+  oneof rows {
+    Totals totals = 3;
+    RangeRows range = 4;
+    LabelRows labels = 5;
+    LogLines logs = 6;
+  }
+}
+
+message LabelNamesRequest {
+  ShardRead read = 1;
+  int64 start_ns = 2;
+  int64 end_ns = 3;
+}
+
+message LabelValuesRequest {
+  ShardRead read = 1;
+  string name = 2;
+  int64 start_ns = 3;
+  int64 end_ns = 4;
+}
+
+message StringsResponse {
+  repeated string values = 1;
+}
+
+message SeriesRequest {
+  ShardRead read = 1;
+  repeated string selectors = 2;
+  int64 start_ns = 3;
+  int64 end_ns = 4;
+}
+
+message SeriesResponse {
+  repeated LabelSet series = 1;
+}

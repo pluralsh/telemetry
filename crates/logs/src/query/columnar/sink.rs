@@ -793,3 +793,362 @@ fn merge_order<T>(rows: &mut Vec<T>, lineless: bool, key: impl Fn(&T) -> (i64, u
         });
     }
 }
+
+/// The wire form of [`Outputs`], which a reader group serving one shard
+/// sends the reader coordinating a query. Rows travel in bounded chunks,
+/// each with the label sets its rows refer to; a row's database is left
+/// for the coordinator to assign by shard order.
+pub(super) mod wire {
+    use proto::logs::internal::v1 as pb;
+
+    use super::*;
+
+    /// Rows per message.
+    const CHUNK_ROWS: usize = 4_096;
+
+    fn tie_to_wire(tie: Tie) -> pb::Tie {
+        pb::Tie {
+            segment: tie.segment,
+            object: tie.object,
+            row: tie.row,
+        }
+    }
+
+    fn tie_from_wire(tie: Option<pb::Tie>) -> Tie {
+        let tie = tie.unwrap_or_default();
+        Tie {
+            database: 0,
+            segment: tie.segment,
+            object: tie.object,
+            row: tie.row,
+        }
+    }
+
+    fn label_set(labels: &LabelMap) -> pb::LabelSet {
+        pb::LabelSet {
+            labels: labels
+                .iter()
+                .map(|(name, value)| pb::Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The label sets a chunk's rows refer to, renumbered from zero.
+    #[derive(Default)]
+    struct Subset {
+        ids: HashMap<u32, u32>,
+        labels: Vec<pb::LabelSet>,
+    }
+
+    impl Subset {
+        fn id(&mut self, table: &SeriesTable, id: u32) -> u32 {
+            *self.ids.entry(id).or_insert_with(|| {
+                self.labels.push(label_set(&table.labels[id as usize]));
+                (self.labels.len() - 1) as u32
+            })
+        }
+    }
+
+    fn message(
+        expr: usize,
+        series: Vec<pb::LabelSet>,
+        rows: pb::shard_output::Rows,
+    ) -> pb::ShardOutput {
+        pb::ShardOutput {
+            expr: expr as u32,
+            series,
+            rows: Some(rows),
+        }
+    }
+
+    fn totals_to_wire(totals: Totals, series: &SeriesTable) -> pb::Totals {
+        pb::Totals {
+            sums: totals
+                .sums
+                .into_iter()
+                .map(|((series, bucket), value)| pb::TotalSum {
+                    series,
+                    bucket,
+                    value,
+                })
+                .collect(),
+            failures: totals
+                .failures
+                .into_iter()
+                .map(
+                    |(bucket, ((timestamp_ns, stream, tie), message))| pb::TotalFailure {
+                        bucket,
+                        timestamp_ns,
+                        stream,
+                        tie: Some(tie_to_wire(tie)),
+                        message,
+                    },
+                )
+                .collect(),
+            pending: totals
+                .pending
+                .into_iter()
+                .map(|(identity, row)| pb::TotalRow {
+                    identity,
+                    timestamp_ns: row.order.0,
+                    stream: row.order.1,
+                    tie: Some(tie_to_wire(row.order.2)),
+                    bucket: row.bucket,
+                    series: if row.value.is_some() {
+                        debug_assert!((row.series as usize) < series.labels.len());
+                        row.series
+                    } else {
+                        u32::MAX
+                    },
+                    value: row.value,
+                    failure: row.failure,
+                })
+                .collect(),
+        }
+    }
+
+    impl Outputs {
+        /// Every expression's kept rows as wire messages.
+        pub(in super::super) fn into_wire(self) -> Vec<pb::ShardOutput> {
+            let mut messages = Vec::new();
+            for (expr, output) in self.0.into_iter().enumerate() {
+                match output {
+                    ExprOutput::Totals(mut totals, series) => {
+                        totals.settle();
+                        messages.push(message(
+                            expr,
+                            series.labels.iter().map(label_set).collect(),
+                            pb::shard_output::Rows::Totals(totals_to_wire(*totals, &series)),
+                        ));
+                    }
+                    ExprOutput::Range(rows, series) => {
+                        let mut rows = rows.into_iter().peekable();
+                        while rows.peek().is_some() {
+                            let mut subset = Subset::default();
+                            let chunk = rows
+                                .by_ref()
+                                .take(CHUNK_ROWS)
+                                .map(|row| pb::RangeRow {
+                                    timestamp_ns: row.timestamp_ns,
+                                    stream: row.stream,
+                                    identity: row.identity,
+                                    tie: Some(tie_to_wire(row.tie)),
+                                    series: match row.value {
+                                        Some(_) => subset.id(&series, row.series),
+                                        None => u32::MAX,
+                                    },
+                                    value: row.value,
+                                    failure: row.failure,
+                                })
+                                .collect();
+                            messages.push(message(
+                                expr,
+                                subset.labels,
+                                pb::shard_output::Rows::Range(pb::RangeRows { rows: chunk }),
+                            ));
+                        }
+                    }
+                    ExprOutput::Labels(rows, groups) => {
+                        let mut rows = rows.into_iter().peekable();
+                        while rows.peek().is_some() {
+                            let mut subset = Subset::default();
+                            let chunk = rows
+                                .by_ref()
+                                .take(CHUNK_ROWS)
+                                .map(|row| pb::LabelRow {
+                                    timestamp_ns: row.timestamp_ns,
+                                    stream: row.stream,
+                                    identity: row.identity,
+                                    tie: Some(tie_to_wire(row.tie)),
+                                    failure: row.failure,
+                                    group: match row.value {
+                                        Some(_) => subset.id(&groups, row.group),
+                                        None => u32::MAX,
+                                    },
+                                    value: row.value,
+                                })
+                                .collect();
+                            messages.push(message(
+                                expr,
+                                subset.labels,
+                                pb::shard_output::Rows::Labels(pb::LabelRows { rows: chunk }),
+                            ));
+                        }
+                    }
+                    ExprOutput::Logs(lines) => {
+                        for chunk in lines.chunks(CHUNK_ROWS) {
+                            let mut table = SeriesTable::default();
+                            let lines = chunk
+                                .iter()
+                                .map(|line| pb::LogLine {
+                                    timestamp_ns: line.timestamp_ns,
+                                    line: line.line.clone(),
+                                    labels: table.adopt(&line.labels),
+                                    metadata: line
+                                        .metadata
+                                        .iter()
+                                        .map(|(name, value)| pb::Field {
+                                            name: name.clone(),
+                                            value: value.clone(),
+                                        })
+                                        .collect(),
+                                    stream: line.stream,
+                                })
+                                .collect();
+                            messages.push(message(
+                                expr,
+                                table.labels.iter().map(label_set).collect(),
+                                pb::shard_output::Rows::Logs(pb::LogLines { lines }),
+                            ));
+                        }
+                    }
+                    ExprOutput::Unused => {}
+                }
+            }
+            messages
+        }
+
+        /// Merges one wire message into these outputs, which `plan` built.
+        pub(in super::super) fn merge_wire(
+            &mut self,
+            plan: &Plan<'_>,
+            message: pb::ShardOutput,
+        ) -> Result<()> {
+            let corrupt = |reason: &str| Error::Corrupt(format!("shard reader output: {reason}"));
+            let expr = message.expr as usize;
+            let mut part = plan.outputs();
+            let Some(slot) = part.0.get_mut(expr) else {
+                return Err(corrupt("unknown expression"));
+            };
+            let mut table = SeriesTable::default();
+            let ids = message
+                .series
+                .into_iter()
+                .map(|set| {
+                    table.adopt(&Arc::new(
+                        set.labels
+                            .into_iter()
+                            .map(|label| (label.name, label.value))
+                            .collect(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let id = |index: u32| -> Result<u32> {
+                ids.get(index as usize)
+                    .copied()
+                    .ok_or_else(|| corrupt("label set out of range"))
+            };
+            let decoded = match (message.rows, &*slot) {
+                (Some(pb::shard_output::Rows::Totals(wire)), ExprOutput::Totals(..)) => {
+                    let mut totals = Totals::default();
+                    for sum in wire.sums {
+                        *totals
+                            .sums
+                            .entry((id(sum.series)?, sum.bucket))
+                            .or_default() += sum.value;
+                    }
+                    for failure in wire.failures {
+                        totals.fail(
+                            failure.bucket,
+                            (
+                                failure.timestamp_ns,
+                                failure.stream,
+                                tie_from_wire(failure.tie),
+                            ),
+                            Some(failure.message),
+                        );
+                    }
+                    for row in wire.pending {
+                        totals.pending.push((
+                            row.identity,
+                            TotalRow {
+                                order: (row.timestamp_ns, row.stream, tie_from_wire(row.tie)),
+                                bucket: row.bucket,
+                                series: match row.value {
+                                    Some(_) => id(row.series)?,
+                                    None => u32::MAX,
+                                },
+                                value: row.value,
+                                failure: row.failure,
+                            },
+                        ));
+                    }
+                    ExprOutput::Totals(Box::new(totals), table)
+                }
+                (Some(pb::shard_output::Rows::Range(wire)), ExprOutput::Range(..)) => {
+                    let rows = wire
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(RangeRow {
+                                timestamp_ns: row.timestamp_ns,
+                                stream: row.stream,
+                                identity: row.identity,
+                                tie: tie_from_wire(row.tie),
+                                series: match row.value {
+                                    Some(_) => id(row.series)?,
+                                    None => u32::MAX,
+                                },
+                                value: row.value,
+                                failure: row.failure,
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    ExprOutput::Range(rows, table)
+                }
+                (Some(pb::shard_output::Rows::Labels(wire)), ExprOutput::Labels(..)) => {
+                    let rows = wire
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(LabelRow {
+                                timestamp_ns: row.timestamp_ns,
+                                stream: row.stream,
+                                identity: row.identity,
+                                tie: tie_from_wire(row.tie),
+                                failure: row.failure,
+                                group: match row.value {
+                                    Some(_) => id(row.group)?,
+                                    None => u32::MAX,
+                                },
+                                value: row.value,
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    ExprOutput::Labels(rows, table)
+                }
+                (Some(pb::shard_output::Rows::Logs(wire)), ExprOutput::Logs(_)) => {
+                    let lines = wire
+                        .lines
+                        .into_iter()
+                        .map(|line| {
+                            let labels = id(line.labels)?;
+                            Ok(LogLine {
+                                timestamp_ns: line.timestamp_ns,
+                                line: line.line,
+                                labels: Arc::clone(&table.labels[labels as usize]),
+                                metadata: line
+                                    .metadata
+                                    .into_iter()
+                                    .map(|field| (field.name, field.value))
+                                    .collect(),
+                                stream: line.stream,
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    ExprOutput::Logs(lines)
+                }
+                _ => return Err(corrupt("rows do not match the expression")),
+            };
+            *slot = decoded;
+            if self.0.is_empty() {
+                *self = plan.outputs();
+            }
+            self.extend(part);
+            Ok(())
+        }
+    }
+}

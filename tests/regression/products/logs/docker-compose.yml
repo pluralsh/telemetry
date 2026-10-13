@@ -1,5 +1,13 @@
 name: logs-regression
 
+x-logs-sharded-environment: &logs-sharded-environment
+  AWS_ACCESS_KEY_ID: logs
+  AWS_SECRET_ACCESS_KEY: logs-fuzz-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+  LOGS_INTERNAL_TOKEN: internal-regression-token
+
 services:
   loki:
     # Pin the multi-architecture image index so local and CI oracles are identical.
@@ -50,7 +58,7 @@ services:
     ports: ["13110:3100"]
 
   minio:
-    profiles: ["fuzz"]
+    profiles: ["fuzz", "sharded"]
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     command: server /data --address ${MINIO_ADDRESS:-:9000} --console-address :9001
     environment:
@@ -75,14 +83,14 @@ services:
     depends_on: [minio]
 
   minio-init:
-    profiles: ["fuzz"]
+    profiles: ["fuzz", "sharded"]
     image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
     environment:
       MC_HOST_local: http://logs:logs-fuzz-secret@minio:9000
     depends_on:
       minio:
         condition: service_started
-    command: ["mb", "--ignore-existing", "local/logs-fuzz", "local/loki-fuzz"]
+    command: ["mb", "--ignore-existing", "local/logs-fuzz", "local/loki-fuzz", "local/logs-sharded"]
     restart: on-failure
 
   logs-s3:
@@ -104,6 +112,73 @@ services:
     volumes:
       - ./${LOGS_CONFIG_DIR:-.}/logs-s3.yaml:/app/regression/logs-s3.yaml:ro
     ports: ["13111:3100"]
+
+  # Two static-shard writers and one reader group per shard over MinIO.
+  logs-writer-0:
+    profiles: ["sharded"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    environment:
+      <<: *logs-sharded-environment
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    command: ["--config", "/app/regression/sharded-writer-0.yaml"]
+    volumes:
+      - ./sharded-writer-0.yaml:/app/regression/sharded-writer-0.yaml:ro
+    ports: ["13103:3100"]
+
+  logs-writer-1:
+    profiles: ["sharded"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    environment:
+      <<: *logs-sharded-environment
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    command: ["--config", "/app/regression/sharded-writer-1.yaml"]
+    volumes:
+      - ./sharded-writer-1.yaml:/app/regression/sharded-writer-1.yaml:ro
+    ports: ["13104:3100"]
+
+  logs-reader-0:
+    profiles: ["sharded"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "0"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    command: ["--config", "/app/regression/sharded-reader-group.yaml"]
+    volumes:
+      - ./sharded-reader-group.yaml:/app/regression/sharded-reader-group.yaml:ro
+    ports: ["13105:3100"]
+
+  logs-reader-1:
+    profiles: ["sharded"]
+    image: telemetry-regression/plural-logs-server:local
+    build:
+      context: ../../../..
+      dockerfile: crates/logs-server/Dockerfile
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "1"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    command: ["--config", "/app/regression/sharded-reader-group.yaml"]
+    volumes:
+      - ./sharded-reader-group.yaml:/app/regression/sharded-reader-group.yaml:ro
+    ports: ["13106:3100"]
 
 volumes:
   loki-data:

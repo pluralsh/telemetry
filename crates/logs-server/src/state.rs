@@ -15,6 +15,7 @@ use proto::logs::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
+use server_common::read_groups::ReadGroups;
 use server_common::reload::{self, Live, LiveConfig};
 use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
 use sharding::{
@@ -32,6 +33,7 @@ use crate::{
     config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
     http::ApiError,
     internal_writer::to_proto_request,
+    shard_reader::GrpcLogsShards,
 };
 
 #[derive(Clone)]
@@ -106,6 +108,25 @@ impl AppState {
             )
             .await?
         });
+        if config.mode == ServerMode::Reader
+            && let Some(groups) = &config.sharding.read_groups
+        {
+            let local = groups
+                .local_shard()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let token = config
+                .auth
+                .internal
+                .as_ref()
+                .map(|secret| secret.expose())
+                .transpose()?;
+            db.shards().scope_readers_to(local);
+            db.connect_remote_shards(Arc::new(GrpcLogsShards::new(Arc::new(ReadGroups::new(
+                groups.clone(),
+                local,
+                token,
+            )))));
+        }
         let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
         let router = WriteRouter::new(
             local_owner,
@@ -169,6 +190,33 @@ impl AppState {
         Ok(state)
     }
 
+    /// The `ShardReader` service of a reader group member, which serves its
+    /// shard to the other groups' coordinators.
+    pub fn shard_reader_service(
+        &self,
+    ) -> anyhow::Result<
+        Option<
+            proto::logs::internal::v1::shard_reader_server::ShardReaderServer<
+                crate::shard_reader::ShardReaderService,
+            >,
+        >,
+    > {
+        if self.config.mode != ServerMode::Reader || self.config.sharding.read_groups.is_none() {
+            return Ok(None);
+        }
+        let token = self
+            .config
+            .auth
+            .internal
+            .as_ref()
+            .map(|secret| secret.expose())
+            .transpose()?;
+        Ok(Some(crate::shard_reader::shard_reader_service(
+            Arc::clone(&self.db),
+            token,
+        )))
+    }
+
     pub(crate) fn live(&self) -> Arc<LiveConfig<NamespaceConfig>> {
         self.live.load()
     }
@@ -210,8 +258,10 @@ impl AppState {
         }
         match self.config.mode {
             ServerMode::Standalone | ServerMode::Reader => {
+                let scope = self.db.shards().reader_scope();
                 let expected = (0..self.router.assignment().read().await.shard_count)
                     .map(ShardId::new)
+                    .filter(|shard| scope.is_none_or(|scope| scope == *shard))
                     .collect::<Vec<_>>();
                 self.db.shards().ids().await == expected
             }
@@ -488,6 +538,7 @@ mod tests {
             sharding: ShardingConfig {
                 shards: 2,
                 io_concurrency_limit: 64,
+                read_groups: None,
                 kind: ShardingBackend::Static {
                     owner_id: owner_id.into(),
                     owners: vec![

@@ -27,6 +27,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 common = { path = "../common" }
+futures.workspace = true
 sharding = { path = "../sharding" }
 snap.workspace = true
 subtle = "2.6.1"

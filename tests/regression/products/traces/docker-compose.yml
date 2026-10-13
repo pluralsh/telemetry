@@ -104,6 +104,32 @@ services:
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["13203:3200"]
 
+  # Reader group 0: opens shard 0 and reads the other shard from its group.
+  traces-reader-0:
+    <<: *traces
+    profiles: ["reader-groups"]
+    command: ["--config", "/app/regression/reader-group.yaml"]
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "0"
+    volumes:
+      - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["13205:3200"]
+
+  # Reader group 1: opens shard 1 and reads the other shard from its group.
+  traces-reader-1:
+    <<: *traces
+    profiles: ["reader-groups"]
+    command: ["--config", "/app/regression/reader-group.yaml"]
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "1"
+    volumes:
+      - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
+      - ./jwks.json:/app/regression/jwks.json:ro
+    ports: ["13206:3200"]
+
   # One process and shard over MinIO, the shape of the single-binary oracle;
   # benchmarks use it so reads skip the split topology's per-shard fan-out.
   traces-s3:

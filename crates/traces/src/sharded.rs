@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -14,7 +14,15 @@ use sharding::{
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
-use crate::routing::{route_trace, trace_shards};
+use futures::future::{try_join, try_join_all};
+use proto::traces::internal::v1 as pb;
+
+use crate::db::Hit;
+use crate::remote::{
+    RemoteShard, SEARCH_CHUNK_TRACES, TracesShardClient, discovery_to_wire, matcher_from_wire,
+    options_from_wire, read_from_wire, scope_from_wire, trace_to_wire,
+};
+use crate::routing::{may_be_split, route_trace, trace_shards};
 use crate::{
     AttributeMatcher, AttributeScope, Config, Durability, Error, Namespace, QueryOptions, Result,
     Trace, TraceBatch, TraceDb, TraceId, TraceQlResult, TraceSummary, WriteReport,
@@ -48,6 +56,8 @@ fn shard_config(config: &Config, shard: ShardId) -> Config {
 pub struct ShardedTraces {
     shards: Arc<ShardSet<TraceDb>>,
     cache: SharedDbCache,
+    /// Reads the shards other reader groups serve.
+    remote: OnceLock<Arc<dyn TracesShardClient>>,
 }
 
 impl ShardedTraces {
@@ -98,6 +108,7 @@ impl ShardedTraces {
             Ok(shards) => Ok(Self {
                 shards: Arc::new(shards),
                 cache,
+                remote: OnceLock::new(),
             }),
             Err(error) => {
                 cache.close().await?;
@@ -109,6 +120,34 @@ impl ShardedTraces {
     /// The open storage shards, for ownership lifecycle management.
     pub fn shards(&self) -> &Arc<ShardSet<TraceDb>> {
         &self.shards
+    }
+
+    /// Reads every shard outside this reader's scope through `client`.
+    /// Returns false when a client is already connected.
+    pub fn connect_remote_shards(&self, client: Arc<dyn TracesShardClient>) -> bool {
+        self.remote.set(client).is_ok()
+    }
+
+    /// The shards this reader reads remotely. Never includes an open shard:
+    /// a local shard is always read in process.
+    fn remote_shards(&self) -> Vec<RemoteShard> {
+        let Some(client) = self.remote.get() else {
+            return Vec::new();
+        };
+        self.shards
+            .remote_shards()
+            .into_iter()
+            .map(|shard| RemoteShard {
+                shard,
+                client: Arc::clone(client),
+            })
+            .collect()
+    }
+
+    fn remote_shard(&self, shard: ShardId) -> Option<RemoteShard> {
+        self.remote_shards()
+            .into_iter()
+            .find(|remote| remote.shard == shard)
     }
 
     /// Warms recent cache blocks for every open shard and namespace, skipping
@@ -184,12 +223,17 @@ impl ShardedTraces {
     ) -> Result<Option<Trace>> {
         let mut parts = Vec::new();
         for shard in trace_shards(assignment, namespace, trace_id) {
-            let database = self.shards.require(shard).await?;
-            parts.extend(
-                self.shards
-                    .with_io(database.get_trace(namespace, trace_id))
-                    .await?,
-            );
+            if let Some(database) = self.shards.get(shard).await {
+                parts.extend(
+                    self.shards
+                        .with_io(database.get_trace(namespace, trace_id))
+                        .await?,
+                );
+            } else if let Some(remote) = self.remote_shard(shard) {
+                parts.extend(remote.get_trace(namespace, trace_id).await?);
+            } else {
+                self.shards.require(shard).await?;
+            }
         }
         Ok(crate::db::merge_traces(parts)?.pop())
     }
@@ -201,12 +245,19 @@ impl ShardedTraces {
         end_ns: u64,
         matchers: &[AttributeMatcher],
     ) -> Result<Vec<Trace>> {
-        let per_shard = self
-            .shards
-            .fan_out(|database| async move {
+        let remote = self.remote_shards();
+        let (mut per_shard, remote) = try_join(
+            self.shards.fan_out(|database| async move {
                 database.search(namespace, start_ns, end_ns, matchers).await
-            })
-            .await?;
+            }),
+            try_join_all(
+                remote
+                    .iter()
+                    .map(|shard| shard.search(namespace, start_ns, end_ns, matchers)),
+            ),
+        )
+        .await?;
+        per_shard.extend(remote);
         let multiple_shards = per_shard.len() > 1;
         let mut results = per_shard.into_iter().flatten().collect::<Vec<_>>();
         if multiple_shards {
@@ -224,18 +275,28 @@ impl ShardedTraces {
         }
         // Select the globally first `limit` IDs from locators alone, then
         // load only those, so S shards never materialize S × limit traces.
-        let mut scanned = self
-            .shards
-            .fan_out(|database| async move {
+        // A remote shard returns its own first `limit`, loaded.
+        let remote = self.remote_shards();
+        let (mut scanned, remote) = try_join(
+            self.shards.fan_out(|database| async move {
                 let ids = database.scan_trace_ids(namespace, limit).await?;
                 Ok::<_, Error>((database, ids))
-            })
-            .await?;
+            }),
+            try_join_all(remote.iter().map(|shard| shard.scan(namespace, limit))),
+        )
+        .await?;
+        let remote = remote.into_iter().flatten().collect::<Vec<_>>();
 
         let mut selected = scanned
             .iter()
             .enumerate()
             .flat_map(|(shard, (_, ids))| ids.iter().map(move |id| (id.trace_id, shard)))
+            .chain(
+                remote
+                    .iter()
+                    .enumerate()
+                    .map(|(index, trace)| (trace.trace_id, scanned.len() + index)),
+            )
             .collect::<Vec<_>>();
         selected.sort_unstable();
         selected.truncate(limit);
@@ -243,6 +304,7 @@ impl ShardedTraces {
         for (shard, (_, ids)) in scanned.iter_mut().enumerate() {
             ids.retain(|id| keep.contains(&(id.trace_id, shard)));
         }
+        let local_count = scanned.len();
 
         let loaded = futures::future::try_join_all(
             scanned.into_iter().filter(|(_, ids)| !ids.is_empty()).map(
@@ -255,6 +317,13 @@ impl ShardedTraces {
         )
         .await?;
         let mut results = loaded.into_iter().flatten().collect::<Vec<_>>();
+        results.extend(
+            remote
+                .into_iter()
+                .enumerate()
+                .filter(|(index, trace)| keep.contains(&(trace.trace_id, local_count + index)))
+                .map(|(_, trace)| trace),
+        );
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         Ok(results)
     }
@@ -266,14 +335,21 @@ impl ShardedTraces {
         end_ns: u64,
         scope: Option<AttributeScope>,
     ) -> Result<Vec<String>> {
-        let names = self
-            .shards
-            .fan_out(|database| async move {
+        let remote = self.remote_shards();
+        let (mut names, remote) = try_join(
+            self.shards.fan_out(|database| async move {
                 database
                     .catalog_names(namespace, start_ns, end_ns, scope)
                     .await
-            })
-            .await?;
+            }),
+            try_join_all(
+                remote
+                    .iter()
+                    .map(|shard| shard.catalog_names(namespace, start_ns, end_ns, scope)),
+            ),
+        )
+        .await?;
+        names.extend(remote);
         Ok(sorted_union(names))
     }
 
@@ -285,61 +361,271 @@ impl ShardedTraces {
         scope: Option<AttributeScope>,
         name: &str,
     ) -> Result<Vec<DiscoveryValue>> {
-        let values = self
-            .shards
-            .fan_out(|database| async move {
+        let remote = self.remote_shards();
+        let (mut values, remote) = try_join(
+            self.shards.fan_out(|database| async move {
                 database
                     .catalog_values(namespace, start_ns, end_ns, scope, name)
                     .await
-            })
-            .await?;
+            }),
+            try_join_all(
+                remote
+                    .iter()
+                    .map(|shard| shard.catalog_values(namespace, start_ns, end_ns, scope, name)),
+            ),
+        )
+        .await?;
+        values.extend(remote);
         Ok(sorted_union(values))
     }
 
     pub async fn query_traceql(
         &self,
+        assignment: &ShardMap,
         namespace: &Namespace,
         start_ns: u64,
         end_ns: u64,
         source: &str,
         options: QueryOptions,
     ) -> Result<Vec<TraceQlResult>> {
-        let databases = self.shards.databases().await;
-        let shards = databases.iter().map(Arc::as_ref).collect::<Vec<_>>();
-        let permits = self.shards.io_permits();
-        crate::db::execute_traceql(
-            &shards,
-            Some(&permits),
-            namespace,
-            (start_ns, end_ns),
-            source,
-            options,
-        )
-        .await
+        self.traceql(assignment, namespace, (start_ns, end_ns), source, options)
+            .await
     }
 
     /// [`Self::query_traceql`] without matched spans, as a search response
     /// lists them.
     pub async fn search_traceql(
         &self,
+        assignment: &ShardMap,
         namespace: &Namespace,
         start_ns: u64,
         end_ns: u64,
         source: &str,
         options: QueryOptions,
     ) -> Result<Vec<TraceSummary>> {
+        self.traceql(assignment, namespace, (start_ns, end_ns), source, options)
+            .await
+    }
+
+    async fn local_traceql<T: Hit>(
+        &self,
+        namespace: &Namespace,
+        range: (u64, u64),
+        source: &str,
+        options: QueryOptions,
+    ) -> Result<Vec<T>> {
         let databases = self.shards.databases().await;
         let shards = databases.iter().map(Arc::as_ref).collect::<Vec<_>>();
         let permits = self.shards.io_permits();
-        crate::db::execute_traceql(
-            &shards,
-            Some(&permits),
-            namespace,
-            (start_ns, end_ns),
-            source,
-            options,
+        crate::db::execute_traceql(&shards, Some(&permits), namespace, range, source, options).await
+    }
+
+    /// Open shards run the query together, exactly; each remote shard runs
+    /// it alone and returns its first `limit` hits, which merge into global
+    /// result order. A hit whose trace may be split across shards, because
+    /// its spans run within [`crate::routing::SPLIT_TRACE_SLACK_NS`] of a cutover that moves
+    /// its ID, is evaluated whole again, since each shard saw only its part.
+    async fn traceql<T: Hit>(
+        &self,
+        assignment: &ShardMap,
+        namespace: &Namespace,
+        range: (u64, u64),
+        source: &str,
+        options: QueryOptions,
+    ) -> Result<Vec<T>> {
+        let remote = self.remote_shards();
+        if remote.is_empty() {
+            return self.local_traceql(namespace, range, source, options).await;
+        }
+        let (mut hits, remote) = try_join(
+            self.local_traceql::<T>(namespace, range, source, options),
+            try_join_all(
+                remote
+                    .iter()
+                    .map(|shard| shard.traceql::<T>(namespace, range, source, &options)),
+            ),
         )
-        .await
+        .await?;
+        hits.extend(remote.into_iter().flatten());
+
+        let mut split = HashMap::<TraceId, Option<T>>::new();
+        for hit in &hits {
+            let trace_id = hit.order().1;
+            let (start, end) = hit.span_range();
+            if !split.contains_key(&trace_id)
+                && may_be_split(assignment, namespace, trace_id, start, end)
+            {
+                split.insert(trace_id, None);
+            }
+        }
+        for (trace_id, whole) in &mut split {
+            if let Some(trace) = self.get_trace(assignment, namespace, *trace_id).await? {
+                *whole = crate::db::evaluate_traceql(&trace, source, &options)?;
+            }
+        }
+        if !split.is_empty() {
+            let mut seen = HashSet::new();
+            hits = hits
+                .into_iter()
+                .filter_map(|hit| {
+                    let trace_id = hit.order().1;
+                    match split.get_mut(&trace_id) {
+                        Some(whole) => seen.insert(trace_id).then(|| whole.take()).flatten(),
+                        None => Some(hit),
+                    }
+                })
+                .collect();
+        }
+        hits.sort_by_key(T::order);
+        hits.truncate(options.limit);
+        Ok(hits)
+    }
+
+    /// The shard a reader coordinating a query asks this one to read, which
+    /// must be the shard this reader serves.
+    async fn served(&self, read: Option<&pb::ShardRead>) -> Result<(Arc<TraceDb>, Namespace)> {
+        let (shard, namespace) = read_from_wire(read)?;
+        if self
+            .shards
+            .reader_scope()
+            .is_some_and(|scope| scope != shard)
+        {
+            return Err(Error::Unavailable(format!(
+                "this reader does not serve shard {}",
+                shard.get()
+            )));
+        }
+        Ok((self.shards.require(shard).await?, namespace))
+    }
+
+    pub async fn serve_get_trace(
+        &self,
+        request: &pb::GetTraceRequest,
+    ) -> Result<pb::TracesResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let trace_id = TraceId::from_slice(&request.trace_id)?;
+        let parts = self
+            .shards
+            .with_io(database.get_trace(&namespace, trace_id))
+            .await?;
+        Ok(pb::TracesResponse {
+            traces: parts.iter().map(trace_to_wire).collect(),
+        })
+    }
+
+    /// The shard's search hits, in bounded messages.
+    pub async fn serve_search(
+        &self,
+        request: &pb::SearchRequest,
+    ) -> Result<Vec<pb::TracesResponse>> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let matchers = request
+            .matchers
+            .iter()
+            .cloned()
+            .map(matcher_from_wire)
+            .collect::<Result<Vec<_>>>()?;
+        let traces = self
+            .shards
+            .with_io(database.search(&namespace, request.start_ns, request.end_ns, &matchers))
+            .await?;
+        Ok(traces
+            .chunks(SEARCH_CHUNK_TRACES)
+            .map(|chunk| pb::TracesResponse {
+                traces: chunk.iter().map(trace_to_wire).collect(),
+            })
+            .collect())
+    }
+
+    pub async fn serve_scan(&self, request: &pb::ScanRequest) -> Result<pb::TracesResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Err(Error::Invalid(
+                "trace scan limit must be greater than zero".to_owned(),
+            ));
+        }
+        let traces = self
+            .shards
+            .with_io(async {
+                let ids = database.scan_trace_ids(&namespace, limit).await?;
+                database.load_scanned(&namespace, ids).await
+            })
+            .await?;
+        Ok(pb::TracesResponse {
+            traces: traces.iter().map(trace_to_wire).collect(),
+        })
+    }
+
+    pub async fn serve_catalog_names(
+        &self,
+        request: &pb::CatalogNamesRequest,
+    ) -> Result<pb::StringsResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let scope = scope_from_wire(request.scope)?;
+        let values = self
+            .shards
+            .with_io(database.catalog_names(&namespace, request.start_ns, request.end_ns, scope))
+            .await?;
+        Ok(pb::StringsResponse { values })
+    }
+
+    pub async fn serve_catalog_values(
+        &self,
+        request: &pb::CatalogValuesRequest,
+    ) -> Result<pb::CatalogValuesResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let scope = scope_from_wire(request.scope)?;
+        let values = self
+            .shards
+            .with_io(database.catalog_values(
+                &namespace,
+                request.start_ns,
+                request.end_ns,
+                scope,
+                &request.name,
+            ))
+            .await?;
+        Ok(pb::CatalogValuesResponse {
+            values: values.iter().map(discovery_to_wire).collect(),
+        })
+    }
+
+    /// The query's first hits on the shard this reader serves.
+    pub async fn serve_traceql(&self, request: &pb::TraceQlRequest) -> Result<pb::TraceQlResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let options = options_from_wire(request);
+        let range = (request.start_ns, request.end_ns);
+        let permits = self.shards.io_permits();
+        let shards = [database.as_ref()];
+        let hits = if request.summaries {
+            crate::db::execute_traceql::<TraceSummary>(
+                &shards,
+                Some(&permits),
+                &namespace,
+                range,
+                &request.query,
+                options,
+            )
+            .await?
+            .into_iter()
+            .map(Hit::to_wire)
+            .collect()
+        } else {
+            crate::db::execute_traceql::<TraceQlResult>(
+                &shards,
+                Some(&permits),
+                &namespace,
+                range,
+                &request.query,
+                options,
+            )
+            .await?
+            .into_iter()
+            .map(Hit::to_wire)
+            .collect()
+        };
+        Ok(pb::TraceQlResponse { hits })
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -498,6 +784,7 @@ mod tests {
         assert_eq!(found[0].spans().count(), 2);
         let counted = database
             .query_traceql(
+                &routing,
                 &namespace,
                 0,
                 1_000,
@@ -658,7 +945,7 @@ mod tests {
         };
         assert_eq!(
             sharded
-                .query_traceql(&namespace, 0, 100, "{}", options)
+                .query_traceql(&routing, &namespace, 0, 100, "{}", options)
                 .await
                 .unwrap(),
             oracle
@@ -700,7 +987,7 @@ mod tests {
         };
         for query in ["{ .shard = 2 }", "{ .shard = 2.0 }"] {
             let results = sharded
-                .query_traceql(&namespace, 0, 100, query, options)
+                .query_traceql(&assignment(4), &namespace, 0, 100, query, options)
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1, "{query}");
@@ -708,10 +995,316 @@ mod tests {
         }
         assert!(
             sharded
-                .query_traceql(&namespace, 0, 100, "{}", options)
+                .query_traceql(&assignment(4), &namespace, 0, 100, "{}", options)
                 .await
                 .is_err()
         );
         sharded.close().await.unwrap();
+    }
+
+    /// Serves another reader's shard in process, recording what was asked.
+    struct InProcessShards {
+        reader: Arc<ShardedTraces>,
+        asked: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl InProcessShards {
+        fn record(&self, read: Option<&pb::ShardRead>) {
+            self.asked.lock().unwrap().push(read.unwrap().shard);
+        }
+    }
+
+    #[async_trait]
+    impl TracesShardClient for InProcessShards {
+        async fn get_trace(&self, request: pb::GetTraceRequest) -> Result<pb::TracesResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_get_trace(&request).await
+        }
+
+        async fn search(&self, request: pb::SearchRequest) -> Result<Vec<pb::TracesResponse>> {
+            self.record(request.read.as_ref());
+            self.reader.serve_search(&request).await
+        }
+
+        async fn scan(&self, request: pb::ScanRequest) -> Result<pb::TracesResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_scan(&request).await
+        }
+
+        async fn catalog_names(
+            &self,
+            request: pb::CatalogNamesRequest,
+        ) -> Result<pb::StringsResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_catalog_names(&request).await
+        }
+
+        async fn catalog_values(
+            &self,
+            request: pb::CatalogValuesRequest,
+        ) -> Result<pb::CatalogValuesResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_catalog_values(&request).await
+        }
+
+        async fn traceql(&self, request: pb::TraceQlRequest) -> Result<pb::TraceQlResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_traceql(&request).await
+        }
+    }
+
+    /// A reader holding only shard 0, reading shard 1 from `everything`.
+    async fn reader_group(
+        everything: &Arc<ShardedTraces>,
+        routing: &ShardMap,
+        namespace: &Namespace,
+        traces: &[Trace],
+    ) -> (ShardedTraces, Arc<InProcessShards>) {
+        let options = ShardingOptions::new(2, 2).unwrap();
+        let coordinator = ShardedTraces::open(config(), options, [ShardId::new(0)])
+            .await
+            .unwrap();
+        for trace in traces {
+            let local = trace_shards(routing, namespace, trace.trace_id)
+                .into_iter()
+                .all(|shard| shard == ShardId::new(0));
+            if local || route_trace(routing, namespace, trace) == ShardId::new(0) {
+                coordinator
+                    .write(
+                        routing,
+                        namespace,
+                        vec![TraceBatch::new(vec![trace.clone()])],
+                        Durability::Written,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(coordinator.shards().scope_readers_to(ShardId::new(0)));
+        let shards = Arc::new(InProcessShards {
+            reader: Arc::clone(everything),
+            asked: Default::default(),
+        });
+        assert!(coordinator.connect_remote_shards(shards.clone()));
+        (coordinator, shards)
+    }
+
+    #[tokio::test]
+    async fn reader_groups_answer_like_a_reader_with_every_shard_open() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let routing = assignment(2);
+        let traces = (1..=16)
+            .map(|id| trace(id, 1_000 - u64::from(id) * 10))
+            .collect::<Vec<_>>();
+        let everything = Arc::new(
+            ShardedTraces::open(
+                config(),
+                ShardingOptions::new(2, 2).unwrap(),
+                [ShardId::new(0), ShardId::new(1)],
+            )
+            .await
+            .unwrap(),
+        );
+        everything
+            .write(
+                &routing,
+                &namespace,
+                vec![TraceBatch::new(traces.clone())],
+                Durability::Written,
+            )
+            .await
+            .unwrap();
+        let (coordinator, shards) = reader_group(&everything, &routing, &namespace, &traces).await;
+        assert!(
+            traces
+                .iter()
+                .any(|trace| route_trace(&routing, &namespace, trace) == ShardId::new(1))
+        );
+
+        for limit in [1, 5, 20] {
+            let options = QueryOptions {
+                limit,
+                ..QueryOptions::default()
+            };
+            for query in ["{}", "{ .shard > 4 }", "{ .shard = 3 }"] {
+                let expected = everything
+                    .query_traceql(&routing, &namespace, 0, 2_000, query, options)
+                    .await
+                    .unwrap();
+                assert!(!expected.is_empty(), "{query}");
+                assert_eq!(
+                    coordinator
+                        .query_traceql(&routing, &namespace, 0, 2_000, query, options)
+                        .await
+                        .unwrap(),
+                    expected,
+                    "{query} limit {limit}"
+                );
+                assert_eq!(
+                    coordinator
+                        .search_traceql(&routing, &namespace, 0, 2_000, query, options)
+                        .await
+                        .unwrap(),
+                    everything
+                        .search_traceql(&routing, &namespace, 0, 2_000, query, options)
+                        .await
+                        .unwrap(),
+                    "{query} limit {limit}"
+                );
+            }
+            assert_eq!(
+                coordinator.scan_traces(&namespace, limit).await.unwrap(),
+                everything.scan_traces(&namespace, limit).await.unwrap(),
+                "limit {limit}"
+            );
+        }
+        assert_eq!(
+            coordinator.search(&namespace, 0, 2_000, &[]).await.unwrap(),
+            everything.search(&namespace, 0, 2_000, &[]).await.unwrap(),
+        );
+        assert_eq!(
+            coordinator
+                .catalog_values(&namespace, 0, 2_000, Some(AttributeScope::Span), "shard")
+                .await
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            coordinator
+                .catalog_names(&namespace, 0, 2_000, None)
+                .await
+                .unwrap(),
+            everything
+                .catalog_names(&namespace, 0, 2_000, None)
+                .await
+                .unwrap(),
+        );
+        for trace in &traces {
+            assert_eq!(
+                coordinator
+                    .get_trace(&routing, &namespace, trace.trace_id)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(trace)
+            );
+        }
+        assert!(!shards.asked.lock().unwrap().is_empty());
+        assert!(shards.asked.lock().unwrap().iter().all(|shard| *shard == 1));
+
+        let error = coordinator
+            .serve_catalog_names(&pb::CatalogNamesRequest {
+                read: Some(crate::remote::shard_read(ShardId::new(1), &namespace)),
+                start_ns: 0,
+                end_ns: 2_000,
+                scope: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Unavailable(_)));
+        coordinator.close().await.unwrap();
+        everything.close().await.unwrap();
+    }
+
+    #[test]
+    fn only_traces_near_a_cutover_that_moves_them_may_be_split() {
+        use crate::routing::SPLIT_TRACE_SLACK_NS;
+
+        let namespace = Namespace::new("tenant").unwrap();
+        let cutover = 10 * SPLIT_TRACE_SLACK_NS;
+        let routing = scaled(&assignment(1), 2, cutover as i64);
+        let moves = |id: u8| {
+            route(
+                &routing,
+                &namespace,
+                TraceId::new([id; 16]).unwrap(),
+                cutover,
+            ) != ShardId::new(0)
+        };
+        let moved = TraceId::new([(1..=u8::MAX).find(|id| moves(*id)).unwrap(); 16]).unwrap();
+        let stayed = TraceId::new([(1..=u8::MAX).find(|id| !moves(*id)).unwrap(); 16]).unwrap();
+        let split = |trace_id, start, end| may_be_split(&routing, &namespace, trace_id, start, end);
+
+        assert!(split(moved, cutover - 5, cutover + 5));
+        assert!(split(
+            moved,
+            cutover + SPLIT_TRACE_SLACK_NS - 1,
+            cutover + SPLIT_TRACE_SLACK_NS
+        ));
+        assert!(!split(
+            moved,
+            cutover + SPLIT_TRACE_SLACK_NS,
+            cutover + 2 * SPLIT_TRACE_SLACK_NS
+        ));
+        assert!(!split(moved, 0, cutover - SPLIT_TRACE_SLACK_NS - 1));
+        assert!(!split(stayed, cutover - 5, cutover + 5));
+    }
+
+    #[tokio::test]
+    async fn reader_groups_evaluate_a_trace_split_across_shards_whole() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let routing = scaled(&assignment(1), 2, 100);
+        let id = (1..=u8::MAX)
+            .find(|id| {
+                let trace_id = TraceId::new([*id; 16]).unwrap();
+                route(&routing, &namespace, trace_id, 100) == ShardId::new(1)
+            })
+            .unwrap();
+        let early = trace(id, 10);
+        let mut late = trace(id, 200);
+        late.resource_spans[0].scope_spans[0].spans[0].span_id = vec![0xAB; 8];
+        let everything = Arc::new(
+            ShardedTraces::open(
+                config(),
+                ShardingOptions::new(2, 2).unwrap(),
+                [ShardId::new(0), ShardId::new(1)],
+            )
+            .await
+            .unwrap(),
+        );
+        for part in [&early, &late] {
+            everything
+                .write(
+                    &routing,
+                    &namespace,
+                    vec![TraceBatch::new(vec![part.clone()])],
+                    Durability::Written,
+                )
+                .await
+                .unwrap();
+        }
+        let (coordinator, _) = reader_group(&everything, &routing, &namespace, &[early]).await;
+        for query in ["{}", "{ .shard > 0 }"] {
+            let expected = everything
+                .query_traceql(
+                    &routing,
+                    &namespace,
+                    0,
+                    1_000,
+                    query,
+                    QueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(expected.len(), 1);
+            assert_eq!(
+                coordinator
+                    .query_traceql(
+                        &routing,
+                        &namespace,
+                        0,
+                        1_000,
+                        query,
+                        QueryOptions::default()
+                    )
+                    .await
+                    .unwrap(),
+                expected,
+                "{query}"
+            );
+        }
+        coordinator.close().await.unwrap();
+        everything.close().await.unwrap();
     }
 }

@@ -26,6 +26,7 @@ metrics.workspace = true
 moka.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
+proto = { path = "../proto" }
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

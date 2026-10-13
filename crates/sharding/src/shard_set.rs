@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -61,6 +64,11 @@ pub struct ShardSet<D: ShardDatabase> {
     opener: ShardOpener<D>,
     shards: RwLock<BTreeMap<ShardId, Arc<D>>>,
     io_permits: Arc<Semaphore>,
+    /// The one shard a reader group member opens; every reader shard when
+    /// unset.
+    reader_scope: OnceLock<ShardId>,
+    /// Shards of the latest reconciled assignment.
+    shard_count: AtomicU32,
 }
 
 impl<D: ShardDatabase> ShardSet<D> {
@@ -76,6 +84,8 @@ impl<D: ShardDatabase> ShardSet<D> {
             opener,
             shards: RwLock::new(BTreeMap::new()),
             io_permits: Arc::new(Semaphore::new(options.io_concurrency_limit() as usize)),
+            reader_scope: OnceLock::new(),
+            shard_count: AtomicU32::new(options.shard_count()),
         };
         let opened = set.open_many(shards.into_iter().collect()).await?;
         *set.shards.get_mut() = opened;
@@ -95,6 +105,28 @@ impl<D: ShardDatabase> ShardSet<D> {
 
     pub const fn role(&self) -> ShardRole {
         self.role
+    }
+
+    /// Limits reader reconciliation to `shard`, for a reader group member.
+    /// Returns false when a different scope was already set.
+    pub fn scope_readers_to(&self, shard: ShardId) -> bool {
+        *self.reader_scope.get_or_init(|| shard) == shard
+    }
+
+    pub fn reader_scope(&self) -> Option<ShardId> {
+        self.reader_scope.get().copied()
+    }
+
+    /// The shards a scoped reader reads through other reader groups: every
+    /// shard of the latest assignment but its own. Empty when unscoped.
+    pub fn remote_shards(&self) -> Vec<ShardId> {
+        let Some(scope) = self.reader_scope() else {
+            return Vec::new();
+        };
+        (0..self.shard_count.load(Ordering::Acquire))
+            .map(ShardId::new)
+            .filter(|shard| *shard != scope)
+            .collect()
     }
 
     pub const fn options(&self) -> ShardingOptions {
@@ -177,15 +209,20 @@ impl<D: ShardDatabase> ShardSet<D> {
         database.close_database().await
     }
 
-    /// Opens readers for every shard in `assignment`. Shards are never
-    /// removed because routing epochs only grow.
+    /// Opens readers for every shard in `assignment`, or only the scoped
+    /// shard of a reader group member. Shards are never removed because
+    /// routing epochs only grow.
     pub async fn reconcile(&self, assignment: &ShardMap) -> Result<(), D::Error> {
         if self.role != ShardRole::Reader {
             return Err(ShardSetError::NotReader.into());
         }
+        self.shard_count
+            .store(assignment.shard_count, Ordering::Release);
         let current = self.ids().await;
+        let scope = self.reader_scope();
         let missing = (0..assignment.shard_count)
             .map(ShardId::new)
+            .filter(|shard| scope.is_none_or(|scope| scope == *shard))
             .filter(|shard| !current.contains(shard))
             .collect::<Vec<_>>();
         if missing.is_empty() {
@@ -414,6 +451,34 @@ mod tests {
         );
         reader.close_all().await.unwrap();
         assert_eq!(closes.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn scoped_readers_reconcile_only_their_shard() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let reader = ShardSet::open(
+            ShardRole::Reader,
+            ShardingOptions::default(),
+            opener(&closes),
+            [],
+        )
+        .await
+        .unwrap();
+        assert!(reader.scope_readers_to(ShardId::new(2)));
+        assert!(!reader.scope_readers_to(ShardId::new(1)));
+        reader.reconcile(&assignment(2)).await.unwrap();
+        assert!(reader.ids().await.is_empty());
+        assert_eq!(
+            reader.remote_shards(),
+            vec![ShardId::new(0), ShardId::new(1)]
+        );
+        reader.reconcile(&assignment(4)).await.unwrap();
+        assert_eq!(reader.ids().await, vec![ShardId::new(2)]);
+        assert_eq!(
+            reader.remote_shards(),
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(3)]
+        );
+        reader.close_all().await.unwrap();
     }
 
     #[tokio::test]
