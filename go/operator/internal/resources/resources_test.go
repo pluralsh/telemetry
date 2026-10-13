@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	testDefaultMemory   = "2Gi"
 	testMetricsName     = "example"
 	testLogsName        = "logs"
 	testNamespace       = "test"
@@ -56,8 +57,8 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	}
 	resources := statefulSet.Spec.Template.Spec.Containers[0].Resources
 	assertResourceQuantity(t, resources.Requests, corev1.ResourceCPU, "250m")
-	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, "2Gi")
-	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, "2Gi")
+	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, testDefaultMemory)
+	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, testDefaultMemory)
 	if _, exists := resources.Limits[corev1.ResourceCPU]; exists {
 		t.Fatal("default resources unexpectedly include a CPU limit")
 	}
@@ -154,8 +155,8 @@ func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 	}
 	readerResources := reader.Spec.Template.Spec.Containers[0].Resources
 	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceCPU, "750m")
-	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceMemory, "2Gi")
-	assertResourceQuantity(t, readerResources.Limits, corev1.ResourceMemory, "2Gi")
+	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceMemory, testDefaultMemory)
+	assertResourceQuantity(t, readerResources.Limits, corev1.ResourceMemory, testDefaultMemory)
 	if _, exists := readerResources.Limits[corev1.ResourceCPU]; exists {
 		t.Fatal("reader resources unexpectedly include a CPU limit")
 	}
@@ -345,8 +346,8 @@ func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
 		t.Fatal("PseudoFS does not use gRPC health probes")
 	}
 	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "250m")
-	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "2Gi")
-	assertResourceQuantity(t, container.Resources.Limits, corev1.ResourceMemory, "2Gi")
+	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceMemory, testDefaultMemory)
+	assertResourceQuantity(t, container.Resources.Limits, corev1.ResourceMemory, testDefaultMemory)
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == volumeSecrets || mount.Name == volumeInternalToken {
 			t.Fatalf("PseudoFS contains unsupported secret mount: %#v", mount)
@@ -501,7 +502,7 @@ func TestStatefulSetMergesFirstClassScheduling(t *testing.T) {
 }
 
 func TestStatefulSetSupportsExplicitEmptyDir(t *testing.T) {
-	dataSize, cacheSize := resource.MustParse("1Gi"), resource.MustParse("2Gi")
+	dataSize, cacheSize := resource.MustParse("1Gi"), resource.MustParse(testDefaultMemory)
 	metrics := &telemetryv1alpha1.Metrics{
 		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
 		Spec: telemetryv1alpha1.MetricsSpec{Writer: telemetryv1alpha1.WorkloadSpec{
@@ -811,10 +812,10 @@ func TestContainerResourcesRequestMemoryAtItsLimit(t *testing.T) {
 		template, configured corev1.ResourceRequirements
 		request, limit       string
 	}{
-		{name: "defaults", request: "2Gi", limit: "2Gi"},
+		{name: "defaults", request: testDefaultMemory, limit: testDefaultMemory},
 		{name: "limit only", configured: corev1.ResourceRequirements{Limits: memory("6Gi")}, request: "6Gi", limit: "6Gi"},
 		{name: "template limit", template: corev1.ResourceRequirements{Limits: memory("3Gi")}, request: "3Gi", limit: "3Gi"},
-		{name: "small request", configured: corev1.ResourceRequirements{Requests: memory("1Gi")}, request: "1Gi", limit: "2Gi"},
+		{name: "small request", configured: corev1.ResourceRequirements{Requests: memory("1Gi")}, request: "1Gi", limit: testDefaultMemory},
 		{name: "large request", configured: corev1.ResourceRequirements{Requests: memory("8Gi")}, request: "8Gi", limit: "8Gi"},
 		{name: "both", configured: corev1.ResourceRequirements{Requests: memory("1Gi"), Limits: memory("4Gi")}, request: "1Gi", limit: "4Gi"},
 	} {

@@ -76,10 +76,10 @@ const (
 )
 
 var (
-	defaultDataSize      = resource.MustParse("10Gi")
-	defaultCacheSize     = resource.MustParse("20Gi")
-	defaultCPURequest    = resource.MustParse("250m")
-	defaultMemoryLimit   = resource.MustParse("2Gi")
+	defaultDataSize    = resource.MustParse("10Gi")
+	defaultCacheSize   = resource.MustParse("20Gi")
+	defaultCPURequest  = resource.MustParse("250m")
+	defaultMemoryLimit = resource.MustParse("2Gi")
 )
 
 // CacheDiskCapacity returns the Foyer disk budget for a workload's effective
