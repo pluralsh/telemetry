@@ -64,8 +64,9 @@ pub struct ReadGroupsConfig {
     /// shard id. The host should resolve to every replica of the group (a
     /// headless Service) so requests can pick and hedge between them.
     pub endpoint: String,
-    /// Starts the same request on a second replica when the first has not
-    /// answered within this long; zero disables hedging.
+    /// Starts the same unary request on a second replica when the first has
+    /// not answered within this long; zero disables hedging. Streaming reads
+    /// are never hedged.
     pub hedge_after_ms: u64,
     pub request_timeout_seconds: u64,
     /// How often a group's replica addresses are re-resolved.

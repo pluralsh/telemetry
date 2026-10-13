@@ -248,7 +248,7 @@ pub(crate) fn dedup_metadata(mut entries: Vec<MetricMetadata>) -> Vec<MetricMeta
 fn is_active_bucket(bucket: TimeBucket) -> bool {
     let now_secs = common::time::now_secs();
     let start_secs = i64::from(bucket.start) * 60;
-    let end_secs = start_secs.saturating_add(i64::from(bucket.size) * 60 * 60);
+    let end_secs = start_secs.saturating_add(i64::from(bucket.size_in_mins()) * 60);
     now_secs >= start_secs && now_secs < end_secs
 }
 

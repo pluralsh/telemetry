@@ -6,11 +6,13 @@
 use std::sync::Arc;
 
 use super::coalescing::CoalescingObjectStore;
+use super::compaction::SegmentCompaction;
 use super::config::{
     BlockCacheConfig, DiskPerformance, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
 };
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
+use super::settings::{base_settings, load_settings_over};
 use super::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::{Settings, SstBlockSize};
@@ -62,6 +64,10 @@ enum StorageBuilderInner {
     InMemory,
     SlateDb {
         db_builder: Box<DbBuilder<String>>,
+        /// The compactor from the settings' `compactor_options`, attached at
+        /// [`StorageBuilder::build`] so it can take the semantics' scheduler.
+        compactor: Option<Box<CompactorBuilder<String>>>,
+        path: String,
         /// Built alongside the writer so [`SlateDbStorage::slate_read`] can
         /// serve the count path from the same path/object store/cache.
         sst_reader: SstReader,
@@ -88,11 +94,17 @@ impl StorageBuilder {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
                 let object_store = create_object_store(&slate_config.object_store)?;
-                let settings = load_slatedb_settings(slate_config)?;
+                let mut settings = load_slatedb_settings(slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
                 );
+                let compactor = settings.compactor_options.take().map(|options| {
+                    Box::new(
+                        CompactorBuilder::new(slate_config.path.clone(), object_store.clone())
+                            .with_options(options),
+                    )
+                });
                 let cache = cache.cache();
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store.clone())
@@ -107,6 +119,8 @@ impl StorageBuilder {
                     SstReader::new(slate_config.path.clone(), object_store, cache, None);
                 StorageBuilderInner::SlateDb {
                     db_builder: Box::new(db_builder),
+                    compactor,
+                    path: slate_config.path.clone(),
                     sst_reader,
                 }
             }
@@ -134,11 +148,15 @@ impl StorageBuilder {
     pub fn map_slatedb(mut self, f: impl FnOnce(DbBuilder<String>) -> DbBuilder<String>) -> Self {
         if let StorageBuilderInner::SlateDb {
             db_builder,
+            compactor,
+            path,
             sst_reader,
         } = self.inner
         {
             self.inner = StorageBuilderInner::SlateDb {
                 db_builder: Box::new(f(*db_builder)),
+                compactor,
+                path,
                 sst_reader,
             };
         }
@@ -159,9 +177,17 @@ impl StorageBuilder {
             }
             StorageBuilderInner::SlateDb {
                 db_builder,
+                compactor,
+                path,
                 sst_reader,
             } => {
                 let mut db_builder = *db_builder;
+                if let Some(mut compactor) = compactor.map(|compactor| *compactor) {
+                    if let Some(policy) = &self.semantics.segment_compaction {
+                        compactor = compactor.with_scheduler_supplier(policy.supplier(&path));
+                    }
+                    db_builder = db_builder.with_compactor_builder(compactor);
+                }
                 db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
                 if let Some(op) = self.semantics.merge_operator {
                     let adapter = SlateDbStorage::merge_operator_adapter(op);
@@ -274,6 +300,7 @@ pub struct StorageSemantics {
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
     pub(crate) filter_policies: Option<Vec<Arc<dyn FilterPolicy>>>,
     pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+    pub(crate) segment_compaction: Option<SegmentCompaction>,
 }
 
 impl StorageSemantics {
@@ -310,6 +337,13 @@ impl StorageSemantics {
         self.segment_extractor = Some(extractor);
         self
     }
+
+    /// Sets the writer's segment compaction policy; see [`SegmentCompaction`].
+    /// Readers ignore it.
+    pub fn with_segment_compaction(mut self, policy: SegmentCompaction) -> Self {
+        self.segment_compaction = Some(policy);
+        self
+    }
 }
 
 pub fn new_slatedb_compactor_builder(
@@ -344,15 +378,7 @@ pub fn sst_block_size(disk: &DiskPerformance) -> SstBlockSize {
 }
 
 fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
-    match &slate_config.settings_path {
-        Some(path) => Ok(Settings::from_file(path).map_err(|e| {
-            StorageError::Storage(format!(
-                "Failed to load SlateDB settings from {}: {}",
-                path, e
-            ))
-        })?),
-        None => Ok(Settings::load().unwrap_or_default()),
-    }
+    load_settings_over(base_settings(), slate_config)
 }
 
 /// Creates an object store from configuration without initializing SlateDB.
@@ -1152,6 +1178,106 @@ mod tests {
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
 
         assert!(storage.is_ok());
+    }
+
+    /// SSTs from both memtable flushes and compaction use the block size
+    /// derived from the configured disk, not SlateDB's 4 KiB default.
+    #[tokio::test]
+    async fn flushed_and_compacted_ssts_use_the_disk_block_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("slatedb.toml");
+        std::fs::write(
+            &settings,
+            "l0_sst_size_bytes = 262144\n[compactor_options]\npoll_interval = \"50ms\"\n",
+        )
+        .unwrap();
+        let StorageConfig::SlateDb(mut slate) = slatedb_config_with_local_dir(tmp.path()) else {
+            unreachable!()
+        };
+        slate.settings_path = Some(settings.to_string_lossy().into_owned());
+        let expected = slate.disk.sst_block_bytes() as u64;
+        assert_eq!(expected, 64 * 1024);
+        let config = StorageConfig::SlateDb(slate.clone());
+        let storage = StorageBuilder::new(&config)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise = |len: usize| -> Bytes {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect::<Vec<u8>>()
+                .into()
+        };
+        let flushes = 6u32;
+        for flush in 0..flushes {
+            let records = (0..256u32)
+                .map(|i| {
+                    let key = format!("key-{:08}", i * flushes + flush);
+                    Record::new(Bytes::from(key), noise(2048)).into()
+                })
+                .collect();
+            storage.put(records).await.unwrap();
+            storage.flush().await.unwrap();
+        }
+
+        let compacted = tmp.path().join("data").join("compacted");
+        let ssts = || -> Vec<ulid::Ulid> {
+            std::fs::read_dir(&compacted)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| {
+                            let name = entry.ok()?.file_name().into_string().ok()?;
+                            name.strip_suffix(".sst")?.parse().ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ssts().len() <= flushes as usize {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no compaction output appeared"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        storage.close().await.unwrap();
+
+        let reader = slatedb::SstReader::new(
+            slate.path.clone(),
+            create_object_store(&slate.object_store).unwrap(),
+            None,
+            None,
+        );
+        for id in ssts() {
+            let Ok(sst) = reader.open(id).await else {
+                continue;
+            };
+            let offsets: Vec<u64> = sst
+                .index()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(offset, _)| offset)
+                .collect();
+            assert!(offsets.len() > 2, "SST {id} has {} blocks", offsets.len());
+            let mut spans: Vec<u64> = offsets.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            spans.sort_unstable();
+            let median = spans[spans.len() / 2];
+            assert!(
+                median > expected / 2 && median <= expected + 4096,
+                "SST {id} blocks span {median} bytes, expected about {expected}"
+            );
+        }
     }
 
     #[test]

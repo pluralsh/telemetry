@@ -51,7 +51,7 @@ mod tests {
     fn head(sequence: u64, pages: u32) -> TraceHead {
         TraceHead {
             first: TraceLocator {
-                segment: 0,
+                segment: crate::SegmentId::new(0, 3_600_000_000_000),
                 page_sequence: sequence,
                 trace_index: 0,
                 expires_at_unix_ms: Some(sequence),
@@ -100,7 +100,12 @@ mod tests {
 
     #[test]
     fn other_records_keep_the_newest_value() {
-        let key = continuation_key(&Namespace::default(), TraceId::new([1; 16]).unwrap(), 0, 1);
+        let key = continuation_key(
+            &Namespace::default(),
+            TraceId::new([1; 16]).unwrap(),
+            crate::SegmentId::new(0, 3_600_000_000_000),
+            1,
+        );
         let merged = TracesMergeOperator.merge_batch(
             &key,
             Some(Bytes::from_static(b"old")),

@@ -44,6 +44,16 @@ fn should_apply_metrics_slatedb_defaults_without_settings_file() {
         Some(DEFAULT_MIN_COMPACTION_SOURCES.to_string().as_str())
     );
     assert_eq!(settings.l0_max_ssts, Settings::default().l0_max_ssts);
+    let compactor = settings.compactor_options.as_ref().unwrap();
+    assert!(compactor.enable_trivial_move);
+    assert_eq!(
+        settings
+            .garbage_collector_options
+            .as_ref()
+            .and_then(|gc| gc.compacted_options.as_ref())
+            .map(|compacted| compacted.min_age),
+        Some(common::storage::settings::DEFAULT_COMPACTED_GC_MIN_AGE)
+    );
 }
 
 #[test]

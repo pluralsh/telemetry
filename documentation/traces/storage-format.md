@@ -8,19 +8,22 @@ shard's only writer, and trace heads are merge records.
 
 ```text
 Common key scope
-┌───────────┬─────────┬─────────────────┬──────────────────┬─────────────┐
-│ subsystem │ version │    namespace    │     segment      │ record type │
-│ 0x05      │ 0x06    │ TerminatedBytes │ sortable i64 BE  │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬─────────────────┬───────────────┬─────────────┐
+│ subsystem │ version │    namespace    │  segment start  │ segment width │ record type │
+│ 0x05      │ 0x07    │ TerminatedBytes │ sortable i64 BE │ u64 BE        │ u8          │
+└───────────┴─────────┴─────────────────┴─────────────────┴───────────────┴─────────────┘
 ```
 
 `TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Keys carry
 no routing information: shard selection hashes the canonical ShardedTraces
 routing key (the namespace length as `u32` BE, namespace bytes, then the
 16-byte trace ID) against the routing epoch in effect at the trace's earliest
-span start. The SlateDB segment extractor is named `traces-trace/v6`. The
-format is not backward compatible: databases of earlier versions are not read
-and there is no migration; reset and reingest them.
+span start. Segment start and width are nanoseconds; the locator segment
+has start `i64::MIN` and width `0` (unbounded). The SlateDB segment extractor
+is named `traces-trace/v7`. The format is not backward compatible: databases
+of earlier versions are not read and there is no migration; reset and
+reingest them. Closed segments are merged and expired ones dropped as
+described in [storage compaction](../common/storage-compaction.md).
 
 Each namespace/time-segment partition also contains the shared discovery
 catalog under the reserved record type `0xff` and catalog format version `1`.
@@ -29,7 +32,7 @@ span-scoped attribute names plus typed scalar values there with the same TTL
 and in the same atomic storage apply as page records and attribute postings.
 Tempo tag discovery scans these compact partition prefixes and does not fetch
 trace payloads. A compact set of live segment IDs is stored as typed catalog
-values in the existing locator segment (`i64::MIN`), so unbounded tag requests
+values in the existing locator segment, so unbounded tag requests
 discover partitions without scanning trace locators. Results
 are unioned across physical shards. Existing prerelease data must be reset and
 reingested; there is no legacy discovery fallback or backfill.
@@ -226,17 +229,17 @@ names. Other matches are decoded and evaluated whole.
 
 ```text
 locator
-┌─────────┬───────┬────────────────────┬──────────────┬───────────────┬─────────────┐
-│ version │ flags │ expiry ms          │ data segment │ page sequence │ trace index │
-│ u8 = 1  │ u8    │ var_u64 if flags&1 │ i64 BE       │ var_u64       │ var_u32     │
-└─────────┴───────┴────────────────────┴──────────────┴───────────────┴─────────────┘
+┌─────────┬───────┬────────────────────┬──────────────────────┬───────────────┬─────────────┐
+│ version │ flags │ expiry ms          │ data segment         │ page sequence │ trace index │
+│ u8 = 1  │ u8    │ var_u64 if flags&1 │ start, width: i64 BE │ var_u64       │ var_u32     │
+└─────────┴───────┴────────────────────┴──────────────────────┴───────────────┴─────────────┘
 
-TraceHead (0x04, stored in reserved segment i64::MIN)
+TraceHead (0x04, stored in the locator segment)
 KEY   common scope │ trace_id: 16 bytes
 VALUE locator of the first page │ pages: u32 BE │ flags: u8 (bit 0 = continued)
 
-TraceContinuation (0x06, stored in reserved segment i64::MIN)
-KEY   common scope │ trace_id: 16 bytes │ data segment: sortable i64 │ page sequence:u64
+TraceContinuation (0x06, stored in the locator segment)
+KEY   common scope │ trace_id: 16 bytes │ data segment start: sortable i64 │ width: u64 │ page sequence:u64
 VALUE locator
 
 AttributePosting (0x05)
@@ -246,7 +249,7 @@ VALUE ┌───────────────────────�
       └─────────────────────────────────────────────┘
 ```
 
-Heads and continuations use a reserved segment (`i64::MIN`) per namespace, so
+Heads and continuations use the reserved locator segment per namespace, so
 trace-by-ID is a lookup in one segment per storage shard followed by page
 fetches. Every page of a trace gets a continuation record. The head is a
 SlateDB merge record: each flush writes an operand for the traces it holds,

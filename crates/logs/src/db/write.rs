@@ -173,7 +173,7 @@ impl DirectWriter {
                         .insert(stream_id);
                 }
                 if let Some(rollup_ns) = self.rollup_ns {
-                    let period = segment_for(segment, rollup_ns);
+                    let period = segment_for(segment.start_ns, rollup_ns);
                     let rollup_id = self.period_ids(&namespace, period).resolve(fingerprint)?;
                     write.put(
                         rollup_dictionary_key(&namespace, period, fingerprint),
@@ -244,7 +244,7 @@ impl DirectWriter {
                 segments.insert(key);
             }
             if let Some(rollup_ns) = self.rollup_ns {
-                let key = (namespace.clone(), segment_for(*segment, rollup_ns));
+                let key = (namespace.clone(), segment_for(segment.start_ns, rollup_ns));
                 if !self.periods.contains_key(&key) {
                     periods.insert(key);
                 }

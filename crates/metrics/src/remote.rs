@@ -647,9 +647,11 @@ impl ShardedMetrics {
         let (shard, namespace, ranges) = self.served_read(request.read).await?;
         let selector = selector_from_wire(request.selector.unwrap_or_default())?;
         let time_range = TimeRange::new(request.start_ms, request.end_ms_exclusive);
+        let permit = self.admit_shard_read().await?;
         let source = self.local_source(shard, &namespace, &ranges).await?;
         let (mut sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
+            let _permit = permit;
             let mut stream = pin!(source.resolve(&selector, time_range));
             while let Some(chunk) = stream.next().await {
                 let message = chunk.map(chunk_to_wire).map_err(from_source_error);
@@ -688,9 +690,11 @@ impl ShardedMetrics {
             series,
             TimeRange::new(request.start_ms, request.end_ms_exclusive),
         );
+        let permit = self.admit_shard_read().await?;
         let source = self.local_source(shard, &namespace, &ranges).await?;
         let (mut sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
+            let _permit = permit;
             let mut stream = pin!(source.samples(samples));
             while let Some(batch) = stream.next().await {
                 let messages = match batch {

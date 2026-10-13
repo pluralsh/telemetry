@@ -67,6 +67,7 @@
       "properties": {
         "storage": {"type": "object"},
         "readerCacheCapacity": {"type": "integer", "minimum": 0},
+        "query": {"type": "object"},
         "write": {"type": "object"},
         "auth": {
           "type": "object",

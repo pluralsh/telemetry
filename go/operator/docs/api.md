@@ -664,8 +664,9 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `storage` _[StorageSpec](#storagespec)_ |  | \{ path:metrics \} |  |
 | `retention` _string_ | Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.<br />When unset, the server default of 60 days applies. |  | Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$` <br /> |
-| `readerCacheCapacity` _integer_ |  | 268435456 | Minimum: 1 <br /> |
-| `forwardIndexCacheCapacityBytes` _integer_ | ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved<br />selectors. When omitted, the operator infers 64 MiB per GiB of requested<br />memory, with a minimum of 64 MiB. |  | Minimum: 1 <br /> |
+| `readerCacheCapacity` _integer_ | ReaderCacheCapacity sizes each shard's query cache: half of it, in<br />bytes, holds decoded series chunks. When omitted, the operator uses 15%<br />of the container memory limit. |  | Minimum: 1 <br /> |
+| `forwardIndexCacheCapacityBytes` _integer_ | ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved<br />selectors. When omitted, the operator uses 5% of the container memory<br />limit. |  | Minimum: 1 <br /> |
+| `query` _[MetricsQuerySpec](#metricsqueryspec)_ | Query limits PromQL evaluation across the whole process. |  |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `request` _[MetricsRequestSpec](#metricsrequestspec)_ |  |  |  |
@@ -674,6 +675,26 @@ _Appears in:_
 | `namespaces` _string array_ |  | [default] |  |
 
 
+
+
+#### MetricsQuerySpec
+
+
+
+MetricsQuerySpec limits the queries one Metrics process evaluates at once.
+
+
+
+_Appears in:_
+- [MetricsConfigSpec](#metricsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxConcurrent` _integer_ | MaxConcurrent is how many queries evaluate at once; the rest wait.<br />Defaults to 32. |  | Minimum: 1 <br /> |
+| `queueTimeoutSeconds` _integer_ | QueueTimeoutSeconds is how long a query waits to start before failing<br />with 503. Defaults to 30. |  | Minimum: 1 <br /> |
+| `maxMemoryBytes` _integer_ | MaxMemoryBytes is the engine memory one query may reserve. Defaults to<br />half the memory budget, capped at 1 GiB, so one query cannot take all<br />of it. |  | Minimum: 1 <br /> |
+| `memoryBudgetBytes` _integer_ | MemoryBudgetBytes is the engine memory all running queries together may<br />reserve. Defaults to 30% of the container memory limit. |  | Minimum: 1 <br /> |
+| `maxConcurrentShardReads` _integer_ | MaxConcurrentShardReads is how many shard reads a reader serves to other<br />reader groups at once. Defaults to 16. |  | Minimum: 1 <br /> |
 
 
 #### MetricsRequestSpec
@@ -985,7 +1006,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `enabled` _boolean_ | Enabled defaults to true. When false, every reader opens every shard. | true |  |
-| `hedgeAfterMilliseconds` _integer_ | HedgeAfterMilliseconds starts a second copy of a shard read on another<br />replica of its group when the first has not answered in time. Zero<br />disables hedging. | 250 | Minimum: 0 <br /> |
+| `hedgeAfterMilliseconds` _integer_ | HedgeAfterMilliseconds starts a second copy of a unary shard read on<br />another replica of its group when the first has not answered in time.<br />Streaming reads are never hedged. Zero disables hedging. | 250 | Minimum: 0 <br /> |
 | `requestTimeoutSeconds` _integer_ | RequestTimeoutSeconds bounds one shard read. | 120 | Minimum: 1 <br /> |
 
 
@@ -1331,7 +1352,7 @@ _Appears in:_
 | `replicas` _integer_ | Replicas defaults to one for sharded writers and two for sharded<br />readers. Standalone mode uses exactly one writer and no reader. |  | Minimum: 0 <br /> |
 | `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is merged with podTemplate.spec.nodeSelector. Values here<br />take precedence when the same key is configured in both places. |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations are merged with podTemplate.spec.tolerations. A first-class<br />toleration replaces a podTemplate toleration with the same key, operator,<br />and effect; otherwise it is appended. |  |  |
-| `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources configures requests and limits for the datastore container.<br />Values here take precedence over podTemplate container resources. Missing<br />values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit. |  |  |
+| `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources configures requests and limits for the datastore container.<br />Values here take precedence over podTemplate container resources. Missing<br />values default to a 250m CPU request and a 2Gi memory limit, with memory<br />requested at its limit unless a request is set. The operator sizes the<br />caches and query memory budget from the memory limit. |  |  |
 | `podTemplate` _[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)_ | PodTemplate is the full Kubernetes pod template escape hatch. Operator<br />required fields and the first-class scheduling fields are merged into it. |  |  |
 | `dataVolume` _[VolumeSpec](#volumespec)_ |  |  |  |
 | `cacheVolume` _[VolumeSpec](#volumespec)_ |  |  |  |

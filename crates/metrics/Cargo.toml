@@ -31,7 +31,6 @@ common = { path = "../common" }
 config.workspace = true
 dashmap.workspace = true
 foldhash.workspace = true
-figment = { version = "0.10.19", features = ["env", "json", "toml", "yaml"] }
 futures.workspace = true
 metrics.workspace = true
 moka.workspace = true
@@ -89,6 +88,11 @@ required-features = ["bench-internals"]
 
 [[bench]]
 name = "chunk_codec"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "cold_read"
 harness = false
 required-features = ["bench-internals"]
 

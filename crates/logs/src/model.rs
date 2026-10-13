@@ -11,7 +11,8 @@ use crate::error::{Error, Result};
 
 pub type StreamId = u32;
 pub type StreamFingerprint = [u8; 16];
-pub type SegmentId = i64;
+/// A time segment: its start and width in nanoseconds.
+pub type SegmentId = common::serde::scope::Segment;
 
 /// A canonical stream label.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

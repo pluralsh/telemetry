@@ -47,21 +47,50 @@ type MetricsConfigSpec struct {
 	// When unset, the server default of 60 days applies.
 	// +kubebuilder:validation:Pattern=`^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`
 	Retention string `json:"retention,omitempty"`
+	// ReaderCacheCapacity sizes each shard's query cache: half of it, in
+	// bytes, holds decoded series chunks. When omitted, the operator uses 15%
+	// of the container memory limit.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=268435456
 	ReaderCacheCapacity *int64 `json:"readerCacheCapacity,omitempty"`
 	// ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
-	// selectors. When omitted, the operator infers 64 MiB per GiB of requested
-	// memory, with a minimum of 64 MiB.
+	// selectors. When omitted, the operator uses 5% of the container memory
+	// limit.
 	// +kubebuilder:validation:Minimum=1
-	ForwardIndexCacheCapacityBytes *int64             `json:"forwardIndexCacheCapacityBytes,omitempty"`
-	CacheWarmer                    *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
-	Write                          WriteSpec          `json:"write,omitempty"`
-	Request                        MetricsRequestSpec `json:"request,omitempty"`
-	Sharding                       ShardingSpec       `json:"sharding,omitempty"`
-	Auth                           AuthSpec           `json:"auth,omitempty"`
+	ForwardIndexCacheCapacityBytes *int64 `json:"forwardIndexCacheCapacityBytes,omitempty"`
+	// Query limits PromQL evaluation across the whole process.
+	Query       *MetricsQuerySpec  `json:"query,omitempty"`
+	CacheWarmer *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
+	Write       WriteSpec          `json:"write,omitempty"`
+	Request     MetricsRequestSpec `json:"request,omitempty"`
+	Sharding    ShardingSpec       `json:"sharding,omitempty"`
+	Auth        AuthSpec           `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
+}
+
+// MetricsQuerySpec limits the queries one Metrics process evaluates at once.
+type MetricsQuerySpec struct {
+	// MaxConcurrent is how many queries evaluate at once; the rest wait.
+	// Defaults to 32.
+	// +kubebuilder:validation:Minimum=1
+	MaxConcurrent *int32 `json:"maxConcurrent,omitempty"`
+	// QueueTimeoutSeconds is how long a query waits to start before failing
+	// with 503. Defaults to 30.
+	// +kubebuilder:validation:Minimum=1
+	QueueTimeoutSeconds *int64 `json:"queueTimeoutSeconds,omitempty"`
+	// MaxMemoryBytes is the engine memory one query may reserve. Defaults to
+	// half the memory budget, capped at 1 GiB, so one query cannot take all
+	// of it.
+	// +kubebuilder:validation:Minimum=1
+	MaxMemoryBytes *int64 `json:"maxMemoryBytes,omitempty"`
+	// MemoryBudgetBytes is the engine memory all running queries together may
+	// reserve. Defaults to 30% of the container memory limit.
+	// +kubebuilder:validation:Minimum=1
+	MemoryBudgetBytes *int64 `json:"memoryBudgetBytes,omitempty"`
+	// MaxConcurrentShardReads is how many shard reads a reader serves to other
+	// reader groups at once. Defaults to 16.
+	// +kubebuilder:validation:Minimum=1
+	MaxConcurrentShardReads *int32 `json:"maxConcurrentShardReads,omitempty"`
 }
 
 // MetricsSpec defines the desired state of Metrics.

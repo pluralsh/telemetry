@@ -295,6 +295,7 @@ impl Compactor {
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000_000);
         segment
+            .start_ns
             .saturating_add(self.segment_ns)
             .saturating_add(finalize_after_ns)
             <= now_ns

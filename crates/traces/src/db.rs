@@ -15,6 +15,7 @@ use common::coordinator::{
     WriteError,
 };
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
+use common::storage::compaction::SegmentCompaction;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
     BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
@@ -188,7 +189,9 @@ impl TraceDb {
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(storage_semantics())
+            .with_semantics(storage_semantics().with_segment_compaction(
+                SegmentCompaction::new(crate::codec::segment_span).with_retention(config.retention),
+            ))
             .build()
             .await?;
         let storage_read = storage.clone();

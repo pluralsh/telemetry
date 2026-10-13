@@ -66,6 +66,11 @@ pub struct TimeSeriesDb {
 }
 
 impl TimeSeriesDb {
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     /// Opens or creates a time series database with the given configuration.
     ///
     /// This is the primary entry point for creating a `TimeSeriesDb` instance.
@@ -106,6 +111,7 @@ impl TimeSeriesDb {
                 &config.storage,
                 common::create_object_store(&config.storage.object_store)?,
                 cache,
+                config.retention,
             )
             .await?,
         );

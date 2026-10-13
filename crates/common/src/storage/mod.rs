@@ -1,4 +1,5 @@
 pub mod coalescing;
+pub mod compaction;
 pub mod config;
 #[cfg(feature = "test-utils")]
 pub mod counting;
@@ -6,6 +7,7 @@ pub mod factory;
 pub mod in_memory;
 pub mod loader;
 pub mod metrics_recorder;
+pub mod settings;
 pub mod slate;
 pub mod sst_blocks;
 pub mod util;

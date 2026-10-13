@@ -17,6 +17,12 @@ use opentelemetry_proto::tonic::{
 use super::*;
 use crate::PageConfig;
 
+/// The test segment with index `index` (10 s wide, as in the test config).
+fn seg(index: i64) -> SegmentId {
+    const WIDTH_NS: i64 = 10_000_000_000;
+    SegmentId::new(index * WIDTH_NS, WIDTH_NS)
+}
+
 fn test_config() -> Config {
     Config {
         storage: StorageConfig::SlateDb(SlateDbStorageConfig {
@@ -141,7 +147,7 @@ async fn traces_in_a_segment_share_one_page_sequence() {
     let mut records = db
         .storage
         .scan_prefix_iter(
-            metadata_prefix(&namespace, 0),
+            metadata_prefix(&namespace, seg(0)),
             BytesRange::unbounded(),
             None,
         )
@@ -219,7 +225,7 @@ async fn applied_writes_coalesce_into_pages_across_requests_in_timestamp_order()
     let mut records = db
         .storage
         .scan_prefix_iter(
-            metadata_prefix(&namespace, 0),
+            metadata_prefix(&namespace, seg(0)),
             BytesRange::unbounded(),
             None,
         )
@@ -757,7 +763,8 @@ async fn reader_catalog_sees_late_writes_to_closed_segments() {
         .write_with_durability(&namespace, vec![TraceBatch::new(late)], Durability::Durable)
         .await
         .unwrap();
-    let sequence = next_sequence_key(&namespace, 1);
+    let minute = i64::try_from(60 * SECOND).unwrap();
+    let sequence = next_sequence_key(&namespace, SegmentId::new(minute, minute));
     tokio::time::timeout(Duration::from_secs(10), async {
         while reader
             .storage
@@ -922,7 +929,7 @@ async fn should_not_pin_retention_barrier_with_idle_coordinator() {
         let ops = (100..116)
             .map(|segment| {
                 RecordOp::put_with_ttl(
-                    next_sequence_key(&namespace, segment),
+                    next_sequence_key(&namespace, seg(segment)),
                     encode_sequence(sequence),
                     Ttl::NoExpiry,
                 )
@@ -1326,7 +1333,7 @@ fn count_reads(db: &mut TraceDb, namespace: &Namespace) -> Arc<CountingStorage> 
     let counting = Arc::new(CountingStorage {
         inner: Arc::clone(&db.storage),
         locator_scope: segment_prefix(namespace, LOCATOR_SEGMENT),
-        metadata_scope: metadata_prefix(namespace, 0),
+        metadata_scope: metadata_prefix(namespace, seg(0)),
         locator_gets: Default::default(),
         locator_scans: Default::default(),
         metadata_gets: Default::default(),
@@ -2057,10 +2064,10 @@ mod value_ranges {
 
     fn in_ranges(predicate: &IndexPredicate, value: &AttributeValue) -> Option<bool> {
         let namespace = Namespace::default();
-        let prefix = field_scan_prefix(&namespace, 0, predicate.field, &predicate.name);
+        let prefix = field_scan_prefix(&namespace, seg(0), predicate.field, &predicate.name);
         let key = field_posting_key(
             &namespace,
-            0,
+            seg(0),
             (predicate.field, &predicate.name, value),
             u64::MAX,
         );

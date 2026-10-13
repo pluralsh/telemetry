@@ -60,6 +60,9 @@ pub struct Config {
 
     /// Cross-query caches on the read path.
     pub query_cache: QueryCacheConfig,
+
+    /// Concurrency and memory limits shared by every query the process runs.
+    pub query_limits: crate::QueryLimitsConfig,
 }
 
 /// Default [`Config::retention`]: 60 days.
@@ -115,6 +118,7 @@ impl Default for Config {
             retention: Some(DEFAULT_RETENTION),
             write_buffer: WriteCoordinatorConfig::default(),
             query_cache: QueryCacheConfig::default(),
+            query_limits: crate::QueryLimitsConfig::default(),
         }
     }
 }

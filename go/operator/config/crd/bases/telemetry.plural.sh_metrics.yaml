@@ -258,8 +258,8 @@ spec:
                   forwardIndexCacheCapacityBytes:
                     description: |-
                       ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
-                      selectors. When omitted, the operator infers 64 MiB per GiB of requested
-                      memory, with a minimum of 64 MiB.
+                      selectors. When omitted, the operator uses 5% of the container memory
+                      limit.
                     format: int64
                     minimum: 1
                     type: integer
@@ -269,8 +269,51 @@ spec:
                     items:
                       type: string
                     type: array
+                  query:
+                    description: Query limits PromQL evaluation across the whole process.
+                    properties:
+                      maxConcurrent:
+                        description: |-
+                          MaxConcurrent is how many queries evaluate at once; the rest wait.
+                          Defaults to 32.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxConcurrentShardReads:
+                        description: |-
+                          MaxConcurrentShardReads is how many shard reads a reader serves to other
+                          reader groups at once. Defaults to 16.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxMemoryBytes:
+                        description: |-
+                          MaxMemoryBytes is the engine memory one query may reserve. Defaults to
+                          half the memory budget, capped at 1 GiB, so one query cannot take all
+                          of it.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      memoryBudgetBytes:
+                        description: |-
+                          MemoryBudgetBytes is the engine memory all running queries together may
+                          reserve. Defaults to 30% of the container memory limit.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      queueTimeoutSeconds:
+                        description: |-
+                          QueueTimeoutSeconds is how long a query waits to start before failing
+                          with 503. Defaults to 30.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    type: object
                   readerCacheCapacity:
-                    default: 268435456
+                    description: |-
+                      ReaderCacheCapacity sizes each shard's query cache: half of it, in
+                      bytes, holds decoded series chunks. When omitted, the operator uses 15%
+                      of the container memory limit.
                     format: int64
                     minimum: 1
                     type: integer
@@ -9676,9 +9719,9 @@ spec:
                       hedgeAfterMilliseconds:
                         default: 250
                         description: |-
-                          HedgeAfterMilliseconds starts a second copy of a shard read on another
-                          replica of its group when the first has not answered in time. Zero
-                          disables hedging.
+                          HedgeAfterMilliseconds starts a second copy of a unary shard read on
+                          another replica of its group when the first has not answered in time.
+                          Streaming reads are never hedged. Zero disables hedging.
                         format: int64
                         minimum: 0
                         type: integer
@@ -9700,7 +9743,9 @@ spec:
                     description: |-
                       Resources configures requests and limits for the datastore container.
                       Values here take precedence over podTemplate container resources. Missing
-                      values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit.
+                      values default to a 250m CPU request and a 2Gi memory limit, with memory
+                      requested at its limit unless a request is set. The operator sizes the
+                      caches and query memory budget from the memory limit.
                     properties:
                       claims:
                         description: |-
@@ -18639,9 +18684,9 @@ spec:
                       hedgeAfterMilliseconds:
                         default: 250
                         description: |-
-                          HedgeAfterMilliseconds starts a second copy of a shard read on another
-                          replica of its group when the first has not answered in time. Zero
-                          disables hedging.
+                          HedgeAfterMilliseconds starts a second copy of a unary shard read on
+                          another replica of its group when the first has not answered in time.
+                          Streaming reads are never hedged. Zero disables hedging.
                         format: int64
                         minimum: 0
                         type: integer
@@ -18663,7 +18708,9 @@ spec:
                     description: |-
                       Resources configures requests and limits for the datastore container.
                       Values here take precedence over podTemplate container resources. Missing
-                      values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit.
+                      values default to a 250m CPU request and a 2Gi memory limit, with memory
+                      requested at its limit unless a request is set. The operator sizes the
+                      caches and query memory budget from the memory limit.
                     properties:
                       claims:
                         description: |-

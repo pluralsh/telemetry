@@ -632,6 +632,7 @@ async fn db_reader_result_cache_sees_late_writes_after_a_manifest_poll() {
         shards,
         SharedDbCache::default(),
         &QueryCacheConfig::default(),
+        &crate::QueryLimitsConfig::default(),
     )
     .await
     .unwrap();

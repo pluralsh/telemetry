@@ -56,7 +56,7 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	}
 	resources := statefulSet.Spec.Template.Spec.Containers[0].Resources
 	assertResourceQuantity(t, resources.Requests, corev1.ResourceCPU, "250m")
-	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, "2Gi")
 	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, "2Gi")
 	if _, exists := resources.Limits[corev1.ResourceCPU]; exists {
 		t.Fatal("default resources unexpectedly include a CPU limit")
@@ -154,7 +154,7 @@ func TestStatefulSetMergesConfiguredContainerResources(t *testing.T) {
 	}
 	readerResources := reader.Spec.Template.Spec.Containers[0].Resources
 	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceCPU, "750m")
-	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, readerResources.Requests, corev1.ResourceMemory, "2Gi")
 	assertResourceQuantity(t, readerResources.Limits, corev1.ResourceMemory, "2Gi")
 	if _, exists := readerResources.Limits[corev1.ResourceCPU]; exists {
 		t.Fatal("reader resources unexpectedly include a CPU limit")
@@ -345,7 +345,7 @@ func TestPseudoFSResourcesAreGRPCOnlyAndPersistent(t *testing.T) {
 		t.Fatal("PseudoFS does not use gRPC health probes")
 	}
 	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "250m")
-	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "512Mi")
+	assertResourceQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "2Gi")
 	assertResourceQuantity(t, container.Resources.Limits, corev1.ResourceMemory, "2Gi")
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == volumeSecrets || mount.Name == volumeInternalToken {
@@ -799,5 +799,40 @@ func TestReaderAutoscalerTargets(t *testing.T) {
 	}
 	if replicas := lo.FromPtr(Replicas(memory, ComponentReader)); replicas != 3 {
 		t.Fatalf("autoscaled reader replicas = %d, want the 3 minimum", replicas)
+	}
+}
+
+func TestContainerResourcesRequestMemoryAtItsLimit(t *testing.T) {
+	memory := func(quantity string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)}
+	}
+	for _, test := range []struct {
+		name                 string
+		template, configured corev1.ResourceRequirements
+		request, limit       string
+	}{
+		{name: "defaults", request: "2Gi", limit: "2Gi"},
+		{name: "limit only", configured: corev1.ResourceRequirements{Limits: memory("6Gi")}, request: "6Gi", limit: "6Gi"},
+		{name: "template limit", template: corev1.ResourceRequirements{Limits: memory("3Gi")}, request: "3Gi", limit: "3Gi"},
+		{name: "small request", configured: corev1.ResourceRequirements{Requests: memory("1Gi")}, request: "1Gi", limit: "2Gi"},
+		{name: "large request", configured: corev1.ResourceRequirements{Requests: memory("8Gi")}, request: "8Gi", limit: "8Gi"},
+		{name: "both", configured: corev1.ResourceRequirements{Requests: memory("1Gi"), Limits: memory("4Gi")}, request: "1Gi", limit: "4Gi"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resources := containerResources(test.template, test.configured)
+			assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, test.request)
+			assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, test.limit)
+		})
+	}
+}
+
+func TestMemoryLimitFollowsTheRenderedContainer(t *testing.T) {
+	metrics := &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace}}
+	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor.Name); limit != 2<<30 {
+		t.Fatalf("default limit = %d", limit)
+	}
+	metrics.Spec.Reader.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}
+	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor.Name); limit != 4<<30 {
+		t.Fatalf("configured limit = %d", limit)
 	}
 }

@@ -4,15 +4,20 @@
 //! with the same scope:
 //!
 //! ```text
-//! ┌───────────┬─────────┬──────────────────┬──────────────────────┬─────────────┬─────┐
-//! │ subsystem │ version │ namespace bytes  │ 0x00 terminator      │ segment i64 │ ... │
-//! │  1 byte   │ 1 byte  │ (no NUL bytes)   │                      │ sortable BE │     │
-//! └───────────┴─────────┴──────────────────┴──────────────────────┴─────────────┴─────┘
+//! ┌───────────┬─────────┬─────────────────┬────────────┬──────────────┬──────────────┬─────┐
+//! │ subsystem │ version │ namespace bytes │ 0x00       │ start ns i64 │ width ns u64 │ ... │
+//! │  1 byte   │ 1 byte  │ (no NUL bytes)  │ terminator │ sortable BE  │ BE           │     │
+//! └───────────┴─────────┴─────────────────┴────────────┴──────────────┴──────────────┴─────┘
 //! ```
+//!
+//! The width makes each scope self-describing, so segments of different
+//! widths (such as hours rolled up into a day) can coexist. A zero width marks
+//! a segment that isn't bounded in time.
 //!
 //! [`ScopedSegmentExtractor`] routes every record sharing a scope into one
 //! SlateDB segment.
 
+use std::fmt;
 use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
@@ -23,10 +28,71 @@ use super::sortable::{decode_i64_sortable, encode_i64_sortable};
 use super::terminated_bytes;
 use crate::namespace::Namespace;
 
-const SEGMENT_LEN: usize = 8;
+const SEGMENT_LEN: usize = 16;
 /// Smallest valid scope: the 2-byte key prefix, a one-byte namespace, its
 /// terminator, and the segment.
 const MIN_SCOPE_LEN: usize = 2 + 1 + 1 + SEGMENT_LEN;
+
+/// A time segment: `[start_ns, start_ns + width_ns)`, or unbounded when
+/// `width_ns` is zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Segment {
+    pub start_ns: i64,
+    pub width_ns: i64,
+}
+
+impl Segment {
+    pub const fn new(start_ns: i64, width_ns: i64) -> Self {
+        Self { start_ns, width_ns }
+    }
+
+    /// An unbounded segment, for records that aren't partitioned by time.
+    pub const fn unbounded(start_ns: i64) -> Self {
+        Self::new(start_ns, 0)
+    }
+
+    /// The `width_ns` segment containing `timestamp_ns`.
+    pub fn containing(timestamp_ns: i64, width_ns: i64) -> Self {
+        Self::new(timestamp_ns.div_euclid(width_ns) * width_ns, width_ns)
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        self.width_ns > 0
+    }
+
+    /// Exclusive end, or `None` for an unbounded segment.
+    pub fn end_ns(&self) -> Option<i64> {
+        self.is_bounded()
+            .then(|| self.start_ns.saturating_add(self.width_ns))
+    }
+
+    /// The segment of the same width that follows this one.
+    pub fn next(&self) -> Self {
+        Self::new(self.start_ns.saturating_add(self.width_ns), self.width_ns)
+    }
+}
+
+impl fmt::Display for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}+{}", self.start_ns, self.width_ns)
+    }
+}
+
+/// Parses the [`Display`](fmt::Display) form, `start_ns+width_ns`.
+impl std::str::FromStr for Segment {
+    type Err = DeserializeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let malformed = || error(format!("malformed segment {value:?}"));
+        let (start, width) = value.split_once('+').ok_or_else(malformed)?;
+        let start_ns = start.parse().map_err(|_| malformed())?;
+        let width_ns: i64 = width.parse().map_err(|_| malformed())?;
+        if width_ns < 0 {
+            return Err(malformed());
+        }
+        Ok(Self::new(start_ns, width_ns))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyScope {
@@ -39,16 +105,17 @@ impl KeyScope {
         Self { subsystem, version }
     }
 
-    pub fn write(&self, bytes: &mut BytesMut, namespace: &Namespace, segment: i64) {
+    pub fn write(&self, bytes: &mut BytesMut, namespace: &Namespace, segment: Segment) {
         bytes.put_u8(self.subsystem);
         bytes.put_u8(self.version);
         terminated_bytes::serialize(namespace.as_bytes(), bytes);
-        bytes.put_u64(encode_i64_sortable(segment));
+        bytes.put_u64(encode_i64_sortable(segment.start_ns));
+        bytes.put_u64(segment.width_ns.max(0) as u64);
     }
 
     /// Parses the scope, returning the namespace, segment, and the scope's
     /// length in bytes.
-    pub fn parse(&self, bytes: &[u8]) -> Result<(Namespace, i64, usize), DeserializeError> {
+    pub fn parse(&self, bytes: &[u8]) -> Result<(Namespace, Segment, usize), DeserializeError> {
         if !self.has_prefix(bytes) {
             return Err(error("invalid key prefix".to_owned()));
         }
@@ -61,10 +128,14 @@ impl KeyScope {
             .map_err(|error| self::error(format!("namespace is not UTF-8: {error}")))?;
         let namespace =
             Namespace::new(namespace).map_err(|error| self::error(error.to_string()))?;
-        let segment = decode_i64_sortable(u64::from_be_bytes(
-            suffix[..SEGMENT_LEN].try_into().unwrap(),
-        ));
-        Ok((namespace, segment, bytes.len() - suffix.len() + SEGMENT_LEN))
+        let start_ns = decode_i64_sortable(u64::from_be_bytes(suffix[..8].try_into().unwrap()));
+        let width_ns = i64::try_from(u64::from_be_bytes(suffix[8..16].try_into().unwrap()))
+            .map_err(|_| error("segment width overflows i64".to_owned()))?;
+        Ok((
+            namespace,
+            Segment::new(start_ns, width_ns),
+            bytes.len() - suffix.len() + SEGMENT_LEN,
+        ))
     }
 
     /// Length of the scope at the start of `bytes`, without validating the
@@ -138,9 +209,13 @@ mod tests {
 
     const SCOPE: KeyScope = KeyScope::new(0x7f, 3);
 
-    fn scope_bytes(namespace: &str, segment: i64) -> Bytes {
+    fn scope_bytes(namespace: &str, start_ns: i64) -> Bytes {
         let mut bytes = BytesMut::new();
-        SCOPE.write(&mut bytes, &Namespace::new(namespace).unwrap(), segment);
+        SCOPE.write(
+            &mut bytes,
+            &Namespace::new(namespace).unwrap(),
+            Segment::new(start_ns, 3_600),
+        );
         bytes.freeze()
     }
 
@@ -151,7 +226,7 @@ mod tests {
         bytes.put_u8(9);
         let (namespace, segment, length) = SCOPE.parse(&bytes).unwrap();
         assert_eq!(namespace.as_str(), "tenant");
-        assert_eq!(segment, -1_000);
+        assert_eq!(segment, Segment::new(-1_000, 3_600));
         assert_eq!(length, scope_len);
         assert_eq!(SCOPE.prefix_len(&bytes), Some(scope_len));
     }
@@ -169,6 +244,26 @@ mod tests {
     fn segments_sort_numerically() {
         assert!(scope_bytes("a", -1) < scope_bytes("a", 0));
         assert!(scope_bytes("a", i64::MAX) < scope_bytes("b", i64::MIN));
+    }
+
+    #[test]
+    fn widths_distinguish_segments_with_one_start() {
+        let mut hour = BytesMut::new();
+        let mut day = BytesMut::new();
+        let namespace = Namespace::new("a").unwrap();
+        SCOPE.write(&mut hour, &namespace, Segment::new(0, 3_600));
+        SCOPE.write(&mut day, &namespace, Segment::new(0, 86_400));
+        assert_ne!(hour, day);
+        assert!(hour < day);
+    }
+
+    #[test]
+    fn segment_arithmetic() {
+        let segment = Segment::containing(-1, 10);
+        assert_eq!(segment, Segment::new(-10, 10));
+        assert_eq!(segment.end_ns(), Some(0));
+        assert_eq!(segment.next(), Segment::new(0, 10));
+        assert_eq!(Segment::unbounded(i64::MIN).end_ns(), None);
     }
 
     #[test]

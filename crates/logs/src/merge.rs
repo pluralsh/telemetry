@@ -71,6 +71,8 @@ fn decoded<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SEGMENT: crate::model::SegmentId = crate::model::SegmentId::new(0, 3_600_000_000_000);
     use crate::Namespace;
     use crate::codec::{field_stats_key, forward_key, posting_key, term_stats_key};
     use crate::model::Label;
@@ -81,7 +83,7 @@ mod tests {
 
     #[test]
     fn unions_stream_postings_in_any_grouping() {
-        let key = posting_key(&Namespace::default(), 0, &Label::new("app", "api"));
+        let key = posting_key(&Namespace::default(), SEGMENT, &Label::new("app", "api"));
         let operator = LogsMergeOperator;
         let all = operator.merge_batch(&key, Some(bitmap(&[1])), &[bitmap(&[2]), bitmap(&[1, 3])]);
         let partial = operator.merge_batch(&key, None, &[bitmap(&[2]), bitmap(&[1, 3])]);
@@ -102,7 +104,7 @@ mod tests {
             })
         };
         let merged = operator.merge_batch(
-            &field_stats_key(&namespace, 0),
+            &field_stats_key(&namespace, SEGMENT),
             Some(field(2, 10)),
             &[field(3, 7)],
         );
@@ -115,7 +117,7 @@ mod tests {
         );
         let term = |documents, blocks| encode_term_stats(TermStats { documents, blocks });
         let merged = operator.merge_batch(
-            &term_stats_key(&namespace, 0, "error"),
+            &term_stats_key(&namespace, SEGMENT, "error"),
             None,
             &[term(4, 1), term(130, 2)],
         );
@@ -130,7 +132,7 @@ mod tests {
 
     #[test]
     fn corrupt_operands_are_dropped() {
-        let key = posting_key(&Namespace::default(), 0, &Label::new("app", "api"));
+        let key = posting_key(&Namespace::default(), SEGMENT, &Label::new("app", "api"));
         let merged =
             LogsMergeOperator.merge_batch(&key, Some(Bytes::from_static(b"junk")), &[bitmap(&[4])]);
         assert_eq!(
@@ -141,7 +143,7 @@ mod tests {
 
     #[test]
     fn other_records_keep_the_newest_value() {
-        let key = forward_key(&Namespace::default(), 0, 1);
+        let key = forward_key(&Namespace::default(), SEGMENT, 1);
         let merged = LogsMergeOperator.merge_batch(
             &key,
             Some(Bytes::from_static(b"old")),

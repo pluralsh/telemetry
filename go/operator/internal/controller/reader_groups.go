@@ -69,7 +69,10 @@ func reconcileReaders(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	keep := map[string]bool{resources.ComponentName(product, resources.ComponentReader): true}
+	keep := readerObjects{
+		services:  map[string]bool{resources.ComponentName(product, resources.ComponentReader): true},
+		workloads: map[string]bool{},
+	}
 	for _, target := range targets {
 		headless := resources.Service(product, resources.ComponentReader, true)
 		if target.Shard != nil {
@@ -78,7 +81,7 @@ func reconcileReaders(
 		if err := reconcileHeadlessService(ctx, c, scheme, product, headless); err != nil {
 			return ctrl.Result{}, err
 		}
-		keep[target.Name], keep[headless.Name] = true, true
+		keep.workloads[target.Name], keep.services[headless.Name] = true, true
 
 		result, err := statefulSet(target.Shard)
 		if err != nil || !result.IsZero() {
@@ -156,10 +159,28 @@ func deleteControlled(ctx context.Context, c client.Client, product, object clie
 	return client.IgnoreNotFound(c.Delete(ctx, object))
 }
 
+// readerObjects are reader object names by kind. The shared reader Service is
+// named like the StatefulSet of the single-reader topology, so a name kept
+// for one kind must not keep the other.
+type readerObjects struct {
+	// services are Service names.
+	services map[string]bool
+	// workloads are StatefulSet, PodDisruptionBudget, and
+	// HorizontalPodAutoscaler names.
+	workloads map[string]bool
+}
+
+func (o readerObjects) keeps(object client.Object) bool {
+	if _, service := object.(*corev1.Service); service {
+		return o.services[object.GetName()]
+	}
+	return o.workloads[object.GetName()]
+}
+
 // pruneReaders deletes the reader objects this product controls that are
 // not in `keep`. Unless `workloads` is set, StatefulSets and the Services
 // that resolve their pods are left serving.
-func pruneReaders(ctx context.Context, c client.Client, product client.Object, keep map[string]bool, workloads bool) error {
+func pruneReaders(ctx context.Context, c client.Client, product client.Object, keep readerObjects, workloads bool) error {
 	selector := client.MatchingLabels(resources.SelectorLabels(product, resources.ComponentReader))
 	namespace := client.InNamespace(product.GetNamespace())
 	lists := []client.ObjectList{&policyv1.PodDisruptionBudgetList{}, &autoscalingv2.HorizontalPodAutoscalerList{}}
@@ -175,7 +196,7 @@ func pruneReaders(ctx context.Context, c client.Client, product client.Object, k
 			return err
 		}
 		for _, object := range items {
-			if keep[object.GetName()] || !metav1.IsControlledBy(object, product) {
+			if keep.keeps(object) || !metav1.IsControlledBy(object, product) {
 				continue
 			}
 			if err := c.Delete(ctx, object); err != nil && !apierrors.IsNotFound(err) {

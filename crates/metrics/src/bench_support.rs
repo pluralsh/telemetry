@@ -69,6 +69,51 @@ pub async fn query_range_traced(
     (series, trace)
 }
 
+/// A reader over `object_store` as the metrics server opens one: the block
+/// and meta caches `storage` configures, and `cache_capacity` bucket readers.
+pub async fn open_reader_over(
+    storage: &common::storage::config::SlateDbStorageConfig,
+    object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    cache_capacity: u64,
+) -> crate::TimeSeriesDbReader {
+    let cache = common::SharedDbCache::from_slatedb_config(storage)
+        .await
+        .expect("block cache");
+    let reader = crate::storage::StorageReader::try_new_with_cache(
+        storage,
+        slatedb::config::DbReaderOptions::default(),
+        None,
+        object_store,
+        &cache,
+    )
+    .await
+    .expect("open reader");
+    crate::TimeSeriesDbReader::from_storage_with_capacity(reader, cache_capacity)
+}
+
+/// [`query_range_traced`] on a reader.
+pub async fn reader_query_range_traced(
+    reader: &crate::TimeSeriesDbReader,
+    namespace: &crate::Namespace,
+    query: &str,
+    range: std::ops::RangeInclusive<std::time::SystemTime>,
+    step: std::time::Duration,
+) -> (Vec<crate::model::RangeSample>, serde_json::Value) {
+    use crate::tsdb::TsdbReadEngine;
+    let outcome = crate::reader::ScopedReader { namespace, reader }
+        .eval_query_range_traced(
+            query,
+            range,
+            step,
+            &crate::model::QueryOptions::default(),
+            Some(crate::promql::trace::TraceCollector::new()),
+        )
+        .await
+        .expect("query");
+    let trace = serde_json::to_value(outcome.trace.expect("trace")).expect("trace json");
+    (outcome.value.into_matrix(), trace)
+}
+
 /// The read path a traced query runs on.
 #[derive(Clone, Copy)]
 pub enum Engine<'a> {
@@ -419,4 +464,9 @@ pub fn aggregate_reference(
     let map = GroupMap::new(groups.to_vec(), group_count);
     let step_count = tile.0.step_count();
     reference::aggregate(kind.into(), step_count, &map, std::slice::from_ref(&tile.0)).0
+}
+
+/// Live SlateDB layout under `db`: `(segments, l0_ssts, sorted_runs, run_ssts)`.
+pub fn storage_layout(db: &crate::TimeSeriesDb) -> (usize, usize, usize, usize) {
+    db.storage().layout()
 }

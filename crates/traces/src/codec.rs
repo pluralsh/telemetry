@@ -14,11 +14,11 @@ use crate::{
     AttributeMatcher, AttributeScope, AttributeValue, Error, Namespace, Result, SegmentId, TraceId,
 };
 
-pub(crate) const KEY_VERSION: u8 = 6;
+pub(crate) const KEY_VERSION: u8 = 7;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v6";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v7";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
 /// Leading byte of page metadata and locator values.
@@ -29,7 +29,7 @@ const HAS_EXPIRY: u8 = 1;
 /// namespace. This makes trace-by-ID a single-shard lookup after data pages are
 /// time-sharded. Each trace has one [`TraceHead`] point record, and one
 /// continuation record per page.
-pub(crate) const LOCATOR_SEGMENT: SegmentId = i64::MIN;
+pub(crate) const LOCATOR_SEGMENT: SegmentId = SegmentId::unbounded(i64::MIN);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -140,8 +140,22 @@ impl TraceLocator {
     }
 }
 
+/// The `[start_ms, end_ms)` span of the SlateDB segment with this prefix;
+/// `None` for unbounded segments and foreign prefixes.
+pub(crate) fn segment_span(prefix: &[u8]) -> Option<(i64, i64)> {
+    let (_, segment, _) = KEY_SCOPE.parse(prefix).ok()?;
+    let end_ns = segment.end_ns()?;
+    Some((
+        segment.start_ns.div_euclid(1_000_000),
+        end_ns.div_euclid(1_000_000) + i64::from(end_ns.rem_euclid(1_000_000) != 0),
+    ))
+}
+
 pub(crate) fn segment_for(timestamp_ns: u64, segment_ns: u64) -> SegmentId {
-    i64::try_from(timestamp_ns / segment_ns).unwrap_or(i64::MAX)
+    SegmentId::containing(
+        i64::try_from(timestamp_ns).unwrap_or(i64::MAX),
+        i64::try_from(segment_ns).unwrap_or(i64::MAX),
+    )
 }
 
 pub(crate) fn segment_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
@@ -204,7 +218,8 @@ pub(crate) fn continuation_key(
 ) -> Bytes {
     let mut bytes = record_prefix(namespace, LOCATOR_SEGMENT, RecordType::TraceContinuation);
     bytes.extend_from_slice(trace_id.as_bytes());
-    bytes.put_u64(encode_i64_sortable(segment));
+    bytes.put_u64(encode_i64_sortable(segment.start_ns));
+    bytes.put_u64(segment.width_ns.max(0) as u64);
     bytes.put_u64(sequence);
     bytes.freeze()
 }
@@ -342,8 +357,9 @@ pub(crate) fn decode_metadata(value: &[u8]) -> Result<StoredPageMetadata> {
 }
 
 pub(crate) fn encode_locator(value: &TraceLocator) -> Result<Bytes> {
-    let mut bytes = value_header(value.expires_at_unix_ms, 20);
-    bytes.put_i64(value.segment);
+    let mut bytes = value_header(value.expires_at_unix_ms, 28);
+    bytes.put_i64(value.segment.start_ns);
+    bytes.put_i64(value.segment.width_ns);
     var_u64::serialize(value.page_sequence, &mut bytes);
     var_u32::serialize(value.trace_index, &mut bytes);
     Ok(bytes.freeze())
@@ -352,11 +368,15 @@ pub(crate) fn encode_locator(value: &TraceLocator) -> Result<Bytes> {
 pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
     let (expires_at_unix_ms, mut buf) = value_body(value, "trace locator")?;
     let (segment, rest) = buf
-        .split_first_chunk::<8>()
+        .split_first_chunk::<16>()
         .ok_or_else(|| Error::Corrupt("truncated trace locator".to_owned()))?;
     buf = rest;
+    let (start, width) = segment.split_at(8);
     let locator = TraceLocator {
-        segment: i64::from_be_bytes(*segment),
+        segment: SegmentId::new(
+            i64::from_be_bytes(start.try_into().unwrap()),
+            i64::from_be_bytes(width.try_into().unwrap()),
+        ),
         page_sequence: var_u64::deserialize(&mut buf)?,
         trace_index: var_u32::deserialize(&mut buf)?,
         expires_at_unix_ms,
@@ -648,20 +668,26 @@ mod tests {
 
     use super::*;
 
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    fn hour(index: i64) -> SegmentId {
+        SegmentId::new(index * HOUR_NS, HOUR_NS)
+    }
+
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v6");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "traces-trace/v7");
     }
 
     #[test]
     fn keys_route_by_namespace_and_time_segment() {
         let namespace = Namespace::new("tenant").unwrap();
-        let key = metadata_key(&namespace, -2, 7);
-        assert!(key.starts_with(&segment_prefix(&namespace, -2)));
+        let key = metadata_key(&namespace, hour(-2), 7);
+        assert!(key.starts_with(&segment_prefix(&namespace, hour(-2))));
         assert_eq!(decode_metadata_sequence(&key).unwrap(), 7);
         assert_eq!(
             KEY_SCOPE.prefix_len(&key),
-            Some(segment_prefix(&namespace, -2).len())
+            Some(segment_prefix(&namespace, hour(-2)).len())
         );
     }
 
@@ -674,8 +700,8 @@ mod tests {
         assert!(head.starts_with(&head_namespace_prefix(&namespace)));
         assert_eq!(decode_head_trace_id(&head).unwrap(), id);
 
-        let first = continuation_key(&namespace, id, 2, 3);
-        let second = continuation_key(&namespace, id, 4, 5);
+        let first = continuation_key(&namespace, id, hour(2), 3);
+        let second = continuation_key(&namespace, id, hour(4), 5);
         assert_ne!(first, second);
         for key in [&first, &second] {
             assert!(key.starts_with(&continuation_prefix(&namespace, id)));
@@ -689,8 +715,8 @@ mod tests {
         let namespace = Namespace::new("tenant").unwrap();
         let id = TraceId::new([1; 16]).unwrap();
         assert!(is_head_key(&head_key(&namespace, id)));
-        assert!(!is_head_key(&continuation_key(&namespace, id, 2, 3)));
-        assert!(!is_head_key(&metadata_key(&namespace, -3, 7)));
+        assert!(!is_head_key(&continuation_key(&namespace, id, hour(2), 3)));
+        assert!(!is_head_key(&metadata_key(&namespace, hour(-3), 7)));
         assert!(!is_head_key(b"junk"));
     }
 
@@ -698,7 +724,7 @@ mod tests {
     fn merged_heads_keep_the_first_page_and_the_latest_expiry() {
         let head = |sequence, expires_at_unix_ms, pages| TraceHead {
             first: TraceLocator {
-                segment: 1,
+                segment: hour(1),
                 page_sequence: sequence,
                 trace_index: 0,
                 expires_at_unix_ms,
@@ -743,7 +769,7 @@ mod tests {
                 metadata
             );
             let locator = TraceLocator {
-                segment: i64::MIN,
+                segment: LOCATOR_SEGMENT,
                 page_sequence: u64::MAX,
                 trace_index: 12,
                 expires_at_unix_ms,
@@ -785,7 +811,7 @@ mod tests {
     #[test]
     fn rejects_unknown_value_versions() {
         let mut locator = encode_locator(&TraceLocator {
-            segment: -4,
+            segment: hour(-4),
             page_sequence: 2,
             trace_index: 1,
             expires_at_unix_ms: None,
@@ -841,8 +867,8 @@ mod tests {
             value: AttributeValue::Int(7),
         };
         assert_ne!(
-            posting_key(&namespace, 0, &string, 1),
-            posting_key(&namespace, 0, &integer, 1)
+            posting_key(&namespace, hour(0), &string, 1),
+            posting_key(&namespace, hour(0), &integer, 1)
         );
     }
 
@@ -852,14 +878,14 @@ mod tests {
             let posting = |value: f64| {
                 field_posting_key(
                     &Namespace::default(),
-                    0,
+                    hour(0),
                     (IndexField::Span, "value", &AttributeValue::Double(value)),
                     0,
                 )
             };
             for value in [left, right] {
                 let key = posting(value);
-                let prefix = field_scan_prefix(&Namespace::default(), 0, IndexField::Span, "value");
+                let prefix = field_scan_prefix(&Namespace::default(), hour(0), IndexField::Span, "value");
                 let (decoded, _) = decode_posting_value(&key, prefix.len()).unwrap();
                 proptest::prop_assert!(AttributeValue::Double(value).exact_eq(&decoded));
             }
@@ -902,8 +928,8 @@ mod tests {
     #[test]
     fn record_type_directly_follows_segment_prefix() {
         let namespace = Namespace::new("tenant").unwrap();
-        let prefix = segment_prefix(&namespace, 9);
-        let key = metadata_key(&namespace, 9, 7);
+        let prefix = segment_prefix(&namespace, hour(9));
+        let key = metadata_key(&namespace, hour(9), 7);
         assert_eq!(key[prefix.len()], RecordType::PageMetadata as u8);
         assert_eq!(KEY_SCOPE.prefix_len(&key), Some(prefix.len()));
     }

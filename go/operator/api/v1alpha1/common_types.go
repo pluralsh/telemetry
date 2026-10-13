@@ -308,7 +308,9 @@ type WorkloadSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 	// Resources configures requests and limits for the datastore container.
 	// Values here take precedence over podTemplate container resources. Missing
-	// values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit.
+	// values default to a 250m CPU request and a 2Gi memory limit, with memory
+	// requested at its limit unless a request is set. The operator sizes the
+	// caches and query memory budget from the memory limit.
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// PodTemplate is the full Kubernetes pod template escape hatch. Operator
 	// required fields and the first-class scheduling fields are merged into it.
@@ -338,9 +340,9 @@ type ReadGroupsSpec struct {
 	// Enabled defaults to true. When false, every reader opens every shard.
 	// +kubebuilder:default=true
 	Enabled *bool `json:"enabled,omitempty"`
-	// HedgeAfterMilliseconds starts a second copy of a shard read on another
-	// replica of its group when the first has not answered in time. Zero
-	// disables hedging.
+	// HedgeAfterMilliseconds starts a second copy of a unary shard read on
+	// another replica of its group when the first has not answered in time.
+	// Streaming reads are never hedged. Zero disables hedging.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=250
 	HedgeAfterMilliseconds *int64 `json:"hedgeAfterMilliseconds,omitempty"`

@@ -138,19 +138,20 @@ func Render(input Input) (Result, error) {
 		if mode == modeReader {
 			workload = input.Metrics.Spec.Reader
 		}
+		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}
 		return yaml.Marshal(renderConfig{
-			Mode:                mode,
-			Listeners:           renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
-			PathPrefix:          input.Metrics.Spec.Ingress.PathPrefix,
-			Storage:             renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode, resources.CacheDiskCapacity(workload)),
-			RetentionSeconds:    retention,
-			ReaderCacheCapacity: int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, 268435456),
-			ForwardIndexCacheCapacityBytes: inferredForwardIndexCacheCapacity(
-				input.Metrics.Spec.Config.ForwardIndexCacheCapacityBytes,
-				workload,
-			),
-			CacheWarmer: renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
-			Write:       renderWriteConfig(input.Metrics.Spec.Config.Write),
+			Mode:                           mode,
+			Listeners:                      renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
+			PathPrefix:                     input.Metrics.Spec.Ingress.PathPrefix,
+			Storage:                        renderStorageConfigForMode(input.Metrics.Spec.Config.Storage, descriptor, mode, resources.CacheDiskCapacity(workload), plan),
+			RetentionSeconds:               retention,
+			ReaderCacheCapacity:            int64Value(input.Metrics.Spec.Config.ReaderCacheCapacity, plan.readerCache()),
+			ForwardIndexCacheCapacityBytes: int64Value(input.Metrics.Spec.Config.ForwardIndexCacheCapacityBytes, plan.forwardIndexCache()),
+			MatcherCacheCapacityBytes:      plan.matcherCache(),
+			ResultCache:                    renderResultCache{CapacityBytes: plan.resultCache()},
+			Query:                          renderMetricsQuery(input.Metrics.Spec.Config.Query, plan),
+			CacheWarmer:                    renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
+			Write:                          renderWriteConfig(input.Metrics.Spec.Config.Write),
 			Request: renderMetricsRequest{
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
@@ -199,7 +200,7 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 		return Result{}, err
 	}
 	descriptor := resources.PseudoFSDescriptor
-	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload))
+	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload), memoryPlan{limit: resources.MemoryLimit(pseudofs.Spec.Workload, descriptor.Name)})
 	// PseudoFS metadata usually fits in memory; writing every inserted block
 	// to disk costs direct I/O on the request path for no hit-rate gain.
 	if cache := storage.BlockCache; cache != nil && cache.Type == string(telemetryv1alpha1.CacheFoyerHybrid) {
@@ -323,7 +324,7 @@ func renderLogs(input Input) (Result, error) {
 				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(logs)),
 				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(logs)),
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload)),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Page: renderLogsPage{
@@ -437,7 +438,7 @@ func renderTraces(input Input) (Result, error) {
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(traces)),
 				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload)),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
@@ -519,7 +520,7 @@ func validateCacheVolume(storage telemetryv1alpha1.StorageSpec, workload telemet
 	return nil
 }
 
-func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, diskCapacity int64) renderStorage {
+func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, diskCapacity int64, plan memoryPlan) renderStorage {
 	objectType := lo.CoalesceOrEmpty(string(spec.ObjectStore.Type), string(telemetryv1alpha1.ObjectStoreLocal))
 	objectPath := spec.ObjectStore.Path
 	if objectType == string(telemetryv1alpha1.ObjectStoreLocal) {
@@ -532,14 +533,14 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 		ObjectStore:  renderObjectStoreConfig(spec.ObjectStore, objectType, objectPath),
 	}
 	if spec.BlockCache == nil {
-		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(int64(536870912)), DiskCapacity: lo.ToPtr(diskCapacity), DiskPath: descriptor.CachePath}
+		result.BlockCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerHybrid), MemoryCapacity: lo.ToPtr(plan.blockCache()), DiskCapacity: lo.ToPtr(diskCapacity), DiskPath: descriptor.CachePath}
 	} else {
-		result.BlockCache = renderCacheConfig(spec.BlockCache, descriptor.CachePath, diskCapacity)
+		result.BlockCache = renderCacheConfig(spec.BlockCache, descriptor.CachePath, diskCapacity, plan.blockCache())
 	}
 	if spec.MetaCache == nil {
-		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(int64(134217728))}
+		result.MetaCache = &renderCache{Type: string(telemetryv1alpha1.CacheFoyerMemory), Capacity: lo.ToPtr(plan.metaCache())}
 	} else {
-		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath, diskCapacity)
+		result.MetaCache = renderCacheConfig(spec.MetaCache, descriptor.CachePath, diskCapacity, plan.metaCache())
 	}
 	if spec.Disk != nil {
 		result.Disk = &renderDisk{IOPS: spec.Disk.IOPS}
@@ -550,8 +551,8 @@ func renderStorageConfig(spec telemetryv1alpha1.StorageSpec, descriptor resource
 	return result
 }
 
-func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, mode string, diskCapacity int64) renderStorage {
-	result := renderStorageConfig(spec, descriptor, diskCapacity)
+func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor resources.Descriptor, mode string, diskCapacity int64, plan memoryPlan) renderStorage {
+	result := renderStorageConfig(spec, descriptor, diskCapacity, plan)
 	if mode == modeWriter && spec.BlockCache == nil {
 		result.BlockCache = nil
 	}
@@ -612,15 +613,15 @@ func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType,
 	return result
 }
 
-func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath string, diskCapacity int64) *renderCache {
+func renderCacheConfig(spec *telemetryv1alpha1.CacheSpec, defaultCachePath string, diskCapacity, memoryCapacity int64) *renderCache {
 	result := &renderCache{Type: string(spec.Type), MemoryCapacity: spec.MemoryCapacity, DiskCapacity: spec.DiskCapacity, DiskPath: spec.DiskPath, Capacity: spec.Capacity, Shards: spec.Shards, WritePolicy: spec.WritePolicy, Flushers: spec.Flushers, BufferPoolSize: spec.BufferPoolSize, SubmitQueueSizeThreshold: spec.SubmitQueueSizeThreshold}
 	if spec.Type == telemetryv1alpha1.CacheFoyerHybrid {
-		result.MemoryCapacity = lo.CoalesceOrEmpty(result.MemoryCapacity, lo.ToPtr(int64(536870912)))
+		result.MemoryCapacity = lo.CoalesceOrEmpty(result.MemoryCapacity, lo.ToPtr(memoryCapacity))
 		result.DiskCapacity = lo.CoalesceOrEmpty(result.DiskCapacity, lo.ToPtr(diskCapacity))
 		result.DiskPath = lo.CoalesceOrEmpty(result.DiskPath, defaultCachePath)
 	}
 	if spec.Type == telemetryv1alpha1.CacheFoyerMemory {
-		result.Capacity = lo.CoalesceOrEmpty(result.Capacity, lo.ToPtr(int64(134217728)))
+		result.Capacity = lo.CoalesceOrEmpty(result.Capacity, lo.ToPtr(memoryCapacity))
 	}
 	return result
 }
@@ -692,22 +693,43 @@ func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.Wo
 	return int32(inferred)
 }
 
-func inferredForwardIndexCacheCapacity(configured *int64, workload telemetryv1alpha1.WorkloadSpec) int64 {
-	if configured != nil {
-		return *configured
+// memoryPlan splits a container's memory limit between its caches and the
+// query memory budget, leaving about a quarter for the runtime, memtables,
+// request and response buffers, and allocator slack. Every share has a
+// floor so that small pods still cache something.
+type memoryPlan struct {
+	limit int64
+}
+
+const mebibyte = int64(1024 * 1024)
+
+func (plan memoryPlan) share(percent, floor int64) int64 {
+	return max(plan.limit/100*percent, floor)
+}
+
+func (plan memoryPlan) blockCache() int64 { return plan.share(20, 64*mebibyte) }
+func (plan memoryPlan) metaCache() int64  { return plan.share(5, 32*mebibyte) }
+
+// readerCache is twice the series cache, which takes half of it.
+func (plan memoryPlan) readerCache() int64       { return plan.share(15, 64*mebibyte) }
+func (plan memoryPlan) forwardIndexCache() int64 { return plan.share(5, 32*mebibyte) }
+func (plan memoryPlan) matcherCache() int64      { return plan.share(3, 16*mebibyte) }
+func (plan memoryPlan) resultCache() int64       { return plan.share(5, 16*mebibyte) }
+func (plan memoryPlan) queryBudget() int64       { return plan.share(30, 128*mebibyte) }
+
+func renderMetricsQuery(spec *telemetryv1alpha1.MetricsQuerySpec, plan memoryPlan) renderQuery {
+	const maxQueryMemory = int64(1 << 30)
+	if spec == nil {
+		spec = &telemetryv1alpha1.MetricsQuerySpec{}
 	}
-	const (
-		bytesPerMiB           = int64(1024 * 1024)
-		mebibytesPerGiB       = int64(1024)
-		minimumMiB            = int64(64)
-		mebibytesPerGiBBudget = int64(64)
-	)
-	memoryMiB := workload.Resources.Requests.Memory().Value() / bytesPerMiB
-	inferredMiB := memoryMiB * mebibytesPerGiBBudget / mebibytesPerGiB
-	if inferredMiB < minimumMiB {
-		inferredMiB = minimumMiB
+	budget := int64Value(spec.MemoryBudgetBytes, plan.queryBudget())
+	return renderQuery{
+		MaxConcurrent:           int32Value(spec.MaxConcurrent, 32),
+		QueueTimeoutSeconds:     int64Value(spec.QueueTimeoutSeconds, 30),
+		MaxMemoryBytes:          int64Value(spec.MaxMemoryBytes, min(budget/2, maxQueryMemory)),
+		MemoryBudgetBytes:       budget,
+		MaxConcurrentShardReads: int32Value(spec.MaxConcurrentShardReads, 16),
 	}
-	return inferredMiB * bytesPerMiB
 }
 
 func mode(metrics *telemetryv1alpha1.Metrics) telemetryv1alpha1.MetricsMode {
@@ -764,12 +786,25 @@ type renderConfig struct {
 	RetentionSeconds               *int64               `json:"retention_seconds,omitempty"`
 	ReaderCacheCapacity            int64                `json:"reader_cache_capacity"`
 	ForwardIndexCacheCapacityBytes int64                `json:"forward_index_cache_capacity_bytes"`
+	MatcherCacheCapacityBytes      int64                `json:"matcher_cache_capacity_bytes"`
+	ResultCache                    renderResultCache    `json:"result_cache"`
+	Query                          renderQuery          `json:"query"`
 	CacheWarmer                    renderCacheWarmer    `json:"cache_warmer"`
 	Write                          renderWrite          `json:"write"`
 	Request                        renderMetricsRequest `json:"request"`
 	Sharding                       renderSharding       `json:"sharding"`
 	Auth                           renderAuth           `json:"auth"`
 	Namespaces                     []renderNamespace    `json:"namespaces"`
+}
+type renderResultCache struct {
+	CapacityBytes int64 `json:"capacity_bytes"`
+}
+type renderQuery struct {
+	MaxConcurrent           int32 `json:"max_concurrent"`
+	QueueTimeoutSeconds     int64 `json:"queue_timeout_seconds"`
+	MaxMemoryBytes          int64 `json:"max_memory_bytes"`
+	MemoryBudgetBytes       int64 `json:"memory_budget_bytes"`
+	MaxConcurrentShardReads int32 `json:"max_concurrent_shard_reads"`
 }
 type renderMetricsRequest struct {
 	MaxRequestBytes        int64 `json:"max_request_bytes"`

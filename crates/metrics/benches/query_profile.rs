@@ -7,7 +7,8 @@
 //! cargo bench -p plural-metrics --features bench-internals --bench query_profile -- \
 //!     [--state compacted|streamed|l0|realtime|realtime-compacted] [--cache block|none] \
 //!     [--baseline] [--query NAME|all] [--seconds N] [--trace N] [--scrapes N] \
-//!     [--l0-bytes BYTES] [--memtable M] [--batch P] [--min-sources N]
+//!     [--l0-bytes BYTES] [--memtable M] [--batch P] [--min-sources N] \
+//!     [--range-hours H] [--step SECS]
 //! ```
 //!
 //! States: `compacted` writes each series' bucket as one value (one entry
@@ -254,6 +255,9 @@ struct Args {
     memtable: i64,
     batch: i64,
     min_sources: Option<usize>,
+    /// Queries cover the last `range_hours` of the corpus at `step`.
+    range_hours: i64,
+    step: Duration,
 }
 
 impl Args {
@@ -280,6 +284,8 @@ fn parse_args() -> Args {
         memtable: 0,
         batch: 1,
         min_sources: None,
+        range_hours: 1,
+        step: Duration::from_secs(15),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -305,6 +311,8 @@ fn parse_args() -> Args {
             "--memtable" => args.memtable = value().parse().expect("memtable"),
             "--batch" => args.batch = value().parse().expect("batch"),
             "--min-sources" => args.min_sources = Some(value().parse().expect("min-sources")),
+            "--range-hours" => args.range_hours = value().parse().expect("range hours"),
+            "--step" => args.step = Duration::from_secs(value().parse().expect("step seconds")),
             "--unpin-after" => {
                 value();
                 eprintln!("--unpin-after is ignored: idle buckets no longer hold a snapshot");
@@ -625,9 +633,10 @@ async fn load_realtime(db: &TimeSeriesDb, namespace: &Namespace, args: &Args) ->
     scrape
 }
 
-fn query_range(end_ms: i64) -> RangeInclusive<SystemTime> {
+fn query_range(args: &Args) -> RangeInclusive<SystemTime> {
     let ms = |ms: i64| UNIX_EPOCH + Duration::from_millis(ms as u64);
-    ms(end_ms - HOUR_MS)..=ms(end_ms)
+    let end_ms = args.end_ms();
+    ms(end_ms - args.range_hours * HOUR_MS)..=ms(end_ms)
 }
 
 fn print_storage_state(args: &Args) {
@@ -694,10 +703,9 @@ async fn run_query(
     dbs: &[(&TimeSeriesDb, String)],
     namespace: &Namespace,
     query: &str,
-    secs: u64,
-    end_ms: i64,
+    args: &Args,
 ) -> Vec<(f64, f64)> {
-    let step = Duration::from_secs(15);
+    let (secs, step) = (args.seconds, args.step);
     let read_operands = || stats::get(stats::MERGE_OPERANDS, "path=read");
     let names: Vec<&str> = dbs.iter().map(|(_, name)| name.as_str()).collect();
     println!("BEGIN {} pid={}", names.join(","), std::process::id());
@@ -708,7 +716,7 @@ async fn run_query(
             let operands_before = read_operands();
             let start = Instant::now();
             let result = db
-                .query_range(namespace, query, query_range(end_ms), step)
+                .query_range(namespace, query, query_range(args), step)
                 .await
                 .expect("query");
             let queried = Instant::now();
@@ -745,15 +753,14 @@ async fn trace_query(
     db: &TimeSeriesDb,
     namespace: &Namespace,
     (name, query): (&str, &str),
-    n: usize,
-    end_ms: i64,
+    args: &Args,
 ) {
-    let step = Duration::from_secs(15);
+    let (n, step) = (args.trace, args.step);
     let mut totals = std::collections::BTreeMap::<String, (f64, u64)>::new();
     let mut wall = Duration::ZERO;
     for _ in 0..n {
         let start = Instant::now();
-        let (_, trace) = query_range_traced(db, namespace, query, query_range(end_ms), step).await;
+        let (_, trace) = query_range_traced(db, namespace, query, query_range(args), step).await;
         wall += start.elapsed();
         let mut add = |key: String, value: &serde_json::Value, calls: u64| {
             let entry = totals.entry(key).or_default();
@@ -820,7 +827,6 @@ fn main() {
         if std::env::var_os("QUERY_PROFILE_DUMP_STATS").is_some() {
             stats::dump("slatedb.");
         }
-        let end_ms = args.end_ms();
         let baseline = if args.baseline {
             // Same `min_sources`: both databases report into the same
             // SlateDB gauges, which `settle` compares against it.
@@ -839,25 +845,33 @@ fn main() {
         let selected = QUERIES
             .iter()
             .filter(|(name, _)| args.query.as_deref().is_none_or(|q| q == *name));
+        let gets = || stats::get(stats::OBJECT_REQUESTS, "");
         for db in std::iter::once(&db).chain(&baseline) {
-            for (_, query) in selected.clone() {
-                db.query_range(
-                    &namespace,
-                    query,
-                    query_range(end_ms),
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("warm-up query");
+            for (name, query) in selected.clone() {
+                let (gets_before, start) = (gets(), Instant::now());
+                let result = db
+                    .query_range(&namespace, query, query_range(&args), args.step)
+                    .await
+                    .expect("warm-up query");
+                println!(
+                    "COLD {name}: ms={:.1} object_requests={:.0} series={} points={}",
+                    ms(start.elapsed()),
+                    gets() - gets_before,
+                    result.len(),
+                    result.iter().map(|s| s.samples.len()).sum::<usize>(),
+                );
+                if std::env::var_os("QUERY_PROFILE_DUMP_STATS").is_some() {
+                    stats::dump("slatedb.object_store");
+                }
             }
         }
         for &(name, query) in selected {
             if args.trace > 0 {
-                trace_query(&db, &namespace, (name, query), args.trace, end_ms).await;
+                trace_query(&db, &namespace, (name, query), &args).await;
             }
             let mut dbs = vec![(&db, name.to_string())];
             dbs.extend(baseline.iter().map(|b| (b, format!("{name}@compacted"))));
-            let times = run_query(&dbs, &namespace, query, args.seconds, end_ms).await;
+            let times = run_query(&dbs, &namespace, query, &args).await;
             if let [(mean, p50), (base_mean, base_p50)] = times[..] {
                 println!(
                     "RATIO {name}: {mean:.2} / {base_mean:.2} = {:.2}x \

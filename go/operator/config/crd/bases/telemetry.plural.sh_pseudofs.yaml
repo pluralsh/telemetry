@@ -9504,9 +9504,9 @@ spec:
                       hedgeAfterMilliseconds:
                         default: 250
                         description: |-
-                          HedgeAfterMilliseconds starts a second copy of a shard read on another
-                          replica of its group when the first has not answered in time. Zero
-                          disables hedging.
+                          HedgeAfterMilliseconds starts a second copy of a unary shard read on
+                          another replica of its group when the first has not answered in time.
+                          Streaming reads are never hedged. Zero disables hedging.
                         format: int64
                         minimum: 0
                         type: integer
@@ -9528,7 +9528,9 @@ spec:
                     description: |-
                       Resources configures requests and limits for the datastore container.
                       Values here take precedence over podTemplate container resources. Missing
-                      values default to 250m CPU and 512Mi memory requests and a 2Gi memory limit.
+                      values default to a 250m CPU request and a 2Gi memory limit, with memory
+                      requested at its limit unless a request is set. The operator sizes the
+                      caches and query memory budget from the memory limit.
                     properties:
                       claims:
                         description: |-

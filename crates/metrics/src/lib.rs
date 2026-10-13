@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod active_series;
+mod admission;
 #[cfg(feature = "bench-internals")]
 pub mod bench_support;
 mod config;
@@ -43,6 +44,7 @@ pub mod otel;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use admission::{DEFAULT_MAX_QUERY_MEMORY_BYTES, QueryLimitsConfig};
 pub use common::namespace::{Namespace, NamespaceError};
 pub use config::{Config, DEFAULT_RETENTION, QueryCacheConfig};
 pub use error::{Error, QueryError, Result};

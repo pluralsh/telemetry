@@ -4,7 +4,7 @@
 //! coordinating a query reads its own shard in process; only the other
 //! shards go through [`ReadGroups`], which resolves each group's replicas,
 //! spreads requests across them, fails over between them and hedges slow
-//! ones. Request and response messages are product-specific.
+//! unary calls. Request and response messages are product-specific.
 
 // `tonic::Status` is the gRPC error boundary these helpers exist to produce.
 #![allow(clippy::result_large_err)]
@@ -178,8 +178,8 @@ impl ReadGroups {
     /// Runs `call` against `shard`'s group: on one replica, failing over to
     /// the next while a replica is unavailable, and racing a second replica
     /// when the first is slower than the hedge delay. `call` should resolve
-    /// once the replica has answered (for a stream, with its first message),
-    /// so a hedge only starts when the answer itself is slow. Returns the
+    /// once the replica has answered, so a hedge only starts when the answer
+    /// itself is slow. Returns the
     /// replica that answered, so follow-up calls can stay on it.
     pub async fn call<T, F, Fut>(&self, shard: ShardId, call: F) -> Result<(Replica, T), Status>
     where
@@ -212,9 +212,12 @@ impl ReadGroups {
 }
 
 impl ReadGroups {
-    /// Opens a server stream from `shard`'s group with [`Self::call`] (or
-    /// [`Self::call_pinned`] when `pinned` is set), counting a replica as
-    /// answered once its first message arrives.
+    /// Opens a server stream from `shard`'s group, preferring `pinned`,
+    /// failing over while a replica is unavailable, and counting a replica
+    /// as answered once its first message arrives. Streams are never hedged:
+    /// their first message waits on the read itself, so a slow one is a cold
+    /// read, and a hedge would only start the same cold read on a second
+    /// replica.
     pub async fn open_stream<T, F, Fut>(
         &self,
         shard: ShardId,
@@ -236,7 +239,7 @@ impl ReadGroups {
         };
         let (replica, (first, rest)) = match pinned {
             Some(pinned) => self.call_pinned(shard, pinned, first_message).await?,
-            None => self.call(shard, first_message).await?,
+            None => race(self.replicas(shard).await?, None, first_message).await?,
         };
         let stream = match first {
             Some(first) => stream::once(async move { Ok(first) }).chain(rest).boxed(),

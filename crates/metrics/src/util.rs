@@ -6,8 +6,6 @@ use crate::error::Error;
 use crate::model::Label;
 
 pub use crate::error::Result;
-use crate::model::BucketSize;
-
 /// Computes a Blake3 hash of a string, truncated to u64 for use as a fingerprint
 /// in dictionary keys (attribute keys and values).
 pub(crate) fn fingerprint_string(value: &str) -> u64 {
@@ -188,14 +186,6 @@ pub(crate) fn quantile_in_place(q: f64, values: &mut [f64]) -> f64 {
     values[lower] * (1.0 - weight) + values[upper] * weight
 }
 
-/// Convert TimeBucketSize to hours
-pub fn time_bucket_size_hours(size: BucketSize) -> u32 {
-    if size == 0 || size > 15 {
-        return 0;
-    }
-    2u32.pow((size - 1) as u32)
-}
-
 /// Convert a `RangeBounds<SystemTime>` into `(start: SystemTime, end: SystemTime)`.
 ///
 /// `Excluded` bounds are adjusted by 1 ms — the smallest sample timestamp
@@ -243,9 +233,7 @@ pub(crate) fn range_bounds_to_secs(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_duration, parse_timestamp, parse_timestamp_to_seconds, time_bucket_size_hours,
-    };
+    use super::{parse_duration, parse_timestamp, parse_timestamp_to_seconds};
     use bytes::{BufMut, Bytes, BytesMut};
     use common::BytesRange;
     use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -526,15 +514,6 @@ mod tests {
 
         assert_ne!(split.fingerprint(), shifted.fingerprint());
         assert_ne!(two.fingerprint(), one.fingerprint());
-    }
-
-    #[test]
-    fn should_convert_time_bucket_size_to_hours() {
-        assert_eq!(time_bucket_size_hours(1), 1);
-        assert_eq!(time_bucket_size_hours(2), 2);
-        assert_eq!(time_bucket_size_hours(3), 4);
-        assert_eq!(time_bucket_size_hours(4), 8);
-        assert_eq!(time_bucket_size_hours(5), 16);
     }
 
     #[test]

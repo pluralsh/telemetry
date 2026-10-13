@@ -19,6 +19,7 @@ use common::coordinator::{
 use common::discovery::{
     CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
+use common::storage::compaction::SegmentCompaction;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
     BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
@@ -270,7 +271,9 @@ impl LogDb {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(storage_semantics())
+            .with_semantics(storage_semantics().with_segment_compaction(
+                SegmentCompaction::new(crate::codec::segment_span).with_retention(config.retention),
+            ))
             .build()
             .await?;
         let storage_read = storage.clone();
@@ -367,7 +370,7 @@ impl LogDb {
         };
         segments
             .into_iter()
-            .map(|segment| segment_for(*segment, rollup_ns))
+            .map(|segment| segment_for(segment.start_ns, rollup_ns))
             .collect()
     }
 

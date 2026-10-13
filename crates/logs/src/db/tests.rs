@@ -298,9 +298,9 @@ async fn reader_discovery_sees_late_writes_to_closed_partitions() {
         Label::new("region", "eu"),
     ])
     .unwrap();
-    let counter = next_stream_id_key(&namespace, 0);
+    let counter = next_stream_id_key(&namespace, seg(0));
     let before = reader
-        .partition_version(&namespace, Partition::Segment(0))
+        .partition_version(&namespace, Partition::Segment(seg(0)))
         .await
         .unwrap();
     writer
@@ -379,11 +379,15 @@ async fn cached_closed_segments_observe_late_writes() {
     db.label_values(&other, "service", 0, 5).await.unwrap();
     let series_key = (
         namespace.clone(),
-        Partition::Segment(0),
+        Partition::Segment(seg(0)),
         vec![Label::new("environment", "prod")],
     );
     assert!(db.caches.series.get(&series_key).is_some());
-    let other_key = (other.clone(), Partition::Segment(0), "service".to_owned());
+    let other_key = (
+        other.clone(),
+        Partition::Segment(seg(0)),
+        "service".to_owned(),
+    );
     assert!(db.caches.label_values.get(&other_key).is_some());
 
     db.write(
@@ -429,7 +433,7 @@ async fn streams_in_a_segment_share_one_id_space() {
     .await
     .unwrap();
 
-    let mut ids = db.stream_ids(&namespace, 0, &[]).await.unwrap();
+    let mut ids = db.stream_ids(&namespace, seg(0), &[]).await.unwrap();
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1]);
     assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
@@ -621,11 +625,11 @@ async fn applied_writes_coalesce_before_flush() {
 
     let rows = db.read(&namespace, 0, 3, &[]).await.unwrap();
     assert_eq!(rows.len(), 2);
-    let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+    let stream_id = db.stream_ids(&namespace, seg(0), &[]).await.unwrap()[0];
     let mut runs = db
         .storage
         .scan_prefix_iter(
-            stream_run_prefix(&namespace, 0, stream_id),
+            stream_run_prefix(&namespace, seg(0), stream_id),
             BytesRange::unbounded(),
             None,
         )
@@ -746,7 +750,7 @@ async fn each_flush_appends_posting_blocks_without_reading_the_index() {
     }
     let stats = db
         .storage
-        .get(crate::codec::term_stats_key(&namespace, 0, "needle"))
+        .get(crate::codec::term_stats_key(&namespace, seg(0), "needle"))
         .await
         .unwrap()
         .unwrap();
@@ -847,7 +851,7 @@ async fn reopened_writers_resume_stream_and_object_ids() {
     .await
     .unwrap();
     let api_id = db
-        .stream_ids(&namespace, 0, std::slice::from_ref(&api))
+        .stream_ids(&namespace, seg(0), std::slice::from_ref(&api))
         .await
         .unwrap();
     db.close().await.unwrap();
@@ -870,10 +874,16 @@ async fn reopened_writers_resume_stream_and_object_ids() {
         .await
         .unwrap();
     assert_eq!(
-        reopened.stream_ids(&namespace, 0, &[api]).await.unwrap(),
+        reopened
+            .stream_ids(&namespace, seg(0), &[api])
+            .await
+            .unwrap(),
         api_id
     );
-    let worker_id = reopened.stream_ids(&namespace, 0, &[worker]).await.unwrap();
+    let worker_id = reopened
+        .stream_ids(&namespace, seg(0), &[worker])
+        .await
+        .unwrap();
     assert_eq!(worker_id.len(), 1);
     assert!(!api_id.contains(&worker_id[0]));
 
@@ -933,11 +943,11 @@ async fn persisted_logical_expiry_survives_reopen_without_physical_ttl() {
     .await
     .unwrap();
 
-    let stream_id = db.stream_ids(&namespace, 0, &[]).await.unwrap()[0];
+    let stream_id = db.stream_ids(&namespace, seg(0), &[]).await.unwrap()[0];
     let mut run_records = db
         .storage
         .scan_prefix_iter(
-            stream_run_prefix(&namespace, 0, stream_id),
+            stream_run_prefix(&namespace, seg(0), stream_id),
             BytesRange::unbounded(),
             None,
         )
@@ -1023,7 +1033,12 @@ fn local_storage(directory: &tempfile::TempDir, path: &str) -> StorageConfig {
     })
 }
 
-/// Start of the segment containing now, so it is still open.
+/// The test segment starting at `start_ns`.
+fn seg(start_ns: i64) -> SegmentId {
+    SegmentId::new(start_ns, SEGMENT_NS)
+}
+
+/// The segment containing now, so it is still open.
 fn current_segment() -> SegmentId {
     let now_ns = common::time::now_ns();
     crate::codec::segment_for(now_ns, SEGMENT_NS)
@@ -1102,7 +1117,7 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
 
     let db = LogDb::open(compacting_config()).await.unwrap();
     let namespace = Namespace::new("compaction").unwrap();
-    let segment = current_segment();
+    let segment = current_segment().start_ns;
     // Two writes share a timestamp; their order must survive merging.
     let timestamps = [1, 2, 3, 3, 5, 6, 7, 8].map(|offset| segment + offset);
     let expected = (0..timestamps.len())
@@ -1114,7 +1129,7 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
 
     // Eight level-0 objects fold into one level-3 object within the flushes.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::Run).await,
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
         1
     );
     let end = segment + 100;
@@ -1124,21 +1139,21 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
         expected
     );
     // Replaced objects stay readable until a later flush deletes them.
-    assert!(count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await > 0);
+    assert!(count_records(&db, &namespace, seg(segment), RecordType::ObjectTombstone).await > 0);
 
     write_line(&db, &namespace, "worker", segment + 50, "other stream").await;
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
+        count_records(&db, &namespace, seg(segment), RecordType::ObjectTombstone).await,
         0
     );
     // The merged object and the worker's object; replaced blocks are gone,
     // leaving a meta and a lines value per remaining block.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::ObjectDirectory).await,
+        count_records(&db, &namespace, seg(segment), RecordType::ObjectDirectory).await,
         2
     );
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::ObjectBlock).await,
+        count_records(&db, &namespace, seg(segment), RecordType::ObjectBlock).await,
         6
     );
     assert_eq!(lines(&db, &namespace, segment, end).await, expected);
@@ -1162,7 +1177,7 @@ async fn settled_segments_merge_below_fan_in() {
         write_line(&db, &namespace, "api", timestamp, line).await;
     }
 
-    let runs = count_records(&db, &namespace, 0, RecordType::Run).await;
+    let runs = count_records(&db, &namespace, seg(0), RecordType::Run).await;
     assert!(runs <= 3, "six late writes left {runs} runs");
     assert_eq!(lines(&db, &namespace, 0, 10).await, expected);
     assert_eq!(
@@ -1180,7 +1195,7 @@ async fn open_segments_merge_runs_the_page_limits_cut_short() {
     config.compaction.fan_in = 8;
     let db = LogDb::open(config).await.unwrap();
     let namespace = Namespace::new("cut-short").unwrap();
-    let segment = current_segment();
+    let segment = current_segment().start_ns;
     // Twenty-row objects are small, but only three fit within `max_rows`.
     let expected = (0..80)
         .map(|index| format!("needle {index}"))
@@ -1200,7 +1215,7 @@ async fn open_segments_merge_runs_the_page_limits_cut_short() {
 
     // The first three merge once the fourth cannot join them.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::Run).await,
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
         2
     );
     let end = segment + 100;
@@ -1218,7 +1233,7 @@ async fn merges_grow_past_the_page_limits_flushes_cut_at() {
     config.compaction.max_object_rows = 256;
     let db = LogDb::open(config).await.unwrap();
     let namespace = Namespace::new("past-page").unwrap();
-    let segment = current_segment();
+    let segment = current_segment().start_ns;
     // Each flush cuts a twenty-row page; four merge into one eighty-row run,
     // past the page's sixty-four row limit.
     let expected = (0..80)
@@ -1238,7 +1253,7 @@ async fn merges_grow_past_the_page_limits_flushes_cut_at() {
     }
 
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::Run).await,
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
         1
     );
     let end = segment + 100;
@@ -1260,7 +1275,7 @@ async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
         ..compacting_config()
     };
     let namespace = Namespace::new("reopen").unwrap();
-    let segment = current_segment();
+    let segment = current_segment().start_ns;
     let expected = (1..=4)
         .map(|index| format!("needle {index}"))
         .collect::<Vec<_>>();
@@ -1270,7 +1285,7 @@ async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
         write_line(&db, &namespace, "api", segment + offset, line).await;
     }
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
+        count_records(&db, &namespace, seg(segment), RecordType::ObjectTombstone).await,
         2
     );
     db.close().await.unwrap();
@@ -1279,12 +1294,12 @@ async fn reopened_writers_rebuild_the_index_and_pending_deletes() {
     write_line(&db, &namespace, "api", segment + 3, &expected[2]).await;
     // Recovery re-queued the tombstones, and the merged object is tracked.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::ObjectTombstone).await,
+        count_records(&db, &namespace, seg(segment), RecordType::ObjectTombstone).await,
         0
     );
     write_line(&db, &namespace, "api", segment + 4, &expected[3]).await;
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::Run).await,
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
         1
     );
     let end = segment + 100;
@@ -1429,8 +1444,8 @@ async fn many_selected_streams_cost_two_scans_per_segment() {
     let counting = count_reads(
         &mut db,
         vec![
-            forward_prefix(&namespace, 0),
-            segment_run_prefix(&namespace, 0),
+            forward_prefix(&namespace, seg(0)),
+            segment_run_prefix(&namespace, seg(0)),
         ],
     );
     let prod = [Label::new("environment", "prod")];
@@ -1481,12 +1496,16 @@ async fn streams_flushed_together_are_read_with_one_object_scan() {
     let namespace = Namespace::default();
     write_forty_streams(&db, &namespace).await;
     assert_eq!(
-        count_records(&db, &namespace, 0, RecordType::ObjectDirectory).await,
+        count_records(&db, &namespace, seg(0), RecordType::ObjectDirectory).await,
         1
     );
     let counting = count_reads(
         &mut db,
-        vec![record_type_prefix(&namespace, 0, RecordType::ObjectBlock)],
+        vec![record_type_prefix(
+            &namespace,
+            seg(0),
+            RecordType::ObjectBlock,
+        )],
     );
     let ascending = |rows: &[LogRow]| {
         rows.windows(2)
@@ -1547,7 +1566,11 @@ async fn cached_blocks_answer_repeat_reads_and_gain_lines_when_needed() {
     .unwrap();
     let counting = count_reads(
         &mut db,
-        vec![record_type_prefix(&namespace, 0, RecordType::ObjectBlock)],
+        vec![record_type_prefix(
+            &namespace,
+            seg(0),
+            RecordType::ObjectBlock,
+        )],
     );
     // The window splits the block, so it is decoded from its meta value.
     let count = async |db: &LogDb| {
@@ -1588,7 +1611,7 @@ async fn cross_stream_merges_keep_write_order_for_out_of_order_rows() {
 
     let db = LogDb::open(compacting_config()).await.unwrap();
     let namespace = Namespace::new("cross-stream").unwrap();
-    let segment = current_segment();
+    let segment = current_segment().start_ns;
     // Rows arrive out of order across flushes, two at one timestamp.
     let offsets = [8, 3, 5, 5];
     for (index, offset) in offsets.iter().enumerate() {
@@ -1616,7 +1639,7 @@ async fn cross_stream_merges_keep_write_order_for_out_of_order_rows() {
     }
     // Four two-stream objects fold into one holding a run per stream.
     assert_eq!(
-        count_records(&db, &namespace, segment, RecordType::Run).await,
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
         2
     );
     let expected = [
@@ -1670,7 +1693,7 @@ async fn a_satisfied_read_selects_at_most_one_segment_ahead() {
         &mut db,
         segments
             .iter()
-            .map(|&segment| segment_run_prefix(&namespace, segment))
+            .map(|&segment| segment_run_prefix(&namespace, seg(segment)))
             .collect(),
     );
     db.read_segments(
@@ -1807,30 +1830,34 @@ async fn rollups_answer_discovery_exactly_like_segments() {
 async fn whole_periods_are_read_from_the_rollup() {
     let db = LogDb::open(test_config()).await.unwrap();
     let second = 1_000_000_000;
+    let period = |start_ns| SegmentId::new(start_ns, 20 * second);
     // Periods are 20s over 10s segments. Discovery reads whole touched
     // segments, so a range covers a period once it touches all its segments.
     assert_eq!(
         db.discovery_partitions(0, 40 * second - 1).unwrap(),
-        vec![Partition::Rollup(0), Partition::Rollup(20 * second)]
+        vec![
+            Partition::Rollup(period(0)),
+            Partition::Rollup(period(20 * second))
+        ]
     );
     assert_eq!(
         db.discovery_partitions(5 * second, 45 * second).unwrap(),
         vec![
-            Partition::Rollup(0),
-            Partition::Rollup(20 * second),
-            Partition::Segment(40 * second),
+            Partition::Rollup(period(0)),
+            Partition::Rollup(period(20 * second)),
+            Partition::Segment(seg(40 * second)),
         ]
     );
     assert_eq!(
         db.discovery_partitions(10 * second, 29 * second).unwrap(),
         vec![
-            Partition::Segment(10 * second),
-            Partition::Segment(20 * second)
+            Partition::Segment(seg(10 * second)),
+            Partition::Segment(seg(20 * second))
         ]
     );
     assert_eq!(
         db.discovery_partitions(-20 * second, -1).unwrap(),
-        vec![Partition::Rollup(-20 * second)]
+        vec![Partition::Rollup(period(-20 * second))]
     );
 
     // A late write into a cached closed period is visible afterwards.
@@ -1848,7 +1875,7 @@ async fn whole_periods_are_read_from_the_rollup() {
             .label_values
             .get(&(
                 namespace.clone(),
-                Partition::Rollup(0),
+                Partition::Rollup(period(0)),
                 "service".to_owned()
             ))
             .is_some()
@@ -2280,7 +2307,7 @@ async fn prefiltered_line_filters_match_unfiltered_reads() {
     for seed in 1..=10u64 {
         let mut db = LogDb::open(compacting_config()).await.unwrap();
         let namespace = Namespace::default();
-        let segment = current_segment();
+        let segment = current_segment().start_ns;
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let mut written = Vec::new();
         for _ in 0..12 {
@@ -2303,7 +2330,7 @@ async fn prefiltered_line_filters_match_unfiltered_reads() {
             &mut db,
             vec![crate::codec::record_type_prefix(
                 &namespace,
-                segment,
+                seg(segment),
                 RecordType::ObjectBlock,
             )],
         );

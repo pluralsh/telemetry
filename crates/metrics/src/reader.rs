@@ -352,7 +352,7 @@ impl TimeSeriesDbReader {
         Self::from_storage_with_capacity(storage, DEFAULT_CACHE_CAPACITY)
     }
 
-    fn from_storage_with_capacity(storage: StorageReader, cache_capacity: u64) -> Self {
+    pub(crate) fn from_storage_with_capacity(storage: StorageReader, cache_capacity: u64) -> Self {
         let query_cache = Cache::builder().max_capacity(cache_capacity).build();
         Self {
             storage,

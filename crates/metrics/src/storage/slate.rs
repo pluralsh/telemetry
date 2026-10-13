@@ -59,7 +59,10 @@ use crate::serde::key::{
 };
 use crate::serde::{TimeBucketScoped, bucket_records_range};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};
+use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, bucket_span, parse_bucket};
+use common::storage::compaction::SegmentCompaction;
+use common::storage::settings::{base_settings, load_settings_over};
+use slatedb::CompactorBuilder;
 
 mod reader;
 mod records;
@@ -461,23 +464,31 @@ impl Storage {
         object_store: Arc<dyn ObjectStore>,
     ) -> crate::util::Result<Self> {
         let cache = SharedDbCache::from_slatedb_config(slate_config).await?;
-        Self::try_new_with_cache(slate_config, object_store, &cache).await
+        Self::try_new_with_cache(slate_config, object_store, &cache, None).await
     }
 
     /// Like [`Self::try_new_with_object_store`] but uses `cache` instead of
-    /// building one from the config.
+    /// building one from the config. With a `retention`, compaction drops
+    /// bucket segments once everything in them has expired.
     pub(crate) async fn try_new_with_cache(
         slate_config: &SlateDbStorageConfig,
         object_store: Arc<dyn ObjectStore>,
         cache: &SharedDbCache,
+        retention: Option<Duration>,
     ) -> crate::util::Result<Self> {
-        let settings = load_settings(slate_config)?;
+        let mut settings = load_settings(slate_config)?;
         info!(
             "create slatedb storage with config: {:?}, settings: {:?}",
             slate_config, settings
         );
 
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
+        let policy = SegmentCompaction::new(bucket_span).with_retention(retention);
+        let compactor = settings.compactor_options.take().map(|options| {
+            CompactorBuilder::new(slate_config.path.clone(), Arc::clone(&object_store))
+                .with_options(options)
+                .with_scheduler_supplier(policy.supplier(&slate_config.path))
+        });
         let mut builder = DbBuilder::new(slate_config.path.clone(), object_store)
             .with_settings(settings)
             .with_sst_block_size(sst_block_size(&slate_config.disk))
@@ -487,6 +498,9 @@ impl Storage {
 
         if let Some(cache) = cache.cache() {
             builder = builder.with_db_cache(cache);
+        }
+        if let Some(compactor) = compactor {
+            builder = builder.with_compactor_builder(compactor);
         }
 
         let db = Arc::new(
@@ -646,6 +660,29 @@ impl Storage {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
+impl Storage {
+    /// Live layout across segments, from the manifest:
+    /// `(segments, l0_ssts, sorted_runs, run_ssts)`.
+    pub(crate) fn layout(&self) -> (usize, usize, usize, usize) {
+        let manifest = self.db.manifest();
+        let segments = manifest.segments();
+        (
+            segments.len(),
+            segments.iter().map(|segment| segment.l0().len()).sum(),
+            segments
+                .iter()
+                .map(|segment| segment.compacted().len())
+                .sum(),
+            segments
+                .iter()
+                .flat_map(|segment| segment.compacted())
+                .map(|run| run.sst_views.len())
+                .sum(),
+        )
+    }
+}
+
 #[cfg(test)]
 impl Storage {
     /// Freezes the memtable and writes it to L0, merging operands up to
@@ -694,12 +731,12 @@ pub(crate) const DEFAULT_L0_SST_SIZE_BYTES: usize = 16 << 20;
 /// barely fewer operands for about twice the compaction bytes.
 pub(crate) const DEFAULT_MIN_COMPACTION_SOURCES: usize = 3;
 
-/// SlateDB's defaults with Metrics' overrides applied; the base layer that
+/// [`base_settings`] with Metrics' overrides applied; the base layer that
 /// a settings file or `SLATEDB_` environment variables override per key.
 pub(crate) fn default_settings() -> Settings {
     let mut settings = Settings {
         l0_sst_size_bytes: DEFAULT_L0_SST_SIZE_BYTES,
-        ..Settings::default()
+        ..base_settings()
     };
     if let Some(compactor) = settings.compactor_options.as_mut() {
         compactor.scheduler_options.insert(
@@ -710,46 +747,10 @@ pub(crate) fn default_settings() -> Settings {
     settings
 }
 
-/// Loads SlateDB settings the way `Settings::from_file` / `Settings::load`
-/// do, but over [`default_settings`] instead of SlateDB's defaults, so
-/// Metrics' tuning applies wherever the user leaves a key unset.
+/// Loads SlateDB settings over [`default_settings`], so Metrics' tuning
+/// applies wherever the user leaves a key unset.
 fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
-    use figment::Figment;
-    use figment::providers::{Env, Format, Json, Toml, Yaml};
-
-    let base = Figment::from(default_settings());
-    let (figment, source) = match &slate_config.settings_path {
-        Some(path) => {
-            let extension = std::path::Path::new(path)
-                .extension()
-                .and_then(|ext| ext.to_str());
-            let figment = match extension {
-                Some("json") => base.merge(Json::file(path)),
-                Some("toml") => base.merge(Toml::file(path)),
-                Some("yaml" | "yml") => base.merge(Yaml::file(path)),
-                _ => {
-                    return Err(StorageError::Storage(format!(
-                        "Failed to load SlateDB settings from {path}: \
-                         unknown format (expected .json, .toml, .yaml or .yml)"
-                    )));
-                }
-            };
-            (figment, path.as_str())
-        }
-        None => (
-            base.merge(Json::file("SlateDb.json"))
-                .merge(Toml::file("SlateDb.toml"))
-                .merge(Yaml::file("SlateDb.yaml"))
-                .merge(Yaml::file("SlateDb.yml"))
-                .admerge(Env::prefixed("SLATEDB_")),
-            "SlateDb.* / SLATEDB_*",
-        ),
-    };
-    figment.extract().map_err(|e| {
-        StorageError::Storage(format!(
-            "Failed to load SlateDB settings from {source}: {e}"
-        ))
-    })
+    load_settings_over(default_settings(), slate_config)
 }
 
 #[cfg(test)]

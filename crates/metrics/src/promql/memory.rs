@@ -92,9 +92,16 @@ impl MemoryReservation {
     /// child still holds when its last clone drops is released back here, so
     /// an operator that forgets to release cannot leak past the scope.
     pub fn scoped(&self) -> Self {
+        self.child(self.inner.cap)
+    }
+
+    /// A child ledger capped at `cap`, whose grows also count against this
+    /// one: a grow succeeds only while both have room. A process-wide budget
+    /// hands each query a child, so concurrent queries share it.
+    pub fn child(&self, cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
-                cap: self.inner.cap,
+                cap,
                 reserved: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
                 parent: Some(self.clone()),
@@ -124,13 +131,17 @@ impl MemoryReservation {
         if bytes == 0 {
             return Ok(());
         }
-        if let Some(parent) = &self.inner.parent {
-            parent.try_grow(bytes)?;
-            let new = self.inner.reserved.fetch_add(bytes, Ordering::AcqRel) + bytes;
-            self.bump_high_water(new);
-            return Ok(());
+        self.grow_local(bytes)?;
+        if let Some(parent) = &self.inner.parent
+            && let Err(error) = parent.try_grow(bytes)
+        {
+            self.inner.reserved.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(error);
         }
+        Ok(())
+    }
 
+    fn grow_local(&self, bytes: usize) -> Result<(), QueryError> {
         let cap = self.inner.cap;
         let mut current = self.inner.reserved.load(Ordering::Acquire);
         loop {
@@ -464,6 +475,31 @@ mod tests {
 
         // then: they go back to the parent
         assert_eq!(query.reserved(), 0);
+    }
+
+    #[test]
+    fn children_are_held_to_their_own_cap_and_the_shared_budget() {
+        // given: two 60-byte queries under a 100-byte process budget
+        let budget = MemoryReservation::new(100);
+        let first = budget.child(60);
+        let second = budget.child(60);
+
+        // when / then: each query stops at its own cap
+        first.try_grow(50).unwrap();
+        assert!(first.try_grow(20).is_err());
+        assert_eq!(first.reserved(), 50);
+
+        // when / then: the second stops where the budget runs out, and its
+        // failed grow leaves nothing reserved anywhere
+        assert!(second.try_grow(60).is_err());
+        assert_eq!(second.reserved(), 0);
+        second.try_grow(50).unwrap();
+        assert_eq!(budget.reserved(), 100);
+
+        // when: a query ends, its share returns to the budget
+        drop(first);
+        assert_eq!(budget.reserved(), 50);
+        second.try_grow(10).unwrap();
     }
 
     #[test]

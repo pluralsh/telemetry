@@ -79,7 +79,6 @@ var (
 	defaultDataSize      = resource.MustParse("10Gi")
 	defaultCacheSize     = resource.MustParse("20Gi")
 	defaultCPURequest    = resource.MustParse("250m")
-	defaultMemoryRequest = resource.MustParse("512Mi")
 	defaultMemoryLimit   = resource.MustParse("2Gi")
 )
 
@@ -842,15 +841,15 @@ func applyPodDefaults(spec *corev1.PodSpec, metrics *Product, component Componen
 	}
 }
 
+// containerResources merges the pod template's and the workload's resources
+// over the defaults. Memory is requested at its limit unless a request is
+// set: the scheduler then reserves what each pod may use, so pods that all
+// reach their limit at once cannot run their node out of memory. A request
+// set without a limit gets the larger of it and the default limit.
 func containerResources(template, configured corev1.ResourceRequirements) corev1.ResourceRequirements {
 	result := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    defaultCPURequest.DeepCopy(),
-			corev1.ResourceMemory: defaultMemoryRequest.DeepCopy(),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceMemory: defaultMemoryLimit.DeepCopy(),
-		},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: defaultCPURequest.DeepCopy()},
+		Limits:   corev1.ResourceList{},
 	}
 	mergeResources := func(resources corev1.ResourceRequirements) {
 		maps.Copy(result.Requests, resources.Requests)
@@ -861,7 +860,37 @@ func containerResources(template, configured corev1.ResourceRequirements) corev1
 	}
 	mergeResources(template)
 	mergeResources(configured)
+	request, requested := result.Requests[corev1.ResourceMemory]
+	limit, limited := result.Limits[corev1.ResourceMemory]
+	switch {
+	case !requested && !limited:
+		result.Requests[corev1.ResourceMemory] = defaultMemoryLimit.DeepCopy()
+		result.Limits[corev1.ResourceMemory] = defaultMemoryLimit.DeepCopy()
+	case !requested:
+		result.Requests[corev1.ResourceMemory] = limit.DeepCopy()
+	case !limited:
+		limit = defaultMemoryLimit.DeepCopy()
+		if request.Cmp(limit) > 0 {
+			limit = request.DeepCopy()
+		}
+		result.Limits[corev1.ResourceMemory] = limit
+	}
 	return result
+}
+
+// MemoryLimit is the byte memory limit the operator renders for the
+// workload's container named container.
+func MemoryLimit(workload telemetryv1alpha1.WorkloadSpec, container string) int64 {
+	var template corev1.ResourceRequirements
+	if workload.PodTemplate != nil {
+		if found, ok := lo.Find(workload.PodTemplate.Spec.Containers, func(candidate corev1.Container) bool {
+			return candidate.Name == container
+		}); ok {
+			template = found.Resources
+		}
+	}
+	limit := containerResources(template, workload.Resources).Limits[corev1.ResourceMemory]
+	return limit.Value()
 }
 
 func objectStoreEnv(metrics *Product) []corev1.EnvVar {

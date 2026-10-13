@@ -250,7 +250,7 @@ fn append_segment(
     partition_catalog.insert(
         PARTITION_SCOPE,
         PARTITION_NAME,
-        DiscoveryValue::Int(segment),
+        DiscoveryValue::String(segment.to_string()),
     );
     let last_segment = traces
         .iter()

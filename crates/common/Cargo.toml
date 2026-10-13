@@ -20,6 +20,7 @@ async-trait.workspace = true
 bytes.workspace = true
 foyer.workspace = true
 futures.workspace = true
+figment = { version = "0.10.19", features = ["env", "json", "toml", "yaml"] }
 metrics.workspace = true
 mixtrics.workspace = true
 ryu.workspace = true

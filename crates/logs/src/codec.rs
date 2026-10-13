@@ -12,11 +12,11 @@ use crate::Namespace;
 use crate::error::{Error, Result};
 use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
 
-pub(crate) const KEY_VERSION: u8 = 5;
+pub(crate) const KEY_VERSION: u8 = 6;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
-pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v5";
+pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v6";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
     ScopedSegmentExtractor::new(SEGMENT_EXTRACTOR_NAME, KEY_SCOPE);
 /// Leading byte of run and object-directory values.
@@ -195,8 +195,19 @@ fn is_expired(expires_at_unix_ms: Option<u64>, unix_ms: u64) -> bool {
     expires_at_unix_ms.is_some_and(|expires_at| unix_ms >= expires_at)
 }
 
+/// The `[start_ms, end_ms)` span of the SlateDB segment with this prefix;
+/// `None` for unbounded segments and foreign prefixes.
+pub(crate) fn segment_span(prefix: &[u8]) -> Option<(i64, i64)> {
+    let (_, segment, _) = KEY_SCOPE.parse(prefix).ok()?;
+    let end_ns = segment.end_ns()?;
+    Some((
+        segment.start_ns.div_euclid(1_000_000),
+        end_ns.div_euclid(1_000_000) + i64::from(end_ns.rem_euclid(1_000_000) != 0),
+    ))
+}
+
 pub(crate) fn segment_for(timestamp_ns: i64, segment_ns: i64) -> SegmentId {
-    timestamp_ns.div_euclid(segment_ns) * segment_ns
+    SegmentId::containing(timestamp_ns, segment_ns)
 }
 
 /// Namespace and time-segment prefix shared by stream records and the
@@ -920,9 +931,15 @@ mod tests {
 
     use super::*;
 
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    fn hour(start_ns: i64) -> SegmentId {
+        SegmentId::new(start_ns, HOUR_NS)
+    }
+
     #[test]
     fn segment_extractor_name_is_stable() {
-        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v5");
+        assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v6");
     }
 
     #[test]
@@ -930,48 +947,50 @@ mod tests {
         let namespace = Namespace::new("tenant").unwrap();
         let label = Label::new("service", "api");
         assert_eq!(
-            merge_kind(&posting_key(&namespace, 0, &label)),
+            merge_kind(&posting_key(&namespace, hour(0), &label)),
             Some(MergeKind::StreamPostings)
         );
         assert_eq!(
-            merge_kind(&rollup_posting_key(&namespace, 0, &label)),
+            merge_kind(&rollup_posting_key(&namespace, hour(0), &label)),
             Some(MergeKind::StreamPostings)
         );
         assert_eq!(
-            merge_kind(&field_stats_key(&namespace, 0)),
+            merge_kind(&field_stats_key(&namespace, hour(0))),
             Some(MergeKind::FieldStats)
         );
         assert_eq!(
-            merge_kind(&term_stats_key(&namespace, 0, "error")),
+            merge_kind(&term_stats_key(&namespace, hour(0), "error")),
             Some(MergeKind::TermStats)
         );
         assert_eq!(
-            merge_kind(&rollup_dictionary_key(&namespace, 0, [1; 16])),
+            merge_kind(&rollup_dictionary_key(&namespace, hour(0), [1; 16])),
             None
         );
-        assert_eq!(merge_kind(&forward_key(&namespace, 0, 1)), None);
+        assert_eq!(merge_kind(&forward_key(&namespace, hour(0), 1)), None);
     }
 
     #[test]
     fn dictionary_keys_decode_their_fingerprint() {
         let namespace = Namespace::new("tenant").unwrap();
-        let prefix = dictionary_prefix(&namespace, 3);
-        let key = dictionary_key(&namespace, 3, [7; 16]);
+        let prefix = dictionary_prefix(&namespace, hour(3));
+        let key = dictionary_key(&namespace, hour(3), [7; 16]);
         assert!(key.starts_with(&prefix));
         assert_eq!(decode_dictionary_key(&key, prefix.len()).unwrap(), [7; 16]);
-        let rollup = rollup_dictionary_prefix(&namespace, 3);
-        let key = rollup_dictionary_key(&namespace, 3, [9; 16]);
+        let rollup = rollup_dictionary_prefix(&namespace, hour(3));
+        let key = rollup_dictionary_key(&namespace, hour(3), [9; 16]);
         assert!(key.starts_with(&rollup));
         assert_eq!(decode_dictionary_key(&key, rollup.len()).unwrap(), [9; 16]);
         assert!(decode_dictionary_key(&key[..key.len() - 1], rollup.len()).is_err());
     }
 
     #[test]
-    fn rollup_records_route_with_their_first_segment_and_stay_disjoint() {
+    fn rollup_records_route_to_their_period_and_stay_disjoint() {
         let namespace = Namespace::new("tenant").unwrap();
-        let period = 7_200;
+        let period = SegmentId::new(0, 24 * HOUR_NS);
         let prefix = rollup_prefix(&namespace, period);
         let segment = segment_prefix(&namespace, period);
+        assert!(prefix.starts_with(&segment));
+        assert!(!prefix.starts_with(&segment_prefix(&namespace, hour(0))));
         let label = Label::new("service", "api");
         let keys = [
             rollup_next_stream_id_key(&namespace, period),
@@ -1001,14 +1020,14 @@ mod tests {
     #[test]
     fn keys_group_by_namespace_then_segment() {
         let namespace = Namespace::new("tenant").unwrap();
-        let first = run_key(&namespace, -10, 2, 8);
-        let second = run_key(&namespace, 10, 1, 7);
+        let first = run_key(&namespace, hour(-10), 2, 8);
+        let second = run_key(&namespace, hour(10), 1, 7);
         assert!(first < second);
-        assert!(first.starts_with(&segment_prefix(&namespace, -10)));
-        assert!(first.starts_with(&stream_run_prefix(&namespace, -10, 2)));
+        assert!(first.starts_with(&segment_prefix(&namespace, hour(-10))));
+        assert!(first.starts_with(&stream_run_prefix(&namespace, hour(-10), 2)));
         assert_eq!(decode_run_key(&first).unwrap(), (2, 8));
         // A stream's runs sort by object ID.
-        assert!(run_key(&namespace, 0, 3, 10) < run_key(&namespace, 0, 3, 11));
+        assert!(run_key(&namespace, hour(0), 3, 10) < run_key(&namespace, hour(0), 3, 11));
     }
 
     #[test]
@@ -1016,31 +1035,33 @@ mod tests {
         let namespace = Namespace::default();
         let object = ObjectRef { id: 5, level: 1 };
         for group in BlockGroup::ALL {
-            let prefix = object_blocks_prefix(&namespace, 0, object, group);
-            let keys = [0, 1, 256].map(|block| block_key(&namespace, 0, object, group, block));
+            let prefix = object_blocks_prefix(&namespace, hour(0), object, group);
+            let keys =
+                [0, 1, 256].map(|block| block_key(&namespace, hour(0), object, group, block));
             assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
             for (key, block) in keys.iter().zip([0, 1, 256]) {
                 assert!(key.starts_with(&prefix));
                 assert_eq!(decode_block_index(key, prefix.len()).unwrap(), block);
             }
-            let other_level = block_key(&namespace, 0, ObjectRef { id: 5, level: 2 }, group, 0);
+            let other_level =
+                block_key(&namespace, hour(0), ObjectRef { id: 5, level: 2 }, group, 0);
             assert!(!other_level.starts_with(&prefix));
         }
         // Every meta block precedes every lines block of the same object.
         assert!(
-            block_key(&namespace, 0, object, BlockGroup::Meta, u32::MAX)
-                < block_key(&namespace, 0, object, BlockGroup::Lines, 0)
+            block_key(&namespace, hour(0), object, BlockGroup::Meta, u32::MAX)
+                < block_key(&namespace, hour(0), object, BlockGroup::Lines, 0)
         );
-        let key = directory_key(&namespace, 0, object);
-        assert!(key.starts_with(&directory_prefix(&namespace, 0)));
+        let key = directory_key(&namespace, hour(0), object);
+        assert!(key.starts_with(&directory_prefix(&namespace, hour(0))));
         assert_eq!(decode_directory_key(&key).unwrap(), object);
     }
 
     #[test]
     fn record_type_directly_follows_segment_prefix() {
         let namespace = Namespace::new("tenant").unwrap();
-        let key = forward_key(&namespace, 42, 7);
-        let prefix = segment_prefix(&namespace, 42);
+        let key = forward_key(&namespace, hour(42), 7);
+        let prefix = segment_prefix(&namespace, hour(42));
         assert_eq!(key[prefix.len()], RecordType::ForwardLabels as u8);
         assert_eq!(decode_forward_key(&key).unwrap(), 7);
     }
@@ -1165,12 +1186,12 @@ mod tests {
     fn tombstones_roundtrip_and_differ_by_level() {
         let namespace = Namespace::new("tenant").unwrap();
         let object = ObjectRef { id: 9, level: 2 };
-        let key = tombstone_key(&namespace, 7, object);
-        assert!(key.starts_with(&tombstone_prefix(&namespace, 7)));
+        let key = tombstone_key(&namespace, hour(7), object);
+        assert!(key.starts_with(&tombstone_prefix(&namespace, hour(7))));
         assert_eq!(decode_tombstone_key(&key).unwrap(), object);
         assert_ne!(
             key,
-            tombstone_key(&namespace, 7, ObjectRef { id: 9, level: 1 })
+            tombstone_key(&namespace, hour(7), ObjectRef { id: 9, level: 1 })
         );
         assert_eq!(
             decode_tombstone(&encode_tombstone(123, 4)).unwrap(),

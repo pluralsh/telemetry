@@ -57,7 +57,10 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 268435456", "forward_index_cache_capacity_bytes: 67108864", testFlushIntervalConfig,
+		"reader_cache_capacity: 322122540", "forward_index_cache_capacity_bytes: 107374180", testFlushIntervalConfig,
+		"memory_capacity: 429496720", "capacity: 107374180", "matcher_cache_capacity_bytes: 64424508",
+		"result_cache:\n  capacity_bytes: 107374180",
+		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 322122540\n  memory_budget_bytes: 644245080\n  queue_timeout_seconds: 30",
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
@@ -283,14 +286,14 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 	if !strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 192") {
 		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
 	}
-	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 134217728") {
-		t.Fatalf("writer config did not infer forward-index capacity from its memory request:\n%s", result.Data[MetricsKey])
+	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 107374180") {
+		t.Fatalf("writer config did not infer forward-index capacity from its memory limit:\n%s", result.Data[MetricsKey])
 	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
 		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
 	}
-	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 268435456") {
-		t.Fatalf("reader config did not infer forward-index capacity from its memory request:\n%s", result.Data[ReaderKey])
+	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 214748360") {
+		t.Fatalf("reader config did not infer forward-index capacity from its memory limit:\n%s", result.Data[ReaderKey])
 	}
 }
 
@@ -351,7 +354,7 @@ func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 
 func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	diskCapacity := resources.CacheDiskCapacity(telemetryv1alpha1.WorkloadSpec{})
-	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeWriter, diskCapacity)
+	defaultWriter := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeWriter, diskCapacity, memoryPlan{limit: 2 << 30})
 	if defaultWriter.BlockCache != nil {
 		t.Fatal("writer storage contains the default data cache")
 	}
@@ -362,11 +365,11 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	spec := telemetryv1alpha1.StorageSpec{
 		BlockCache: &telemetryv1alpha1.CacheSpec{Type: telemetryv1alpha1.CacheFoyerHybrid},
 	}
-	writer := renderStorageConfigForMode(spec, resources.MetricsDescriptor, modeWriter, diskCapacity)
+	writer := renderStorageConfigForMode(spec, resources.MetricsDescriptor, modeWriter, diskCapacity, memoryPlan{limit: 2 << 30})
 	if writer.BlockCache == nil {
 		t.Fatal("writer discarded an explicitly configured data cache")
 	}
-	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone, diskCapacity)
+	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone, diskCapacity, memoryPlan{limit: 2 << 30})
 	if standalone.BlockCache == nil {
 		t.Fatal("standalone storage is missing the default data cache")
 	}
@@ -374,13 +377,13 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 
 func TestStorageRendersDiskPerformanceInBytes(t *testing.T) {
 	diskCapacity := resources.CacheDiskCapacity(telemetryv1alpha1.WorkloadSpec{})
-	if storage := renderStorageConfig(telemetryv1alpha1.StorageSpec{}, resources.LogsDescriptor, diskCapacity); storage.Disk != nil {
+	if storage := renderStorageConfig(telemetryv1alpha1.StorageSpec{}, resources.LogsDescriptor, diskCapacity, memoryPlan{limit: 2 << 30}); storage.Disk != nil {
 		t.Fatalf("unset disk rendered %+v, want the storage default", storage.Disk)
 	}
 
 	spec := telemetryv1alpha1.StorageSpec{Disk: &telemetryv1alpha1.DiskSpec{ThroughputMiBps: lo.ToPtr(int64(1000)), IOPS: lo.ToPtr(int64(16000))}}
 	for _, mode := range []string{modeWriter, modeReader} {
-		disk := renderStorageConfigForMode(spec, resources.LogsDescriptor, mode, diskCapacity).Disk
+		disk := renderStorageConfigForMode(spec, resources.LogsDescriptor, mode, diskCapacity, memoryPlan{limit: 2 << 30}).Disk
 		if disk == nil || *disk.ThroughputBytesPerSecond != 1000<<20 || *disk.IOPS != 16000 {
 			t.Fatalf("%s rendered disk %+v", mode, disk)
 		}
@@ -694,5 +697,34 @@ func TestRenderCloudObjectStoresWithoutCredentials(t *testing.T) {
 				t.Fatalf("rendered config exposed a secret reference:\n%s", rendered)
 			}
 		})
+	}
+}
+
+func TestRenderSizesMetricsMemoryFromTheLimit(t *testing.T) {
+	metrics := &telemetryv1alpha1.Metrics{
+		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.MetricsSpec{
+			Mode: telemetryv1alpha1.MetricsModeSharded,
+			Reader: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("10Gi")},
+			}},
+			Config: telemetryv1alpha1.MetricsConfigSpec{
+				ReaderCacheCapacity: lo.ToPtr(int64(1 << 30)),
+				Query:               &telemetryv1alpha1.MetricsQuerySpec{MaxConcurrent: lo.ToPtr(int32(4))},
+			},
+		},
+	}
+	result, err := Render(Input{Metrics: metrics, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := string(result.Data[ReaderKey])
+	for _, expected := range []string{
+		"memory_capacity: 2147483640", "reader_cache_capacity: 1073741824",
+		"max_concurrent: 4", "max_memory_bytes: 1073741824", "memory_budget_bytes: 3221225460",
+	} {
+		if !strings.Contains(reader, expected) {
+			t.Errorf("reader config missing %q:\n%s", expected, reader)
+		}
 	}
 }

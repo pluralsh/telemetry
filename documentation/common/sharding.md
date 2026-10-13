@@ -90,9 +90,12 @@ coordinating reader.
 
 Each group's endpoint is a headless Service that resolves to every replica of
 the group. A reader spreads calls across those replicas, fails over to
-another replica when one is unavailable, and starts the same call on a second
-replica when the first has not answered within `hedge_after_ms` (250 ms by
-default; zero disables hedging). Follow-up calls of one query, such as
+another replica when one is unavailable, and starts the same unary call on a
+second replica when the first has not answered within `hedge_after_ms` (250 ms
+by default; zero disables hedging). Streaming reads (Metrics series
+resolution and sample reads, Traces search) are never hedged: their first
+message waits on the read itself, so a slow one is usually a cold read, and a
+hedge would only start the same cold read on another replica. Follow-up calls of one query, such as
 Metrics sample reads after series resolution, stay on the replica that
 answered first. Calls are bounded by `request_timeout_seconds` and carry the
 `auth.internal` credential.

@@ -12,7 +12,8 @@ use opentelemetry_proto::tonic::{
 
 use crate::{Error, Result};
 
-pub type SegmentId = i64;
+/// A time segment: its start and width in nanoseconds.
+pub type SegmentId = common::serde::scope::Segment;
 
 /// A validated, non-zero W3C/OTLP 16-byte trace identifier.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]

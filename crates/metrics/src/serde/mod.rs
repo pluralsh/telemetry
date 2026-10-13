@@ -96,7 +96,7 @@ pub fn decode_fixed_element_array<T: Decode>(
 }
 
 /// Key format version.
-pub const KEY_VERSION: u8 = 0x03;
+pub const KEY_VERSION: u8 = 0x04;
 
 /// Subsystem byte for timeseries storage (see [`common::serde::subsystem`]).
 pub const SUBSYSTEM: u8 = common::serde::subsystem::TIMESERIES;

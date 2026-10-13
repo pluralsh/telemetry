@@ -16,6 +16,7 @@ use slatedb::config::DbReaderOptions;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::QueryAdmission;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{SeriesId, TimeBucket};
 use crate::promql::memory::QueryError as SourceQueryError;
@@ -34,7 +35,8 @@ use crate::tsdb::{
 };
 use crate::{
     Config, Error, Label, Labels, MetricMetadata, Namespace, QueryCacheConfig, QueryError,
-    QueryValue, RangeSample, Result, Series, TimeSeriesDb, TimeSeriesDbReader, Visibility,
+    QueryLimitsConfig, QueryValue, RangeSample, Result, Series, TimeSeriesDb, TimeSeriesDbReader,
+    Visibility,
 };
 
 const SOURCE_BUCKET_BITS: u32 = 40;
@@ -125,6 +127,7 @@ pub struct ShardedMetrics {
     shards: Arc<ShardSet<MetricsShard>>,
     block_cache: SharedDbCache,
     result_cache: Option<ResultCache>,
+    admission: QueryAdmission,
     /// Reads the shards other reader groups serve; unset outside reader
     /// groups, where every shard is open locally.
     remote: OnceLock<Arc<dyn MetricsShardClient>>,
@@ -137,6 +140,7 @@ impl ShardedMetrics {
         shards: Result<ShardSet<MetricsShard>>,
         block_cache: SharedDbCache,
         caches: &QueryCacheConfig,
+        limits: &QueryLimitsConfig,
     ) -> Result<Self> {
         let shards = match shards {
             Ok(shards) => shards,
@@ -151,6 +155,7 @@ impl ShardedMetrics {
             result_cache: caches
                 .result_cache_enabled
                 .then(|| ResultCache::new(caches.result_capacity_bytes)),
+            admission: QueryAdmission::new(limits),
             remote: OnceLock::new(),
         })
     }
@@ -161,6 +166,7 @@ impl ShardedMetrics {
         owned_shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
         let caches = config.query_cache;
+        let limits = config.query_limits;
         let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
         let shard_cache = block_cache.clone();
         let opener = shard_opener(move |shard| {
@@ -174,7 +180,7 @@ impl ShardedMetrics {
             }
         });
         let shards = ShardSet::open(ShardRole::Writer, options, opener, owned_shards).await;
-        Self::new(shards, block_cache, &caches).await
+        Self::new(shards, block_cache, &caches, &limits).await
     }
 
     pub async fn open_readers(
@@ -185,6 +191,7 @@ impl ShardedMetrics {
         cache_capacity: u64,
     ) -> Result<Self> {
         let caches = config.query_cache;
+        let limits = config.query_limits;
         let matcher_capacity = caches.matcher_capacity_bytes;
         let forward_index_capacity = caches.forward_index_capacity_bytes;
         let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
@@ -211,7 +218,7 @@ impl ShardedMetrics {
             }
         });
         let shards = ShardSet::open(ShardRole::Reader, options, opener, local_shards).await;
-        Self::new(shards, block_cache, &caches).await
+        Self::new(shards, block_cache, &caches, &limits).await
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -366,10 +373,12 @@ impl ShardedMetrics {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, at_ms, at_ms, options.lookback_delta)?;
+        let admitted = self.admission.admit().await?;
         let (source, plan) = self
             .traced_query_source(namespace, &ranges, &options, plan, trace)
             .await?;
-        let outcome = execute_query_source(query, source, plan, true).await?;
+        let outcome =
+            execute_query_source(query, source, plan, true, admitted.reservation.clone()).await?;
         Ok((outcome.value, trace_json(outcome.trace)))
     }
 
@@ -528,10 +537,12 @@ impl ShardedMetrics {
             duration_to_ms(options.lookback_delta),
         );
         let ranges = preload_ranges_for_query(query, start_ms, end_ms, options.lookback_delta)?;
+        let admitted = self.admission.admit().await?;
         let (source, plan) = self
             .traced_query_source(namespace, &ranges, &options, plan, trace)
             .await?;
-        let outcome = execute_query_source(query, source, plan, false).await?;
+        let outcome =
+            execute_query_source(query, source, plan, false, admitted.reservation.clone()).await?;
         Ok((
             query_value_to_range_samples(outcome.value)?,
             trace_json(outcome.trace),
@@ -795,6 +806,13 @@ impl ShardedMetrics {
         Ok(MultiShardSeriesSource::new(
             sources.into_iter().map(|(_, source)| source).collect(),
         ))
+    }
+
+    /// A slot to serve one shard read to another reader group.
+    pub(crate) async fn admit_shard_read(
+        &self,
+    ) -> std::result::Result<OwnedSemaphorePermit, QueryError> {
+        self.admission.admit_shard_read().await
     }
 
     /// The local shard `shard`, which must be open here.

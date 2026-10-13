@@ -13,7 +13,7 @@ after `bucket size`; the record type is outside that boundary.
 Common key scope
 ┌───────────┬─────────┬─────────────────┬──────────────┬─────────────┬─────────────┐
 │ subsystem │ version │    namespace    │ bucket start │ bucket size │ record type │
-│ 0x01      │ 0x03    │ TerminatedBytes │ u32 BE       │ u8          │ u8          │
+│ 0x01      │ 0x04    │ TerminatedBytes │ u32 BE       │ u8          │ u8          │
 └───────────┴─────────┴─────────────────┴──────────────┴─────────────┴─────────────┘
                                                                ▲
                                                    SlateDB segment boundary
@@ -21,14 +21,18 @@ Common key scope
 
 Keys use big-endian numeric fields for lexical ordering. Values use their
 record-specific encoding. `TerminatedBytes` escapes embedded delimiters and
-ends with `0x00`; bucket size `0` is reserved. Keys carry no routing
+ends with `0x00`. Bucket start is minutes since the Unix epoch and bucket
+size is whole hours; the size must divide 24 (1, 2, 3, 4, 6, 8, 12 or 24),
+and prefixes with any other size are not treated as buckets. Keys carry no routing
 information: shard selection hashes the canonical Metrics routing key used by
 `ShardedMetrics` (namespace bytes followed by sorted `(label name, label value)`
 pairs separated with zero bytes) against the routing epoch in effect at each
 sample's timestamp, and a series written across a routing-epoch cutover
 appears in more than one shard. The SlateDB segment extractor is named
-`metrics-timeseries/v3`. Version 3 is a hard format switch: version-2 databases
-are not read.
+`metrics-timeseries/v4`. Version 4 is a hard format switch: earlier
+databases are not read; reset and reingest them. Closed buckets are merged and
+expired ones dropped as described in
+[storage compaction](../common/storage-compaction.md).
 
 Each namespace/time-bucket partition also contains the shared discovery
 catalog under the reserved record type `0xff` and catalog format version `1`.

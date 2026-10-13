@@ -704,16 +704,17 @@ impl TraceDb {
         .await?;
         let mut segments = BTreeSet::new();
         for value in starts {
-            match value {
-                DiscoveryValue::Int(segment) if segment >= first && segment <= last => {
-                    segments.insert(segment);
-                }
-                DiscoveryValue::Int(_) => {}
-                _ => {
-                    return Err(Error::Corrupt(
-                        "traces partition catalog contains a non-integer segment".to_owned(),
-                    ));
-                }
+            let segment: Option<SegmentId> = match &value {
+                DiscoveryValue::String(segment) => segment.parse().ok(),
+                _ => None,
+            };
+            let Some(segment) = segment else {
+                return Err(Error::Corrupt(
+                    "traces partition catalog contains a malformed segment".to_owned(),
+                ));
+            };
+            if segment >= first && segment <= last {
+                segments.insert(segment);
             }
         }
         for value in extents {

@@ -6,18 +6,23 @@ segment, records sort by record type.
 
 ```text
 Record prefix
-┌───────────┬─────────┬─────────────────┬──────────────────┬─────────────┐
-│ subsystem │ version │    namespace    │   time segment   │ record type │
-│ 0x03      │ 0x04    │ TerminatedBytes │ sortable i64 BE  │ u8          │
-└───────────┴─────────┴─────────────────┴──────────────────┴─────────────┘
+┌───────────┬─────────┬─────────────────┬─────────────────┬───────────────┬─────────────┐
+│ subsystem │ version │    namespace    │  segment start  │ segment width │ record type │
+│ 0x03      │ 0x06    │ TerminatedBytes │ sortable i64 BE │ u64 BE        │ u8          │
+└───────────┴─────────┴─────────────────┴─────────────────┴───────────────┴─────────────┘
 ```
 
 `TerminatedBytes` escapes embedded delimiters and ends with `0x00`. Keys carry
 no routing information: shard selection hashes the canonical `ShardedLogs`
 routing key against the routing epoch in effect at each entry's timestamp. The
-SlateDB segment extractor is named `logs-log/v5`. Version 5 is a hard format
-switch: databases written by earlier versions are not read and there is no
-migration; reset and reingest them. In the layouts below, `record prefix`
+Segment start and width are nanoseconds. Because each key records its
+segment's width, segments of different widths can share a database: rollup
+records live in their own segment as wide as the rollup period. The SlateDB
+segment extractor is named `logs-log/v6`. Version 6 is a hard format switch:
+databases written by earlier versions are not read and there is no
+migration; reset and reingest them. Closed segments are merged and expired
+ones dropped as described in
+[storage compaction](../common/storage-compaction.md). In the layouts below, `record prefix`
 means the complete prefix above through the record-type byte.
 
 Each namespace/time-segment partition also contains the shared discovery

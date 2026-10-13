@@ -31,26 +31,32 @@ service:
 writer:
   replicas: 1
   resources:
+    # Memory is requested at its limit so that pods reaching their limits
+    # together cannot run their node out of memory.
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 2Gi
     limits:
       memory: 2Gi
 
 reader:
   replicas: 2
   resources:
+    # Memory is requested at its limit so that pods reaching their limits
+    # together cannot run their node out of memory.
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 2Gi
     limits:
       memory: 2Gi
 
 standalone:
   resources:
+    # Memory is requested at its limit so that pods reaching their limits
+    # together cannot run their node out of memory.
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 2Gi
     limits:
       memory: 2Gi
 
@@ -69,6 +75,14 @@ config:
       type: FoyerMemory
       capacity: 134217728
   readerCacheCapacity: 268435456
+  # Engine memory for PromQL evaluation, sized with the caches above to fit
+  # the 2Gi limit. Raise both with the memory limit.
+  query:
+    max_concurrent: 32
+    queue_timeout_seconds: 30
+    max_memory_bytes: 268435456
+    memory_budget_bytes: 536870912
+    max_concurrent_shard_reads: 16
   write:
     durability: applied
     flush_interval_seconds: 10

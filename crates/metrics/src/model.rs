@@ -20,7 +20,7 @@ pub(crate) type SeriesId = u32;
 pub(crate) type SeriesFingerprint = u128;
 /// Time bucket (minutes since UNIX epoch)
 pub(crate) type BucketStart = u32;
-/// Time bucket size (1-15, exponential: 1=1h, 2=2h, 3=4h, 4=8h, etc. = 2^(n-1) hours)
+/// Time bucket width in hours; a divisor of 24 (see [`TimeBucket::is_valid_size`]).
 pub(crate) type BucketSize = u8;
 
 /// NormalNaN is a quiet NaN (same as f64::NAN)
@@ -868,7 +868,13 @@ impl TimeBucket {
     }
 
     pub(crate) fn size_in_mins(&self) -> u32 {
-        (self.size.pow(2) * 60) as u32
+        u32::from(self.size) * 60
+    }
+
+    /// Whether `size` hours is a bucket width: a divisor of 24, so buckets
+    /// of every width nest inside days.
+    pub(crate) fn is_valid_size(size: BucketSize) -> bool {
+        size > 0 && 24 % size == 0
     }
 }
 

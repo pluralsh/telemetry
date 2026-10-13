@@ -282,7 +282,7 @@ var _ = Describe("Metrics Controller", func() {
 		}
 	})
 
-	It("autoscales reader groups and folds them back into one reader when groups are disabled", func() {
+	It("autoscales reader groups, folds them back into one reader, and replaces that reader when groups return", func() {
 		metrics, auth, password := createMetricsFixture(ctx, "reader-groups-envtest", telemetryv1alpha1.MetricsModeSharded)
 		created = append(created, metrics, auth, password)
 		metrics.Spec.Writer.Replicas = lo.ToPtr(int32(2))
@@ -348,6 +348,38 @@ var _ = Describe("Metrics Controller", func() {
 		config := &corev1.Secret{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-config"}, config)).To(Succeed())
 		Expect(string(config.Data["reader.yaml"])).NotTo(ContainSubstring("read_groups"))
+
+		Expect(k8sClient.Get(ctx, key, metrics)).To(Succeed())
+		metrics.Spec.Reader.ReadGroups = &telemetryv1alpha1.ReadGroupsSpec{Enabled: lo.ToPtr(true)}
+		Expect(k8sClient.Update(ctx, metrics)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(reader), &appsv1.StatefulSet{})).To(Succeed(),
+			"the reader opening every shard keeps serving until the reader groups are ready")
+		for _, name := range groups {
+			group := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, group)).To(Succeed())
+			group.Status.Replicas = *group.Spec.Replicas
+			group.Status.ReadyReplicas = *group.Spec.Replicas
+			group.Status.ObservedGeneration = group.Generation
+			Expect(k8sClient.Status().Update(ctx, group)).To(Succeed())
+			created = append(created, group,
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name + "-headless", Namespace: namespace}},
+				&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+				&autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}},
+			)
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		for _, object := range []client.Object{
+			&appsv1.StatefulSet{}, &policyv1.PodDisruptionBudget{}, &autoscalingv2.HorizontalPodAutoscaler{},
+		} {
+			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(reader), object)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%T %s", object, reader.Name)
+		}
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: metrics.Name + "-reader-headless"}, &corev1.Service{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		assertService(ctx, metrics.Name+"-reader", false)
 
 		created = append(created, config, reader,
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: metrics.Name + "-internal-token", Namespace: namespace}},

@@ -828,6 +828,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    const SEGMENT: crate::model::SegmentId = crate::model::SegmentId::new(0, 3_600_000_000_000);
     use crate::analyzer::DEFAULT_ANALYZER;
 
     fn posting(document: u64, frequency: u32, length: u32) -> Posting {
@@ -851,7 +853,7 @@ mod tests {
         let mut ops = Vec::new();
         term_index_ops(
             &mut ops,
-            (&namespace, 0),
+            (&namespace, SEGMENT),
             "error",
             postings,
             3,
@@ -869,13 +871,16 @@ mod tests {
                     if put
                         .record
                         .key
-                        .starts_with(&term_directory_prefix(&namespace, 0, "error")) =>
+                        .starts_with(&term_directory_prefix(&namespace, SEGMENT, "error")) =>
                 {
                     fragments.push((put.record.key, decode_directory(&put.record.value).unwrap()));
                 }
                 RecordOp::Put(_) => blocks += 1,
                 RecordOp::Merge(merge) => {
-                    assert_eq!(merge.record.key, term_stats_key(&namespace, 0, "error"));
+                    assert_eq!(
+                        merge.record.key,
+                        term_stats_key(&namespace, SEGMENT, "error")
+                    );
                     stats = Some(decode_term_stats(&merge.record.value).unwrap());
                 }
                 RecordOp::Delete(_) => unreachable!(),
@@ -889,11 +894,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (
-                    term_directory_key(&namespace, 0, "error", first),
+                    term_directory_key(&namespace, SEGMENT, "error", first),
                     DIRECTORY_ENTRIES
                 ),
                 (
-                    term_directory_key(&namespace, 0, "error", first | DIRECTORY_ENTRIES as u64),
+                    term_directory_key(
+                        &namespace,
+                        SEGMENT,
+                        "error",
+                        first | DIRECTORY_ENTRIES as u64
+                    ),
                     1
                 ),
             ]

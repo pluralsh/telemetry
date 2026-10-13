@@ -83,6 +83,47 @@ impl Default for ResultCacheConfig {
     }
 }
 
+/// Limits shared by every PromQL query this process evaluates.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueryConfig {
+    /// Queries evaluated at once; the rest wait for a slot.
+    pub max_concurrent: usize,
+    /// How long a query waits for a slot before failing with 503.
+    pub queue_timeout_seconds: u64,
+    /// Engine memory one query may reserve.
+    pub max_memory_bytes: u64,
+    /// Engine memory every running query together may reserve.
+    pub memory_budget_bytes: u64,
+    /// Shard reads this reader serves to other reader groups at once.
+    pub max_concurrent_shard_reads: usize,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        let defaults = plural_metrics::QueryLimitsConfig::default();
+        Self {
+            max_concurrent: defaults.max_concurrent_queries,
+            queue_timeout_seconds: defaults.queue_timeout.as_secs(),
+            max_memory_bytes: defaults.max_query_memory_bytes,
+            memory_budget_bytes: defaults.memory_budget_bytes,
+            max_concurrent_shard_reads: defaults.max_concurrent_shard_reads,
+        }
+    }
+}
+
+impl QueryConfig {
+    pub fn limits(&self) -> plural_metrics::QueryLimitsConfig {
+        plural_metrics::QueryLimitsConfig {
+            max_concurrent_queries: self.max_concurrent,
+            queue_timeout: std::time::Duration::from_secs(self.queue_timeout_seconds),
+            max_query_memory_bytes: self.max_memory_bytes,
+            memory_budget_bytes: self.memory_budget_bytes,
+            max_concurrent_shard_reads: self.max_concurrent_shard_reads,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -100,6 +141,7 @@ pub struct Config {
     /// Byte budget for forward-index entries and resolved selectors, per shard.
     pub forward_index_cache_capacity_bytes: u64,
     pub result_cache: ResultCacheConfig,
+    pub query: QueryConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
     pub request: RequestConfig,
@@ -123,6 +165,7 @@ impl Default for Config {
             forward_index_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
                 .forward_index_capacity_bytes,
             result_cache: ResultCacheConfig::default(),
+            query: QueryConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),
@@ -167,6 +210,16 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "path_prefix must be empty or start with '/' and must not end with '/'".to_owned(),
+            ));
+        }
+        if self.query.max_concurrent == 0
+            || self.query.queue_timeout_seconds == 0
+            || self.query.max_memory_bytes == 0
+            || self.query.memory_budget_bytes == 0
+            || self.query.max_concurrent_shard_reads == 0
+        {
+            return Err(ConfigError::Validation(
+                "query limits must be greater than zero".to_owned(),
             ));
         }
         self.cache_warmer

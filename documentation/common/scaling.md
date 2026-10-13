@@ -380,10 +380,10 @@ What changes for the same per-shard availability (`r = R`):
 - **CPU.** Shard work runs in parallel across groups rather than in one
   process, which lowers latency for wide queries. Total CPU is about the
   same plus protobuf encoding and decoding of remote results.
-- **Hedging.** A call that has not answered after `hedge_after_ms` is started
-  on a second replica, so the slowest calls can run twice. With the 250 ms
-  default this is usually a small fraction of calls; raise the delay or set
-  it to zero to trade tail latency for less duplicate work.
+- **Hedging.** A unary call that has not answered after `hedge_after_ms` is
+  started on a second replica, so the slowest calls can run twice. Streaming
+  reads, which carry nearly all the bytes and memory, are never hedged. Raise
+  the delay or set it to zero to trade tail latency for less duplicate work.
 
 Groups pay off when the dataset, shard count, or query load is large enough
 that one process cannot open, cache, and scan every shard efficiently. With

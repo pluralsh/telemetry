@@ -29,14 +29,18 @@ pub(super) async fn execute_query<R: QueryReader + Send + Sync + 'static>(
     let source = Arc::new(crate::promql::source_adapter::QueryReaderSource::new(
         Arc::new(reader),
     ));
-    execute_query_source(query, source, ctx, is_instant).await
+    let reservation = crate::promql::memory::MemoryReservation::new(DEFAULT_MEMORY_CAP_BYTES);
+    execute_query_source(query, source, ctx, is_instant, reservation).await
 }
 
+/// Runs `query` over `source`, with every operator's memory reserved from
+/// `reservation`.
 pub(crate) async fn execute_query_source<S: crate::promql::source::SeriesSource + 'static>(
     query: &str,
     source: Arc<S>,
     ctx: crate::promql::plan::LoweringContext,
     is_instant: bool,
+    reservation: crate::promql::memory::MemoryReservation,
 ) -> std::result::Result<ExecuteOutcome, QueryError> {
     use crate::promql::trace::{self, Phase};
     use std::future::poll_fn;
@@ -75,8 +79,6 @@ pub(crate) async fn execute_query_source<S: crate::promql::source::SeriesSource 
         if let Some(c) = trace_collector.as_ref() {
             c.record_phase(Phase::Optimize, t0.elapsed().as_nanos() as u64);
         }
-
-        let reservation = crate::promql::memory::MemoryReservation::new(DEFAULT_MEMORY_CAP_BYTES);
 
         // Build physical ----------------------------------------------
         let t0 = Instant::now();

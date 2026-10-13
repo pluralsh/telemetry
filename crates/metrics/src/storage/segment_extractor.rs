@@ -40,7 +40,7 @@ const MIN_ROUTING_PREFIX_LEN: usize = 8;
 /// Stable, persisted identifier for this extractor's routing rules. Bump
 /// whenever the routing logic changes in a way that would re-route existing
 /// keys (e.g. a new `KEY_VERSION` with a different prefix shape).
-pub(crate) const EXTRACTOR_NAME: &str = "metrics-timeseries/v3";
+pub(crate) const EXTRACTOR_NAME: &str = "metrics-timeseries/v4";
 
 fn routing_prefix_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < MIN_ROUTING_PREFIX_LEN || bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
@@ -117,7 +117,7 @@ impl PrefixExtractor for TimeseriesSegmentExtractor {
 /// Used by the bucket-discovery path to project the segments list returned by
 /// `StorageRead::list_segments` into the set of buckets visible to a query.
 /// Returns `None` for any prefix that isn't a well-formed timeseries routing
-/// prefix, including the reserved `bucket_size == 0`.
+/// prefix, including bucket sizes that aren't a divisor of 24 hours.
 pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<(Namespace, TimeBucket)> {
     let length = routing_prefix_len(prefix)?;
     let namespace_end = prefix[2..].iter().position(|byte| *byte == 0)? + 2;
@@ -131,11 +131,20 @@ pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<(Namespace, TimeBucket)> {
         prefix[bucket_offset + 3],
     ]);
     let size: BucketSize = prefix[bucket_offset + 4];
-    if size == 0 {
+    if !TimeBucket::is_valid_size(size) {
         return None;
     }
     debug_assert_eq!(length, bucket_offset + 5);
     Some((namespace, TimeBucket { start, size }))
+}
+
+/// The `[start, end)` of a bucket segment in Unix milliseconds, for
+/// [`common::storage::compaction::SegmentCompaction`].
+pub(crate) fn bucket_span(prefix: &[u8]) -> Option<(i64, i64)> {
+    let (_, bucket) = parse_bucket(prefix)?;
+    let start = i64::from(bucket.start);
+    let end = start + i64::from(bucket.size_in_mins());
+    Some((start * 60_000, end * 60_000))
 }
 
 #[cfg(test)]
@@ -186,7 +195,7 @@ mod tests {
 
     #[test]
     fn should_return_stable_name() {
-        assert_eq!(TimeseriesSegmentExtractor.name(), "metrics-timeseries/v3");
+        assert_eq!(TimeseriesSegmentExtractor.name(), "metrics-timeseries/v4");
     }
 
     #[test]
@@ -290,7 +299,7 @@ mod tests {
 
     #[test]
     fn parse_bucket_decodes_extracted_prefix() {
-        for size in [1, 2] {
+        for size in [1, 2, 24] {
             let key = key(&namespace("tenant"), 7777, size, RecordType::TimeSeries);
 
             assert_eq!(
@@ -310,6 +319,8 @@ mod tests {
 
         for bytes in [
             raw_prefix("tenant", 7777, 0),
+            raw_prefix("tenant", 7777, 5),
+            raw_prefix("tenant", 7777, 48),
             raw_prefix("", 7777, 1),
             raw_prefix("bad\nname", 7777, 1),
             truncated[..truncated.len() - 1].to_vec(),
@@ -318,5 +329,15 @@ mod tests {
         ] {
             assert_eq!(parse_bucket(&bytes), None, "{bytes:02x?}");
         }
+    }
+
+    #[test]
+    fn bucket_span_covers_the_bucket_in_millis() {
+        let hour = raw_prefix("tenant", 120, 1);
+        let day = raw_prefix("tenant", 1440, 24);
+
+        assert_eq!(bucket_span(&hour), Some((7_200_000, 10_800_000)));
+        assert_eq!(bucket_span(&day), Some((86_400_000, 172_800_000)));
+        assert_eq!(bucket_span(&raw_prefix("tenant", 120, 5)), None);
     }
 }

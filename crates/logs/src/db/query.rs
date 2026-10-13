@@ -322,9 +322,13 @@ impl LogDb {
             if segment == last {
                 return Ok(result);
             }
-            segment = segment
-                .checked_add(self.segment_ns)
-                .ok_or_else(|| Error::Invalid("discovery segment range overflow".into()))?;
+            segment = SegmentId::new(
+                segment
+                    .start_ns
+                    .checked_add(self.segment_ns)
+                    .ok_or_else(|| Error::Invalid("discovery segment range overflow".into()))?,
+                self.segment_ns,
+            );
         }
     }
 
@@ -345,8 +349,9 @@ impl LogDb {
         let mut partitions = Vec::new();
         let mut index = 0;
         while let Some(&segment) = segments.get(index) {
-            if segment_for(segment, rollup_ns) == segment && segments.len() - index >= per_period {
-                partitions.push(Partition::Rollup(segment));
+            let period = segment_for(segment.start_ns, rollup_ns);
+            if period.start_ns == segment.start_ns && segments.len() - index >= per_period {
+                partitions.push(Partition::Rollup(period));
                 index += per_period;
             } else {
                 partitions.push(Partition::Segment(segment));
@@ -414,9 +419,13 @@ impl LogDb {
         let mut segment = segment_for(start_ns, self.segment_ns);
         let mut segments = vec![segment];
         while segment != last_segment {
-            segment = segment
-                .checked_add(self.segment_ns)
-                .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?;
+            segment = SegmentId::new(
+                segment
+                    .start_ns
+                    .checked_add(self.segment_ns)
+                    .ok_or_else(|| Error::Invalid("query segment range overflow".to_owned()))?,
+                self.segment_ns,
+            );
             segments.push(segment);
         }
         if reverse {

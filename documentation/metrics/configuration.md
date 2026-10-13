@@ -103,6 +103,22 @@ result_cache:
   enabled: true
   capacity_bytes: 134217728 # 128 MiB.
 
+# Limits shared by every PromQL query this process evaluates. Queries past
+# max_concurrent wait for a slot and fail with 503 after queue_timeout_seconds.
+# Each query's engine memory (sample buffers, accumulators, intermediate
+# results) is capped at max_memory_bytes, and all running queries together at
+# memory_budget_bytes, so concurrent dashboard panels cannot add up past it.
+# A query that finds the budget full fails, so keep max_memory_bytes at most
+# half the budget and let max_concurrent queue bursts instead. Size the
+# budget to what the container can spare after its caches; the operator
+# renders 30% of the memory limit, with half of that per query.
+query:
+  max_concurrent: 32
+  queue_timeout_seconds: 30
+  max_memory_bytes: 1073741824 # 1 GiB.
+  memory_budget_bytes: 2147483648 # 2 GiB.
+  max_concurrent_shard_reads: 16 # Reads served to other reader groups at once.
+
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: applied
@@ -214,7 +230,8 @@ Metrics loads SlateDB settings from `storage.settings_path` or, without it,
 from SlateDB's `SlateDb.{json,toml,yaml,yml}` files and `SLATEDB_` environment
 variables, layered over these defaults instead of SlateDB's. Any key the user
 sets wins; nested keys merge, so overriding one scheduler option keeps the
-others.
+others. These add to the garbage-collection and trivial-move defaults every
+database shares; see [storage compaction](../common/storage-compaction.md).
 
 | Setting | Metrics | SlateDB |
 |---|---|---|
