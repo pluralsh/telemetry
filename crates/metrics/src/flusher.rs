@@ -36,7 +36,7 @@ fn op_estimated_bytes(op: &RecordOp) -> usize {
 pub(crate) struct TsdbFlusher {
     pub(crate) storage: Arc<dyn Store>,
     /// Optional retention duration. When set, every record produced by a flush
-    /// is stamped with the same `Ttl::ExpireAt(bucket_start_ms + retention_ms)`
+    /// is stamped with the same [`bucket_ttl`] expiry
     /// so SlateDB can collapse merge operands during compaction. Without a
     /// shared expiration, operands written at different wall-clock times get
     /// different TTLs and never merge — see issue #342.
@@ -84,15 +84,17 @@ fn next_generation(persisted: u64) -> u64 {
 }
 
 /// Compute the absolute expire-at timestamp (ms since epoch) shared by every
-/// record in `bucket` for the given `retention`. Returns `Ttl::Default` when
+/// record in `bucket` for the given `retention`: `retention` after the start
+/// of the bucket's last hour, so a rollup bucket keeps each sample at least
+/// as long as the hour bucket it came from. Returns `Ttl::Default` when
 /// retention is disabled.
-fn bucket_ttl(bucket: TimeBucket, retention: Option<Duration>) -> Ttl {
+pub(crate) fn bucket_ttl(bucket: TimeBucket, retention: Option<Duration>) -> Ttl {
     let Some(retention) = retention else {
         return Ttl::Default;
     };
-    let bucket_start_ms = i64::from(bucket.start) * 60 * 1000;
+    let last_hour_start_ms = bucket.end_ms() - 3_600_000;
     let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
-    Ttl::ExpireAt(bucket_start_ms.saturating_add(retention_ms))
+    Ttl::ExpireAt(last_hour_start_ms.saturating_add(retention_ms))
 }
 
 #[async_trait]
@@ -315,6 +317,20 @@ mod tests {
         // then: bucket_start_ms = 1000 * 60 * 1000; retention_ms = 7d in ms
         let expected = 1000_i64 * 60 * 1000 + 7 * 86_400 * 1000;
         assert_eq!(ttl, Ttl::ExpireAt(expected));
+    }
+
+    #[test]
+    fn should_expire_a_rollup_bucket_with_its_last_hour() {
+        let retention = Some(Duration::from_secs(86_400));
+        let day = TimeBucket {
+            start: 1440,
+            size: 24,
+        };
+
+        assert_eq!(
+            bucket_ttl(day, retention),
+            bucket_ttl(TimeBucket::hour(1440 + 23 * 60), retention)
+        );
     }
 
     #[test]

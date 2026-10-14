@@ -888,7 +888,7 @@ async fn ingest_clusters(config: &Config, namespace: &Namespace, hours: i64) {
         }
     }
     let writer = LogDb::open(config.clone()).await.unwrap();
-    let end = common::time::now_ns() / (FLUSH_SECONDS * SECOND) * (FLUSH_SECONDS * SECOND);
+    let end = profile_end(FLUSH_SECONDS);
     let flushes = hours * 3600 / FLUSH_SECONDS;
     let started = Instant::now();
     let mut rows = 0usize;
@@ -1104,6 +1104,9 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
         span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
         span_scan_max_spread: std::env::var("PROFILE_SPAN_SPREAD")
             .map_or(SPAN_SCAN_MAX_SPREAD, |value| value.parse().unwrap()),
+        rolled: tokio::sync::RwLock::new(HashMap::new()),
+        rollup_lock: Mutex::new(()),
+        retention: config.retention,
     }
 }
 
@@ -1130,7 +1133,49 @@ async fn profile_cluster_day() {
         std::fs::write(&marker, b"").unwrap();
     }
 
-    let end = common::time::now_ns() / (step * SECOND) * (step * SECOND);
+    if std::env::var("PROFILE_ROLLUP").is_ok() && !store.join("rolled").exists() {
+        let writer = LogDb::open(config.clone()).await.unwrap();
+        if let Some(slate) = writer.storage.slate_read() {
+            let mut sizes = slate
+                .segment_sizes()
+                .into_iter()
+                .map(|(_, bytes)| bytes)
+                .collect::<Vec<_>>();
+            sizes.sort_unstable();
+            println!(
+                "segments {} sst bytes total {} median {} max {}",
+                sizes.len(),
+                sizes.iter().sum::<u64>(),
+                sizes.get(sizes.len() / 2).copied().unwrap_or(0),
+                sizes.last().copied().unwrap_or(0),
+            );
+        }
+        // `PROFILE_ROLLUP_MAX_GB` overrides the largest rollup segment.
+        let max_segment_bytes = std::env::var("PROFILE_ROLLUP_MAX_GB").map_or(
+            common::storage::rollup::RollupConfig::default().max_segment_bytes,
+            |value| value.parse::<u64>().unwrap() << 30,
+        );
+        let started = Instant::now();
+        let sealed = writer
+            .rollup_at(
+                &common::storage::rollup::RollupConfig {
+                    delay: Duration::ZERO,
+                    max_segment_bytes,
+                    ..Default::default()
+                },
+                common::time::now_ns(),
+            )
+            .await
+            .unwrap();
+        println!(
+            "rollup: sealed {sealed} in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        writer.close().await.unwrap();
+        std::fs::write(store.join("rolled"), b"").unwrap();
+    }
+
+    let end = profile_end(step);
     let start = end - 86_400 * SECOND;
     let request = QueryRequest::range(
         format!(r#"sum(count_over_time({{cluster="{cluster}"}} [{step}s]))"#),
@@ -1250,6 +1295,17 @@ async fn profile_cluster_day() {
     );
     db.close().await.unwrap();
     cold.close().await.unwrap();
+}
+
+/// Now rounded down to `step_seconds`, or with `PROFILE_END=midnight` the
+/// last UTC midnight, so a day-long query reads exactly one closed day.
+fn profile_end(step_seconds: i64) -> i64 {
+    let step = if std::env::var("PROFILE_END").as_deref() == Ok("midnight") {
+        86_400 * SECOND
+    } else {
+        step_seconds * SECOND
+    };
+    common::time::now_ns() / step * step
 }
 
 fn plan_segments(db: &LogDb, start: i64, end: i64) -> usize {

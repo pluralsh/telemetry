@@ -109,6 +109,28 @@ pub(crate) fn write_bucket_prefix(buf: &mut BytesMut, namespace: &Namespace, buc
     buf.put_u8(bucket.size);
 }
 
+/// Set on the bucket-size byte of a rollup seal's key. The size byte is part
+/// of the segment prefix, so a seal lands in a segment of its own, and
+/// readers learn which buckets are sealed from the segment list alone.
+pub(crate) const SEAL_SIZE_FLAG: u8 = 0x80;
+
+/// Segment prefix of `bucket`'s rollup seal.
+pub(crate) fn seal_prefix(namespace: &Namespace, bucket: &TimeBucket) -> Bytes {
+    let mut buf = BytesMut::new();
+    KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(&mut buf);
+    common::serde::terminated_bytes::serialize(namespace.as_bytes(), &mut buf);
+    buf.put_u32(bucket.start);
+    buf.put_u8(bucket.size | SEAL_SIZE_FLAG);
+    buf.freeze()
+}
+
+/// Key of `bucket`'s rollup seal record.
+pub(crate) fn seal_key(namespace: &Namespace, bucket: &TimeBucket) -> Bytes {
+    let mut buf = BytesMut::from(seal_prefix(namespace, bucket).as_ref());
+    buf.put_u8(RecordType::RollupSeal.id());
+    buf.freeze()
+}
+
 /// Range containing every record of one bucket.
 pub(crate) fn bucket_records_range(namespace: &Namespace, bucket: &TimeBucket) -> BytesRange {
     let mut prefix = BytesMut::new();
@@ -131,6 +153,7 @@ pub enum RecordType {
     InvertedIndex = 0x04,
     TimeSeries = 0x05,
     BucketGeneration = 0x06,
+    RollupSeal = 0x07,
 }
 
 impl RecordType {
@@ -147,6 +170,7 @@ impl RecordType {
             0x04 => Ok(RecordType::InvertedIndex),
             0x05 => Ok(RecordType::TimeSeries),
             0x06 => Ok(RecordType::BucketGeneration),
+            0x07 => Ok(RecordType::RollupSeal),
             _ => Err(EncodingError {
                 message: format!("invalid record type: 0x{:02x}", id),
             }),

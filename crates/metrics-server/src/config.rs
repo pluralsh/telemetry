@@ -124,6 +124,42 @@ impl QueryConfig {
     }
 }
 
+/// Background rollup of closed hour buckets into wider buckets.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RollupConfig {
+    pub enabled: bool,
+    /// Largest stored size of a rollup bucket.
+    pub max_bucket_bytes: u64,
+    /// How long after a day ends before its hours are rolled up.
+    pub delay_seconds: u64,
+    /// How often to look for days to roll up.
+    pub interval_seconds: u64,
+}
+
+impl Default for RollupConfig {
+    fn default() -> Self {
+        let defaults = plural_metrics::RollupConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            max_bucket_bytes: defaults.max_bucket_bytes,
+            delay_seconds: defaults.delay.as_secs(),
+            interval_seconds: defaults.interval.as_secs(),
+        }
+    }
+}
+
+impl RollupConfig {
+    pub fn rollup(&self) -> plural_metrics::RollupConfig {
+        plural_metrics::RollupConfig {
+            enabled: self.enabled,
+            max_bucket_bytes: self.max_bucket_bytes,
+            delay: std::time::Duration::from_secs(self.delay_seconds),
+            interval: std::time::Duration::from_secs(self.interval_seconds.max(1)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -142,6 +178,7 @@ pub struct Config {
     pub forward_index_cache_capacity_bytes: u64,
     pub result_cache: ResultCacheConfig,
     pub query: QueryConfig,
+    pub rollup: RollupConfig,
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
     pub request: RequestConfig,
@@ -166,6 +203,7 @@ impl Default for Config {
                 .forward_index_capacity_bytes,
             result_cache: ResultCacheConfig::default(),
             query: QueryConfig::default(),
+            rollup: RollupConfig::default(),
             cache_warmer: CacheWarmerConfig::default(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),

@@ -577,6 +577,7 @@ pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {
             result_capacity_bytes: config.result_cache.capacity_bytes,
         },
         query_limits: config.query.limits(),
+        rollup: config.rollup.rollup(),
     }
 }
 

@@ -346,11 +346,44 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     /// Lists the timeseries buckets currently visible to this handle, by
     /// projecting the segment prefixes reported by SlateDB (manifest plus
     /// unflushed memtable segments) through the timeseries extractor.
+    /// The buckets of `namespace` a query reads; see [`visible_buckets`].
     fn list_buckets(&self, namespace: &Namespace) -> Vec<TimeBucket> {
-        (self.segments)()
+        let (buckets, sealed) = self.list_segments(namespace);
+        visible_buckets(buckets, &sealed)
+    }
+
+    /// Every bucket segment of `namespace`, and every sealed bucket.
+    pub(super) fn list_segments(
+        &self,
+        namespace: &Namespace,
+    ) -> (Vec<TimeBucket>, Vec<TimeBucket>) {
+        let mut buckets = Vec::new();
+        let mut sealed = Vec::new();
+        for segment in (self.segments)() {
+            match parse_segment(&segment.prefix) {
+                Some((key_namespace, Segment::Bucket(bucket))) if key_namespace == *namespace => {
+                    buckets.push(bucket);
+                }
+                Some((key_namespace, Segment::Seal(bucket))) if key_namespace == *namespace => {
+                    sealed.push(bucket);
+                }
+                _ => {}
+            }
+        }
+        (buckets, sealed)
+    }
+
+    /// The bucket each of `buckets` is read from: itself, or the sealed
+    /// bucket covering it.
+    pub(super) fn resolve_buckets(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Vec<TimeBucket> {
+        let (_, sealed) = self.list_segments(namespace);
+        buckets
             .iter()
-            .filter_map(|seg| parse_bucket(&seg.prefix))
-            .filter_map(|(key_namespace, bucket)| (key_namespace == *namespace).then_some(bucket))
+            .map(|bucket| covering_bucket(*bucket, &sealed))
             .collect()
     }
 
@@ -435,6 +468,9 @@ where
                 if !wanted.contains(&bucket) {
                     return None;
                 }
+                // A rollup bucket's samples dwarf the cache budget for the
+                // hours a warm is meant to keep hot.
+                let include_samples = include_samples && bucket.size == 1;
                 let targets: Arc<[CacheTarget]> =
                     bucket_cache_targets(namespace, &bucket, include_samples).into();
                 let ids = segment

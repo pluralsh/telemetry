@@ -22,7 +22,9 @@ segment extractor is named `logs-log/v6`. Version 6 is a hard format switch:
 databases written by earlier versions are not read and there is no
 migration; reset and reingest them. Closed segments are merged and expired
 ones dropped as described in
-[storage compaction](../common/storage-compaction.md). In the layouts below, `record prefix`
+[storage compaction](../common/storage-compaction.md), and closed days are
+rolled up into wider segments as described in
+[segment rollup](../common/segment-rollup.md). In the layouts below, `record prefix`
 means the complete prefix above through the record-type byte.
 
 Each namespace/time-segment partition also contains the shared discovery

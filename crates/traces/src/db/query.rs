@@ -166,10 +166,11 @@ impl TraceDb {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
+        let rollups = &self.rollups(namespace);
         let mut found = stream::iter(ids)
             .map(|trace_id| async move {
                 let locators = self.cached_locate(namespace, trace_id, now).await?;
-                Ok::<_, Error>((trace_id, locators))
+                Ok::<_, Error>((trace_id, visible_locators(rollups, locators)))
             })
             .buffer_unordered(READ_CONCURRENCY)
             .try_collect::<HashMap<_, _>>()
@@ -713,7 +714,12 @@ impl TraceDb {
                     "traces partition catalog contains a malformed segment".to_owned(),
                 ));
             };
-            if segment >= first && segment <= last {
+            // A rollup segment starts before the hours it covers.
+            let overlaps = segment.start_ns <= last.start_ns
+                && segment
+                    .end_ns()
+                    .is_some_and(|end_ns| end_ns > first.start_ns);
+            if overlaps {
                 segments.insert(segment);
             }
         }
@@ -733,7 +739,21 @@ impl TraceDb {
                 segments.insert(segment);
             }
         }
+        let rollups = self.rollups(namespace);
+        if !rollups.is_empty() {
+            segments.retain(|segment| rollups.is_visible(*segment));
+        }
         Ok(segments)
+    }
+
+    /// The rollup markers of `namespace`, which decide which segments reads
+    /// use.
+    pub(super) fn rollups(&self, namespace: &Namespace) -> Rollups {
+        Rollups::markers(
+            self.storage.slate_read().as_ref(),
+            crate::codec::KEY_SCOPE,
+            namespace,
+        )
     }
 
     /// The first `limit` live trace IDs in ID order, with each trace's first
@@ -851,10 +871,12 @@ impl TraceDb {
     ) -> Result<Vec<Trace>> {
         let mut traces = Vec::with_capacity(trace_ids.len());
         let memo = PageMemo::default();
+        let rollups = &self.rollups(namespace);
         for batch in trace_ids.chunks(MATERIALIZE_BATCH) {
             let located = stream::iter(batch.iter().copied())
                 .map(|trace_id| async move {
-                    Ok::<_, Error>((trace_id, self.locate(namespace, trace_id, now).await?))
+                    let locators = self.locate(namespace, trace_id, now).await?;
+                    Ok::<_, Error>((trace_id, visible_locators(rollups, locators)))
                 })
                 .buffered(READ_CONCURRENCY)
                 .try_collect()
@@ -865,7 +887,7 @@ impl TraceDb {
     }
 
     /// `trace_id`'s head, unless it is missing or expired.
-    async fn live_head(
+    pub(super) async fn live_head(
         &self,
         namespace: &Namespace,
         trace_id: TraceId,
@@ -1085,12 +1107,11 @@ impl TraceDb {
         let now = unix_time_ms()?;
         trace_ids.sort_unstable();
         trace_ids.dedup();
+        let rollups = &self.rollups(namespace);
         let located = stream::iter(trace_ids)
             .map(|trace_id| async move {
-                Ok::<_, Error>((
-                    trace_id,
-                    self.cached_locate(namespace, trace_id, now).await?,
-                ))
+                let locators = self.cached_locate(namespace, trace_id, now).await?;
+                Ok::<_, Error>((trace_id, visible_locators(rollups, locators)))
             })
             .buffer_unordered(READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
@@ -2040,8 +2061,16 @@ fn attributes_match(attributes: &[KeyValue], predicate: &IndexPredicate) -> bool
     })
 }
 
-/// Drops spans whose resource, scope and protobuf encoding repeat an earlier
-/// span. Only spans sharing a span id can be equal, so only those are encoded.
+/// `locators` without those into segments a seal covers. Locators into an
+/// unsealed rollup stay: a rollup's replaced head points only there, and a
+/// trace it also left in place merges both copies without repeating spans.
+fn visible_locators(rollups: &Rollups, mut locators: Vec<TraceLocator>) -> Vec<TraceLocator> {
+    if !rollups.is_empty() {
+        locators.retain(|locator| rollups.sealed_cover(locator.segment).is_none());
+    }
+    locators
+}
+
 fn live_locators(locators: &[TraceLocator], now: u64) -> Vec<TraceLocator> {
     locators
         .iter()
@@ -2050,6 +2079,8 @@ fn live_locators(locators: &[TraceLocator], now: u64) -> Vec<TraceLocator> {
         .collect()
 }
 
+/// Drops spans whose resource, scope and protobuf encoding repeat an earlier
+/// span. Only spans sharing a span id can be equal, so only those are encoded.
 fn merge_continuations(trace_id: TraceId, continuations: Vec<Trace>) -> Result<Trace> {
     let mut span_id_counts: HashMap<Vec<u8>, u32> = HashMap::new();
     for span in continuations

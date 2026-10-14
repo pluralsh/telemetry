@@ -192,6 +192,7 @@ impl AppState {
         }
         state.start_cache_warmer(true).await;
         state.start_durable_flush_task().await;
+        state.start_rollup_task().await;
         Ok(state)
     }
 
@@ -467,6 +468,35 @@ impl AppState {
         self.db.flush().await?;
         self.db.close().await?;
         Ok(())
+    }
+
+    /// Periodically rolls closed days of segments up into wider ones.
+    async fn start_rollup_task(&self) {
+        let rollup = self.config.rollup.rollup();
+        if !rollup.enabled || self.config.mode == ServerMode::Reader {
+            return;
+        }
+        let state = self.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(rollup.interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    () = state.cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        let rolled = tokio::select! {
+                            () = state.cancellation.cancelled() => break,
+                            rolled = state.db.rollup(&rollup) => rolled,
+                        };
+                        if let Err(error) = rolled {
+                            tracing::warn!(%error, "Traces segment rollup failed");
+                        }
+                    }
+                }
+            }
+        });
+        self.tasks.lock().await.push(task);
     }
 
     async fn start_durable_flush_task(&self) {

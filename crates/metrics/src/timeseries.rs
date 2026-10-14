@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::Namespace;
-use crate::config::Config;
+use crate::config::{Config, RollupConfig};
 use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series, TimeBucket};
 use crate::storage::{Storage, StorageRead};
@@ -59,10 +60,84 @@ pub enum Visibility {
 /// ```
 pub struct TimeSeriesDb {
     storage: Arc<Storage>,
+    tenants: Arc<Tenants>,
+    rollup: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+}
+
+/// Each namespace's [`Tsdb`], created on first use.
+struct Tenants {
+    storage: Arc<Storage>,
     namespaces: RwLock<std::collections::HashMap<Namespace, Arc<Tsdb>>>,
     retention: Option<Duration>,
     write_buffer: common::coordinator::WriteCoordinatorConfig,
     query_cache: crate::config::QueryCacheConfig,
+}
+
+impl Tenants {
+    async fn get(&self, namespace: &Namespace) -> Arc<Tsdb> {
+        if let Some(tsdb) = self.namespaces.read().await.get(namespace).cloned() {
+            return tsdb;
+        }
+        let mut namespaces = self.namespaces.write().await;
+        namespaces
+            .entry(namespace.clone())
+            .or_insert_with(|| {
+                Arc::new(Tsdb::with_retention_scoped_and_buffer(
+                    namespace.clone(),
+                    Arc::clone(&self.storage),
+                    self.retention,
+                    self.write_buffer.clone(),
+                    self.query_cache,
+                ))
+            })
+            .clone()
+    }
+
+    async fn all(&self) -> Vec<Arc<Tsdb>> {
+        self.namespaces.read().await.values().cloned().collect()
+    }
+
+    /// One rollup pass over every namespace in storage.
+    async fn rollup(&self, config: &RollupConfig, now_ms: i64) -> Result<usize> {
+        let mut sealed = 0;
+        for namespace in self.storage.namespaces() {
+            sealed += self.get(&namespace).await.rollup(config, now_ms).await?;
+        }
+        Ok(sealed)
+    }
+}
+
+/// Runs [`Tenants::rollup`] every `config.interval` until `cancel` fires.
+fn spawn_rollup(
+    tenants: Arc<Tenants>,
+    config: RollupConfig,
+) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + config.interval,
+            config.interval,
+        );
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            // A pass cut short leaves at most an unsealed rollup bucket,
+            // which the next pass, or the next process, finishes.
+            tokio::select! {
+                () = stop.cancelled() => return,
+                result = tenants.rollup(&config, common::time::now_ms()) => {
+                    if let Err(err) = result {
+                        tracing::warn!(error = %err, "metrics rollup pass failed");
+                    }
+                }
+            }
+        }
+    });
+    (cancel, handle)
 }
 
 impl TimeSeriesDb {
@@ -115,13 +190,28 @@ impl TimeSeriesDb {
             )
             .await?,
         );
-        Ok(Self {
-            storage,
+        let tenants = Arc::new(Tenants {
+            storage: Arc::clone(&storage),
             namespaces: RwLock::new(std::collections::HashMap::new()),
             retention: config.retention,
             write_buffer: config.write_buffer,
             query_cache: config.query_cache,
+        });
+        let rollup = config
+            .rollup
+            .enabled
+            .then(|| spawn_rollup(Arc::clone(&tenants), config.rollup));
+        Ok(Self {
+            storage,
+            tenants,
+            rollup,
         })
+    }
+
+    /// Runs one rollup pass as of `now_ms`, returning the buckets sealed.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub async fn rollup_now(&self, config: &RollupConfig, now_ms: i64) -> Result<usize> {
+        self.tenants.rollup(config, now_ms).await
     }
 
     pub(crate) fn storage_read(&self) -> Storage {
@@ -129,22 +219,7 @@ impl TimeSeriesDb {
     }
 
     async fn tenant(&self, namespace: &Namespace) -> Arc<Tsdb> {
-        if let Some(tsdb) = self.namespaces.read().await.get(namespace).cloned() {
-            return tsdb;
-        }
-        let mut namespaces = self.namespaces.write().await;
-        namespaces
-            .entry(namespace.clone())
-            .or_insert_with(|| {
-                Arc::new(Tsdb::with_retention_scoped_and_buffer(
-                    namespace.clone(),
-                    Arc::clone(&self.storage),
-                    self.retention,
-                    self.write_buffer.clone(),
-                    self.query_cache,
-                ))
-            })
-            .clone()
+        self.tenants.get(namespace).await
     }
 
     pub(crate) async fn read_engine(&self, namespace: &Namespace) -> Arc<Tsdb> {
@@ -356,14 +431,7 @@ impl TimeSeriesDb {
     ///
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
-        let tenants = self
-            .namespaces
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for tsdb in tenants {
+        for tsdb in self.tenants.all().await {
             tsdb.flush_written().await?;
         }
         self.storage.flush().await?;
@@ -400,10 +468,22 @@ impl TimeSeriesDb {
     /// All written data is flushed to durable storage before the database is
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
-    pub async fn close(self) -> Result<()> {
+    pub async fn close(mut self) -> Result<()> {
+        if let Some((cancel, handle)) = self.rollup.take() {
+            cancel.cancel();
+            let _ = handle.await;
+        }
         self.flush().await?;
         self.storage.close().await?;
         Ok(())
+    }
+}
+
+impl Drop for TimeSeriesDb {
+    fn drop(&mut self) {
+        if let Some((cancel, _)) = &self.rollup {
+            cancel.cancel();
+        }
     }
 }
 

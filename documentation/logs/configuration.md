@@ -111,6 +111,14 @@ compaction:
   delete_delay_seconds: 600
   max_merges_per_flush: 256
 
+# Rollup of closed UTC days of segments into wider segments; see
+# [Segment rollup](../common/segment-rollup.md). Reader-mode servers never roll up.
+rollup:
+  enabled: true
+  max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
+  delay_seconds: 3600 # How long after a day ends before it is rolled up.
+  interval_seconds: 300 # How often closed days are looked for.
+
 # Bytes of object blocks kept in memory across queries, with their bodies
 # decompressed once a query needs them; one budget shared by every storage
 # shard of the process; 256 MiB, the default. 0 disables it.

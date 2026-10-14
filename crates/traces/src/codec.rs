@@ -16,7 +16,7 @@ use crate::{
 
 pub(crate) const KEY_VERSION: u8 = 7;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::TRACE;
-const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
+pub(crate) const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
 pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "traces-trace/v7";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
@@ -100,11 +100,17 @@ pub(crate) struct TraceHead {
     /// Pages written for the trace, added to in the batch that writes them,
     /// so a cached set of its continuations holding this many is current.
     pub pages: u32,
+    /// Discards every older operand: a rollup's copy of a single-page trace
+    /// becomes its only page, so the trace stays one point read.
+    pub replaces: bool,
 }
 
 /// Combines an older head with a newer one. Associative, as SlateDB
 /// requires: operands may be combined in any grouping.
 pub(crate) fn merge_heads(older: TraceHead, newer: TraceHead) -> TraceHead {
+    if newer.replaces {
+        return newer;
+    }
     let expires_at_unix_ms = older
         .first
         .expires_at_unix_ms
@@ -117,6 +123,7 @@ pub(crate) fn merge_heads(older: TraceHead, newer: TraceHead) -> TraceHead {
         },
         continued: true,
         pages: older.pages.saturating_add(newer.pages),
+        replaces: older.replaces,
     }
 }
 
@@ -144,6 +151,8 @@ impl TraceLocator {
 /// `None` for unbounded segments and foreign prefixes.
 pub(crate) fn segment_span(prefix: &[u8]) -> Option<(i64, i64)> {
     let (_, segment, _) = KEY_SCOPE.parse(prefix).ok()?;
+    // A rollup marker spans its rollup segment.
+    let segment = common::storage::rollup::data_segment(segment);
     let end_ns = segment.end_ns()?;
     Some((
         segment.start_ns.div_euclid(1_000_000),
@@ -386,12 +395,16 @@ pub(crate) fn decode_locator(value: &[u8]) -> Result<TraceLocator> {
 }
 
 const HEAD_CONTINUED: u8 = 1;
+const HEAD_REPLACES: u8 = 2;
 
 /// `locator │ pages: u32 BE │ flags: u8`.
 pub(crate) fn encode_head(value: &TraceHead) -> Result<Bytes> {
     let mut bytes = BytesMut::from(encode_locator(&value.first)?.as_ref());
     bytes.put_u32(value.pages);
-    bytes.put_u8(if value.continued { HEAD_CONTINUED } else { 0 });
+    bytes.put_u8(
+        (if value.continued { HEAD_CONTINUED } else { 0 })
+            | (if value.replaces { HEAD_REPLACES } else { 0 }),
+    );
     Ok(bytes.freeze())
 }
 
@@ -399,7 +412,7 @@ pub(crate) fn decode_head(value: &[u8]) -> Result<TraceHead> {
     let (&flags, rest) = value
         .split_last()
         .ok_or_else(|| Error::Corrupt("empty trace head".to_owned()))?;
-    if flags & !HEAD_CONTINUED != 0 {
+    if flags & !(HEAD_CONTINUED | HEAD_REPLACES) != 0 {
         return Err(Error::Corrupt(format!("unknown trace head flags {flags}")));
     }
     let (locator, pages) = rest
@@ -409,6 +422,7 @@ pub(crate) fn decode_head(value: &[u8]) -> Result<TraceHead> {
         first: decode_locator(locator)?,
         continued: flags & HEAD_CONTINUED != 0,
         pages: u32::from_be_bytes(*pages),
+        replaces: flags & HEAD_REPLACES != 0,
     })
 }
 
@@ -731,6 +745,7 @@ mod tests {
             },
             continued: pages > 1,
             pages,
+            replaces: false,
         };
         let (a, b, c) = (
             head(1, Some(30), 1),
@@ -778,12 +793,13 @@ mod tests {
                 decode_locator(&encode_locator(&locator).unwrap()).unwrap(),
                 locator
             );
-            for continued in [false, true] {
+            for (continued, replaces) in [(false, false), (true, false), (false, true)] {
                 for pages in [1, u32::MAX] {
                     let head = TraceHead {
                         first: locator,
                         continued,
                         pages,
+                        replaces,
                     };
                     assert_eq!(decode_head(&encode_head(&head).unwrap()).unwrap(), head);
                 }

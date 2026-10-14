@@ -58,6 +58,7 @@ mod tests {
             },
             continued: pages > 1,
             pages,
+            replaces: false,
         }
     }
 
@@ -78,6 +79,27 @@ mod tests {
         assert_eq!(merged.first.expires_at_unix_ms, Some(3));
         assert_eq!(merged.pages, 4);
         assert!(merged.continued);
+    }
+
+    #[test]
+    fn a_replacing_head_discards_older_operands_in_any_grouping() {
+        let key = head_key(&Namespace::default(), TraceId::new([1; 16]).unwrap());
+        let operator = TracesMergeOperator;
+        let replacing = encode_head(&TraceHead {
+            replaces: true,
+            ..head(7, 1)
+        })
+        .unwrap();
+        let operands = [encoded(2, 2), replacing, encoded(3, 1)];
+        let all = operator.merge_batch(&key, Some(encoded(1, 1)), &operands);
+        let older = operator.merge_batch(&key, Some(encoded(1, 1)), &operands[..1]);
+        let newer = operator.merge_batch(&key, None, &operands[1..]);
+        assert_eq!(all, operator.merge_batch(&key, Some(older), &[newer]));
+        let merged = decode_head(&all).unwrap();
+        assert_eq!(merged.first.page_sequence, 7);
+        assert_eq!(merged.pages, 2);
+        assert!(merged.continued);
+        assert!(merged.replaces);
     }
 
     #[test]

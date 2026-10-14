@@ -18,20 +18,24 @@ pub(super) struct TraceWrite {
     pub(super) namespace: Namespace,
     pub(super) groups: BTreeMap<SegmentId, Vec<Trace>>,
     pub(super) report: WriteReport,
+    /// Traces whose head this write replaces rather than adds to.
+    pub(super) rebased: Vec<TraceId>,
 }
 
 type TraceGroup = (Namespace, SegmentId);
+type Rebased = HashSet<(Namespace, TraceId)>;
 
 #[derive(Default)]
 pub(super) struct TraceWriteDelta {
     groups: BTreeMap<TraceGroup, Vec<Trace>>,
+    rebased: Rebased,
     estimated_size: usize,
 }
 
 impl Delta for TraceWriteDelta {
     type Context = ();
     type Write = TraceWrite;
-    type Frozen = BTreeMap<TraceGroup, Vec<Trace>>;
+    type Frozen = (BTreeMap<TraceGroup, Vec<Trace>>, Rebased);
     type FrozenView = ();
     type ApplyResult = WriteReport;
     type DeltaView = ();
@@ -42,6 +46,12 @@ impl Delta for TraceWriteDelta {
     }
 
     fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
+        self.rebased.extend(
+            write
+                .rebased
+                .into_iter()
+                .map(|trace_id| (write.namespace.clone(), trace_id)),
+        );
         for (segment, traces) in write.groups {
             self.estimated_size = self.estimated_size.saturating_add(
                 traces
@@ -66,7 +76,7 @@ impl Delta for TraceWriteDelta {
         for traces in self.groups.values_mut() {
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
-        (self.groups, (), ())
+        ((self.groups, self.rebased), (), ())
     }
 
     fn reader(&self) -> Self::DeltaView {}
@@ -99,11 +109,11 @@ type FlushHeads = HashMap<Namespace, HashMap<TraceId, TraceHead>>;
 impl Flusher<TraceWriteDelta> for TraceFlusher {
     async fn flush_delta(
         &mut self,
-        frozen: BTreeMap<TraceGroup, Vec<Trace>>,
+        (groups, rebased): <TraceWriteDelta as Delta>::Frozen,
         _epoch_range: &Range<u64>,
     ) -> std::result::Result<(), String> {
         let (pages, written) = self
-            .direct_write(frozen)
+            .direct_write(groups, &rebased)
             .await
             .map_err(|error| error.to_string())?;
         self.read_cache.invalidate_traces(written).await;
@@ -174,6 +184,7 @@ impl TraceFlusher {
     async fn direct_write(
         &mut self,
         groups: BTreeMap<TraceGroup, Vec<Trace>>,
+        rebased: &Rebased,
     ) -> Result<(usize, Vec<(Namespace, TraceId)>)> {
         if groups.is_empty() {
             return Ok((0, Vec::new()));
@@ -217,7 +228,8 @@ impl TraceFlusher {
         }
         let mut written = Vec::new();
         for (namespace, heads) in heads {
-            for (trace_id, head) in heads {
+            for (trace_id, mut head) in heads {
+                head.replaces = rebased.contains(&(namespace.clone(), trace_id));
                 ops.push(RecordOp::merge_with_ttl(
                     head_key(&namespace, trace_id),
                     encode_head(&head)?,
@@ -257,7 +269,10 @@ fn append_segment(
         .map(|trace| segment_for(trace.timestamp_range().1, segment_ns))
         .max()
         .unwrap_or(segment);
-    if last_segment > segment {
+    if segment
+        .end_ns()
+        .is_some_and(|end_ns| last_segment.start_ns >= end_ns)
+    {
         partition_catalog.insert(
             PARTITION_SCOPE,
             PARTITION_EXTENT_NAME,
@@ -301,7 +316,7 @@ fn append_segment(
     Ok(pages)
 }
 
-fn retention_values(retention: Option<Duration>) -> Result<Retention> {
+pub(super) fn retention_values(retention: Option<Duration>) -> Result<Retention> {
     let physical_ttl = retention
         .map(|duration| {
             u64::try_from(duration.as_millis())
@@ -364,6 +379,7 @@ fn record_page(
                 first: here,
                 continued: false,
                 pages: 1,
+                replaces: false,
             });
             Ok(false)
         }

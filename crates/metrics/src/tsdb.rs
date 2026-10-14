@@ -8,7 +8,7 @@ use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::error;
 
 use crate::Namespace;
@@ -18,7 +18,7 @@ use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{ForwardIndexCache, MiniQueryReader, MiniTsdb, SeriesCache};
 use crate::model::{
     Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Series, SeriesId,
-    TimeBucket,
+    TimeBucket, visible_buckets,
 };
 use crate::postings_cache::PostingsCache;
 use crate::query::{BucketQueryReader, QueryReader};
@@ -30,6 +30,7 @@ mod discovery;
 mod engine;
 mod execute;
 mod preload;
+mod rollup;
 
 pub(crate) use discovery::*;
 pub(crate) use engine::*;
@@ -261,6 +262,14 @@ pub(crate) struct Tsdb {
     /// coordinators for the same bucket.
     bucket_creation: Mutex<()>,
 
+    /// Buckets wider than an hour in storage, sealed or still being filled
+    /// by a rollup. A write to an hour one covers goes to it instead. Held
+    /// for read across each ingest, so a rollup taking it for write knows no
+    /// write to the hours it drains is in flight.
+    rolled: RwLock<HashSet<TimeBucket>>,
+    /// One rollup at a time.
+    rollup_lock: Mutex<()>,
+
     /// Retention duration plumbed into each `MiniTsdb` so the flusher can
     /// stamp records with a bucket-aligned `Ttl::ExpireAt`. `None` disables
     /// per-record expiration.
@@ -314,6 +323,12 @@ impl Tsdb {
             .build();
 
         let active_series = Arc::new(ActiveSeriesTracker::new(current_unix_minute()));
+        let (buckets, sealed) = storage.segments(&namespace);
+        let rolled = buckets
+            .into_iter()
+            .chain(sealed)
+            .filter(|bucket| bucket.size > 1)
+            .collect();
 
         Self {
             namespace,
@@ -321,6 +336,8 @@ impl Tsdb {
             ingest_cache,
             discovery_cache: crate::discovery::MetricsDiscoveryCache::new(),
             bucket_creation: Mutex::new(()),
+            rolled: RwLock::new(rolled),
+            rollup_lock: Mutex::new(()),
             retention,
             write_buffer,
             active_series,
@@ -395,7 +412,7 @@ impl Tsdb {
                 buckets.push(bucket);
             }
         }
-        buckets.sort_by_key(|bucket| bucket.start);
+        let buckets = self.visible(&snapshot, buckets).await;
 
         let readers = self.build_readers(&snapshot, read_at, buckets).await;
         Ok(TsdbQueryReader::new(readers))
@@ -430,13 +447,27 @@ impl Tsdb {
                 buckets.push(bucket);
             }
         }
-        buckets.sort_by_key(|bucket| bucket.start);
+        let buckets = self.visible(&snapshot, buckets).await;
 
         let readers = {
             let _g = crate::promql::trace::Scope::enter("build_readers");
             self.build_readers(&snapshot, read_at, buckets).await
         };
         Ok(TsdbQueryReader::new(readers))
+    }
+
+    /// `buckets` as reads over `snapshot` see them, sorted by start: an
+    /// ingest-cache bucket may be a rollup not yet sealed, or an hour one
+    /// has replaced.
+    async fn visible(
+        &self,
+        snapshot: &StorageSnapshot,
+        buckets: Vec<TimeBucket>,
+    ) -> Vec<TimeBucket> {
+        let (_, sealed) = snapshot.bucket_segments(&self.namespace).await;
+        let mut buckets = visible_buckets(buckets, &sealed);
+        buckets.sort_by_key(|bucket| bucket.start);
+        buckets
     }
 
     /// Build a reader over `snapshot` for each bucket. `read_at` is the
@@ -525,6 +556,7 @@ impl Tsdb {
         if !series_list.is_empty() {
             self.discovery_cache.clear();
         }
+        let rolled = self.rolled.read().await;
         let mut bucket_series_map: HashMap<TimeBucket, Vec<Series>> = HashMap::new();
         let mut total_samples = 0;
 
@@ -536,7 +568,13 @@ impl Tsdb {
                     std::time::UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms as u64),
                 )
             })?;
-            for (bucket, series) in partitions {
+            for (hour, series) in partitions {
+                let bucket = rolled
+                    .iter()
+                    .filter(|wide| wide.covers(&hour))
+                    .max_by_key(|wide| wide.size)
+                    .copied()
+                    .unwrap_or(hour);
                 bucket_series_map.entry(bucket).or_default().push(series);
             }
         }

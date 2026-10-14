@@ -63,6 +63,40 @@ pub struct Config {
 
     /// Concurrency and memory limits shared by every query the process runs.
     pub query_limits: crate::QueryLimitsConfig,
+
+    /// Background rollup of closed hour buckets into wider buckets.
+    pub rollup: RollupConfig,
+}
+
+/// Background rollup of closed hour buckets into wider buckets.
+///
+/// Once a day is `delay` past its end, its hours are re-written into the
+/// fewest aligned buckets of 24, 12, 8, 6, 4, 3 or 2 hours whose stored size
+/// stays within `max_bucket_bytes`, so a query over the day opens a few
+/// segments instead of 24. Hours too large to share a bucket stay as they
+/// are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollupConfig {
+    pub enabled: bool,
+    /// Largest stored size, summed over the covered hours, of a rollup
+    /// bucket.
+    pub max_bucket_bytes: u64,
+    /// How long after a day ends before its hours are rolled up, leaving
+    /// room for late samples.
+    pub delay: Duration,
+    /// How often to look for days to roll up.
+    pub interval: Duration,
+}
+
+impl Default for RollupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bucket_bytes: 4 << 30,
+            delay: Duration::from_secs(60 * 60),
+            interval: Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 /// Default [`Config::retention`]: 60 days.
@@ -119,6 +153,7 @@ impl Default for Config {
             write_buffer: WriteCoordinatorConfig::default(),
             query_cache: QueryCacheConfig::default(),
             query_limits: crate::QueryLimitsConfig::default(),
+            rollup: RollupConfig::default(),
         }
     }
 }

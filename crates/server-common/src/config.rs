@@ -63,3 +63,39 @@ impl WriteConfig {
         }
     }
 }
+
+/// Background rollup of closed time segments into wider ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SegmentRollupConfig {
+    pub enabled: bool,
+    /// Largest rollup segment, by the stored size of what it covers.
+    pub max_segment_bytes: u64,
+    /// How long after a day ends before its segments are rolled up.
+    pub delay_seconds: u64,
+    /// How often to look for days to roll up.
+    pub interval_seconds: u64,
+}
+
+impl Default for SegmentRollupConfig {
+    fn default() -> Self {
+        let defaults = common::storage::rollup::RollupConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            max_segment_bytes: defaults.max_segment_bytes,
+            delay_seconds: defaults.delay.as_secs(),
+            interval_seconds: defaults.interval.as_secs(),
+        }
+    }
+}
+
+impl SegmentRollupConfig {
+    pub fn rollup(&self) -> common::storage::rollup::RollupConfig {
+        common::storage::rollup::RollupConfig {
+            enabled: self.enabled,
+            max_segment_bytes: self.max_segment_bytes,
+            delay: Duration::from_secs(self.delay_seconds),
+            interval: Duration::from_secs(self.interval_seconds.max(1)),
+        }
+    }
+}

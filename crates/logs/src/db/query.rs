@@ -37,7 +37,7 @@ impl LogDb {
     ) -> Result<Vec<String>> {
         self.validate_discovery_range(start_ns, end_ns)?;
         let per_partition: Vec<_> =
-            futures::stream::iter(self.discovery_partitions(start_ns, end_ns)?)
+            futures::stream::iter(self.visible_partitions(namespace, start_ns, end_ns)?)
                 .map(|partition| self.partition_label_names(namespace, partition))
                 .buffer_unordered(SEGMENT_DISCOVERY_CONCURRENCY)
                 .try_collect()
@@ -106,7 +106,7 @@ impl LogDb {
     ) -> Result<Vec<String>> {
         self.validate_discovery_range(start_ns, end_ns)?;
         let per_partition: Vec<_> =
-            futures::stream::iter(self.discovery_partitions(start_ns, end_ns)?)
+            futures::stream::iter(self.visible_partitions(namespace, start_ns, end_ns)?)
                 .map(|partition| self.partition_label_values(namespace, partition, name))
                 .buffer_unordered(SEGMENT_DISCOVERY_CONCURRENCY)
                 .try_collect()
@@ -171,7 +171,7 @@ impl LogDb {
             .collect::<Vec<_>>();
         let exact_sets = &exact_sets;
         let per_partition: Vec<Vec<(Vec<Label>, SegmentSeries)>> =
-            futures::stream::iter(self.discovery_partitions(start_ns, end_ns)?)
+            futures::stream::iter(self.visible_partitions(namespace, start_ns, end_ns)?)
                 .map(|partition| async move {
                     let version = self.partition_version(namespace, partition).await?;
                     let names = self
@@ -392,22 +392,128 @@ impl LogDb {
         filter: &StreamFilter,
     ) -> Result<ScanTargets> {
         let now_unix_ms = unix_time_ms()?;
-        let segments = futures::stream::iter(self.segment_ids((start_ns, end_ns), false)?)
-            .map(|segment| async move {
-                let streams = self
-                    .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
-                    .await?;
-                Ok::<_, Error>((segment, streams))
-            })
-            .buffered(SEGMENT_LIST_CONCURRENCY)
-            .try_collect()
-            .await?;
+        let segments = futures::stream::iter(self.visible_segment_ids(
+            namespace,
+            (start_ns, end_ns),
+            false,
+        )?)
+        .map(|segment| async move {
+            let streams = self
+                .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
+                .await?;
+            Ok::<_, Error>((segment, streams))
+        })
+        .buffered(SEGMENT_LIST_CONCURRENCY)
+        .try_collect()
+        .await?;
         Ok(ScanTargets {
             range: (start_ns, end_ns),
             segments,
             line_terms: filter.line_terms.clone(),
             first_ordinal: 0,
         })
+    }
+
+    /// The rollup markers of `namespace`, which decide which segments reads
+    /// use.
+    pub(super) fn rollups(&self, namespace: &Namespace) -> Rollups {
+        Rollups::markers(
+            self.storage.slate_read().as_ref(),
+            crate::codec::KEY_SCOPE,
+            namespace,
+        )
+    }
+
+    /// [`Self::segment_ids`], each covered segment replaced by its sealed
+    /// rollup.
+    pub(super) fn visible_segment_ids(
+        &self,
+        namespace: &Namespace,
+        range: (i64, i64),
+        reverse: bool,
+    ) -> Result<Vec<SegmentId>> {
+        let segments = self.segment_ids(range, false)?;
+        let rollups = self.rollups(namespace);
+        if rollups.is_empty() {
+            return Ok(if reverse {
+                segments.into_iter().rev().collect()
+            } else {
+                segments
+            });
+        }
+        let mut visible = rollups.visible(segments);
+        if reverse {
+            visible.reverse();
+        }
+        Ok(visible)
+    }
+
+    /// [`Self::discovery_partitions`], each covered segment replaced by its
+    /// sealed rollup.
+    pub(super) fn visible_partitions(
+        &self,
+        namespace: &Namespace,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Vec<Partition>> {
+        let partitions = self.discovery_partitions(start_ns, end_ns)?;
+        let rollups = self.rollups(namespace);
+        if rollups.is_empty() {
+            return Ok(partitions);
+        }
+        let mut visible = Vec::with_capacity(partitions.len());
+        for partition in partitions {
+            let partition = match partition {
+                Partition::Segment(segment) => {
+                    Partition::Segment(rollups.sealed_cover(segment).unwrap_or(segment))
+                }
+                rollup @ Partition::Rollup(_) => rollup,
+            };
+            if !visible.contains(&partition) {
+                visible.push(partition);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Every stream of `segment` with live rows, in reads of at most
+    /// `streams` streams each.
+    pub(super) async fn segment_reads(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        streams: usize,
+    ) -> Result<Vec<ScanTargets>> {
+        let range = (
+            segment.start_ns,
+            segment
+                .start_ns
+                .saturating_add(segment.width_ns)
+                .saturating_sub(1),
+        );
+        let found = self
+            .segment_streams(
+                namespace,
+                segment,
+                &StreamFilter::exact(Vec::new()),
+                range,
+                unix_time_ms()?,
+            )
+            .await?;
+        let mut found = found
+            .into_iter()
+            .filter(|stream| !stream.runs.is_empty())
+            .peekable();
+        let mut reads = Vec::new();
+        while found.peek().is_some() {
+            reads.push(ScanTargets {
+                range,
+                segments: vec![(segment, found.by_ref().take(streams.max(1)).collect())],
+                line_terms: None,
+                first_ordinal: 0,
+            });
+        }
+        Ok(reads)
     }
 
     /// Segments covering `[start_ns, end_ns]` in scan order.
@@ -559,7 +665,7 @@ impl LogDb {
             self.segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
         };
         let mut segments = self
-            .segment_ids((start_ns, end_ns), reverse)?
+            .visible_segment_ids(namespace, (start_ns, end_ns), reverse)?
             .into_iter()
             .enumerate();
         let Some(mut segment) = segments.next() else {

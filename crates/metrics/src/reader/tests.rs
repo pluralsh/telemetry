@@ -259,6 +259,7 @@ async fn slatedb_writer_and_reader_coexist_no_fencing() {
         write_buffer: Default::default(),
         query_cache: Default::default(),
         query_limits: Default::default(),
+        rollup: Default::default(),
     })
     .await
     .unwrap();
@@ -395,6 +396,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         write_buffer: Default::default(),
         query_cache: Default::default(),
         query_limits: Default::default(),
+        rollup: Default::default(),
     })
     .await
     .unwrap();
@@ -421,6 +423,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         write_buffer: Default::default(),
         query_cache: Default::default(),
         query_limits: Default::default(),
+        rollup: Default::default(),
     })
     .await
     .unwrap();
@@ -584,6 +587,7 @@ async fn should_open_reader_pinned_to_checkpoint() {
         write_buffer: Default::default(),
         query_cache: Default::default(),
         query_limits: Default::default(),
+        rollup: Default::default(),
     })
     .await
     .unwrap();

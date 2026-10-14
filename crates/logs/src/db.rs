@@ -20,6 +20,7 @@ use common::discovery::{
     CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
 use common::storage::compaction::SegmentCompaction;
+use common::storage::rollup::Rollups;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
     BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
@@ -54,6 +55,7 @@ use crate::search::{
 
 mod block_cache;
 mod query;
+mod rollup;
 mod write;
 
 pub(crate) use block_cache::BlockCache;
@@ -181,6 +183,13 @@ pub struct LogDb {
     span_scan_min_streams: usize,
     /// [`SPAN_SCAN_MAX_SPREAD`], overridable for profiling.
     span_scan_max_spread: usize,
+    /// Rollup segments, pending or sealed, that take the writes of the
+    /// segments they cover. Ingest holds the read lock until its write is
+    /// applied, so a rollup holding the write lock sees none in flight.
+    rolled: tokio::sync::RwLock<HashMap<Namespace, BTreeSet<SegmentId>>>,
+    /// Serializes rollup passes.
+    rollup_lock: Mutex<()>,
+    retention: Option<Duration>,
 }
 
 /// Where discovery reads one slice of a time range from.
@@ -271,12 +280,29 @@ impl LogDb {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(storage_semantics().with_segment_compaction(
-                SegmentCompaction::new(crate::codec::segment_span).with_retention(config.retention),
-            ))
+            .with_semantics(
+                storage_semantics().with_segment_compaction(
+                    SegmentCompaction::new(crate::codec::segment_span)
+                        .with_retention(config.retention)
+                        .with_superseded(common::storage::rollup::superseded(
+                            crate::codec::KEY_SCOPE,
+                            segment_ns,
+                        )),
+                ),
+            )
             .build()
             .await?;
         let storage_read = storage.clone();
+        let rolled = storage_read
+            .slate_read()
+            .map(|slate| {
+                Rollups::load_all(&slate, crate::codec::KEY_SCOPE)
+                    .into_iter()
+                    .map(|(namespace, rollups)| (namespace, rollups.routed()))
+                    .filter(|(_, routed)| !routed.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let rollup_ns = config.discovery_rollup.map(duration_ns).transpose()?;
         let direct_writer = DirectWriter::new(
             storage_read.clone(),
@@ -317,6 +343,9 @@ impl LogDb {
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
+            rolled: tokio::sync::RwLock::new(rolled),
+            rollup_lock: Mutex::new(()),
+            retention: config.retention,
         })
     }
 
@@ -413,6 +442,9 @@ impl LogDb {
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
+            rolled: tokio::sync::RwLock::new(HashMap::new()),
+            rollup_lock: Mutex::new(()),
+            retention: config.retention,
         })
     }
 
@@ -444,39 +476,73 @@ impl LogDb {
         batches: Vec<LogBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
-        let groups = group_by_stream(batches, self.segment_ns)?;
+        let rolled = self.rolled.read().await;
+        let routed = rolled.get(namespace);
+        let groups = group_by_stream(batches, self.segment_ns, |segment| {
+            routed
+                .and_then(|routed| {
+                    routed
+                        .iter()
+                        .filter(|wide| {
+                            wide.start_ns <= segment.start_ns
+                                && segment.start_ns < wide.start_ns.saturating_add(wide.width_ns)
+                        })
+                        .max_by_key(|wide| wide.width_ns)
+                        .copied()
+                })
+                .unwrap_or(segment)
+        })?;
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
-        let write = LogsWrite {
-            namespace: namespace.clone(),
-            groups,
-        };
-        let mut write_handle = self
-            .write_handle()?
-            .try_write(write)
-            .await
-            .map_err(map_write_error)?;
-        let report = write_handle
-            .wait(CoordinatorDurability::Applied)
-            .await
-            .map_err(map_write_error)?;
+        let report = self.apply_groups(namespace, groups, None).await?;
+        drop(rolled);
 
         if durability != Durability::Applied {
-            let mut flush_handle = self
-                .write_handle()?
-                .flush(false)
-                .await
-                .map_err(map_write_error)?;
-            flush_handle
-                .wait(CoordinatorDurability::Written)
-                .await
-                .map_err(map_write_error)?;
+            self.flush_written().await?;
         }
         if durability == Durability::Durable {
             self.writer()?.flush().await?;
         }
         Ok(report)
+    }
+
+    /// Applies `groups` to the write delta, waiting up to `wait` for room
+    /// in the queue, or failing at once without it.
+    async fn apply_groups(
+        &self,
+        namespace: &Namespace,
+        groups: StreamGroups,
+        wait: Option<Duration>,
+    ) -> Result<WriteReport> {
+        let write = LogsWrite {
+            namespace: namespace.clone(),
+            groups,
+        };
+        let handle = self.write_handle()?;
+        let mut write_handle = match wait {
+            Some(timeout) => handle.write_timeout(write, timeout).await,
+            None => handle.try_write(write).await,
+        }
+        .map_err(map_write_error)?;
+        write_handle
+            .wait(CoordinatorDurability::Applied)
+            .await
+            .map_err(map_write_error)
+    }
+
+    /// Writes every applied delta to storage.
+    async fn flush_written(&self) -> Result<()> {
+        let mut flush_handle = self
+            .write_handle()?
+            .flush(false)
+            .await
+            .map_err(map_write_error)?;
+        flush_handle
+            .wait(CoordinatorDurability::Written)
+            .await
+            .map_err(map_write_error)?;
+        Ok(())
     }
 }
 

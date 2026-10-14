@@ -11,8 +11,11 @@
 //! ```text
 //! cargo bench -p plural-metrics --features bench-internals --bench cold_read -- \
 //!     [--hours H] [--pods N] [--latency-ms MS] [--mib-per-sec N] [--step SECS] \
-//!     [--query NAME|all] [--trace] [--repeat N] [--writes-per-hour W]
+//!     [--query NAME|all] [--trace] [--repeat N] [--writes-per-hour W] [--rollup]
 //! ```
+//!
+//! `--rollup` rolls the loaded hours up into wider buckets, as the writer
+//! does once a day closes, before the reader opens.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +28,9 @@ use common::storage::config::{
 };
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use plural_metrics::bench_support::{open_reader_over, reader_query_range_traced, storage_layout};
-use plural_metrics::{Config, Label, MetricType, Namespace, Sample, Series, TimeSeriesDb};
+use plural_metrics::{
+    Config, Label, MetricType, Namespace, RollupConfig, Sample, Series, TimeSeriesDb,
+};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -79,6 +84,7 @@ struct Args {
     /// Writes per series per hour: 1 is a fully compacted bucket; more
     /// model a live writer, each write a merge operand per series.
     writes_per_hour: i64,
+    rollup: bool,
 }
 
 fn parse_args() -> Args {
@@ -92,6 +98,7 @@ fn parse_args() -> Args {
         trace: false,
         repeat: 0,
         writes_per_hour: 1,
+        rollup: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -110,6 +117,7 @@ fn parse_args() -> Args {
             "--writes-per-hour" => {
                 args.writes_per_hour = value().parse().expect("writes per hour");
             }
+            "--rollup" => args.rollup = true,
             "--bench" => {}
             other => panic!("unknown argument {other}"),
         }
@@ -238,6 +246,10 @@ async fn load(storage: &SlateDbStorageConfig, args: &Args) -> usize {
     let writer = TimeSeriesDb::open(Config {
         storage: storage.clone(),
         retention: None,
+        rollup: RollupConfig {
+            enabled: false,
+            ..RollupConfig::default()
+        },
         ..Default::default()
     })
     .await
@@ -274,6 +286,20 @@ async fn load(storage: &SlateDbStorageConfig, args: &Args) -> usize {
         writer.flush().await.expect("flush");
     }
     settle(&writer).await;
+    if args.rollup {
+        let start = Instant::now();
+        let day_ms = 24 * HOUR_MS;
+        let last_day_end = (T0_MS + args.hours * HOUR_MS + day_ms - 1) / day_ms * day_ms;
+        let sealed = writer
+            .rollup_now(&RollupConfig::default(), last_day_end + 2 * HOUR_MS)
+            .await
+            .expect("rollup");
+        println!(
+            "rollup: sealed={sealed} in {:.1}s",
+            start.elapsed().as_secs_f64()
+        );
+        settle(&writer).await;
+    }
     let (segments, l0, runs, run_ssts) = storage_layout(&writer);
     println!("layout: segments={segments} l0_ssts={l0} sorted_runs={runs} run_ssts={run_ssts}");
     writer.close().await.expect("close writer");

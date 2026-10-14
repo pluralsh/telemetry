@@ -16,6 +16,9 @@
 //!   the segment is merged again.
 //! - **Drain**: once both the segment's end and its newest SST are older
 //!   than the retention, drop the segment without rewriting it.
+//! - **Supersede**: with a [`Superseded`] hook, drop a segment the hook
+//!   reports as superseded (every record it holds is held by another
+//!   segment), also without rewriting it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -32,15 +35,30 @@ use slatedb::config::CompactorOptions;
 /// for a segment that isn't bounded in time.
 pub type SegmentSpan = fn(&[u8]) -> Option<(i64, i64)>;
 
+/// Whether the segment with this prefix is superseded, given a test for
+/// which segment prefixes are live in the manifest.
+pub type Superseded = Arc<dyn Fn(&[u8], &dyn Fn(&[u8]) -> bool) -> bool + Send + Sync>;
+
 /// Default delay between a segment ending and it being merged.
 pub const DEFAULT_MERGE_GRACE: Duration = Duration::from_secs(30 * 60);
 
 /// Segment-aware compaction policy for one database.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SegmentCompaction {
     span: SegmentSpan,
     grace: Duration,
     retention: Option<Duration>,
+    superseded: Option<Superseded>,
+}
+
+impl std::fmt::Debug for SegmentCompaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentCompaction")
+            .field("grace", &self.grace)
+            .field("retention", &self.retention)
+            .field("superseded", &self.superseded.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SegmentCompaction {
@@ -49,7 +67,14 @@ impl SegmentCompaction {
             span,
             grace: DEFAULT_MERGE_GRACE,
             retention: None,
+            superseded: None,
         }
+    }
+
+    /// Drops segments `superseded` reports as superseded.
+    pub fn with_superseded(mut self, superseded: Superseded) -> Self {
+        self.superseded = Some(superseded);
+        self
     }
 
     /// How long after a segment ends before it's merged into one run.
@@ -176,7 +201,12 @@ impl CompactionScheduler for Scheduler {
         for planned in plan(&self.policy, now_ms, &segments, &busy, slots, next_run) {
             let kind = match planned {
                 Planned::Merge { .. } => "merge",
-                Planned::Drain { .. } => "drain",
+                Planned::Drain {
+                    superseded: false, ..
+                } => "drain",
+                Planned::Drain {
+                    superseded: true, ..
+                } => "supersede",
             };
             metrics::counter!(
                 "storage_segment_compactions_total",
@@ -231,6 +261,8 @@ enum Planned {
     Drain {
         prefix: Bytes,
         sources: Vec<SourceId>,
+        /// Dropped because it is superseded rather than expired.
+        superseded: bool,
     },
 }
 
@@ -242,7 +274,9 @@ impl Planned {
                 sources,
                 destination,
             } => CompactionSpec::for_segment(prefix, sources, destination),
-            Planned::Drain { prefix, sources } => CompactionSpec::drain_segment(prefix, sources),
+            Planned::Drain {
+                prefix, sources, ..
+            } => CompactionSpec::drain_segment(prefix, sources),
         }
     }
 }
@@ -258,13 +292,29 @@ fn plan(
     mut next_run: u32,
 ) -> Vec<Planned> {
     let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-    let mut candidates: Vec<(i64, &SegmentState)> = segments
+    let live = |segment: &&SegmentState| !segment.l0.is_empty() || !segment.runs.is_empty();
+    let present: HashSet<&[u8]> = segments
+        .iter()
+        .filter(live)
+        .map(|segment| segment.prefix.as_ref())
+        .collect();
+    let is_present = |prefix: &[u8]| present.contains(prefix);
+    let superseded = |segment: &SegmentState| {
+        policy
+            .superseded
+            .as_ref()
+            .is_some_and(|superseded| superseded(&segment.prefix, &is_present))
+    };
+    let mut candidates: Vec<(i64, bool, &SegmentState)> = segments
         .iter()
         .filter(|segment| !busy.contains(&segment.prefix))
-        .filter(|segment| !segment.l0.is_empty() || !segment.runs.is_empty())
-        .filter_map(|segment| Some(((policy.span)(&segment.prefix)?.1, segment)))
+        .filter(live)
+        .filter_map(|segment| {
+            let end_ms = (policy.span)(&segment.prefix)?.1;
+            Some((end_ms, superseded(segment), segment))
+        })
         .collect();
-    candidates.sort_by_key(|(end_ms, _)| *end_ms);
+    candidates.sort_by_key(|(end_ms, _, _)| *end_ms);
 
     let expired = |end_ms: i64, segment: &SegmentState| {
         policy.retention.is_some_and(|retention| {
@@ -281,15 +331,18 @@ fn plan(
 
     let drains = candidates
         .iter()
-        .filter(|(end_ms, segment)| expired(*end_ms, segment))
-        .map(|(_, segment)| Planned::Drain {
+        .filter(|(end_ms, superseded, segment)| *superseded || expired(*end_ms, segment))
+        .map(|(end_ms, superseded, segment)| Planned::Drain {
             prefix: segment.prefix.clone(),
             sources: segment.sources(),
+            superseded: *superseded && !expired(*end_ms, segment),
         });
     let merges = candidates
         .iter()
-        .filter(|(end_ms, segment)| !expired(*end_ms, segment) && mergeable(*end_ms, segment))
-        .map(|(_, segment)| {
+        .filter(|(end_ms, superseded, segment)| {
+            !superseded && !expired(*end_ms, segment) && mergeable(*end_ms, segment)
+        })
+        .map(|(_, _, segment)| {
             let destination = match segment.runs.iter().min() {
                 Some(id) => *id,
                 None => {
@@ -417,6 +470,36 @@ mod tests {
             prefixes(&plan(&policy, at_hour(7.0), &segments, &none, 4, 10)),
             vec![("drain", 1), ("drain", 2)]
         );
+    }
+
+    /// Prefix `[hour]` is superseded once a seal `[hour | 0x80]` is live.
+    fn sealed(prefix: &[u8], present: &dyn Fn(&[u8]) -> bool) -> bool {
+        prefix
+            .first()
+            .is_some_and(|hour| *hour < 0x80 && present(&[hour | 0x80]))
+    }
+
+    #[test]
+    fn drops_superseded_segments_instead_of_merging_them() {
+        let policy = policy().with_superseded(Arc::new(sealed));
+        let segments = [
+            segment(1, 2, &[3], 0),
+            segment(2, 2, &[4], 0),
+            segment(0x81, 1, &[], 0),
+        ];
+        let planned = plan(&policy, at_hour(10.0), &segments, &HashSet::new(), 4, 10);
+        assert_eq!(prefixes(&planned), vec![("drain", 1), ("merge", 2)]);
+        assert!(matches!(
+            planned[0],
+            Planned::Drain {
+                superseded: true,
+                ..
+            }
+        ));
+
+        let busy = HashSet::from([Bytes::from_static(&[1])]);
+        let planned = plan(&policy, at_hour(10.0), &segments, &busy, 4, 10);
+        assert_eq!(prefixes(&planned), vec![("merge", 2)]);
     }
 
     #[test]

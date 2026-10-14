@@ -190,6 +190,21 @@ mod failing_storage {
             self.inner.get_buckets_for_ranges(namespace, ranges).await
         }
 
+        async fn bucket_segments(
+            &self,
+            namespace: &crate::Namespace,
+        ) -> (Vec<TimeBucket>, Vec<TimeBucket>) {
+            self.inner.bucket_segments(namespace).await
+        }
+
+        async fn resolve_buckets(
+            &self,
+            namespace: &crate::Namespace,
+            buckets: &[TimeBucket],
+        ) -> Vec<TimeBucket> {
+            self.inner.resolve_buckets(namespace, buckets).await
+        }
+
         async fn get_forward_index(
             &self,
             namespace: &crate::Namespace,

@@ -231,7 +231,7 @@ impl ForwardIndexCache {
 }
 
 /// Cross-query cache of decoded series, each a bucket's whole value, in a
-/// table per bucket generation. The generation is read before any of the
+/// table per bucket generation and metric. The generation is read before any of the
 /// query's samples, and every flush advances it in the batch that writes
 /// its samples, so an entry never holds data older than its generation's.
 /// Samples are served only while their generation record remains visible, so
@@ -239,7 +239,9 @@ impl ForwardIndexCache {
 /// entry remains cached.
 /// Discovery's per-bucket series sets live here too, under the same keys.
 pub(crate) struct SeriesCache {
-    series: TableCache<(Namespace, TimeBucket, u64), Arc<SeriesData>>,
+    /// A table per bucket generation and metric, so a rollup bucket's
+    /// metrics are evicted one at a time, as an hour bucket's whole table is.
+    series: TableCache<(Namespace, TimeBucket, u64, Arc<str>), Arc<SeriesData>>,
     sets: moka::future::Cache<SetCacheKey, Arc<[Labels]>>,
 }
 
@@ -330,6 +332,19 @@ impl<R: StorageRead> MiniQueryReader<R> {
             .copied()
     }
 
+    /// The series cache, unless `(start_ms, end_ms]` reads under half of a
+    /// rollup bucket: a miss decodes the whole bucket, which for a short
+    /// query against a day of samples costs far more than it saves.
+    fn sample_cache(&self, start_ms: i64, end_ms: i64) -> Option<&SeriesCache> {
+        let read = end_ms
+            .min(self.bucket.end_ms())
+            .saturating_sub(start_ms.max(self.bucket.start_ms()));
+        let span = self.bucket.end_ms() - self.bucket.start_ms();
+        self.series_cache
+            .as_deref()
+            .filter(|_| self.bucket.size == 1 || read.saturating_mul(2) >= span)
+    }
+
     /// [`Self::samples_many`] through the series cache: hits are cut to the
     /// range, misses decoded whole, cached, then cut.
     async fn cached_samples_many(
@@ -341,7 +356,14 @@ impl<R: StorageRead> MiniQueryReader<R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<SeriesData>> {
-        let key = || (self.namespace.clone(), self.bucket, generation);
+        let key = || {
+            (
+                self.namespace.clone(),
+                self.bucket,
+                generation,
+                Arc::<str>::from(metric_name),
+            )
+        };
         let table = cache.series.table(key());
         let mut out = Vec::with_capacity(series_ids.len());
         let mut missing = Vec::new();
@@ -709,7 +731,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<SeriesData> {
-        if let Some(cache) = &self.series_cache
+        if let Some(cache) = self.sample_cache(start_ms, end_ms)
             && let Some(generation) = self.generation().await?
         {
             let mut out = self
@@ -735,7 +757,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<SeriesData>> {
-        if let Some(cache) = &self.series_cache
+        if let Some(cache) = self.sample_cache(start_ms, end_ms)
             && let Some(generation) = self.generation().await?
         {
             return self
@@ -829,12 +851,49 @@ impl<R: StorageRead> MiniQueryReader<R> {
         }
     }
 
+    /// [`Self::fetch_series_samples`], over a rollup bucket split by series
+    /// ID into up to one concurrent part per hour it covers: a range over
+    /// hour buckets reads each hour at once, and one wide bucket read as a
+    /// single request would serialize the same bytes.
+    async fn fetch_samples_many(
+        &self,
+        metric_name: &str,
+        series_ids: &[SeriesId],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesData>> {
+        let parts = usize::from(self.bucket.size).min(series_ids.len() / SCAN_MIN_SERIES);
+        if parts <= 1 {
+            return self
+                .fetch_series_samples(metric_name, series_ids, start_ms, end_ms)
+                .await;
+        }
+        let mut order: Vec<usize> = (0..series_ids.len()).collect();
+        order.sort_unstable_by_key(|&position| series_ids[position]);
+        let groups: Vec<&[usize]> = order.chunks(order.len().div_ceil(parts)).collect();
+        let fetched = futures::future::try_join_all(groups.iter().map(|group| {
+            let ids: Vec<SeriesId> = group.iter().map(|&position| series_ids[position]).collect();
+            async move {
+                self.fetch_series_samples(metric_name, &ids, start_ms, end_ms)
+                    .await
+            }
+        }))
+        .await?;
+        let mut out = vec![SeriesData::default(); series_ids.len()];
+        for (group, data) in groups.into_iter().zip(fetched) {
+            for (&position, data) in group.iter().zip(data) {
+                out[position] = data;
+            }
+        }
+        Ok(out)
+    }
+
     /// One key-range scan instead of a point get per series: a metric's
     /// time-series keys are contiguous and ordered by series ID, so the scan
     /// reads them sequentially (with read-ahead) rather than probing every
     /// SST once per series. Falls back to point gets for small or sparse
     /// requests, where the scan would mostly read unrequested series.
-    async fn fetch_samples_many(
+    async fn fetch_series_samples(
         &self,
         metric_name: &str,
         series_ids: &[SeriesId],
@@ -1086,12 +1145,21 @@ impl MiniTsdb {
             .await?
             .unwrap_or(0);
 
+        // A rollup bucket only takes copied and late samples, neither of
+        // which makes a series active.
+        let delta_active_series = if bucket.size == 1 {
+            active_series.clone()
+        } else {
+            Arc::new(ActiveSeriesTracker::new(
+                crate::active_series::current_unix_minute(),
+            ))
+        };
         let context = TsdbContext {
             namespace: namespace.clone(),
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
-            active_series: active_series.clone(),
+            active_series: delta_active_series,
         };
 
         let flusher = TsdbFlusher {

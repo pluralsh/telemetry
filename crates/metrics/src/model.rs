@@ -876,6 +876,65 @@ impl TimeBucket {
     pub(crate) fn is_valid_size(size: BucketSize) -> bool {
         size > 0 && 24 % size == 0
     }
+
+    /// Exclusive end, in minutes since the epoch.
+    pub(crate) fn end(&self) -> u32 {
+        self.start.saturating_add(self.size_in_mins())
+    }
+
+    pub(crate) fn start_ms(&self) -> i64 {
+        i64::from(self.start) * 60_000
+    }
+
+    pub(crate) fn end_ms(&self) -> i64 {
+        i64::from(self.end()) * 60_000
+    }
+
+    /// Whether `other` lies within this bucket and is narrower.
+    pub(crate) fn covers(&self, other: &TimeBucket) -> bool {
+        self.size > other.size && self.start <= other.start && other.end() <= self.end()
+    }
+
+    /// The `size`-hour bucket containing `self`'s start.
+    pub(crate) fn widened(&self, size: BucketSize) -> TimeBucket {
+        let width = u32::from(size) * 60;
+        TimeBucket {
+            start: self.start - self.start % width,
+            size,
+        }
+    }
+
+    /// The one-hour buckets inside this one.
+    pub(crate) fn hours(&self) -> impl Iterator<Item = TimeBucket> + use<> {
+        let start = self.start;
+        (0..u32::from(self.size)).map(move |hour| TimeBucket::hour(start + hour * 60))
+    }
+}
+
+/// The buckets a query reads among `buckets`, given the `sealed` buckets
+/// whose rollup has completed: a bucket wider than an hour is read once it is
+/// sealed, and any bucket a sealed bucket covers is not, so each sample is
+/// read once.
+pub(crate) fn visible_buckets(
+    buckets: impl IntoIterator<Item = TimeBucket>,
+    sealed: &[TimeBucket],
+) -> Vec<TimeBucket> {
+    buckets
+        .into_iter()
+        .filter(|bucket| bucket.size == 1 || sealed.contains(bucket))
+        .filter(|bucket| !sealed.iter().any(|seal| seal.covers(bucket)))
+        .collect()
+}
+
+/// The bucket a read of `bucket` resolves to: the sealed bucket covering it,
+/// if any.
+pub(crate) fn covering_bucket(bucket: TimeBucket, sealed: &[TimeBucket]) -> TimeBucket {
+    sealed
+        .iter()
+        .copied()
+        .filter(|seal| seal.covers(&bucket))
+        .max_by_key(|seal| seal.size)
+        .unwrap_or(bucket)
 }
 
 #[cfg(test)]

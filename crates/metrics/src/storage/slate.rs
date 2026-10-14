@@ -14,7 +14,7 @@
 //! `Ttl`/options → SlateDB conversions are all reused from `common::storage`;
 //! only the storage *handles* are native here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -49,6 +49,7 @@ use crate::Namespace;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{
     HistogramSample, Label, Sample, SeriesData, SeriesFingerprint, SeriesId, TimeBucket,
+    covering_bucket, visible_buckets,
 };
 use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
@@ -57,9 +58,11 @@ use crate::serde::key::{
     BucketGenerationKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
     decode_bucket_generation, encode_bucket_generation,
 };
-use crate::serde::{TimeBucketScoped, bucket_records_range};
+use crate::serde::{TimeBucketScoped, bucket_records_range, seal_key};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
-use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, bucket_span, parse_bucket};
+use crate::storage::segment_extractor::{
+    Segment, TimeseriesSegmentExtractor, bucket_span, parse_bucket, parse_segment, superseded,
+};
 use common::storage::compaction::SegmentCompaction;
 use common::storage::settings::{base_settings, load_settings_over};
 use slatedb::CompactorBuilder;
@@ -112,6 +115,18 @@ pub(crate) trait StorageRead: Send + Sync {
         namespace: &Namespace,
         ranges: &[(i64, i64)],
     ) -> crate::util::Result<Vec<TimeBucket>>;
+
+    /// Every bucket segment of `namespace`, visible or not, and every sealed
+    /// bucket.
+    async fn bucket_segments(&self, namespace: &Namespace) -> (Vec<TimeBucket>, Vec<TimeBucket>);
+
+    /// The bucket each of `buckets` is read from: itself, or the sealed
+    /// bucket covering it.
+    async fn resolve_buckets(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Vec<TimeBucket>;
 
     /// Loads the full forward index of `bucket`.
     async fn get_forward_index(
@@ -200,17 +215,24 @@ pub(crate) trait StorageRead: Send + Sync {
         }
     }
 
-    /// [`Self::get_bucket_generation`] for each of `buckets`, in order.
+    /// [`Self::get_bucket_generation`] for each of `buckets`, in order, read
+    /// from the bucket it resolves to, so a write to a rollup bucket changes
+    /// the generation of every bucket it covers.
     async fn get_bucket_generations(
         &self,
         namespace: &Namespace,
         buckets: &[TimeBucket],
     ) -> crate::util::Result<Vec<Option<u64>>> {
-        futures::future::try_join_all(
-            buckets
-                .iter()
-                .map(|bucket| self.get_bucket_generation(namespace, bucket)),
-        )
+        let resolved = self.resolve_buckets(namespace, buckets).await;
+        futures::future::try_join_all(resolved.iter().map(|bucket| async move {
+            // Generations count per bucket, so tag a rollup bucket's with its
+            // width: an hour's generation must change when it resolves to a
+            // rollup bucket that happens to sit at the same count.
+            let generation = self.get_bucket_generation(namespace, bucket).await?;
+            Ok::<_, crate::error::Error>(
+                generation.map(|generation| generation | (u64::from(bucket.size) << 56)),
+            )
+        }))
         .await
     }
 }
@@ -248,6 +270,18 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
         self.reader()
             .get_buckets_for_ranges(namespace, ranges)
             .await
+    }
+
+    async fn bucket_segments(&self, namespace: &Namespace) -> (Vec<TimeBucket>, Vec<TimeBucket>) {
+        self.reader().list_segments(namespace)
+    }
+
+    async fn resolve_buckets(
+        &self,
+        namespace: &Namespace,
+        buckets: &[TimeBucket],
+    ) -> Vec<TimeBucket> {
+        self.reader().resolve_buckets(namespace, buckets)
     }
 
     async fn get_forward_index(
@@ -483,7 +517,9 @@ impl Storage {
         );
 
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
-        let policy = SegmentCompaction::new(bucket_span).with_retention(retention);
+        let policy = SegmentCompaction::new(bucket_span)
+            .with_retention(retention)
+            .with_superseded(Arc::new(superseded));
         let compactor = settings.compactor_options.take().map(|options| {
             CompactorBuilder::new(slate_config.path.clone(), Arc::clone(&object_store))
                 .with_options(options)
@@ -683,7 +719,6 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
 impl Storage {
     /// Freezes the memtable and writes it to L0, merging operands up to
     /// SlateDB's oldest live snapshot.
@@ -696,6 +731,69 @@ impl Storage {
             .map_err(StorageError::from_storage)
     }
 
+    /// Every bucket segment of `namespace`, visible or not, and every
+    /// sealed bucket, as of now.
+    pub(crate) fn segments(&self, namespace: &Namespace) -> (Vec<TimeBucket>, Vec<TimeBucket>) {
+        self.reader.list_segments(namespace)
+    }
+
+    /// Every namespace with a segment in the manifest.
+    pub(crate) fn namespaces(&self) -> Vec<Namespace> {
+        let manifest = self.db.manifest();
+        let namespaces: HashSet<Namespace> = manifest
+            .segments()
+            .iter()
+            .filter_map(|segment| parse_segment(segment.prefix()).map(|(namespace, _)| namespace))
+            .collect();
+        namespaces.into_iter().collect()
+    }
+
+    /// Estimated on-disk bytes of each bucket segment of `namespace`, from
+    /// the SSTs live in the manifest. Excludes the memtable.
+    pub(crate) fn bucket_bytes(&self, namespace: &Namespace) -> HashMap<TimeBucket, u64> {
+        let manifest = self.db.manifest();
+        manifest
+            .segments()
+            .iter()
+            .filter_map(|segment| {
+                let (segment_namespace, bucket) = parse_bucket(segment.prefix())?;
+                (&segment_namespace == namespace).then(|| {
+                    let l0: u64 = segment.l0().iter().map(|view| view.estimate_size()).sum();
+                    let runs: u64 = segment
+                        .compacted()
+                        .iter()
+                        .map(|run| run.estimate_size())
+                        .sum();
+                    (bucket, l0 + runs)
+                })
+            })
+            .collect()
+    }
+
+    /// Durably marks `bucket` as holding every sample of the narrower
+    /// buckets it covers, making it visible to reads in their place.
+    pub(crate) async fn seal(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        ttl: Ttl,
+    ) -> StorageResult<()> {
+        self.put_with_options(
+            vec![PutRecordOp::new_with_options(
+                Record::empty(seal_key(namespace, &bucket)),
+                PutOptions { ttl },
+            )],
+            WriteOptions {
+                await_durable: true,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Storage {
     /// `(recent_snapshot_min_seq, last_l0_seq)` from the manifest. The first
     /// is the merge barrier compaction uses: the oldest live snapshot's
     /// sequence at the last L0 flush, or that flush's last sequence when no

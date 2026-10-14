@@ -7,6 +7,7 @@ pub mod factory;
 pub mod in_memory;
 pub mod loader;
 pub mod metrics_recorder;
+pub mod rollup;
 pub mod settings;
 pub mod slate;
 pub mod sst_blocks;
@@ -487,6 +488,11 @@ pub trait Storage: StorageRead {
     ///
     /// Returns an error if durability cannot be established.
     async fn flush(&self) -> StorageResult<()>;
+
+    /// Flushes the memtable to L0, so the manifest lists what it held.
+    async fn flush_memtable(&self) -> StorageResult<()> {
+        self.flush().await
+    }
 
     /// Subscribes to the durable sequence watermark.
     ///

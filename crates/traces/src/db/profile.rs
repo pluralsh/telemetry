@@ -187,8 +187,25 @@ async fn profile_traceql_phases() {
         .unwrap_or(0.0);
     let dir = tempfile::tempdir().unwrap();
     let namespace = Namespace::new("profile").unwrap();
-    let now = common::time::now_ns().unsigned_abs();
-    let base = now - 600 * 1_000_000_000;
+    // `PROFILE_SPREAD_HOURS` spreads traces over the hours before the last
+    // UTC midnight instead of the last ten minutes.
+    let spread_hours: Option<u64> =
+        env("PROFILE_SPREAD_HOURS").and_then(|value| value.parse().ok());
+    let (base, now, spread_seconds) = match spread_hours {
+        Some(hours) => {
+            let day = 86_400 * 1_000_000_000;
+            let midnight = common::time::now_ns().unsigned_abs() / day * day;
+            (
+                midnight - hours * 3_600 * 1_000_000_000,
+                midnight - 1,
+                hours * 3_600,
+            )
+        }
+        None => {
+            let now = common::time::now_ns().unsigned_abs();
+            (now - 600 * 1_000_000_000, now, 500)
+        }
+    };
     let writer = TraceDb::open(config(dir.path())).await.unwrap();
     let mut rng = StdRng::seed_from_u64(7);
     let rounds = 50;
@@ -197,7 +214,7 @@ async fn profile_traceql_phases() {
     for _ in 0..rounds {
         let mut batch = (0..traces / rounds)
             .map(|_| {
-                let offset = rng.random_range(0..500u64) * 1_000_000_000;
+                let offset = rng.random_range(0..spread_seconds) * 1_000_000_000;
                 random_trace(&mut rng, base + offset)
             })
             .collect::<Vec<_>>();
@@ -222,6 +239,26 @@ async fn profile_traceql_phases() {
         "ingest {:.2}ms over {rounds} durable writes",
         ms(started.elapsed())
     );
+    writer
+        .rollup_writer()
+        .unwrap()
+        .flush_memtable()
+        .await
+        .unwrap();
+    if env("PROFILE_ROLLUP").is_some() {
+        let started = Instant::now();
+        let sealed = writer
+            .rollup_at(
+                &common::storage::rollup::RollupConfig {
+                    delay: Duration::ZERO,
+                    ..Default::default()
+                },
+                common::time::now_ns(),
+            )
+            .await
+            .unwrap();
+        println!("rollup: sealed {sealed} in {:.2}ms", ms(started.elapsed()));
+    }
     writer.close().await.unwrap();
     let db = TraceDb::open_reader(config(dir.path()), DbReaderOptions::default())
         .await
@@ -251,9 +288,11 @@ async fn profile_traceql_phases() {
                 max_concurrency: 8,
             };
             // Warm caches once, then measure.
+            let first = Instant::now();
             db.query_traceql(&namespace, start, end, source, options)
                 .await
                 .unwrap();
+            let first = first.elapsed();
             let total = Instant::now();
             let results = db
                 .query_traceql(&namespace, start, end, source, options)
@@ -292,8 +331,9 @@ async fn profile_traceql_phases() {
             }
             let execute = started.elapsed();
             println!(
-                "limit {limit:>4} results {:>4} | total {:>7.2}ms | candidates {:>5} select {:>6.2} load-all {:>6.2} exec-all {:>6.2} (matched {matched}) | {}",
+                "limit {limit:>4} results {:>4} | first {:>7.2}ms total {:>7.2}ms | candidates {:>5} select {:>6.2} load-all {:>6.2} exec-all {:>6.2} (matched {matched}) | {}",
                 results.len(),
+                ms(first),
                 ms(total),
                 located.len(),
                 ms(candidates),

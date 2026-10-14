@@ -92,6 +92,14 @@ page:
   max_size_bytes: 4194304 # Hard page trace data limit, excluding the column sidecar; 4 MiB.
   max_traces: 1024 # Maximum traces in one page.
 
+# Rollup of closed UTC days of segments into wider segments; see
+# [Segment rollup](../common/segment-rollup.md). Reader-mode servers never roll up.
+rollup:
+  enabled: true
+  max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
+  delay_seconds: 3600 # How long after a day ends before it is rolled up.
+  interval_seconds: 300 # How often closed days are looked for.
+
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: applied

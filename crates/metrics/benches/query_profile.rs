@@ -656,8 +656,7 @@ fn print_storage_state(args: &Args) {
     );
     println!(
         "tuning: l0_sst_size_bytes={} min_compaction_sources={}",
-        args.l0_bytes
-            .map_or(default_slatedb_tuning().0 as u64, |bytes| bytes),
+        args.l0_bytes.unwrap_or(default_slatedb_tuning().0 as u64),
         args.min_sources(),
     );
     let hours = args.scrapes as f64 / SCRAPES_PER_HOUR as f64;

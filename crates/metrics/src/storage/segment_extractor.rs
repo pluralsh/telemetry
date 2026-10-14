@@ -31,7 +31,7 @@ use slatedb::{PrefixExtractor, PrefixTarget};
 
 use crate::Namespace;
 use crate::model::{BucketSize, BucketStart, TimeBucket};
-use crate::serde::{KEY_VERSION, SUBSYSTEM};
+use crate::serde::{KEY_VERSION, SEAL_SIZE_FLAG, SUBSYSTEM, seal_prefix};
 
 /// Shortest routing prefix: `[subsystem(1), version(1), namespace
 /// terminator(1), time_bucket(4 BE), bucket_size(1)]` with an empty namespace.
@@ -112,13 +112,20 @@ impl PrefixExtractor for TimeseriesSegmentExtractor {
     }
 }
 
-/// Decodes a routing prefix back into its namespace and `TimeBucket`.
-///
-/// Used by the bucket-discovery path to project the segments list returned by
-/// `StorageRead::list_segments` into the set of buckets visible to a query.
+/// What a timeseries segment holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Segment {
+    /// A bucket's records.
+    Bucket(TimeBucket),
+    /// The rollup seal of the bucket, written once the bucket holds every
+    /// sample of the narrower buckets it covers.
+    Seal(TimeBucket),
+}
+
+/// Decodes a routing prefix into its namespace and what the segment holds.
 /// Returns `None` for any prefix that isn't a well-formed timeseries routing
 /// prefix, including bucket sizes that aren't a divisor of 24 hours.
-pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<(Namespace, TimeBucket)> {
+pub(crate) fn parse_segment(prefix: &[u8]) -> Option<(Namespace, Segment)> {
     let length = routing_prefix_len(prefix)?;
     let namespace_end = prefix[2..].iter().position(|byte| *byte == 0)? + 2;
     let namespace =
@@ -130,21 +137,51 @@ pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<(Namespace, TimeBucket)> {
         prefix[bucket_offset + 2],
         prefix[bucket_offset + 3],
     ]);
-    let size: BucketSize = prefix[bucket_offset + 4];
+    let raw_size: BucketSize = prefix[bucket_offset + 4];
+    let size = raw_size & !SEAL_SIZE_FLAG;
     if !TimeBucket::is_valid_size(size) {
         return None;
     }
     debug_assert_eq!(length, bucket_offset + 5);
-    Some((namespace, TimeBucket { start, size }))
+    let bucket = TimeBucket { start, size };
+    let segment = if raw_size & SEAL_SIZE_FLAG == 0 {
+        Segment::Bucket(bucket)
+    } else {
+        Segment::Seal(bucket)
+    };
+    Some((namespace, segment))
 }
 
-/// The `[start, end)` of a bucket segment in Unix milliseconds, for
+/// Decodes a bucket segment's routing prefix back into its namespace and
+/// `TimeBucket`; `None` for seals and malformed prefixes.
+///
+/// Used by the bucket-discovery path to project the segments list returned by
+/// `StorageRead::list_segments` into the set of buckets visible to a query.
+pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<(Namespace, TimeBucket)> {
+    match parse_segment(prefix)? {
+        (namespace, Segment::Bucket(bucket)) => Some((namespace, bucket)),
+        (_, Segment::Seal(_)) => None,
+    }
+}
+
+/// The `[start, end)` of a bucket segment, or of the bucket a seal segment
+/// seals, in Unix milliseconds, for
 /// [`common::storage::compaction::SegmentCompaction`].
 pub(crate) fn bucket_span(prefix: &[u8]) -> Option<(i64, i64)> {
-    let (_, bucket) = parse_bucket(prefix)?;
-    let start = i64::from(bucket.start);
-    let end = start + i64::from(bucket.size_in_mins());
-    Some((start * 60_000, end * 60_000))
+    let (Segment::Bucket(bucket) | Segment::Seal(bucket)) = parse_segment(prefix)?.1;
+    Some((bucket.start_ms(), bucket.end_ms()))
+}
+
+/// Whether the bucket segment at `prefix` is covered by a sealed wider
+/// bucket, judged by `present` over every segment prefix: its samples are
+/// then all in the wider bucket, and the segment can be dropped.
+pub(crate) fn superseded(prefix: &[u8], present: &dyn Fn(&[u8]) -> bool) -> bool {
+    let Some((namespace, bucket)) = parse_bucket(prefix) else {
+        return false;
+    };
+    (bucket.size + 1..=24)
+        .filter(|size| TimeBucket::is_valid_size(*size) && size % bucket.size == 0)
+        .any(|size| present(&seal_prefix(&namespace, &bucket.widened(size))))
 }
 
 #[cfg(test)]
@@ -339,5 +376,54 @@ mod tests {
         assert_eq!(bucket_span(&hour), Some((7_200_000, 10_800_000)));
         assert_eq!(bucket_span(&day), Some((86_400_000, 172_800_000)));
         assert_eq!(bucket_span(&raw_prefix("tenant", 120, 5)), None);
+    }
+
+    #[test]
+    fn seal_keys_route_to_their_own_segment() {
+        let tenant = namespace("tenant");
+        let day = TimeBucket {
+            start: 1440,
+            size: 24,
+        };
+        let seal = crate::serde::seal_key(&tenant, &day);
+        let samples = key(&tenant, 1440, 24, RecordType::TimeSeries);
+
+        assert_eq!(extracted(&seal), seal_prefix(&tenant, &day).as_ref());
+        assert_ne!(extracted(&seal), extracted(&samples));
+        assert_eq!(
+            parse_segment(extracted(&seal)),
+            Some((tenant.clone(), Segment::Seal(day)))
+        );
+        assert_eq!(parse_bucket(extracted(&seal)), None);
+        assert_eq!(
+            bucket_span(extracted(&seal)),
+            bucket_span(extracted(&samples))
+        );
+    }
+
+    #[test]
+    fn hours_are_superseded_only_by_a_covering_seal() {
+        let tenant = namespace("tenant");
+        let six_hours = TimeBucket {
+            start: 1440 + 6 * 60,
+            size: 6,
+        };
+        let sealed = [seal_prefix(&tenant, &six_hours)];
+        let present = |prefix: &[u8]| sealed.iter().any(|seal| seal.as_ref() == prefix);
+        let hour = |offset: u32| raw_prefix("tenant", 1440 + offset * 60, 1);
+
+        assert!(superseded(&hour(6), &present));
+        assert!(superseded(&hour(11), &present));
+        assert!(!superseded(&hour(5), &present));
+        assert!(!superseded(&hour(12), &present));
+        assert!(!superseded(
+            &raw_prefix("other", 1440 + 6 * 60, 1),
+            &present
+        ));
+        assert!(!superseded(&sealed[0], &present));
+        assert!(!superseded(
+            &raw_prefix("tenant", six_hours.start, six_hours.size),
+            &present
+        ));
     }
 }

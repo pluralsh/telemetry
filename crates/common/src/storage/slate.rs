@@ -145,6 +145,37 @@ impl SlateReadHandle {
         self.source.manifest()
     }
 
+    /// Prefixes of segments with live SSTs that `keep` selects.
+    pub fn segment_prefixes(&self, keep: impl Fn(&[u8]) -> bool) -> Vec<Bytes> {
+        let manifest = self.source.manifest();
+        manifest
+            .segments()
+            .iter()
+            .filter(|segment| !segment.l0().is_empty() || !segment.compacted().is_empty())
+            .filter(|segment| keep(segment.prefix()))
+            .map(|segment| Bytes::copy_from_slice(segment.prefix()))
+            .collect()
+    }
+
+    /// Prefix and estimated SST bytes of every segment with live SSTs.
+    pub fn segment_sizes(&self) -> Vec<(Bytes, u64)> {
+        let manifest = self.source.manifest();
+        manifest
+            .segments()
+            .iter()
+            .filter(|segment| !segment.l0().is_empty() || !segment.compacted().is_empty())
+            .map(|segment| {
+                let l0: u64 = segment.l0().iter().map(|view| view.estimate_size()).sum();
+                let runs: u64 = segment
+                    .compacted()
+                    .iter()
+                    .map(|run| run.estimate_size())
+                    .sum();
+                (Bytes::copy_from_slice(segment.prefix()), l0 + runs)
+            })
+            .collect()
+    }
+
     /// Warms cache blocks for live SlateDB segments matching `prefixes`.
     ///
     /// Filters and SST indexes are always warmed into SlateDB's metadata cache.
@@ -652,6 +683,15 @@ impl Storage for SlateDbStorage {
     async fn flush(&self) -> StorageResult<()> {
         self.db.flush().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    async fn flush_memtable(&self) -> StorageResult<()> {
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await
+            .map_err(StorageError::from_storage)
     }
 
     async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {

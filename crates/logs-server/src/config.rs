@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 use common::{CacheWarmerConfig, storage::config::StorageConfig};
 use serde::{Deserialize, Serialize};
 pub use server_common::auth::{Access, AuthConfig, Credential, JwksSource, JwtConfig, Secret};
-pub use server_common::config::{Durability, WriteConfig};
+pub use server_common::config::{Durability, SegmentRollupConfig, WriteConfig};
 pub use server_common::usage::UsageReportingConfig;
 
 pub use sharding::server::{ServerMode, StaticOwner};
@@ -167,6 +167,8 @@ pub struct Config {
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
+    /// Rollup of closed days of segments into wider segments.
+    pub rollup: SegmentRollupConfig,
     /// Byte budget of the process's cache of object blocks with their
     /// decompressed bodies, shared by every shard; `0` disables it.
     pub reader_cache_capacity: u64,
@@ -193,6 +195,7 @@ impl Default for Config {
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
+            rollup: SegmentRollupConfig::default(),
             reader_cache_capacity: core.block_cache_capacity_bytes,
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),

@@ -26,6 +26,12 @@ remaining `max_concurrent_compactions` slots, oldest segment first:
 - **Merge.** Once a segment has been closed for 30 minutes, all of its L0
   SSTs and sorted runs are merged into one sorted run. A late write adds an
   L0 SST again, and the segment is merged again.
+- **Supersede.** A database can mark segments whose data now lives in another
+  segment, and the policy drains them like expired ones instead of merging
+  them. Metrics marks an hour bucket once a sealed
+  [rollup](../metrics/storage-format.md#rollup) bucket covers it; Logs and
+  Traces mark a segment once a sealed [rollup](segment-rollup.md) segment
+  covers it.
 
 Segments that already have a compaction running are skipped. Segments with
 no fixed end, such as the Traces locator segment, are never merged or
@@ -42,7 +48,7 @@ The policy reports:
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `storage_segment_compactions_total` | `path`, `kind` (`merge`, `drain`) | Compactions the policy started |
+| `storage_segment_compactions_total` | `path`, `kind` (`merge`, `drain`, `supersede`) | Compactions the policy started |
 | `storage_compaction_oldest_active_seconds` | `path` | Age of the oldest running compaction |
 
 Alert on `storage_compaction_oldest_active_seconds` staying high. Garbage

@@ -5,7 +5,8 @@ path is `storage.path/shard-NNNN`; namespaces do not add another path level.
 All tenant isolation is encoded in the keys described below, and every read,
 write, ingest cache, and metadata catalog lookup remains namespace-scoped.
 
-Records are grouped into time buckets (normally one hour). Every key begins
+Records are grouped into time buckets: one hour while written, then rolled
+up into wider buckets once the day closes (see [rollup](#rollup)). Every key begins
 with the following layout. The SlateDB segment boundary remains immediately
 after `bucket size`; the record type is outside that boundary.
 
@@ -55,6 +56,7 @@ cross-shard queries join series by label fingerprint, never by ID.
 | `0x04` | Inverted index | Label term to series-ID postings |
 | `0x05` | Time series | Compressed samples for one series |
 | `0x06` | Bucket generation | Write generation of the bucket |
+| `0x07` | Rollup seal | Marks a rollup bucket complete |
 
 ## Record types
 
@@ -205,7 +207,56 @@ shares the bucket's TTL, so it expires with the data it describes; an absent
 record means the bucket was never flushed.
 
 The range-query result cache compares the generations of the buckets a step
-depends on against those recorded when the step was cached.
+depends on against those recorded when the step was cached. A bucket a sealed
+rollup bucket covers reports the rollup bucket's generation with the rollup
+bucket's size in its top byte, so the generation changes when the rollup
+replaces the hour even if the two counts are equal.
+
+### Rollup seal (`0x07`)
+
+An empty value written once a rollup bucket holds every sample of the hours
+it covers. The bucket size byte carries the flag `0x80`, so the seal of a
+bucket sits in its own SlateDB segment, apart from the bucket's data, and the
+segment list alone tells which buckets are sealed. The seal shares its
+bucket's TTL.
+
+```text
+KEY   ┌───────────┬─────────┬─────────────────┬──────────────┬────────────────────┬──────┐
+      │ subsystem │ version │    namespace    │ bucket start │ bucket size | 0x80 │ 0x07 │
+      └───────────┴─────────┴─────────────────┴──────────────┴────────────────────┴──────┘
+VALUE empty
+```
+
+## Rollup
+
+SlateDB never compacts across segments, so a day of hour buckets stays 24
+segments, and a query over the day opens all 24. A writer therefore rolls
+each closed day up into wider buckets:
+
+1. Once the day ended `rollup.delay_seconds` ago, it tiles the day with the
+   fewest aligned buckets of 24, 12, 8, 6, 4, 3 or 2 hours whose hours' stored
+   SST bytes sum to at most `rollup.max_bucket_bytes`. An hour too large to
+   share a bucket stays an hour bucket, and a window with at most one stored
+   hour is left alone.
+2. For each window it first routes new writes for the window's hours to the
+   wider bucket, flushing whatever the hours had pending, then copies every
+   series' labels, metadata and samples from the hours into it.
+3. It writes the seal durably, after the copied data.
+
+Reads list a bucket wider than an hour only once sealed, and hide every
+bucket a sealed bucket covers, so a query sees either the hours or their
+rollup, never both. Compaction then drops the covered hour segments (see
+[storage compaction](../common/storage-compaction.md)). A rollup interrupted
+before its seal leaves an unsealed bucket that reads ignore; the writer keeps
+routing the hours' writes to it and finishes the copy on its next pass.
+Samples copied twice merge by timestamp, so the copy is idempotent.
+
+A rollup bucket's records expire at the start of its last hour plus the
+retention, so no sample is dropped earlier than in its hour bucket. A query
+reads a rollup bucket's samples in up to one concurrent part per hour it
+covers, as it would read the hours. Samples of a rollup bucket are kept in
+the decoded-series cache only for queries reading at least half of it, and
+the cache warmer warms only its indexes.
 
 ## Durability and visibility
 

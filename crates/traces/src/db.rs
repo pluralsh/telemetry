@@ -16,6 +16,7 @@ use common::coordinator::{
 };
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
 use common::storage::compaction::SegmentCompaction;
+use common::storage::rollup::Rollups;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
     BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
@@ -68,6 +69,7 @@ use crate::{
 
 mod query;
 mod read_cache;
+mod rollup;
 mod write;
 
 pub use read_cache::ReadCacheConfig;
@@ -138,6 +140,13 @@ pub struct TraceDb {
     /// Whether records expire, so cached postings may name pages that no
     /// longer exist.
     expiring: bool,
+    /// Rollup segments, pending or sealed, that take the writes of the
+    /// segments they cover. Ingest holds the read lock until its write is
+    /// applied, so a rollup holding the write lock sees none in flight.
+    rolled: tokio::sync::RwLock<HashMap<Namespace, BTreeSet<SegmentId>>>,
+    /// Serializes rollup passes.
+    rollup_lock: Mutex<()>,
+    retention: Option<Duration>,
 }
 
 impl TraceDb {
@@ -189,12 +198,29 @@ impl TraceDb {
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(storage_semantics().with_segment_compaction(
-                SegmentCompaction::new(crate::codec::segment_span).with_retention(config.retention),
-            ))
+            .with_semantics(
+                storage_semantics().with_segment_compaction(
+                    SegmentCompaction::new(crate::codec::segment_span)
+                        .with_retention(config.retention)
+                        .with_superseded(common::storage::rollup::superseded(
+                            crate::codec::KEY_SCOPE,
+                            i64::try_from(segment_ns).unwrap_or(i64::MAX),
+                        )),
+                ),
+            )
             .build()
             .await?;
         let storage_read = storage.clone();
+        let rolled = storage_read
+            .slate_read()
+            .map(|slate| {
+                Rollups::load_all(&slate, crate::codec::KEY_SCOPE)
+                    .into_iter()
+                    .map(|(namespace, rollups)| (namespace, rollups.routed()))
+                    .filter(|(_, routed)| !routed.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let read_cache = Arc::new(ReadCache::new(&config.read_cache, true));
         let flusher = TraceFlusher::new(
             storage.clone(),
@@ -227,6 +253,9 @@ impl TraceDb {
             ),
             read_cache,
             expiring: config.retention.is_some(),
+            rolled: tokio::sync::RwLock::new(rolled),
+            rollup_lock: Mutex::new(()),
+            retention: config.retention,
         })
     }
 
@@ -270,6 +299,9 @@ impl TraceDb {
             ),
             read_cache: Arc::new(ReadCache::new(&config.read_cache, false)),
             expiring: config.retention.is_some(),
+            rolled: tokio::sync::RwLock::new(HashMap::new()),
+            rollup_lock: Mutex::new(()),
+            retention: config.retention,
         })
     }
 
@@ -296,12 +328,27 @@ impl TraceDb {
         batches: Vec<TraceBatch>,
         durability: Durability,
     ) -> Result<WriteReport> {
+        let rolled = self.rolled.read().await;
+        let routed = rolled.get(namespace);
         let mut groups: BTreeMap<SegmentId, Vec<Trace>> = BTreeMap::new();
         let mut report = WriteReport::default();
         for batch in batches {
             for trace in batch.traces {
                 let (min_timestamp_ns, _) = trace.timestamp_range();
                 let segment = segment_for(min_timestamp_ns, self.segment_ns);
+                let segment = routed
+                    .and_then(|routed| {
+                        routed
+                            .iter()
+                            .filter(|wide| {
+                                wide.start_ns <= segment.start_ns
+                                    && segment.start_ns
+                                        < wide.start_ns.saturating_add(wide.width_ns)
+                            })
+                            .max_by_key(|wide| wide.width_ns)
+                            .copied()
+                    })
+                    .unwrap_or(segment);
                 report.traces += 1;
                 report.spans += trace.spans().count();
                 groups.entry(segment).or_default().push(trace);
@@ -310,23 +357,11 @@ impl TraceDb {
         if groups.is_empty() {
             return Ok(report);
         }
-        for traces in groups.values_mut() {
-            traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
-        }
-        let write = TraceWrite {
-            namespace: namespace.clone(),
-            groups,
-            report,
-        };
+        let report = self
+            .apply_groups(namespace, groups, report, Vec::new(), None)
+            .await?;
+        drop(rolled);
         let handle = self.write_handle()?;
-        let mut write_handle = handle
-            .try_write(write)
-            .await
-            .map_err(|error| map_write_error(error.discard_inner()))?;
-        let report = write_handle
-            .wait(CoordinatorDurability::Applied)
-            .await
-            .map_err(map_write_error)?;
         if durability != Durability::Applied {
             let flush_storage = durability == Durability::Durable;
             let mut flush_handle = handle.flush(flush_storage).await.map_err(map_write_error)?;
@@ -344,6 +379,37 @@ impl TraceDb {
 }
 
 impl TraceDb {
+    /// Applies `groups` to the write delta, waiting up to `wait` for room
+    /// in the queue, or failing at once without it.
+    async fn apply_groups(
+        &self,
+        namespace: &Namespace,
+        mut groups: BTreeMap<SegmentId, Vec<Trace>>,
+        report: WriteReport,
+        rebased: Vec<TraceId>,
+        wait: Option<Duration>,
+    ) -> Result<WriteReport> {
+        for traces in groups.values_mut() {
+            traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
+        }
+        let write = TraceWrite {
+            namespace: namespace.clone(),
+            groups,
+            report,
+            rebased,
+        };
+        let handle = self.write_handle()?;
+        let mut write_handle = match wait {
+            Some(timeout) => handle.write_timeout(write, timeout).await,
+            None => handle.try_write(write).await,
+        }
+        .map_err(|error| map_write_error(error.discard_inner()))?;
+        write_handle
+            .wait(CoordinatorDurability::Applied)
+            .await
+            .map_err(map_write_error)
+    }
+
     pub async fn flush(&self) -> Result<()> {
         if let Some(handle) = &self.write_handle {
             let mut flush_handle = handle.flush(false).await.map_err(map_write_error)?;

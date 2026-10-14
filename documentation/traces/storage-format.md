@@ -23,7 +23,9 @@ has start `i64::MIN` and width `0` (unbounded). The SlateDB segment extractor
 is named `traces-trace/v7`. The format is not backward compatible: databases
 of earlier versions are not read and there is no migration; reset and
 reingest them. Closed segments are merged and expired ones dropped as
-described in [storage compaction](../common/storage-compaction.md).
+described in [storage compaction](../common/storage-compaction.md), and
+closed days are rolled up into wider segments as described in
+[segment rollup](../common/segment-rollup.md).
 
 Each namespace/time-segment partition also contains the shared discovery
 catalog under the reserved record type `0xff` and catalog format version `1`.
@@ -236,7 +238,7 @@ locator
 
 TraceHead (0x04, stored in the locator segment)
 KEY   common scope │ trace_id: 16 bytes
-VALUE locator of the first page │ pages: u32 BE │ flags: u8 (bit 0 = continued)
+VALUE locator of the first page │ pages: u32 BE │ flags: u8 (bit 0 = continued, bit 1 = replaces)
 
 TraceContinuation (0x06, stored in the locator segment)
 KEY   common scope │ trace_id: 16 bytes │ data segment start: sortable i64 │ width: u64 │ page sequence:u64
@@ -257,8 +259,12 @@ naming the first of its pages, counting them, and setting `continued` when
 there are several. The traces merge operator keeps the oldest operand's first
 page, sums page counts, sets `continued` once operands combine, and gives the
 first locator the latest expiry among them (none if any has none), so the head
-outlives every page it reaches. Readers open the database with the same merge
-operator.
+outlives every page it reaches. An operand with `replaces` set discards every
+older one, and the result keeps the flag; a [segment rollup](../common/segment-rollup.md)
+writes one for each trace whose only page it copies, so the head names the
+copy alone. Readers open the database with the same merge operator. Earlier
+releases reject heads with `replaces` set, so upgrade readers no later than
+the writer.
 
 A head that is not continued names the trace's only page; otherwise readers
 scan the trace's continuations, skipping expired ones. Cached locators are

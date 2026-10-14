@@ -117,13 +117,12 @@ impl PostingsCache {
     }
 
     fn cacheable(&self, bucket: TimeBucket) -> bool {
-        let Some(retention) = self.retention else {
+        let common::Ttl::ExpireAt(expires_ms) = crate::flusher::bucket_ttl(bucket, self.retention)
+        else {
             return true;
         };
-        let expires_secs = (i64::from(bucket.start) * 60)
-            .saturating_add(i64::try_from(retention.as_secs()).unwrap_or(i64::MAX));
         let margin = i64::try_from(EXPIRY_MARGIN.as_secs()).unwrap_or(i64::MAX);
-        expires_secs > common::time::now_secs().saturating_add(margin)
+        expires_ms / 1000 > common::time::now_secs().saturating_add(margin)
     }
 
     pub(crate) async fn term(

@@ -419,6 +419,16 @@ impl ShardedLogs {
         self.shards.flush_all().await
     }
 
+    /// Rolls up closed days in every shard opened for writing; see
+    /// [`LogDb::rollup`].
+    pub async fn rollup(&self, config: &common::storage::rollup::RollupConfig) -> Result<usize> {
+        let mut sealed = 0;
+        for database in self.shards.databases().await {
+            sealed += database.rollup(config).await?;
+        }
+        Ok(sealed)
+    }
+
     /// Closes every shard, then the cache they share.
     pub async fn close(&self) -> Result<()> {
         let closed = self.shards.close_all().await;

@@ -14,7 +14,7 @@ use crate::model::{Label, Labels, SegmentId, StreamFingerprint, StreamId};
 
 pub(crate) const KEY_VERSION: u8 = 6;
 pub(crate) const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
-const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
+pub(crate) const KEY_SCOPE: KeyScope = KeyScope::new(SUBSYSTEM, KEY_VERSION);
 /// Persisted by SlateDB; renaming it makes existing databases unopenable.
 pub(crate) const SEGMENT_EXTRACTOR_NAME: &str = "logs-log/v6";
 pub(crate) const SEGMENT_EXTRACTOR: ScopedSegmentExtractor =
@@ -196,9 +196,11 @@ fn is_expired(expires_at_unix_ms: Option<u64>, unix_ms: u64) -> bool {
 }
 
 /// The `[start_ms, end_ms)` span of the SlateDB segment with this prefix;
-/// `None` for unbounded segments and foreign prefixes.
+/// `None` for unbounded segments and foreign prefixes. A rollup marker spans
+/// its rollup segment.
 pub(crate) fn segment_span(prefix: &[u8]) -> Option<(i64, i64)> {
     let (_, segment, _) = KEY_SCOPE.parse(prefix).ok()?;
+    let segment = common::storage::rollup::data_segment(segment);
     let end_ns = segment.end_ns()?;
     Some((
         segment.start_ns.div_euclid(1_000_000),

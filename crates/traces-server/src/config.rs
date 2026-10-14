@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 use common::{CacheWarmerConfig, storage::config::StorageConfig};
 use serde::{Deserialize, Serialize};
 pub use server_common::auth::{Access, AuthConfig};
-pub use server_common::config::{Durability, WriteConfig};
+pub use server_common::config::{Durability, SegmentRollupConfig, WriteConfig};
 pub use server_common::usage::UsageReportingConfig;
 
 pub use sharding::server::{ServerMode, StaticOwner};
@@ -138,6 +138,8 @@ pub struct Config {
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub read_cache: ReadCacheConfig,
+    /// Rollup of closed days of segments into wider segments.
+    pub rollup: SegmentRollupConfig,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -159,6 +161,7 @@ impl Default for Config {
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             read_cache: ReadCacheConfig::default(),
+            rollup: SegmentRollupConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
