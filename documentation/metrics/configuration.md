@@ -123,11 +123,14 @@ query:
 # 24, 12, 8, 6, 4, 3 or 2 hour buckets whose stored size stays within
 # max_bucket_bytes, delay_seconds after the day ends, checking every
 # interval_seconds. Hours too large to share a bucket stay as they are.
+# The operator gives writers an 8Gi memory limit by default and does not
+# roll out a writer whose limit is below 6Gi.
 rollup:
   enabled: true
   max_bucket_bytes: 4294967296 # 4 GiB.
   delay_seconds: 3600
   interval_seconds: 300
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.

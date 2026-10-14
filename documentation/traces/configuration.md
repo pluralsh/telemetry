@@ -99,6 +99,7 @@ rollup:
   max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
   delay_seconds: 3600 # How long after a day ends before it is rolled up.
   interval_seconds: 300 # How often closed days are looked for.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.

@@ -118,6 +118,7 @@ rollup:
   max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
   delay_seconds: 3600 # How long after a day ends before it is rolled up.
   interval_seconds: 300 # How often closed days are looked for.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
 
 # Bytes of object blocks kept in memory across queries, with their bodies
 # decompressed once a query needs them; one budget shared by every storage

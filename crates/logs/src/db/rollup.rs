@@ -17,8 +17,9 @@ use common::storage::rollup::{Marker, RollupConfig, marker_key};
 
 use super::*;
 
-/// Streams read and written per copy step.
-const COPY_STREAMS: usize = 256;
+/// Streams read and written per copy step. One stream can hold enough rows to
+/// use the writer's whole memory budget, so never materialize several at once.
+const COPY_STREAMS: usize = 1;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl LogDb {
@@ -47,15 +48,20 @@ impl LogDb {
                 now_ns,
             );
             for wide in planned {
-                self.roll_up(&namespace, wide).await?;
+                tracing::info!(%namespace, segment = %wide, "starting logs rollup segment");
+                self.roll_up(&namespace, wide, config.copy_buffer_bytes)
+                    .await?;
                 sealed += 1;
             }
+        }
+        if sealed > 0 {
+            tracing::info!(sealed, "finished logs rollup pass");
         }
         Ok(sealed)
     }
 
     /// Copies every segment `wide` covers into it, then seals it.
-    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId) -> Result<()> {
+    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId, buffer: u64) -> Result<()> {
         let writer = self.writer()?;
         let ttl = self.marker_ttl()?;
         {
@@ -73,9 +79,11 @@ impl LogDb {
             rolled.entry(namespace.clone()).or_default().insert(wide);
             self.flush_written().await?;
         }
+        let mut queued = 0;
         let mut start_ns = wide.start_ns;
         while start_ns < wide.start_ns.saturating_add(wide.width_ns) {
-            self.copy_segment(namespace, SegmentId::new(start_ns, self.segment_ns), wide)
+            let segment = SegmentId::new(start_ns, self.segment_ns);
+            self.copy_segment(namespace, segment, wide, buffer, &mut queued)
                 .await?;
             start_ns = start_ns.saturating_add(self.segment_ns);
         }
@@ -98,32 +106,48 @@ impl LogDb {
         Ok(())
     }
 
+    /// Copies `segment` into `wide`. `apply_groups` waits only until the
+    /// coordinator accepts a chunk, so once `queued` copied bytes exceed
+    /// `buffer` the copy waits for them to be written.
     async fn copy_segment(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         wide: SegmentId,
+        buffer: u64,
+        queued: &mut u64,
     ) -> Result<()> {
         for read in self.segment_reads(namespace, segment, COPY_STREAMS).await? {
-            let rows = self
-                .read_bounded(namespace, read, &PageBudget::new(usize::MAX))
-                .await?;
-            // Rows of one stream share their labels.
-            let mut streams: HashMap<usize, usize> = HashMap::new();
-            let mut batches: Vec<LogBatch> = Vec::new();
-            for row in rows {
-                let stream = Arc::as_ptr(&row.labels) as usize;
-                let index = *streams.entry(stream).or_insert_with(|| {
-                    batches.push(LogBatch::new((*row.labels).clone(), Vec::new()));
-                    batches.len() - 1
-                });
-                batches[index].entries.push(row.entry);
-            }
-            let groups = group_by_stream(batches, self.segment_ns, |_| wide)?;
-            if !groups.is_empty() {
-                self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
-                    .await?;
-            }
+            let (sender, mut rows) = tokio::sync::mpsc::channel(1);
+            let budget = PageBudget::new(usize::MAX);
+            let read = self.read_bounded_chunks(namespace, read, &budget, sender);
+            let write = async {
+                while let Some(rows) = rows.recv().await {
+                    // Rows of one stream share their labels.
+                    let mut streams: HashMap<usize, usize> = HashMap::new();
+                    let mut batches: Vec<LogBatch> = Vec::new();
+                    for row in rows {
+                        *queued += row_bytes(&row.entry);
+                        let stream = Arc::as_ptr(&row.labels) as usize;
+                        let index = *streams.entry(stream).or_insert_with(|| {
+                            batches.push(LogBatch::new((*row.labels).clone(), Vec::new()));
+                            batches.len() - 1
+                        });
+                        batches[index].entries.push(row.entry);
+                    }
+                    let groups = group_by_stream(batches, self.segment_ns, |_| wide)?;
+                    if !groups.is_empty() {
+                        self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
+                            .await?;
+                    }
+                    if *queued >= buffer {
+                        self.flush_written().await?;
+                        *queued = 0;
+                    }
+                }
+                Ok::<_, Error>(())
+            };
+            tokio::try_join!(read, write)?;
         }
         Ok(())
     }
@@ -146,6 +170,16 @@ impl LogDb {
             .transpose()
             .map(|ttl| ttl.unwrap_or(Ttl::NoExpiry))
     }
+}
+
+/// Approximate in-memory size of one copied entry.
+fn row_bytes(entry: &LogEntry) -> u64 {
+    let metadata: usize = entry
+        .structured_metadata
+        .iter()
+        .map(|field| field.name.len() + field.value.len())
+        .sum();
+    (entry.line.len() + metadata + std::mem::size_of::<LogEntry>()) as u64
 }
 
 #[cfg(test)]
@@ -262,6 +296,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waits_for_storage_whenever_the_copy_buffer_fills() {
+        let db = LogDb::open(config()).await.unwrap();
+        write_day(&db).await;
+        let before = rows(&db).await;
+
+        let config = RollupConfig {
+            copy_buffer_bytes: 1,
+            ..RollupConfig::default()
+        };
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+
+        assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(rows(&db).await, before);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rolls_a_closed_day_into_one_segment_serving_the_same_rows() {
         let db = LogDb::open(config()).await.unwrap();
         write_day(&db).await;
@@ -366,7 +417,8 @@ mod tests {
             .or_default()
             .insert(day());
         for hour in 0..5 {
-            db.copy_segment(&namespace(), SegmentId::new(DAY + hour * HOUR, HOUR), day())
+            let hour = SegmentId::new(DAY + hour * HOUR, HOUR);
+            db.copy_segment(&namespace(), hour, day(), u64::MAX, &mut 0)
                 .await
                 .unwrap();
         }

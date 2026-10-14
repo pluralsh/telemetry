@@ -1155,12 +1155,18 @@ async fn profile_cluster_day() {
             common::storage::rollup::RollupConfig::default().max_segment_bytes,
             |value| value.parse::<u64>().unwrap() << 30,
         );
+        // `PROFILE_ROLLUP_BUFFER_MB` overrides the copy buffer.
+        let copy_buffer_bytes = std::env::var("PROFILE_ROLLUP_BUFFER_MB").map_or(
+            common::storage::rollup::DEFAULT_COPY_BUFFER_BYTES,
+            |value| value.parse::<u64>().unwrap() << 20,
+        );
         let started = Instant::now();
         let sealed = writer
             .rollup_at(
                 &common::storage::rollup::RollupConfig {
                     delay: Duration::ZERO,
                     max_segment_bytes,
+                    copy_buffer_bytes,
                     ..Default::default()
                 },
                 common::time::now_ns(),
@@ -1173,6 +1179,9 @@ async fn profile_cluster_day() {
         );
         writer.close().await.unwrap();
         std::fs::write(store.join("rolled"), b"").unwrap();
+        if std::env::var("PROFILE_ROLLUP_ONLY").is_ok() {
+            return;
+        }
     }
 
     let end = profile_end(step);

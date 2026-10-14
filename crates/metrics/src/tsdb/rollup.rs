@@ -16,7 +16,9 @@ use crate::config::RollupConfig;
 use crate::discovery::MetricsDiscoveryCache;
 use crate::error::Error;
 use crate::minitsdb::MiniTsdb;
-use crate::model::{BucketSize, MetricMetadata, Sample, Series, SeriesData, TimeBucket};
+use crate::model::{
+    BucketSize, HistogramSample, Label, MetricMetadata, Sample, Series, SeriesData, TimeBucket,
+};
 use crate::serde::TimeBucketScoped;
 use crate::serde::key::TimeSeriesKey;
 use crate::storage::{StorageRead, StorageSnapshot};
@@ -78,7 +80,7 @@ impl Tsdb {
         let (buckets, sealed) = self.storage.segments(&self.namespace);
         let mut done = 0;
         for wide in buckets.iter().filter(|b| b.size > 1 && !sealed.contains(b)) {
-            self.roll_up(*wide).await?;
+            self.roll_up(*wide, config.copy_buffer_bytes).await?;
             done += 1;
         }
 
@@ -121,7 +123,7 @@ impl Tsdb {
                     start: day_start + u32::try_from(first).unwrap_or(0) * 60,
                     size: width,
                 };
-                self.roll_up(bucket).await?;
+                self.roll_up(bucket, config.copy_buffer_bytes).await?;
                 done += 1;
             }
         }
@@ -137,7 +139,7 @@ impl Tsdb {
     }
 
     /// Copies every hour `wide` covers into it, then seals it.
-    async fn roll_up(&self, wide: TimeBucket) -> Result<()> {
+    async fn roll_up(&self, wide: TimeBucket, buffer: u64) -> Result<()> {
         {
             // No ingest is in flight while this is held, so once the hours'
             // pending writes are flushed every later write to them goes to
@@ -153,8 +155,10 @@ impl Tsdb {
         }
         let snapshot = self.storage.snapshot().await?;
         let mini = self.get_or_create_for_ingest(wide).await?;
+        let mut queued = 0;
         for hour in wide.hours() {
-            self.copy_hour(&snapshot, hour, &mini).await?;
+            self.copy_hour(&snapshot, hour, &mini, buffer, &mut queued)
+                .await?;
         }
         mini.flush_written().await?;
         self.storage
@@ -171,11 +175,16 @@ impl Tsdb {
         Ok(())
     }
 
+    /// Copies `hour` into `mini`. `ingest_batch` waits only until the
+    /// coordinator accepts a batch, so once `queued` copied bytes exceed
+    /// `buffer` the copy waits for them to be written.
     async fn copy_hour(
         &self,
         snapshot: &StorageSnapshot,
         hour: TimeBucket,
         mini: &MiniTsdb,
+        buffer: u64,
+        queued: &mut u64,
     ) -> Result<()> {
         let forward = snapshot.get_forward_index(&self.namespace, hour).await?;
         if forward.series.is_empty() {
@@ -208,6 +217,7 @@ impl Tsdb {
                 .get(&key.metric_name)
                 .filter(|m| m.metric_type == spec.metric_type && m.unit == spec.unit)
                 .and_then(|m| m.description.clone());
+            *queued += series_bytes(spec.labels.iter(), &data);
             batch.push(Series {
                 labels: spec.labels.iter().cloned().collect(),
                 metric_type: spec.metric_type,
@@ -221,9 +231,13 @@ impl Tsdb {
                     .collect(),
                 histograms: data.histograms,
             });
-            if batch.len() == COPY_BATCH {
+            if batch.len() == COPY_BATCH || *queued >= buffer {
                 mini.ingest_batch(&batch, Some(COPY_WRITE_TIMEOUT)).await?;
                 batch.clear();
+                if *queued >= buffer {
+                    mini.flush_written().await?;
+                    *queued = 0;
+                }
             }
         }
         if !batch.is_empty() {
@@ -233,13 +247,24 @@ impl Tsdb {
     }
 }
 
+/// Approximate in-memory size of one copied series.
+fn series_bytes<'a>(labels: impl IntoIterator<Item = &'a Label>, data: &SeriesData) -> u64 {
+    let labels: usize = labels
+        .into_iter()
+        .map(|label| label.name.len() + label.value.len())
+        .sum();
+    let samples = data.timestamps.len() * std::mem::size_of::<Sample>();
+    let histograms = data.histograms.len() * std::mem::size_of::<HistogramSample>();
+    (std::mem::size_of::<Series>() + labels + samples + histograms) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 
     use super::*;
-    use crate::model::{Label, MetricType, QueryOptions};
+    use crate::model::{MetricType, QueryOptions};
     use crate::storage::{Storage, in_memory_storage};
     use crate::tsdb::TsdbReadEngine;
 
@@ -381,6 +406,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waits_for_storage_whenever_the_copy_buffer_fills() {
+        let storage = Arc::new(in_memory_storage().await);
+        let tsdb = Tsdb::with_retention(storage.clone(), None);
+        write_day(&tsdb, &storage).await;
+        let before = samples(&tsdb).await;
+
+        let config = RollupConfig {
+            copy_buffer_bytes: 1,
+            ..config(u64::MAX)
+        };
+        assert_eq!(tsdb.rollup(&config, after_delay()).await.unwrap(), 1);
+
+        assert_eq!(sealed(&storage).await, vec![day()]);
+        assert_eq!(samples(&tsdb).await, before);
+    }
+
+    #[tokio::test]
     async fn leaves_days_inside_the_delay_alone() {
         let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::with_retention(storage.clone(), None);
@@ -454,7 +496,10 @@ mod tests {
         let snapshot = storage.snapshot().await.unwrap();
         let mini = interrupted.get_or_create_for_ingest(day()).await.unwrap();
         for hour in day().hours().take(5) {
-            interrupted.copy_hour(&snapshot, hour, &mini).await.unwrap();
+            interrupted
+                .copy_hour(&snapshot, hour, &mini, u64::MAX, &mut 0)
+                .await
+                .unwrap();
         }
         interrupted.flush().await.unwrap();
         storage.flush_memtable().await.unwrap();

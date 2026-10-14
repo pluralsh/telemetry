@@ -80,6 +80,10 @@ var (
 	defaultCacheSize   = resource.MustParse("20Gi")
 	defaultCPURequest  = resource.MustParse("250m")
 	defaultMemoryLimit = resource.MustParse("2Gi")
+	// Writers roll closed days up into segments of up to 4 GiB of stored
+	// data, and a rollup peaks at about one and a half times that.
+	defaultRollupMemoryLimit = resource.MustParse("8Gi")
+	MinRollupMemoryLimit     = resource.MustParse("6Gi")
 )
 
 // CacheDiskCapacity returns the Foyer disk budget for a workload's effective
@@ -132,6 +136,35 @@ type VolumeError struct {
 
 func (e *VolumeError) Error() string {
 	return fmt.Sprintf("%s storage %q is invalid: %s", e.Component, e.Volume, e.Reason)
+}
+
+// MemoryError reports a component whose memory limit cannot hold a rollup.
+type MemoryError struct {
+	Component Component
+	Limit     resource.Quantity
+}
+
+func (e *MemoryError) Error() string {
+	return fmt.Sprintf("%s memory limit %s is below the %s a rollup needs", e.Component, e.Limit.String(), MinRollupMemoryLimit.String())
+}
+
+// rollsUp reports whether component runs the background rollup, which only
+// writers and standalone servers of the time-segmented stores do.
+func rollsUp(descriptor Descriptor, component Component) bool {
+	return descriptor.Kind != PseudoFSDescriptor.Kind && component != ComponentReader
+}
+
+// ValidateMemory rejects writer and standalone memory limits too small for
+// a rollup.
+func ValidateMemory(value any) error {
+	metrics := product(value)
+	for _, component := range Components(value) {
+		limit := MemoryLimit(workloadFor(metrics, component), metrics.Descriptor, component)
+		if rollsUp(metrics.Descriptor, component) && limit < MinRollupMemoryLimit.Value() {
+			return &MemoryError{Component: component, Limit: *resource.NewQuantity(limit, resource.BinarySI)}
+		}
+	}
+	return nil
 }
 
 type StatefulSetInput struct {
@@ -729,7 +762,7 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 			others = append(others, container)
 		}
 	}
-	metricsContainer.Resources = containerResources(metricsContainer.Resources, workloadFor(metrics, component).Resources)
+	metricsContainer.Resources = containerResources(metricsContainer.Resources, workloadFor(metrics, component).Resources, defaultMemory(metrics.Descriptor, component))
 	productVersion := lo.CoalesceOrEmpty(metrics.Version, metrics.Image.Tag, input.DefaultProductVersion, operatorversion.ProductVersion)
 	metricsContainer.Image = lo.CoalesceOrEmpty(metrics.Image.Repository, metrics.Descriptor.Image) + ":" + productVersion
 	if metrics.Image.PullPolicy != "" {
@@ -846,7 +879,7 @@ func applyPodDefaults(spec *corev1.PodSpec, metrics *Product, component Componen
 // set: the scheduler then reserves what each pod may use, so pods that all
 // reach their limit at once cannot run their node out of memory. A request
 // set without a limit gets the larger of it and the default limit.
-func containerResources(template, configured corev1.ResourceRequirements) corev1.ResourceRequirements {
+func containerResources(template, configured corev1.ResourceRequirements, defaultLimit resource.Quantity) corev1.ResourceRequirements {
 	result := corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: defaultCPURequest.DeepCopy()},
 		Limits:   corev1.ResourceList{},
@@ -864,12 +897,12 @@ func containerResources(template, configured corev1.ResourceRequirements) corev1
 	limit, limited := result.Limits[corev1.ResourceMemory]
 	switch {
 	case !requested && !limited:
-		result.Requests[corev1.ResourceMemory] = defaultMemoryLimit.DeepCopy()
-		result.Limits[corev1.ResourceMemory] = defaultMemoryLimit.DeepCopy()
+		result.Requests[corev1.ResourceMemory] = defaultLimit.DeepCopy()
+		result.Limits[corev1.ResourceMemory] = defaultLimit.DeepCopy()
 	case !requested:
 		result.Requests[corev1.ResourceMemory] = limit.DeepCopy()
 	case !limited:
-		limit = defaultMemoryLimit.DeepCopy()
+		limit = defaultLimit.DeepCopy()
 		if request.Cmp(limit) > 0 {
 			limit = request.DeepCopy()
 		}
@@ -878,18 +911,22 @@ func containerResources(template, configured corev1.ResourceRequirements) corev1
 	return result
 }
 
+func defaultMemory(descriptor Descriptor, component Component) resource.Quantity {
+	return lo.Ternary(rollsUp(descriptor, component), defaultRollupMemoryLimit, defaultMemoryLimit)
+}
+
 // MemoryLimit is the byte memory limit the operator renders for the
-// workload's container named container.
-func MemoryLimit(workload telemetryv1alpha1.WorkloadSpec, container string) int64 {
+// workload's descriptor container in component.
+func MemoryLimit(workload telemetryv1alpha1.WorkloadSpec, descriptor Descriptor, component Component) int64 {
 	var template corev1.ResourceRequirements
 	if workload.PodTemplate != nil {
 		if found, ok := lo.Find(workload.PodTemplate.Spec.Containers, func(candidate corev1.Container) bool {
-			return candidate.Name == container
+			return candidate.Name == descriptor.Name
 		}); ok {
 			template = found.Resources
 		}
 	}
-	limit := containerResources(template, workload.Resources).Limits[corev1.ResourceMemory]
+	limit := containerResources(template, workload.Resources, defaultMemory(descriptor, component)).Limits[corev1.ResourceMemory]
 	return limit.Value()
 }
 

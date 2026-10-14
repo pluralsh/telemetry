@@ -570,6 +570,89 @@ impl LogDb {
             .await
     }
 
+    /// Sends each decoded row chunk before reading more. Used by rollup so
+    /// copying a hot stream never retains all of its rows at once.
+    pub(super) async fn read_bounded_chunks(
+        &self,
+        namespace: &Namespace,
+        targets: ScanTargets,
+        budget: &PageBudget,
+        sender: tokio::sync::mpsc::Sender<Vec<LogRow>>,
+    ) -> Result<()> {
+        for (ordinal, (segment, streams)) in (targets.first_ordinal..).zip(targets.segments) {
+            self.read_segment_chunks(
+                namespace,
+                (segment, ordinal),
+                streams,
+                targets.range,
+                budget,
+                &sender,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn read_segment_chunks(
+        &self,
+        namespace: &Namespace,
+        (segment, ordinal): (SegmentId, usize),
+        streams: Vec<SegmentStream>,
+        range: (i64, i64),
+        budget: &PageBudget,
+        sender: &tokio::sync::mpsc::Sender<Vec<LogRow>>,
+    ) -> Result<()> {
+        let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
+        let units = plan_reads(&streams, false, COALESCE_GAP_BLOCKS);
+        let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
+        let mut decoded = futures::stream::iter(units)
+            .map(|unit| async move {
+                budget.take()?;
+                let decoding = budget.decode(unit.decode_bytes(true)).await?;
+                let blocks = self
+                    .load_blocks(
+                        namespace,
+                        segment,
+                        unit.object,
+                        unit.first_block..unit.end_block,
+                        ReadNeeds { lines: true },
+                    )
+                    .await?;
+                let runs = tokio::spawn(async move {
+                    let mut runs = Vec::with_capacity(unit.runs.len());
+                    for run in unit.runs {
+                        let first = (run.run.first_block - unit.first_block) as usize;
+                        let blocks = &blocks[first..first + run.run.blocks as usize];
+                        let decoded = PendingRows::decode(&run, blocks, range, None, ordinal)?;
+                        runs.push((run, decoded));
+                    }
+                    Ok::<_, Error>(runs)
+                })
+                .await
+                .map_err(|error| Error::Invalid(format!("page decode task failed: {error}")))??;
+                Ok::<_, Error>((decoding, runs))
+            })
+            .buffered(PAGE_READ_CONCURRENCY);
+        let mut pending = PendingRows::new(false);
+        let mut fetched = 0;
+        while let Some((decoding, runs)) = decoded.try_next().await? {
+            fetched += 1;
+            for (run, decoded) in runs {
+                pending.push(run, decoded);
+            }
+            drop(decoding);
+            if let Some(ready) =
+                <PendingRows as PendingReads>::release(&mut pending, bounds.get(fetched).copied())
+            {
+                sender
+                    .send(ready)
+                    .await
+                    .map_err(|_| Error::Invalid("rollup row consumer stopped".into()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::read_bounded_with`], handing over slices of per-run column
     /// batches instead of rows.
     pub(crate) async fn read_bounded_columns(

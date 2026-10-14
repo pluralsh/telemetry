@@ -57,10 +57,11 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 322122540", "forward_index_cache_capacity_bytes: 107374180", testFlushIntervalConfig,
-		"memory_capacity: 429496720", "capacity: 107374180", "matcher_cache_capacity_bytes: 64424508",
-		"result_cache:\n  capacity_bytes: 107374180",
-		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 322122540\n  memory_budget_bytes: 644245080\n  queue_timeout_seconds: 30",
+		"reader_cache_capacity: 1288490175", "forward_index_cache_capacity_bytes: 429496725", testFlushIntervalConfig,
+		"memory_capacity: 1717986900", "capacity: 429496725", "matcher_cache_capacity_bytes: 257698035",
+		"result_cache:\n  capacity_bytes: 429496725",
+		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 1073741824\n  memory_budget_bytes: 2576980350\n  queue_timeout_seconds: 30",
+		"rollup:\n  copy_buffer_bytes: 429496725",
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
@@ -286,7 +287,8 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 	if !strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 192") {
 		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
 	}
-	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 107374180") {
+	// A request without a limit gets the 8Gi writer default.
+	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 429496725") {
 		t.Fatalf("writer config did not infer forward-index capacity from its memory limit:\n%s", result.Data[MetricsKey])
 	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
@@ -372,6 +374,18 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 	standalone := renderStorageConfigForMode(telemetryv1alpha1.StorageSpec{}, resources.MetricsDescriptor, modeStandalone, diskCapacity, memoryPlan{limit: 2 << 30})
 	if standalone.BlockCache == nil {
 		t.Fatal("standalone storage is missing the default data cache")
+	}
+}
+
+func TestRollupCopyBufferScalesWithMemory(t *testing.T) {
+	for limit, want := range map[int64]int64{
+		256 << 20: 32 << 20,
+		2 << 30:   2 << 30 / 100 * 5,
+		16 << 30:  16 << 30 / 100 * 5,
+	} {
+		if got := renderRollupConfig(memoryPlan{limit: limit}).CopyBufferBytes; got != want {
+			t.Fatalf("limit %d rendered copy buffer %d, want %d", limit, got, want)
+		}
 	}
 }
 

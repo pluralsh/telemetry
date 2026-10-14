@@ -66,6 +66,9 @@ func (r *LogsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Get(ctx, req.NamespacedName, logs); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if err := resources.ValidateMemory(logs); err != nil {
+		return ctrl.Result{}, r.setStatus(ctx, logs, metav1.ConditionFalse, reasonMemoryLimitTooLow, err.Error(), logs.Status.ConfigHash)
+	}
 	result, err := r.reconcile(ctx, logs)
 	if err != nil {
 		var storageErr *StorageChangeError

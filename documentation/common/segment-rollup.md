@@ -45,6 +45,9 @@ with the span of their rollup segment.
    continuation into the rollup segment. While copying a batch of traces the
    writer holds new writes and flushes pending ones, so no head it reads
    goes stale before its copy is applied.
+   The writer accepts copied data before writing it, so once
+   `rollup.copy_buffer_bytes` of it are queued the copy waits until they are
+   written. Traces copies in steps of about that many page bytes.
 4. It writes the sealed marker durably, after the copy, and flushes the
    memtable so the manifest lists it.
 
@@ -75,6 +78,12 @@ rollup:
   max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
   delay_seconds: 3600 # How long after a UTC day ends before it is rolled up.
   interval_seconds: 300 # How often closed days are looked for.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
 ```
 
 Reader-mode servers never roll up.
+
+A rollup holds up to about one and a half times its segment's stored size in
+memory, so with the 4 GiB default the operator gives writers and standalone
+servers an 8Gi memory limit unless one is set, and does not roll out a writer
+whose limit is below 6Gi.

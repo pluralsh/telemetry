@@ -23,8 +23,6 @@ use common::storage::rollup::{Marker, RollupConfig, marker_key};
 
 use super::*;
 
-/// Traces written per copy step.
-const COPY_TRACES: usize = 1_024;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl TraceDb {
@@ -47,7 +45,8 @@ impl TraceDb {
         let mut sealed = 0;
         for (namespace, rollups) in Rollups::load_all(&slate, crate::codec::KEY_SCOPE) {
             for wide in rollups.plan(base_ns, None, config, self.retention, now_ns) {
-                self.roll_up(&namespace, wide).await?;
+                self.roll_up(&namespace, wide, config.copy_buffer_bytes)
+                    .await?;
                 sealed += 1;
             }
         }
@@ -61,7 +60,7 @@ impl TraceDb {
     }
 
     /// Copies every segment `wide` covers into it, then seals it.
-    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId) -> Result<()> {
+    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId, buffer: u64) -> Result<()> {
         let writer = self.rollup_writer()?;
         let ttl = retention_values(self.retention)?.physical_ttl;
         {
@@ -82,8 +81,8 @@ impl TraceDb {
         let base_ns = i64::try_from(self.segment_ns).unwrap_or(i64::MAX);
         let mut start_ns = wide.start_ns;
         while start_ns < wide.start_ns.saturating_add(wide.width_ns) {
-            self.copy_segment(namespace, SegmentId::new(start_ns, base_ns), wide)
-                .await?;
+            let segment = SegmentId::new(start_ns, base_ns);
+            self.copy_segment(namespace, segment, wide, buffer).await?;
             start_ns = start_ns.saturating_add(base_ns);
         }
         self.flush().await?;
@@ -105,11 +104,14 @@ impl TraceDb {
         Ok(())
     }
 
+    /// Copies `segment` into `wide` in steps of about `buffer` page bytes.
+    /// Each step waits for the one before it to be written.
     async fn copy_segment(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         wide: SegmentId,
+        buffer: u64,
     ) -> Result<()> {
         let now = unix_time_ms()?;
         let mut sequences = Vec::new();
@@ -131,6 +133,7 @@ impl TraceDb {
             }
         }
         let mut traces = Vec::new();
+        let mut chunk = 0;
         for sequence in sequences {
             let Some(payload) = self
                 .storage
@@ -143,9 +146,11 @@ impl TraceDb {
             for index in 0..page.directory().len() {
                 traces.push(page.decode_trace(index)?);
             }
-            if traces.len() >= COPY_TRACES {
+            chunk += page.retained_bytes() as u64;
+            if chunk >= buffer {
                 self.copy_traces(namespace, (segment, wide), std::mem::take(&mut traces))
                     .await?;
+                chunk = 0;
             }
         }
         if !traces.is_empty() {
@@ -177,7 +182,10 @@ impl TraceDb {
             .await
             .map_err(map_write_error)?;
         let now = unix_time_ms()?;
-        let ids = traces.iter().map(|trace| trace.trace_id).collect::<Vec<_>>();
+        let ids = traces
+            .iter()
+            .map(|trace| trace.trace_id)
+            .collect::<Vec<_>>();
         let heads = stream::iter(ids)
             .map(|trace_id| async move { self.live_head(namespace, trace_id, now).await })
             .buffered(READ_CONCURRENCY)
@@ -368,6 +376,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copies_in_steps_of_the_copy_buffer() {
+        let db = TraceDb::open(config()).await.unwrap();
+        write_day(&db).await;
+        let before = spans(&db).await;
+
+        let config = RollupConfig {
+            copy_buffer_bytes: 1,
+            ..RollupConfig::default()
+        };
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+
+        assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(spans(&db).await, before);
+        assert_heads_rebased(&db).await;
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rolls_a_closed_day_into_one_segment_serving_the_same_traces() {
         let db = TraceDb::open(config()).await.unwrap();
         write_day(&db).await;
@@ -453,7 +479,9 @@ mod tests {
             .insert(day());
         for hour in 0..5 {
             let hour = SegmentId::new((DAY + hour * HOUR) as i64, HOUR as i64);
-            db.copy_segment(&namespace(), hour, day()).await.unwrap();
+            db.copy_segment(&namespace(), hour, day(), u64::MAX)
+                .await
+                .unwrap();
         }
         publish(&db).await;
         assert_eq!(spans(&db).await, before);

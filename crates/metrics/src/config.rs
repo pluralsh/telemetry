@@ -86,6 +86,9 @@ pub struct RollupConfig {
     pub delay: Duration,
     /// How often to look for days to roll up.
     pub interval: Duration,
+    /// Copied bytes a rollup may hand the writer before waiting for them to
+    /// reach storage. Larger values copy faster at the cost of memory.
+    pub copy_buffer_bytes: u64,
 }
 
 impl Default for RollupConfig {
@@ -95,6 +98,7 @@ impl Default for RollupConfig {
             max_bucket_bytes: 4 << 30,
             delay: Duration::from_secs(60 * 60),
             interval: Duration::from_secs(5 * 60),
+            copy_buffer_bytes: common::storage::rollup::DEFAULT_COPY_BUFFER_BYTES,
         }
     }
 }

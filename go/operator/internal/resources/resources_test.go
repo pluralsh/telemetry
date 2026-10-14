@@ -1,6 +1,7 @@
 package resources
 
 import (
+	"errors"
 	"maps"
 	"slices"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 const (
 	testDefaultMemory   = "2Gi"
+	testRollupMemory    = "8Gi"
 	testMetricsName     = "example"
 	testLogsName        = "logs"
 	testNamespace       = "test"
@@ -57,8 +59,8 @@ func TestStatefulSetUsesPersistentDefaults(t *testing.T) {
 	}
 	resources := statefulSet.Spec.Template.Spec.Containers[0].Resources
 	assertResourceQuantity(t, resources.Requests, corev1.ResourceCPU, "250m")
-	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, testDefaultMemory)
-	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, testDefaultMemory)
+	assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, testRollupMemory)
+	assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, testRollupMemory)
 	if _, exists := resources.Limits[corev1.ResourceCPU]; exists {
 		t.Fatal("default resources unexpectedly include a CPU limit")
 	}
@@ -820,7 +822,7 @@ func TestContainerResourcesRequestMemoryAtItsLimit(t *testing.T) {
 		{name: "both", configured: corev1.ResourceRequirements{Requests: memory("1Gi"), Limits: memory("4Gi")}, request: "1Gi", limit: "4Gi"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			resources := containerResources(test.template, test.configured)
+			resources := containerResources(test.template, test.configured, defaultMemoryLimit)
 			assertResourceQuantity(t, resources.Requests, corev1.ResourceMemory, test.request)
 			assertResourceQuantity(t, resources.Limits, corev1.ResourceMemory, test.limit)
 		})
@@ -829,11 +831,43 @@ func TestContainerResourcesRequestMemoryAtItsLimit(t *testing.T) {
 
 func TestMemoryLimitFollowsTheRenderedContainer(t *testing.T) {
 	metrics := &telemetryv1alpha1.Metrics{ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace}}
-	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor.Name); limit != 2<<30 {
+	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor, ComponentReader); limit != 2<<30 {
 		t.Fatalf("default limit = %d", limit)
 	}
 	metrics.Spec.Reader.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}
-	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor.Name); limit != 4<<30 {
+	if limit := MemoryLimit(metrics.Spec.Reader, MetricsDescriptor, ComponentReader); limit != 4<<30 {
 		t.Fatalf("configured limit = %d", limit)
+	}
+}
+
+func TestRollupWritersDefaultToEnoughMemoryForARollup(t *testing.T) {
+	for _, descriptor := range []Descriptor{MetricsDescriptor, LogsDescriptor, TracesDescriptor} {
+		for _, component := range []Component{ComponentWriter, ComponentStandalone} {
+			if limit := MemoryLimit(telemetryv1alpha1.WorkloadSpec{}, descriptor, component); limit != 8<<30 {
+				t.Fatalf("%s %s default limit = %d, want 8Gi", descriptor.Kind, component, limit)
+			}
+		}
+	}
+	if limit := MemoryLimit(telemetryv1alpha1.WorkloadSpec{}, PseudoFSDescriptor, ComponentStandalone); limit != 2<<30 {
+		t.Fatalf("PseudoFS default limit = %d, want 2Gi", limit)
+	}
+}
+
+func TestValidateMemoryRejectsWritersTooSmallForARollup(t *testing.T) {
+	logs := &telemetryv1alpha1.Logs{ObjectMeta: metav1.ObjectMeta{Name: "logs", Namespace: testNamespace}}
+	if err := ValidateMemory(logs); err != nil {
+		t.Fatalf("default resources rejected: %v", err)
+	}
+	logs.Spec.Writer.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}
+	var memoryErr *MemoryError
+	if err := ValidateMemory(logs); !errors.As(err, &memoryErr) || memoryErr.Component != ComponentStandalone {
+		t.Fatalf("2Gi standalone writer accepted: %v", err)
+	}
+
+	logs.Spec.Mode = telemetryv1alpha1.ProductModeSharded
+	logs.Spec.Writer.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("6Gi")}
+	logs.Spec.Reader.Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}
+	if err := ValidateMemory(logs); err != nil {
+		t.Fatalf("6Gi writer with a small reader rejected: %v", err)
 	}
 }

@@ -46,7 +46,13 @@ pub struct RollupConfig {
     pub delay: Duration,
     /// How often closed days are looked for.
     pub interval: Duration,
+    /// Copied bytes a rollup may hand the writer before waiting for them to
+    /// reach storage. Larger values copy faster at the cost of memory.
+    pub copy_buffer_bytes: u64,
 }
+
+/// Default [`RollupConfig::copy_buffer_bytes`].
+pub const DEFAULT_COPY_BUFFER_BYTES: u64 = 64 << 20;
 
 impl Default for RollupConfig {
     fn default() -> Self {
@@ -55,6 +61,7 @@ impl Default for RollupConfig {
             max_segment_bytes: 4 << 30,
             delay: Duration::from_secs(3_600),
             interval: Duration::from_secs(300),
+            copy_buffer_bytes: DEFAULT_COPY_BUFFER_BYTES,
         }
     }
 }

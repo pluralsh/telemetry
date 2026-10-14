@@ -74,6 +74,9 @@ func (r *MetricsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if err := resources.ValidateMemory(metrics); err != nil {
+		return ctrl.Result{}, r.setStatus(ctx, metrics, metav1.ConditionFalse, reasonMemoryLimitTooLow, err.Error(), metrics.Status.ConfigHash)
+	}
 	result, err := r.reconcile(ctx, metrics)
 	if err != nil {
 		var storageErr *StorageChangeError

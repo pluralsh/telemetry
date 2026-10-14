@@ -138,7 +138,7 @@ func Render(input Input) (Result, error) {
 		if mode == modeReader {
 			workload = input.Metrics.Spec.Reader
 		}
-		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}
+		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(mode))}
 		return yaml.Marshal(renderConfig{
 			Mode:                           mode,
 			Listeners:                      renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
@@ -156,6 +156,7 @@ func Render(input Input) (Result, error) {
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
 			},
+			Rollup:     renderRollupConfig(plan),
 			Sharding:   renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, workload, grpcPort(input.Metrics), mode),
 			Auth:       renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces: namespaces,
@@ -200,7 +201,7 @@ func renderPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) (Result, error) {
 		return Result{}, err
 	}
 	descriptor := resources.PseudoFSDescriptor
-	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload), memoryPlan{limit: resources.MemoryLimit(pseudofs.Spec.Workload, descriptor.Name)})
+	storage := renderStorageConfig(spec.Storage, descriptor, resources.CacheDiskCapacity(pseudofs.Spec.Workload), memoryPlan{limit: resources.MemoryLimit(pseudofs.Spec.Workload, descriptor, resources.ComponentStandalone)})
 	// PseudoFS metadata usually fits in memory; writing every inserted block
 	// to disk costs direct I/O on the request path for no hit-rate gain.
 	if cache := storage.BlockCache; cache != nil && cache.Type == string(telemetryv1alpha1.CacheFoyerHybrid) {
@@ -317,6 +318,7 @@ func renderLogs(input Input) (Result, error) {
 		if component == modeReader {
 			workload = logs.Spec.Reader
 		}
+		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(component))}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
 			PathPrefix: logs.Spec.Ingress.PathPrefix,
@@ -324,9 +326,10 @@ func renderLogs(input Input) (Result, error) {
 				HTTP: fmt.Sprintf("0.0.0.0:%d", resources.HTTPPort(logs)),
 				GRPC: fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(logs)),
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), plan),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
+			Rollup:                 renderRollupConfig(plan),
 			Page: renderLogsPage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
@@ -430,6 +433,7 @@ func renderTraces(input Input) (Result, error) {
 		if component == modeReader {
 			workload = traces.Spec.Reader
 		}
+		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(component))}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
 			PathPrefix: traces.Spec.Ingress.PathPrefix,
@@ -438,9 +442,10 @@ func renderTraces(input Input) (Result, error) {
 				GRPC:     fmt.Sprintf("0.0.0.0:%d", resources.GRPCPort(traces)),
 				OTLPGRPC: "0.0.0.0:4317", JaegerGRPC: "0.0.0.0:14250",
 			},
-			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), memoryPlan{limit: resources.MemoryLimit(workload, descriptor.Name)}),
+			Storage:                renderStorageConfigForMode(spec.Storage, descriptor, component, resources.CacheDiskCapacity(workload), plan),
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
+			Rollup:                 renderRollupConfig(plan),
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
@@ -717,6 +722,13 @@ func (plan memoryPlan) matcherCache() int64      { return plan.share(3, 16*mebib
 func (plan memoryPlan) resultCache() int64       { return plan.share(5, 16*mebibyte) }
 func (plan memoryPlan) queryBudget() int64       { return plan.share(30, 128*mebibyte) }
 
+// rollupCopyBuffer bounds the copied bytes a rollup queues for the writer.
+func (plan memoryPlan) rollupCopyBuffer() int64 { return plan.share(5, 32*mebibyte) }
+
+func renderRollupConfig(plan memoryPlan) renderRollup {
+	return renderRollup{CopyBufferBytes: plan.rollupCopyBuffer()}
+}
+
 func renderMetricsQuery(spec *telemetryv1alpha1.MetricsQuerySpec, plan memoryPlan) renderQuery {
 	const maxQueryMemory = int64(1 << 30)
 	if spec == nil {
@@ -792,6 +804,7 @@ type renderConfig struct {
 	CacheWarmer                    renderCacheWarmer    `json:"cache_warmer"`
 	Write                          renderWrite          `json:"write"`
 	Request                        renderMetricsRequest `json:"request"`
+	Rollup                         renderRollup         `json:"rollup"`
 	Sharding                       renderSharding       `json:"sharding"`
 	Auth                           renderAuth           `json:"auth"`
 	Namespaces                     []renderNamespace    `json:"namespaces"`
@@ -822,9 +835,13 @@ type renderLogsConfig struct {
 	Sharding               renderSharding      `json:"sharding"`
 	Request                renderLogsRequest   `json:"request"`
 	Elasticsearch          renderElasticsearch `json:"elasticsearch"`
+	Rollup                 renderRollup        `json:"rollup"`
 	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
 	Auth                   renderAuth          `json:"auth"`
 	Namespaces             []renderNamespace   `json:"namespaces"`
+}
+type renderRollup struct {
+	CopyBufferBytes int64 `json:"copy_buffer_bytes"`
 }
 type renderElasticsearch struct {
 	MessageFields []string `json:"message_fields"`
@@ -842,6 +859,7 @@ type renderTracesConfig struct {
 	Write                  renderWrite         `json:"write"`
 	Sharding               renderSharding      `json:"sharding"`
 	Request                renderTracesRequest `json:"request"`
+	Rollup                 renderRollup        `json:"rollup"`
 	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
 	Auth                   renderAuth          `json:"auth"`
 	Namespaces             []renderNamespace   `json:"namespaces"`

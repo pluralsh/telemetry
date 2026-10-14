@@ -135,6 +135,8 @@ pub struct RollupConfig {
     pub delay_seconds: u64,
     /// How often to look for days to roll up.
     pub interval_seconds: u64,
+    /// Copied bytes a rollup may queue before waiting for storage.
+    pub copy_buffer_bytes: u64,
 }
 
 impl Default for RollupConfig {
@@ -145,6 +147,7 @@ impl Default for RollupConfig {
             max_bucket_bytes: defaults.max_bucket_bytes,
             delay_seconds: defaults.delay.as_secs(),
             interval_seconds: defaults.interval.as_secs(),
+            copy_buffer_bytes: defaults.copy_buffer_bytes,
         }
     }
 }
@@ -156,6 +159,7 @@ impl RollupConfig {
             max_bucket_bytes: self.max_bucket_bytes,
             delay: std::time::Duration::from_secs(self.delay_seconds),
             interval: std::time::Duration::from_secs(self.interval_seconds.max(1)),
+            copy_buffer_bytes: self.copy_buffer_bytes.max(1),
         }
     }
 }

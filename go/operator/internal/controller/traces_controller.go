@@ -66,6 +66,9 @@ func (r *TracesReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, req.NamespacedName, traces); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if err := resources.ValidateMemory(traces); err != nil {
+		return ctrl.Result{}, r.setStatus(ctx, traces, metav1.ConditionFalse, reasonMemoryLimitTooLow, err.Error(), traces.Status.ConfigHash)
+	}
 	result, err := r.reconcile(ctx, traces)
 	if err != nil {
 		var storageErr *StorageChangeError

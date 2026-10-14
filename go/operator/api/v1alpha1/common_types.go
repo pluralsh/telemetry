@@ -308,9 +308,12 @@ type WorkloadSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 	// Resources configures requests and limits for the datastore container.
 	// Values here take precedence over podTemplate container resources. Missing
-	// values default to a 250m CPU request and a 2Gi memory limit, with memory
-	// requested at its limit unless a request is set. The operator sizes the
-	// caches and query memory budget from the memory limit.
+	// values default to a 250m CPU request and a 2Gi memory limit (8Gi for
+	// Metrics, Logs and Traces writers and standalone servers, which roll up
+	// closed days), with memory requested at its limit unless a request is
+	// set. Those writers need at least a 6Gi limit and are not rolled out with
+	// less. The operator sizes the caches and query memory budget from the
+	// memory limit.
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// PodTemplate is the full Kubernetes pod template escape hatch. Operator
 	// required fields and the first-class scheduling fields are merged into it.
