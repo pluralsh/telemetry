@@ -21,6 +21,7 @@ const (
 	testBucket              = "metrics"
 	testTenantNamespace     = "tenant-a"
 	testFlushIntervalConfig = "flush_interval_seconds: 10"
+	testCopyBufferPath      = "rollup.copy_buffer_bytes"
 	testCacheWarmerConfig   = "cache_warmer:"
 	testWarmRangeConfig     = "warm_range_seconds: 7200"
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
@@ -756,7 +757,7 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 			name: testMetricsProduct,
 			bounds: []string{
 				"reader_cache_capacity", "forward_index_cache_capacity_bytes", "matcher_cache_capacity_bytes",
-				"result_cache.capacity_bytes", "query.memory_budget_bytes", "rollup.copy_buffer_bytes",
+				"result_cache.capacity_bytes", "query.memory_budget_bytes", testCopyBufferPath,
 			},
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Metrics: &telemetryv1alpha1.Metrics{
@@ -767,7 +768,7 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 		},
 		{
 			name:   testLogsProduct,
-			bounds: []string{"reader_cache_capacity", "result_cache_capacity", "request.max_in_flight_query_bytes", "rollup.copy_buffer_bytes"},
+			bounds: []string{"reader_cache_capacity", "result_cache_capacity", "request.max_in_flight_query_bytes", testCopyBufferPath},
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Logs: &telemetryv1alpha1.Logs{
 					ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
@@ -779,7 +780,7 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 			name: testTracesProduct,
 			bounds: []string{
 				"read_cache.metadata_bytes", "read_cache.postings_bytes", "read_cache.pages_bytes", "read_cache.locators_bytes",
-				"rollup.copy_buffer_bytes",
+				testCopyBufferPath,
 			},
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Traces: &telemetryv1alpha1.Traces{

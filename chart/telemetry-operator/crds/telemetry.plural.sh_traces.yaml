@@ -9746,8 +9746,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-
@@ -18714,8 +18715,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-

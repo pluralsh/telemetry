@@ -258,8 +258,8 @@ spec:
                   forwardIndexCacheCapacityBytes:
                     description: |-
                       ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
-                      selectors. When omitted, the operator uses 5% of the container memory
-                      limit.
+                      selectors. When omitted, the operator sizes it from the container
+                      memory limit.
                     format: int64
                     minimum: 1
                     type: integer
@@ -297,7 +297,8 @@ spec:
                       memoryBudgetBytes:
                         description: |-
                           MemoryBudgetBytes is the engine memory all running queries together may
-                          reserve. Defaults to 30% of the container memory limit.
+                          reserve. When omitted, the operator sizes it from the container memory
+                          limit.
                         format: int64
                         minimum: 1
                         type: integer
@@ -312,8 +313,8 @@ spec:
                   readerCacheCapacity:
                     description: |-
                       ReaderCacheCapacity sizes each shard's query cache: half of it, in
-                      bytes, holds decoded series chunks. When omitted, the operator uses 15%
-                      of the container memory limit.
+                      bytes, holds decoded series chunks. When omitted, the operator sizes it
+                      from the container memory limit.
                     format: int64
                     minimum: 1
                     type: integer
@@ -9747,8 +9748,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-
@@ -18715,8 +18717,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-
