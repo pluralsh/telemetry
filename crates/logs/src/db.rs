@@ -48,10 +48,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
 };
-use crate::object::{
-    BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records, run_slice_ns,
-    slice_streams,
-};
+use crate::object::{BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records};
 use crate::search::{
     FieldStats, IndexDelta, block_max_scores, encode_field_stats, source_matches, term_index_ops,
 };

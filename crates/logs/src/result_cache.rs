@@ -51,7 +51,11 @@ pub(crate) struct CachePlan {
 impl CachePlan {
     /// `None` for queries the cache must not serve; see
     /// [`crate::query::step_lookback`].
-    pub(crate) fn new(namespace: &Namespace, request: &QueryRequest, segment_ns: i64) -> Option<Self> {
+    pub(crate) fn new(
+        namespace: &Namespace,
+        request: &QueryRequest,
+        segment_ns: i64,
+    ) -> Option<Self> {
         let step_ns = request.step_ns.filter(|step| *step > 0)?;
         let lookback_ns = crate::query::step_lookback(request)?;
         (segment_ns > 0).then(|| Self {
@@ -291,8 +295,7 @@ fn entry_bytes(entry: &ResultEntry) -> usize {
             64 + labels + series.samples.len() * 16
         })
         .sum();
-    let generations =
-        entry.generations.segments.len() * (32 + entry.generations.shards.len() * 16);
+    let generations = entry.generations.segments.len() * (32 + entry.generations.shards.len() * 16);
     128 + series + generations
 }
 
@@ -343,8 +346,14 @@ mod tests {
         assert_eq!(a.key, plan(count, 2 * MINUTE, MINUTE).unwrap().key);
         assert_ne!(a.key, shifted.key);
         // A 5m window reaches back into the previous hour.
-        assert_eq!(a.step_starts(HOUR + MINUTE).collect::<Vec<_>>(), vec![0, HOUR]);
-        assert_eq!(a.step_starts(HOUR + 6 * MINUTE).collect::<Vec<_>>(), vec![HOUR]);
+        assert_eq!(
+            a.step_starts(HOUR + MINUTE).collect::<Vec<_>>(),
+            vec![0, HOUR]
+        );
+        assert_eq!(
+            a.step_starts(HOUR + 6 * MINUTE).collect::<Vec<_>>(),
+            vec![HOUR]
+        );
     }
 
     #[tokio::test]
@@ -363,12 +372,20 @@ mod tests {
         };
         let points: Vec<_> = (0..=5).map(|i| (i * 30 * MINUTE, i as f64)).collect();
         cache
-            .insert(&plan, 0, last, &[series("a", &points)], generations(&[1, 1, 1, 1]))
+            .insert(
+                &plan,
+                0,
+                last,
+                &[series("a", &points)],
+                generations(&[1, 1, 1, 1]),
+            )
             .await;
 
         // Segments are hours -1..=2. Hour 1 changes: the steps at 0 and 30m
         // read no later than hour 0; the step at 1h reads hours 0 and 1.
-        let lookup = cache.lookup(&plan, 0, last, &generations(&[1, 1, 2, 1])).await;
+        let lookup = cache
+            .lookup(&plan, 0, last, &generations(&[1, 1, 2, 1]))
+            .await;
         assert_eq!(lookup.reused_steps, 2);
         let reused = ResultCache::reused(&lookup, 0, 30 * MINUTE);
         assert_eq!(reused, vec![series("a", &points[..2])]);

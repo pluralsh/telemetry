@@ -193,14 +193,6 @@ metadata. Readers reject other bits. Runs are keyed by stream before object,
 so a stream's runs are contiguous, and carry no timestamp in the key. Run
 records are a few dozen bytes.
 
-In a segment wider than `segment_duration_seconds`, which only a rollup
-writes, no object holds rows from both sides of a boundary of the segment's
-**slice**: the widest of 30, 15, 5 and 1 minutes that divides the segment's
-width at least 48 times (30 minutes for a day, 5 for a 4-hour window).
-Writes cut an object per slice and merges join only objects of one slice,
-so a range-query step at least a slice wide, aligned to it, counts most runs
-whole from their records instead of reading their blocks.
-
 Each block stands alone: its meta header holds the block's time range, row
 count and line bytes, so readers skip blocks outside the query range without
 decompressing them. Rows inside a block are in stored order, which is

@@ -1266,9 +1266,11 @@ impl LogDb {
     ) -> Result<Vec<(StreamId, Arc<Labels>)>> {
         if let Some(spans) = self.span_scans(&stream_ids) {
             let prefix = forward_prefix(namespace, segment);
-            let mut labelled = futures::future::try_join_all(spans.into_iter().map(|span| {
-                self.scan_labels(prefix.clone(), span, decode_forward_key)
-            }))
+            let mut labelled = futures::future::try_join_all(
+                spans
+                    .into_iter()
+                    .map(|span| self.scan_labels(prefix.clone(), span, decode_forward_key)),
+            )
             .await?
             .into_iter()
             .flatten()
@@ -1527,7 +1529,7 @@ impl LogDb {
         }
         (spans.len().saturating_mul(self.span_scan_min_streams) <= stream_ids.len()
             && covered <= stream_ids.len().saturating_mul(self.span_scan_max_spread))
-            .then_some(spans)
+        .then_some(spans)
     }
 }
 

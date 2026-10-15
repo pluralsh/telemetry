@@ -777,7 +777,8 @@ impl Storage {
 
     /// Holds merges of `bucket`'s segment while a rollup copies into it.
     pub(crate) fn hold_merges(&self, namespace: &Namespace, bucket: TimeBucket) -> MergeHold {
-        self.merge_holds.copying(bucket_segment_prefix(namespace, &bucket))
+        self.merge_holds
+            .copying(bucket_segment_prefix(namespace, &bucket))
     }
 
     /// Waits up to `wait` for `bucket`'s segment to hold everything it held

@@ -16,10 +16,10 @@ use proto::logs::internal::v1 as pb;
 
 use crate::db::BlockCache;
 use crate::query::{ShardSource, query_databases, serve_shard_query};
-use crate::result_cache::{CachePlan, Generations, ResultCache};
 use crate::remote::{
     LogsShardClient, RemoteShard, labels_to_wire, namespace_from_wire, query_from_wire,
 };
+use crate::result_cache::{CachePlan, Generations, ResultCache};
 use crate::{
     Config, Durability, Error, Labels, LogBatch, LogDb, Namespace, QueryOptions, QueryRequest,
     QueryResult, Result, WriteReport,
@@ -304,12 +304,16 @@ impl ShardedLogs {
         let step = plan.step_ns();
         let start = request.start_ns;
         if request.end_ns < start {
-            return self.query_sources(sources, namespace, request, options).await;
+            return self
+                .query_sources(sources, namespace, request, options)
+                .await;
         }
         let last = start + (request.end_ns - start) / step * step;
         let starts = plan.segment_starts(start, last);
         let Ok(generations) = self.generations(&sources, namespace, &starts).await else {
-            return self.query_sources(sources, namespace, request, options).await;
+            return self
+                .query_sources(sources, namespace, request, options)
+                .await;
         };
         let lookup = cache.lookup(plan, start, last, &generations).await;
         let reused_steps = i64::try_from(lookup.reused_steps).unwrap_or(i64::MAX);
@@ -1009,7 +1013,9 @@ mod tests {
                 Durability::Written,
             )
         };
-        write(&[10 * MINUTE, 70 * MINUTE, 130 * MINUTE]).await.unwrap();
+        write(&[10 * MINUTE, 70 * MINUTE, 130 * MINUTE])
+            .await
+            .unwrap();
         let request = QueryRequest::range(
             r#"sum(count_over_time({app="a"}[30m]))"#,
             h0,

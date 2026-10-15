@@ -343,8 +343,7 @@ impl DirectWriter {
     }
 
     /// Packs one segment's streams, in stream order, into level-0 objects
-    /// numbered from `first`, and returns the next unallocated object ID. A
-    /// rollup segment gets objects of one [`run_slice_ns`] slice each.
+    /// numbered from `first`, and returns the next unallocated object ID.
     fn append_segment_objects(
         &self,
         write: &mut PendingWrite,
@@ -353,20 +352,12 @@ impl DirectWriter {
         first: u64,
         streams: Vec<(StreamId, Vec<LogEntry>)>,
     ) -> Result<u64> {
-        let slices = match run_slice_ns(segment, duration_ns(self.config.segment_duration)?) {
-            Some(slice_ns) => slice_streams(streams, slice_ns),
-            None => vec![streams],
-        };
-        let mut built = Vec::new();
-        for streams in slices {
-            let mut builder = ObjectBuilder::new(self.config.page.clone())?;
-            for (stream_id, entries) in streams {
-                builder.push_run(stream_id, entries)?;
-            }
-            built.extend(builder.finish());
+        let mut builder = ObjectBuilder::new(self.config.page.clone())?;
+        for (stream_id, entries) in streams {
+            builder.push_run(stream_id, entries)?;
         }
         let mut next = first;
-        for built in built {
+        for built in builder.finish() {
             let object = ObjectRef { id: next, level: 0 };
             next = next
                 .checked_add(1)

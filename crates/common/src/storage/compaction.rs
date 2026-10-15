@@ -92,7 +92,10 @@ impl MergeHolds {
     }
 
     fn set(&self, prefix: &Bytes, hold: Option<Hold>) {
-        let mut holds = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut holds = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match hold {
             Some(hold) => holds.insert(prefix.clone(), hold),
             None => holds.remove(prefix),
@@ -499,23 +502,20 @@ fn plan(
             !superseded && !expired(*end_ms, segment) && mergeable(*end_ms, segment)
         })
         .partition(|(_, _, segment)| requested(segment));
-    let merges = requested
-        .into_iter()
-        .chain(routine)
-        .map(|(_, _, segment)| {
-            let destination = match segment.runs.iter().min() {
-                Some(id) => *id,
-                None => {
-                    next_run += 1;
-                    next_run - 1
-                }
-            };
-            Planned::Merge {
-                prefix: segment.prefix.clone(),
-                sources: segment.sources(),
-                destination,
+    let merges = requested.into_iter().chain(routine).map(|(_, _, segment)| {
+        let destination = match segment.runs.iter().min() {
+            Some(id) => *id,
+            None => {
+                next_run += 1;
+                next_run - 1
             }
-        });
+        };
+        Planned::Merge {
+            prefix: segment.prefix.clone(),
+            sources: segment.sources(),
+            destination,
+        }
+    });
     drains.chain(merges).take(slots).collect()
 }
 

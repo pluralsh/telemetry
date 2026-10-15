@@ -520,7 +520,8 @@ impl Rollups {
             if !covers(block, *segment) || !self.is_visible(*segment) {
                 continue;
             }
-            let slot = usize::try_from((segment.start_ns - block.start_ns) / window_ns).unwrap_or(0);
+            let slot =
+                usize::try_from((segment.start_ns - block.start_ns) / window_ns).unwrap_or(0);
             if let Some(bytes) = bytes.get_mut(slot) {
                 *bytes += size;
                 present[slot] += 1;
@@ -786,7 +787,10 @@ mod tests {
         };
         assert_eq!(
             rollups.plan(HOUR, None, &config, None, DAY + 5 * HOUR),
-            vec![Segment::new(DAY, 2 * HOUR), Segment::new(DAY + 2 * HOUR, 2 * HOUR)]
+            vec![
+                Segment::new(DAY, 2 * HOUR),
+                Segment::new(DAY + 2 * HOUR, 2 * HOUR)
+            ]
         );
     }
 
@@ -820,7 +824,10 @@ mod tests {
         };
         assert_eq!(
             sealed.plan(HOUR, None, &capped, None, after(DAY)),
-            vec![Segment::new(DAY, 12 * HOUR), Segment::new(DAY + 12 * HOUR, 12 * HOUR)]
+            vec![
+                Segment::new(DAY, 12 * HOUR),
+                Segment::new(DAY + 12 * HOUR, 12 * HOUR)
+            ]
         );
         // Too big to widen at all, they stay.
         let tight = RollupConfig {

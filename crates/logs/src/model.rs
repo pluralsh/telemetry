@@ -249,7 +249,6 @@ mod tests {
         assert_eq!(order, vec![3, 1, 4, 0, 2]);
     }
 
-
     #[test]
     fn structured_metadata_is_canonicalized() {
         let fields = Fields::new(vec![

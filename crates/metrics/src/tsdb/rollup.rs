@@ -124,8 +124,14 @@ impl Tsdb {
         let mini = self.get_or_create_for_ingest(wide).await?;
         let mut queued = 0;
         for source in sources {
-            self.copy_bucket(&snapshot, source, &mini, config.copy_buffer_bytes, &mut queued)
-                .await?;
+            self.copy_bucket(
+                &snapshot,
+                source,
+                &mini,
+                config.copy_buffer_bytes,
+                &mut queued,
+            )
+            .await?;
         }
         mini.flush_written().await?;
         self.storage.flush_memtable().await?;
@@ -424,8 +430,14 @@ mod tests {
         assert_eq!(samples(&tsdb).await, before);
 
         // The day's last window first, then the day from its windows.
-        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 1);
-        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 1);
+        assert_eq!(
+            tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(),
+            1
+        );
         assert!(sealed(&storage).await.contains(&day()));
         let reader = tsdb
             .query_reader(day().start_ms() / 1000, day().end_ms() / 1000 - 1)
@@ -438,7 +450,10 @@ mod tests {
             vec![day()]
         );
         assert_eq!(samples(&tsdb).await, before);
-        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 0);
+        assert_eq!(
+            tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
