@@ -48,13 +48,13 @@ type MetricsConfigSpec struct {
 	// +kubebuilder:validation:Pattern=`^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`
 	Retention string `json:"retention,omitempty"`
 	// ReaderCacheCapacity sizes each shard's query cache: half of it, in
-	// bytes, holds decoded series chunks. When omitted, the operator uses 15%
-	// of the container memory limit.
+	// bytes, holds decoded series chunks. When omitted, the operator sizes it
+	// from the container memory limit.
 	// +kubebuilder:validation:Minimum=1
 	ReaderCacheCapacity *int64 `json:"readerCacheCapacity,omitempty"`
 	// ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved
-	// selectors. When omitted, the operator uses 5% of the container memory
-	// limit.
+	// selectors. When omitted, the operator sizes it from the container
+	// memory limit.
 	// +kubebuilder:validation:Minimum=1
 	ForwardIndexCacheCapacityBytes *int64 `json:"forwardIndexCacheCapacityBytes,omitempty"`
 	// Query limits PromQL evaluation across the whole process.
@@ -84,7 +84,8 @@ type MetricsQuerySpec struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxMemoryBytes *int64 `json:"maxMemoryBytes,omitempty"`
 	// MemoryBudgetBytes is the engine memory all running queries together may
-	// reserve. Defaults to 30% of the container memory limit.
+	// reserve. When omitted, the operator sizes it from the container memory
+	// limit.
 	// +kubebuilder:validation:Minimum=1
 	MemoryBudgetBytes *int64 `json:"memoryBudgetBytes,omitempty"`
 	// MaxConcurrentShardReads is how many shard reads a reader serves to other

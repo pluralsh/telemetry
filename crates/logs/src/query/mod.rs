@@ -952,6 +952,25 @@ fn match_score(row: &LogLine) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// How far before a step its read window reaches, for a range metric query
+/// whose step results depend only on their own windows; `None` for any
+/// other query.
+pub(crate) fn step_lookback(request: &QueryRequest) -> Option<i64> {
+    request.step_ns?;
+    let query = logql::parse(&request.query).ok()?;
+    if matches!(query.value, Expr::Log(_)) || uses_vector_op(&query, VectorOp::ApproxTopK) {
+        return None;
+    }
+    let mut logs = Vec::new();
+    collect_log_exprs(&query, &mut logs);
+    for log in logs {
+        if log_offset(log).ok()? < 0 {
+            return None;
+        }
+    }
+    max_lookback(&query).ok()
+}
+
 fn max_lookback(query: &Query) -> Result<i64> {
     let mut logs = Vec::new();
     collect_log_exprs(query, &mut logs);

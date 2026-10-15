@@ -92,14 +92,24 @@ page:
   max_size_bytes: 4194304 # Hard page trace data limit, excluding the column sidecar; 4 MiB.
   max_traces: 1024 # Maximum traces in one page.
 
-# Rollup of closed UTC days of segments into wider segments; see
+# Rollup of closed 4-hour windows, then UTC days, of segments into wider segments; see
 # [Segment rollup](../common/segment-rollup.md). Reader-mode servers never roll up.
 rollup:
   enabled: true
   max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
-  delay_seconds: 3600 # How long after a day ends before it is rolled up.
-  interval_seconds: 300 # How often closed days are looked for.
-  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
+  delay_seconds: 600 # How long after a window or day ends before it is rolled up.
+  window_seconds: 14400 # Width of the windows rolled up as the day goes; 4 hours.
+  merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
+  interval_seconds: 300 # How often closed windows and days are looked for.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
+
+# Decoded read caches of each storage shard; 0 disables one. The defaults are
+# below; the operator sizes them from the memory limit.
+read_cache:
+  metadata_bytes: 16777216 # Page metadata, which resolves postings to candidates; 16 MiB.
+  postings_bytes: 33554432 # Attribute postings per segment and field or value; 32 MiB.
+  pages_bytes: 67108864 # Decoded page payloads; 64 MiB.
+  locators_bytes: 8388608 # The pages of each trace; 8 MiB.
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.

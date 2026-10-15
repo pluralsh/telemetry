@@ -1,15 +1,20 @@
-//! Rollup of closed hour buckets into wider buckets.
+//! Rollup of closed hour buckets into wider buckets; see
+//! [`common::storage::rollup`], whose planner this shares.
 //!
 //! SlateDB compacts within a segment, and every bucket is its own segment,
-//! so a day of hour buckets stays 24 segments however long it sits. A
-//! rollup re-writes a closed day's hours into the fewest aligned buckets of
-//! 24, 12, 8, 6, 4, 3 or 2 hours that stay within the configured size,
-//! then seals each one. Until sealed a rollup bucket is invisible to reads;
-//! once sealed it replaces the hours it covers, which compaction then
-//! drains. A rollup interrupted before its seal resumes on the next pass.
+//! so a day of hour buckets stays 24 segments however long it sits. Each
+//! closed window of the day (4 hours by default) is re-written into one
+//! bucket, or narrower ones within the configured size, and each closed day
+//! into the fewest wider buckets its windows fit. Until sealed a rollup
+//! bucket is invisible to reads; once merged into one sorted run and sealed
+//! it replaces the buckets it covers, which compaction then drains. A
+//! rollup interrupted before its seal resumes on the next pass.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
+
+use common::serde::scope::Segment;
+use common::storage::rollup::Rollups;
 
 use super::Tsdb;
 use crate::config::RollupConfig;
@@ -25,142 +30,118 @@ use crate::storage::{StorageRead, StorageSnapshot};
 use crate::util::Result;
 use common::storage::StorageError;
 
-/// Bucket widths in hours a day may be tiled with, widest first.
-const WIDTHS: [BucketSize; 8] = [24, 12, 8, 6, 4, 3, 2, 1];
-const HOURS_PER_DAY: usize = 24;
-const MINUTES_PER_DAY: u32 = 24 * 60;
+const MINUTE_NS: i64 = 60_000_000_000;
+const HOUR_NS: i64 = 60 * MINUTE_NS;
 /// Series copied per write into the rollup bucket.
 const COPY_BATCH: usize = 2_048;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The fewest aligned windows, as `(first hour, width)`, tiling a day whose
-/// hours hold `bytes`, each window at most `max_bytes` unless an hour wide.
-/// Ties go to the tiling whose windows are widest first.
-pub(crate) fn tile_day(bytes: &[u64; HOURS_PER_DAY], max_bytes: u64) -> Vec<(usize, BucketSize)> {
-    // best[end] = (window count, last window width) of the best tiling of
-    // hours [0, end).
-    let mut best: [Option<(usize, BucketSize)>; HOURS_PER_DAY + 1] = [None; HOURS_PER_DAY + 1];
-    best[0] = Some((0, 0));
-    for end in 1..=HOURS_PER_DAY {
-        for width in WIDTHS {
-            let width_hours = usize::from(width);
-            if end % width_hours != 0 {
-                continue;
-            }
-            let start = end - width_hours;
-            let Some((count, _)) = best[start] else {
-                continue;
-            };
-            let size: u64 = bytes[start..end].iter().sum();
-            if width > 1 && size > max_bytes {
-                continue;
-            }
-            if best[end].is_none_or(|(current, _)| count + 1 < current) {
-                best[end] = Some((count + 1, width));
-            }
-        }
-    }
-    let mut windows = Vec::new();
-    let mut end = HOURS_PER_DAY;
-    while end > 0 {
-        let (_, width) = best[end].expect("hour windows always tile a day");
-        end -= usize::from(width);
-        windows.push((end, width));
-    }
-    windows.reverse();
-    windows
+fn segment(bucket: TimeBucket) -> Segment {
+    Segment::new(
+        i64::from(bucket.start) * MINUTE_NS,
+        i64::from(bucket.size) * HOUR_NS,
+    )
+}
+
+fn bucket(segment: Segment) -> Option<TimeBucket> {
+    Some(TimeBucket {
+        start: u32::try_from(segment.start_ns / MINUTE_NS).ok()?,
+        size: BucketSize::try_from(segment.width_ns / HOUR_NS).ok()?,
+    })
 }
 
 impl Tsdb {
-    /// Rolls up every day of this namespace that ended at least
+    /// Rolls up every window and day of this namespace that ended at least
     /// `config.delay` before `now_ms`, first finishing any interrupted
     /// rollup. Returns the rollup buckets sealed.
     pub(crate) async fn rollup(&self, config: &RollupConfig, now_ms: i64) -> Result<usize> {
         let _one = self.rollup_lock.lock().await;
-        let (buckets, sealed) = self.storage.segments(&self.namespace);
         let mut done = 0;
-        for wide in buckets.iter().filter(|b| b.size > 1 && !sealed.contains(b)) {
-            self.roll_up(*wide, config.copy_buffer_bytes).await?;
-            done += 1;
-        }
-
-        let wide: Vec<TimeBucket> = buckets
-            .iter()
-            .chain(&sealed)
-            .filter(|b| b.size > 1)
-            .copied()
-            .collect();
-        let days: BTreeSet<u32> = buckets
-            .iter()
-            .filter(|b| b.size == 1)
-            .map(|b| b.start - b.start % MINUTES_PER_DAY)
-            .collect();
-        let delay_ms = i64::try_from(config.delay.as_millis()).unwrap_or(i64::MAX);
-        let sizes = self.storage.bucket_bytes(&self.namespace);
-        for day_start in days {
-            let day = TimeBucket {
-                start: day_start,
-                size: 24,
+        for wide in self.rollups().plan(
+            HOUR_NS,
+            None,
+            &config.planner(),
+            self.retention,
+            now_ms.saturating_mul(1_000_000),
+        ) {
+            let Some(wide) = bucket(wide).filter(|wide| TimeBucket::is_valid_size(wide.size))
+            else {
+                continue;
             };
-            if day.end_ms().saturating_add(delay_ms) > now_ms || self.expired(day, now_ms) {
-                continue;
-            }
-            if day.hours().any(|hour| wide.iter().any(|w| w.covers(&hour))) {
-                continue;
-            }
-            let mut bytes = [0; HOURS_PER_DAY];
-            let mut present = [false; HOURS_PER_DAY];
-            for (index, hour) in day.hours().enumerate() {
-                bytes[index] = sizes.get(&hour).copied().unwrap_or(0);
-                present[index] = buckets.contains(&hour);
-            }
-            for (first, width) in tile_day(&bytes, config.max_bucket_bytes) {
-                let hours = first..first + usize::from(width);
-                if width == 1 || present[hours.clone()].iter().filter(|p| **p).count() < 2 {
-                    continue;
-                }
-                let bucket = TimeBucket {
-                    start: day_start + u32::try_from(first).unwrap_or(0) * 60,
-                    size: width,
-                };
-                self.roll_up(bucket, config.copy_buffer_bytes).await?;
-                done += 1;
-            }
+            self.roll_up(wide, config).await?;
+            done += 1;
         }
         Ok(done)
     }
 
-    /// Whether every record of `bucket` is past retention.
-    fn expired(&self, bucket: TimeBucket, now_ms: i64) -> bool {
-        matches!(
-            crate::flusher::bucket_ttl(bucket, self.retention),
-            common::Ttl::ExpireAt(expires_ms) if expires_ms <= now_ms
+    /// This namespace's buckets as the shared planner sees them: a bucket
+    /// wider than an hour is a rollup, pending until its seal.
+    fn rollups(&self) -> Rollups {
+        let (buckets, sealed) = self.storage.segments(&self.namespace);
+        let sizes = self
+            .storage
+            .bucket_bytes(&self.namespace)
+            .into_iter()
+            .map(|(bucket, bytes)| (segment(bucket), bytes))
+            .collect();
+        Rollups::new(
+            sealed.iter().copied().map(segment).collect(),
+            buckets
+                .iter()
+                .filter(|bucket| bucket.size > 1)
+                .copied()
+                .map(segment)
+                .collect(),
+            sizes,
         )
     }
 
-    /// Copies every hour `wide` covers into it, then seals it.
-    async fn roll_up(&self, wide: TimeBucket, buffer: u64) -> Result<()> {
+    /// Copies what reads see of every bucket `wide` covers into it, has it
+    /// merged into one sorted run, then seals it.
+    async fn roll_up(&self, wide: TimeBucket, config: &RollupConfig) -> Result<()> {
+        let hold = self.storage.hold_merges(&self.namespace, wide);
+        let sources: Vec<TimeBucket> = self
+            .rollups()
+            .sources(segment(wide), HOUR_NS)
+            .into_iter()
+            .filter_map(bucket)
+            .collect();
         {
-            // No ingest is in flight while this is held, so once the hours'
-            // pending writes are flushed every later write to them goes to
-            // `wide` and the snapshot below holds all they will ever get.
+            // No ingest is in flight while this is held, so once the
+            // buckets' pending writes are flushed every later write to them
+            // goes to `wide` and the snapshot below holds all they will ever
+            // get.
             let mut rolled = self.rolled.write().await;
             rolled.insert(wide);
-            for hour in wide.hours() {
-                if let Some(mini) = self.ingest_cache.get(&hour).await {
+            for covered in wide.hours().chain(sources.iter().copied()) {
+                if let Some(mini) = self.ingest_cache.get(&covered).await {
                     mini.flush_written().await?;
-                    self.ingest_cache.invalidate(&hour).await;
+                    self.ingest_cache.invalidate(&covered).await;
                 }
             }
         }
         let snapshot = self.storage.snapshot().await?;
         let mini = self.get_or_create_for_ingest(wide).await?;
         let mut queued = 0;
-        for hour in wide.hours() {
-            self.copy_hour(&snapshot, hour, &mini, buffer, &mut queued)
+        for source in sources {
+            self.copy_bucket(&snapshot, source, &mini, config.copy_buffer_bytes, &mut queued)
                 .await?;
         }
         mini.flush_written().await?;
+        self.storage.flush_memtable().await?;
+        let copied_ms = common::time::now_ms().max(0).unsigned_abs();
+        hold.merge();
+        if !self
+            .storage
+            .await_merge(&self.namespace, wide, copied_ms, config.merge_wait)
+            .await
+        {
+            tracing::warn!(
+                namespace = %self.namespace,
+                bucket = ?wide,
+                "sealing rollup bucket before its merge"
+            );
+        }
         self.storage
             .seal(
                 &self.namespace,
@@ -170,30 +151,31 @@ impl Tsdb {
             .await?;
         // Publishes the seal to the segment list, hiding the hours.
         self.storage.flush_memtable().await?;
+        drop(hold);
         self.discovery_cache.clear();
         tracing::info!(namespace = %self.namespace, bucket = ?wide, "sealed rollup bucket");
         Ok(())
     }
 
-    /// Copies `hour` into `mini`. `ingest_batch` waits only until the
+    /// Copies `source` into `mini`. `ingest_batch` waits only until the
     /// coordinator accepts a batch, so once `queued` copied bytes exceed
     /// `buffer` the copy waits for them to be written.
-    async fn copy_hour(
+    async fn copy_bucket(
         &self,
         snapshot: &StorageSnapshot,
-        hour: TimeBucket,
+        source: TimeBucket,
         mini: &MiniTsdb,
         buffer: u64,
         queued: &mut u64,
     ) -> Result<()> {
-        let forward = snapshot.get_forward_index(&self.namespace, hour).await?;
+        let forward = snapshot.get_forward_index(&self.namespace, source).await?;
         if forward.series.is_empty() {
             return Ok(());
         }
         let metadata: HashMap<String, MetricMetadata> = crate::discovery::metadata(
             snapshot.clone(),
             &self.namespace,
-            &[hour],
+            &[source],
             None,
             &MetricsDiscoveryCache::new(),
         )
@@ -203,7 +185,7 @@ impl Tsdb {
         .collect();
 
         let mut records = snapshot
-            .scan_prefix(TimeSeriesKey::bucket_prefix(&self.namespace, &hour))
+            .scan_prefix(TimeSeriesKey::bucket_prefix(&self.namespace, &source))
             .await?;
         let mut batch = Vec::with_capacity(COPY_BATCH);
         while let Some(record) = records.next().await.map_err(StorageError::from_storage)? {
@@ -269,7 +251,7 @@ mod tests {
     use crate::tsdb::TsdbReadEngine;
 
     /// 2024-01-01 in minutes.
-    const DAY: u32 = 19_723 * MINUTES_PER_DAY;
+    const DAY: u32 = 19_723 * 24 * 60;
     const HOUR_MS: i64 = 3_600_000;
 
     fn day() -> TimeBucket {
@@ -423,15 +405,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaves_days_inside_the_delay_alone() {
+    async fn rolls_up_windows_as_the_day_goes_then_the_day_from_them() {
         let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::with_retention(storage.clone(), None);
         write_day(&tsdb, &storage).await;
+        let before = samples(&tsdb).await;
 
-        let now = day().end_ms() + HOUR_MS / 2;
+        // Five minutes past midnight, the last window is still in its delay.
+        let now = day().end_ms() + 5 * 60_000;
+        assert_eq!(tsdb.rollup(&config(u64::MAX), now).await.unwrap(), 5);
+        let windows: Vec<_> = (0..5)
+            .map(|index| TimeBucket {
+                start: DAY + index * 4 * 60,
+                size: 4,
+            })
+            .collect();
+        assert_eq!(sealed(&storage).await, windows);
+        assert_eq!(samples(&tsdb).await, before);
 
-        assert_eq!(tsdb.rollup(&config(u64::MAX), now).await.unwrap(), 0);
-        assert!(sealed(&storage).await.is_empty());
+        // The day's last window first, then the day from its windows.
+        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 1);
+        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 1);
+        assert!(sealed(&storage).await.contains(&day()));
+        let reader = tsdb
+            .query_reader(day().start_ms() / 1000, day().end_ms() / 1000 - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::query::QueryReader::list_buckets(&reader)
+                .await
+                .unwrap(),
+            vec![day()]
+        );
+        assert_eq!(samples(&tsdb).await, before);
+        assert_eq!(tsdb.rollup(&config(u64::MAX), after_delay()).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -497,7 +504,7 @@ mod tests {
         let mini = interrupted.get_or_create_for_ingest(day()).await.unwrap();
         for hour in day().hours().take(5) {
             interrupted
-                .copy_hour(&snapshot, hour, &mini, u64::MAX, &mut 0)
+                .copy_bucket(&snapshot, hour, &mini, u64::MAX, &mut 0)
                 .await
                 .unwrap();
         }
@@ -528,44 +535,5 @@ mod tests {
             stored += SeriesData::decode(&record.value).unwrap().timestamps.len();
         }
         assert_eq!(stored, 3 * 24 * 2);
-    }
-
-    fn widths(windows: &[(usize, BucketSize)]) -> Vec<BucketSize> {
-        windows.iter().map(|(_, width)| *width).collect()
-    }
-
-    #[test]
-    fn small_day_rolls_into_one_bucket() {
-        let windows = tile_day(&[10; 24], 1_000);
-        assert_eq!(windows, vec![(0, 24)]);
-    }
-
-    #[test]
-    fn halves_when_the_day_exceeds_the_cap() {
-        assert_eq!(widths(&tile_day(&[10; 24], 120)), vec![12, 12]);
-        assert_eq!(widths(&tile_day(&[10; 24], 119)), vec![8, 8, 8]);
-    }
-
-    #[test]
-    fn one_hot_hour_only_narrows_its_own_window() {
-        let mut bytes = [10; 24];
-        bytes[20] = 5_000;
-        let windows = tile_day(&bytes, 1_000);
-        assert_eq!(windows.len(), 5, "{windows:?}");
-        assert!(windows.contains(&(20, 1)));
-        let covered: usize = windows.iter().map(|(_, w)| usize::from(*w)).sum();
-        assert_eq!(covered, 24);
-        for (first, width) in &windows {
-            assert_eq!(first % usize::from(*width), 0, "{windows:?}");
-            if *width > 1 {
-                let size: u64 = bytes[*first..first + usize::from(*width)].iter().sum();
-                assert!(size <= 1_000, "{windows:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn oversized_hours_stay_hours() {
-        assert_eq!(tile_day(&[2_000; 24], 1_000).len(), 24);
     }
 }

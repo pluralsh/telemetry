@@ -283,10 +283,11 @@ impl LogDb {
             }
         }
         let ids = selected.unwrap_or_default().iter().collect::<Vec<_>>();
-        if let Some(span) = self.span_scan(&ids) {
-            let labelled = scan(span).await?;
+        if let Some(spans) = self.span_scans(&ids) {
+            let labelled = futures::future::try_join_all(spans.into_iter().map(scan)).await?;
             return Ok(labelled
                 .into_iter()
+                .flatten()
                 .filter(|(id, _)| ids.binary_search(id).is_ok())
                 .map(|(_, labels)| labels)
                 .collect());
@@ -422,6 +423,47 @@ impl LogDb {
             crate::codec::KEY_SCOPE,
             namespace,
         )
+    }
+
+    /// The write generation of the base segment starting at each of
+    /// `starts`, as reads resolve it: the next object ID of the sealed rollup
+    /// covering it, or of the segment itself, tagged with that segment's
+    /// width. Every write allocates an object ID and merges reuse their first
+    /// input's, so a generation changes exactly when what reads see might.
+    /// `None` for a segment never written, or whose counter expired.
+    pub(crate) async fn segment_generations(
+        &self,
+        namespace: &Namespace,
+        starts: &[i64],
+    ) -> Result<Vec<Option<u64>>> {
+        let rollups = self.rollups(namespace);
+        let base = self.segment_ns;
+        let resolved = starts
+            .iter()
+            .map(|&start| {
+                let segment = SegmentId::new(start, base);
+                rollups.sealed_cover(segment).unwrap_or(segment)
+            })
+            .collect::<Vec<_>>();
+        let distinct = resolved.iter().copied().collect::<BTreeSet<_>>();
+        let generations = futures::stream::iter(distinct)
+            .map(|segment| async move {
+                let next = self
+                    .storage
+                    .get(next_object_id_key(namespace, segment))
+                    .await?
+                    .map(|record| decode_object_id(&record.value))
+                    .transpose()?;
+                let width = u64::try_from(segment.width_ns / base.max(1)).unwrap_or(u64::MAX);
+                Ok::<_, Error>((segment, next.map(|next| next | (width.min(0xff) << 56))))
+            })
+            .buffer_unordered(SEGMENT_LIST_CONCURRENCY)
+            .try_collect::<HashMap<_, _>>()
+            .await?;
+        Ok(resolved
+            .iter()
+            .map(|segment| generations.get(segment).copied().flatten())
+            .collect())
     }
 
     /// [`Self::segment_ids`], each covered segment replaced by its sealed
@@ -1222,10 +1264,15 @@ impl LogDb {
         segment: SegmentId,
         stream_ids: Vec<StreamId>,
     ) -> Result<Vec<(StreamId, Arc<Labels>)>> {
-        if let Some(span) = self.span_scan(&stream_ids) {
-            let mut labelled = self
-                .scan_labels(forward_prefix(namespace, segment), span, decode_forward_key)
-                .await?;
+        if let Some(spans) = self.span_scans(&stream_ids) {
+            let prefix = forward_prefix(namespace, segment);
+            let mut labelled = futures::future::try_join_all(spans.into_iter().map(|span| {
+                self.scan_labels(prefix.clone(), span, decode_forward_key)
+            }))
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
             labelled.retain(|(stream_id, _)| stream_ids.binary_search(stream_id).is_ok());
             if labelled.len() != stream_ids.len() {
                 return Err(Error::Corrupt(
@@ -1275,9 +1322,9 @@ impl LogDb {
             .map(|(stream_id, labels)| (*stream_id, Arc::clone(labels)))
             .collect::<Vec<_>>();
         let stream_ids = labelled.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        if let Some(span) = self.span_scan(&stream_ids) {
+        if let Some(spans) = self.span_scans(&stream_ids) {
             let mut runs = self
-                .spanned_runs(namespace, segment, span, stream_ids, live)
+                .spanned_runs(namespace, segment, spans, stream_ids, live)
                 .await?;
             return Ok(labelled
                 .into_iter()
@@ -1348,24 +1395,39 @@ impl LogDb {
         &self,
         namespace: &Namespace,
         segment: SegmentId,
-        span: BytesRange,
+        spans: Vec<BytesRange>,
         stream_ids: Vec<StreamId>,
-        keep: impl Fn(&StoredRun) -> bool + Send + 'static,
+        keep: impl Fn(&StoredRun) -> bool + Send + Sync + 'static,
     ) -> Result<HashMap<StreamId, Vec<(u64, StoredRun)>>> {
         let storage = Arc::clone(&self.storage);
         let prefix = segment_run_prefix(namespace, segment);
         tokio::spawn(async move {
+            let (stream_ids, keep) = (&stream_ids, &keep);
+            let scans = spans.into_iter().map(|span| {
+                let (storage, prefix) = (&storage, prefix.clone());
+                async move {
+                    let mut runs = Vec::new();
+                    let mut records = storage.scan_prefix_iter(prefix, span, None).await?;
+                    while let Some(record) = records.next().await? {
+                        let (stream_id, object_id) = decode_run_key(&record.key)?;
+                        if stream_ids.binary_search(&stream_id).is_err() {
+                            continue;
+                        }
+                        let run = decode_run(&record.value)?;
+                        if keep(&run) {
+                            runs.push((stream_id, object_id, run));
+                        }
+                    }
+                    Ok::<_, Error>(runs)
+                }
+            });
             let mut runs = HashMap::<StreamId, Vec<_>>::new();
-            let mut records = storage.scan_prefix_iter(prefix, span, None).await?;
-            while let Some(record) = records.next().await? {
-                let (stream_id, object_id) = decode_run_key(&record.key)?;
-                if stream_ids.binary_search(&stream_id).is_err() {
-                    continue;
-                }
-                let run = decode_run(&record.value)?;
-                if keep(&run) {
-                    runs.entry(stream_id).or_default().push((object_id, run));
-                }
+            for (stream_id, object_id, run) in futures::future::try_join_all(scans)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                runs.entry(stream_id).or_default().push((object_id, run));
             }
             Ok(runs)
         })
@@ -1419,27 +1481,53 @@ impl LogDb {
         Ok(labelled)
     }
 
-    /// The stream-ID span of `stream_ids` (ascending) when one range scan
-    /// over it is cheaper than a point operation per stream. A scanned
-    /// record costs about an eighth of a point operation; IDs are allocated
-    /// sequentially per segment, so selectors matching many streams cover
-    /// dense spans.
-    fn span_scan(&self, stream_ids: &[StreamId]) -> Option<BytesRange> {
-        let (&first, &last) = (stream_ids.first()?, stream_ids.last()?);
-        let spread = (last - first) as usize + 1;
-        if stream_ids.len() < self.span_scan_min_streams
-            || spread > stream_ids.len().saturating_mul(self.span_scan_max_spread)
-        {
+    /// Ranges covering `stream_ids` (ascending) when range scans over them
+    /// are cheaper than a point operation per stream. The IDs split at their
+    /// widest gaps of more than `span_scan_max_spread` unselected IDs, at
+    /// most [`SPAN_SCAN_MAX_SPANS`] spans, since every scan costs its own
+    /// object-store reads; the spans must average at least
+    /// `span_scan_min_streams` selected IDs and cover at most
+    /// `span_scan_max_spread` IDs per selected one. A scanned record costs
+    /// about an eighth of a point operation; IDs are allocated in locality
+    /// order, so a selector on a coarse label covers a few dense spans.
+    pub(super) fn span_scans(&self, stream_ids: &[StreamId]) -> Option<Vec<BytesRange>> {
+        if stream_ids.len() < self.span_scan_min_streams {
             return None;
         }
-        let end = match last.checked_add(1) {
-            Some(next) => Bound::Excluded(Bytes::copy_from_slice(&next.to_be_bytes())),
-            None => Bound::Unbounded,
-        };
-        Some(BytesRange::new(
-            Bound::Included(Bytes::copy_from_slice(&first.to_be_bytes())),
-            end,
-        ))
+        let mut splits: Vec<(StreamId, usize)> = stream_ids
+            .windows(2)
+            .enumerate()
+            .map(|(index, pair)| (pair[1] - pair[0], index + 1))
+            .filter(|(gap, _)| *gap as usize > self.span_scan_max_spread)
+            .collect();
+        if splits.len() >= SPAN_SCAN_MAX_SPANS {
+            splits.select_nth_unstable_by(SPAN_SCAN_MAX_SPANS - 1, |left, right| {
+                right.0.cmp(&left.0)
+            });
+            splits.truncate(SPAN_SCAN_MAX_SPANS - 1);
+        }
+        let mut bounds: Vec<usize> = splits.into_iter().map(|(_, index)| index).collect();
+        bounds.sort_unstable();
+        bounds.push(stream_ids.len());
+        let mut spans = Vec::with_capacity(bounds.len());
+        let mut covered = 0usize;
+        let mut first = 0;
+        for end in bounds {
+            let (low, high) = (stream_ids[first], stream_ids[end - 1]);
+            covered += (high - low) as usize + 1;
+            let end_key = match high.checked_add(1) {
+                Some(next) => Bound::Excluded(Bytes::copy_from_slice(&next.to_be_bytes())),
+                None => Bound::Unbounded,
+            };
+            spans.push(BytesRange::new(
+                Bound::Included(Bytes::copy_from_slice(&low.to_be_bytes())),
+                end_key,
+            ));
+            first = end;
+        }
+        (spans.len().saturating_mul(self.span_scan_min_streams) <= stream_ids.len()
+            && covered <= stream_ids.len().saturating_mul(self.span_scan_max_spread))
+            .then_some(spans)
     }
 }
 
@@ -2105,6 +2193,16 @@ pub(crate) struct ScanTargets {
     line_terms: Option<Vec<String>>,
     /// Position in the whole read of the first of `segments`.
     first_ordinal: usize,
+}
+
+impl ScanTargets {
+    pub(super) fn streams(&self) -> impl Iterator<Item = (StreamId, &Labels)> {
+        self.segments.iter().flat_map(|(_, streams)| {
+            streams
+                .iter()
+                .map(|stream| (stream.stream_id, stream.labels.as_ref()))
+        })
+    }
 }
 
 impl ScanTargets {

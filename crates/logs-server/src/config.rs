@@ -172,6 +172,9 @@ pub struct Config {
     /// Byte budget of the process's cache of object blocks with their
     /// decompressed bodies, shared by every shard; `0` disables it.
     pub reader_cache_capacity: u64,
+    /// Byte budget of the cache of range metric query results; `0`
+    /// disables it.
+    pub result_cache_capacity: u64,
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
@@ -197,6 +200,7 @@ impl Default for Config {
             compaction: CompactionConfig::default(),
             rollup: SegmentRollupConfig::default(),
             reader_cache_capacity: core.block_cache_capacity_bytes,
+            result_cache_capacity: core.result_cache_capacity_bytes,
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
@@ -350,6 +354,7 @@ impl Config {
             },
             write_buffer: self.write.write_buffer(),
             block_cache_capacity_bytes: self.reader_cache_capacity,
+            result_cache_capacity_bytes: self.result_cache_capacity,
         }
     }
 }

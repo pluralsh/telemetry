@@ -111,7 +111,7 @@ result_cache:
 # A query that finds the budget full fails, so keep max_memory_bytes at most
 # half the budget and let max_concurrent queue bursts instead. Size the
 # budget to what the container can spare after its caches; the operator
-# renders 30% of the memory limit, with half of that per query.
+# sizes it from the memory limit, with half of that per query, at most 1 GiB.
 query:
   max_concurrent: 32
   queue_timeout_seconds: 30
@@ -119,18 +119,21 @@ query:
   memory_budget_bytes: 2147483648 # 2 GiB.
   max_concurrent_shard_reads: 16 # Reads served to other reader groups at once.
 
-# Writers roll each closed day's hour buckets up into the fewest aligned
-# 24, 12, 8, 6, 4, 3 or 2 hour buckets whose stored size stays within
-# max_bucket_bytes, delay_seconds after the day ends, checking every
-# interval_seconds. Hours too large to share a bucket stay as they are.
+# Writers roll each closed window_seconds window of hour buckets up into
+# one bucket, then each closed day's windows into 24, 12 or 8 hour buckets,
+# delay_seconds after each ends, checking every interval_seconds. No bucket
+# covers more than max_bucket_bytes of stored data; hours too large to share
+# a bucket stay as they are. See the storage format's Rollup section.
 # The operator gives writers an 8Gi memory limit by default and does not
 # roll out a writer whose limit is below 6Gi.
 rollup:
   enabled: true
   max_bucket_bytes: 4294967296 # 4 GiB.
-  delay_seconds: 3600
+  delay_seconds: 600
+  window_seconds: 14400 # 4 hours.
+  merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
   interval_seconds: 300
-  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.

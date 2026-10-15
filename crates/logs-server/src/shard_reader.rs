@@ -113,6 +113,18 @@ impl ShardReader for ShardReaderService {
             .map(Response::new)
             .map_err(error_status)
     }
+
+    async fn segment_generations(
+        &self,
+        request: Request<pb::SegmentGenerationsRequest>,
+    ) -> Result<Response<pb::SegmentGenerationsResponse>, Status> {
+        self.authorize(&request)?;
+        self.readers
+            .serve_segment_generations(request.get_ref())
+            .await
+            .map(Response::new)
+            .map_err(error_status)
+    }
 }
 
 fn client(replica: &Replica) -> ShardReaderClient<Channel> {
@@ -185,6 +197,13 @@ impl LogsShardClient for GrpcLogsShards {
 
     async fn series(&self, request: pb::SeriesRequest) -> plural_logs::Result<pb::SeriesResponse> {
         unary!(self, request, series)
+    }
+
+    async fn segment_generations(
+        &self,
+        request: pb::SegmentGenerationsRequest,
+    ) -> plural_logs::Result<pb::SegmentGenerationsResponse> {
+        unary!(self, request, segment_generations)
     }
 }
 

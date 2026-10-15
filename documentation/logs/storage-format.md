@@ -85,6 +85,15 @@ postings are SlateDB merge operands holding only the IDs the write added;
 the logs merge operator unions them, so readers must open the database with
 it. Rollup periods are handled the same way.
 
+A write allocates the IDs of the streams it adds to a segment in locality
+order: by the value of each label name, the name with the fewest distinct
+values among those streams first, a stream without the label before one with
+it. Streams sharing coarse labels, such as a cluster or namespace, so get
+neighbouring IDs, and a selector on such a label covers a narrow span of
+run records. A segment rollup registers every stream of the segments it
+copies, in one such order, before copying any row, so a rollup segment's
+IDs follow that order however the streams were spread over its sources.
+
 ## Objects, runs and blocks
 
 Log rows are stored in **objects**. An object holds the rows written together
@@ -184,6 +193,14 @@ metadata. Readers reject other bits. Runs are keyed by stream before object,
 so a stream's runs are contiguous, and carry no timestamp in the key. Run
 records are a few dozen bytes.
 
+In a segment wider than `segment_duration_seconds`, which only a rollup
+writes, no object holds rows from both sides of a boundary of the segment's
+**slice**: the widest of 30, 15, 5 and 1 minutes that divides the segment's
+width at least 48 times (30 minutes for a day, 5 for a 4-hour window).
+Writes cut an object per slice and merges join only objects of one slice,
+so a range-query step at least a slice wide, aligned to it, counts most runs
+whole from their records instead of reading their blocks.
+
 Each block stands alone: its meta header holds the block's time range, row
 count and line bytes, so readers skip blocks outside the query range without
 decompressing them. Rows inside a block are in stored order, which is
@@ -204,6 +221,18 @@ changes once written. Readers keep blocks in a cross-query cache bounded by
 `reader_cache_capacity`, each with its bodies decompressed on first use, so a
 repeated read does no storage reads and decompresses nothing. A block cached
 without lines is read again when a query needs them.
+
+Range metric queries are also cached as results, bounded by
+`result_cache_capacity`: a query's per-step series are kept with, for each
+base segment its steps read, every shard's next object ID of the segment
+reads resolve it to (the segment, or the sealed rollup covering it, whose
+width over `segment_duration_seconds` is in the top byte). Every write
+allocates an object ID and merges keep their inputs' IDs, so a repeat of the
+query on the same step grid reuses the leading steps whose segments still
+report those values and evaluates only the rest; a coordinating reader asks
+other reader groups for their shards' values over the `SegmentGenerations`
+RPC. Queries whose steps depend on more than their own window (negative
+offsets, `approx_topk`) are not cached.
 
 The object directory lists every run of the object in stream order; a run's
 first block is the sum of the block counts before it. The directory is read by

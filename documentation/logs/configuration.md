@@ -111,19 +111,29 @@ compaction:
   delete_delay_seconds: 600
   max_merges_per_flush: 256
 
-# Rollup of closed UTC days of segments into wider segments; see
+# Rollup of closed 4-hour windows, then UTC days, of segments into wider segments; see
 # [Segment rollup](../common/segment-rollup.md). Reader-mode servers never roll up.
 rollup:
   enabled: true
   max_segment_bytes: 4294967296 # Largest rollup segment by covered bytes; 4 GiB.
-  delay_seconds: 3600 # How long after a day ends before it is rolled up.
-  interval_seconds: 300 # How often closed days are looked for.
-  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator renders 5% of the memory limit, at least 32 MiB.
+  delay_seconds: 600 # How long after a window or day ends before it is rolled up.
+  window_seconds: 14400 # Width of the windows rolled up as the day goes; 4 hours.
+  merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
+  interval_seconds: 300 # How often closed windows and days are looked for.
+  copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
 
 # Bytes of object blocks kept in memory across queries, with their bodies
 # decompressed once a query needs them; one budget shared by every storage
-# shard of the process; 256 MiB, the default. 0 disables it.
+# shard of the process; 256 MiB, the default, which the operator replaces
+# with a size from the memory limit. 0 disables it.
 reader_cache_capacity: 268435456
+
+# Bytes of range metric query results kept across queries. A repeated query
+# reuses the steps whose segments every shard reports unchanged and evaluates
+# only the rest, typically the newest few; 128 MiB, the default, which the
+# operator replaces with a size from the memory limit. 0 disables it. Results whose rows have since expired by retention are served until
+# their entry has been idle for 30 minutes.
+result_cache_capacity: 134217728
 
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
@@ -190,7 +200,7 @@ request:
   max_query_pages: 10000 # Maximum read units (object block ranges) per query.
   max_structured_metadata_fields: 128 # Per-entry metadata field limit.
   query_concurrency: 16 # Concurrent query work.
-  max_in_flight_query_bytes: 134217728 # Query memory budget; 128 MiB.
+  max_in_flight_query_bytes: 134217728 # Query memory budget; 128 MiB, or a size from the memory limit under the operator.
 
 # Mapping for Elasticsearch _bulk documents; see the Logs APIs page.
 # Per-request _msg_field, _time_field, and _stream_fields parameters override it.

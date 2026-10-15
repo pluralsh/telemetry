@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::model::SegmentId;
 use crate::object::{
     MergeInput, ObjectLocation, ObjectProperties, ReadNeeds, merge_objects, object_records,
-    read_blocks,
+    read_blocks, run_slice_ns, slice_of,
 };
 
 /// Deletions applied per storage write.
@@ -263,11 +263,12 @@ impl Compactor {
         deletes: &mut Vec<PendingDelete>,
     ) -> Result<()> {
         let finalize = self.is_settled(*segment, now_unix_ms);
+        let slice_ns = run_slice_ns(*segment, self.segment_ns);
         state
             .objects
             .retain(|tracked| !tracked.stored.is_expired_at(now_unix_ms));
         while *budget > 0 {
-            let Some(range) = self.select(&state.objects, finalize, now_unix_ms) else {
+            let Some(range) = self.select(&state.objects, finalize, slice_ns, now_unix_ms) else {
                 break;
             };
             let (merged, replaced) = self
@@ -306,12 +307,17 @@ impl Compactor {
     /// `finalize` is set the longest mergeable run of at
     /// least two objects whose largest is at most half of it, so late writes
     /// to a settled segment rewrite each row a logarithmic number of times.
+    /// With `slice_ns`, only objects of the same slice merge, so no run
+    /// crosses one.
     fn select(
         &self,
         objects: &[Tracked],
         finalize: bool,
+        slice_ns: Option<i64>,
         now_unix_ms: u64,
     ) -> Option<Range<usize>> {
+        let slice =
+            |tracked: &Tracked| slice_ns.map(|slice_ns| object_slice(&tracked.stored, slice_ns));
         let min_age_ms = u64::try_from(self.config.min_age.as_millis()).unwrap_or(u64::MAX);
         let eligible = |tracked: &Tracked| {
             finalize
@@ -333,6 +339,8 @@ impl Compactor {
                 bytes += next.stored.bytes();
                 if !follows(&objects[end - 1], next)
                     || !eligible(next)
+                    || slice(next) != slice(first)
+                    || slice(first) == Some(None)
                     || (!finalize && next.object.level != first.object.level)
                 {
                     break;
@@ -532,6 +540,14 @@ impl Compactor {
 /// stream's rows in write order.
 fn follows(previous: &Tracked, next: &Tracked) -> bool {
     previous.object.id.checked_add(previous.stored.span) == Some(next.object.id)
+}
+
+/// The slice of `slice_ns` all of `stored`'s rows are in, if one is.
+fn object_slice(stored: &StoredObject, slice_ns: i64) -> Option<i64> {
+    let min = stored.runs.iter().map(|run| run.min_timestamp_ns).min()?;
+    let max = stored.runs.iter().map(|run| run.max_timestamp_ns).max()?;
+    let slice = slice_of(min, slice_ns);
+    (slice == slice_of(max, slice_ns)).then_some(slice)
 }
 
 /// Whether no object holds more than half of the run's bytes.

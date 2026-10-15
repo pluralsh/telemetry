@@ -58,12 +58,12 @@ use crate::serde::key::{
     BucketGenerationKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
     decode_bucket_generation, encode_bucket_generation,
 };
-use crate::serde::{TimeBucketScoped, bucket_records_range, seal_key};
+use crate::serde::{TimeBucketScoped, bucket_records_range, seal_key, write_bucket_prefix};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{
     Segment, TimeseriesSegmentExtractor, bucket_span, parse_bucket, parse_segment, superseded,
 };
-use common::storage::compaction::SegmentCompaction;
+use common::storage::compaction::{MergeHold, MergeHolds, SegmentCompaction};
 use common::storage::settings::{base_settings, load_settings_over};
 use slatedb::CompactorBuilder;
 
@@ -473,6 +473,8 @@ pub(crate) struct Storage {
     reader: StorageReaderInner<Db>,
     /// Set by every write, cleared by the periodic memtable flush.
     unflushed: Arc<AtomicBool>,
+    /// Holds on the merges of buckets a rollup copies into.
+    merge_holds: MergeHolds,
 }
 
 impl HasReader for Storage {
@@ -520,6 +522,7 @@ impl Storage {
         let policy = SegmentCompaction::new(bucket_span)
             .with_retention(retention)
             .with_superseded(Arc::new(superseded));
+        let merge_holds = policy.holds();
         let compactor = settings.compactor_options.take().map(|options| {
             CompactorBuilder::new(slate_config.path.clone(), Arc::clone(&object_store))
                 .with_options(options)
@@ -546,7 +549,8 @@ impl Storage {
                 .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?,
         );
 
-        let storage = Self::from_db(db);
+        let mut storage = Self::from_db(db);
+        storage.merge_holds = merge_holds;
         storage.spawn_memtable_flusher(MEMTABLE_FLUSH_INTERVAL);
         Ok(storage)
     }
@@ -559,6 +563,7 @@ impl Storage {
                 segments: Arc::new(move || db.status().list_segments()),
             },
             unflushed: Arc::new(AtomicBool::new(false)),
+            merge_holds: MergeHolds::default(),
         }
     }
 
@@ -770,6 +775,29 @@ impl Storage {
             .collect()
     }
 
+    /// Holds merges of `bucket`'s segment while a rollup copies into it.
+    pub(crate) fn hold_merges(&self, namespace: &Namespace, bucket: TimeBucket) -> MergeHold {
+        self.merge_holds.copying(bucket_segment_prefix(namespace, &bucket))
+    }
+
+    /// Waits up to `wait` for `bucket`'s segment to hold everything it held
+    /// at `since_ms` in one sorted run. Returns whether it does.
+    pub(crate) async fn await_merge(
+        &self,
+        namespace: &Namespace,
+        bucket: TimeBucket,
+        since_ms: u64,
+        wait: Duration,
+    ) -> bool {
+        common::storage::rollup::await_merge(
+            || self.db.manifest(),
+            &bucket_segment_prefix(namespace, &bucket),
+            since_ms,
+            wait,
+        )
+        .await
+    }
+
     /// Durably marks `bucket` as holding every sample of the narrower
     /// buckets it covers, making it visible to reads in their place.
     pub(crate) async fn seal(
@@ -790,6 +818,12 @@ impl Storage {
         .await?;
         Ok(())
     }
+}
+
+fn bucket_segment_prefix(namespace: &Namespace, bucket: &TimeBucket) -> bytes::Bytes {
+    let mut prefix = bytes::BytesMut::new();
+    write_bucket_prefix(&mut prefix, namespace, bucket);
+    prefix.freeze()
 }
 
 #[cfg(test)]

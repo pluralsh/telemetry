@@ -14,6 +14,9 @@ service ShardReader {
   rpc LabelNames(LabelNamesRequest) returns (StringsResponse);
   rpc LabelValues(LabelValuesRequest) returns (StringsResponse);
   rpc Series(SeriesRequest) returns (SeriesResponse);
+  // The write generation of each requested base segment, as reads resolve
+  // it, so a coordinator can tell which cached query steps are still valid.
+  rpc SegmentGenerations(SegmentGenerationsRequest) returns (SegmentGenerationsResponse);
 }
 
 message ShardRead {
@@ -156,4 +159,19 @@ message SeriesRequest {
 
 message SeriesResponse {
   repeated LabelSet series = 1;
+}
+
+message SegmentGenerationsRequest {
+  ShardRead read = 1;
+  // Starts of base-width segments.
+  repeated int64 segment_starts = 2;
+}
+
+message Generation {
+  optional uint64 value = 1;
+}
+
+// Parallel to the request's `segment_starts`.
+message SegmentGenerationsResponse {
+  repeated Generation generations = 1;
 }

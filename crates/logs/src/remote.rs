@@ -24,6 +24,10 @@ pub trait LogsShardClient: Send + Sync + 'static {
     async fn label_names(&self, request: pb::LabelNamesRequest) -> Result<pb::StringsResponse>;
     async fn label_values(&self, request: pb::LabelValuesRequest) -> Result<pb::StringsResponse>;
     async fn series(&self, request: pb::SeriesRequest) -> Result<pb::SeriesResponse>;
+    async fn segment_generations(
+        &self,
+        request: pb::SegmentGenerationsRequest,
+    ) -> Result<pb::SegmentGenerationsResponse>;
 }
 
 pub(crate) fn shard_read(shard: ShardId, namespace: &Namespace) -> pb::ShardRead {
@@ -108,6 +112,30 @@ pub(crate) struct RemoteShard {
 }
 
 impl RemoteShard {
+    pub(crate) async fn segment_generations(
+        &self,
+        namespace: &Namespace,
+        starts: &[i64],
+    ) -> Result<Vec<Option<u64>>> {
+        let response = self
+            .client
+            .segment_generations(pb::SegmentGenerationsRequest {
+                read: Some(shard_read(self.shard, namespace)),
+                segment_starts: starts.to_vec(),
+            })
+            .await?;
+        if response.generations.len() != starts.len() {
+            return Err(Error::Unavailable(
+                "shard reader returned the wrong number of segment generations".to_owned(),
+            ));
+        }
+        Ok(response
+            .generations
+            .into_iter()
+            .map(|generation| generation.value)
+            .collect())
+    }
+
     pub(crate) async fn label_names(
         &self,
         namespace: &Namespace,

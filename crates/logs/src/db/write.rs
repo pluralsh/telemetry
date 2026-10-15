@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::codec::{decode_dictionary_key, dictionary_prefix, rollup_dictionary_prefix};
+use crate::model::locality_order;
 
 /// How long a segment's or rollup period's IDs stay in memory after its
 /// last write. A later write reloads them.
@@ -151,6 +152,7 @@ impl DirectWriter {
         let mut next_objects = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
+            self.allocate_in_locality_order(&namespace, &groups)?;
             let mut runs: BTreeMap<SegmentId, Vec<(StreamId, Vec<LogEntry>)>> = BTreeMap::new();
             for ((segment, fingerprint), (labels, entries)) in groups {
                 let stream_id = self
@@ -192,7 +194,9 @@ impl DirectWriter {
                     }
                 }
                 write.report.rows += entries.len();
-                runs.entry(segment).or_default().push((stream_id, entries));
+                if !entries.is_empty() {
+                    runs.entry(segment).or_default().push((stream_id, entries));
+                }
             }
             for (segment, mut streams) in runs {
                 streams.sort_unstable_by_key(|(stream_id, _)| *stream_id);
@@ -231,6 +235,48 @@ impl DirectWriter {
         }
         self.evict_idle();
         Ok(written)
+    }
+
+    /// Allocates the IDs of the streams `groups` adds to each segment and
+    /// rollup period in [`locality_order`].
+    fn allocate_in_locality_order(
+        &mut self,
+        namespace: &Namespace,
+        groups: &StreamGroups,
+    ) -> Result<()> {
+        let mut segments: BTreeMap<SegmentId, Vec<(StreamFingerprint, &Labels)>> = BTreeMap::new();
+        let mut periods: BTreeMap<SegmentId, Vec<(StreamFingerprint, &Labels)>> = BTreeMap::new();
+        for ((segment, fingerprint), (labels, _)) in groups {
+            segments
+                .entry(*segment)
+                .or_default()
+                .push((*fingerprint, labels));
+            if let Some(rollup_ns) = self.rollup_ns {
+                periods
+                    .entry(segment_for(segment.start_ns, rollup_ns))
+                    .or_default()
+                    .push((*fingerprint, labels));
+            }
+        }
+        let order = |streams: &[(StreamFingerprint, &Labels)]| {
+            let labels: Vec<&Labels> = streams.iter().map(|(_, labels)| *labels).collect();
+            locality_order(&labels)
+        };
+        for (segment, streams) in segments {
+            let ids = &mut self.segment_ids(namespace, segment).streams;
+            for position in order(&streams) {
+                ids.resolve(streams[position].0)?;
+            }
+        }
+        for (period, mut streams) in periods {
+            streams.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+            streams.dedup_by_key(|(fingerprint, _)| *fingerprint);
+            let ids = self.period_ids(namespace, period);
+            for position in order(&streams) {
+                ids.resolve(streams[position].0)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads the IDs of every segment and rollup period `groups` touches that
@@ -297,7 +343,8 @@ impl DirectWriter {
     }
 
     /// Packs one segment's streams, in stream order, into level-0 objects
-    /// numbered from `first`, and returns the next unallocated object ID.
+    /// numbered from `first`, and returns the next unallocated object ID. A
+    /// rollup segment gets objects of one [`run_slice_ns`] slice each.
     fn append_segment_objects(
         &self,
         write: &mut PendingWrite,
@@ -306,12 +353,20 @@ impl DirectWriter {
         first: u64,
         streams: Vec<(StreamId, Vec<LogEntry>)>,
     ) -> Result<u64> {
-        let mut next = first;
-        let mut builder = ObjectBuilder::new(self.config.page.clone())?;
-        for (stream_id, entries) in streams {
-            builder.push_run(stream_id, entries)?;
+        let slices = match run_slice_ns(segment, duration_ns(self.config.segment_duration)?) {
+            Some(slice_ns) => slice_streams(streams, slice_ns),
+            None => vec![streams],
+        };
+        let mut built = Vec::new();
+        for streams in slices {
+            let mut builder = ObjectBuilder::new(self.config.page.clone())?;
+            for (stream_id, entries) in streams {
+                builder.push_run(stream_id, entries)?;
+            }
+            built.extend(builder.finish());
         }
-        for built in builder.finish() {
+        let mut next = first;
+        for built in built {
             let object = ObjectRef { id: next, level: 0 };
             next = next
                 .checked_add(1)

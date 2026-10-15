@@ -131,8 +131,14 @@ pub struct RollupConfig {
     pub enabled: bool,
     /// Largest stored size of a rollup bucket.
     pub max_bucket_bytes: u64,
-    /// How long after a day ends before its hours are rolled up.
+    /// How long after a window or day ends before its buckets are rolled up.
     pub delay_seconds: u64,
+    /// Width of the in-day windows rolled up as each closes; the day is then
+    /// rolled up from them.
+    pub window_seconds: u64,
+    /// Longest a rollup waits for compaction to merge it before sealing it
+    /// anyway.
+    pub merge_wait_seconds: u64,
     /// How often to look for days to roll up.
     pub interval_seconds: u64,
     /// Copied bytes a rollup may queue before waiting for storage.
@@ -146,6 +152,8 @@ impl Default for RollupConfig {
             enabled: defaults.enabled,
             max_bucket_bytes: defaults.max_bucket_bytes,
             delay_seconds: defaults.delay.as_secs(),
+            window_seconds: defaults.window.as_secs(),
+            merge_wait_seconds: defaults.merge_wait.as_secs(),
             interval_seconds: defaults.interval.as_secs(),
             copy_buffer_bytes: defaults.copy_buffer_bytes,
         }
@@ -158,6 +166,8 @@ impl RollupConfig {
             enabled: self.enabled,
             max_bucket_bytes: self.max_bucket_bytes,
             delay: std::time::Duration::from_secs(self.delay_seconds),
+            window: std::time::Duration::from_secs(self.window_seconds),
+            merge_wait: std::time::Duration::from_secs(self.merge_wait_seconds),
             interval: std::time::Duration::from_secs(self.interval_seconds.max(1)),
             copy_buffer_bytes: self.copy_buffer_bytes.max(1),
         }

@@ -81,14 +81,18 @@ pub struct RollupConfig {
     /// Largest stored size, summed over the covered hours, of a rollup
     /// bucket.
     pub max_bucket_bytes: u64,
-    /// How long after a day ends before its hours are rolled up, leaving
-    /// room for late samples.
+    /// Width of the rollups made as the day goes, a fraction of a day.
+    pub window: Duration,
+    /// How long after a window or day ends before it is rolled up.
     pub delay: Duration,
-    /// How often to look for days to roll up.
+    /// How often to look for windows and days to roll up.
     pub interval: Duration,
     /// Copied bytes a rollup may hand the writer before waiting for them to
     /// reach storage. Larger values copy faster at the cost of memory.
     pub copy_buffer_bytes: u64,
+    /// How long a copied rollup waits for its merge into one sorted run
+    /// before it is sealed anyway.
+    pub merge_wait: Duration,
 }
 
 impl Default for RollupConfig {
@@ -96,9 +100,26 @@ impl Default for RollupConfig {
         Self {
             enabled: true,
             max_bucket_bytes: 4 << 30,
-            delay: Duration::from_secs(60 * 60),
+            window: common::storage::rollup::DEFAULT_WINDOW,
+            delay: common::storage::rollup::DEFAULT_DELAY,
             interval: Duration::from_secs(5 * 60),
             copy_buffer_bytes: common::storage::rollup::DEFAULT_COPY_BUFFER_BYTES,
+            merge_wait: common::storage::rollup::DEFAULT_MERGE_WAIT,
+        }
+    }
+}
+
+impl RollupConfig {
+    /// The same settings as the shared planner takes them.
+    pub(crate) fn planner(&self) -> common::storage::rollup::RollupConfig {
+        common::storage::rollup::RollupConfig {
+            enabled: self.enabled,
+            max_segment_bytes: self.max_bucket_bytes,
+            window: self.window,
+            delay: self.delay,
+            interval: self.interval,
+            copy_buffer_bytes: self.copy_buffer_bytes,
+            merge_wait: self.merge_wait,
         }
     }
 }

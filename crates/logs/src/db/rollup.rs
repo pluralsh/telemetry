@@ -16,6 +16,7 @@
 use common::storage::rollup::{Marker, RollupConfig, marker_key};
 
 use super::*;
+use crate::model::locality_order;
 
 /// Streams read and written per copy step. One stream can hold enough rows to
 /// use the writer's whole memory budget, so never materialize several at once.
@@ -23,9 +24,9 @@ const COPY_STREAMS: usize = 1;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl LogDb {
-    /// Rolls up every day that ended `config.delay` ago in each namespace,
-    /// first finishing any interrupted rollup. Returns the rollup segments
-    /// sealed.
+    /// Rolls up every window and day that ended `config.delay` ago in each
+    /// namespace, first finishing any interrupted rollup. Returns the rollup
+    /// segments sealed.
     pub async fn rollup(&self, config: &RollupConfig) -> Result<usize> {
         self.rollup_at(config, common::time::now_ns()).await
     }
@@ -49,8 +50,7 @@ impl LogDb {
             );
             for wide in planned {
                 tracing::info!(%namespace, segment = %wide, "starting logs rollup segment");
-                self.roll_up(&namespace, wide, config.copy_buffer_bytes)
-                    .await?;
+                self.roll_up(&namespace, wide, config).await?;
                 sealed += 1;
             }
         }
@@ -60,10 +60,19 @@ impl LogDb {
         Ok(sealed)
     }
 
-    /// Copies every segment `wide` covers into it, then seals it.
-    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId, buffer: u64) -> Result<()> {
+    /// Copies what reads see of every segment `wide` covers into it, has it
+    /// merged into one sorted run, then seals it.
+    async fn roll_up(
+        &self,
+        namespace: &Namespace,
+        wide: SegmentId,
+        config: &RollupConfig,
+    ) -> Result<()> {
+        let buffer = config.copy_buffer_bytes;
         let writer = self.writer()?;
         let ttl = self.marker_ttl()?;
+        let prefix = segment_prefix(namespace, wide);
+        let hold = self.merge_holds.copying(prefix.clone());
         {
             // No write is in flight while this is held, so once applied
             // deltas are written every later write to the covered segments
@@ -79,15 +88,33 @@ impl LogDb {
             rolled.entry(namespace.clone()).or_default().insert(wide);
             self.flush_written().await?;
         }
+        let sources = self.rollups(namespace).sources(wide, self.segment_ns);
+        self.register_streams(namespace, &sources, wide).await?;
         let mut queued = 0;
-        let mut start_ns = wide.start_ns;
-        while start_ns < wide.start_ns.saturating_add(wide.width_ns) {
-            let segment = SegmentId::new(start_ns, self.segment_ns);
+        for segment in sources {
             self.copy_segment(namespace, segment, wide, buffer, &mut queued)
                 .await?;
-            start_ns = start_ns.saturating_add(self.segment_ns);
         }
         self.flush_written().await?;
+        writer.flush_memtable().await?;
+        let copied_ms = unix_time_ms()?;
+        hold.merge();
+        if let Some(slate) = writer.slate_read() {
+            let merged = common::storage::rollup::await_merge(
+                || slate.manifest(),
+                &prefix,
+                copied_ms,
+                config.merge_wait,
+            )
+            .await;
+            if !merged {
+                tracing::warn!(
+                    %namespace,
+                    segment = %wide,
+                    "sealing logs rollup segment before its merge"
+                );
+            }
+        }
         writer
             .apply_with_options(
                 vec![RecordOp::put_with_ttl(
@@ -102,8 +129,39 @@ impl LogDb {
             .await?;
         // Publishes the seal to the manifest, which is where reads find it.
         writer.flush_memtable().await?;
+        drop(hold);
         tracing::info!(%namespace, segment = %wide, "sealed logs rollup segment");
         Ok(())
+    }
+
+    /// Gives every stream of `sources` its ID in `wide` before any row is
+    /// copied, all in one [`locality_order`], so streams that the copy finds
+    /// segment by segment still get neighbouring IDs when they share coarse
+    /// labels.
+    async fn register_streams(
+        &self,
+        namespace: &Namespace,
+        sources: &[SegmentId],
+        wide: SegmentId,
+    ) -> Result<()> {
+        let mut streams = BTreeSet::new();
+        for segment in sources {
+            for read in self.segment_reads(namespace, *segment, usize::MAX).await? {
+                streams.extend(read.streams().map(|(_, labels)| labels.clone()));
+            }
+        }
+        let streams: Vec<Labels> = streams.into_iter().collect();
+        let order = locality_order(&streams.iter().collect::<Vec<_>>());
+        let mut groups = StreamGroups::new();
+        for position in order {
+            let labels = streams[position].clone();
+            groups.insert((wide, labels.fingerprint()), (labels, Vec::new()));
+        }
+        if !groups.is_empty() {
+            self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
+                .await?;
+        }
+        self.flush_written().await
     }
 
     /// Copies `segment` into `wide`. `apply_groups` waits only until the
@@ -213,6 +271,7 @@ mod tests {
                 ..CompactionConfig::default()
             },
             block_cache_capacity_bytes: 0,
+            result_cache_capacity_bytes: 0,
             ..Config::default()
         }
     }
@@ -295,6 +354,92 @@ mod tests {
         SegmentId::new(DAY, 24 * HOUR)
     }
 
+    async fn runs_of(db: &LogDb, segment: SegmentId) -> Vec<crate::codec::StoredRun> {
+        let mut records = db
+            .storage
+            .scan_prefix_iter(
+                crate::codec::segment_run_prefix(&namespace(), segment),
+                common::BytesRange::unbounded(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut runs = Vec::new();
+        while let Some(record) = records.next().await.unwrap() {
+            runs.push(crate::codec::decode_run(&record.value).unwrap());
+        }
+        runs
+    }
+
+    #[tokio::test]
+    async fn no_run_of_a_rollup_crosses_a_step_of_its_width() {
+        let db = LogDb::open(Config {
+            compaction: CompactionConfig {
+                min_age: Duration::ZERO,
+                fan_in: 2,
+                ..CompactionConfig::default()
+            },
+            ..config()
+        })
+        .await
+        .unwrap();
+        write_day(&db).await;
+        let before = rows(&db).await;
+        let config = RollupConfig::default();
+
+        assert_eq!(db.rollup_at(&config, DAY + 21 * HOUR).await.unwrap(), 5);
+        let window = SegmentId::new(DAY, 4 * HOUR);
+        let runs = runs_of(&db, window).await;
+        // Two streams, each with rows at :01 and :31 of every hour.
+        assert_eq!(runs.len(), 2 * 2 * 4);
+        for run in &runs {
+            assert_eq!(
+                crate::object::slice_of(run.min_timestamp_ns, 300 * 1_000_000_000),
+                crate::object::slice_of(run.max_timestamp_ns, 300 * 1_000_000_000),
+            );
+        }
+
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        let runs = runs_of(&db, day()).await;
+        assert_eq!(runs.len(), 2 * 2 * 24);
+        assert_eq!(rows(&db).await, before);
+        db.close().await.unwrap();
+    }
+
+    #[test]
+    fn slices_a_rollup_segment_at_the_step_of_its_width() {
+        use crate::object::run_slice_ns;
+        let minutes = |m: i64| m * 60_000_000_000;
+        assert_eq!(run_slice_ns(SegmentId::new(DAY, HOUR), HOUR), None);
+        assert_eq!(
+            run_slice_ns(SegmentId::new(DAY, 2 * HOUR), HOUR),
+            Some(minutes(1))
+        );
+        assert_eq!(
+            run_slice_ns(SegmentId::new(DAY, 4 * HOUR), HOUR),
+            Some(minutes(5))
+        );
+        assert_eq!(
+            run_slice_ns(SegmentId::new(DAY, 8 * HOUR), HOUR),
+            Some(minutes(5))
+        );
+        assert_eq!(
+            run_slice_ns(SegmentId::new(DAY, 12 * HOUR), HOUR),
+            Some(minutes(15))
+        );
+        assert_eq!(run_slice_ns(day(), HOUR), Some(minutes(30)));
+        // A step's window ends on its boundary, so a slice does too.
+        assert_eq!(
+            crate::object::slice_of(DAY + minutes(5), minutes(5)),
+            crate::object::slice_of(DAY + 1, minutes(5))
+        );
+        assert_ne!(
+            crate::object::slice_of(DAY + minutes(5), minutes(5)),
+            crate::object::slice_of(DAY + minutes(5) + 1, minutes(5))
+        );
+    }
+
     #[tokio::test]
     async fn waits_for_storage_whenever_the_copy_buffer_fills() {
         let db = LogDb::open(config()).await.unwrap();
@@ -323,12 +468,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Closed with no rollup yet, the day is copied once, directly.
         let config = RollupConfig::default();
-        assert_eq!(db.rollup_at(&config, DAY + 24 * HOUR).await.unwrap(), 0);
         assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
 
         let rollups = db.rollups(&namespace());
         assert_eq!(rollups.sealed(), &[day()]);
+        assert_merged(&db, day());
         assert_eq!(
             db.visible_segment_ids(&namespace(), (DAY, DAY + 24 * HOUR - 1), false)
                 .unwrap(),
@@ -348,6 +494,104 @@ mod tests {
                 .unwrap(),
             vec!["api".to_owned(), "worker".to_owned()]
         );
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 0);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gives_streams_sharing_coarse_labels_neighbouring_ids() {
+        let db = LogDb::open(config()).await.unwrap();
+        // Each hour brings in new apps on both clusters, so the copy finds
+        // the clusters' streams interleaved.
+        for hour in 0..8 {
+            let batches = ["c0", "c1"]
+                .map(|cluster| {
+                    let labels = Labels::new(vec![
+                        Label::new("app", format!("a{hour}")),
+                        Label::new("cluster", cluster),
+                    ])
+                    .unwrap();
+                    LogBatch::new(labels, vec![LogEntry::new(DAY + hour * HOUR, "line")])
+                })
+                .to_vec();
+            db.write(&namespace(), batches).await.unwrap();
+        }
+        db.flush_memtable().await.unwrap();
+        assert_eq!(
+            db.rollup_at(&RollupConfig::default(), after_delay())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut ids: BTreeMap<String, Vec<StreamId>> = BTreeMap::new();
+        for read in db
+            .segment_reads(&namespace(), day(), usize::MAX)
+            .await
+            .unwrap()
+        {
+            for (id, labels) in read.streams() {
+                let cluster = labels.iter().find(|label| label.name == "cluster").unwrap();
+                ids.entry(cluster.value.clone()).or_default().push(id);
+            }
+        }
+        for streams in ids.values_mut() {
+            streams.sort_unstable();
+        }
+        let first = ids["c0"][0].min(ids["c1"][0]);
+        assert_eq!(ids["c0"], (first..first + 8).collect::<Vec<_>>());
+        assert_eq!(ids["c1"], (first + 8..first + 16).collect::<Vec<_>>());
+        db.close().await.unwrap();
+    }
+
+    /// `segment` is one sorted run.
+    fn assert_merged(db: &LogDb, segment: SegmentId) {
+        let manifest = db.storage.slate_read().unwrap().manifest();
+        let prefix = segment_prefix(&namespace(), segment);
+        let live = manifest
+            .segments()
+            .iter()
+            .find(|live| live.prefix().as_ref() == prefix.as_ref())
+            .unwrap();
+        assert_eq!(live.l0().len() + live.compacted().len(), 1, "{segment}");
+    }
+
+    #[tokio::test]
+    async fn rolls_up_windows_as_the_day_goes_then_the_day_from_them() {
+        let db = LogDb::open(config()).await.unwrap();
+        write_day(&db).await;
+        let before = rows(&db).await;
+        let config = RollupConfig::default();
+
+        assert_eq!(db.rollup_at(&config, DAY + 21 * HOUR).await.unwrap(), 5);
+        let windows: Vec<SegmentId> = (0..5)
+            .map(|index| SegmentId::new(DAY + index * 4 * HOUR, 4 * HOUR))
+            .collect();
+        assert_eq!(db.rollups(&namespace()).sealed(), windows.as_slice());
+        for window in &windows {
+            assert_merged(&db, *window);
+        }
+        let mut visible = windows.clone();
+        visible.extend((20..24).map(|hour| SegmentId::new(DAY + hour * HOUR, HOUR)));
+        assert_eq!(
+            db.visible_segment_ids(&namespace(), (DAY, DAY + 24 * HOUR - 1), false)
+                .unwrap(),
+            visible
+        );
+        assert_eq!(rows(&db).await, before);
+
+        // The day's last window first, then the day from its windows.
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        assert!(db.rollups(&namespace()).sealed().contains(&day()));
+        assert_merged(&db, day());
+        assert_eq!(
+            db.visible_segment_ids(&namespace(), (DAY, DAY + 24 * HOUR - 1), false)
+                .unwrap(),
+            vec![day()]
+        );
+        assert_eq!(rows(&db).await, before);
+        assert_eq!(queried(&db).await, before.len());
         assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 0);
         db.close().await.unwrap();
     }

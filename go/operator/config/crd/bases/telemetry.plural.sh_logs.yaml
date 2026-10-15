@@ -320,7 +320,9 @@ spec:
                         minimum: 1
                         type: integer
                       maxInFlightQueryBytes:
-                        default: 134217728
+                        description: |-
+                          MaxInFlightQueryBytes bounds the decoded bytes all running queries hold
+                          at once. When omitted, the operator sizes it from the memory limit.
                         format: int64
                         minimum: 1
                         type: integer
@@ -9777,8 +9779,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-
@@ -18745,8 +18748,9 @@ spec:
                       Metrics, Logs and Traces writers and standalone servers, which roll up
                       closed days), with memory requested at its limit unless a request is
                       set. Those writers need at least a 6Gi limit and are not rolled out with
-                      less. The operator sizes the caches and query memory budget from the
-                      memory limit.
+                      less. The operator holds back a quarter of the memory limit (at least
+                      768Mi, at most half) as headroom and sizes the caches and query memory
+                      budgets from the rest.
                     properties:
                       claims:
                         description: |-

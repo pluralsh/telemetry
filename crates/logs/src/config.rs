@@ -27,7 +27,14 @@ pub struct Config {
     /// which keeps each cached block's bodies once a query decompresses
     /// them. Zero disables it.
     pub block_cache_capacity_bytes: u64,
+    /// Byte budget of the cache of range metric query results, which lets a
+    /// repeated query evaluate only the steps whose segments changed since.
+    /// Zero disables it.
+    pub result_cache_capacity_bytes: u64,
 }
+
+/// Default [`Config::result_cache_capacity_bytes`]: 128 MiB.
+pub const DEFAULT_RESULT_CACHE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Default [`Config::block_cache_capacity_bytes`]: 256 MiB.
 pub const DEFAULT_BLOCK_CACHE_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
@@ -89,6 +96,7 @@ impl Default for Config {
             compaction: CompactionConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),
             block_cache_capacity_bytes: DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
+            result_cache_capacity_bytes: DEFAULT_RESULT_CACHE_CAPACITY_BYTES,
         }
     }
 }

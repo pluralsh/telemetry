@@ -15,7 +15,7 @@ use common::coordinator::{
     WriteError,
 };
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
-use common::storage::compaction::SegmentCompaction;
+use common::storage::compaction::{MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
@@ -146,6 +146,8 @@ pub struct TraceDb {
     rolled: tokio::sync::RwLock<HashMap<Namespace, BTreeSet<SegmentId>>>,
     /// Serializes rollup passes.
     rollup_lock: Mutex<()>,
+    /// Holds on the merges of segments a rollup copies into.
+    merge_holds: MergeHolds,
     retention: Option<Duration>,
 }
 
@@ -197,11 +199,13 @@ impl TraceDb {
         config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
+        let merge_holds = MergeHolds::default();
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
             .with_semantics(
                 storage_semantics().with_segment_compaction(
                     SegmentCompaction::new(crate::codec::segment_span)
                         .with_retention(config.retention)
+                        .with_holds(merge_holds.clone())
                         .with_superseded(common::storage::rollup::superseded(
                             crate::codec::KEY_SCOPE,
                             i64::try_from(segment_ns).unwrap_or(i64::MAX),
@@ -255,6 +259,7 @@ impl TraceDb {
             expiring: config.retention.is_some(),
             rolled: tokio::sync::RwLock::new(rolled),
             rollup_lock: Mutex::new(()),
+            merge_holds,
             retention: config.retention,
         })
     }
@@ -301,6 +306,7 @@ impl TraceDb {
             expiring: config.retention.is_some(),
             rolled: tokio::sync::RwLock::new(HashMap::new()),
             rollup_lock: Mutex::new(()),
+            merge_holds: MergeHolds::default(),
             retention: config.retention,
         })
     }

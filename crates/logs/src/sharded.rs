@@ -16,6 +16,7 @@ use proto::logs::internal::v1 as pb;
 
 use crate::db::BlockCache;
 use crate::query::{ShardSource, query_databases, serve_shard_query};
+use crate::result_cache::{CachePlan, Generations, ResultCache};
 use crate::remote::{
     LogsShardClient, RemoteShard, labels_to_wire, namespace_from_wire, query_from_wire,
 };
@@ -37,6 +38,31 @@ impl ShardDatabase for LogDb {
     }
 }
 
+/// The result cache a configuration asks for, with the base segment width
+/// its plans resolve steps to.
+struct QueryResults {
+    cache: Option<ResultCache>,
+    segment_ns: i64,
+}
+
+impl QueryResults {
+    fn new(config: &Config) -> Self {
+        Self {
+            cache: (config.result_cache_capacity_bytes > 0)
+                .then(|| ResultCache::new(config.result_cache_capacity_bytes)),
+            segment_ns: i64::try_from(config.segment_duration.as_nanos()).unwrap_or(i64::MAX),
+        }
+    }
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
 fn shard_config(config: &Config, shard: ShardId) -> Config {
     let mut config = config.clone();
     config.storage = config
@@ -54,6 +80,8 @@ pub struct ShardedLogs {
     cache: SharedDbCache,
     /// Reads the shards other reader groups serve.
     remote: OnceLock<Arc<dyn LogsShardClient>>,
+    results: Option<ResultCache>,
+    segment_ns: i64,
 }
 
 impl ShardedLogs {
@@ -63,6 +91,7 @@ impl ShardedLogs {
         shards: impl IntoIterator<Item = ShardId>,
     ) -> Result<Self> {
         config.validate()?;
+        let results = QueryResults::new(&config);
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
@@ -75,6 +104,7 @@ impl ShardedLogs {
         Self::new(
             ShardSet::open(ShardRole::Writer, options, opener, shards).await,
             cache,
+            results,
         )
         .await
     }
@@ -86,6 +116,7 @@ impl ShardedLogs {
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
         config.validate()?;
+        let results = QueryResults::new(&config);
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
@@ -99,16 +130,23 @@ impl ShardedLogs {
         Self::new(
             ShardSet::open(ShardRole::Reader, options, opener, shards).await,
             cache,
+            results,
         )
         .await
     }
 
-    async fn new(shards: Result<ShardSet<LogDb>>, cache: SharedDbCache) -> Result<Self> {
+    async fn new(
+        shards: Result<ShardSet<LogDb>>,
+        cache: SharedDbCache,
+        results: QueryResults,
+    ) -> Result<Self> {
         match shards {
             Ok(shards) => Ok(Self {
                 shards: Arc::new(shards),
                 cache,
                 remote: OnceLock::new(),
+                results: results.cache,
+                segment_ns: results.segment_ns,
             }),
             Err(error) => {
                 cache.close().await?;
@@ -206,6 +244,19 @@ impl ShardedLogs {
         request: &QueryRequest,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        let sources = self.sources().await;
+        if let Some(cache) = &self.results
+            && let Some(plan) = CachePlan::new(namespace, request, self.segment_ns)
+        {
+            return self
+                .cached_query(cache, &plan, sources, namespace, request, options)
+                .await;
+        }
+        self.query_sources(sources, namespace, request, options)
+            .await
+    }
+
+    async fn sources(&self) -> Vec<(ShardId, ShardSource)> {
         let mut sources = self
             .shards
             .entries()
@@ -219,6 +270,16 @@ impl ShardedLogs {
             )
             .collect::<Vec<_>>();
         sources.sort_by_key(|(shard, _)| *shard);
+        sources
+    }
+
+    async fn query_sources(
+        &self,
+        sources: Vec<(ShardId, ShardSource)>,
+        namespace: &Namespace,
+        request: &QueryRequest,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
         query_databases(
             sources.into_iter().map(|(_, source)| source).collect(),
             namespace,
@@ -227,6 +288,87 @@ impl ShardedLogs {
             self.shards.io_permits(),
         )
         .await
+    }
+
+    /// Serves the steps whose segments are unchanged since a previous run of
+    /// the same query from the result cache and evaluates the rest.
+    async fn cached_query(
+        &self,
+        cache: &ResultCache,
+        plan: &CachePlan,
+        sources: Vec<(ShardId, ShardSource)>,
+        namespace: &Namespace,
+        request: &QueryRequest,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
+        let step = plan.step_ns();
+        let start = request.start_ns;
+        if request.end_ns < start {
+            return self.query_sources(sources, namespace, request, options).await;
+        }
+        let last = start + (request.end_ns - start) / step * step;
+        let starts = plan.segment_starts(start, last);
+        let Ok(generations) = self.generations(&sources, namespace, &starts).await else {
+            return self.query_sources(sources, namespace, request, options).await;
+        };
+        let lookup = cache.lookup(plan, start, last, &generations).await;
+        let reused_steps = i64::try_from(lookup.reused_steps).unwrap_or(i64::MAX);
+        let tail_start = start.saturating_add(reused_steps.saturating_mul(step));
+        let head = ResultCache::reused(&lookup, start, tail_start - step);
+        let tail = if lookup.reused_steps > 0 && tail_start > last {
+            Vec::new()
+        } else {
+            let mut tail_request = request.clone();
+            tail_request.start_ns = tail_start;
+            match self
+                .query_sources(sources, namespace, &tail_request, options)
+                .await?
+            {
+                QueryResult::Matrix(series) => series,
+                other => return Ok(other),
+            }
+        };
+        let computed = if tail_start > last {
+            0
+        } else {
+            (last - tail_start) / step + 1
+        };
+        ResultCache::record(lookup.reused_steps, computed as usize);
+        let merged = crate::result_cache::merge(head, tail);
+        let now = now_ns();
+        let through = if last <= now {
+            last
+        } else {
+            start + (now.saturating_sub(start)).div_euclid(step) * step
+        };
+        if computed > 0 && through >= start {
+            cache
+                .insert(plan, start, through, &merged, generations)
+                .await;
+        }
+        Ok(QueryResult::Matrix(merged))
+    }
+
+    /// Every source's generations of the segments starting at `starts`.
+    async fn generations(
+        &self,
+        sources: &[(ShardId, ShardSource)],
+        namespace: &Namespace,
+        starts: &[i64],
+    ) -> Result<Generations> {
+        let per_shard = try_join_all(sources.iter().map(|(shard, source)| async move {
+            let values = match source {
+                ShardSource::Local(database) => {
+                    database.segment_generations(namespace, starts).await?
+                }
+                ShardSource::Remote(remote) => {
+                    remote.segment_generations(namespace, starts).await?
+                }
+            };
+            Ok::<_, Error>((*shard, values))
+        }))
+        .await?;
+        Ok(Generations::new(starts, per_shard))
     }
 
     pub async fn label_names(
@@ -397,6 +539,23 @@ impl ShardedLogs {
             ))
             .await?;
         Ok(pb::StringsResponse { values })
+    }
+
+    pub async fn serve_segment_generations(
+        &self,
+        request: &pb::SegmentGenerationsRequest,
+    ) -> Result<pb::SegmentGenerationsResponse> {
+        let (database, namespace) = self.served(request.read.as_ref()).await?;
+        let generations = self
+            .shards
+            .with_io(database.segment_generations(&namespace, &request.segment_starts))
+            .await?;
+        Ok(pb::SegmentGenerationsResponse {
+            generations: generations
+                .into_iter()
+                .map(|value| pb::Generation { value })
+                .collect(),
+        })
     }
 
     pub async fn serve_series(&self, request: &pb::SeriesRequest) -> Result<pb::SeriesResponse> {
@@ -817,6 +976,89 @@ mod tests {
             self.record(request.read.as_ref());
             self.reader.serve_series(&request).await
         }
+
+        async fn segment_generations(
+            &self,
+            request: pb::SegmentGenerationsRequest,
+        ) -> Result<pb::SegmentGenerationsResponse> {
+            self.record(request.read.as_ref());
+            self.reader.serve_segment_generations(&request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn result_cache_recomputes_only_steps_reading_changed_segments() {
+        const MINUTE: i64 = 60_000_000_000;
+        const HOUR: i64 = 60 * MINUTE;
+        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+        let routing = assignment(options.shard_count());
+        let database = ShardedLogs::open(in_memory(), options, [ShardId::new(0)])
+            .await
+            .unwrap();
+        let namespace = Namespace::new("tenant").unwrap();
+        let h0 = (now_ns() / HOUR - 3) * HOUR;
+        let write = |offsets: &[i64]| {
+            let entries = offsets
+                .iter()
+                .map(|offset| LogEntry::new(h0 + offset, "line"))
+                .collect();
+            database.write(
+                &routing,
+                &namespace,
+                vec![LogBatch::new(labels(&[("app", "a")]), entries)],
+                Durability::Written,
+            )
+        };
+        write(&[10 * MINUTE, 70 * MINUTE, 130 * MINUTE]).await.unwrap();
+        let request = QueryRequest::range(
+            r#"sum(count_over_time({app="a"}[30m]))"#,
+            h0,
+            h0 + 3 * HOUR,
+            10 * MINUTE,
+        );
+        let uncached = || async {
+            database
+                .query_sources(
+                    database.sources().await,
+                    &namespace,
+                    &request,
+                    QueryOptions::default(),
+                )
+                .await
+                .unwrap()
+        };
+        let plan = CachePlan::new(&namespace, &request, database.segment_ns).unwrap();
+        let reused = || async {
+            let sources = database.sources().await;
+            let starts = plan.segment_starts(h0, h0 + 3 * HOUR);
+            let generations = database
+                .generations(&sources, &namespace, &starts)
+                .await
+                .unwrap();
+            let cache = database.results.as_ref().unwrap();
+            cache
+                .lookup(&plan, h0, h0 + 3 * HOUR, &generations)
+                .await
+                .reused_steps
+        };
+
+        let first = database
+            .query(&namespace, &request, QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(first, uncached().await);
+        assert_eq!(reused().await, 19);
+
+        // Steps from 1h on read hour 1, which the late line changes.
+        write(&[75 * MINUTE]).await.unwrap();
+        assert_eq!(reused().await, 6);
+        let second = database
+            .query(&namespace, &request, QueryOptions::default())
+            .await
+            .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, uncached().await);
+        assert_eq!(reused().await, 19);
     }
 
     #[tokio::test]

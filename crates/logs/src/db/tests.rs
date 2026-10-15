@@ -38,6 +38,7 @@ fn test_config() -> Config {
         write_buffer: Default::default(),
         // Read-counting tests count storage reads.
         block_cache_capacity_bytes: 0,
+        result_cache_capacity_bytes: 0,
     }
 }
 
@@ -1401,6 +1402,51 @@ async fn write_forty_streams(db: &LogDb, namespace: &Namespace) {
 }
 
 #[tokio::test]
+async fn span_scans_skip_wide_gaps_between_dense_groups() {
+    let db = LogDb::open(test_config()).await.unwrap();
+    let groups: Vec<StreamId> = (0..8).chain(1_000..1_008).chain(5_000..5_008).collect();
+    let spans = db
+        .span_scans(&groups)
+        .unwrap()
+        .into_iter()
+        .map(|span| (span.start, span.end))
+        .collect::<Vec<_>>();
+    let bounds = |first: StreamId, last: StreamId| {
+        (
+            std::ops::Bound::Included(Bytes::copy_from_slice(&first.to_be_bytes())),
+            std::ops::Bound::Excluded(Bytes::copy_from_slice(&(last + 1).to_be_bytes())),
+        )
+    };
+    assert_eq!(
+        spans,
+        vec![bounds(0, 7), bounds(1_000, 1_007), bounds(5_000, 5_007)]
+    );
+    // Six groups read as four spans, joined across the narrowest gaps.
+    let many: Vec<StreamId> = [0, 100, 1_000, 1_050, 3_000, 9_000]
+        .into_iter()
+        .flat_map(|start| start..start + 8)
+        .collect();
+    let joined = db
+        .span_scans(&many)
+        .unwrap()
+        .into_iter()
+        .map(|span| (span.start, span.end))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        joined,
+        vec![
+            bounds(0, 107),
+            bounds(1_000, 1_057),
+            bounds(3_000, 3_007),
+            bounds(9_000, 9_007),
+        ]
+    );
+    let scattered: Vec<StreamId> = (0..16).map(|index| index * 100).collect();
+    assert!(db.span_scans(&scattered).is_none());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn span_scans_and_point_reads_select_the_same_rows() {
     let mut db = LogDb::open(test_config()).await.unwrap();
     let namespace = Namespace::default();
@@ -2213,31 +2259,22 @@ async fn page_limit_counts_objects_instead_of_sparse_read_ranges() {
     .unwrap();
     let namespace = Namespace::default();
 
-    // Pick labels whose fingerprint order is selected, unselected, selected.
+    // Streams whose ID order is selected, unselected, selected: the zone
+    // label, absent from the first, orders them before the environment does.
     // The middle twelve-block run forces two sparse read ranges in one object.
-    let mut candidates = (0..100)
-        .map(|index| {
-            labels(
-                &format!("s{index}"),
-                if index % 2 == 0 { "prod" } else { "dev" },
-            )
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(Labels::fingerprint);
-    let selected = candidates
-        .windows(3)
-        .find(|window| {
-            let environment = |labels: &Labels, wanted: &str| {
-                labels
-                    .iter()
-                    .any(|label| label.name == "environment" && label.value == wanted)
-            };
-            environment(&window[0], "prod")
-                && environment(&window[1], "dev")
-                && environment(&window[2], "prod")
-        })
-        .expect("candidate fingerprints contain prod/dev/prod")
-        .to_vec();
+    let zoned = |service: &str, environment: &str| {
+        Labels::new(vec![
+            Label::new("service", service),
+            Label::new("environment", environment),
+            Label::new("zone", "z"),
+        ])
+        .unwrap()
+    };
+    let selected = vec![
+        labels("s0", "prod"),
+        zoned("s1", "dev"),
+        zoned("s2", "prod"),
+    ];
     let batches = selected
         .into_iter()
         .map(|labels| {

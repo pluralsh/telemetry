@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
 	"github.com/pluralsh/telemetry/go/operator/internal/resources"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -57,11 +59,11 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 1288490175", "forward_index_cache_capacity_bytes: 429496725", testFlushIntervalConfig,
-		"memory_capacity: 1717986900", "capacity: 429496725", "matcher_cache_capacity_bytes: 257698035",
-		"result_cache:\n  capacity_bytes: 429496725",
-		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 1073741824\n  memory_budget_bytes: 2576980350\n  queue_timeout_seconds: 30",
-		"rollup:\n  copy_buffer_bytes: 429496725",
+		"reader_cache_capacity: 1159641162", "forward_index_cache_capacity_bytes: 386547054", testFlushIntervalConfig,
+		"memory_capacity: 1417339198", "capacity: 386547054", "matcher_cache_capacity_bytes: 193273527",
+		"result_cache:\n  capacity_bytes: 386547054",
+		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 1030792144\n  memory_budget_bytes: 2061584288\n  queue_timeout_seconds: 30",
+		"rollup:\n  copy_buffer_bytes: 257698036",
 		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
@@ -288,13 +290,13 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
 	}
 	// A request without a limit gets the 8Gi writer default.
-	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 429496725") {
+	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 386547054") {
 		t.Fatalf("writer config did not infer forward-index capacity from its memory limit:\n%s", result.Data[MetricsKey])
 	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
 		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
 	}
-	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 214748360") {
+	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 193273524") {
 		t.Fatalf("reader config did not infer forward-index capacity from its memory limit:\n%s", result.Data[ReaderKey])
 	}
 }
@@ -326,7 +328,7 @@ func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 			t.Errorf("rendered Logs config missing %q:\n%s", expected, rendered)
 		}
 	}
-	for _, invalid := range []string{"reader_cache_capacity:", "visibility_interval_seconds:"} {
+	for _, invalid := range []string{"visibility_interval_seconds:"} {
 		if strings.Contains(rendered, invalid) {
 			t.Errorf("rendered Logs config contains unsupported field %q:\n%s", invalid, rendered)
 		}
@@ -380,8 +382,8 @@ func TestWriterStoragePreservesExplicitDataCache(t *testing.T) {
 func TestRollupCopyBufferScalesWithMemory(t *testing.T) {
 	for limit, want := range map[int64]int64{
 		256 << 20: 32 << 20,
-		2 << 30:   2 << 30 / 100 * 5,
-		16 << 30:  16 << 30 / 100 * 5,
+		2 << 30:   (2<<30 - 768<<20) / 100 * 4,
+		16 << 30:  (16<<30 - 4<<30) / 100 * 4,
 	} {
 		if got := renderRollupConfig(memoryPlan{limit: limit}).CopyBufferBytes; got != want {
 			t.Fatalf("limit %d rendered copy buffer %d, want %d", limit, got, want)
@@ -734,11 +736,111 @@ func TestRenderSizesMetricsMemoryFromTheLimit(t *testing.T) {
 	}
 	reader := string(result.Data[ReaderKey])
 	for _, expected := range []string{
-		"memory_capacity: 2147483640", "reader_cache_capacity: 1073741824",
-		"max_concurrent: 4", "max_memory_bytes: 1073741824", "memory_budget_bytes: 3221225460",
+		"memory_capacity: 1771673992", "reader_cache_capacity: 1073741824",
+		"max_concurrent: 4", "max_memory_bytes: 1073741824", "memory_budget_bytes: 2576980352",
 	} {
 		if !strings.Contains(reader, expected) {
 			t.Errorf("reader config missing %q:\n%s", expected, reader)
 		}
 	}
+}
+
+func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
+	storage := []string{"storage.block_cache.memory_capacity", "storage.meta_cache.capacity"}
+	products := []struct {
+		name   string
+		bounds []string
+		input  func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
+	}{
+		{
+			name: testMetricsProduct,
+			bounds: []string{
+				"reader_cache_capacity", "forward_index_cache_capacity_bytes", "matcher_cache_capacity_bytes",
+				"result_cache.capacity_bytes", "query.memory_budget_bytes", "rollup.copy_buffer_bytes",
+			},
+			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
+				return Input{Metrics: &telemetryv1alpha1.Metrics{
+					ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
+					Spec:       telemetryv1alpha1.MetricsSpec{Mode: mode, Writer: workload, Reader: workload},
+				}}
+			},
+		},
+		{
+			name:   testLogsProduct,
+			bounds: []string{"reader_cache_capacity", "result_cache_capacity", "request.max_in_flight_query_bytes", "rollup.copy_buffer_bytes"},
+			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
+				return Input{Logs: &telemetryv1alpha1.Logs{
+					ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
+					Spec:       telemetryv1alpha1.LogsSpec{Mode: mode, Writer: workload, Reader: workload},
+				}}
+			},
+		},
+		{
+			name: testTracesProduct,
+			bounds: []string{
+				"read_cache.metadata_bytes", "read_cache.postings_bytes", "read_cache.pages_bytes", "read_cache.locators_bytes",
+				"rollup.copy_buffer_bytes",
+			},
+			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
+				return Input{Traces: &telemetryv1alpha1.Traces{
+					ObjectMeta: metav1.ObjectMeta{Name: testTracesProduct, Namespace: testMetricsNamespace},
+					Spec:       telemetryv1alpha1.TracesSpec{Mode: mode, Writer: workload, Reader: workload},
+				}}
+			},
+		},
+	}
+	for _, product := range products {
+		for _, mode := range []telemetryv1alpha1.ProductMode{telemetryv1alpha1.ProductModeStandalone, telemetryv1alpha1.ProductModeSharded} {
+			for _, limit := range []string{"2Gi", "4Gi", "8Gi"} {
+				t.Run(fmt.Sprintf("%s/%s/%s", product.name, mode, limit), func(t *testing.T) {
+					quantity := resource.MustParse(limit)
+					workload := telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceMemory: quantity},
+					}}
+					input := product.input(mode, workload)
+					input.InternalToken = []byte("token")
+					result, err := Render(input)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for key, data := range result.Data {
+						if !strings.HasSuffix(key, ".yaml") {
+							continue
+						}
+						var rendered map[string]any
+						if err := yaml.Unmarshal(data, &rendered); err != nil {
+							t.Fatal(err)
+						}
+						plan := memoryPlan{limit: quantity.Value()}
+						total := plan.headroom()
+						for _, path := range append(product.bounds, storage...) {
+							value, found := lookupPath(rendered, path)
+							if !found && !strings.HasPrefix(path, "storage.") {
+								t.Fatalf("%s is missing %s:\n%s", key, path, data)
+							}
+							total += int64(value)
+						}
+						if total > plan.limit {
+							t.Fatalf("%s bounds and headroom total %d, over the %d limit:\n%s", key, total, plan.limit, data)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func lookupPath(rendered map[string]any, path string) (float64, bool) {
+	var value any = rendered
+	for _, part := range strings.Split(path, ".") {
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		if value, ok = fields[part]; !ok {
+			return 0, false
+		}
+	}
+	number, ok := value.(float64)
+	return number, ok
 }

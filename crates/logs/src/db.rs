@@ -19,7 +19,7 @@ use common::coordinator::{
 use common::discovery::{
     CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
-use common::storage::compaction::SegmentCompaction;
+use common::storage::compaction::{MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
@@ -48,7 +48,10 @@ use crate::error::{Error, Result};
 use crate::model::{
     Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
 };
-use crate::object::{BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records};
+use crate::object::{
+    BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records, run_slice_ns,
+    slice_streams,
+};
 use crate::search::{
     FieldStats, IndexDelta, block_max_scores, encode_field_stats, source_matches, term_index_ops,
 };
@@ -68,12 +71,16 @@ use write::*;
 const PAGE_READ_CONCURRENCY: usize = 16;
 /// Streams whose forward labels and run records are read concurrently.
 const STREAM_METADATA_CONCURRENCY: usize = 32;
-/// Fewest selected streams read by one range scan over their ID span instead
-/// of an operation per stream: below it, both cost a few point operations.
+/// Fewest selected streams, on average, read by one range scan over their ID
+/// span instead of an operation per stream: below it, both cost a few point
+/// operations.
 const SPAN_SCAN_MIN_STREAMS: usize = 8;
-/// Widest span, relative to the selected stream count, still read by range
-/// scans; past it unselected streams' records outweigh the point operations.
+/// Narrowest gap of unselected stream IDs that may end a span, and the most
+/// IDs spans may cover per selected stream; past either, unselected streams'
+/// records outweigh another operation.
 const SPAN_SCAN_MAX_SPREAD: usize = 16;
+/// Most range scans one selection is read by.
+const SPAN_SCAN_MAX_SPANS: usize = 4;
 /// Segments whose stream metadata is listed concurrently by `scan_targets`.
 const SEGMENT_LIST_CONCURRENCY: usize = 4;
 /// Segments a query reads at once, each fetching up to
@@ -189,6 +196,8 @@ pub struct LogDb {
     rolled: tokio::sync::RwLock<HashMap<Namespace, BTreeSet<SegmentId>>>,
     /// Serializes rollup passes.
     rollup_lock: Mutex<()>,
+    /// Holds on the merges of segments a rollup copies into.
+    merge_holds: MergeHolds,
     retention: Option<Duration>,
 }
 
@@ -279,11 +288,13 @@ impl LogDb {
     ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
+        let merge_holds = MergeHolds::default();
         let storage = StorageBuilder::with_cache(&config.storage, cache)?
             .with_semantics(
                 storage_semantics().with_segment_compaction(
                     SegmentCompaction::new(crate::codec::segment_span)
                         .with_retention(config.retention)
+                        .with_holds(merge_holds.clone())
                         .with_superseded(common::storage::rollup::superseded(
                             crate::codec::KEY_SCOPE,
                             segment_ns,
@@ -345,6 +356,7 @@ impl LogDb {
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
             rolled: tokio::sync::RwLock::new(rolled),
             rollup_lock: Mutex::new(()),
+            merge_holds,
             retention: config.retention,
         })
     }
@@ -444,6 +456,7 @@ impl LogDb {
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
             rolled: tokio::sync::RwLock::new(HashMap::new()),
             rollup_lock: Mutex::new(()),
+            merge_holds: MergeHolds::default(),
             retention: config.retention,
         })
     }

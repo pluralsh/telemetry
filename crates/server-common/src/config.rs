@@ -71,8 +71,14 @@ pub struct SegmentRollupConfig {
     pub enabled: bool,
     /// Largest rollup segment, by the stored size of what it covers.
     pub max_segment_bytes: u64,
-    /// How long after a day ends before its segments are rolled up.
+    /// How long after a window or day ends before its segments are rolled up.
     pub delay_seconds: u64,
+    /// Width of the in-day windows rolled up as each closes; the day is then
+    /// rolled up from them.
+    pub window_seconds: u64,
+    /// Longest a rollup waits for compaction to merge it before sealing it
+    /// anyway.
+    pub merge_wait_seconds: u64,
     /// How often to look for days to roll up.
     pub interval_seconds: u64,
     /// Copied bytes a rollup may queue before waiting for storage.
@@ -86,6 +92,8 @@ impl Default for SegmentRollupConfig {
             enabled: defaults.enabled,
             max_segment_bytes: defaults.max_segment_bytes,
             delay_seconds: defaults.delay.as_secs(),
+            window_seconds: defaults.window.as_secs(),
+            merge_wait_seconds: defaults.merge_wait.as_secs(),
             interval_seconds: defaults.interval.as_secs(),
             copy_buffer_bytes: defaults.copy_buffer_bytes,
         }
@@ -98,6 +106,8 @@ impl SegmentRollupConfig {
             enabled: self.enabled,
             max_segment_bytes: self.max_segment_bytes,
             delay: Duration::from_secs(self.delay_seconds),
+            window: Duration::from_secs(self.window_seconds),
+            merge_wait: Duration::from_secs(self.merge_wait_seconds),
             interval: Duration::from_secs(self.interval_seconds.max(1)),
             copy_buffer_bytes: self.copy_buffer_bytes.max(1),
         }

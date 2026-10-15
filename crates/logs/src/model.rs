@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,44 @@ impl Labels {
         }
         hasher.finalize().as_bytes()[..16].try_into().unwrap()
     }
+}
+
+/// Positions of `streams` in an order that keeps streams sharing coarse
+/// labels together: by the value of each label name, fewest distinct values
+/// first, absent before present. Stream IDs allocated in this order let a
+/// selector on a coarse label such as a cluster or namespace cover a narrow
+/// ID range instead of one spread over the whole segment.
+pub(crate) fn locality_order<'a>(streams: &[&'a Labels]) -> Vec<usize> {
+    let mut values: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
+    for labels in streams {
+        for label in labels.iter() {
+            values.entry(&label.name).or_default().insert(&label.value);
+        }
+    }
+    let mut names: Vec<(usize, &'a str)> = values
+        .iter()
+        .map(|(name, values)| (values.len(), *name))
+        .collect();
+    names.sort_unstable();
+    let key = |labels: &'a Labels| -> Vec<Option<&'a str>> {
+        names
+            .iter()
+            .map(|(_, name)| {
+                labels
+                    .0
+                    .binary_search_by(|label| label.name.as_str().cmp(name))
+                    .ok()
+                    .map(|position| labels.0[position].value.as_str())
+            })
+            .collect()
+    };
+    let mut order: Vec<(Vec<Option<&'a str>>, usize)> = streams
+        .iter()
+        .enumerate()
+        .map(|(position, labels)| (key(labels), position))
+        .collect();
+    order.sort_unstable();
+    order.into_iter().map(|(_, position)| position).collect()
 }
 
 /// One structured metadata field attached to a log entry.
@@ -193,6 +232,23 @@ pub struct LogRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locality_order_groups_by_the_coarsest_labels_first() {
+        let stream = |pairs: &[(&str, &str)]| {
+            Labels::new(pairs.iter().map(|(n, v)| Label::new(*n, *v)).collect()).unwrap()
+        };
+        let streams = [
+            stream(&[("app", "a"), ("cluster", "c1")]),
+            stream(&[("app", "b"), ("cluster", "c0")]),
+            stream(&[("app", "c"), ("cluster", "c1")]),
+            stream(&[("app", "d")]),
+            stream(&[("app", "e"), ("cluster", "c0")]),
+        ];
+        let order = locality_order(&streams.iter().collect::<Vec<_>>());
+        assert_eq!(order, vec![3, 1, 4, 0, 2]);
+    }
+
 
     #[test]
     fn structured_metadata_is_canonicalized() {

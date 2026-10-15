@@ -23,15 +23,24 @@ remaining `max_concurrent_compactions` slots, oldest segment first:
 - **Drain.** A segment is dropped without being rewritten once both its end
   and its newest SST are older than the database's retention. Without a
   retention, nothing is drained.
-- **Merge.** Once a segment has been closed for 30 minutes, all of its L0
+- **Merge.** Once a segment has been closed for 5 minutes, all of its L0
   SSTs and sorted runs are merged into one sorted run. A late write adds an
-  L0 SST again, and the segment is merged again.
+  L0 SST again; the segment is merged again once the late SSTs add up to a
+  sixteenth of its largest run, or a sixty-fourth once it has more than 8
+  sources, so a trickle of late writes doesn't rewrite a large segment each
+  time.
+- **Cap.** A segment still taking writes is merged whenever it has more than
+  8 L0 SSTs and sorted runs, so a query over the open hour never reads more
+  than 8 of them. Size-tiered compaction alone leaves up to about 10.
+- **Hold.** A [rollup](segment-rollup.md) segment is not merged while it is
+  being copied, since reads can't see it until it is sealed. Once copied,
+  its merge goes ahead of every other one, and the rollup is sealed after.
 - **Supersede.** A database can mark segments whose data now lives in another
   segment, and the policy drains them like expired ones instead of merging
   them. Metrics marks an hour bucket once a sealed
   [rollup](../metrics/storage-format.md#rollup) bucket covers it; Logs and
   Traces mark a segment once a sealed [rollup](segment-rollup.md) segment
-  covers it.
+  covers it. That includes a window's rollup once the day's covers it.
 
 Segments that already have a compaction running are skipped. Segments with
 no fixed end, such as the Traces locator segment, are never merged or

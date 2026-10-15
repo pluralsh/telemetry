@@ -231,21 +231,29 @@ VALUE empty
 
 SlateDB never compacts across segments, so a day of hour buckets stays 24
 segments, and a query over the day opens all 24. A writer therefore rolls
-each closed day up into wider buckets:
+each closed window (`rollup.window_seconds`, 4 hours by default) and then
+each closed day up into wider buckets, with the planner Logs and Traces use
+(see [segment rollup](../common/segment-rollup.md)):
 
-1. Once the day ended `rollup.delay_seconds` ago, it tiles the day with the
-   fewest aligned buckets of 24, 12, 8, 6, 4, 3 or 2 hours whose hours' stored
-   SST bytes sum to at most `rollup.max_bucket_bytes`. An hour too large to
-   share a bucket stays an hour bucket, and a window with at most one stored
-   hour is left alone.
-2. For each window it first routes new writes for the window's hours to the
-   wider bucket, flushing whatever the hours had pending, then copies every
-   series' labels, metadata and samples from the hours into it.
-3. It writes the seal durably, after the copied data.
+1. Once a window ended `rollup.delay_seconds` ago, it tiles the window with
+   the fewest aligned buckets whose hours' stored SST bytes sum to at most
+   `rollup.max_bucket_bytes`. Once the day ended as long ago and every
+   window is sealed, it tiles the day with 24, 12 or 8 hour buckets from the
+   windows. A day with no rollup yet is tiled straight from its hours. An
+   hour too large to share a bucket stays an hour bucket, and a tile with at
+   most one stored bucket is left alone.
+2. For each tile it first routes new writes for the tile's hours to the
+   wider bucket, flushing whatever they had pending, then copies every
+   series' labels, metadata and samples from what reads see of the tile,
+   each window's sealed bucket in place of its hours. Compaction leaves the
+   bucket alone while it is copied.
+3. It asks compaction to merge the bucket first and waits until it is one
+   SST or sorted run, at most `rollup.merge_wait_seconds`, then writes the
+   seal durably.
 
 Reads list a bucket wider than an hour only once sealed, and hide every
 bucket a sealed bucket covers, so a query sees either the hours or their
-rollup, never both. Compaction then drops the covered hour segments (see
+rollup, never both. Compaction then drops the covered segments, hours or windows (see
 [storage compaction](../common/storage-compaction.md)). A rollup interrupted
 before its seal leaves an unsealed bucket that reads ignore; the writer keeps
 routing the hours' writes to it and finishes the copy on its next pass.

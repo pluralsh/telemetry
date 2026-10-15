@@ -330,6 +330,8 @@ func renderLogs(input Input) (Result, error) {
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Rollup:                 renderRollupConfig(plan),
+			ReaderCacheCapacity:    plan.logsObjectBlockCache(),
+			ResultCacheCapacity:    plan.logsResultCache(),
 			Page: renderLogsPage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
@@ -352,7 +354,7 @@ func renderLogs(input Input) (Result, error) {
 				MaxQueryPages:               int64Value(spec.Request.MaxQueryPages, 10000),
 				MaxStructuredMetadataFields: int64Value(spec.Request.MaxStructuredMetadataFields, 128),
 				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
-				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, 134217728),
+				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, plan.logsInFlightQuery()),
 			},
 			Elasticsearch: renderElasticsearch{
 				MessageFields: lo.Ternary(spec.Elasticsearch.MessageFields == nil, []string{"message", "log", "msg"}, spec.Elasticsearch.MessageFields),
@@ -446,6 +448,7 @@ func renderTraces(input Input) (Result, error) {
 			SegmentDurationSeconds: int64Value(spec.SegmentDurationSeconds, 3600),
 			RetentionSeconds:       retention,
 			Rollup:                 renderRollupConfig(plan),
+			ReadCache:              plan.tracesReadCache(),
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
@@ -698,32 +701,56 @@ func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.Wo
 	return int32(inferred)
 }
 
-// memoryPlan splits a container's memory limit between its caches and the
-// query memory budget, leaving about a quarter for the runtime, memtables,
-// request and response buffers, and allocator slack. Every share has a
-// floor so that small pods still cache something.
+// memoryPlan splits a container's memory limit between its caches and
+// query budgets. It first holds back headroom for what nothing bounds: the
+// runtime, memtables and write buffers, request and response buffers, query
+// state outside the budgets, and allocator slack. Small pods need a larger
+// fraction of that, so it is a quarter of the limit but at least 768 MiB,
+// and at most half. Each cache and budget gets a share of the rest, and
+// every product's shares sum to at most all of it, so the rendered bounds
+// and the headroom fit the limit; the floors matter only for limits too
+// small to run well.
 type memoryPlan struct {
 	limit int64
 }
 
 const mebibyte = int64(1024 * 1024)
 
-func (plan memoryPlan) share(percent, floor int64) int64 {
-	return max(plan.limit/100*percent, floor)
+func (plan memoryPlan) headroom() int64 {
+	return min(max(plan.limit/4, 768*mebibyte), plan.limit/2)
 }
 
-func (plan memoryPlan) blockCache() int64 { return plan.share(20, 64*mebibyte) }
-func (plan memoryPlan) metaCache() int64  { return plan.share(5, 32*mebibyte) }
+func (plan memoryPlan) share(percent, floor int64) int64 {
+	return max((plan.limit-plan.headroom())/100*percent, floor)
+}
 
-// readerCache is twice the series cache, which takes half of it.
-func (plan memoryPlan) readerCache() int64       { return plan.share(15, 64*mebibyte) }
-func (plan memoryPlan) forwardIndexCache() int64 { return plan.share(5, 32*mebibyte) }
-func (plan memoryPlan) matcherCache() int64      { return plan.share(3, 16*mebibyte) }
-func (plan memoryPlan) resultCache() int64       { return plan.share(5, 16*mebibyte) }
-func (plan memoryPlan) queryBudget() int64       { return plan.share(30, 128*mebibyte) }
+func (plan memoryPlan) blockCache() int64 { return plan.share(22, 64*mebibyte) }
+func (plan memoryPlan) metaCache() int64  { return plan.share(6, 32*mebibyte) }
 
 // rollupCopyBuffer bounds the copied bytes a rollup queues for the writer.
-func (plan memoryPlan) rollupCopyBuffer() int64 { return plan.share(5, 32*mebibyte) }
+func (plan memoryPlan) rollupCopyBuffer() int64 { return plan.share(4, 32*mebibyte) }
+
+// readerCache is twice the series cache, which takes half of it.
+func (plan memoryPlan) readerCache() int64       { return plan.share(18, 64*mebibyte) }
+func (plan memoryPlan) forwardIndexCache() int64 { return plan.share(6, 32*mebibyte) }
+func (plan memoryPlan) matcherCache() int64      { return plan.share(3, 16*mebibyte) }
+func (plan memoryPlan) resultCache() int64       { return plan.share(6, 16*mebibyte) }
+func (plan memoryPlan) queryBudget() int64       { return plan.share(32, 128*mebibyte) }
+
+// logsObjectBlockCache holds object blocks with their bodies decompressed,
+// which warm queries read without the SST block cache.
+func (plan memoryPlan) logsObjectBlockCache() int64 { return plan.share(24, 64*mebibyte) }
+func (plan memoryPlan) logsResultCache() int64      { return plan.share(6, 16*mebibyte) }
+func (plan memoryPlan) logsInFlightQuery() int64    { return plan.share(16, 64*mebibyte) }
+
+func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
+	return renderTracesReadCache{
+		MetadataBytes: plan.share(2, 8*mebibyte),
+		PostingsBytes: plan.share(4, 16*mebibyte),
+		PagesBytes:    plan.share(8, 32*mebibyte),
+		LocatorsBytes: plan.share(2, 8*mebibyte),
+	}
+}
 
 func renderRollupConfig(plan memoryPlan) renderRollup {
 	return renderRollup{CopyBufferBytes: plan.rollupCopyBuffer()}
@@ -836,9 +863,17 @@ type renderLogsConfig struct {
 	Request                renderLogsRequest   `json:"request"`
 	Elasticsearch          renderElasticsearch `json:"elasticsearch"`
 	Rollup                 renderRollup        `json:"rollup"`
+	ReaderCacheCapacity    int64               `json:"reader_cache_capacity"`
+	ResultCacheCapacity    int64               `json:"result_cache_capacity"`
 	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
 	Auth                   renderAuth          `json:"auth"`
 	Namespaces             []renderNamespace   `json:"namespaces"`
+}
+type renderTracesReadCache struct {
+	MetadataBytes int64 `json:"metadata_bytes"`
+	PostingsBytes int64 `json:"postings_bytes"`
+	PagesBytes    int64 `json:"pages_bytes"`
+	LocatorsBytes int64 `json:"locators_bytes"`
 }
 type renderRollup struct {
 	CopyBufferBytes int64 `json:"copy_buffer_bytes"`
@@ -849,20 +884,21 @@ type renderElasticsearch struct {
 	StreamFields  []string `json:"stream_fields"`
 }
 type renderTracesConfig struct {
-	Mode                   string              `json:"mode"`
-	Listeners              renderListeners     `json:"listeners"`
-	PathPrefix             string              `json:"path_prefix,omitempty"`
-	Storage                renderStorage       `json:"storage"`
-	SegmentDurationSeconds int64               `json:"segment_duration_seconds"`
-	RetentionSeconds       *int64              `json:"retention_seconds,omitempty"`
-	Page                   renderTracesPage    `json:"page"`
-	Write                  renderWrite         `json:"write"`
-	Sharding               renderSharding      `json:"sharding"`
-	Request                renderTracesRequest `json:"request"`
-	Rollup                 renderRollup        `json:"rollup"`
-	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
-	Auth                   renderAuth          `json:"auth"`
-	Namespaces             []renderNamespace   `json:"namespaces"`
+	Mode                   string                `json:"mode"`
+	Listeners              renderListeners       `json:"listeners"`
+	PathPrefix             string                `json:"path_prefix,omitempty"`
+	Storage                renderStorage         `json:"storage"`
+	SegmentDurationSeconds int64                 `json:"segment_duration_seconds"`
+	RetentionSeconds       *int64                `json:"retention_seconds,omitempty"`
+	Page                   renderTracesPage      `json:"page"`
+	Write                  renderWrite           `json:"write"`
+	Sharding               renderSharding        `json:"sharding"`
+	Request                renderTracesRequest   `json:"request"`
+	Rollup                 renderRollup          `json:"rollup"`
+	ReadCache              renderTracesReadCache `json:"read_cache"`
+	CacheWarmer            renderCacheWarmer     `json:"cache_warmer"`
+	Auth                   renderAuth            `json:"auth"`
+	Namespaces             []renderNamespace     `json:"namespaces"`
 }
 type renderPseudoFSConfig struct {
 	Listener                string                   `json:"listener"`

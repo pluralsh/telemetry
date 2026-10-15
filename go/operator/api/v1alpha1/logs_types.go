@@ -60,8 +60,9 @@ type LogsRequestSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=16
 	QueryConcurrency *int32 `json:"queryConcurrency,omitempty"`
+	// MaxInFlightQueryBytes bounds the decoded bytes all running queries hold
+	// at once. When omitted, the operator sizes it from the memory limit.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=134217728
 	MaxInFlightQueryBytes *int64 `json:"maxInFlightQueryBytes,omitempty"`
 }
 

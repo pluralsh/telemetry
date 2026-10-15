@@ -85,6 +85,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
         },
         write_buffer: Default::default(),
         block_cache_capacity_bytes: crate::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
+        result_cache_capacity_bytes: 0,
     }
 }
 
@@ -1106,6 +1107,7 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
             .map_or(SPAN_SCAN_MAX_SPREAD, |value| value.parse().unwrap()),
         rolled: tokio::sync::RwLock::new(HashMap::new()),
         rollup_lock: Mutex::new(()),
+        merge_holds: Default::default(),
         retention: config.retention,
     }
 }
@@ -1326,4 +1328,306 @@ fn plan_segments(db: &LogDb, start: i64, end: i64) -> usize {
 async fn profile_log_query_phases() {
     profile(false).await;
     profile(true).await;
+}
+
+/// Bytes of every file under `path`. Garbage collection keeps replaced SSTs
+/// for an hour, so over a shorter run this is every byte written.
+fn dir_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
+            _ => entry.metadata().map_or(0, |meta| meta.len()),
+        })
+        .sum()
+}
+
+/// Waits until `db`'s manifest stops changing for `quiet`, at most `limit`,
+/// writing nothing so the writer's compactor drains its queue.
+async fn settle(db: &LogDb, quiet: Duration, limit: Duration) -> Duration {
+    let started = Instant::now();
+    let Some(slate) = db.storage.slate_read() else {
+        return Duration::ZERO;
+    };
+    let layout = || {
+        let manifest = slate.manifest();
+        manifest
+            .segments()
+            .iter()
+            .map(|segment| (segment.l0().len(), segment.compacted().len()))
+            .collect::<Vec<_>>()
+    };
+    let mut last = layout();
+    let mut stable = Instant::now();
+    while started.elapsed() < limit {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = layout();
+        if now != last {
+            last = now;
+            stable = Instant::now();
+        } else if stable.elapsed() >= quiet {
+            break;
+        }
+    }
+    started.elapsed()
+}
+
+/// Visible segments a query over `[start, end]` reads, and their SSTs
+/// sources (L0s plus sorted runs) in total and at most.
+fn read_layout(db: &LogDb, namespace: &Namespace, start: i64, end: i64) -> (usize, usize, usize) {
+    let segments = db
+        .visible_segment_ids(namespace, (start, end), false)
+        .unwrap();
+    let manifest = db.storage.slate_read().unwrap().manifest();
+    let sources = segments
+        .iter()
+        .map(|segment| {
+            let mut prefix = bytes::BytesMut::new();
+            crate::codec::KEY_SCOPE.write(&mut prefix, namespace, *segment);
+            manifest
+                .segments()
+                .iter()
+                .find(|live| live.prefix().as_ref() == prefix.as_ref())
+                .map_or(0, |live| live.l0().len() + live.compacted().len())
+        })
+        .collect::<Vec<_>>();
+    (
+        segments.len(),
+        sources.iter().sum(),
+        sources.iter().copied().max().unwrap_or(0),
+    )
+}
+
+/// For each segment the last day of `PROFILE_STORE` reads, the runs of the
+/// `mgmt` cluster's streams: how many, how many are isolated, their time
+/// spans, and how many a 5 or 30 minute step boundary splits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_run_spans() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let config = production_config(&store);
+    let namespace = Namespace::new("default").unwrap();
+    let db = cold_reader(&config, Duration::ZERO, &Arc::new(AtomicUsize::new(0))).await;
+    let end = common::time::now_ns();
+    let request = QueryRequest::range(
+        r#"sum(count_over_time({cluster="mgmt"} [300s]))"#,
+        end - 86_400 * SECOND,
+        end,
+        300 * SECOND,
+    );
+    let options = QueryOptions::default();
+    let parsed = crate::logql::parse(&request.query).unwrap();
+    let plan = crate::query::ScanPlan::new(&request, &parsed, &options).unwrap();
+    let targets = db
+        .scan_targets(&namespace, plan.scan_start, end, &plan.streams)
+        .await
+        .unwrap();
+    let splits = |run: &StoredRun, step: i64| {
+        run.min_timestamp_ns.div_euclid(step) != run.max_timestamp_ns.div_euclid(step)
+    };
+    for (segment, streams) in &targets.segments {
+        let mut spans = Vec::new();
+        let (mut isolated, mut split_5m, mut split_30m, mut rows) = (0, 0, 0, 0u64);
+        for stream in streams {
+            for ((_, run), alone) in stream.runs.iter().zip(isolated_runs(&stream.runs)) {
+                spans.push((run.max_timestamp_ns - run.min_timestamp_ns) / SECOND);
+                isolated += usize::from(alone);
+                split_5m += usize::from(splits(run, 300 * SECOND));
+                split_30m += usize::from(splits(run, 1_800 * SECOND));
+                rows += u64::from(run.rows);
+            }
+        }
+        if spans.is_empty() {
+            continue;
+        }
+        spans.sort_unstable();
+        let at = |q: f64| spans[((spans.len() - 1) as f64 * q) as usize];
+        println!(
+            "{segment}: streams {} runs {} rows/run {:.0} isolated {isolated} span p50 {}s p90 {}s max {}s split 5m {split_5m} 30m {split_30m}",
+            streams.len(),
+            spans.len(),
+            rows as f64 / spans.len() as f64,
+            at(0.5),
+            at(0.9),
+            spans[spans.len() - 1],
+        );
+    }
+    db.close().await.unwrap();
+}
+
+/// Object-store reads since the last call, by file kind: reads, distinct
+/// files and bytes requested.
+fn get_breakdown() -> String {
+    let keys = std::mem::take(&mut *GET_KEYS.lock().unwrap());
+    let mut kinds = std::collections::BTreeMap::<String, (usize, HashSet<String>, u64)>::new();
+    for key in keys {
+        let (path, range) = key.split_once(' ').unwrap_or((key.as_str(), ""));
+        let kind = path.rsplit('/').nth(1).unwrap_or("?").to_owned();
+        let bytes = range
+            .split_once("Bounded(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(span, _)| span.split_once(".."))
+            .and_then(|(from, to)| Some(to.parse::<u64>().ok()? - from.parse::<u64>().ok()?))
+            .unwrap_or(0);
+        let entry = kinds.entry(kind).or_default();
+        entry.0 += 1;
+        entry.1.insert(path.to_owned());
+        entry.2 += bytes;
+    }
+    kinds
+        .into_iter()
+        .map(|(kind, (reads, files, bytes))| {
+            format!(
+                "{kind}: reads {reads} files {} KiB {}",
+                files.len(),
+                bytes >> 10
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Runs Console's per-cluster log chart over the last hour, 4 hours and day
+/// ending at `end`, each cold on a fresh reader and then warm.
+async fn profile_ranges(
+    phase: &str,
+    writer: &LogDb,
+    config: &Config,
+    namespace: &Namespace,
+    latency: Duration,
+    end: i64,
+) {
+    for (label, range, step) in [
+        ("1h", 3_600, 60),
+        ("4h", 4 * 3_600, 300),
+        ("1d", 86_400, 1_800),
+    ] {
+        let start = end - range * SECOND;
+        let (segments, sources, widest) = read_layout(writer, namespace, start, end);
+        let request = QueryRequest::range(
+            r#"sum(count_over_time({cluster="mgmt"} [STEPs]))"#.replace("STEP", &step.to_string()),
+            start,
+            end,
+            step * SECOND,
+        )
+        .frontend_step_aligned();
+        let gets = Arc::new(AtomicUsize::new(0));
+        take_get_keys();
+        let mut db = cold_reader(config, latency, &gets).await;
+        let opened = gets.swap(0, Ordering::Relaxed);
+        let open_reads = get_breakdown();
+        let counting = Arc::new(common::storage::counting::CountingStorage::new(
+            db.storage.clone(),
+            classify_key,
+        ));
+        db.storage = counting.clone();
+        let timed = Instant::now();
+        db.query(namespace, &request, QueryOptions::default())
+            .await
+            .unwrap();
+        let cold = timed.elapsed();
+        let cold_gets = gets.swap(0, Ordering::Relaxed);
+        let cold_reads = get_breakdown();
+        let io = counting.take();
+        let mut warm = Vec::new();
+        for _ in 0..3 {
+            let timed = Instant::now();
+            db.query(namespace, &request, QueryOptions::default())
+                .await
+                .unwrap();
+            warm.push(ms(timed.elapsed()));
+        }
+        counting.take();
+        take_get_keys();
+        println!(
+            "{phase} {label}: segments {segments} sources {sources} (max {widest}) cold {:.0}ms gets {cold_gets} (+{opened} to open) warm {:.0}/{:.0}/{:.0}ms",
+            ms(cold),
+            warm[0],
+            warm[1],
+            warm[2],
+        );
+        println!("    open: {open_reads}");
+        println!("    query: {cold_reads}");
+        for ((op, class), stats) in io {
+            println!(
+                "    {op}/{class}: calls {} records {} KiB {}",
+                stats.calls,
+                stats.records,
+                stats.bytes >> 10,
+            );
+        }
+        db.close().await.unwrap();
+    }
+}
+
+/// Ingests `PROFILE_HOURS` (8) of production-shaped logs ending now into a
+/// fresh `PROFILE_STORE`, times Console's per-cluster log chart over the last
+/// hour, 4 hours and day cold (`PROFILE_LATENCY_MS` per object-store read)
+/// and warm, runs one rollup pass with the default config, lets compaction
+/// settle, and times the same queries again over the same data, with what
+/// each read from the object store and the bytes written by each phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_query_ranges() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    assert!(!store.exists(), "PROFILE_STORE must not exist yet");
+    let hours: i64 = std::env::var("PROFILE_HOURS").map_or(8, |value| value.parse().unwrap());
+    let latency = Duration::from_millis(
+        std::env::var("PROFILE_LATENCY_MS").map_or(20, |value| value.parse().unwrap()),
+    );
+    let namespace = Namespace::new("default").unwrap();
+    let config = production_config(&store);
+    std::fs::create_dir_all(&store).unwrap();
+
+    let started = Instant::now();
+    ingest_clusters(&config, &namespace, hours).await;
+    let writer = LogDb::open(config.clone()).await.unwrap();
+    let settled = settle(&writer, Duration::from_secs(10), Duration::from_secs(180)).await;
+    let ingested = dir_bytes(&store);
+    println!(
+        "ingest: {hours}h in {:.0}s (settled {:.0}s), store {:.2} GiB",
+        started.elapsed().as_secs_f64(),
+        settled.as_secs_f64(),
+        ingested as f64 / f64::from(1 << 30),
+    );
+    let end = common::time::now_ns() / (60 * SECOND) * (60 * SECOND);
+    profile_ranges("before", &writer, &config, &namespace, latency, end).await;
+
+    let started = Instant::now();
+    let sealed = writer
+        .rollup_at(
+            &common::storage::rollup::RollupConfig::default(),
+            common::time::now_ns(),
+        )
+        .await
+        .unwrap();
+    let rolled = started.elapsed();
+    let settled = settle(&writer, Duration::from_secs(10), Duration::from_secs(600)).await;
+    let total = dir_bytes(&store);
+    println!(
+        "rollup: sealed {sealed} in {:.0}s (settled {:.0}s), wrote {:.2} GiB, store {:.2} GiB",
+        rolled.as_secs_f64(),
+        settled.as_secs_f64(),
+        (total - ingested) as f64 / f64::from(1 << 30),
+        total as f64 / f64::from(1 << 30),
+    );
+    if let Some(rollups) = writer
+        .storage
+        .slate_read()
+        .map(|slate| Rollups::load_all(&slate, crate::codec::KEY_SCOPE))
+    {
+        for (_, rollups) in rollups {
+            let sealed: Vec<String> = rollups
+                .sealed()
+                .iter()
+                .map(|segment| format!("{segment}"))
+                .collect();
+            println!("  sealed: {}", sealed.join(" "));
+        }
+    }
+    profile_ranges("after", &writer, &config, &namespace, latency, end).await;
+    writer.close().await.unwrap();
 }

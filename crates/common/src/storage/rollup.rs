@@ -3,17 +3,28 @@
 //!
 //! SlateDB compacts within a segment, and every `(namespace, time segment)`
 //! is its own segment, so a day of hour segments stays 24 segments however
-//! long it sits. A store rolls a closed day up by re-writing its segments
-//! into the fewest aligned segments of 24, 12, 8, 6, 4, 3 or 2 hours (or
-//! narrower whole multiples of its segment width) that stay within a size
-//! cap, recording two markers in segments of their own:
+//! long it sits. A store rolls segments up by re-writing them into wider
+//! aligned ones that stay within a size cap, in two tiers:
+//!
+//! - Each [`RollupConfig::window`] of the day (4 hours by default), once it
+//!   has closed, into one segment of that width, or of narrower widths
+//!   dividing it if that's over the cap. Queries over the last hours and
+//!   day read these within minutes of the window closing.
+//! - Each closed day, into the fewest aligned segments of 24, 12 or 8 hours
+//!   the cap allows, made from its windows' rollups. A day too big for any
+//!   of those keeps its windows. A closed day with no rollups yet (after a
+//!   backfill) is instead tiled from its segments directly, so it is
+//!   copied once.
+//!
+//! Each rollup records two markers in segments of their own:
 //!
 //! - **Pending**, written before the first copy. From then on the store
 //!   routes writes for the covered segments to the rollup segment, and reads
 //!   ignore the rollup segment.
-//! - **Sealed**, written once every covered segment is copied. Reads use the
-//!   rollup segment in place of the segments it covers, which compaction
-//!   then drains ([`superseded`]).
+//! - **Sealed**, written once every covered segment is copied and the
+//!   rollup segment merged into one sorted run. Reads use the rollup
+//!   segment in place of the segments it covers, which compaction then
+//!   drains ([`superseded`]).
 //!
 //! A marker's scope is the rollup segment's with a flag bit set in its
 //! width, so markers never share a segment with data and are found from
@@ -24,10 +35,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use slatedb::manifest::VersionedManifest;
 
 use crate::namespace::Namespace;
 use crate::serde::scope::{KeyScope, Segment};
-use crate::storage::compaction::Superseded;
+use crate::storage::compaction::{Superseded, merged_since};
 use crate::storage::slate::SlateReadHandle;
 
 pub const DAY_NS: i64 = 86_400 * 1_000_000_000;
@@ -42,26 +54,64 @@ pub struct RollupConfig {
     pub enabled: bool,
     /// Largest rollup segment, by the estimated size of what it covers.
     pub max_segment_bytes: u64,
-    /// How long after a day ends before it is rolled up.
+    /// Width of the rollups made as the day goes, a fraction of a day; the
+    /// widest rollup width at most this is used.
+    pub window: Duration,
+    /// How long after a window or day ends before it is rolled up.
     pub delay: Duration,
-    /// How often closed days are looked for.
+    /// How often closed windows and days are looked for.
     pub interval: Duration,
     /// Copied bytes a rollup may hand the writer before waiting for them to
     /// reach storage. Larger values copy faster at the cost of memory.
     pub copy_buffer_bytes: u64,
+    /// How long a copied rollup waits for its merge into one sorted run
+    /// before it is sealed anyway, as it must be when no compactor runs in
+    /// the writer's process.
+    pub merge_wait: Duration,
 }
 
 /// Default [`RollupConfig::copy_buffer_bytes`].
 pub const DEFAULT_COPY_BUFFER_BYTES: u64 = 64 << 20;
+/// Default [`RollupConfig::window`].
+pub const DEFAULT_WINDOW: Duration = Duration::from_secs(4 * 3_600);
+/// Default [`RollupConfig::delay`]. Writes arriving after a rollup starts
+/// go to the rollup, so this only spares it re-merging the stragglers.
+pub const DEFAULT_DELAY: Duration = Duration::from_secs(10 * 60);
+/// Default [`RollupConfig::merge_wait`].
+pub const DEFAULT_MERGE_WAIT: Duration = Duration::from_secs(30 * 60);
+const MERGE_POLL: Duration = Duration::from_secs(1);
+
+/// Waits until the segment at `prefix` holds everything it held at
+/// `since_ms` in one sorted run, as the `manifest` it reads shows, for at
+/// most `wait`. Returns whether it does.
+pub async fn await_merge(
+    manifest: impl Fn() -> VersionedManifest,
+    prefix: &[u8],
+    since_ms: u64,
+    wait: Duration,
+) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if merged_since(&manifest(), prefix, since_ms) {
+            return true;
+        }
+        if started.elapsed() >= wait {
+            return false;
+        }
+        tokio::time::sleep(MERGE_POLL.min(wait)).await;
+    }
+}
 
 impl Default for RollupConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             max_segment_bytes: 4 << 30,
-            delay: Duration::from_secs(3_600),
+            window: DEFAULT_WINDOW,
+            delay: DEFAULT_DELAY,
             interval: Duration::from_secs(300),
             copy_buffer_bytes: DEFAULT_COPY_BUFFER_BYTES,
+            merge_wait: DEFAULT_MERGE_WAIT,
         }
     }
 }
@@ -133,20 +183,28 @@ fn covers(wide: Segment, narrow: Segment) -> bool {
             .is_some_and(|end| wide.end_ns().is_some_and(|wide_end| end <= wide_end))
 }
 
-/// A compaction hook draining each `base_ns` segment of `scope` that a live
-/// seal covers.
+fn overlaps(a: Segment, b: Segment) -> bool {
+    a.start_ns < b.start_ns.saturating_add(b.width_ns)
+        && b.start_ns < a.start_ns.saturating_add(a.width_ns)
+}
+
+/// A compaction hook draining each data segment of `scope`, `base_ns` wide
+/// or a narrower rollup, that a live seal of a wider rollup covers.
 pub fn superseded(scope: KeyScope, base_ns: i64) -> Superseded {
     Arc::new(move |prefix, present| {
         let Ok((namespace, segment, _)) = scope.parse(prefix) else {
             return false;
         };
-        if segment.width_ns != base_ns {
+        if parse_marker(segment).is_some() || segment.width_ns < base_ns {
             return false;
         }
-        widths(base_ns, None).into_iter().any(|width| {
-            let cover = Segment::containing(segment.start_ns, width);
-            present(&marker_key(scope, &namespace, Marker::Sealed, cover))
-        })
+        widths(base_ns, None)
+            .into_iter()
+            .filter(|width| *width > segment.width_ns && width % segment.width_ns == 0)
+            .any(|width| {
+                let cover = Segment::containing(segment.start_ns, width);
+                present(&marker_key(scope, &namespace, Marker::Sealed, cover))
+            })
     })
 }
 
@@ -240,6 +298,23 @@ impl Rollups {
             .collect()
     }
 
+    /// Rollups from their `sealed` and `pending` segments and the estimated
+    /// bytes of every data segment, for stores that keep markers their own
+    /// way.
+    pub fn new(
+        mut sealed: Vec<Segment>,
+        mut pending: Vec<Segment>,
+        sizes: HashMap<Segment, u64>,
+    ) -> Self {
+        sealed.sort();
+        pending.sort();
+        Self {
+            sealed,
+            pending,
+            sizes,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sealed.is_empty() && self.pending.is_empty()
     }
@@ -296,11 +371,41 @@ impl Rollups {
         visible
     }
 
-    /// The rollup segments to fill, in order: unsealed ones first, then the
-    /// tiling of every day of `base_ns` segments that ended `delay` before
-    /// `now_ns` and is not yet expired under `retention`. Days already
-    /// holding a rollup are skipped, as are windows with fewer than two
-    /// segments to merge.
+    /// What a rollup into `wide` copies, in order: each `base_ns` segment
+    /// it covers, or the widest sealed rollup narrower than `wide` covering
+    /// that segment in its place.
+    pub fn sources(&self, wide: Segment, base_ns: i64) -> Vec<Segment> {
+        let mut sources: Vec<Segment> = Vec::new();
+        let mut start_ns = wide.start_ns;
+        while start_ns < wide.start_ns.saturating_add(wide.width_ns) {
+            let base = Segment::new(start_ns, base_ns);
+            let source = self
+                .sealed
+                .iter()
+                .copied()
+                .filter(|narrow| narrow.width_ns < wide.width_ns && covers(*narrow, base))
+                .max_by_key(|narrow| narrow.width_ns)
+                .unwrap_or(base);
+            if sources.last() != Some(&source) {
+                sources.push(source);
+            }
+            start_ns = start_ns.saturating_add(base_ns);
+        }
+        sources
+    }
+
+    /// The rollup segments to fill, in order: unsealed ones first, then,
+    /// for every block (a day, or a period if narrower) not yet expired
+    /// under `retention`:
+    ///
+    /// - once it ended `delay` before `now_ns` and holds no rollup, the
+    ///   tiling of its `base_ns` segments;
+    /// - otherwise the tiling of each closed window of it holding no
+    ///   rollup;
+    /// - and once it ended, every window's rollup is sealed and none is
+    ///   left to plan, the tiling of its windows into wider rollups.
+    ///
+    /// Tiles with fewer than two segments to merge are skipped.
     pub fn plan(
         &self,
         base_ns: i64,
@@ -311,59 +416,155 @@ impl Rollups {
     ) -> Vec<Segment> {
         let mut planned = self.unsealed();
         let widths = widths(base_ns, period_ns);
-        if widths.is_empty() {
+        let Some(&block_ns) = widths.first() else {
             return planned;
-        }
+        };
+        let window_ns = i64::try_from(config.window.as_nanos()).unwrap_or(i64::MAX);
+        let window_ns = widths
+            .iter()
+            .copied()
+            .find(|width| *width <= window_ns && *width < block_ns);
         let delay_ns = i64::try_from(config.delay.as_nanos()).unwrap_or(i64::MAX);
         let retention_ns = retention.map(|r| i64::try_from(r.as_nanos()).unwrap_or(i64::MAX));
+        let closed = |span: Segment| {
+            span.start_ns
+                .saturating_add(span.width_ns)
+                .saturating_add(delay_ns)
+                <= now_ns
+        };
         let routed = self.routed();
-        let days: BTreeSet<i64> = self
+        let blocks: BTreeSet<i64> = self
             .sizes
             .keys()
-            .filter(|segment| segment.width_ns == base_ns)
-            .map(|segment| segment.start_ns.div_euclid(DAY_NS) * DAY_NS)
+            .filter(|segment| segment.is_bounded() && segment.width_ns < block_ns)
+            .filter_map(|segment| segment.start_ns.div_euclid(block_ns).checked_mul(block_ns))
             .collect();
-        let slots = usize::try_from(DAY_NS / base_ns).unwrap_or(0);
-        let slot_widths: Vec<usize> = widths
-            .iter()
-            .map(|width| usize::try_from(width / base_ns).unwrap_or(1))
-            .chain([1])
-            .collect();
-        for day_start in days {
-            let day = Segment::new(day_start, DAY_NS);
-            let day_end = day_start.saturating_add(DAY_NS);
-            if day_end.saturating_add(delay_ns) > now_ns
-                || retention_ns.is_some_and(|r| day_end.saturating_add(r) <= now_ns)
+        for block_start in blocks {
+            let block = Segment::new(block_start, block_ns);
+            let block_end = block_start.saturating_add(block_ns);
+            if retention_ns.is_some_and(|r| block_end.saturating_add(r) <= now_ns)
                 || routed
                     .iter()
-                    .any(|wide| *wide == day || covers(day, *wide) || covers(*wide, day))
+                    .any(|wide| *wide == block || covers(*wide, block))
             {
                 continue;
             }
-            let mut bytes = vec![0; slots];
-            let mut present = vec![false; slots];
-            for (slot, segment) in (0..slots).map(|slot| {
-                let start = day_start + i64::try_from(slot).unwrap_or(0) * base_ns;
-                (slot, Segment::new(start, base_ns))
-            }) {
-                if let Some(size) = self.sizes.get(&segment) {
-                    bytes[slot] = *size;
-                    present[slot] = true;
-                }
+            let inside: Vec<Segment> = routed
+                .iter()
+                .copied()
+                .filter(|wide| overlaps(*wide, block))
+                .collect();
+            if closed(block) && inside.is_empty() {
+                planned.extend(self.tile_base(block, base_ns, &widths, config));
+                continue;
             }
-            for (first, len) in tile(&bytes, &slot_widths, config.max_segment_bytes) {
-                if len == 1 || present[first..first + len].iter().filter(|p| **p).count() < 2 {
+            let Some(window_ns) = window_ns else {
+                continue;
+            };
+            let mut windows_left = false;
+            for index in 0..block_ns / window_ns {
+                let window = Segment::new(block_start + index * window_ns, window_ns);
+                if !closed(window) || inside.iter().any(|wide| overlaps(*wide, window)) {
                     continue;
                 }
-                let start = day_start + i64::try_from(first).unwrap_or(0) * base_ns;
-                planned.push(Segment::new(
-                    start,
-                    i64::try_from(len).unwrap_or(1) * base_ns,
-                ));
+                let tiles = self.tile_base(window, base_ns, &widths, config);
+                windows_left |= !tiles.is_empty();
+                planned.extend(tiles);
+            }
+            if closed(block)
+                && !windows_left
+                && inside.iter().all(|wide| {
+                    wide.width_ns <= window_ns && self.sealed.binary_search(wide).is_ok()
+                })
+            {
+                planned.extend(self.tile_windows(block, window_ns, &widths, config));
             }
         }
         planned
     }
+
+    /// The tiling of `span`'s `base_ns` segments with `widths` dividing it.
+    fn tile_base(
+        &self,
+        span: Segment,
+        base_ns: i64,
+        widths: &[i64],
+        config: &RollupConfig,
+    ) -> Vec<Segment> {
+        let slots = usize::try_from(span.width_ns / base_ns).unwrap_or(0);
+        let mut bytes = vec![0; slots];
+        let mut present = vec![0; slots];
+        for slot in 0..slots {
+            let start = span.start_ns + i64::try_from(slot).unwrap_or(0) * base_ns;
+            if let Some(size) = self.sizes.get(&Segment::new(start, base_ns)) {
+                bytes[slot] = *size;
+                present[slot] = 1;
+            }
+        }
+        tiles(span, base_ns, &bytes, &present, widths, config)
+    }
+
+    /// The tiling of `block`'s `window_ns` windows, each holding what reads
+    /// see there, into rollups wider than a window.
+    fn tile_windows(
+        &self,
+        block: Segment,
+        window_ns: i64,
+        widths: &[i64],
+        config: &RollupConfig,
+    ) -> Vec<Segment> {
+        let slots = usize::try_from(block.width_ns / window_ns).unwrap_or(0);
+        let mut bytes = vec![0; slots];
+        let mut present = vec![0; slots];
+        for (segment, size) in &self.sizes {
+            if !covers(block, *segment) || !self.is_visible(*segment) {
+                continue;
+            }
+            let slot = usize::try_from((segment.start_ns - block.start_ns) / window_ns).unwrap_or(0);
+            if let Some(bytes) = bytes.get_mut(slot) {
+                *bytes += size;
+                present[slot] += 1;
+            }
+        }
+        let wider: Vec<i64> = widths
+            .iter()
+            .copied()
+            .filter(|width| *width > window_ns)
+            .collect();
+        tiles(block, window_ns, &bytes, &present, &wider, config)
+    }
+}
+
+/// The rollups tiling `span`'s `slot_ns` slots holding `bytes` and
+/// `present` segments with `widths` dividing `span`, each with at least two
+/// segments.
+fn tiles(
+    span: Segment,
+    slot_ns: i64,
+    bytes: &[u64],
+    present: &[usize],
+    widths: &[i64],
+    config: &RollupConfig,
+) -> Vec<Segment> {
+    let slot_widths: Vec<usize> = widths
+        .iter()
+        .filter(|width| {
+            **width <= span.width_ns && span.width_ns % **width == 0 && **width % slot_ns == 0
+        })
+        .map(|width| usize::try_from(width / slot_ns).unwrap_or(1))
+        .filter(|slots| *slots > 1)
+        .chain([1])
+        .collect();
+    tile(bytes, &slot_widths, config.max_segment_bytes)
+        .into_iter()
+        .filter(|(first, len)| *len > 1 && present[*first..first + len].iter().sum::<usize>() >= 2)
+        .map(|(first, len)| {
+            Segment::new(
+                span.start_ns + i64::try_from(first).unwrap_or(0) * slot_ns,
+                i64::try_from(len).unwrap_or(1) * slot_ns,
+            )
+        })
+        .collect()
 }
 
 /// The fewest aligned windows, as `(first slot, slots)`, tiling slots
@@ -467,15 +668,26 @@ mod tests {
         assert!(widths(7_000_000_000, None).is_empty());
     }
 
+    fn sized(segments: &[Segment], bytes: u64) -> HashMap<Segment, u64> {
+        segments.iter().map(|segment| (*segment, bytes)).collect()
+    }
+
+    fn base_hours(first: i64, count: i64) -> Vec<Segment> {
+        (first..first + count)
+            .map(|hour| Segment::new(DAY + hour * HOUR, HOUR))
+            .collect()
+    }
+
+    fn windows(first: i64, count: i64) -> Vec<Segment> {
+        (first..first + count)
+            .map(|index| Segment::new(DAY + index * 4 * HOUR, 4 * HOUR))
+            .collect()
+    }
+
     #[test]
     fn plans_a_closed_day_and_finishes_unsealed_rollups_first() {
         let rollups = Rollups::from_segments(SCOPE, &namespace(), hours(24));
         let config = RollupConfig::default();
-        assert!(
-            rollups
-                .plan(HOUR, None, &config, None, DAY + DAY_NS)
-                .is_empty()
-        );
         assert_eq!(
             rollups.plan(HOUR, None, &config, None, after(DAY)),
             vec![Segment::new(DAY, DAY_NS)]
@@ -544,17 +756,116 @@ mod tests {
     }
 
     #[test]
-    fn compaction_drains_only_base_segments_under_a_live_seal() {
+    fn ignores_unbounded_segments() {
+        let mut sizes = sized(&base_hours(0, 24), 10);
+        sizes.insert(Segment::unbounded(i64::MIN), 10);
+        let rollups = Rollups::new(Vec::new(), Vec::new(), sizes);
+        assert_eq!(
+            rollups.plan(HOUR, None, &RollupConfig::default(), None, after(DAY)),
+            vec![Segment::new(DAY, DAY_NS)]
+        );
+    }
+
+    #[test]
+    fn rolls_up_each_window_as_it_closes_while_the_day_goes() {
+        let rollups = Rollups::new(Vec::new(), Vec::new(), sized(&base_hours(0, 24), 10));
+        let config = RollupConfig::default();
+        // At 21:00 the windows up to 20:00 have closed, and 20:00 too soon.
+        assert_eq!(
+            rollups.plan(HOUR, None, &config, None, DAY + 21 * HOUR),
+            windows(0, 5)
+        );
+        assert_eq!(
+            rollups.plan(HOUR, None, &config, None, DAY + 20 * HOUR + HOUR / 12),
+            windows(0, 4)
+        );
+        // A window over the cap splits into halves.
+        let config = RollupConfig {
+            max_segment_bytes: 30,
+            ..RollupConfig::default()
+        };
+        assert_eq!(
+            rollups.plan(HOUR, None, &config, None, DAY + 5 * HOUR),
+            vec![Segment::new(DAY, 2 * HOUR), Segment::new(DAY + 2 * HOUR, 2 * HOUR)]
+        );
+    }
+
+    #[test]
+    fn rolls_a_closed_days_windows_into_the_day_once_all_are_sealed() {
+        let config = RollupConfig::default();
+        let mut sizes = sized(&base_hours(0, 24), 10);
+        sizes.extend(sized(&windows(0, 5), 40));
+        // The last window is still to roll up, so the day waits for it.
+        let partial = Rollups::new(windows(0, 5), Vec::new(), sizes.clone());
+        assert_eq!(
+            partial.plan(HOUR, None, &config, None, after(DAY)),
+            vec![Segment::new(DAY + 20 * HOUR, 4 * HOUR)]
+        );
+        // Unsealed, it is only finished.
+        let pending = Rollups::new(windows(0, 5), windows(5, 1), sizes.clone());
+        assert_eq!(
+            pending.plan(HOUR, None, &config, None, after(DAY)),
+            windows(5, 1)
+        );
+        sizes.extend(sized(&windows(5, 1), 40));
+        let sealed = Rollups::new(windows(0, 6), windows(0, 6), sizes.clone());
+        assert_eq!(
+            sealed.plan(HOUR, None, &config, None, after(DAY)),
+            vec![Segment::new(DAY, DAY_NS)]
+        );
+        // Too big for a day, the windows pair up into the fewest that fit.
+        let capped = RollupConfig {
+            max_segment_bytes: 130,
+            ..RollupConfig::default()
+        };
+        assert_eq!(
+            sealed.plan(HOUR, None, &capped, None, after(DAY)),
+            vec![Segment::new(DAY, 12 * HOUR), Segment::new(DAY + 12 * HOUR, 12 * HOUR)]
+        );
+        // Too big to widen at all, they stay.
+        let tight = RollupConfig {
+            max_segment_bytes: 50,
+            ..RollupConfig::default()
+        };
+        assert!(sealed.plan(HOUR, None, &tight, None, after(DAY)).is_empty());
+        // Once the day holds a rollup wider than a window, it's done.
+        let mut rolled = windows(0, 6);
+        rolled.push(Segment::new(DAY, 12 * HOUR));
+        let done = Rollups::new(rolled.clone(), rolled, sizes);
+        assert!(done.plan(HOUR, None, &capped, None, after(DAY)).is_empty());
+    }
+
+    #[test]
+    fn copies_the_widest_sealed_rollup_in_place_of_what_it_covers() {
+        let day = Segment::new(DAY, DAY_NS);
+        let mut sizes = sized(&base_hours(0, 24), 10);
+        sizes.extend(sized(&windows(0, 2), 40));
+        let rollups = Rollups::new(windows(0, 2), vec![day], sizes);
+        let mut expected = windows(0, 2);
+        expected.extend(base_hours(8, 16));
+        assert_eq!(rollups.sources(day, HOUR), expected);
+        assert_eq!(rollups.sources(windows(1, 1)[0], HOUR), base_hours(4, 4));
+    }
+
+    #[test]
+    fn compaction_drains_segments_under_a_live_seal_of_a_wider_rollup() {
         let hook = superseded(SCOPE, HOUR);
         let day = Segment::new(DAY, DAY_NS);
+        let window = Segment::new(DAY + 4 * HOUR, 4 * HOUR);
         let seal = marker_key(SCOPE, &namespace(), Marker::Sealed, day);
+        let window_seal = marker_key(SCOPE, &namespace(), Marker::Sealed, window);
         let live = |prefix: &[u8]| prefix == seal.as_ref();
+        let window_live = |prefix: &[u8]| prefix == window_seal.as_ref();
         let none = |_: &[u8]| false;
         let hour = prefix(Segment::new(DAY + 5 * HOUR, HOUR));
         assert!(hook(&hour, &live));
+        assert!(hook(&hour, &window_live));
         assert!(!hook(&hour, &none));
+        assert!(hook(&prefix(window), &live));
+        assert!(!hook(&prefix(window), &window_live));
         assert!(!hook(&prefix(day), &live));
         assert!(!hook(&seal, &live));
+        assert!(!hook(&window_seal, &live));
         assert!(!hook(&prefix(Segment::new(DAY + DAY_NS, HOUR)), &live));
     }
 
@@ -564,5 +875,19 @@ mod tests {
         assert_eq!(tile(&[10; 24], &widths, 1_000), vec![(0, 24)]);
         assert_eq!(tile(&[10; 24], &widths, 120), vec![(0, 12), (12, 12)]);
         assert_eq!(tile(&[2_000; 24], &widths, 1_000).len(), 24);
+    }
+
+    #[test]
+    fn one_hot_hour_only_narrows_its_own_window() {
+        let widths = [24, 12, 8, 6, 4, 3, 2, 1];
+        let mut bytes = [10; 24];
+        bytes[20] = 5_000;
+        let windows = tile(&bytes, &widths, 1_000);
+        assert_eq!(windows.len(), 5, "{windows:?}");
+        assert!(windows.contains(&(20, 1)));
+        assert_eq!(windows.iter().map(|(_, len)| len).sum::<usize>(), 24);
+        for (first, len) in &windows {
+            assert_eq!(first % len, 0, "{windows:?}");
+        }
     }
 }

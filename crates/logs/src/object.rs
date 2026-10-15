@@ -386,6 +386,60 @@ fn decompress_zstd(compressed: &[u8], expected_len: u32, buffer: &mut Vec<u8>) -
     Ok(())
 }
 
+/// Steps a rollup segment's runs are sliced at, widest first.
+const SLICE_STEPS_NS: [i64; 4] = [
+    1_800_000_000_000,
+    900_000_000_000,
+    300_000_000_000,
+    60_000_000_000,
+];
+
+/// Points Console's log charts draw over a range: 48 steps of 5 minutes for
+/// 4 hours, of 30 minutes for a day.
+const SLICES_PER_SEGMENT: i64 = 48;
+
+/// The time slice no run of `segment` may cross, for a segment wider than
+/// `base_ns`: the widest of [`SLICE_STEPS_NS`] that divides it into at least
+/// [`SLICES_PER_SEGMENT`]. A count over steps of a multiple of it is then
+/// read from run metadata alone, as over an hour segment's short runs; a
+/// run crossing a step boundary has its blocks read instead.
+pub(crate) fn run_slice_ns(segment: SegmentId, base_ns: i64) -> Option<i64> {
+    if segment.width_ns <= base_ns {
+        return None;
+    }
+    SLICE_STEPS_NS.into_iter().find(|step| {
+        segment.width_ns % step == 0 && step.saturating_mul(SLICES_PER_SEGMENT) <= segment.width_ns
+    })
+}
+
+/// The slice of `slice_ns` holding `timestamp_ns`, numbered so slice `k` is
+/// `(k * slice_ns, (k + 1) * slice_ns]`, as a step's evaluation window is.
+pub(crate) fn slice_of(timestamp_ns: i64, slice_ns: i64) -> i64 {
+    timestamp_ns.saturating_sub(1).div_euclid(slice_ns)
+}
+
+/// `streams`' rows grouped by their slice of `slice_ns`, in slice order, each
+/// slice's streams still in the order given.
+pub(crate) fn slice_streams(
+    streams: Vec<(StreamId, Vec<LogEntry>)>,
+    slice_ns: i64,
+) -> Vec<Vec<(StreamId, Vec<LogEntry>)>> {
+    let mut slices = BTreeMap::<i64, Vec<(StreamId, Vec<LogEntry>)>>::new();
+    for (stream_id, entries) in streams {
+        let mut parts = BTreeMap::<i64, Vec<LogEntry>>::new();
+        for entry in entries {
+            parts
+                .entry(slice_of(entry.timestamp_ns, slice_ns))
+                .or_default()
+                .push(entry);
+        }
+        for (slice, entries) in parts {
+            slices.entry(slice).or_default().push((stream_id, entries));
+        }
+    }
+    slices.into_values().collect()
+}
+
 /// One stream's run within a [`BuiltObject`].
 #[derive(Debug)]
 pub(crate) struct BuiltRun {

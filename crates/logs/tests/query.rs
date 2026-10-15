@@ -24,6 +24,7 @@ fn config(path: &str) -> Config {
         retention: None,
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
+        result_cache_capacity_bytes: plural_logs::DEFAULT_RESULT_CACHE_CAPACITY_BYTES,
         page: PageConfig {
             target_size_bytes: 1024,
             max_rows: 2,

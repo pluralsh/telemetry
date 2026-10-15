@@ -12,16 +12,24 @@
 //! segment whose span it can read from the segment prefix:
 //!
 //! - **Merge**: [`SegmentCompaction::grace`] after a segment ends, merge its
-//!   L0s and sorted runs into one sorted run. Late writes add L0s again, and
-//!   the segment is merged again.
+//!   L0s and sorted runs into one sorted run. Late writes add L0s again,
+//!   which are merged in once they hold a share of the segment's bytes or
+//!   leave it with too many sources, so a trickle of late writes doesn't
+//!   rewrite a large segment every few seconds.
+//! - **Cap**: until then, merge a segment whenever size-tiered compaction
+//!   leaves it more than [`SegmentCompaction::with_max_open_sources`]
+//!   sources, which bounds what reads of the newest data probe.
+//! - **Hold**: a rollup copying into a segment holds its merges
+//!   ([`MergeHolds`]) and then asks for one, so the segment is rewritten
+//!   once rather than every time the copy adds L0s.
 //! - **Drain**: once both the segment's end and its newest SST are older
 //!   than the retention, drop the segment without rewriting it.
 //! - **Supersede**: with a [`Superseded`] hook, drop a segment the hook
 //!   reports as superseded (every record it holds is held by another
 //!   segment), also without rewriting it.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -30,6 +38,7 @@ use slatedb::compactor::{
     SizeTieredCompactionSchedulerSupplier, SourceId,
 };
 use slatedb::config::CompactorOptions;
+use slatedb::manifest::VersionedManifest;
 
 /// The `[start_ms, end_ms)` span of the segment with this prefix, or `None`
 /// for a segment that isn't bounded in time.
@@ -40,21 +49,112 @@ pub type SegmentSpan = fn(&[u8]) -> Option<(i64, i64)>;
 pub type Superseded = Arc<dyn Fn(&[u8], &dyn Fn(&[u8]) -> bool) -> bool + Send + Sync>;
 
 /// Default delay between a segment ending and it being merged.
-pub const DEFAULT_MERGE_GRACE: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_MERGE_GRACE: Duration = Duration::from_secs(5 * 60);
+/// Default [`SegmentCompaction::with_max_open_sources`]. Size-tiered
+/// compaction that keeps up leaves an hour of 10-second L0 flushes at most
+/// about 10 sources; capping it at 8 costs about one more rewrite of the
+/// hour, and lower caps cost several.
+pub const DEFAULT_MAX_OPEN_SOURCES: usize = 8;
+/// A merged segment's late L0s and runs are merged in once they hold this
+/// fraction (as a divisor) of its largest source's bytes...
+const LATE_BYTES_DIVISOR: u64 = 16;
+/// ...or once they're past the source cap and hold this fraction of them.
+const LATE_CAPPED_BYTES_DIVISOR: u64 = 64;
+
+/// Whether a rollup is copying into a segment or waiting for its merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    Copying,
+    Merge,
+}
+
+/// Segments, by prefix, whose merges a rollup in this process controls:
+/// none while it copies, then one regardless of thresholds.
+#[derive(Clone, Debug, Default)]
+pub struct MergeHolds(Arc<Mutex<HashMap<Bytes, Hold>>>);
+
+impl MergeHolds {
+    /// Holds merges of `prefix` until the guard asks for one or drops.
+    pub fn copying(&self, prefix: Bytes) -> MergeHold {
+        self.set(&prefix, Some(Hold::Copying));
+        MergeHold {
+            holds: self.clone(),
+            prefix,
+        }
+    }
+
+    fn get(&self, prefix: &[u8]) -> Option<Hold> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(prefix)
+            .copied()
+    }
+
+    fn set(&self, prefix: &Bytes, hold: Option<Hold>) {
+        let mut holds = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match hold {
+            Some(hold) => holds.insert(prefix.clone(), hold),
+            None => holds.remove(prefix),
+        };
+    }
+}
+
+/// A rollup's hold on one segment's merges; released on drop.
+#[derive(Debug)]
+pub struct MergeHold {
+    holds: MergeHolds,
+    prefix: Bytes,
+}
+
+impl MergeHold {
+    /// Asks for the segment to be merged into one run.
+    pub fn merge(&self) {
+        self.holds.set(&self.prefix, Some(Hold::Merge));
+    }
+}
+
+impl Drop for MergeHold {
+    fn drop(&mut self) {
+        self.holds.set(&self.prefix, None);
+    }
+}
+
+/// Whether everything `manifest` held in the segment at `prefix` before
+/// `since_ms` is in one source: a lone L0 SST or sorted run, or one run and
+/// only L0s flushed since, which are late writes.
+pub fn merged_since(manifest: &VersionedManifest, prefix: &[u8], since_ms: u64) -> bool {
+    let Some(segment) = manifest
+        .segments()
+        .iter()
+        .find(|segment| segment.prefix().as_ref() == prefix)
+    else {
+        return true;
+    };
+    segment.compacted().len() + segment.l0().len() <= 1
+        || (segment.compacted().len() <= 1
+            && segment
+                .l0()
+                .iter()
+                .all(|view| view.id.timestamp_ms() >= since_ms))
+}
 
 /// Segment-aware compaction policy for one database.
 #[derive(Clone)]
 pub struct SegmentCompaction {
     span: SegmentSpan,
     grace: Duration,
+    max_open_sources: usize,
     retention: Option<Duration>,
     superseded: Option<Superseded>,
+    holds: MergeHolds,
 }
 
 impl std::fmt::Debug for SegmentCompaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentCompaction")
             .field("grace", &self.grace)
+            .field("max_open_sources", &self.max_open_sources)
             .field("retention", &self.retention)
             .field("superseded", &self.superseded.is_some())
             .finish_non_exhaustive()
@@ -66,9 +166,29 @@ impl SegmentCompaction {
         Self {
             span,
             grace: DEFAULT_MERGE_GRACE,
+            max_open_sources: DEFAULT_MAX_OPEN_SOURCES,
             retention: None,
             superseded: None,
+            holds: MergeHolds::default(),
         }
+    }
+
+    /// Most sources a segment keeps before it's merged, whether or not it
+    /// has ended.
+    pub fn with_max_open_sources(mut self, max_open_sources: usize) -> Self {
+        self.max_open_sources = max_open_sources.max(2);
+        self
+    }
+
+    /// Uses `holds` for the segments rollups copy into.
+    pub fn with_holds(mut self, holds: MergeHolds) -> Self {
+        self.holds = holds;
+        self
+    }
+
+    /// The holds rollups copying into this database's segments take.
+    pub fn holds(&self) -> MergeHolds {
+        self.holds.clone()
     }
 
     /// Drops segments `superseded` reports as superseded.
@@ -168,17 +288,28 @@ impl CompactionScheduler for Scheduler {
         let segments: Vec<SegmentState> = manifest
             .segments()
             .iter()
-            .map(|segment| SegmentState {
-                prefix: segment.prefix().clone(),
-                l0: segment.l0().iter().map(|view| view.id).collect(),
-                runs: segment.compacted().iter().map(|run| run.id).collect(),
-                newest_ms: segment
+            .map(|segment| {
+                let created = || {
+                    segment
+                        .l0()
+                        .iter()
+                        .chain(segment.compacted().iter().flat_map(|run| &run.sst_views))
+                        .map(|view| view.id.timestamp_ms())
+                };
+                let sizes = segment
                     .l0()
                     .iter()
-                    .chain(segment.compacted().iter().flat_map(|run| &run.sst_views))
-                    .map(|view| view.id.timestamp_ms())
-                    .max()
-                    .unwrap_or(0),
+                    .map(|view| view.estimate_size())
+                    .chain(segment.compacted().iter().map(|run| run.estimate_size()));
+                SegmentState {
+                    prefix: segment.prefix().clone(),
+                    l0: segment.l0().iter().map(|view| view.id).collect(),
+                    runs: segment.compacted().iter().map(|run| run.id).collect(),
+                    newest_ms: created().max().unwrap_or(0),
+                    oldest_ms: created().min().unwrap_or(0),
+                    bytes: sizes.clone().sum(),
+                    largest: sizes.max().unwrap_or(0),
+                }
             })
             .collect();
         let committed = manifest
@@ -239,6 +370,12 @@ struct SegmentState {
     /// Creation time of the segment's newest SST, which is no older than
     /// any write it holds.
     newest_ms: u64,
+    /// Creation time of the segment's oldest SST. Once a merge rewrites
+    /// the segment every SST it has is newer than the merge's grace.
+    oldest_ms: u64,
+    /// Estimated bytes of all its SSTs and of its largest source.
+    bytes: u64,
+    largest: u64,
 }
 
 impl SegmentState {
@@ -325,8 +462,26 @@ fn plan(
         })
     };
     let grace_ms = i64::try_from(policy.grace.as_millis()).unwrap_or(i64::MAX);
+    let requested = |segment: &SegmentState| policy.holds.get(&segment.prefix) == Some(Hold::Merge);
     let mergeable = |end_ms: i64, segment: &SegmentState| {
-        segment.l0.len() + segment.runs.len() > 1 && now_ms >= end_ms.saturating_add(grace_ms)
+        let sources = segment.l0.len() + segment.runs.len();
+        if sources <= 1 {
+            return false;
+        }
+        match policy.holds.get(&segment.prefix) {
+            Some(Hold::Copying) => return false,
+            Some(Hold::Merge) => return true,
+            None => {}
+        }
+        let merge_at = end_ms.saturating_add(grace_ms);
+        if now_ms < merge_at {
+            return sources > policy.max_open_sources;
+        }
+        let rest = segment.bytes.saturating_sub(segment.largest);
+        i64::try_from(segment.oldest_ms).unwrap_or(i64::MAX) < merge_at
+            || rest.saturating_mul(LATE_BYTES_DIVISOR) >= segment.largest
+            || (sources > policy.max_open_sources
+                && rest.saturating_mul(LATE_CAPPED_BYTES_DIVISOR) >= segment.largest)
     };
 
     let drains = candidates
@@ -337,11 +492,16 @@ fn plan(
             sources: segment.sources(),
             superseded: *superseded && !expired(*end_ms, segment),
         });
-    let merges = candidates
+    // A rollup waits on its requested merge, so those go first.
+    let (requested, routine): (Vec<_>, Vec<_>) = candidates
         .iter()
         .filter(|(end_ms, superseded, segment)| {
             !superseded && !expired(*end_ms, segment) && mergeable(*end_ms, segment)
         })
+        .partition(|(_, _, segment)| requested(segment));
+    let merges = requested
+        .into_iter()
+        .chain(routine)
         .map(|(_, _, segment)| {
             let destination = match segment.runs.iter().min() {
                 Some(id) => *id,
@@ -385,6 +545,9 @@ mod tests {
                 .collect(),
             runs: runs.to_vec(),
             newest_ms,
+            oldest_ms: 0,
+            bytes: (l0 + runs.len()) as u64,
+            largest: 1,
         }
     }
 
@@ -521,6 +684,74 @@ mod tests {
                 10
             )),
             vec![("drain", 1), ("merge", 10), ("merge", 20)]
+        );
+    }
+
+    #[test]
+    fn merges_an_open_segment_only_past_the_source_cap() {
+        let policy = policy().with_max_open_sources(8);
+        let none = HashSet::new();
+        let at_cap = [segment(1, 4, &[5, 4, 3, 2], 0)];
+        assert!(plan(&policy, at_hour(1.5), &at_cap, &none, 4, 10).is_empty());
+        let over = [segment(1, 5, &[5, 4, 3, 2], 0)];
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(1.5), &over, &none, 4, 10)),
+            vec![("merge", 1)]
+        );
+    }
+
+    #[test]
+    fn re_merges_late_writes_only_once_they_add_up() {
+        let none = HashSet::new();
+        let merged_at = at_hour(2.6);
+        let late = |l0: usize, bytes: u64| SegmentState {
+            oldest_ms: merged_at,
+            bytes: 1_000 + bytes,
+            largest: 1_000,
+            ..segment(1, l0, &[3], at_hour(5.0))
+        };
+        // A few small late L0s stay until they hold a sixteenth of the run.
+        assert!(plan(&policy(), at_hour(5.0), &[late(3, 30)], &none, 4, 10).is_empty());
+        assert_eq!(
+            prefixes(&plan(&policy(), at_hour(5.0), &[late(3, 63)], &none, 4, 10)),
+            vec![("merge", 1)]
+        );
+        // Past the source cap, a smaller share is enough.
+        assert!(plan(&policy(), at_hour(5.0), &[late(8, 10)], &none, 4, 10).is_empty());
+        assert_eq!(
+            prefixes(&plan(&policy(), at_hour(5.0), &[late(8, 16)], &none, 4, 10)),
+            vec![("merge", 1)]
+        );
+    }
+
+    #[test]
+    fn holds_a_copy_target_then_merges_it_first_on_request() {
+        let holds = MergeHolds::default();
+        let policy = policy().with_holds(holds.clone());
+        let none = HashSet::new();
+        let segments = [
+            segment(1, 2, &[3], 0),
+            SegmentState {
+                oldest_ms: at_hour(9.0),
+                bytes: 1_001,
+                largest: 1_000,
+                ..segment(2, 1, &[4], 0)
+            },
+        ];
+        let hold = holds.copying(Bytes::from_static(&[2]));
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(10.0), &segments, &none, 4, 10)),
+            vec![("merge", 1)]
+        );
+        hold.merge();
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(10.0), &segments, &none, 4, 10)),
+            vec![("merge", 2), ("merge", 1)]
+        );
+        drop(hold);
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(10.0), &segments, &none, 4, 10)),
+            vec![("merge", 1)]
         );
     }
 }

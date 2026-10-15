@@ -26,9 +26,9 @@ use super::*;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl TraceDb {
-    /// Rolls up every day that ended `config.delay` ago in each namespace,
-    /// first finishing any interrupted rollup. Returns the rollup segments
-    /// sealed.
+    /// Rolls up every window and day that ended `config.delay` ago in each
+    /// namespace, first finishing any interrupted rollup. Returns the rollup
+    /// segments sealed.
     pub async fn rollup(&self, config: &RollupConfig) -> Result<usize> {
         self.rollup_at(config, common::time::now_ns()).await
     }
@@ -45,8 +45,7 @@ impl TraceDb {
         let mut sealed = 0;
         for (namespace, rollups) in Rollups::load_all(&slate, crate::codec::KEY_SCOPE) {
             for wide in rollups.plan(base_ns, None, config, self.retention, now_ns) {
-                self.roll_up(&namespace, wide, config.copy_buffer_bytes)
-                    .await?;
+                self.roll_up(&namespace, wide, config).await?;
                 sealed += 1;
             }
         }
@@ -59,10 +58,18 @@ impl TraceDb {
             .ok_or_else(|| Error::Invalid("writes are unavailable on a read-only database".into()))
     }
 
-    /// Copies every segment `wide` covers into it, then seals it.
-    async fn roll_up(&self, namespace: &Namespace, wide: SegmentId, buffer: u64) -> Result<()> {
+    /// Copies what reads see of every segment `wide` covers into it, has it
+    /// merged into one sorted run, then seals it.
+    async fn roll_up(
+        &self,
+        namespace: &Namespace,
+        wide: SegmentId,
+        config: &RollupConfig,
+    ) -> Result<()> {
         let writer = self.rollup_writer()?;
         let ttl = retention_values(self.retention)?.physical_ttl;
+        let prefix = segment_prefix(namespace, wide);
+        let hold = self.merge_holds.copying(prefix.clone());
         {
             // No write is in flight while this is held, so once applied
             // deltas are written every later write to the covered segments
@@ -79,13 +86,30 @@ impl TraceDb {
             self.flush().await?;
         }
         let base_ns = i64::try_from(self.segment_ns).unwrap_or(i64::MAX);
-        let mut start_ns = wide.start_ns;
-        while start_ns < wide.start_ns.saturating_add(wide.width_ns) {
-            let segment = SegmentId::new(start_ns, base_ns);
-            self.copy_segment(namespace, segment, wide, buffer).await?;
-            start_ns = start_ns.saturating_add(base_ns);
+        for segment in self.rollups(namespace).sources(wide, base_ns) {
+            self.copy_segment(namespace, segment, wide, config.copy_buffer_bytes)
+                .await?;
         }
         self.flush().await?;
+        writer.flush_memtable().await?;
+        let copied_ms = unix_time_ms()?;
+        hold.merge();
+        if let Some(slate) = writer.slate_read() {
+            let merged = common::storage::rollup::await_merge(
+                || slate.manifest(),
+                &prefix,
+                copied_ms,
+                config.merge_wait,
+            )
+            .await;
+            if !merged {
+                tracing::warn!(
+                    %namespace,
+                    segment = %wide,
+                    "sealing traces rollup segment before its merge"
+                );
+            }
+        }
         writer
             .apply_with_options(
                 vec![RecordOp::put_with_ttl(
@@ -100,6 +124,7 @@ impl TraceDb {
             .await?;
         // Publishes the seal to the manifest, which is where reads find it.
         writer.flush_memtable().await?;
+        drop(hold);
         tracing::info!(%namespace, segment = %wide, "sealed traces rollup segment");
         Ok(())
     }
@@ -402,16 +427,49 @@ mod tests {
         let window = names(&db, DAY + 3 * HOUR, DAY + 6 * HOUR - 1).await;
         assert_eq!(window.len(), 5, "{window:?}");
 
+        // Closed with no rollup yet, the day is copied once, directly.
         let config = RollupConfig::default();
-        assert_eq!(
-            db.rollup_at(&config, (DAY + 24 * HOUR) as i64)
-                .await
-                .unwrap(),
-            0
-        );
         assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
 
         assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(
+            db.catalog_segments(&namespace(), DAY + 5 * HOUR, DAY + 6 * HOUR)
+                .await
+                .unwrap(),
+            BTreeSet::from([day()])
+        );
+        assert_eq!(spans(&db).await, before);
+        assert_eq!(names(&db, DAY + 3 * HOUR, DAY + 6 * HOUR - 1).await, window);
+        assert_heads_rebased(&db).await;
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 0);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rolls_up_windows_as_the_day_goes_then_the_day_from_them() {
+        let db = TraceDb::open(config()).await.unwrap();
+        write_day(&db).await;
+        let before = spans(&db).await;
+        let window = names(&db, DAY + 3 * HOUR, DAY + 6 * HOUR - 1).await;
+        let config = RollupConfig::default();
+
+        assert_eq!(
+            db.rollup_at(&config, (DAY + 21 * HOUR) as i64)
+                .await
+                .unwrap(),
+            5
+        );
+        let windows: Vec<SegmentId> = (0..5)
+            .map(|index| SegmentId::new((DAY + index * 4 * HOUR) as i64, 4 * HOUR as i64))
+            .collect();
+        assert_eq!(db.rollups(&namespace()).sealed(), windows.as_slice());
+        assert_eq!(spans(&db).await, before);
+        assert_eq!(names(&db, DAY + 3 * HOUR, DAY + 6 * HOUR - 1).await, window);
+
+        // The day's last window first, then the day from its windows.
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+        assert!(db.rollups(&namespace()).sealed().contains(&day()));
         assert_eq!(
             db.catalog_segments(&namespace(), DAY + 5 * HOUR, DAY + 6 * HOUR)
                 .await
