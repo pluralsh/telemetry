@@ -8,10 +8,12 @@
 //!
 //! A rollup re-writes every row of the segments it covers through the
 //! ordinary write path, so the rollup segment gets its own streams,
-//! objects, full-text index and discovery catalog. Queries deduplicate
-//! identical rows, so a rollup interrupted before its seal is simply copied
-//! again. Copied rows expire a retention after the copy rather than after
-//! their first write.
+//! objects, full-text index and discovery catalog. Each copied chunk and its
+//! progress key are one atomic storage write, so a rollup interrupted before
+//! its seal resumes without storing the chunk twice. Copied rows expire a
+//! retention after the copy rather than after their first write.
+
+use std::collections::VecDeque;
 
 use common::storage::rollup::{Marker, RollupConfig, marker_key};
 
@@ -21,7 +23,24 @@ use crate::model::locality_order;
 /// Streams read and written per copy step. One stream can hold enough rows to
 /// use the writer's whole memory budget, so never materialize several at once.
 const COPY_STREAMS: usize = 1;
+/// Rows per deterministic copy checkpoint. This is independent of physical
+/// objects and read coalescing, so source compaction cannot renumber a retry.
+const COPY_ROWS: usize = 1024;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const COPY_PROGRESS_VERSION: u8 = 1;
+
+struct CopyState {
+    buffer: u64,
+    queued: u64,
+    copied: HashSet<Bytes>,
+    ttl: Ttl,
+}
+
+struct CopyBatch {
+    source: SegmentId,
+    fingerprint: StreamFingerprint,
+    ordinal: u64,
+}
 
 impl LogDb {
     /// Rolls up every window and day that ended `config.delay` ago in each
@@ -72,7 +91,20 @@ impl LogDb {
         let writer = self.writer()?;
         let ttl = self.marker_ttl()?;
         let prefix = segment_prefix(namespace, wide);
+        let sources = self.rollups(namespace).sources(wide, self.segment_ns);
         let hold = self.merge_holds.copying(prefix.clone());
+        let _source_holds: Vec<_> = sources
+            .iter()
+            .map(|source| self.merge_holds.copying(segment_prefix(namespace, *source)))
+            .collect();
+        let pending_key = marker_key(crate::codec::KEY_SCOPE, namespace, Marker::Pending, wide);
+        if let Some(record) = self.storage.get(pending_key.clone()).await?
+            && record.value.as_ref() != [COPY_PROGRESS_VERSION]
+        {
+            return Err(Error::Invalid(format!(
+                "rollup segment {wide} was started without retry checkpoints"
+            )));
+        }
         {
             // No write is in flight while this is held, so once applied
             // deltas are written every later write to the covered segments
@@ -80,19 +112,23 @@ impl LogDb {
             let mut rolled = self.rolled.write().await;
             writer
                 .apply(vec![RecordOp::put_with_ttl(
-                    marker_key(crate::codec::KEY_SCOPE, namespace, Marker::Pending, wide),
-                    Bytes::new(),
+                    pending_key,
+                    Bytes::from_static(&[COPY_PROGRESS_VERSION]),
                     ttl,
                 )])
                 .await?;
             rolled.entry(namespace.clone()).or_default().insert(wide);
             self.flush_written().await?;
         }
-        let sources = self.rollups(namespace).sources(wide, self.segment_ns);
+        let mut copy = CopyState {
+            buffer,
+            queued: 0,
+            copied: self.copy_progress(namespace, wide).await?,
+            ttl,
+        };
         self.register_streams(namespace, &sources, wide).await?;
-        let mut queued = 0;
         for segment in sources {
-            self.copy_segment(namespace, segment, wide, buffer, &mut queued)
+            self.copy_segment(namespace, segment, wide, &mut copy)
                 .await?;
         }
         self.flush_written().await?;
@@ -172,42 +208,132 @@ impl LogDb {
         namespace: &Namespace,
         segment: SegmentId,
         wide: SegmentId,
-        buffer: u64,
-        queued: &mut u64,
+        copy: &mut CopyState,
     ) -> Result<()> {
         for read in self.segment_reads(namespace, segment, COPY_STREAMS).await? {
+            let fingerprints: Vec<_> = read
+                .streams()
+                .map(|(_, labels)| labels.fingerprint())
+                .collect();
+            let [fingerprint] = fingerprints.as_slice() else {
+                return Err(Error::Corrupt(
+                    "rollup copy step did not contain exactly one stream".to_owned(),
+                ));
+            };
             let (sender, mut rows) = tokio::sync::mpsc::channel(1);
             let budget = PageBudget::new(usize::MAX);
             let read = self.read_bounded_chunks(namespace, read, &budget, sender);
             let write = async {
+                let mut pending = VecDeque::new();
+                let mut batch = 0u64;
                 while let Some(rows) = rows.recv().await {
-                    // Rows of one stream share their labels.
-                    let mut streams: HashMap<usize, usize> = HashMap::new();
-                    let mut batches: Vec<LogBatch> = Vec::new();
-                    for row in rows {
-                        *queued += row_bytes(&row.entry);
-                        let stream = Arc::as_ptr(&row.labels) as usize;
-                        let index = *streams.entry(stream).or_insert_with(|| {
-                            batches.push(LogBatch::new((*row.labels).clone(), Vec::new()));
-                            batches.len() - 1
-                        });
-                        batches[index].entries.push(row.entry);
+                    pending.extend(rows);
+                    while pending.len() >= COPY_ROWS {
+                        let rows = pending.drain(..COPY_ROWS).collect();
+                        self.write_copy_batch(
+                            namespace,
+                            wide,
+                            CopyBatch {
+                                source: segment,
+                                fingerprint: *fingerprint,
+                                ordinal: batch,
+                            },
+                            rows,
+                            copy,
+                        )
+                        .await?;
+                        batch = batch.saturating_add(1);
                     }
-                    let groups = group_by_stream(batches, self.segment_ns, |_| wide)?;
-                    if !groups.is_empty() {
-                        self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
-                            .await?;
-                    }
-                    if *queued >= buffer {
+                    if copy.queued >= copy.buffer {
                         self.flush_written().await?;
-                        *queued = 0;
+                        copy.queued = 0;
                     }
+                }
+                if !pending.is_empty() {
+                    self.write_copy_batch(
+                        namespace,
+                        wide,
+                        CopyBatch {
+                            source: segment,
+                            fingerprint: *fingerprint,
+                            ordinal: batch,
+                        },
+                        pending.into_iter().collect(),
+                        copy,
+                    )
+                    .await?;
                 }
                 Ok::<_, Error>(())
             };
             tokio::try_join!(read, write)?;
         }
         Ok(())
+    }
+
+    async fn write_copy_batch(
+        &self,
+        namespace: &Namespace,
+        wide: SegmentId,
+        batch: CopyBatch,
+        rows: Vec<LogRow>,
+        copy: &mut CopyState,
+    ) -> Result<()> {
+        let progress = copy_progress_key(
+            namespace,
+            wide,
+            batch.source,
+            &batch.fingerprint,
+            batch.ordinal,
+        );
+        if copy.copied.contains(&progress) {
+            return Ok(());
+        }
+        let mut streams: HashMap<usize, usize> = HashMap::new();
+        let mut batches: Vec<LogBatch> = Vec::new();
+        for row in rows {
+            copy.queued += row_bytes(&row.entry);
+            let stream = Arc::as_ptr(&row.labels) as usize;
+            let index = *streams.entry(stream).or_insert_with(|| {
+                batches.push(LogBatch::new((*row.labels).clone(), Vec::new()));
+                batches.len() - 1
+            });
+            batches[index].entries.push(row.entry);
+        }
+        let groups = group_by_stream(batches, self.segment_ns, |_| wide)?;
+        self.apply_groups_with_ops(
+            namespace,
+            groups,
+            vec![RecordOp::put_with_ttl(
+                progress.clone(),
+                Bytes::new(),
+                copy.ttl,
+            )],
+            Some(COPY_WRITE_TIMEOUT),
+        )
+        .await?;
+        copy.copied.insert(progress);
+        Ok(())
+    }
+
+    async fn copy_progress(
+        &self,
+        namespace: &Namespace,
+        wide: SegmentId,
+    ) -> Result<HashSet<Bytes>> {
+        let prefix = marker_key(crate::codec::KEY_SCOPE, namespace, Marker::Pending, wide);
+        let mut records = self
+            .storage
+            .scan_prefix_iter(prefix.clone(), BytesRange::unbounded(), None)
+            .await?;
+        let mut copied = HashSet::new();
+        while let Some(record) = records.next().await? {
+            if record.key.len() > prefix.len()
+                && record.key.get(prefix.len()) == Some(&COPY_PROGRESS_VERSION)
+            {
+                copied.insert(record.key);
+            }
+        }
+        Ok(copied)
     }
 
     /// Publishes everything written so far to the manifest.
@@ -228,6 +354,24 @@ impl LogDb {
             .transpose()
             .map(|ttl| ttl.unwrap_or(Ttl::NoExpiry))
     }
+}
+
+fn copy_progress_key(
+    namespace: &Namespace,
+    wide: SegmentId,
+    source: SegmentId,
+    fingerprint: &StreamFingerprint,
+    batch: u64,
+) -> Bytes {
+    let prefix = marker_key(crate::codec::KEY_SCOPE, namespace, Marker::Pending, wide);
+    let mut key = Vec::with_capacity(prefix.len() + 1 + 8 + 8 + 16 + 8);
+    key.extend_from_slice(&prefix);
+    key.push(COPY_PROGRESS_VERSION);
+    key.extend_from_slice(&source.start_ns.to_be_bytes());
+    key.extend_from_slice(&source.width_ns.to_be_bytes());
+    key.extend_from_slice(fingerprint);
+    key.extend_from_slice(&batch.to_be_bytes());
+    Bytes::from(key)
 }
 
 /// Approximate in-memory size of one copied entry.
@@ -511,6 +655,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn line_filters_match_the_same_rows_across_rollups() {
+        let db = LogDb::open(config()).await.unwrap();
+        let mut batches = Vec::new();
+        for service in ["api", "worker"] {
+            let entries = (0..24)
+                .flat_map(|hour| {
+                    [1, 31].map(|minute| {
+                        let at = DAY + hour * HOUR + minute * 60_000_000_000;
+                        let level = ["info", "error", "warn"][(hour + minute) as usize % 3];
+                        LogEntry::new(
+                            at,
+                            format!("{service} level={level} req{hour}x{minute} path=/v1/{service}/items"),
+                        )
+                    })
+                })
+                .collect();
+            batches.push(LogBatch::new(stream(service), entries));
+        }
+        db.write(&namespace(), batches).await.unwrap();
+        db.flush_memtable().await.unwrap();
+        let rows = rows(&db).await;
+
+        let check = async |stage: &str| {
+            for needle in [
+                "level=error",
+                "error",
+                "req3x31",
+                "req1",
+                "/v1/worker",
+                "items",
+                "api level",
+                "absent",
+            ] {
+                let mut expected: Vec<i64> = rows
+                    .iter()
+                    .filter(|(_, _, line)| line.contains(needle))
+                    .map(|(_, at, _)| *at)
+                    .collect();
+                expected.sort_unstable();
+                let result = db
+                    .query(
+                        &namespace(),
+                        &QueryRequest::range(
+                            format!(r#"{{env="prod"}} |= "{needle}""#),
+                            DAY,
+                            DAY + 24 * HOUR - 1,
+                            60_000_000_000,
+                        ),
+                        QueryOptions {
+                            limit: 10_000,
+                            ..QueryOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let QueryResult::Streams(streams) = result else {
+                    panic!("expected streams");
+                };
+                let mut actual: Vec<i64> = streams
+                    .iter()
+                    .flat_map(|stream| stream.entries.iter().map(|entry| entry.timestamp_ns))
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{stage}: |= {needle:?}");
+            }
+        };
+        check("hours").await;
+        let config = RollupConfig::default();
+        db.rollup_at(&config, DAY + 21 * HOUR).await.unwrap();
+        check("windows").await;
+        db.rollup_at(&config, after_delay()).await.unwrap();
+        db.rollup_at(&config, after_delay()).await.unwrap();
+        assert!(db.rollups(&namespace()).sealed().contains(&day()));
+        check("day").await;
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn routes_late_writes_to_the_rollup_segment() {
         let db = LogDb::open(config()).await.unwrap();
         write_day(&db).await;
@@ -563,7 +785,7 @@ mod tests {
                     Marker::Pending,
                     day(),
                 ),
-                Bytes::new(),
+                Bytes::from_static(&[COPY_PROGRESS_VERSION]),
                 Ttl::NoExpiry,
             )])
             .await
@@ -574,9 +796,15 @@ mod tests {
             .entry(namespace())
             .or_default()
             .insert(day());
+        let mut copy = CopyState {
+            buffer: u64::MAX,
+            queued: 0,
+            copied: HashSet::new(),
+            ttl: db.marker_ttl().unwrap(),
+        };
         for hour in 0..5 {
             let hour = SegmentId::new(DAY + hour * HOUR, HOUR);
-            db.copy_segment(&namespace(), hour, day(), u64::MAX, &mut 0)
+            db.copy_segment(&namespace(), hour, day(), &mut copy)
                 .await
                 .unwrap();
         }
@@ -590,9 +818,41 @@ mod tests {
             1
         );
         assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
-        // The hours copied twice are stored twice, and queried once.
-        assert_eq!(rows(&db).await.len(), before.len() + 2 * 5 * 2);
+        // The retry skipped every chunk already stored with its progress key.
+        assert_eq!(rows(&db).await.len(), before.len());
         assert_eq!(queried(&db).await, before.len());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_an_interrupted_rollup_without_copy_checkpoints() {
+        let db = LogDb::open(config()).await.unwrap();
+        write_day(&db).await;
+        db.writer()
+            .unwrap()
+            .apply(vec![RecordOp::put_with_ttl(
+                marker_key(
+                    crate::codec::KEY_SCOPE,
+                    &namespace(),
+                    Marker::Pending,
+                    day(),
+                ),
+                Bytes::new(),
+                Ttl::NoExpiry,
+            )])
+            .await
+            .unwrap();
+        db.flush_memtable().await.unwrap();
+
+        let error = db
+            .rollup_at(&RollupConfig::default(), after_delay())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("started without retry checkpoints")
+        );
         db.close().await.unwrap();
     }
 }

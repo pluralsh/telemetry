@@ -529,9 +529,23 @@ impl LogDb {
         groups: StreamGroups,
         wait: Option<Duration>,
     ) -> Result<WriteReport> {
+        self.apply_groups_with_ops(namespace, groups, Vec::new(), wait)
+            .await
+    }
+
+    /// Applies `groups` and `ops` in the same coordinator delta and SlateDB
+    /// write batch.
+    async fn apply_groups_with_ops(
+        &self,
+        namespace: &Namespace,
+        groups: StreamGroups,
+        ops: Vec<RecordOp>,
+        wait: Option<Duration>,
+    ) -> Result<WriteReport> {
         let write = LogsWrite {
             namespace: namespace.clone(),
             groups,
+            ops,
         };
         let handle = self.write_handle()?;
         let mut write_handle = match wait {

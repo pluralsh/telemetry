@@ -134,6 +134,7 @@ impl DirectWriter {
     /// Writes every group atomically and returns the objects it wrote.
     async fn write_groups(&mut self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenObject>> {
         self.load_ids(&groups).await?;
+        let FrozenLogsWriteDelta { groups, ops } = groups;
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
@@ -141,13 +142,13 @@ impl DirectWriter {
             written_at_unix_ms: unix_time_ms()?,
         };
         let mut by_namespace: BTreeMap<Namespace, StreamGroups> = BTreeMap::new();
-        for ((namespace, segment, fingerprint), group) in groups.groups {
+        for ((namespace, segment, fingerprint), group) in groups {
             by_namespace
                 .entry(namespace)
                 .or_default()
                 .insert((segment, fingerprint), group);
         }
-        let mut all_ops = Vec::new();
+        let mut all_ops = ops;
         let mut written = Vec::new();
         let mut next_objects = Vec::new();
         for (namespace, groups) in by_namespace {
@@ -495,14 +496,17 @@ type CoordinatedStreamGroups =
 pub(super) struct LogsWrite {
     pub(super) namespace: Namespace,
     pub(super) groups: StreamGroups,
+    pub(super) ops: Vec<RecordOp>,
 }
 
 pub(super) struct FrozenLogsWriteDelta {
     groups: CoordinatedStreamGroups,
+    ops: Vec<RecordOp>,
 }
 
 pub(super) struct LogsWriteDelta {
     groups: CoordinatedStreamGroups,
+    ops: Vec<RecordOp>,
 }
 
 impl Delta for LogsWriteDelta {
@@ -517,6 +521,7 @@ impl Delta for LogsWriteDelta {
     fn init((): Self::Context) -> Self {
         Self {
             groups: BTreeMap::new(),
+            ops: Vec::new(),
         }
     }
 
@@ -546,6 +551,7 @@ impl Delta for LogsWriteDelta {
                 .or_insert_with(|| (labels.clone(), Vec::new()));
             group.1.append(&mut entries);
         }
+        self.ops.extend(write.ops);
         Ok(report)
     }
 
@@ -562,7 +568,8 @@ impl Delta for LogsWriteDelta {
                         .map(|entry| size_of::<i64>() + entry.line.len())
                         .sum::<usize>()
             })
-            .sum()
+            .sum::<usize>()
+            .saturating_add(self.ops.len().saturating_mul(64))
     }
 
     fn freeze(mut self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
@@ -572,6 +579,7 @@ impl Delta for LogsWriteDelta {
         (
             FrozenLogsWriteDelta {
                 groups: self.groups,
+                ops: self.ops,
             },
             (),
             (),

@@ -208,17 +208,27 @@ pub fn superseded(scope: KeyScope, base_ns: i64) -> Superseded {
     })
 }
 
-/// A compaction hook reporting each rollup segment of `scope` whose rollup
-/// has started (its pending marker is live) but not sealed.
+/// A compaction hook reporting each pending rollup target and every source it
+/// covers. Holding the sources makes a retry's copy checkpoints stable across
+/// process restarts: compaction cannot change their physical read chunks
+/// between attempts.
 pub fn unsealed(scope: KeyScope, base_ns: i64) -> Superseded {
     Arc::new(move |prefix, present| {
         let Ok((namespace, segment, _)) = scope.parse(prefix) else {
             return false;
         };
-        parse_marker(segment).is_none()
-            && segment.width_ns > base_ns
-            && present(&marker_key(scope, &namespace, Marker::Pending, segment))
-            && !present(&marker_key(scope, &namespace, Marker::Sealed, segment))
+        if parse_marker(segment).is_some() || segment.width_ns < base_ns {
+            return false;
+        }
+        let pending = |wide| {
+            present(&marker_key(scope, &namespace, Marker::Pending, wide))
+                && !present(&marker_key(scope, &namespace, Marker::Sealed, wide))
+        };
+        pending(segment)
+            || widths(base_ns, None)
+                .into_iter()
+                .filter(|width| *width > segment.width_ns && width % segment.width_ns == 0)
+                .any(|width| pending(Segment::containing(segment.start_ns, width)))
     })
 }
 
@@ -902,7 +912,8 @@ mod tests {
         assert!(!hook(&prefix(day), &sealed));
         assert!(!hook(&prefix(day), &|_: &[u8]| false));
         assert!(!hook(&pending, &started));
-        assert!(!hook(&prefix(Segment::new(DAY, HOUR)), &|_: &[u8]| true));
+        assert!(hook(&prefix(Segment::new(DAY, HOUR)), &started));
+        assert!(!hook(&prefix(Segment::new(DAY + DAY_NS, HOUR)), &started));
     }
 
     #[test]
