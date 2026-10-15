@@ -150,6 +150,7 @@ pub struct SegmentCompaction {
     max_open_sources: usize,
     retention: Option<Duration>,
     superseded: Option<Superseded>,
+    unsealed: Option<Superseded>,
     holds: MergeHolds,
 }
 
@@ -160,6 +161,7 @@ impl std::fmt::Debug for SegmentCompaction {
             .field("max_open_sources", &self.max_open_sources)
             .field("retention", &self.retention)
             .field("superseded", &self.superseded.is_some())
+            .field("unsealed", &self.unsealed.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +174,7 @@ impl SegmentCompaction {
             max_open_sources: DEFAULT_MAX_OPEN_SOURCES,
             retention: None,
             superseded: None,
+            unsealed: None,
             holds: MergeHolds::default(),
         }
     }
@@ -197,6 +200,16 @@ impl SegmentCompaction {
     /// Drops segments `superseded` reports as superseded.
     pub fn with_superseded(mut self, superseded: Superseded) -> Self {
         self.superseded = Some(superseded);
+        self
+    }
+
+    /// Merges a segment `unsealed` reports as a rollup not yet sealed only
+    /// when its rollup asks. A rollup that failed or whose process restarted
+    /// has no [`MergeHold`], and rewriting its partial copy would keep the
+    /// segment busy while the retried copy adds L0s that only its compaction
+    /// can clear, stalling every flush.
+    pub fn with_unsealed(mut self, unsealed: Superseded) -> Self {
+        self.unsealed = Some(unsealed);
         self
     }
 
@@ -464,6 +477,12 @@ fn plan(
                 && now_ms >= newest_ms.saturating_add(retention_ms)
         })
     };
+    let unsealed = |segment: &SegmentState| {
+        policy
+            .unsealed
+            .as_ref()
+            .is_some_and(|unsealed| unsealed(&segment.prefix, &is_present))
+    };
     let grace_ms = i64::try_from(policy.grace.as_millis()).unwrap_or(i64::MAX);
     let requested = |segment: &SegmentState| policy.holds.get(&segment.prefix) == Some(Hold::Merge);
     let mergeable = |end_ms: i64, segment: &SegmentState| {
@@ -474,6 +493,7 @@ fn plan(
         match policy.holds.get(&segment.prefix) {
             Some(Hold::Copying) => return false,
             Some(Hold::Merge) => return true,
+            None if unsealed(segment) => return false,
             None => {}
         }
         let merge_at = end_ms.saturating_add(grace_ms);
@@ -721,6 +741,27 @@ mod tests {
         assert_eq!(
             prefixes(&plan(&policy(), at_hour(5.0), &[late(8, 16)], &none, 4, 10)),
             vec![("merge", 1)]
+        );
+    }
+
+    #[test]
+    fn merges_an_unsealed_rollup_only_on_request() {
+        let holds = MergeHolds::default();
+        let policy = policy()
+            .with_holds(holds.clone())
+            .with_unsealed(Arc::new(|prefix, _| prefix == [2]));
+        let none = HashSet::new();
+        let segments = [segment(1, 2, &[3], 0), segment(2, 2, &[4], 0)];
+        // No hold, as after a failed rollup or a restart.
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(10.0), &segments, &none, 4, 10)),
+            vec![("merge", 1)]
+        );
+        let hold = holds.copying(Bytes::from_static(&[2]));
+        hold.merge();
+        assert_eq!(
+            prefixes(&plan(&policy, at_hour(10.0), &segments, &none, 4, 10)),
+            vec![("merge", 2), ("merge", 1)]
         );
     }
 

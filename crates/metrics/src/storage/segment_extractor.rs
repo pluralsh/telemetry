@@ -184,6 +184,15 @@ pub(crate) fn superseded(prefix: &[u8], present: &dyn Fn(&[u8]) -> bool) -> bool
         .any(|size| present(&seal_prefix(&namespace, &bucket.widened(size))))
 }
 
+/// Whether the bucket segment at `prefix` is a rollup bucket, wider than an
+/// hour, whose seal is not yet written: a rollup is copying into it.
+pub(crate) fn unsealed(prefix: &[u8], present: &dyn Fn(&[u8]) -> bool) -> bool {
+    let Some((namespace, bucket)) = parse_bucket(prefix) else {
+        return false;
+    };
+    bucket.size > 1 && !present(&seal_prefix(&namespace, &bucket))
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
@@ -425,5 +434,23 @@ mod tests {
             &raw_prefix("tenant", six_hours.start, six_hours.size),
             &present
         ));
+    }
+
+    #[test]
+    fn rollup_buckets_are_unsealed_until_their_seal() {
+        let tenant = namespace("tenant");
+        let six_hours = TimeBucket {
+            start: 1440 + 6 * 60,
+            size: 6,
+        };
+        let sealed = [seal_prefix(&tenant, &six_hours)];
+        let present = |prefix: &[u8]| sealed.iter().any(|seal| seal.as_ref() == prefix);
+        let none = |_: &[u8]| false;
+        let bucket = raw_prefix("tenant", six_hours.start, six_hours.size);
+
+        assert!(unsealed(&bucket, &none));
+        assert!(!unsealed(&bucket, &present));
+        assert!(!unsealed(&raw_prefix("tenant", six_hours.start, 1), &none));
+        assert!(!unsealed(&sealed[0], &none));
     }
 }

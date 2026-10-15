@@ -208,6 +208,20 @@ pub fn superseded(scope: KeyScope, base_ns: i64) -> Superseded {
     })
 }
 
+/// A compaction hook reporting each rollup segment of `scope` whose rollup
+/// has started (its pending marker is live) but not sealed.
+pub fn unsealed(scope: KeyScope, base_ns: i64) -> Superseded {
+    Arc::new(move |prefix, present| {
+        let Ok((namespace, segment, _)) = scope.parse(prefix) else {
+            return false;
+        };
+        parse_marker(segment).is_none()
+            && segment.width_ns > base_ns
+            && present(&marker_key(scope, &namespace, Marker::Pending, segment))
+            && !present(&marker_key(scope, &namespace, Marker::Sealed, segment))
+    })
+}
+
 /// Rollup widths for `base_ns` segments, widest first: day fractions wider
 /// than and a whole multiple of `base_ns`, and dividing `period_ns` if set.
 pub fn widths(base_ns: i64, period_ns: Option<i64>) -> Vec<i64> {
@@ -874,6 +888,21 @@ mod tests {
         assert!(!hook(&seal, &live));
         assert!(!hook(&window_seal, &live));
         assert!(!hook(&prefix(Segment::new(DAY + DAY_NS, HOUR)), &live));
+    }
+
+    #[test]
+    fn reports_a_started_rollup_unsealed_until_its_seal() {
+        let hook = unsealed(SCOPE, HOUR);
+        let day = Segment::new(DAY, DAY_NS);
+        let pending = marker_key(SCOPE, &namespace(), Marker::Pending, day);
+        let seal = marker_key(SCOPE, &namespace(), Marker::Sealed, day);
+        let started = |prefix: &[u8]| prefix == pending.as_ref();
+        let sealed = |prefix: &[u8]| prefix == pending.as_ref() || prefix == seal.as_ref();
+        assert!(hook(&prefix(day), &started));
+        assert!(!hook(&prefix(day), &sealed));
+        assert!(!hook(&prefix(day), &|_: &[u8]| false));
+        assert!(!hook(&pending, &started));
+        assert!(!hook(&prefix(Segment::new(DAY, HOUR)), &|_: &[u8]| true));
     }
 
     #[test]

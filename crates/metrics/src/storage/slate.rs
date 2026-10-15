@@ -62,6 +62,7 @@ use crate::serde::{TimeBucketScoped, bucket_records_range, seal_key, write_bucke
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::storage::segment_extractor::{
     Segment, TimeseriesSegmentExtractor, bucket_span, parse_bucket, parse_segment, superseded,
+    unsealed,
 };
 use common::storage::compaction::{MergeHold, MergeHolds, SegmentCompaction};
 use common::storage::settings::{base_settings, load_settings_over};
@@ -521,7 +522,8 @@ impl Storage {
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
         let policy = SegmentCompaction::new(bucket_span)
             .with_retention(retention)
-            .with_superseded(Arc::new(superseded));
+            .with_superseded(Arc::new(superseded))
+            .with_unsealed(Arc::new(unsealed));
         let merge_holds = policy.holds();
         let compactor = settings.compactor_options.take().map(|options| {
             CompactorBuilder::new(slate_config.path.clone(), Arc::clone(&object_store))

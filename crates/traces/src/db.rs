@@ -209,6 +209,10 @@ impl TraceDb {
                         .with_superseded(common::storage::rollup::superseded(
                             crate::codec::KEY_SCOPE,
                             i64::try_from(segment_ns).unwrap_or(i64::MAX),
+                        ))
+                        .with_unsealed(common::storage::rollup::unsealed(
+                            crate::codec::KEY_SCOPE,
+                            i64::try_from(segment_ns).unwrap_or(i64::MAX),
                         )),
                 ),
             )

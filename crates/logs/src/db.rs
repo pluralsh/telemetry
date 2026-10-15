@@ -295,6 +295,10 @@ impl LogDb {
                         .with_superseded(common::storage::rollup::superseded(
                             crate::codec::KEY_SCOPE,
                             segment_ns,
+                        ))
+                        .with_unsealed(common::storage::rollup::unsealed(
+                            crate::codec::KEY_SCOPE,
+                            segment_ns,
                         )),
                 ),
             )
