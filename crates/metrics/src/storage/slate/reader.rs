@@ -317,6 +317,34 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         }
     }
 
+    /// The highest series ID with a forward-index entry in `bucket`, from a
+    /// descending scan that reads one block per source.
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(super) async fn last_forward_index_series(
+        &self,
+        namespace: &Namespace,
+        bucket: &TimeBucket,
+    ) -> crate::util::Result<Option<SeriesId>> {
+        let options = ScanOptions {
+            read_ahead_bytes: 1,
+            max_fetch_tasks: 1,
+            order: IterationOrder::Descending,
+            ..Self::scan_options()
+        };
+        let prefix = ForwardIndexKey::bucket_prefix(namespace, bucket);
+        let mut iter = self
+            .db
+            .scan_prefix_with_options(prefix, .., &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
+            if let Ok(key) = ForwardIndexKey::decode(record.key.as_ref()) {
+                return Ok(Some(key.series_id));
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the series dictionary using the provided insert function and
     /// return the next unused series ID.
     #[tracing::instrument(level = "trace", skip(self, bucket, insert))]
@@ -613,6 +641,43 @@ impl StorageReader {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl StorageReader {
+    /// Every bucket segment of `namespace` in the manifest, with its L0 SST
+    /// ids and each sorted run's SST ids, as SlateDB debug-prints them.
+    pub(crate) fn bucket_ssts(
+        &self,
+        namespace: &Namespace,
+    ) -> Vec<(TimeBucket, Vec<String>, Vec<Vec<String>>)> {
+        let manifest = self.reader.db.status().current_manifest;
+        manifest
+            .segments()
+            .iter()
+            .filter_map(|segment| {
+                let (segment_namespace, bucket) = parse_bucket(segment.prefix())?;
+                (&segment_namespace == namespace).then(|| {
+                    let l0 = segment
+                        .l0()
+                        .iter()
+                        .map(|view| format!("{:?}", view.sst.id))
+                        .collect();
+                    let runs = segment
+                        .compacted()
+                        .iter()
+                        .map(|run| {
+                            run.sst_views
+                                .iter()
+                                .map(|view| format!("{:?}", view.sst.id))
+                                .collect()
+                        })
+                        .collect();
+                    (bucket, l0, runs)
+                })
+            })
+            .collect()
     }
 }
 

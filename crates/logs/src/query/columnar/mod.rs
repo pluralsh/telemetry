@@ -13,7 +13,6 @@ use tokio::sync::oneshot;
 
 use super::parallel::{BATCH_ROWS, panicked, pool};
 use super::*;
-use crate::db::SEGMENT_READ_CONCURRENCY;
 
 mod batch;
 mod sink;
@@ -118,7 +117,7 @@ pub(super) async fn load<'a>(
             }
             sink.finish().await
         })
-        .buffered(SEGMENT_READ_CONCURRENCY)
+        .buffered(database.segment_read_concurrency())
         .try_collect::<Vec<_>>()
         .await?;
     let mut sinks = sinks.into_iter();

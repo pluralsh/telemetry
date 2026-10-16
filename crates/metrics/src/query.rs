@@ -23,6 +23,9 @@ pub(crate) const FORWARD_INDEX_MANY_CONCURRENCY: usize = 64;
 pub(crate) struct CachedSeriesResolution {
     pub(crate) series_ids: Arc<[SeriesId]>,
     pub(crate) labels: Arc<[Labels]>,
+    /// Set by projected resolutions, whose `labels` are only the projected
+    /// labels and so no longer identify their series.
+    pub(crate) fingerprints: Option<Arc<[u128]>>,
 }
 
 /// Trait for read-only queries within a single time bucket.
@@ -108,6 +111,16 @@ pub(crate) trait BucketQueryReader: Send + Sync {
             .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// Each series' [`Labels::series_fingerprint`] as stored with it, in
+    /// `series_ids` order; `None` for a series stored without one. `Ok(None)`
+    /// when the reader cannot read fingerprints at all.
+    async fn series_fingerprints(
+        &self,
+        _series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        Ok(None)
     }
 
     /// Fetch a single inverted-index posting by term. Returns `None` if
@@ -261,6 +274,16 @@ pub(crate) trait QueryReader: Send + Sync {
             .buffered(FORWARD_INDEX_MANY_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// Series fingerprints within `bucket`. See
+    /// [`BucketQueryReader::series_fingerprints`].
+    async fn series_fingerprints(
+        &self,
+        _bucket: &TimeBucket,
+        _series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        Ok(None)
     }
 
     /// Fetch a single inverted-index posting within `bucket`. See
@@ -475,6 +498,15 @@ impl<R: QueryReader> QueryReader for LimitedQueryReader<R> {
         self.inner.forward_index_many(bucket, series_ids).await
     }
 
+    async fn series_fingerprints(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        let _permit = acquire(&self.limits.metadata).await;
+        self.inner.series_fingerprints(bucket, series_ids).await
+    }
+
     async fn inverted_index_term(
         &self,
         bucket: &TimeBucket,
@@ -554,12 +586,44 @@ pub(crate) mod test_utils {
     pub(crate) struct MockQueryReader {
         /// Map from bucket to its data
         bucket_data: BucketData,
+        /// Buckets read as if written before series fingerprints were stored.
+        without_fingerprints: std::collections::HashSet<TimeBucket>,
+    }
+
+    impl MockQueryReader {
+        /// Serve `bucket` as if an older writer wrote it, with no stored
+        /// series fingerprints.
+        pub(crate) fn without_fingerprints(mut self, bucket: TimeBucket) -> Self {
+            self.without_fingerprints.insert(bucket);
+            self
+        }
     }
 
     #[async_trait]
     impl QueryReader for MockQueryReader {
         async fn list_buckets(&self) -> Result<Vec<TimeBucket>> {
             Ok(self.bucket_data.keys().cloned().collect())
+        }
+
+        async fn series_fingerprints(
+            &self,
+            bucket: &TimeBucket,
+            series_ids: &[SeriesId],
+        ) -> Result<Option<Vec<Option<u128>>>> {
+            let Some((fwd, _, _)) = self.bucket_data.get(bucket) else {
+                return Ok(None);
+            };
+            let stored = !self.without_fingerprints.contains(bucket);
+            Ok(Some(
+                series_ids
+                    .iter()
+                    .map(|id| {
+                        fwd.get_spec(id)
+                            .filter(|_| stored)
+                            .map(|spec| spec.labels.series_fingerprint())
+                    })
+                    .collect(),
+            ))
         }
 
         async fn forward_index(
@@ -816,6 +880,7 @@ pub(crate) mod test_utils {
         pub(crate) fn build(self) -> MockQueryReader {
             MockQueryReader {
                 bucket_data: self.bucket_data,
+                without_fingerprints: Default::default(),
             }
         }
     }

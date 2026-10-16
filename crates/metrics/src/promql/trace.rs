@@ -77,6 +77,8 @@ pub enum IoKind {
     Deserialize,
     /// Forward index (series-id → labels).
     ForwardIndexFetch,
+    /// Series fingerprints (series-id → identity), read by projected resolves.
+    SeriesFingerprintFetch,
     /// Inverted index (label → series-ids).
     InvertedIndexFetch,
     /// `label_values` for the labels endpoint / regex candidate search.
@@ -89,6 +91,7 @@ impl IoKind {
             IoKind::SamplesFetch => "samples_fetch",
             IoKind::Deserialize => "deserialize",
             IoKind::ForwardIndexFetch => "forward_index_fetch",
+            IoKind::SeriesFingerprintFetch => "series_fingerprint_fetch",
             IoKind::InvertedIndexFetch => "inverted_index_fetch",
             IoKind::LabelValuesFetch => "label_values_fetch",
         }
@@ -134,8 +137,18 @@ struct Inner {
     /// Subphase samples taken with no operator on the stack (planner /
     /// reshape phases). Surface under the top-level `subphases` field.
     orphan_subphases: BTreeMap<&'static str, (u64, u64)>,
+    /// Keyed by the source adapter's encoded bucket id.
+    buckets: BTreeMap<u64, BucketAccum>,
     /// All IO `Instant`s are normalised to offsets from here.
     query_start: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BucketAccum {
+    resolve_ns: u64,
+    series: u64,
+    sample_ns: u64,
+    sample_batches: u64,
 }
 
 impl Default for Inner {
@@ -147,6 +160,7 @@ impl Default for Inner {
             io_concurrency_wait_ns: 0,
             io_concurrency_wait_count: 0,
             orphan_subphases: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             query_start: Instant::now(),
         }
     }
@@ -302,6 +316,23 @@ impl TraceCollector {
         }
     }
 
+    /// Additive per bucket: one resolve's wall time and series, or one
+    /// sample batch's.
+    pub fn record_bucket(&self, bucket_id: u64, stage: BucketStage, elapsed_ns: u64, series: u64) {
+        let mut inner = self.lock();
+        let slot = inner.buckets.entry(bucket_id).or_default();
+        match stage {
+            BucketStage::Resolve => {
+                slot.resolve_ns = slot.resolve_ns.saturating_add(elapsed_ns);
+                slot.series += series;
+            }
+            BucketStage::Samples => {
+                slot.sample_ns = slot.sample_ns.saturating_add(elapsed_ns);
+                slot.sample_batches += 1;
+            }
+        }
+    }
+
     pub fn record_io_concurrency_wait(&self, elapsed_ns: u64) {
         let mut inner = self.lock();
         inner.io_concurrency_wait_ns = inner.io_concurrency_wait_ns.saturating_add(elapsed_ns);
@@ -358,6 +389,18 @@ impl TraceCollector {
             })
             .collect();
         let orphan_subphases = subphase_vec(&inner.orphan_subphases);
+        let buckets = inner
+            .buckets
+            .iter()
+            .map(|(&bucket_id, accum)| BucketStats {
+                start_minute: bucket_id >> 8,
+                size_hours: bucket_id & 0xFF,
+                resolve_ms: ns_to_ms(accum.resolve_ns),
+                series: accum.series,
+                sample_ms: ns_to_ms(accum.sample_ns),
+                sample_batches: accum.sample_batches,
+            })
+            .collect();
         QueryTrace {
             total_ms: ns_to_ms(total_ns),
             io_concurrency_wait_ms: ns_to_ms(inner.io_concurrency_wait_ns),
@@ -366,6 +409,7 @@ impl TraceCollector {
             operators,
             io,
             subphases: orphan_subphases,
+            buckets,
         }
     }
 }
@@ -475,6 +519,28 @@ pub struct QueryTrace {
     /// Sub-phases recorded outside any operator (planner / reshape phases).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub subphases: Vec<SubphaseStats>,
+    /// Per-bucket resolve and sample-read time, oldest bucket first.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub buckets: Vec<BucketStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketStage {
+    Resolve,
+    Samples,
+}
+
+/// One bucket's share of a query. Its resolves and sample batches overlap
+/// other buckets', so the times are its own walls, not the query's.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketStats {
+    pub start_minute: u64,
+    pub size_hours: u64,
+    pub resolve_ms: f64,
+    pub series: u64,
+    pub sample_ms: f64,
+    pub sample_batches: u64,
 }
 
 /// Times every `next()` on its inner operator. Inserted once per operator in
@@ -572,6 +638,11 @@ pub fn io_finished(kind: IoKind, start: Instant, elapsed_ns: u64) {
 /// No-op outside a [`with_trace`] scope — safe to call unconditionally.
 pub fn record_bytes(kind: IoKind, bytes: u64) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_bytes(kind, bytes));
+}
+
+/// No-op outside a [`with_trace`] scope.
+pub fn record_bucket(bucket_id: u64, stage: BucketStage, elapsed_ns: u64, series: u64) {
+    let _ = TRACE_COLLECTOR.try_with(|c| c.record_bucket(bucket_id, stage, elapsed_ns, series));
 }
 
 /// Records time queued for the pod-wide storage I/O semaphore. No-op outside

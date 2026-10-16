@@ -141,7 +141,7 @@ fn spawn_rollup(
 }
 
 impl TimeSeriesDb {
-    #[cfg(feature = "bench-internals")]
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn storage(&self) -> &Storage {
         &self.storage
     }

@@ -51,6 +51,30 @@ pub(crate) fn insert_forward_index(
     )))
 }
 
+/// Always a put: binaries that predate the record type cannot decode it in
+/// the merge operator.
+pub(crate) fn insert_series_fingerprint(
+    namespace: &Namespace,
+    bucket: TimeBucket,
+    series_id: SeriesId,
+    fingerprint: SeriesFingerprint,
+    ttl: Ttl,
+) -> RecordOp {
+    let key = SeriesFingerprintKey {
+        namespace: namespace.clone(),
+        bucket,
+        series_id,
+    }
+    .encode();
+    RecordOp::Put(PutRecordOp::new_with_options(
+        Record {
+            key,
+            value: encode_series_fingerprint(fingerprint),
+        },
+        PutOptions { ttl },
+    ))
+}
+
 pub(crate) fn merge_inverted_index(
     namespace: &Namespace,
     bucket: TimeBucket,

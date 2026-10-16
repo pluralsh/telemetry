@@ -55,8 +55,9 @@ use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::key::{
-    BucketGenerationKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
-    decode_bucket_generation, encode_bucket_generation,
+    BucketGenerationKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey,
+    SeriesFingerprintKey, TimeSeriesKey, decode_bucket_generation, encode_bucket_generation,
+    encode_series_fingerprint,
 };
 use crate::serde::{TimeBucketScoped, bucket_records_range, seal_key, write_bucket_prefix};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
@@ -174,6 +175,13 @@ pub(crate) trait StorageRead: Send + Sync {
         bucket: &TimeBucket,
         series_id: SeriesId,
     ) -> crate::util::Result<Option<SeriesSpec>>;
+
+    /// The highest series ID with a forward-index entry in `bucket`.
+    async fn last_forward_index_series(
+        &self,
+        namespace: &Namespace,
+        bucket: &TimeBucket,
+    ) -> crate::util::Result<Option<SeriesId>>;
 
     /// Loads the series dictionary of `bucket` through `insert` and returns
     /// the maximum series ID found.
@@ -342,6 +350,16 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
     ) -> crate::util::Result<Option<SeriesSpec>> {
         self.reader()
             .get_forward_index_one(namespace, bucket, series_id)
+            .await
+    }
+
+    async fn last_forward_index_series(
+        &self,
+        namespace: &Namespace,
+        bucket: &TimeBucket,
+    ) -> crate::util::Result<Option<SeriesId>> {
+        self.reader()
+            .last_forward_index_series(namespace, bucket)
             .await
     }
 

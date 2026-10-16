@@ -61,7 +61,7 @@ mod write;
 pub(crate) use block_cache::BlockCache;
 #[cfg(feature = "bench-internals")]
 pub(crate) use query::run_entries;
-pub(crate) use query::{Boundaries, SampleRead, ScanTargets, StreamFilter};
+pub(crate) use query::{Boundaries, MetadataNeeds, SampleRead, ScanTargets, StreamFilter};
 use write::*;
 
 /// Read units fetched concurrently within one query segment.
@@ -79,11 +79,15 @@ const SPAN_SCAN_MAX_SPREAD: usize = 16;
 /// Most range scans one selection is read by.
 const SPAN_SCAN_MAX_SPANS: usize = 4;
 /// Segments whose stream metadata is listed concurrently by `scan_targets`.
-const SEGMENT_LIST_CONCURRENCY: usize = 4;
+/// A cold listing is a chain of dependent object-store reads, so a day of
+/// hourly segments is listed at once; a query keeps every listing until it
+/// reads it anyway, so this only adds the block reads in flight.
+const SEGMENT_LIST_CONCURRENCY: usize = 32;
 /// Segments a query reads at once, each fetching up to
-/// [`PAGE_READ_CONCURRENCY`] units: a lone segment's reads can't keep a disk
-/// busy as it drains, and small segments drain often.
-pub(crate) const SEGMENT_READ_CONCURRENCY: usize = 4;
+/// [`PAGE_READ_CONCURRENCY`] units: a segment's reads are a few dependent
+/// object-store round trips, which segments read together overlap, and
+/// [`DECODE_BYTES_IN_FLIGHT`] bounds what they hold.
+const SEGMENT_READ_CONCURRENCY: usize = 16;
 /// Estimated decoded bytes a budget's read units may hold at once, which
 /// bounds the memory concurrent segments add.
 const DECODE_BYTES_IN_FLIGHT: u32 = 256 << 20;
@@ -93,6 +97,34 @@ const SEGMENT_DISCOVERY_CONCURRENCY: usize = 16;
 /// bounds the series cache to roughly `capacity * this` label sets.
 const SERIES_CACHE_MAX_STREAMS: usize = 2_048;
 const WRITE_CHANNEL: &str = "write";
+
+/// How queries list and read segments; tests and profiles override the
+/// defaults to compare the alternatives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadTuning {
+    /// [`SEGMENT_LIST_CONCURRENCY`].
+    pub(crate) list_concurrency: usize,
+    /// [`SEGMENT_READ_CONCURRENCY`].
+    pub(crate) read_concurrency: usize,
+    /// Whether streams selected by exact labels are cached against those
+    /// labels' postings rather than the segment's stream counter, so a cold
+    /// listing reads no counter before them.
+    pub(crate) postings_validate: bool,
+    /// Whether the runs of streams the exact labels alone select are read
+    /// while their labels are.
+    pub(crate) overlap_runs: bool,
+}
+
+impl Default for ReadTuning {
+    fn default() -> Self {
+        Self {
+            list_concurrency: SEGMENT_LIST_CONCURRENCY,
+            read_concurrency: SEGMENT_READ_CONCURRENCY,
+            postings_validate: true,
+            overlap_runs: true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteReport {
@@ -187,6 +219,11 @@ pub struct LogDb {
     span_scan_min_streams: usize,
     /// [`SPAN_SCAN_MAX_SPREAD`], overridable for profiling.
     span_scan_max_spread: usize,
+    /// Whether queries depending on only some stream labels build just those
+    /// from postings; off in tests and profiles comparing with full reads.
+    project_labels: bool,
+    /// [`ReadTuning::default`] outside tests and profiles.
+    tuning: ReadTuning,
     /// Rollup segments, pending or sealed, that take the writes of the
     /// segments they cover. Ingest holds the read lock until its write is
     /// applied, so a rollup holding the write lock sees none in flight.
@@ -220,7 +257,9 @@ struct DiscoveryCaches {
     /// selector matchers run.
     series: DiscoveryCache<SeriesKey, Versioned<Vec<Arc<Labels>>>>,
     /// A segment's streams holding every exact label, with their IDs, as
-    /// queries select them; weighed by label bytes.
+    /// queries select them: with all their labels, or only those a set of
+    /// names projects; weighed by label bytes. See
+    /// [`ReadTuning::postings_validate`] for when an entry is current.
     streams: moka::sync::Cache<StreamsKey, SegmentStreams>,
 }
 
@@ -230,7 +269,7 @@ type Versioned<V> = (PartitionVersion, V);
 
 type SeriesKey = (Namespace, Partition, Vec<Label>);
 type SegmentSeries = Arc<Versioned<Vec<Arc<Labels>>>>;
-type StreamsKey = (Namespace, SegmentId, Vec<Label>);
+type StreamsKey = (Namespace, SegmentId, Vec<Label>, Option<Arc<[String]>>);
 type SegmentStreams = Arc<Versioned<Vec<(StreamId, Arc<Labels>)>>>;
 
 /// Byte budget of [`DiscoveryCaches::streams`].
@@ -355,6 +394,8 @@ impl LogDb {
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
+            project_labels: true,
+            tuning: ReadTuning::default(),
             rolled: tokio::sync::RwLock::new(rolled),
             rollup_lock: Mutex::new(()),
             merge_holds,
@@ -455,11 +496,18 @@ impl LogDb {
             database_id: block_cache::next_database_id(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
+            project_labels: true,
+            tuning: ReadTuning::default(),
             rolled: tokio::sync::RwLock::new(HashMap::new()),
             rollup_lock: Mutex::new(()),
             merge_holds: MergeHolds::default(),
             retention: config.retention,
         })
+    }
+
+    /// Segments a query reads at once.
+    pub(crate) fn segment_read_concurrency(&self) -> usize {
+        self.tuning.read_concurrency
     }
 
     fn write_handle(&self) -> Result<&WriteCoordinatorHandle<LogsWriteDelta>> {

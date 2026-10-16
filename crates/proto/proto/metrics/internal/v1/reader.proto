@@ -56,11 +56,19 @@ message Selector {
   repeated MatcherGroup or_matchers = 3;
 }
 
+// Label names, sorted and distinct.
+message LabelProjection {
+  repeated string names = 1;
+}
+
 message ResolveRequest {
   ShardRead read = 1;
   Selector selector = 2;
   int64 start_ms = 3;
   int64 end_ms_exclusive = 4;
+  // When set, a chunk may carry only these labels, and then carries
+  // `fingerprints`. Servers that predate it return full labels.
+  LabelProjection projection = 5;
 }
 
 message LabelSet {
@@ -73,6 +81,9 @@ message ResolvedChunk {
   repeated LabelSet labels = 2;
   repeated uint32 series_ids = 3;
   repeated string metric_names = 4;
+  // 16 big-endian bytes per series fingerprint, parallel to `series_ids`;
+  // empty when `labels` are the full labels.
+  bytes fingerprints = 5;
 }
 
 message SeriesRef {

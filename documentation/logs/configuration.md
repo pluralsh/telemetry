@@ -84,6 +84,12 @@ storage:
 
 segment_duration_seconds: 3600 # Time partition width; keep stable for a dataset.
 retention_seconds: 1209600 # Logical retention; 14 days, the default. `null` keeps data forever.
+# Labels new streams are grouped by first when they get stream IDs, so a
+# selector on them reads a narrow ID range; then the other labels, fewest
+# values first. The default is Console's cluster and namespace labels, as
+# Alloy's Loki pushes and OTLP resources name them. `[]` disables it; changing
+# it only affects streams created afterwards.
+stream_locality_labels: [cluster, k8s_cluster_name, namespace, k8s_namespace_name]
 
 # Each write-buffer flush packs every written stream of a segment into
 # multi-stream objects; these limits cut larger flushes into several objects.

@@ -17,6 +17,8 @@ use crate::{
     query_value_to_response, range_result_to_response,
 };
 
+mod cold;
+
 // The server's allocator, so profiles weigh allocation as it does.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

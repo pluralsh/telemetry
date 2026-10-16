@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use futures::Stream;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::VectorSelector;
+use roaring::RoaringBitmap;
 
 use crate::model::{Label, Labels, SeriesData, SeriesId, TimeBucket};
 use crate::query::{CachedSeriesResolution, QueryReader};
@@ -124,7 +126,19 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         let reader = self.reader.clone();
         let index_cache = self.index_cache.clone();
         let selector = selector.clone();
-        resolve_stream(reader, index_cache, selector, time_range)
+        resolve_stream(reader, index_cache, selector, time_range, None)
+    }
+
+    fn resolve_projected(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
+        let reader = self.reader.clone();
+        let index_cache = self.index_cache.clone();
+        let selector = selector.clone();
+        resolve_stream(reader, index_cache, selector, time_range, Some(projection))
     }
 
     fn samples(
@@ -147,8 +161,9 @@ fn resolve_stream<R: QueryReader + 'static>(
     index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
+    projection: Option<Arc<[String]>>,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
-    async_stream_resolve(reader, index_cache, selector, time_range)
+    async_stream_resolve(reader, index_cache, selector, time_range, projection)
 }
 
 /// Up to [`METADATA_STAGE_READAHEAD`] buckets resolve in parallel; emission
@@ -159,6 +174,7 @@ fn async_stream_resolve<R: QueryReader + 'static>(
     index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
+    projection: Option<Arc<[String]>>,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
     stream::once(async move {
         let buckets = reader
@@ -180,8 +196,36 @@ fn async_stream_resolve<R: QueryReader + 'static>(
                 let reader = reader.clone();
                 let index_cache = index_cache.clone();
                 let selector = selector.clone();
+                let projection = projection.clone();
                 async move {
-                    resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector).await
+                    let started = std::time::Instant::now();
+                    let chunk = match projection {
+                        Some(projection) => {
+                            resolve_one_bucket_projected(
+                                reader.as_ref(),
+                                &index_cache,
+                                bucket,
+                                &selector,
+                                &projection,
+                            )
+                            .await
+                        }
+                        None => {
+                            resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector)
+                                .await
+                        }
+                    };
+                    let series = match &chunk {
+                        Ok(Some(chunk)) => chunk.series.len() as u64,
+                        _ => 0,
+                    };
+                    super::trace::record_bucket(
+                        encode_bucket(bucket),
+                        super::trace::BucketStage::Resolve,
+                        started.elapsed().as_nanos() as u64,
+                        series,
+                    );
+                    chunk
                 }
             }))
             .buffered(METADATA_STAGE_READAHEAD),
@@ -210,18 +254,30 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 ) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
     let key = selector_util::selector_cache_key(selector);
     if let Some(resolution) = reader.cached_selector_resolution(&bucket, &key).await {
-        return Ok(resolved_chunk(bucket, resolution));
+        return Ok(resolved_chunk(bucket, resolution, None));
     }
 
     let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector).await?;
+    resolve_candidates(reader, index_cache, bucket, &key, candidates).await
+}
+
+/// The full resolution of `candidates`, cached under the selector's `key`.
+async fn resolve_candidates<R: QueryReader + ?Sized>(
+    reader: &R,
+    index_cache: &IndexCache,
+    bucket: TimeBucket,
+    key: &Arc<str>,
+    candidates: Vec<SeriesId>,
+) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
     if candidates.is_empty() {
         reader
             .cache_selector_resolution(
                 &bucket,
-                &key,
+                key,
                 Arc::new(CachedSeriesResolution {
                     series_ids: Arc::from([]),
                     labels: Arc::from([]),
+                    fingerprints: None,
                 }),
             )
             .await;
@@ -249,16 +305,134 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     let resolution = Arc::new(CachedSeriesResolution {
         series_ids: Arc::from(candidates),
         labels: Arc::from(labels_vec),
+        fingerprints: None,
     });
     reader
-        .cache_selector_resolution(&bucket, &key, resolution.clone())
+        .cache_selector_resolution(&bucket, key, resolution.clone())
         .await;
-    Ok(resolved_chunk(bucket, resolution))
+    Ok(resolved_chunk(bucket, resolution, None))
 }
 
+/// [`resolve_one_bucket`] reading only the `projection` labels, from the
+/// inverted index, with each series identified by its stored fingerprint.
+/// That needs one metric name for the whole selector (handles carry it in
+/// place of the forward-index entry) and a fingerprint for every candidate;
+/// otherwise the bucket resolves in full and the caller projects it, which
+/// yields the same chunk.
+async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
+    reader: &R,
+    index_cache: &IndexCache,
+    bucket: TimeBucket,
+    selector: &VectorSelector,
+    projection: &[String],
+) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
+    let Some(metric_name) = selector_util::exact_metric_name(selector) else {
+        return resolve_one_bucket(reader, index_cache, bucket, selector).await;
+    };
+    let metric_name: Arc<str> = Arc::from(metric_name);
+    let key = selector_util::selector_cache_key(selector);
+    let projected_key = selector_util::projected_cache_key(&key, projection);
+    if let Some(resolution) = reader
+        .cached_selector_resolution(&bucket, &projected_key)
+        .await
+    {
+        return Ok(resolved_chunk(bucket, resolution, Some(&metric_name)));
+    }
+    if let Some(resolution) = reader.cached_selector_resolution(&bucket, &key).await {
+        return Ok(resolved_chunk(bucket, resolution, None));
+    }
+
+    let wanted =
+        selector_util::find_candidate_postings(reader, index_cache, &bucket, selector).await?;
+    let candidates: Vec<SeriesId> = wanted.iter().collect();
+    if candidates.is_empty() {
+        return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
+    }
+    let Some(fingerprints) = stored_fingerprints(reader, &bucket, &candidates).await? else {
+        return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
+    };
+    let labels = projected_labels(
+        reader,
+        index_cache,
+        &bucket,
+        (&wanted, &candidates),
+        projection,
+        &metric_name,
+    )
+    .await?;
+    let resolution = Arc::new(CachedSeriesResolution {
+        series_ids: Arc::from(candidates),
+        labels: Arc::from(labels),
+        fingerprints: Some(Arc::from(fingerprints)),
+    });
+    reader
+        .cache_selector_resolution(&bucket, &projected_key, resolution.clone())
+        .await;
+    Ok(resolved_chunk(bucket, resolution, Some(&metric_name)))
+}
+
+/// Every candidate's stored fingerprint, or `None` when any is missing
+/// (data written before fingerprints were stored).
+async fn stored_fingerprints<R: QueryReader + ?Sized>(
+    reader: &R,
+    bucket: &TimeBucket,
+    candidates: &[SeriesId],
+) -> Result<Option<Vec<u128>>, QueryError> {
+    Ok(reader
+        .series_fingerprints(bucket, candidates)
+        .await
+        .map_err(storage_err)?
+        .and_then(|fingerprints| fingerprints.into_iter().collect()))
+}
+
+/// Each candidate's `projection` labels (sorted names), read from the
+/// label's postings; a candidate without a label lacks it here too.
+/// `candidates` lists `wanted` in order.
+async fn projected_labels<R: QueryReader + ?Sized>(
+    reader: &R,
+    index_cache: &IndexCache,
+    bucket: &TimeBucket,
+    (wanted, candidates): (&RoaringBitmap, &[SeriesId]),
+    projection: &[String],
+    metric_name: &str,
+) -> Result<Vec<Labels>, QueryError> {
+    let postings = futures::future::try_join_all(
+        projection
+            .iter()
+            .filter(|name| name.as_str() != METRIC_NAME)
+            .map(|name| index_cache.label_postings(reader, bucket, name)),
+    )
+    .await
+    .map_err(storage_err)?;
+    let mut postings = postings.iter();
+    let mut labels: Vec<Vec<Label>> = vec![Vec::new(); candidates.len()];
+    for name in projection {
+        if name == METRIC_NAME {
+            for series in &mut labels {
+                series.push(Label::metric_name(metric_name));
+            }
+            continue;
+        }
+        let values = postings
+            .next()
+            .expect("one postings list per projected label");
+        for (value, series_ids) in values.iter() {
+            for series_id in series_ids & wanted {
+                if let Ok(position) = candidates.binary_search(&series_id) {
+                    labels[position].push(Label::new(name.as_str(), value.as_str()));
+                }
+            }
+        }
+    }
+    Ok(labels.into_iter().map(Labels::new).collect())
+}
+
+/// `metric_name`, when given, names every series: projected labels may not
+/// carry `__name__`.
 fn resolved_chunk(
     bucket: TimeBucket,
     resolution: Arc<CachedSeriesResolution>,
+    metric_name: Option<&Arc<str>>,
 ) -> Option<ResolvedSeriesChunk> {
     if resolution.series_ids.is_empty() {
         return None;
@@ -267,22 +441,25 @@ fn resolved_chunk(
     let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(resolution.series_ids.len());
     // Candidates are ordered by series ID, so one metric's series tend to be
     // adjacent and share a name allocation.
-    let mut metric_name: Arc<str> = Arc::from("");
+    let mut name_of_run: Arc<str> = Arc::from("");
     for (&series_id, labels) in resolution.series_ids.iter().zip(resolution.labels.iter()) {
-        let name = labels.metric_name();
-        if *metric_name != *name {
-            metric_name = Arc::from(name);
-        }
-        handles.push(ResolvedSeriesRef::new(
-            bucket_id,
-            series_id,
-            metric_name.clone(),
-        ));
+        let name = match metric_name {
+            Some(name) => name.clone(),
+            None => {
+                let name = labels.metric_name();
+                if *name_of_run != *name {
+                    name_of_run = Arc::from(name);
+                }
+                name_of_run.clone()
+            }
+        };
+        handles.push(ResolvedSeriesRef::new(bucket_id, series_id, name));
     }
     Some(ResolvedSeriesChunk {
         bucket_id,
         labels: resolution.labels.clone(),
         series: Arc::from(handles),
+        fingerprints: resolution.fingerprints.clone(),
     })
 }
 
@@ -346,6 +523,7 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
 ) -> Result<SampleBatch, QueryError> {
     let bucket = decode_bucket(run.bucket_id)
         .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
+    let started = std::time::Instant::now();
 
     let series_count = run.range.end - run.range.start;
     let mut block = SampleBlock::with_series_count(series_count);
@@ -381,6 +559,12 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
             fill_column(&mut block, col_idx, samples);
         }
     }
+    super::trace::record_bucket(
+        run.bucket_id,
+        super::trace::BucketStage::Samples,
+        started.elapsed().as_nanos() as u64,
+        series_count as u64,
+    );
 
     Ok(SampleBatch {
         series_range: run.range,
@@ -495,6 +679,37 @@ pub(crate) mod selector_util {
                 .chain(&selector.matchers.matchers)
                 .map(|m| (m.name.as_str(), match_op_symbol(&m.op), m.value.as_str())),
         )
+    }
+
+    /// [`selector_cache_key`] for a resolution projected to `projection`,
+    /// which never collides with a full resolution's key.
+    pub(crate) fn projected_cache_key(key: &str, projection: &[String]) -> Arc<str> {
+        use std::fmt::Write;
+        let mut projected = format!("{key}by{}:", projection.len());
+        for name in projection {
+            let _ = write!(projected, "{}:{name};", name.len());
+        }
+        Arc::from(projected)
+    }
+
+    /// The one metric name every series of `selector` has, when it names
+    /// one exactly.
+    pub(crate) fn exact_metric_name(selector: &VectorSelector) -> Option<&str> {
+        if !selector.matchers.or_matchers.is_empty() {
+            return None;
+        }
+        selector
+            .name
+            .as_deref()
+            .or_else(|| {
+                selector
+                    .matchers
+                    .matchers
+                    .iter()
+                    .find(|m| m.name == METRIC_NAME && matches!(m.op, MatchOp::Equal))
+                    .map(|m| m.value.as_str())
+            })
+            .filter(|name| !name.is_empty())
     }
 
     /// The exact strings a regex matches when it is a literal alternation

@@ -692,3 +692,64 @@ async fn should_match_regex_or_group() {
         ]
     );
 }
+
+#[tokio::test]
+async fn should_resolve_projections_from_the_index_only_where_fingerprints_are_stored() {
+    // given: two buckets of one metric, one series lacking `env`, and the
+    // older bucket written before fingerprints were stored
+    let mut b = MockMultiBucketQueryReaderBuilder::new();
+    for bucket in [h0(), h60()] {
+        let at = bucket.start_ms() + 1_000;
+        for (env, pod) in [("a", "p0"), ("a", "p1"), ("b", "p0")] {
+            let id = format!("{env}-{pod}");
+            b.add_sample(
+                bucket,
+                labels("m", &[("env", env), ("id", &id), ("pod", pod)]),
+                MetricType::Gauge,
+                Sample::new(at, 1.0),
+            );
+        }
+        b.add_sample(
+            bucket,
+            labels("m", &[("pod", "p9")]),
+            MetricType::Gauge,
+            Sample::new(at, 1.0),
+        );
+        b.add_sample(
+            bucket,
+            labels("other", &[("env", "a")]),
+            MetricType::Gauge,
+            Sample::new(at, 1.0),
+        );
+    }
+    let src = source(b.build().without_fingerprints(h0()));
+    let projection: Arc<[String]> = Arc::from(vec!["env".to_string()]);
+    let range = TimeRange::new(0, 7_200_000);
+
+    // when
+    let projected =
+        collect_ok(src.resolve_projected(&sel_metric("m"), range, projection.clone())).await;
+    let full = collect_ok(src.resolve(&sel_metric("m"), range)).await;
+
+    // then: the old bucket resolves in full, the other from the index, and
+    // both normalize to the projection of the full resolution
+    assert_eq!(projected.len(), 2);
+    assert!(projected[0].fingerprints.is_none());
+    assert!(projected[1].fingerprints.is_some());
+    assert!(projected[1].labels.iter().all(|labels| labels.len() <= 1));
+    let normalized = |chunks: Vec<ResolvedSeriesChunk>| {
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                let chunk = chunk.projected(&projection);
+                (
+                    chunk.bucket_id,
+                    chunk.labels.to_vec(),
+                    chunk.series.to_vec(),
+                    chunk.fingerprints.expect("projected").to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(normalized(projected), normalized(full));
+}

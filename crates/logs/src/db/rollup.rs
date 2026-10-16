@@ -18,7 +18,6 @@ use std::collections::VecDeque;
 use common::storage::rollup::{Marker, RollupConfig, marker_key};
 
 use super::*;
-use crate::model::locality_order;
 
 /// Streams read and written per copy step. One stream can hold enough rows to
 /// use the writer's whole memory budget, so never materialize several at once.
@@ -171,9 +170,10 @@ impl LogDb {
     }
 
     /// Gives every stream of `sources` its ID in `wide` before any row is
-    /// copied, all in one [`locality_order`], so streams that the copy finds
-    /// segment by segment still get neighbouring IDs when they share coarse
-    /// labels.
+    /// copied, all in one write the writer allocates in
+    /// [`locality_order`](crate::model::locality_order), so streams that the
+    /// copy finds segment by segment still get neighbouring IDs when they
+    /// share coarse labels.
     async fn register_streams(
         &self,
         namespace: &Namespace,
@@ -186,13 +186,10 @@ impl LogDb {
                 streams.extend(read.streams().map(|(_, labels)| labels.clone()));
             }
         }
-        let streams: Vec<Labels> = streams.into_iter().collect();
-        let order = locality_order(&streams.iter().collect::<Vec<_>>());
-        let mut groups = StreamGroups::new();
-        for position in order {
-            let labels = streams[position].clone();
-            groups.insert((wide, labels.fingerprint()), (labels, Vec::new()));
-        }
+        let groups: StreamGroups = streams
+            .into_iter()
+            .map(|labels| ((wide, labels.fingerprint()), (labels, Vec::new())))
+            .collect();
         if !groups.is_empty() {
             self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
                 .await?;
@@ -386,7 +383,9 @@ fn row_bytes(entry: &LogEntry) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
+    };
 
     use super::*;
     use crate::config::CompactionConfig;
@@ -820,6 +819,116 @@ mod tests {
         assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
         // The retry skipped every chunk already stored with its progress key.
         assert_eq!(rows(&db).await.len(), before.len());
+        assert_eq!(queried(&db).await, before.len());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finishes_a_rollup_interrupted_under_another_stream_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = |stream_locality_labels: Vec<String>| Config {
+            storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "logs-rollup-test".to_owned(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: directory.path().display().to_string(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+                disk: Default::default(),
+            }),
+            stream_locality_labels,
+            ..config()
+        };
+        // `container` has fewer values than `cluster`, so the two orders
+        // differ.
+        let batches = (0..12)
+            .map(|pod| {
+                let labels = Labels::new(vec![
+                    Label::new("env", "prod"),
+                    Label::new("cluster", format!("c{}", pod % 4)),
+                    Label::new("container", format!("x{}", pod % 3)),
+                    Label::new("pod", format!("p{pod}")),
+                ])
+                .unwrap();
+                let entries = (0..24)
+                    .map(|hour| LogEntry::new(DAY + hour * HOUR, format!("{pod} {hour}")))
+                    .collect();
+                LogBatch::new(labels, entries)
+            })
+            .collect::<Vec<_>>();
+        let wide_ids = async |db: &LogDb| {
+            let mut ids = BTreeMap::new();
+            for read in db
+                .segment_reads(&namespace(), day(), usize::MAX)
+                .await
+                .unwrap()
+            {
+                ids.extend(read.streams().map(|(id, labels)| (labels.clone(), id)));
+            }
+            ids
+        };
+
+        // An older binary, ordering by value counts alone, registered the
+        // day's streams and copied a few hours before it stopped.
+        let db = LogDb::open(config(Vec::new())).await.unwrap();
+        db.write(&namespace(), batches).await.unwrap();
+        db.flush_memtable().await.unwrap();
+        let before = rows(&db).await;
+        db.writer()
+            .unwrap()
+            .apply(vec![RecordOp::put_with_ttl(
+                marker_key(
+                    crate::codec::KEY_SCOPE,
+                    &namespace(),
+                    Marker::Pending,
+                    day(),
+                ),
+                Bytes::from_static(&[COPY_PROGRESS_VERSION]),
+                Ttl::NoExpiry,
+            )])
+            .await
+            .unwrap();
+        db.rolled
+            .write()
+            .await
+            .entry(namespace())
+            .or_default()
+            .insert(day());
+        let sources = db.rollups(&namespace()).sources(day(), db.segment_ns);
+        db.register_streams(&namespace(), &sources, day())
+            .await
+            .unwrap();
+        let mut copy = CopyState {
+            buffer: u64::MAX,
+            queued: 0,
+            copied: HashSet::new(),
+            ttl: db.marker_ttl().unwrap(),
+        };
+        for source in &sources[..5] {
+            db.copy_segment(&namespace(), *source, day(), &mut copy)
+                .await
+                .unwrap();
+        }
+        db.flush_memtable().await.unwrap();
+        let registered = wide_ids(&db).await;
+        assert_eq!(registered.len(), 12);
+        db.close().await.unwrap();
+
+        // The retry, by a binary with the default order, keeps every
+        // stream's ID and copies each row once.
+        let db = LogDb::open(config(Config::default().stream_locality_labels))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.rollup_at(&RollupConfig::default(), after_delay())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(wide_ids(&db).await, registered);
+        assert_eq!(rows(&db).await, before);
         assert_eq!(queried(&db).await, before.len());
         db.close().await.unwrap();
     }

@@ -94,6 +94,33 @@ pub struct ResolvedSeriesChunk {
     pub bucket_id: u64,
     pub labels: Arc<[Labels]>,
     pub series: Arc<[ResolvedSeriesRef]>,
+    /// Parallel to `series` in an answer to
+    /// [`SeriesSource::resolve_projected`] that applied the projection:
+    /// `labels` then hold only the projected labels, so each series is
+    /// identified by its [`Labels::series_fingerprint`] instead.
+    pub fingerprints: Option<Arc<[u128]>>,
+}
+
+impl ResolvedSeriesChunk {
+    /// This chunk with the projection applied: full labels are fingerprinted
+    /// and cut down to `projection` (sorted), exactly as a source applying
+    /// the projection itself would return them.
+    pub fn projected(self, projection: &[String]) -> Self {
+        if self.fingerprints.is_some() {
+            return self;
+        }
+        let fingerprints = self.labels.iter().map(Labels::series_fingerprint).collect();
+        let labels = self
+            .labels
+            .iter()
+            .map(|labels| labels.project(projection))
+            .collect();
+        Self {
+            labels,
+            fingerprints: Some(fingerprints),
+            ..self
+        }
+    }
 }
 
 /// Request from operator to source for raw samples covering a specific
@@ -174,6 +201,19 @@ pub trait SeriesSource: Send + Sync {
         selector: &VectorSelector,
         time_range: TimeRange,
     ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send;
+
+    /// [`Self::resolve`] for a caller that reads only the labels named in
+    /// `projection` (sorted) and tells series apart by fingerprint. Chunks
+    /// may come back with or without the projection applied; callers
+    /// normalize them with [`ResolvedSeriesChunk::projected`].
+    fn resolve_projected(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        _projection: Arc<[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
+        self.resolve(selector, time_range)
+    }
 
     /// Stream raw samples for a pre-resolved series roster. No step, lookback,
     /// or rollup — per-series timestamp order, exact source timestamps, stale

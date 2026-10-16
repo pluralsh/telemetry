@@ -40,7 +40,7 @@ pub fn decode_samples(block: &EncodedBlock) -> Result<Vec<(i64, u32)>> {
         &block.0,
         (i64::MIN, i64::MAX),
         |_| true,
-        false,
+        &crate::object::FieldSelection::None,
         |_, sample| samples.push((sample.timestamp_ns, sample.line_len)),
     )?;
     Ok(samples)

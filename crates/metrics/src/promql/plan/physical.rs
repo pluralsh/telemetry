@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use promql_parser::label::METRIC_NAME;
 use promql_parser::parser;
 
 use crate::model::{Label, Labels};
@@ -48,6 +49,7 @@ use super::super::operators::sort::SortOp;
 use super::super::operators::subquery::SubqueryOp;
 use super::super::operators::vector_selector::VectorSelectorOp;
 use super::super::source::{ResolvedSeriesChunk, ResolvedSeriesRef, SeriesSource, TimeRange};
+use super::super::source_adapter::selector_util::exact_metric_name;
 
 use super::super::trace;
 use super::error::PlanError;
@@ -184,6 +186,7 @@ where
             source,
             reservation: &reservation,
             ctx,
+            projection: None,
         },
         grid,
         /*under_rollup=*/ false,
@@ -314,6 +317,13 @@ struct ResolvedLeaf {
     request_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
 }
 
+/// What makes two resolved handles the same logical series.
+#[derive(PartialEq, Eq, Hash)]
+enum RosterKey {
+    Labels(Labels),
+    Fingerprint(u128),
+}
+
 /// Drain [`SeriesSource::resolve`] into a unique-per-labelset series roster
 /// plus the per-logical-series grouped source
 /// handles needed to load samples across buckets.
@@ -323,31 +333,48 @@ struct ResolvedLeaf {
 /// series. The execution RFC's core data model expects the planner to collapse
 /// these onto one schema row per logical series while preserving every bucket
 /// handle for the leaf operator's raw-sample fetch path.
+///
+/// With a `projection`, rows carry only the projected labels and are keyed
+/// by series fingerprint, so series sharing projected labels stay distinct
+/// rows; the parent must read nothing but those labels.
 async fn resolve_leaf<S>(
     source: &Arc<S>,
     selector: &parser::VectorSelector,
     time_range: TimeRange,
     reservation: &MemoryReservation,
+    projection: Option<&Arc<[String]>>,
 ) -> Result<ResolvedLeaf, PlanError>
 where
     S: SeriesSource + Send + Sync + 'static,
 {
-    let mut stream: BoxStream<'_, Result<ResolvedSeriesChunk, QueryError>> =
-        Box::pin(source.resolve(selector, time_range));
+    let mut stream: BoxStream<'_, Result<ResolvedSeriesChunk, QueryError>> = match projection {
+        Some(projection) => {
+            Box::pin(source.resolve_projected(selector, time_range, projection.clone()))
+        }
+        None => Box::pin(source.resolve(selector, time_range)),
+    };
 
-    let mut roster_index: HashMap<Labels, usize, foldhash::fast::RandomState> = HashMap::default();
+    let mut roster_index: HashMap<RosterKey, usize, foldhash::fast::RandomState> =
+        HashMap::default();
     let mut labels: Vec<Labels> = Vec::new();
     let mut refs: Vec<Vec<ResolvedSeriesRef>> = Vec::new();
 
     while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(map_source_err)?;
+        let mut chunk = chunk_res.map_err(map_source_err)?;
+        if let Some(projection) = projection {
+            chunk = chunk.projected(projection);
+        }
         debug_assert_eq!(chunk.labels.len(), chunk.series.len());
-        for (label, sref) in chunk.labels.iter().zip(chunk.series.iter()) {
+        for (position, (label, sref)) in chunk.labels.iter().zip(chunk.series.iter()).enumerate() {
             debug_assert!(label.as_slice().is_sorted(), "unsorted labels {label:?}");
-            match roster_index.entry(label.clone()) {
+            let key = match &chunk.fingerprints {
+                Some(fingerprints) => RosterKey::Fingerprint(fingerprints[position]),
+                None => RosterKey::Labels(label.clone()),
+            };
+            match roster_index.entry(key) {
                 Entry::Occupied(row) => refs[*row.get()].push(sref.clone()),
                 Entry::Vacant(row) => {
-                    labels.push(row.key().clone());
+                    labels.push(label.clone());
                     row.insert(refs.len());
                     refs.push(vec![sref.clone()]);
                 }
@@ -393,6 +420,9 @@ struct BuildEnv<'a, S> {
     source: &'a Arc<S>,
     reservation: &'a MemoryReservation,
     ctx: &'a LoweringContext,
+    /// Labels the leaves below may resolve to; set only by an aggregation
+    /// over a [`projection_chain`].
+    projection: Option<&'a Arc<[String]>>,
 }
 
 impl<S> Clone for BuildEnv<'_, S> {
@@ -430,6 +460,7 @@ where
         source,
         reservation,
         ctx,
+        projection,
     } = env;
     match plan {
         LogicalPlan::Scalar(v) => {
@@ -455,7 +486,8 @@ where
         } => {
             let lookback = lookback_ms.unwrap_or(ctx.lookback_delta_ms);
             let time_range = selector_time_range(grid, lookback, 0, at, offset);
-            let resolved = resolve_leaf(source, &selector, time_range, reservation).await?;
+            let resolved =
+                resolve_leaf(source, &selector, time_range, reservation, projection).await?;
             let series_count = resolved.schema.len() as u64;
             let at_parser = at.map(to_parser_at);
             let off_parser = to_parser_offset(offset);
@@ -616,6 +648,7 @@ where
         source,
         reservation,
         ctx,
+        projection,
     } = env;
     let rollup = match child {
         LogicalPlan::MatrixSelector {
@@ -625,7 +658,8 @@ where
             at,
         } => {
             let time_range = selector_time_range(grid, 0, range_ms, at, offset);
-            let resolved = resolve_leaf(source, &selector, time_range, reservation).await?;
+            let resolved =
+                resolve_leaf(source, &selector, time_range, reservation, projection).await?;
             let series_count = resolved.schema.len() as u64;
             let at_parser = at.map(to_parser_at);
             let off_parser = to_parser_offset(offset);
@@ -835,9 +869,18 @@ where
     let BuildEnv {
         reservation, ctx, ..
     } = env;
-    let child_op = build_node(child, env, grid, false, stats).await?;
+    let projection = aggregate_projection(&kind, param.as_ref(), &grouping, &child, ctx);
+    let child_env = BuildEnv {
+        projection: projection.as_ref(),
+        ..env
+    };
+    let child_op = build_node(child, child_env, grid, false, stats).await?;
+    let param_env = BuildEnv {
+        projection: None,
+        ..env
+    };
     let param_op = if let Some(param) = param {
-        Some(build_node(param, env, grid, false, stats).await?)
+        Some(build_node(param, param_env, grid, false, stats).await?)
     } else {
         None
     };
@@ -864,6 +907,60 @@ where
     )
     .map_err(map_construct_err)?;
     Ok(wrap_op(Box::new(op), "Aggregate", ctx))
+}
+
+/// The `by` labels when they are all an aggregation reads of its input
+/// series, so its leaf can resolve only those.
+///
+/// `__name__` in `by` is never projected: a chain that drops the name would
+/// then see series it no longer tells apart by labels.
+fn aggregate_projection(
+    kind: &AggregateKind,
+    param: Option<&LogicalPlan>,
+    grouping: &AggregateGrouping,
+    child: &LogicalPlan,
+    ctx: &LoweringContext,
+) -> Option<Arc<[String]>> {
+    let reducer = matches!(
+        kind,
+        AggregateKind::Sum
+            | AggregateKind::Avg
+            | AggregateKind::Min
+            | AggregateKind::Max
+            | AggregateKind::Count
+            | AggregateKind::Stddev
+            | AggregateKind::Stdvar
+            | AggregateKind::Group
+    );
+    let AggregateGrouping::By(labels) = grouping else {
+        return None;
+    };
+    if !ctx.label_projection
+        || !reducer
+        || param.is_some()
+        || labels.iter().any(|label| label == METRIC_NAME)
+        || !projection_chain(child)
+    {
+        return None;
+    }
+    let mut names = labels.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    Some(Arc::from(names))
+}
+
+/// Per-series functions down to a selector with one exact metric name,
+/// which keeps every name-dropping step in the chain collision-free.
+fn projection_chain(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::VectorSelector { selector, .. } => exact_metric_name(selector).is_some(),
+        LogicalPlan::Rollup { child, .. } => match child.as_ref() {
+            LogicalPlan::MatrixSelector { selector, .. } => exact_metric_name(selector).is_some(),
+            _ => false,
+        },
+        LogicalPlan::InstantFn { child, .. } => projection_chain(child),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

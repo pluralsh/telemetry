@@ -344,6 +344,13 @@ pub(crate) fn posting_key(namespace: &Namespace, segment: SegmentId, label: &Lab
     bytes.freeze()
 }
 
+/// Prefix of every [`posting_key`] of label `name`, each followed by its value.
+pub(crate) fn posting_name_prefix(namespace: &Namespace, segment: SegmentId, name: &str) -> Bytes {
+    let mut bytes = record_prefix(namespace, segment, RecordType::LabelPostings);
+    common::serde::terminated_bytes::serialize(name.as_bytes(), &mut bytes);
+    bytes.freeze()
+}
+
 pub(crate) fn field_stats_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
     record_prefix(namespace, segment, RecordType::SearchFieldStats).freeze()
 }

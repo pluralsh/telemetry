@@ -368,6 +368,17 @@ impl QueryReader for TsdbQueryReader {
         mini.forward_index_many(series_ids).await
     }
 
+    async fn series_fingerprints(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.series_fingerprints(series_ids).await
+    }
+
     async fn label_postings(
         &self,
         bucket: &TimeBucket,

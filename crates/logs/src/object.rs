@@ -11,6 +11,7 @@
 //! the blocks of many streams, ordered by stream, so a query selecting most
 //! of a segment's streams reads each object with one range scan.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::{Bound, Range};
@@ -149,8 +150,41 @@ pub(crate) struct ReadNeeds {
 pub(crate) struct RowSample {
     pub timestamp_ns: i64,
     pub line_len: u32,
-    /// Empty unless the decode asked for structured metadata.
+    /// The fields of its structured metadata the decode selected.
     pub structured_metadata: Fields,
+}
+
+/// Which structured metadata fields a decode without lines materializes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FieldSelection {
+    None,
+    /// Fields with these names, sorted and unique.
+    Only(Arc<[String]>),
+    All,
+}
+
+impl FieldSelection {
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// The selected fields of `fields`.
+    pub(crate) fn select<'a>(&self, fields: &'a Fields) -> Cow<'a, Fields> {
+        match self {
+            Self::None => Cow::Owned(Fields::default()),
+            Self::Only(names) => Cow::Owned(
+                Fields::from_canonical(
+                    fields
+                        .iter()
+                        .filter(|field| names.binary_search(&field.name).is_ok())
+                        .cloned()
+                        .collect(),
+                )
+                .expect("a subset of canonical fields is canonical"),
+            ),
+            Self::All => Cow::Borrowed(fields),
+        }
+    }
 }
 
 /// A block's meta value is `0x03 │ min ts │ max ts │ rows │ line bytes │
@@ -317,17 +351,17 @@ pub(crate) fn decode_block_rows(
 
 /// Passes `emit` the rows of a block in `[start_ns, end_ns]` whose index in
 /// the block passes `keep`, without their lines, reading only the block's
-/// meta value. Structured metadata is materialized only with `metadata`.
+/// meta value. Only the structured metadata `fields` selects is materialized.
 pub(crate) fn decode_samples_where(
     block: &Block,
     range: (i64, i64),
     keep: impl FnMut(u32) -> bool,
-    metadata: bool,
+    fields: &FieldSelection,
     mut emit: impl FnMut(u32, RowSample),
 ) -> Result<()> {
     with_meta(block, range, |_, columns| {
         let kept = columns.kept(range, keep);
-        columns.emit_samples(&kept, metadata, &mut emit)
+        columns.emit_samples(&kept, fields, &mut emit)
     })
 }
 
@@ -1251,27 +1285,76 @@ impl<'a> MetaColumns<'a> {
         Ok(())
     }
 
-    /// Emits rows `kept` without their lines.
+    /// Structured metadata of row `index` whose names `wanted` flags, by
+    /// index into the block's names.
+    fn selected_fields(&self, index: usize, wanted: &[bool]) -> Result<Fields> {
+        let mut reader = ColumnReader::at(self.body, self.rows[index].fields_at);
+        let field_count = reader.length("structured metadata count")?;
+        let mut fields = Vec::new();
+        let mut value_end = self.values_start(index);
+        for _ in 0..field_count {
+            let name = reader.length("structured metadata name index")?;
+            let value_start = value_end;
+            value_end += reader.length("structured metadata value length")?;
+            if wanted[name] {
+                let value = utf8(&self.values[value_start..value_end]).map_err(|error| {
+                    Error::Corrupt(format!("structured metadata value is not UTF-8: {error}"))
+                })?;
+                fields.push(Field {
+                    name: self.names[name].to_owned(),
+                    value: value.to_owned(),
+                });
+            }
+        }
+        canonical_fields(fields)
+    }
+
+    /// Emits rows `kept` without their lines, with the structured metadata
+    /// `fields` selects.
     fn emit_samples(
         &self,
         kept: &[u32],
-        metadata: bool,
+        fields: &FieldSelection,
         emit: &mut impl FnMut(u32, RowSample),
     ) -> Result<()> {
         let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else {
             return Ok(());
         };
-        let values = if metadata {
-            Some(self.values_between(first as usize, last as usize)?)
-        } else {
-            None
+        enum Decode<'v> {
+            Nothing,
+            Selected(Vec<bool>),
+            All(usize, &'v str),
+        }
+        let decode = match fields {
+            FieldSelection::None => Decode::Nothing,
+            FieldSelection::Only(names) => {
+                let wanted = self
+                    .names
+                    .iter()
+                    .map(|name| {
+                        names
+                            .binary_search_by(|wanted| (**wanted).cmp(name))
+                            .is_ok()
+                    })
+                    .collect::<Vec<_>>();
+                if wanted.contains(&true) {
+                    Decode::Selected(wanted)
+                } else {
+                    Decode::Nothing
+                }
+            }
+            FieldSelection::All => {
+                let (values_base, values) = self.values_between(first as usize, last as usize)?;
+                Decode::All(values_base, values)
+            }
         };
         for &index in kept {
             let index = index as usize;
             let row = &self.rows[index];
-            let structured_metadata = match values {
-                Some((values_base, values)) => self.fields(index, values, values_base)?,
-                None => Fields::default(),
+            let structured_metadata = match &decode {
+                Decode::Nothing => Fields::default(),
+                Decode::Selected(wanted) => self.selected_fields(index, wanted)?,
+                Decode::All(values_base, values) => self.fields(index, values, *values_base)?,
             };
             emit(
                 index as u32,
@@ -1474,13 +1557,17 @@ mod tests {
         Block::new(block.meta.clone(), Some(Bytes::copy_from_slice(lines)))
     }
 
-    fn samples_of(block: &Block, range: (i64, i64), metadata: bool) -> Vec<(u32, RowSample)> {
+    fn samples_of(
+        block: &Block,
+        range: (i64, i64),
+        fields: &FieldSelection,
+    ) -> Vec<(u32, RowSample)> {
         let mut samples = Vec::new();
         decode_samples_where(
             block,
             range,
             |_| true,
-            metadata,
+            fields,
             |index, sample| samples.push((index, sample)),
         )
         .unwrap();
@@ -1575,7 +1662,7 @@ mod tests {
         let rows = mixed_rows();
         let block = encode_block(&rows).unwrap();
         let meta_only = Block::new(block.meta.clone(), None);
-        let expected = |metadata: bool| {
+        let expected = |fields: &FieldSelection| {
             rows.iter()
                 .enumerate()
                 .filter(|(_, row)| (11..=13).contains(&row.timestamp_ns))
@@ -1585,20 +1672,34 @@ mod tests {
                         RowSample {
                             timestamp_ns: row.timestamp_ns,
                             line_len: row.line.len() as u32,
-                            structured_metadata: if metadata {
-                                row.structured_metadata.clone()
-                            } else {
-                                Fields::default()
-                            },
+                            structured_metadata: fields
+                                .select(&row.structured_metadata)
+                                .into_owned(),
                         },
                     )
                 })
                 .collect::<Vec<_>>()
         };
-        for metadata in [false, true] {
+        let names = rows
+            .iter()
+            .flat_map(|row| row.structured_metadata.iter())
+            .map(|field| field.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut selections = vec![
+            FieldSelection::None,
+            FieldSelection::All,
+            FieldSelection::Only(["absent".to_owned()].into()),
+        ];
+        selections.extend(
+            names
+                .iter()
+                .map(|name| FieldSelection::Only([name.clone(), "zz".to_owned()].into())),
+        );
+        for fields in selections {
             assert_eq!(
-                samples_of(&meta_only, (11, 13), metadata),
-                expected(metadata)
+                samples_of(&meta_only, (11, 13), &fields),
+                expected(&fields),
+                "{fields:?}"
             );
         }
         assert!(matches!(decode_block(&meta_only), Err(Error::Invalid(_))));
@@ -1915,6 +2016,7 @@ mod tests {
             ),
             sorted in any::<bool>(),
             range in (-60i64..60, 0i64..60),
+            selected in prop::collection::btree_set("[a-d]{1,3}", 0..4),
         ) {
             let mut rows: Vec<_> = rows
                 .into_iter()
@@ -1943,12 +2045,26 @@ mod tests {
                 .iter()
                 .map(|(index, row)| (*index, row.timestamp_ns, row.line.len() as u32))
                 .collect();
-            prop_assert_eq!(decode_where(&block, (start, end), |index| index % 3 != 1).unwrap(), expected);
+            prop_assert_eq!(decode_where(&block, (start, end), |index| index % 3 != 1).unwrap(), expected.clone());
             let mut sampled = Vec::new();
-            decode_samples_where(&block, (start, end), |index| index % 3 != 1, false, |index, sample| {
+            decode_samples_where(&block, (start, end), |index| index % 3 != 1, &FieldSelection::None, |index, sample| {
                 sampled.push((index, sample.timestamp_ns, sample.line_len));
             }).unwrap();
             prop_assert_eq!(sampled, samples);
+            for fields in [
+                FieldSelection::Only(selected.iter().cloned().collect::<Vec<_>>().into()),
+                FieldSelection::All,
+            ] {
+                let mut projected = Vec::new();
+                decode_samples_where(&block, (start, end), |index| index % 3 != 1, &fields, |index, sample| {
+                    projected.push((index, sample.structured_metadata));
+                }).unwrap();
+                let wanted: Vec<_> = expected
+                    .iter()
+                    .map(|(index, row)| (*index, fields.select(&row.structured_metadata).into_owned()))
+                    .collect();
+                prop_assert_eq!(projected, wanted);
+            }
         }
 
         #[test]

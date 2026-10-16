@@ -13,8 +13,8 @@ use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
 use crate::postings_cache::PostingsCache;
 use crate::storage::{
-    Store, insert_forward_index, insert_series_id, merge_inverted_index, merge_samples,
-    put_bucket_generation,
+    Store, insert_forward_index, insert_series_fingerprint, insert_series_id, merge_inverted_index,
+    merge_samples, put_bucket_generation,
 };
 use crate::tsdb_metrics;
 
@@ -162,6 +162,17 @@ impl TsdbFlusher {
         }
 
         for entry in frozen.forward_index.series.iter() {
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
+                insert_series_fingerprint(
+                    &frozen.namespace,
+                    frozen.bucket,
+                    *entry.key(),
+                    entry.value().labels.series_fingerprint(),
+                    ttl,
+                ),
+            );
             push_op(
                 &mut ops,
                 &mut estimated_bytes,

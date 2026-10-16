@@ -162,6 +162,11 @@ pub struct Config {
     /// Discovery rollup period, a whole multiple of the segment duration;
     /// `null` disables it.
     pub discovery_rollup_seconds: Option<u64>,
+    /// Label names new streams are grouped by first when they are given
+    /// stream IDs, so selectors on them read narrow ID ranges; Console's
+    /// cluster and namespace labels by default, `[]` to group by value
+    /// counts alone.
+    pub stream_locality_labels: Vec<String>,
     /// How long data is kept, counted from ingestion; 14 days by default,
     /// `null` keeps it forever.
     pub retention_seconds: Option<u64>,
@@ -195,6 +200,7 @@ impl Default for Config {
             storage: core.storage,
             segment_duration_seconds: core.segment_duration.as_secs(),
             discovery_rollup_seconds: core.discovery_rollup.map(|value| value.as_secs()),
+            stream_locality_labels: core.stream_locality_labels,
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
@@ -267,6 +273,11 @@ impl Config {
                 "elasticsearch field names cannot be empty".to_owned(),
             ));
         }
+        if self.stream_locality_labels.iter().any(String::is_empty) {
+            return Err(ConfigError::Validation(
+                "stream_locality_labels cannot contain empty names".to_owned(),
+            ));
+        }
         if let Some(rollup) = self.discovery_rollup_seconds
             && (rollup == 0 || rollup % self.segment_duration_seconds != 0)
         {
@@ -336,6 +347,7 @@ impl Config {
             storage: self.storage.clone(),
             segment_duration: Duration::from_secs(self.segment_duration_seconds),
             discovery_rollup: self.discovery_rollup_seconds.map(Duration::from_secs),
+            stream_locality_labels: self.stream_locality_labels.clone(),
             retention: self.retention_seconds.map(Duration::from_secs),
             page: plural_logs::PageConfig {
                 target_size_bytes: self.page.target_size_bytes,

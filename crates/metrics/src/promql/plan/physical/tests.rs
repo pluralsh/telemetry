@@ -53,6 +53,7 @@ impl SeriesSource for MockSource {
             bucket_id: 1,
             labels: Arc::from(labels),
             series: Arc::from(refs),
+            fingerprints: None,
         };
         stream::iter(vec![Ok(chunk)]).right_stream()
     }
@@ -201,6 +202,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
             bucket_id: 10,
             labels: Arc::from(vec![labels_of(&[("__name__", "m"), ("pod", "a")])]),
             series: Arc::from(vec![ResolvedSeriesRef::new(10, 7, name.clone())]),
+            fingerprints: None,
         },
         ResolvedSeriesChunk {
             bucket_id: 20,
@@ -212,6 +214,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
                 ResolvedSeriesRef::new(20, 11, name.clone()),
                 ResolvedSeriesRef::new(20, 12, name.clone()),
             ]),
+            fingerprints: None,
         },
     ]));
     let reservation = MemoryReservation::new(1 << 20);
@@ -224,6 +227,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
             &make_selector("m"),
             TimeRange::new(0, 1_000),
             &reservation,
+            None,
         ))
         .expect("resolved leaf");
 
@@ -253,6 +257,121 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
     assert_ne!(
         resolved.schema.fingerprint(0),
         resolved.schema.fingerprint(1)
+    );
+}
+
+#[test]
+fn should_keep_series_sharing_projected_labels_as_distinct_rows() {
+    // given: two series that differ only in a label outside the projection,
+    // one of them in two buckets
+    let name: Arc<str> = Arc::from("m");
+    let a = labels_of(&[("__name__", "m"), ("job", "x"), ("pod", "a")]);
+    let b = labels_of(&[("__name__", "m"), ("job", "x"), ("pod", "b")]);
+    let source = Arc::new(ChunkedResolveSource::new(vec![
+        ResolvedSeriesChunk {
+            bucket_id: 10,
+            labels: Arc::from(vec![a.clone()]),
+            series: Arc::from(vec![ResolvedSeriesRef::new(10, 7, name.clone())]),
+            fingerprints: None,
+        },
+        ResolvedSeriesChunk {
+            bucket_id: 20,
+            labels: Arc::from(vec![a, b]),
+            series: Arc::from(vec![
+                ResolvedSeriesRef::new(20, 11, name.clone()),
+                ResolvedSeriesRef::new(20, 12, name.clone()),
+            ]),
+            fingerprints: None,
+        },
+    ]));
+    let reservation = MemoryReservation::new(1 << 20);
+    let projection: Arc<[String]> = Arc::from(vec!["job".to_string()]);
+
+    // when
+    let resolved = mk_rt()
+        .block_on(resolve_leaf(
+            &source,
+            &make_selector("m"),
+            TimeRange::new(0, 1_000),
+            &reservation,
+            Some(&projection),
+        ))
+        .expect("resolved leaf");
+
+    // then: rows carry only `job`, but stay one per series
+    assert_eq!(resolved.schema.len(), 2);
+    assert_eq!(resolved.schema.labels(0), &labels_of(&[("job", "x")]));
+    assert_eq!(resolved.schema.labels(1), &labels_of(&[("job", "x")]));
+    assert_eq!(
+        resolved.request_series[0].as_ref(),
+        &[
+            ResolvedSeriesRef::new(10, 7, name.clone()),
+            ResolvedSeriesRef::new(20, 11, name.clone()),
+        ]
+    );
+    assert_eq!(
+        resolved.request_series[1].as_ref(),
+        &[ResolvedSeriesRef::new(20, 12, name)]
+    );
+}
+
+#[test]
+fn should_project_only_reducers_by_labels_over_per_series_chains() {
+    let ctx = make_ctx();
+    let projection_of = |query: &str| {
+        let plan = crate::promql::plan::lowering::lower(&parse(query), &ctx).expect("lower");
+        let LogicalPlan::Aggregate {
+            kind,
+            child,
+            param,
+            grouping,
+        } = plan
+        else {
+            panic!("{query} is not an aggregation");
+        };
+        aggregate_projection(&kind, param.as_deref(), &grouping, &child, &ctx)
+            .map(|names| names.to_vec())
+    };
+    let names = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+
+    assert_eq!(
+        projection_of("sum by (pod, job, pod) (rate(m[5m]))"),
+        names(&["job", "pod"])
+    );
+    assert_eq!(projection_of("max by (job) (abs(m))"), names(&["job"]));
+    assert_eq!(projection_of("count by () (m)"), names(&[]));
+    assert_eq!(projection_of("count(m)"), names(&[]));
+    assert_eq!(
+        projection_of("stddev by (job) (last_over_time(m[1m]))"),
+        names(&["job"])
+    );
+    for query in [
+        "sum without (pod) (m)",
+        "sum by (__name__) (m)",
+        "topk by (job) (2, m)",
+        "quantile by (job) (0.5, m)",
+        "sum by (job) (m * 2)",
+        "sum by (job) (label_replace(m, \"a\", \"$1\", \"b\", \"(.*)\"))",
+        "sum by (job) (rate(m[5m:1m]))",
+        "sum by (job) ({__name__=~\"m|n\"})",
+        "sum by (job) (sum by (job, pod) (m))",
+    ] {
+        assert_eq!(projection_of(query), None, "{query}");
+    }
+    let off = ctx.clone().with_label_projection(false);
+    let plan = crate::promql::plan::lowering::lower(&parse("sum by (job) (m)"), &off).unwrap();
+    let LogicalPlan::Aggregate {
+        kind,
+        child,
+        param,
+        grouping,
+    } = plan
+    else {
+        panic!("not an aggregation");
+    };
+    assert_eq!(
+        aggregate_projection(&kind, param.as_deref(), &grouping, &child, &off),
+        None
     );
 }
 

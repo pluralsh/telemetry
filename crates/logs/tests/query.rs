@@ -21,6 +21,7 @@ fn config(path: &str) -> Config {
         }),
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),
+        stream_locality_labels: Vec::new(),
         retention: None,
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
@@ -1334,6 +1335,90 @@ async fn matrix(db: &LogDb, namespace: &Namespace, query: &str) -> Vec<plural_lo
         panic!("expected matrix for {query}");
     };
     matrix
+}
+
+/// Line-free counts grouped by a label read only the structured metadata
+/// that can become it: a stream label shadows metadata of its name, which
+/// is promoted as `<name>_extracted`.
+#[tokio::test]
+async fn grouped_line_free_counts_promote_only_the_metadata_they_group_by() {
+    let db = LogDb::open(config("query-grouped-metadata")).await.unwrap();
+    let namespace = Namespace::new("tenant").unwrap();
+    let entry = |second: i64, fields: &[(&str, &str)]| {
+        let fields = fields
+            .iter()
+            .map(|(name, value)| Field::new(*name, *value))
+            .collect();
+        LogEntry::with_structured_metadata(second * S, "line", Fields::new(fields).unwrap())
+    };
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(
+                labels("api", "prod"),
+                vec![
+                    entry(1, &[("env", "staging"), ("pod", "p1")]),
+                    entry(2, &[("pod", "p1")]),
+                    entry(3, &[("pod", "p2")]),
+                ],
+            ),
+            LogBatch::new(
+                labels("worker", "prod"),
+                vec![entry(1, &[("pod", "p2")]), entry(2, &[])],
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    let counts = async |grouping: &str| {
+        let query = format!(r#"sum by ({grouping}) (count_over_time({{env="prod"}}[10s]))"#);
+        let QueryResult::Vector(vector) = db
+            .query(
+                &namespace,
+                &QueryRequest::instant(query, 5 * S),
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected vector");
+        };
+        let mut counts = vector
+            .into_iter()
+            .map(|sample| {
+                let labels = sample
+                    .labels
+                    .iter()
+                    .map(|label| format!("{}={}", label.name, label.value))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (labels, sample.sample.value)
+            })
+            .collect::<Vec<_>>();
+        counts.sort_by(|a, b| a.0.cmp(&b.0));
+        counts
+    };
+    let expect = |counts: &[(&str, f64)]| {
+        counts
+            .iter()
+            .map(|(labels, count)| ((*labels).to_owned(), *count))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counts("env").await, expect(&[("env=prod", 5.0)]));
+    assert_eq!(
+        counts("env_extracted").await,
+        expect(&[("", 4.0), ("env_extracted=staging", 1.0)])
+    );
+    assert_eq!(
+        counts("pod").await,
+        expect(&[("", 1.0), ("pod=p1", 2.0), ("pod=p2", 2.0)])
+    );
+    assert_eq!(
+        counts("app").await,
+        expect(&[("app=api", 3.0), ("app=worker", 2.0)])
+    );
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

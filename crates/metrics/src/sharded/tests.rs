@@ -690,6 +690,9 @@ async fn binary_join_across_shards_matches_unsharded_database() {
 struct InProcessShards {
     peers: Arc<std::sync::OnceLock<std::collections::BTreeMap<ShardId, Arc<ShardedMetrics>>>>,
     requested: Arc<std::sync::Mutex<Vec<ShardId>>>,
+    /// Drops label projections, as a server or client predating them would.
+    unprojected: Arc<std::sync::atomic::AtomicBool>,
+    fingerprinted_chunks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InProcessShards {
@@ -703,11 +706,21 @@ impl InProcessShards {
 impl crate::MetricsShardQuery for InProcessShards {
     fn resolve(
         &self,
-        request: proto::metrics::internal::v1::ResolveRequest,
+        mut request: proto::metrics::internal::v1::ResolveRequest,
     ) -> crate::WireStream<proto::metrics::internal::v1::ResolvedChunk> {
+        use std::sync::atomic::Ordering;
         let peer = self.peer(request.read.as_ref());
+        if self.unprojected.load(Ordering::Relaxed) {
+            request.projection = None;
+        }
+        let fingerprinted = Arc::clone(&self.fingerprinted_chunks);
         stream::once(async move { peer.serve_resolve(request).await })
             .try_flatten()
+            .inspect_ok(move |chunk| {
+                if !chunk.fingerprints.is_empty() {
+                    fingerprinted.fetch_add(1, Ordering::Relaxed);
+                }
+            })
             .boxed()
     }
 
@@ -923,6 +936,130 @@ async fn reader_groups_answer_like_a_reader_with_every_shard_open() {
         requested.iter().all(|shard| *shard == ShardId::new(1)),
         "the coordinator's own shard went over the transport: {requested:?}"
     );
+    everything.close().await.unwrap();
+    for group in groups.values() {
+        group.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn remote_shards_answer_projected_aggregations_whether_or_not_they_project() {
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: SlateDbStorageConfig {
+            path: "projection".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+            disk: Default::default(),
+        },
+        ..Default::default()
+    };
+    let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+    let namespace = Namespace::new("projection").unwrap();
+    let writers =
+        ShardedMetrics::open_writers(config.clone(), options, [ShardId::new(0), ShardId::new(1)])
+            .await
+            .unwrap();
+    let now = common::time::now_ms() / 60_000 * 60_000;
+    let samples = minutely(now - 30 * 60_000, now);
+    // Each shard holds several series per job.
+    let mut series = Vec::new();
+    for shard in [0, 1] {
+        for (job, replica) in [("api", "0"), ("api", "1"), ("web", "0")] {
+            series.push(series_on_shard(
+                &writers,
+                "requests_total",
+                shard,
+                &[("job", job), ("replica", replica)],
+                samples.clone(),
+            ));
+        }
+    }
+    writers
+        .write(&assignment(2), &namespace, series, Visibility::Durable)
+        .await
+        .unwrap();
+    writers.close().await.unwrap();
+
+    let open = |shards: Vec<ShardId>| {
+        ShardedMetrics::open_readers(
+            config.clone(),
+            options,
+            shards,
+            DbReaderOptions {
+                skip_wal_replay: false,
+                ..DbReaderOptions::default()
+            },
+            64 * 1024 * 1024,
+        )
+    };
+    let everything = open(vec![ShardId::new(0), ShardId::new(1)]).await.unwrap();
+    let transport = InProcessShards::default();
+    let mut groups = std::collections::BTreeMap::new();
+    for shard in [ShardId::new(0), ShardId::new(1)] {
+        let group = open(vec![shard]).await.unwrap();
+        assert!(group.shards().scope_readers_to(shard));
+        assert!(group.connect_remote_shards(Arc::new(transport.clone())));
+        groups.insert(shard, Arc::new(group));
+    }
+    assert!(transport.peers.set(groups.clone()).is_ok());
+    let coordinator = &groups[&ShardId::new(0)];
+
+    let queries = [
+        "sum by (job) (rate(requests_total[5m]))",
+        "count by (job) (requests_total)",
+        "max by (job) (sum by (job, instance) (requests_total))",
+        "avg(requests_total)",
+    ];
+    // Projecting servers first: their selector caches then cannot serve the
+    // projected reads from full resolutions.
+    for unprojected in [false, true] {
+        transport.unprojected.store(unprojected, Ordering::Relaxed);
+        let fingerprinted = transport.fingerprinted_chunks.load(Ordering::Relaxed);
+        for query in queries {
+            let expected = normalized(
+                everything
+                    .query(&namespace, query, Some(at(now)))
+                    .await
+                    .unwrap(),
+            );
+            let actual = normalized(
+                coordinator
+                    .query(&namespace, query, Some(at(now)))
+                    .await
+                    .unwrap(),
+            );
+            assert!(!expected.is_empty(), "query: {query}");
+            assert_eq!(
+                actual, expected,
+                "query: {query}, unprojected: {unprojected}"
+            );
+            let range = at(now - 20 * 60_000)..=at(now);
+            let step = Duration::from_secs(60);
+            assert_eq!(
+                range_normalized(
+                    coordinator
+                        .query_range(&namespace, query, range.clone(), step)
+                        .await
+                        .unwrap()
+                ),
+                range_normalized(
+                    everything
+                        .query_range(&namespace, query, range, step)
+                        .await
+                        .unwrap()
+                ),
+                "query: {query}, unprojected: {unprojected}"
+            );
+        }
+        let sent = transport.fingerprinted_chunks.load(Ordering::Relaxed) - fingerprinted;
+        assert_eq!(sent > 0, !unprojected, "fingerprinted chunks: {sent}");
+    }
     everything.close().await.unwrap();
     for group in groups.values() {
         group.close().await.unwrap();

@@ -24,7 +24,10 @@ use crate::postings_cache::PostingsCache;
 use crate::query::{BucketQueryReader, CachedSeriesResolution};
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
-use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, TimeSeriesKey};
+use crate::serde::key::{
+    ForwardIndexKey, InvertedIndexKey, SeriesFingerprintKey, TimeSeriesKey,
+    decode_series_fingerprint,
+};
 use crate::util::Result;
 
 /// Per-bucket query reader over any storage read handle — a
@@ -163,8 +166,12 @@ where
 /// visible later.
 pub(crate) struct ForwardIndexCache {
     specs: TableCache<(Namespace, TimeBucket), SeriesSpec>,
+    fingerprints: TableCache<(Namespace, TimeBucket), u128>,
     resolutions: moka::future::Cache<ResolutionCacheKey, Arc<CachedSeriesResolution>>,
 }
+
+/// Charged per cached fingerprint, with the table's hash-map overhead.
+const FINGERPRINT_ENTRY_BYTES: u64 = 32;
 
 type ResolutionCacheKey = (Namespace, TimeBucket, u64, Arc<str>);
 
@@ -183,11 +190,13 @@ fn spec_bytes(spec: &SeriesSpec) -> u64 {
 impl ForwardIndexCache {
     pub(crate) fn new(capacity_bytes: u64) -> Self {
         let resolution_bytes = capacity_bytes / 4;
+        let fingerprint_bytes = capacity_bytes / 16;
         Self {
             specs: TableCache::new(
-                capacity_bytes.saturating_sub(resolution_bytes),
+                capacity_bytes.saturating_sub(resolution_bytes + fingerprint_bytes),
                 FORWARD_CACHE_IDLE_TIMEOUT,
             ),
+            fingerprints: TableCache::new(fingerprint_bytes, FORWARD_CACHE_IDLE_TIMEOUT),
             resolutions: moka::future::Cache::builder()
                 .max_capacity(resolution_bytes)
                 .time_to_idle(FORWARD_CACHE_IDLE_TIMEOUT)
@@ -204,6 +213,7 @@ impl ForwardIndexCache {
                             64 + key.len()
                                 + 4 * resolution.series_ids.len()
                                 + 40 * resolution.labels.len()
+                                + resolution.fingerprints.as_ref().map_or(0, |f| 16 * f.len())
                                 + labels,
                         )
                         .unwrap_or(u32::MAX)
@@ -449,7 +459,11 @@ impl<R: StorageRead> MiniQueryReader<R> {
             replica.probed_at.store(generation, Ordering::Release);
             return Ok(replica.cache.read_seq());
         }
-        let next = self.first_unseen_series(watermark.unwrap_or(0)).await?;
+        let next = if crate::read_tuning::read_tuning().scan_watermark {
+            self.series_after_last().await?
+        } else {
+            self.first_unseen_series(watermark.unwrap_or(0)).await?
+        };
         *watermark = Some(next);
         replica.cache.stamp(self.bucket);
         replica.probed_at.store(generation, Ordering::Release);
@@ -500,6 +514,19 @@ impl<R: StorageRead> MiniQueryReader<R> {
             }
         }
         Ok(unseen as SeriesId)
+    }
+
+    /// The first unseen series ID as one past the last visible one, which
+    /// dense, in-order allocation makes equal to [`Self::first_unseen_series`]
+    /// from zero, in one descending scan rather than rounds of point gets.
+    async fn series_after_last(&self) -> Result<SeriesId> {
+        let last = io_trace_async(
+            IoKindLocal::ForwardIndexFetch,
+            self.snapshot
+                .last_forward_index_series(&self.namespace, &self.bucket),
+        )
+        .await?;
+        Ok(last.map_or(0, |last| last.saturating_add(1)))
     }
 
     async fn series_exist(&self, ids: &[u64]) -> Result<Vec<bool>> {
@@ -804,6 +831,46 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
             .insert(|| (self.namespace.clone(), self.bucket), &table, found);
         Ok(out)
     }
+
+    async fn series_fingerprints(
+        &self,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        let Some(cache) = &self.forward_cache else {
+            return self.fetch_series_fingerprints(series_ids).await.map(Some);
+        };
+        let table = cache
+            .fingerprints
+            .table((self.namespace.clone(), self.bucket));
+        let mut out = Vec::with_capacity(series_ids.len());
+        let mut missing = Vec::new();
+        {
+            let entries = table.read();
+            for (position, &series_id) in series_ids.iter().enumerate() {
+                let hit = entries.get(&series_id).copied();
+                if hit.is_none() {
+                    missing.push((position, series_id));
+                }
+                out.push(hit);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(Some(out));
+        }
+        let missing_ids: Vec<SeriesId> = missing.iter().map(|&(_, id)| id).collect();
+        let fetched = self.fetch_series_fingerprints(&missing_ids).await?;
+        let mut found = Vec::new();
+        for ((position, series_id), fingerprint) in missing.into_iter().zip(fetched) {
+            if let Some(fingerprint) = fingerprint {
+                found.push((series_id, fingerprint, FINGERPRINT_ENTRY_BYTES));
+            }
+            out[position] = fingerprint;
+        }
+        cache
+            .fingerprints
+            .insert(|| (self.namespace.clone(), self.bucket), &table, found);
+        Ok(Some(out))
+    }
 }
 
 impl<R: StorageRead> MiniQueryReader<R> {
@@ -968,16 +1035,6 @@ impl<R: StorageRead> MiniQueryReader<R> {
         &self,
         series_ids: &[SeriesId],
     ) -> Result<Vec<Option<SeriesSpec>>> {
-        if !scan_worthwhile(series_ids) {
-            let fetches: Vec<_> = series_ids
-                .iter()
-                .map(|&series_id| self.forward_index_one(series_id))
-                .collect();
-            return futures::stream::iter(fetches)
-                .buffered(crate::query::FORWARD_INDEX_MANY_CONCURRENCY)
-                .try_collect()
-                .await;
-        }
         let key = |series_id| {
             ForwardIndexKey {
                 namespace: self.namespace.clone(),
@@ -986,10 +1043,103 @@ impl<R: StorageRead> MiniQueryReader<R> {
             }
             .encode()
         };
-        self.scan_series(key, series_ids, IoKindLocal::ForwardIndexFetch, |value| {
-            Ok(Some(ForwardIndexValue::decode(value)?.into()))
-        })
+        self.fetch_clustered(
+            series_ids,
+            FORWARD_SCAN_MAX_GAP,
+            key,
+            IoKindLocal::ForwardIndexFetch,
+            |value| Ok(Some(ForwardIndexValue::decode(value)?.into())),
+            |series_id| self.forward_index_one(series_id),
+        )
         .await
+    }
+
+    async fn fetch_series_fingerprints(
+        &self,
+        series_ids: &[SeriesId],
+    ) -> Result<Vec<Option<u128>>> {
+        let kind = IoKindLocal::SeriesFingerprintFetch;
+        let key = |series_id| {
+            SeriesFingerprintKey {
+                namespace: self.namespace.clone(),
+                bucket: self.bucket,
+                series_id,
+            }
+            .encode()
+        };
+        self.fetch_clustered(
+            series_ids,
+            FINGERPRINT_SCAN_MAX_GAP,
+            key,
+            kind,
+            |value| Ok(Some(decode_series_fingerprint(value)?)),
+            |series_id| {
+                let key = key(series_id);
+                async move {
+                    let Some(value) = io_trace_async(kind, self.snapshot.get(key)).await? else {
+                        return Ok(None);
+                    };
+                    crate::promql::trace::record_bytes(kind, value.len() as u64);
+                    Ok(Some(decode_series_fingerprint(&value)?))
+                }
+            },
+        )
+        .await
+    }
+
+    /// The values of `series_ids` in order, range-scanning each cluster of
+    /// IDs at most `max_gap` apart and reading the rest with `get`. Each
+    /// cold point get costs a round trip and a whole block, so stepping
+    /// over a gap narrower than a block's entries reads no more bytes.
+    async fn fetch_clustered<T, F>(
+        &self,
+        series_ids: &[SeriesId],
+        max_gap: SeriesId,
+        key: impl Fn(SeriesId) -> Bytes,
+        kind: IoKindLocal,
+        decode: impl Fn(&[u8]) -> Result<T>,
+        get: impl Fn(SeriesId) -> F,
+    ) -> Result<Vec<T>>
+    where
+        T: Default + Clone,
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let tuning = crate::read_tuning::read_tuning();
+        let (clusters, singles) = if tuning.cluster_scans {
+            scan_clusters(series_ids, max_gap)
+        } else if scan_worthwhile(series_ids) {
+            (vec![(0..series_ids.len()).collect()], Vec::new())
+        } else {
+            (Vec::new(), (0..series_ids.len()).collect())
+        };
+        // Futures are built up front so the streams carry no closure, which
+        // trips async_trait's `Send` inference.
+        let (key, decode) = (&key, &decode);
+        let scans: Vec<_> = clusters
+            .iter()
+            .map(|cluster| {
+                let ids: Vec<SeriesId> = cluster.iter().map(|&at| series_ids[at]).collect();
+                async move { self.scan_series(key, &ids, kind, decode).await }
+            })
+            .collect();
+        let gets: Vec<_> = singles.iter().map(|&at| get(series_ids[at])).collect();
+        let scans = futures::stream::iter(scans)
+            .buffered(CLUSTER_SCAN_CONCURRENCY)
+            .try_collect::<Vec<_>>();
+        let gets = futures::stream::iter(gets)
+            .buffered(tuning.point_get_concurrency)
+            .try_collect::<Vec<_>>();
+        let (scanned, got) = futures::try_join!(scans, gets)?;
+        let mut out = vec![T::default(); series_ids.len()];
+        for (cluster, values) in clusters.iter().zip(scanned) {
+            for (&at, value) in cluster.iter().zip(values) {
+                out[at] = value;
+            }
+        }
+        for (&at, value) in singles.iter().zip(got) {
+            out[at] = value;
+        }
+        Ok(out)
     }
 }
 
@@ -1079,6 +1229,30 @@ const SCAN_MIN_SERIES: usize = 8;
 /// requested series. A cached point get costs about as much as stepping
 /// the scan iterator over seven keys, so scans stop paying off past that.
 const SCAN_MAX_SPAN_PER_SERIES: u64 = 6;
+
+/// About a 64 KiB block of forward-index entries, and of fingerprints.
+const FORWARD_SCAN_MAX_GAP: SeriesId = 64;
+const FINGERPRINT_SCAN_MAX_GAP: SeriesId = 512;
+/// Cluster scans in flight per batch, each with its own read-ahead.
+const CLUSTER_SCAN_CONCURRENCY: usize = 8;
+
+/// Positions of `series_ids` in ID order, split where consecutive IDs are
+/// more than `max_gap` apart: runs of at least [`SCAN_MIN_SERIES`] to scan,
+/// and the rest to point-read.
+fn scan_clusters(series_ids: &[SeriesId], max_gap: SeriesId) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..series_ids.len()).collect();
+    order.sort_unstable_by_key(|&at| series_ids[at]);
+    let mut clusters = Vec::new();
+    let mut singles = Vec::new();
+    for run in order.chunk_by(|&a, &b| series_ids[b] - series_ids[a] <= max_gap) {
+        if run.len() >= SCAN_MIN_SERIES {
+            clusters.push(run.to_vec());
+        } else {
+            singles.extend_from_slice(run);
+        }
+    }
+    (clusters, singles)
+}
 
 /// Whether `series_ids` is large and dense enough for a range scan to beat
 /// point gets.
@@ -1511,6 +1685,114 @@ mod tests {
 
         // then
         assert_eq!(found, vec![1000, 1000, 1000, 1000, 1000, 1000]);
+    }
+
+    #[tokio::test]
+    async fn should_find_the_same_watermark_by_reverse_scan_as_by_probing() {
+        for count in [0, 1, 37, 1000] {
+            // given - `count` series between an earlier and a later bucket
+            let bucket = TimeBucket::hour(60);
+            let storage = test_storage().await;
+            for (neighbour, ts) in [
+                (TimeBucket::hour(0), 100_000),
+                (TimeBucket::hour(120), 7_300_000),
+            ] {
+                let mini = load_with_config(neighbour, storage.clone(), 16).await;
+                let batch: Vec<Series> = (0..2000).map(|host| host_series("m", host, ts)).collect();
+                mini.ingest_batch(&batch, None).await.unwrap();
+                mini.flush_written().await.unwrap();
+            }
+            if count > 0 {
+                let mini = load_with_config(bucket, storage.clone(), 16).await;
+                let batch: Vec<Series> = (0..count)
+                    .map(|host| host_series("m", host, 3_700_000))
+                    .collect();
+                mini.ingest_batch(&batch, None).await.unwrap();
+                mini.flush_written().await.unwrap();
+            }
+            let reader = MiniQueryReader::new(
+                Namespace::default(),
+                bucket,
+                storage.snapshot().await.unwrap(),
+            );
+
+            // when
+            let scanned = reader.series_after_last().await.unwrap();
+            let probed = reader.first_unseen_series(0).await.unwrap();
+
+            // then
+            assert_eq!((scanned, probed), (count as SeriesId, count as SeriesId));
+        }
+    }
+
+    #[tokio::test]
+    async fn should_fetch_the_same_records_under_every_read_tuning() {
+        // given - 3 metrics written host-major, so each one's IDs are 3
+        // apart, and one on every 97th host, too sparse to cluster
+        let bucket = TimeBucket::hour(60);
+        let storage = test_storage().await;
+        let mini = load_with_config(bucket, storage.clone(), 16).await;
+        let batch: Vec<Series> = (0..1200)
+            .flat_map(|host| {
+                let rare = (host % 97 == 0).then(|| host_series("rare", host, 3_700_000));
+                (0..3)
+                    .map(move |m| host_series(&format!("m{m}"), host, 3_700_000))
+                    .chain(rare)
+            })
+            .collect();
+        mini.ingest_batch(&batch, None).await.unwrap();
+        mini.flush_written().await.unwrap();
+        let reader = MiniQueryReader::new(
+            Namespace::default(),
+            bucket,
+            storage.snapshot().await.unwrap(),
+        );
+        let dense = metric_ids(&reader, "m0").await;
+        let rare = metric_ids(&reader, "rare").await;
+        // Dense runs, stragglers, a duplicate and an ID with no series, out
+        // of order.
+        let mut mixed: Vec<SeriesId> = dense
+            .iter()
+            .step_by(40)
+            .chain(&dense[100..140])
+            .chain(&rare)
+            .copied()
+            .collect();
+        mixed.extend([dense[5], 1_000_000]);
+        mixed.reverse();
+        let selections = [
+            dense.clone(),
+            dense.iter().copied().step_by(8).collect(),
+            rare,
+            mixed,
+        ];
+
+        // when
+        let mut answers = Vec::new();
+        for tuning in crate::read_tuning::every_tuning() {
+            let _tuning = crate::read_tuning::override_read_tuning(tuning).await;
+            let mut answer = Vec::new();
+            for ids in &selections {
+                let specs = reader.fetch_forward_index_many(ids).await.unwrap();
+                let fingerprints = reader.fetch_series_fingerprints(ids).await.unwrap();
+                let labels: Vec<_> = specs
+                    .into_iter()
+                    .map(|spec| spec.map(|spec| spec.labels))
+                    .collect();
+                answer.push((labels, fingerprints));
+            }
+            answers.push((tuning, answer));
+        }
+
+        // then
+        let (_, expected) = &answers[0];
+        let (labels, fingerprints) = &expected[3];
+        assert!(labels[0].is_none() && fingerprints[0].is_none());
+        assert!(labels[1..].iter().all(Option::is_some));
+        assert!(fingerprints[1..].iter().all(Option::is_some));
+        for (tuning, answer) in &answers {
+            assert_eq!(answer, expected, "{tuning:?}");
+        }
     }
 
     #[tokio::test]

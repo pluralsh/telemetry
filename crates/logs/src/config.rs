@@ -17,6 +17,11 @@ pub struct Config {
     /// requests for whole periods without walking their segments. A whole
     /// multiple of `segment_duration`; `None` disables it.
     pub discovery_rollup: Option<Duration>,
+    /// Label names new streams are grouped by first, in this order, when
+    /// they are given stream IDs; the remaining names follow, fewest
+    /// distinct values first. Selectors on a leading label then read a
+    /// narrow ID range. Empty groups by value counts alone.
+    pub stream_locality_labels: Vec<String>,
     /// How long data is kept, counted from ingestion; `None` keeps it
     /// forever.
     pub retention: Option<Duration>,
@@ -41,6 +46,16 @@ pub const DEFAULT_BLOCK_CACHE_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default [`Config::retention`]: 14 days.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Default [`Config::stream_locality_labels`]: the cluster and namespace
+/// labels Console selects logs by, as Loki pushes from Grafana Alloy name
+/// them and as OTLP resource attributes are sanitized into label names.
+pub const DEFAULT_STREAM_LOCALITY_LABELS: [&str; 4] = [
+    "cluster",
+    "k8s_cluster_name",
+    "namespace",
+    "k8s_namespace_name",
+];
 
 /// Every write-buffer flush cuts at least one page per written stream; these
 /// limits split larger flushes further.
@@ -91,6 +106,7 @@ impl Default for Config {
             }),
             segment_duration: Duration::from_secs(60 * 60),
             discovery_rollup: Some(Duration::from_secs(24 * 60 * 60)),
+            stream_locality_labels: DEFAULT_STREAM_LOCALITY_LABELS.map(String::from).to_vec(),
             retention: Some(DEFAULT_RETENTION),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
@@ -138,6 +154,11 @@ impl Config {
         {
             return Err(crate::Error::Invalid(
                 "discovery_rollup must be a whole multiple of segment_duration".to_owned(),
+            ));
+        }
+        if self.stream_locality_labels.iter().any(String::is_empty) {
+            return Err(crate::Error::Invalid(
+                "stream_locality_labels cannot contain empty names".to_owned(),
             ));
         }
         if self.page.target_size_bytes == 0

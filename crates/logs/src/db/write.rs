@@ -259,22 +259,36 @@ impl DirectWriter {
                     .push((*fingerprint, labels));
             }
         }
-        let order = |streams: &[(StreamFingerprint, &Labels)]| {
+        let priority = &self.config.stream_locality_labels;
+        let ordered = |streams: Vec<(StreamFingerprint, &Labels)>| -> Vec<StreamFingerprint> {
             let labels: Vec<&Labels> = streams.iter().map(|(_, labels)| *labels).collect();
-            locality_order(&labels)
+            locality_order(&labels, priority)
+                .into_iter()
+                .map(|position| streams[position].0)
+                .collect()
         };
-        for (segment, streams) in segments {
+        let segments: Vec<_> = segments
+            .into_iter()
+            .map(|(segment, streams)| (segment, ordered(streams)))
+            .collect();
+        let periods: Vec<_> = periods
+            .into_iter()
+            .map(|(period, mut streams)| {
+                streams.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+                streams.dedup_by_key(|(fingerprint, _)| *fingerprint);
+                (period, ordered(streams))
+            })
+            .collect();
+        for (segment, fingerprints) in segments {
             let ids = &mut self.segment_ids(namespace, segment).streams;
-            for position in order(&streams) {
-                ids.resolve(streams[position].0)?;
+            for fingerprint in fingerprints {
+                ids.resolve(fingerprint)?;
             }
         }
-        for (period, mut streams) in periods {
-            streams.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
-            streams.dedup_by_key(|(fingerprint, _)| *fingerprint);
+        for (period, fingerprints) in periods {
             let ids = self.period_ids(namespace, period);
-            for position in order(&streams) {
-                ids.resolve(streams[position].0)?;
+            for fingerprint in fingerprints {
+                ids.resolve(fingerprint)?;
             }
         }
         Ok(())
@@ -734,5 +748,108 @@ impl PendingWrite {
         self.written.push((segment, object, stored));
         self.report.pages += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+
+    use super::*;
+    use crate::config::CompactionConfig;
+    use crate::model::Label;
+
+    const HOUR: i64 = 3_600 * 1_000_000_000;
+    /// 2024-01-01.
+    const DAY: i64 = 19_723 * 24 * HOUR;
+
+    fn config(stream_locality_labels: &[&str]) -> Config {
+        Config {
+            storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "logs-write-test".to_owned(),
+                object_store: ObjectStoreConfig::InMemory,
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+                disk: Default::default(),
+            }),
+            stream_locality_labels: stream_locality_labels
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            retention: None,
+            compaction: CompactionConfig {
+                enabled: false,
+                ..CompactionConfig::default()
+            },
+            block_cache_capacity_bytes: 0,
+            result_cache_capacity_bytes: 0,
+            ..Config::default()
+        }
+    }
+
+    /// The IDs the dictionary under `prefix` gives each cluster's streams,
+    /// ascending.
+    async fn cluster_ids(
+        db: &LogDb,
+        prefix: Bytes,
+        clusters: &HashMap<StreamFingerprint, &str>,
+    ) -> BTreeMap<String, Vec<StreamId>> {
+        let mut records = db
+            .storage
+            .scan_prefix_iter(prefix.clone(), BytesRange::unbounded(), None)
+            .await
+            .unwrap();
+        let mut ids: BTreeMap<String, Vec<StreamId>> = BTreeMap::new();
+        while let Some(record) = records.next().await.unwrap() {
+            let fingerprint = decode_dictionary_key(&record.key, prefix.len()).unwrap();
+            ids.entry(clusters[&fingerprint].to_owned())
+                .or_default()
+                .push(decode_stream_id(&record.value).unwrap());
+        }
+        for streams in ids.values_mut() {
+            streams.sort_unstable();
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn gives_a_flushed_clusters_streams_one_id_range() {
+        // `container` has fewer values than `cluster`, so value counts alone
+        // split every cluster's streams by container.
+        let mut batches = Vec::new();
+        let mut clusters = HashMap::new();
+        for cluster in ["mgmt", "prod", "dev", "edge"] {
+            for pod in 0..12 {
+                let labels = Labels::new(vec![
+                    Label::new("cluster", cluster),
+                    Label::new("namespace", format!("ns-{}", pod % 4)),
+                    Label::new("pod", format!("{cluster}-{pod}")),
+                    Label::new("container", format!("c-{}", pod % 3)),
+                ])
+                .unwrap();
+                clusters.insert(labels.fingerprint(), cluster);
+                let entries = vec![LogEntry::new(DAY + HOUR / 2, "line")];
+                batches.push(LogBatch::new(labels, entries));
+            }
+        }
+        let namespace = Namespace::new("tenant").unwrap();
+        let contiguous = |ids: &Vec<StreamId>| ids.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        for (priority, grouped) in [(&["cluster", "namespace"][..], true), (&[][..], false)] {
+            let db = LogDb::open(config(priority)).await.unwrap();
+            db.write(&namespace, batches.clone()).await.unwrap();
+            db.flush_memtable().await.unwrap();
+            for prefix in [
+                dictionary_prefix(&namespace, SegmentId::new(DAY, HOUR)),
+                rollup_dictionary_prefix(&namespace, SegmentId::new(DAY, 24 * HOUR)),
+            ] {
+                let ids = cluster_ids(&db, prefix, &clusters).await;
+                assert_eq!(ids.len(), 4);
+                for (cluster, ids) in &ids {
+                    assert_eq!(contiguous(ids), grouped, "{priority:?} {cluster} {ids:?}");
+                }
+            }
+            db.close().await.unwrap();
+        }
     }
 }

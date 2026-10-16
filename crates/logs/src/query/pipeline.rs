@@ -212,7 +212,7 @@ pub(super) fn merge_parsed<R: StageRow>(row: &mut R, labels: BTreeMap<String, St
 }
 
 /// Labels that report a pipeline error; `keep` and grouping never remove them.
-pub(super) fn is_error_label(name: &str) -> bool {
+pub(crate) fn is_error_label(name: &str) -> bool {
     matches!(
         name,
         ERROR_LABEL | ERROR_DETAILS_LABEL | PRESERVE_ERROR_LABEL
@@ -953,17 +953,88 @@ mod tests {
         ] {
             assert!(read(query).is_none(), "{query}");
         }
-        assert!(
-            !read(r#"sum(count_over_time({a="b"}[1m]))"#)
-                .unwrap()
-                .metadata
-        );
-        assert!(
-            read(r#"sum by (a) (count_over_time({a="b"}[1m]))"#)
-                .unwrap()
-                .metadata
-        );
-        assert!(read(r#"count_over_time({a="b"}[1m])"#).unwrap().metadata);
+        let names = |names: &[&str]| {
+            MetadataNeeds::Names(names.iter().map(|name| (*name).to_owned()).collect())
+        };
+        for (query, needs) in [
+            (r#"sum(count_over_time({a="b"}[1m]))"#, MetadataNeeds::None),
+            (r#"sum by () (rate({a="b"}[1m]))"#, MetadataNeeds::None),
+            (
+                r#"sum by (a) (count_over_time({a="b"}[1m]))"#,
+                names(&["a"]),
+            ),
+            (
+                r#"topk(2, sum by (b, a) (bytes_rate({a="b"}[1m])))"#,
+                names(&["a", "b"]),
+            ),
+            (
+                r#"label_replace(sum by (a) (rate({a="b"}[1m])), "c", "$1", "a", "(.*)")"#,
+                names(&["a"]),
+            ),
+            (
+                r#"sum by (a) (rate({a="b"}[1m])) / on (a) sum by (a, c_extracted) (rate({c="d"}[1m]))"#,
+                names(&["a", "c_extracted"]),
+            ),
+            (
+                r#"sum by (a) (rate({a="b"}[1m])) / sum(rate({c="d"}[1m]))"#,
+                names(&["a"]),
+            ),
+            (r#"count_over_time({a="b"}[1m])"#, MetadataNeeds::All),
+            (
+                r#"sum without (a) (count_over_time({a="b"}[1m]))"#,
+                MetadataNeeds::All,
+            ),
+            (
+                r#"max by (a) (count_over_time({a="b"}[1m]))"#,
+                MetadataNeeds::All,
+            ),
+            (r#"count by (a) (rate({a="b"}[1m]))"#, MetadataNeeds::All),
+            (
+                r#"sum by (a) (rate({a="b"}[1m])) or rate({c="d"}[1m])"#,
+                MetadataNeeds::All,
+            ),
+        ] {
+            assert_eq!(read(query).unwrap().metadata, needs, "{query}");
+        }
+    }
+
+    #[test]
+    fn grouped_lineless_reads_need_their_grouping_selector_and_error_labels() {
+        let labels = |query: &str| lineless_labels(&logql::parse(query).unwrap());
+        let with_errors = |names: &[&str]| {
+            let mut names = names
+                .iter()
+                .chain(&[ERROR_LABEL, ERROR_DETAILS_LABEL, PRESERVE_ERROR_LABEL])
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            Some(names)
+        };
+        for (query, names) in [
+            (r#"sum(count_over_time({a="b"}[1m]))"#, &["a"][..]),
+            (
+                r#"sum by (c) (rate({a="b", d=~"e", f!="g"}[1m]))"#,
+                &["a", "c", "d", "f"][..],
+            ),
+            (
+                r#"topk(1, sum by (c_extracted_extracted) (rate({a="b"}[1m])))"#,
+                &["a", "c", "c_extracted", "c_extracted_extracted"][..],
+            ),
+            (
+                r#"sum by (c) (rate({a="b"}[1m])) / on () sum(rate({d="x", e!~"f"}[1m]))"#,
+                &["a", "c", "d", "e"][..],
+            ),
+        ] {
+            assert_eq!(labels(query), with_errors(names), "{query}");
+        }
+        for query in [
+            r#"count_over_time({a="b"}[1m])"#,
+            r#"sum without (c) (count_over_time({a="b"}[1m]))"#,
+            r#"max by (c) (count_over_time({a="b"}[1m]))"#,
+            r#"sum by (c) (rate({a="b"}[1m])) or rate({c="d"}[1m])"#,
+        ] {
+            assert_eq!(labels(query), None, "{query}");
+        }
     }
 
     fn logfmt(line: &str, strict: bool) -> (BTreeMap<String, String>, Option<String>) {

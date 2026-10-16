@@ -465,6 +465,7 @@ async fn open_database() -> LogDb {
         }),
         segment_duration: Duration::from_secs(3600),
         discovery_rollup: Some(Duration::from_secs(24 * 3600)),
+        stream_locality_labels: Vec::new(),
         retention: None,
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,

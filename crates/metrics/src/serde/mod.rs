@@ -146,6 +146,10 @@ pub const MIN_PREFIX_AND_RECORD_TYPE_LEN: usize = KEY_PREFIX_LEN + 1 + 4 + 1 + 1
 /// Encoded as the single byte after the bucket header in every bucket-scoped key.
 /// `0x01` is reserved (formerly `BucketList`, now superseded by SlateDB
 /// segments).
+///
+/// Binaries that predate a record type fail to decode it, so a new type must
+/// only be written with puts (the merge operator decodes merged keys alone)
+/// and read through scans of its own prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     SeriesDictionary = 0x02,
@@ -154,6 +158,7 @@ pub enum RecordType {
     TimeSeries = 0x05,
     BucketGeneration = 0x06,
     RollupSeal = 0x07,
+    SeriesFingerprint = 0x08,
 }
 
 impl RecordType {
@@ -171,6 +176,7 @@ impl RecordType {
             0x05 => Ok(RecordType::TimeSeries),
             0x06 => Ok(RecordType::BucketGeneration),
             0x07 => Ok(RecordType::RollupSeal),
+            0x08 => Ok(RecordType::SeriesFingerprint),
             _ => Err(EncodingError {
                 message: format!("invalid record type: 0x{:02x}", id),
             }),
@@ -400,6 +406,16 @@ mod tests {
         let mut samples = BytesMut::new();
         write_record_prefix(&mut samples, &namespace, &bucket, RecordType::TimeSeries);
         assert!(!range.contains(&samples));
+
+        let mut fingerprint = BytesMut::new();
+        write_record_prefix(
+            &mut fingerprint,
+            &namespace,
+            &bucket,
+            RecordType::SeriesFingerprint,
+        );
+        fingerprint.put_u32(1);
+        assert!(!range.contains(&fingerprint));
 
         let mut adjacent = BytesMut::new();
         write_record_prefix(

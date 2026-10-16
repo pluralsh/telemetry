@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::analyzer::DEFAULT_ANALYZER;
-use crate::db::{Boundaries, PageBudget, SampleRead, ScanTargets, StreamFilter};
+use crate::db::{Boundaries, MetadataNeeds, PageBudget, SampleRead, ScanTargets, StreamFilter};
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
     FormatValue, Grouping, IpPattern, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm,
@@ -32,6 +32,7 @@ mod label_regex;
 mod metric;
 mod parallel;
 mod pipeline;
+pub(crate) use pipeline::is_error_label;
 mod regex_cache;
 pub(crate) mod template;
 mod units;
@@ -249,14 +250,16 @@ impl<'a> ScanPlan<'a> {
         query: &'a Query,
         options: &QueryOptions,
     ) -> Result<Self> {
+        let lineless = lineless_read(query, request)?;
+        let labels = lineless.as_ref().and_then(|_| lineless_labels(query));
         Ok(Self {
             shared: parallel::enabled().then(|| Arc::new((query.clone(), request.clone()))),
             request,
             query,
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
-            streams: stream_filter(query)?,
+            streams: stream_filter(query)?.with_labels(labels),
             indexed_terms: indexed_match_terms(query),
-            lineless: lineless_read(query, request)?,
+            lineless,
             limit: options.limit,
             direction: options.direction,
         })
@@ -270,6 +273,20 @@ impl<'a> ScanPlan<'a> {
         targets: Option<ScanTargets>,
     ) -> Result<columnar::ColumnarSink<'a>> {
         columnar::load(database, namespace, self, budget, targets).await
+    }
+
+    /// [`Self::load`], for profiles timing it apart from listing.
+    #[cfg(test)]
+    pub(crate) async fn load_targets(
+        &self,
+        database: &LogDb,
+        namespace: &Namespace,
+        budget: &PageBudget,
+        targets: ScanTargets,
+    ) -> Result<()> {
+        self.load(database, namespace, budget, Some(targets))
+            .await
+            .map(drop)
     }
 
     fn finish(
@@ -1192,7 +1209,7 @@ fn evaluation_steps(request: &QueryRequest) -> (i64, i64, u64) {
 /// expression is the input of a `count_over_time`, `rate`, `bytes_over_time`
 /// or `bytes_rate` with no pipeline stages, so each row contributes only its
 /// timestamp, line length and labels. Structured metadata, which becomes
-/// labels, is read unless every such aggregation groups by nothing.
+/// labels, is read as [`lineless_metadata`] needs it.
 fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleRead>> {
     let mut logs = Vec::new();
     collect_log_exprs(query, &mut logs);
@@ -1211,9 +1228,7 @@ fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleR
     if logs.is_empty() || !logs.iter().all(|log| qualifies(log)) {
         return Ok(None);
     }
-    let metadata = !aggregations.iter().all(|(_, _, grouping)| {
-        grouping.is_some_and(|grouping| !grouping.without && grouping.labels.is_empty())
-    });
+    let metadata = lineless_metadata(&aggregations);
     let (first, step, count) = evaluation_steps(request);
     let mut boundaries = Vec::with_capacity(logs.len() * 2);
     for log in logs {
@@ -1235,6 +1250,69 @@ fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleR
         metadata,
         boundaries,
     }))
+}
+
+/// The structured metadata a lineless read of `aggregations` needs. A range
+/// aggregation's series keep only the labels it groups by, or, with grouping
+/// pushed in from an outer `sum`, the sum's; every other expression sees
+/// only those series. So `by (labels)` needs the metadata that can become
+/// those labels, and any aggregation without grouping, or `without`, needs
+/// all of it, as its series' identity depends on every label: a `max` over
+/// them would see fewer, larger series were any metadata dropped.
+fn lineless_metadata(aggregations: &[(RangeOp, &LogExpr, Option<&Grouping>)]) -> MetadataNeeds {
+    let mut names = Vec::new();
+    for (_, _, grouping) in aggregations {
+        match grouping {
+            Some(grouping) if !grouping.without => names.extend(grouping.labels.iter().cloned()),
+            _ => return MetadataNeeds::All,
+        }
+    }
+    if names.is_empty() {
+        return MetadataNeeds::None;
+    }
+    names.sort_unstable();
+    names.dedup();
+    MetadataNeeds::Names(names)
+}
+
+/// The stream labels a lineless read of `query` depends on, when every range
+/// aggregation groups `by` labels: those labels, each with its `_extracted`
+/// suffixes stripped, since whether a stream has label `n` decides whether
+/// metadata `n` is promoted to `n` or `n_extracted`; the error labels, which
+/// errored series keep and failures read; and every label a stream selector
+/// matches on. A stream labelled with only these yields the same series,
+/// metadata reads and selection as with all of its labels. `None` when an
+/// aggregation keeps every label.
+fn lineless_labels(query: &Query) -> Option<Vec<String>> {
+    let mut aggregations = Vec::new();
+    collect_range_aggregations(query, &mut aggregations);
+    let mut names = [ERROR_LABEL, ERROR_DETAILS_LABEL, PRESERVE_ERROR_LABEL]
+        .map(str::to_owned)
+        .to_vec();
+    for (_, _, grouping) in &aggregations {
+        let grouping = grouping.filter(|grouping| !grouping.without)?;
+        for label in &grouping.labels {
+            let mut name = label.as_str();
+            names.push(name.to_owned());
+            while let Some(shorter) = name
+                .strip_suffix("_extracted")
+                .filter(|shorter| !shorter.is_empty())
+            {
+                names.push(shorter.to_owned());
+                name = shorter;
+            }
+        }
+    }
+    let mut logs = Vec::new();
+    collect_log_exprs(query, &mut logs);
+    names.extend(
+        logs.iter()
+            .flat_map(|log| &log.selector.value.matchers)
+            .map(|matcher| matcher.value.label.clone()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    Some(names)
 }
 
 /// Log expressions whose samples Loki extracts with no labels at all:

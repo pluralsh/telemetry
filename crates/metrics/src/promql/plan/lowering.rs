@@ -69,6 +69,9 @@ pub struct LoweringContext {
     /// `Some` → physical planner wraps every operator in a
     /// [`TracingOperator`](crate::promql::trace::TracingOperator).
     pub trace: Option<Arc<TraceCollector>>,
+    /// Lets the physical planner resolve only the grouping labels of
+    /// aggregations that read nothing else. Results are the same either way.
+    pub label_projection: bool,
 }
 
 impl PartialEq for LoweringContext {
@@ -80,6 +83,7 @@ impl PartialEq for LoweringContext {
             && self.step_ms == other.step_ms
             && self.lookback_delta_ms == other.lookback_delta_ms
             && self.parallelism == other.parallelism
+            && self.label_projection == other.label_projection
     }
 }
 
@@ -94,6 +98,7 @@ impl LoweringContext {
             lookback_delta_ms,
             parallelism: super::parallelism::Parallelism::default(),
             trace: None,
+            label_projection: true,
         }
     }
 
@@ -107,11 +112,17 @@ impl LoweringContext {
             lookback_delta_ms,
             parallelism: super::parallelism::Parallelism::default(),
             trace: None,
+            label_projection: true,
         }
     }
 
     pub fn with_parallelism(mut self, parallelism: super::parallelism::Parallelism) -> Self {
         self.parallelism = parallelism;
+        self
+    }
+
+    pub fn with_label_projection(mut self, label_projection: bool) -> Self {
+        self.label_projection = label_projection;
         self
     }
 

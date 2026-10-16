@@ -86,13 +86,17 @@ the logs merge operator unions them, so readers must open the database with
 it. Rollup periods are handled the same way.
 
 A write allocates the IDs of the streams it adds to a segment in locality
-order: by the value of each label name, the name with the fewest distinct
-values among those streams first, a stream without the label before one with
+order: by the value of each `stream_locality_labels` name in turn (by
+default `cluster`, `k8s_cluster_name`, `namespace`, `k8s_namespace_name`),
+then of each remaining label name, the name with the fewest distinct values
+among those streams first; a stream without the label sorts before one with
 it. Streams sharing coarse labels, such as a cluster or namespace, so get
 neighbouring IDs, and a selector on such a label covers a narrow span of
 run records. A segment rollup registers every stream of the segments it
-copies, in one such order, before copying any row, so a rollup segment's
-IDs follow that order however the streams were spread over its sources.
+copies in one write, so in one such order, before copying any row, so a
+rollup segment's IDs follow that order however the streams were spread over
+its sources. The order only affects how many records a read scans: readers
+treat stream IDs as opaque, and existing IDs are never renumbered.
 
 ## Objects, runs and blocks
 

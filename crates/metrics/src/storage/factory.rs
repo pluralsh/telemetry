@@ -265,6 +265,16 @@ mod failing_storage {
                 .await
         }
 
+        async fn last_forward_index_series(
+            &self,
+            namespace: &crate::Namespace,
+            bucket: &TimeBucket,
+        ) -> crate::util::Result<Option<SeriesId>> {
+            self.inner
+                .last_forward_index_series(namespace, bucket)
+                .await
+        }
+
         async fn load_series_dictionary<F>(
             &self,
             namespace: &crate::Namespace,

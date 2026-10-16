@@ -25,6 +25,7 @@ fn test_config() -> Config {
         }),
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),
+        stream_locality_labels: Vec::new(),
         retention: Some(Duration::from_secs(60)),
         page: PageConfig {
             target_size_bytes: 64,
@@ -1528,6 +1529,223 @@ async fn many_selected_streams_cost_two_scans_per_segment() {
     db.close().await.unwrap();
 }
 
+/// Every [`ReadTuning`] listing alternative.
+fn read_tunings() -> Vec<ReadTuning> {
+    [false, true]
+        .into_iter()
+        .flat_map(|postings_validate| {
+            [false, true].map(|overlap_runs| ReadTuning {
+                postings_validate,
+                overlap_runs,
+                ..ReadTuning::default()
+            })
+        })
+        .collect()
+}
+
+/// A watched prefix, with where to say it was reached and wait to resume.
+type Pause = (
+    Bytes,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+/// Holds the first read under a watched prefix, once armed, until released.
+struct PausingStorage {
+    inner: Arc<dyn StorageRead>,
+    armed: std::sync::Mutex<Option<Pause>>,
+}
+
+impl PausingStorage {
+    fn wrap(db: &mut LogDb) -> Arc<Self> {
+        let pausing = Arc::new(Self {
+            inner: Arc::clone(&db.storage),
+            armed: std::sync::Mutex::new(None),
+        });
+        db.storage = pausing.clone();
+        pausing
+    }
+
+    /// Pauses the next read under `prefix`: the first receiver fires once
+    /// it is reached, and it proceeds once the sender is sent to.
+    fn arm(
+        &self,
+        prefix: Bytes,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, paused) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *self.armed.lock().unwrap() = Some((prefix, reached, resumed));
+        (paused, resume)
+    }
+
+    async fn pause(&self, key: &[u8]) {
+        let taken = {
+            let mut armed = self.armed.lock().unwrap();
+            match &*armed {
+                Some((prefix, _, _)) if key.starts_with(prefix) => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, reached, resumed)) = taken {
+            reached.send(()).unwrap();
+            resumed.await.unwrap();
+        }
+    }
+
+    /// Drops an armed pause no read reached, failing its receiver.
+    fn disarm(&self) {
+        self.armed.lock().unwrap().take();
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageRead for PausingStorage {
+    async fn get(
+        &self,
+        key: Bytes,
+    ) -> common::storage::StorageResult<Option<common::storage::Record>> {
+        self.pause(&key).await;
+        self.inner.get(key).await
+    }
+
+    async fn scan_iter(
+        &self,
+        range: BytesRange,
+    ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
+    {
+        self.inner.scan_iter(range).await
+    }
+
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<slatedb::FilterContext>,
+    ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
+    {
+        self.pause(&prefix).await;
+        self.inner
+            .scan_prefix_iter(prefix, subrange, filter_context)
+            .await
+    }
+}
+
+/// A stream written while a listing reads its segment, before or after
+/// the stream counter or the postings it is selected by, is read by the
+/// next query: the cached listing is never current for the segment with it.
+#[tokio::test]
+async fn streams_written_during_a_listing_are_read_next() {
+    let prod = Label::new("environment", "prod");
+    let namespace = Namespace::default();
+    let watched = [
+        next_stream_id_key(&namespace, seg(0)),
+        posting_key(&namespace, seg(0), &prod),
+        segment_run_prefix(&namespace, seg(0)),
+        forward_prefix(&namespace, seg(0)),
+    ];
+    for tuning in read_tunings() {
+        for (index, prefix) in watched.iter().enumerate() {
+            for min_streams in [usize::MAX, 1] {
+                let mut db = LogDb::open(test_config()).await.unwrap();
+                db.tuning = tuning;
+                db.span_scan_min_streams = min_streams;
+                write_forty_streams(&db, &namespace).await;
+                let pausing = PausingStorage::wrap(&mut db);
+                let (paused, resume) = pausing.arm(prefix.clone());
+                let (listed, ()) = tokio::join!(
+                    async {
+                        let listed = db
+                            .read(&namespace, 0, 5_000, std::slice::from_ref(&prod))
+                            .await;
+                        pausing.disarm();
+                        listed
+                    },
+                    async {
+                        // Unreached by listings that skip the read.
+                        let _ = paused.await;
+                        db.write(
+                            &namespace,
+                            vec![LogBatch::new(
+                                labels("s40", "prod"),
+                                vec![LogEntry::new(1_040, "line 40")],
+                            )],
+                        )
+                        .await
+                        .unwrap();
+                        let _ = resume.send(());
+                    }
+                );
+                let listed = listed.unwrap().len();
+                assert!(
+                    listed == 40 || listed == 41,
+                    "{tuning:?} {index} {min_streams}: {listed}"
+                );
+                for _ in 0..2 {
+                    let rows = db
+                        .read(&namespace, 0, 5_000, std::slice::from_ref(&prod))
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), 41, "{tuning:?} {index} {min_streams}");
+                }
+                db.close().await.unwrap();
+            }
+        }
+    }
+}
+
+/// Matchers postings can't resolve select streams by their labels before
+/// any of their runs are read, whether or not the runs of streams the exact
+/// labels alone select are read alongside their labels.
+#[tokio::test]
+async fn label_matchers_prune_streams_before_their_runs_are_read() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    let namespace = Namespace::default();
+    let cases = [
+        (r#"{environment="prod"}"#, 20, 40),
+        (r#"{environment="prod", service=~"s0[0-4]"}"#, 3, 6),
+        (r#"{environment="prod", service!="s00"}"#, 19, 38),
+        (r#"{environment="prod", service=""}"#, 0, 0),
+    ];
+    for tuning in read_tunings() {
+        let mut db = LogDb::open(test_config()).await.unwrap();
+        db.tuning = tuning;
+        db.span_scan_min_streams = usize::MAX;
+        write_forty_streams(&db, &namespace).await;
+        let counting = count_reads(&mut db, vec![segment_run_prefix(&namespace, seg(0))]);
+        for (query, streams, rows) in cases {
+            // Listed afresh, then from the cache.
+            db.caches.streams.invalidate_all();
+            for _ in 0..2 {
+                let result = db
+                    .query(
+                        &namespace,
+                        &QueryRequest::range(query, 0, 5_000, 1),
+                        QueryOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                let crate::QueryResult::Streams(found) = result else {
+                    panic!("{query}: not streams");
+                };
+                assert_eq!(
+                    found
+                        .iter()
+                        .map(|stream| stream.entries.len())
+                        .sum::<usize>(),
+                    rows,
+                    "{tuning:?} {query}"
+                );
+                assert_eq!(counting.take(), vec![(0, streams)], "{tuning:?} {query}");
+            }
+        }
+        db.close().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn streams_flushed_together_are_read_with_one_object_scan() {
     use crate::codec::{RecordType, record_type_prefix};
@@ -1952,7 +2170,7 @@ fn rollups_must_align_with_segments() {
 fn window_boundaries_split_only_the_spans_they_fall_inside() {
     // Windows (5, 10], (15, 20], (25, 30]: boundaries 5, 15, 25 and 10, 20, 30.
     let read = SampleRead {
-        metadata: false,
+        metadata: MetadataNeeds::None,
         boundaries: vec![
             Boundaries {
                 first: 10,
@@ -1975,7 +2193,7 @@ fn window_boundaries_split_only_the_spans_they_fall_inside() {
     assert!(read.splits(-50, 6));
     assert!(!read.splits(10, 10));
     let instant = SampleRead {
-        metadata: false,
+        metadata: MetadataNeeds::None,
         boundaries: vec![Boundaries {
             first: i64::MAX,
             step: 1,
@@ -1985,7 +2203,7 @@ fn window_boundaries_split_only_the_spans_they_fall_inside() {
     assert!(!instant.splits(i64::MIN, i64::MAX));
     assert!(!instant.splits(i64::MAX, i64::MAX));
     let near_max = SampleRead {
-        metadata: false,
+        metadata: MetadataNeeds::None,
         boundaries: vec![Boundaries {
             first: i64::MAX - 1,
             step: 1,
@@ -2170,6 +2388,416 @@ async fn lineless_metric_reads_match_full_row_reads() {
         }
         db.close().await.unwrap();
     }
+}
+
+#[test]
+fn grouped_lineless_reads_select_the_metadata_their_labels_come_from() {
+    use crate::object::FieldSelection;
+
+    let names = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+    let only = |names: &[&str]| {
+        FieldSelection::Only(names.iter().map(|name| (*name).to_owned()).collect())
+    };
+    let api = labels("api", "prod");
+    let fields = |grouping: &[&str]| MetadataNeeds::Names(names(grouping)).fields(&api);
+    assert_eq!(MetadataNeeds::None.fields(&api), FieldSelection::None);
+    assert_eq!(MetadataNeeds::All.fields(&api), FieldSelection::All);
+    // Stream labels shadow metadata of their name, which becomes `_extracted`.
+    assert_eq!(fields(&["service", "environment"]), FieldSelection::None);
+    assert_eq!(fields(&["service", "pod"]), only(&["pod"]));
+    assert_eq!(
+        fields(&["service_extracted"]),
+        only(&["service", "service_extracted"])
+    );
+    assert_eq!(
+        fields(&["service_extracted_extracted"]),
+        only(&[
+            "service",
+            "service_extracted",
+            "service_extracted_extracted"
+        ])
+    );
+    assert_eq!(fields(&["pod_extracted"]), only(&["pod", "pod_extracted"]));
+    assert_eq!(fields(&["_extracted"]), only(&["_extracted"]));
+}
+
+/// Writes of three streams, one with a `pod` label, whose structured
+/// metadata clashes with stream labels, chains `_extracted` names, and
+/// includes rows repeating another's timestamp and line that differ only in
+/// a `trace` field; a repeated write duplicates rows across objects. With
+/// `errors`, a rare row carries `__error__` metadata.
+fn projection_batches(rng: &mut Rng, previous: &[LogBatch], errors: bool) -> Vec<LogBatch> {
+    if !previous.is_empty() && rng.below(4) == 0 {
+        return previous.to_vec();
+    }
+    let streams = [
+        labels("api", "prod"),
+        labels("cart", "prod"),
+        Labels::new(vec![
+            Label::new("service", "api"),
+            Label::new("environment", "prod"),
+            Label::new("pod", "z"),
+        ])
+        .unwrap(),
+    ];
+    let optional: [(&str, &[&str]); 4] = [
+        ("pod", &["x", "y"]),
+        ("service", &["web", "db"]),
+        ("service_extracted", &["s"]),
+        ("zone", &["a", "b"]),
+    ];
+    let streams: Vec<_> = streams.into_iter().filter(|_| rng.below(3) > 0).collect();
+    streams
+        .into_iter()
+        .map(|labels| {
+            let mut entries = Vec::new();
+            for _ in 0..1 + rng.below(9) {
+                let timestamp = rng.below(120) as i64 * 250_000_000;
+                let line = rng.pick(&["GET /a", "GET /b", "POST /checkout", ""]);
+                let mut fields = Vec::new();
+                for (name, values) in optional {
+                    if rng.below(3) == 0 {
+                        fields.push(crate::Field::new(name, rng.pick(values)));
+                    }
+                }
+                if errors && rng.below(40) == 0 {
+                    fields.push(crate::Field::new("__error__", "bad"));
+                    fields.push(crate::Field::new("__error_details__", "oops"));
+                }
+                let entry = |trace: Option<&str>| {
+                    let mut fields = fields.clone();
+                    fields.extend(trace.map(|trace| crate::Field::new("trace", trace)));
+                    LogEntry::with_structured_metadata(
+                        timestamp,
+                        line,
+                        crate::Fields::new(fields).unwrap(),
+                    )
+                };
+                match rng.below(5) {
+                    0 => entries.extend([entry(Some("1")), entry(Some("2"))]),
+                    1 => entries.extend([entry(Some("1")), entry(Some("1"))]),
+                    2 => entries.push(entry(Some("1"))),
+                    _ => entries.push(entry(None)),
+                }
+            }
+            LogBatch::new(labels, entries)
+        })
+        .collect()
+}
+
+/// Lineless reads that decode only the metadata their grouping labels can
+/// come from agree with the same read forced to decode all of it, by an
+/// ungrouped `or` operand that selects nothing, and with the full-row read a
+/// no-op line filter forces.
+#[tokio::test]
+async fn projected_metadata_reads_match_full_metadata_reads() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    const MS: i64 = 1_000_000;
+    let ops = ["count_over_time", "rate", "bytes_over_time", "bytes_rate"];
+    let wrappers = [
+        "sum by (service) ({})",
+        "sum by (environment) ({})",
+        "sum by (pod) ({})",
+        "sum by (zone, service) ({})",
+        "sum by (service_extracted) ({})",
+        "sum by (service_extracted_extracted) ({})",
+        "sum by (pod_extracted) ({})",
+        "sum by (trace) ({})",
+        "sum by (__error__) ({})",
+        "sum without (pod) ({})",
+        "max by (service) ({})",
+        "topk(1, sum by (pod) ({}))",
+        "sum by (service, pod) ({}) / on (service) group_left sum by (service) ({})",
+        r#"label_replace(sum by (zone) ({}), "z", "$1", "zone", "(.*)")"#,
+        "sum by (pod) ({}) + on () group_left sum({})",
+    ];
+    let selectors = [r#"{environment="prod"}"#, r#"{service="api"}"#];
+    for seed in 1..=30u64 {
+        let db = LogDb::open(Config {
+            retention: None,
+            page: PageConfig {
+                target_size_bytes: 4096,
+                max_rows: 12,
+                rows_per_block: 3,
+            },
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut previous = Vec::new();
+        for _ in 0..1 + rng.below(6) {
+            let batches = projection_batches(&mut rng, &previous, seed % 5 == 0);
+            db.write(&namespace, batches.clone()).await.unwrap();
+            previous = batches;
+        }
+        for _ in 0..40 {
+            let op = ops[rng.below(ops.len() as u64) as usize];
+            let selector = selectors[rng.below(2) as usize];
+            let range = [1_000, 2_500, 5_000, 7_000][rng.below(4) as usize];
+            let window = |filter: &str| format!("{op}({selector}{filter} [{range}ms])");
+            let wrapper = wrappers[rng.below(wrappers.len() as u64) as usize];
+            let projected = wrapper.replace("{}", &window(""));
+            let queries = [
+                format!(r#"{projected} or count_over_time({{service="none"}}[{range}ms])"#),
+                wrapper.replace("{}", &window(r#" |= """#)),
+                projected,
+            ];
+            let start = rng.below(140) as i64 * 250 * MS;
+            let requests = if rng.below(4) == 0 {
+                queries.map(|query| QueryRequest::instant(query, start))
+            } else {
+                let end = start + rng.below(80) as i64 * 250 * MS;
+                let step = [250, 1_000, 3_000, 5_000][rng.below(4) as usize] * MS;
+                queries.map(|query| QueryRequest::range(query, start, end, step))
+            };
+            // Rendered, so that NaN samples of `0 / 0` compare equal.
+            let result = async |request| {
+                format!(
+                    "{:?}",
+                    db.query(&namespace, request, QueryOptions::default())
+                        .await
+                        .map_err(|error| error.to_string())
+                )
+            };
+            let projected = result(&requests[2]).await;
+            for other in &requests[..2] {
+                assert_eq!(
+                    projected,
+                    result(other).await,
+                    "seed {seed}: {:?} vs {other:?}",
+                    requests[2]
+                );
+            }
+        }
+        db.close().await.unwrap();
+    }
+}
+
+/// Writes over thirty hours from `day` of streams labelled by cluster, app
+/// and a unique pod, most with a namespace, some with a `level` that
+/// metadata of that name clashes with, and with `errors`, one with an
+/// `__error__` label. Rows fall on five-minute marks, so streams' rows
+/// often share a timestamp, carry clashing and `_extracted` metadata, and
+/// with `errors`, `__error__` metadata of a few kinds; some rows repeat
+/// within a write, and a write may repeat the previous one.
+fn label_projection_batches(
+    rng: &mut Rng,
+    day: i64,
+    previous: &[LogBatch],
+    errors: bool,
+) -> Vec<LogBatch> {
+    if !previous.is_empty() && rng.below(4) == 0 {
+        return previous.to_vec();
+    }
+    (0..2 + rng.below(12))
+        .map(|_| {
+            let mut pairs = vec![
+                Label::new("cluster", rng.pick(&["c0", "c1"])),
+                Label::new("app", rng.pick(&["a0", "a1", "a2", "a3"])),
+                Label::new("pod", format!("p{}", rng.below(40))),
+            ];
+            if rng.below(4) > 0 {
+                pairs.push(Label::new("namespace", rng.pick(&["n0", "n1", "n2"])));
+            }
+            if rng.below(3) == 0 {
+                pairs.push(Label::new("level", rng.pick(&["info", "warn"])));
+            }
+            if errors && rng.below(12) == 0 {
+                pairs.push(Label::new("__error__", "StreamErr"));
+            }
+            let entries = (0..1 + rng.below(8))
+                .flat_map(|_| {
+                    let errored = errors && rng.below(6) == 0;
+                    // Errored rows of different streams often share one,
+                    // which their streams' order then reports.
+                    let mark = if errored {
+                        rng.below(6) * 60
+                    } else {
+                        rng.below(360)
+                    };
+                    let timestamp = day + mark as i64 * 300 * 1_000_000_000;
+                    let line = rng.pick(&["GET /a", "POST /b", ""]);
+                    let mut fields = Vec::new();
+                    for (name, values) in [
+                        ("level", &["debug", "error"][..]),
+                        ("level_extracted", &["x"][..]),
+                        ("namespace", &["m0", "m1"][..]),
+                        ("trace", &["t0", "t1", "t2"][..]),
+                    ] {
+                        if rng.below(3) == 0 {
+                            fields.push(crate::Field::new(name, rng.pick(values)));
+                        }
+                    }
+                    if errored {
+                        fields.push(crate::Field::new(
+                            "__error__",
+                            rng.pick(&["JSONParserErr", "LogfmtParserErr"]),
+                        ));
+                        fields.push(crate::Field::new(
+                            "__error_details__",
+                            rng.pick(&["d0", "d1", "d2"]),
+                        ));
+                        if rng.below(4) == 0 {
+                            fields.push(crate::Field::new("__preserve_error__", "true"));
+                        }
+                    }
+                    let entry = LogEntry::with_structured_metadata(
+                        timestamp,
+                        line,
+                        crate::Fields::new(fields).unwrap(),
+                    );
+                    let copies = if rng.below(5) == 0 { 2 } else { 1 };
+                    std::iter::repeat_n(entry, copies)
+                })
+                .collect();
+            LogBatch::new(Labels::new(pairs).unwrap(), entries)
+        })
+        .collect()
+}
+
+/// Lineless grouped queries whose streams carry only the labels they
+/// depend on, built from postings, agree with the same queries reading
+/// every stream's forward labels, over hourly segments and, with a rollup,
+/// a sealed day segment taking later writes, and with cached selections of
+/// either kind in between.
+#[tokio::test]
+async fn projected_stream_labels_match_full_stream_labels() {
+    use crate::query::{QueryOptions, QueryRequest};
+    use common::storage::rollup::RollupConfig;
+
+    const HOUR: i64 = 3_600 * 1_000_000_000;
+    const DAY: i64 = 19_723 * 24 * HOUR;
+    let ops = ["count_over_time", "rate", "bytes_over_time", "bytes_rate"];
+    let wrappers = [
+        "sum by (namespace) ({})",
+        "sum by (app, namespace) ({})",
+        "sum by (cluster) ({})",
+        "sum by (pod) ({})",
+        "sum by (level) ({})",
+        "sum by (level_extracted) ({})",
+        "sum by (level_extracted_extracted) ({})",
+        "sum by (namespace_extracted, app) ({})",
+        "sum by (trace) ({})",
+        "sum by (__error__) ({})",
+        "sum ({})",
+        "sum without (pod) ({})",
+        "sum without (level) ({})",
+        "max by (app) ({})",
+        "{}",
+        "topk(2, sum by (namespace) ({}))",
+        "max(sum by (app) ({}))",
+        "sum by (app) ({}) > 1",
+        "sum by (namespace) ({}) / on (namespace) sum by (namespace) ({2})",
+        "sum by (app) ({}) + on () group_left sum({2})",
+        r#"label_replace(sum by (app) ({}), "x", "$1", "app", "(.*)")"#,
+    ];
+    let selectors = [
+        r#"{cluster="c0"}"#,
+        r#"{cluster="c1", namespace=~"n[01]"}"#,
+        r#"{cluster="c0", app!="a1"}"#,
+        r#"{cluster="c0", namespace=""}"#,
+        r#"{cluster="c1", pod=~"p1.*", level!~"warn"}"#,
+        r#"{app="a2", namespace!="n2"}"#,
+        r#"{cluster=~"c.*"}"#,
+    ];
+    let (mut projected, mut full) = (0, 0);
+    for seed in 1..=16u64 {
+        let rolled = seed % 2 == 0;
+        let mut db = LogDb::open(Config {
+            segment_duration: Duration::from_secs(3_600),
+            discovery_rollup: rolled.then_some(Duration::from_secs(24 * 3_600)),
+            retention: None,
+            page: PageConfig {
+                target_size_bytes: 4096,
+                max_rows: 12,
+                rows_per_block: 3,
+            },
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let errors = seed % 3 == 0;
+        let mut previous = Vec::new();
+        for round in 0..2 + rng.below(5) {
+            let batches = label_projection_batches(&mut rng, DAY, &previous, errors);
+            db.write(&namespace, batches.clone()).await.unwrap();
+            previous = batches;
+            if rolled && round == 1 {
+                db.flush_memtable().await.unwrap();
+                db.rollup_at(&RollupConfig::default(), DAY + 26 * HOUR)
+                    .await
+                    .unwrap();
+                assert!(!db.rollups(&namespace).sealed().is_empty(), "seed {seed}");
+            }
+        }
+        for _ in 0..40 {
+            let op = ops[rng.below(ops.len() as u64) as usize];
+            let mut selector = || selectors[rng.below(selectors.len() as u64) as usize];
+            let (first, second) = (selector(), selector());
+            let range = ["10m", "1h", "3h"][rng.below(3) as usize];
+            let wrapper = wrappers[rng.below(wrappers.len() as u64) as usize];
+            let query = wrapper
+                .replace("{}", &format!("{op}({first} [{range}])"))
+                .replace("{2}", &format!("{op}({second} [{range}])"));
+            let start = DAY + rng.below(31 * 12) as i64 * 300 * 1_000_000_000;
+            let request = if rng.below(4) == 0 {
+                QueryRequest::instant(query, start)
+            } else {
+                let end = start + rng.below(12 * 12) as i64 * 300 * 1_000_000_000;
+                let step = [300, 1_800, 3_600, 7_200][rng.below(4) as usize] * 1_000_000_000;
+                QueryRequest::range(query, start, end, step)
+            };
+            // Rendered, so that NaN samples of `0 / 0` compare equal.
+            let mut results = Vec::new();
+            for tuning in read_tunings() {
+                // Listings validated by postings carry no stream counter.
+                if !tuning.postings_validate && db.tuning.postings_validate {
+                    for (key, _) in db.caches.streams.iter() {
+                        match key.3 {
+                            Some(_) => projected += 1,
+                            None => full += 1,
+                        }
+                    }
+                    db.caches.streams.invalidate_all();
+                }
+                db.tuning = tuning;
+                for project in [true, false, true] {
+                    db.project_labels = project;
+                    results.push(format!(
+                        "{:?}",
+                        db.query(&namespace, &request, QueryOptions::default())
+                            .await
+                            .map_err(|error| error.to_string())
+                    ));
+                }
+            }
+            for (index, result) in results.iter().enumerate() {
+                assert_eq!(
+                    *result,
+                    results[0],
+                    "seed {seed} {:?} project {}: {request:?}",
+                    read_tunings()[index / 3],
+                    index % 3 != 1
+                );
+            }
+        }
+        for (key, _) in db.caches.streams.iter() {
+            match key.3 {
+                Some(_) => projected += 1,
+                None => full += 1,
+            }
+        }
+        db.close().await.unwrap();
+    }
+    assert!(
+        projected > 100 && full > 100,
+        "{projected} projected, {full} full"
+    );
 }
 
 /// Runs counted from their records leave gaps between the runs decoded

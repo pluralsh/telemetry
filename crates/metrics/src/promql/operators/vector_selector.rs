@@ -29,7 +29,6 @@
 //!
 //! [`SeriesSource`]: crate::promql::source::SeriesSource
 
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -49,6 +48,7 @@ use super::super::source::{
     ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
 };
 use super::super::trace;
+use super::prefetch::{ChunkLoad, Prefetch};
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -360,8 +360,10 @@ enum State<'a> {
     LoadingChunk {
         chunk_start: usize,
         chunk_len: usize,
-        #[allow(clippy::type_complexity)]
-        future: Pin<Box<dyn Future<Output = Result<ChunkSamples, QueryError>> + Send + 'a>>,
+        future: ChunkLoad<'a, ChunkSamples>,
+        /// Whether read-ahead overlapped the load, so a failure is retried
+        /// alone before it is final.
+        retry: bool,
     },
     /// Chunk loaded; step chunks emit one batch per poll.
     Emitting {
@@ -397,6 +399,7 @@ pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
 
     // Runtime state ---------------------------------------------------------
     state: State<'a>,
+    prefetch: Prefetch<'a, ChunkSamples>,
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
@@ -437,6 +440,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             shape,
             reservation,
             state: State::Init,
+            prefetch: Prefetch::new(crate::read_tuning::read_tuning().chunk_prefetch),
         }
     }
 
@@ -456,17 +460,46 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         )
     }
 
+    fn chunk_len(&self, chunk_start: usize) -> usize {
+        (chunk_start + self.shape.series_chunk).min(self.total_series()) - chunk_start
+    }
+
+    /// Loads the chunk at `chunk_start` (prefetched if it was) and queues
+    /// read-ahead of the chunks after it.
     fn start_chunk_load(&mut self, chunk_start: usize) -> State<'a>
     where
         S: 'a,
     {
-        let chunk_end = (chunk_start + self.shape.series_chunk).min(self.total_series());
-        let chunk_len = chunk_end - chunk_start;
+        let chunk_len = self.chunk_len(chunk_start);
+        let retry = self.prefetch.active();
+        let future = match self.prefetch.take(chunk_start) {
+            Some(future) => future,
+            None => self.chunk_load(chunk_start),
+        };
+        let after = (chunk_start + chunk_len..self.total_series()).step_by(self.shape.series_chunk);
+        for start in self.prefetch.wanted(after) {
+            let load = self.chunk_load(start);
+            self.prefetch.push(start, load);
+        }
+        State::LoadingChunk {
+            chunk_start,
+            chunk_len,
+            future,
+            retry,
+        }
+    }
+
+    fn chunk_load(&self, chunk_start: usize) -> ChunkLoad<'a, ChunkSamples>
+    where
+        S: 'a,
+    {
+        let chunk_len = self.chunk_len(chunk_start);
+        let chunk_end = chunk_start + chunk_len;
         let (request, request_to_series) = self.chunk_request(chunk_start, chunk_end);
         let source = self.source.clone();
         let reservation = self.reservation.clone();
 
-        let future = Box::pin(async move {
+        Box::pin(async move {
             let mut samples = ChunkSamples::new(reservation, chunk_len);
             let stream = source.samples(request);
             let mut stream: SampleStream<'_> = Box::pin(stream);
@@ -480,18 +513,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                     samples.absorb(batch, &request_to_series)
                 })?;
             }
-            // Silence "unused variable" when chunk_start isn't read
-            // by absorb — it's threaded into the state machine as an
-            // identifier for the series slice we're hydrating.
-            let _ = chunk_start;
             Ok(samples)
-        });
-
-        State::LoadingChunk {
-            chunk_start,
-            chunk_len,
-            future,
-        }
+        })
     }
 
     fn build_batch(
@@ -641,20 +664,34 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                     chunk_start,
                     chunk_len,
                     mut future,
+                    retry,
                 } => {
                     // Time each poll of the hydration future — covers the
                     // `samples_stream.next().await` + `absorb` loop. Only
                     // Ready polls record (Pending polls don't contribute
                     // CPU, just the wake-up cost).
                     let _g = trace::Scope::enter("hydrate");
-                    match future.as_mut().poll(cx) {
+                    let polled = future.as_mut().poll(cx);
+                    self.prefetch.poll(cx);
+                    match polled {
                         Poll::Pending => {
                             self.state = State::LoadingChunk {
                                 chunk_start,
                                 chunk_len,
                                 future,
+                                retry,
                             };
                             return Poll::Pending;
+                        }
+                        Poll::Ready(Err(_)) if retry => {
+                            drop(future);
+                            self.prefetch.disable();
+                            self.state = State::LoadingChunk {
+                                chunk_start,
+                                chunk_len,
+                                future: self.chunk_load(chunk_start),
+                                retry: false,
+                            };
                         }
                         Poll::Ready(Ok(samples)) => {
                             self.state = State::Emitting {
@@ -702,6 +739,10 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                             return Poll::Ready(Some(Err(err)));
                         }
                     };
+                    {
+                        let _g = trace::Scope::enter("hydrate");
+                        self.prefetch.poll(cx);
+                    }
                     self.state = State::Emitting {
                         chunk_start,
                         chunk_len,

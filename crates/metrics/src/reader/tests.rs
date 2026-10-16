@@ -765,6 +765,60 @@ async fn should_see_new_series_in_a_bucket_whose_postings_are_cached() {
 }
 
 #[tokio::test]
+async fn should_see_new_series_behind_cached_postings_whichever_way_it_finds_the_watermark() {
+    for scan_watermark in [false, true] {
+        let _tuning = crate::read_tuning::override_read_tuning(crate::read_tuning::ReadTuning {
+            scan_watermark,
+            ..crate::read_tuning::ReadTuning::DEFAULT
+        })
+        .await;
+        // given: a reader that has cached the postings of a 3-series metric
+        let shared = create_shared_storage().await;
+        let tsdb = crate::tsdb::Tsdb::new(shared.storage.clone());
+        let series = |instance: usize| {
+            Series::builder("watermarked")
+                .label("instance", format!("i{instance}"))
+                .sample(1700000000000, 1.0)
+                .build()
+        };
+        tsdb.ingest_samples((0..3).map(series).collect(), None)
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+        let reader = TimeSeriesDbReader::from_storage(shared.reader().await);
+        let ns = crate::Namespace::default();
+        let at = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000));
+        let count = || async {
+            match reader
+                .query(&ns, r#"count(watermarked{instance!="z"})"#, at)
+                .await
+                .unwrap()
+            {
+                QueryValue::Vector(samples) => samples.first().map_or(0.0, |s| s.value),
+                other => panic!("expected Vector, got {other:?}"),
+            }
+        };
+        assert_eq!(count().await, 3.0);
+
+        // when: 40 more series land in the same bucket
+        tsdb.ingest_samples((3..43).map(series).collect(), None)
+            .await
+            .unwrap();
+        tsdb.flush().await.unwrap();
+
+        // then: all of them become visible once the reader's view advances
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while count().await != 43.0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan_watermark={scan_watermark}: new series stayed hidden"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn should_cache_selector_results_and_drop_them_when_the_bucket_gains_series() {
     // given: a reader that resolved a selector once
     let shared = create_shared_storage().await;

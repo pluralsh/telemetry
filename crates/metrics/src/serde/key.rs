@@ -345,6 +345,79 @@ pub fn decode_bucket_generation(buf: &[u8]) -> Result<u64, EncodingError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// SeriesFingerprint key: laid out like [`ForwardIndexKey`], so a dense run
+/// of series IDs is one range scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesFingerprintKey {
+    pub namespace: Namespace,
+    pub bucket: TimeBucket,
+    pub series_id: SeriesId,
+}
+
+impl SeriesFingerprintKey {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        write_record_prefix(
+            &mut buf,
+            &self.namespace,
+            &self.bucket,
+            RecordType::SeriesFingerprint,
+        );
+        buf.extend_from_slice(&self.series_id.to_be_bytes());
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        let (namespace, bucket, record_type, offset) = parse_record_prefix(buf)?;
+        if record_type != RecordType::SeriesFingerprint {
+            return Err(EncodingError {
+                message: format!(
+                    "invalid record type: expected SeriesFingerprint, got {:?}",
+                    record_type
+                ),
+            });
+        }
+        let series_id = buf
+            .get(offset..offset + 4)
+            .and_then(|suffix| suffix.try_into().ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| EncodingError {
+                message: "Buffer too short for SeriesFingerprintKey".to_string(),
+            })?;
+        Ok(SeriesFingerprintKey {
+            namespace,
+            bucket,
+            series_id,
+        })
+    }
+}
+
+impl RecordKey for SeriesFingerprintKey {
+    const RECORD_TYPE: RecordType = RecordType::SeriesFingerprint;
+}
+
+impl TimeBucketScoped for SeriesFingerprintKey {
+    fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+    fn bucket(&self) -> TimeBucket {
+        self.bucket
+    }
+}
+
+/// A series' [`crate::model::Labels::series_fingerprint`], stored as `u128`
+/// big-endian.
+pub fn encode_series_fingerprint(fingerprint: SeriesFingerprint) -> Bytes {
+    Bytes::copy_from_slice(&fingerprint.to_be_bytes())
+}
+
+pub fn decode_series_fingerprint(buf: &[u8]) -> Result<SeriesFingerprint, EncodingError> {
+    let bytes: [u8; 16] = buf.try_into().map_err(|_| EncodingError {
+        message: format!("series fingerprint must be 16 bytes, got {}", buf.len()),
+    })?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +495,24 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_encode_series_fingerprint_keys_in_series_id_order() {
+        let key = |series_id| SeriesFingerprintKey {
+            namespace: Namespace::new("tenant").unwrap(),
+            bucket: TimeBucket::hour(120),
+            series_id,
+        };
+        let encoded = key(7).encode();
+        assert_eq!(SeriesFingerprintKey::decode(&encoded).unwrap(), key(7));
+        assert!(key(255).encode() < key(256).encode());
+        assert!(ForwardIndexKey::decode(&encoded).is_err());
+        assert_eq!(
+            decode_series_fingerprint(&encode_series_fingerprint(u128::MAX - 5)).unwrap(),
+            u128::MAX - 5
+        );
+        assert!(decode_series_fingerprint(&[0; 8]).is_err());
     }
 
     #[test]

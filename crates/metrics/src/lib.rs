@@ -23,6 +23,7 @@ mod postings_cache;
 mod profile;
 mod promql;
 mod query;
+mod read_tuning;
 mod reader;
 mod remote;
 #[cfg(feature = "remote-write")]

@@ -131,6 +131,8 @@ pub struct ShardedMetrics {
     /// Reads the shards other reader groups serve; unset outside reader
     /// groups, where every shard is open locally.
     remote: OnceLock<Arc<dyn MetricsShardClient>>,
+    #[cfg(test)]
+    label_projection: bool,
 }
 
 pub type ShardedTimeseries = ShardedMetrics;
@@ -157,7 +159,25 @@ impl ShardedMetrics {
                 .then(|| ResultCache::new(caches.result_capacity_bytes)),
             admission: QueryAdmission::new(limits),
             remote: OnceLock::new(),
+            #[cfg(test)]
+            label_projection: true,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_label_projection(mut self, label_projection: bool) -> Self {
+        self.label_projection = label_projection;
+        self
+    }
+
+    /// `plan` as this facade's test switches leave it.
+    fn tuned(
+        &self,
+        plan: crate::promql::plan::LoweringContext,
+    ) -> crate::promql::plan::LoweringContext {
+        #[cfg(test)]
+        let plan = plan.with_label_projection(self.label_projection);
+        plan
     }
 
     pub async fn open_writers(
@@ -190,6 +210,27 @@ impl ShardedMetrics {
         reader_options: DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
+        Self::open_readers_over(
+            config,
+            options,
+            local_shards,
+            reader_options,
+            cache_capacity,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::open_readers`] with every shard read through `object_store`
+    /// when given.
+    pub(crate) async fn open_readers_over(
+        config: Config,
+        options: ShardingOptions,
+        local_shards: impl IntoIterator<Item = ShardId>,
+        reader_options: DbReaderOptions,
+        cache_capacity: u64,
+        object_store: Option<Arc<dyn slatedb::object_store::ObjectStore>>,
+    ) -> Result<Self> {
         let caches = config.query_cache;
         let limits = config.query_limits;
         let matcher_capacity = caches.matcher_capacity_bytes;
@@ -200,13 +241,19 @@ impl ShardedMetrics {
             let storage = shard_storage(&config, shard);
             let reader_options = reader_options.clone();
             let cache = shard_cache.clone();
+            let object_store = object_store.clone();
             async move {
-                TimeSeriesDbReader::open_with_cache(
+                let object_store = match object_store {
+                    Some(object_store) => object_store,
+                    None => common::create_object_store(&storage.object_store)?,
+                };
+                TimeSeriesDbReader::open_over(
                     storage,
                     reader_options,
                     cache_capacity,
                     None,
                     &cache,
+                    object_store,
                 )
                 .await
                 .map(|db| {
@@ -368,10 +415,10 @@ impl ShardedMetrics {
         let query_time = time.unwrap_or_else(SystemTime::now);
         let at_ms = system_time_to_ms(query_time);
         let options = crate::QueryOptions::default();
-        let plan = crate::promql::plan::LoweringContext::for_instant(
+        let plan = self.tuned(crate::promql::plan::LoweringContext::for_instant(
             at_ms,
             duration_to_ms(options.lookback_delta),
-        );
+        ));
         let ranges = preload_ranges_for_query(query, at_ms, at_ms, options.lookback_delta)?;
         let admitted = self.admission.admit().await?;
         let (source, plan) = self
@@ -530,12 +577,12 @@ impl ShardedMetrics {
         trace: bool,
     ) -> std::result::Result<(Vec<RangeSample>, Option<serde_json::Value>), QueryError> {
         let options = crate::QueryOptions::default();
-        let plan = crate::promql::plan::LoweringContext::new(
+        let plan = self.tuned(crate::promql::plan::LoweringContext::new(
             start_ms,
             end_ms,
             step_ms,
             duration_to_ms(options.lookback_delta),
-        );
+        ));
         let ranges = preload_ranges_for_query(query, start_ms, end_ms, options.lookback_delta)?;
         let admitted = self.admission.admit().await?;
         let (source, plan) = self
@@ -1089,6 +1136,17 @@ impl QueryReader for ShardQueryReader {
         }
     }
 
+    async fn series_fingerprints(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        match self {
+            Self::Writer(reader) => reader.series_fingerprints(bucket, series_ids).await,
+            Self::Reader(reader) => reader.series_fingerprints(bucket, series_ids).await,
+        }
+    }
+
     async fn label_postings(
         &self,
         bucket: &TimeBucket,
@@ -1278,6 +1336,15 @@ impl<R: QueryReader> QueryReader for IoLimitedQueryReader<R> {
         self.inner.forward_index_many(bucket, series_ids).await
     }
 
+    async fn series_fingerprints(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        let _permit = self.acquire().await?;
+        self.inner.series_fingerprints(bucket, series_ids).await
+    }
+
     async fn label_postings(
         &self,
         bucket: &TimeBucket,
@@ -1356,10 +1423,23 @@ impl ShardSource {
         &self,
         selector: &promql_parser::parser::VectorSelector,
         time_range: TimeRange,
+        projection: Option<Arc<[String]>>,
     ) -> Vec<std::result::Result<ResolvedSeriesChunk, SourceQueryError>> {
-        match self {
-            Self::Local(source) => source.resolve(selector, time_range).collect().await,
-            Self::Remote(source) => source.resolve(selector, time_range).collect().await,
+        match (self, projection) {
+            (Self::Local(source), None) => source.resolve(selector, time_range).collect().await,
+            (Self::Remote(source), None) => source.resolve(selector, time_range).collect().await,
+            (Self::Local(source), Some(projection)) => {
+                source
+                    .resolve_projected(selector, time_range, projection)
+                    .collect()
+                    .await
+            }
+            (Self::Remote(source), Some(projection)) => {
+                source
+                    .resolve_projected(selector, time_range, projection)
+                    .collect()
+                    .await
+            }
         }
     }
 
@@ -1398,22 +1478,23 @@ impl MultiShardSeriesSource {
             bucket_id & SOURCE_BUCKET_MASK,
         )
     }
-}
 
-impl SeriesSource for MultiShardSeriesSource {
-    fn resolve(
+    fn resolve_shards(
         &self,
         selector: &promql_parser::parser::VectorSelector,
         time_range: TimeRange,
-    ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
+        projection: Option<Arc<[String]>>,
+    ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send + use<>
+    {
         let selector = selector.clone();
         let sources: Vec<_> = self.sources.iter().cloned().enumerate().collect();
         let width = sources.len().max(1);
         stream::iter(sources.into_iter().map(move |(source_index, source)| {
             let selector = selector.clone();
+            let projection = projection.clone();
             async move {
                 source
-                    .resolve_all(&selector, time_range)
+                    .resolve_all(&selector, time_range, projection)
                     .await
                     .into_iter()
                     .map(move |chunk| {
@@ -1431,6 +1512,7 @@ impl SeriesSource for MultiShardSeriesSource {
                                         metric_name: Arc::clone(&series.metric_name),
                                     })
                                     .collect(),
+                                fingerprints: chunk.fingerprints,
                             }
                         })
                     })
@@ -1439,6 +1521,25 @@ impl SeriesSource for MultiShardSeriesSource {
         }))
         .buffered(width)
         .flat_map(stream::iter)
+    }
+}
+
+impl SeriesSource for MultiShardSeriesSource {
+    fn resolve(
+        &self,
+        selector: &promql_parser::parser::VectorSelector,
+        time_range: TimeRange,
+    ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
+        self.resolve_shards(selector, time_range, None)
+    }
+
+    fn resolve_projected(
+        &self,
+        selector: &promql_parser::parser::VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
+        self.resolve_shards(selector, time_range, Some(projection))
     }
 
     fn samples(

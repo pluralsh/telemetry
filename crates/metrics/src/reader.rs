@@ -146,6 +146,17 @@ impl QueryReader for ReaderQueryReader {
         mini.forward_index_many(series_ids).await
     }
 
+    async fn series_fingerprints(
+        &self,
+        bucket: &TimeBucket,
+        series_ids: &[SeriesId],
+    ) -> Result<Option<Vec<Option<u128>>>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.series_fingerprints(series_ids).await
+    }
+
     async fn label_postings(
         &self,
         bucket: &TimeBucket,
@@ -336,11 +347,33 @@ impl TimeSeriesDbReader {
         checkpoint_id: Option<Uuid>,
         cache: &common::SharedDbCache,
     ) -> Result<Self> {
+        let object_store = common::create_object_store(&storage_config.object_store)?;
+        Self::open_over(
+            storage_config,
+            reader_options,
+            cache_capacity,
+            checkpoint_id,
+            cache,
+            object_store,
+        )
+        .await
+    }
+
+    /// [`Self::open_with_cache`] over `object_store` instead of the one
+    /// `storage_config` names.
+    pub(crate) async fn open_over(
+        storage_config: SlateDbStorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Option<Uuid>,
+        cache: &common::SharedDbCache,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    ) -> Result<Self> {
         let reader = StorageReader::try_new_with_cache(
             &storage_config,
             reader_options,
             checkpoint_id,
-            common::create_object_store(&storage_config.object_store)?,
+            object_store,
             cache,
         )
         .await?;

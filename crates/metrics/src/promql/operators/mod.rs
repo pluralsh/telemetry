@@ -40,6 +40,7 @@ pub(crate) mod histogram;
 pub(crate) mod instant_fn;
 pub(crate) mod label_manip;
 pub(crate) mod matrix_selector;
+pub(crate) mod prefetch;
 pub(crate) mod rechunk;
 pub(crate) mod rollup;
 pub(crate) mod sort;

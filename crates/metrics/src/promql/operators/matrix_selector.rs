@@ -34,7 +34,6 @@
 //! Adjacent-step cells for the same series advance monotonically, so
 //! `RollupOp`'s two-pointer driver reuses state across steps.
 
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -53,6 +52,7 @@ use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
     ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
 };
+use super::prefetch::{ChunkLoad, Prefetch};
 use super::vector_selector::histogram_sample_bytes;
 
 // ---------------------------------------------------------------------------
@@ -602,8 +602,10 @@ enum State<'a> {
     LoadingChunk {
         chunk_start: usize,
         chunk_len: usize,
-        #[allow(clippy::type_complexity)]
-        future: Pin<Box<dyn Future<Output = Result<PackedChunk, QueryError>> + Send + 'a>>,
+        future: ChunkLoad<'a, PackedChunk>,
+        /// Whether read-ahead overlapped the load, so a failure is retried
+        /// alone before it is final.
+        retry: bool,
     },
     Emitting {
         chunk_start: usize,
@@ -655,6 +657,7 @@ pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
     /// A consumed batch's cell index, kept for the next batch. Unreserved,
     /// but never more than one batch's.
     spare_cells: Vec<CellIndex>,
+    prefetch: Prefetch<'a, PackedChunk>,
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
@@ -716,6 +719,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             reservation,
             state: State::Init,
             spare_cells: Vec::new(),
+            prefetch: Prefetch::new(crate::read_tuning::read_tuning().chunk_prefetch),
         }
     }
 
@@ -740,17 +744,44 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         )
     }
 
+    fn chunk_len(&self, chunk_start: usize) -> usize {
+        (chunk_start + self.shape.series_chunk).min(self.total_series()) - chunk_start
+    }
+
+    /// Loads the chunk at `chunk_start` (prefetched if it was) and queues
+    /// read-ahead of the chunks after it.
     fn start_chunk_load(&mut self, chunk_start: usize) -> State<'a>
     where
         S: 'a,
     {
-        let chunk_end = (chunk_start + self.shape.series_chunk).min(self.total_series());
-        let chunk_len = chunk_end - chunk_start;
-        let (request, request_to_series) = self.chunk_request(chunk_start, chunk_end);
+        let chunk_len = self.chunk_len(chunk_start);
+        let retry = self.prefetch.active();
+        let future = match self.prefetch.take(chunk_start) {
+            Some(future) => future,
+            None => self.chunk_load(chunk_start),
+        };
+        let after = (chunk_start + chunk_len..self.total_series()).step_by(self.shape.series_chunk);
+        for start in self.prefetch.wanted(after) {
+            let load = self.chunk_load(start);
+            self.prefetch.push(start, load);
+        }
+        State::LoadingChunk {
+            chunk_start,
+            chunk_len,
+            future,
+            retry,
+        }
+    }
+
+    fn chunk_load(&self, chunk_start: usize) -> ChunkLoad<'a, PackedChunk>
+    where
+        S: 'a,
+    {
+        let chunk_len = self.chunk_len(chunk_start);
+        let (request, request_to_series) = self.chunk_request(chunk_start, chunk_start + chunk_len);
         let source = self.source.clone();
         let reservation = self.reservation.clone();
-
-        let future = Box::pin(async move {
+        Box::pin(async move {
             let mut samples = ChunkSamples::new(reservation, chunk_len);
             let stream = source.samples(request);
             let mut stream: SampleStream<'_> = Box::pin(stream);
@@ -759,13 +790,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                 samples.absorb(batch, &request_to_series)?;
             }
             samples.pack()
-        });
-
-        State::LoadingChunk {
-            chunk_start,
-            chunk_len,
-            future,
-        }
+        })
     }
 
     fn build_window_batch(
@@ -873,32 +898,49 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     chunk_start,
                     chunk_len,
                     mut future,
-                } => match future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.state = State::LoadingChunk {
-                            chunk_start,
-                            chunk_len,
-                            future,
-                        };
-                        return Poll::Pending;
+                    retry,
+                } => {
+                    let polled = future.as_mut().poll(cx);
+                    self.prefetch.poll(cx);
+                    match polled {
+                        Poll::Pending => {
+                            self.state = State::LoadingChunk {
+                                chunk_start,
+                                chunk_len,
+                                future,
+                                retry,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(_)) if retry => {
+                            drop(future);
+                            self.prefetch.disable();
+                            self.state = State::LoadingChunk {
+                                chunk_start,
+                                chunk_len,
+                                future: self.chunk_load(chunk_start),
+                                retry: false,
+                            };
+                        }
+                        Poll::Ready(Ok(samples)) => {
+                            let cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
+                            let hist_cursors =
+                                (0..chunk_len).map(|_| SeriesCursor::new()).collect();
+                            self.state = State::Emitting {
+                                chunk_start,
+                                chunk_len,
+                                samples: Box::new(samples),
+                                cursors,
+                                hist_cursors,
+                                next_step_chunk_start: 0,
+                            };
+                        }
+                        Poll::Ready(Err(err)) => {
+                            self.state = State::Errored;
+                            return Poll::Ready(Some(Err(err)));
+                        }
                     }
-                    Poll::Ready(Ok(samples)) => {
-                        let cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
-                        let hist_cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
-                        self.state = State::Emitting {
-                            chunk_start,
-                            chunk_len,
-                            samples: Box::new(samples),
-                            cursors,
-                            hist_cursors,
-                            next_step_chunk_start: 0,
-                        };
-                    }
-                    Poll::Ready(Err(err)) => {
-                        self.state = State::Errored;
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                },
+                }
                 State::Emitting {
                     chunk_start,
                     chunk_len,
@@ -927,6 +969,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                         next_step_chunk_start,
                     ) {
                         Ok(batch) => {
+                            self.prefetch.poll(cx);
                             let step_advance = batch.step_count();
                             self.state = State::Emitting {
                                 chunk_start,

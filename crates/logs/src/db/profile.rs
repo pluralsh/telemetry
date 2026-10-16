@@ -69,6 +69,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
         }),
         segment_duration: Duration::from_secs(if production { 3600 } else { 60 }),
         discovery_rollup: Some(Duration::from_secs(24 * 3600)),
+        stream_locality_labels: Vec::new(),
         retention: None,
         page: if production {
             PageConfig::default()
@@ -1105,10 +1106,179 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
         span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
         span_scan_max_spread: std::env::var("PROFILE_SPAN_SPREAD")
             .map_or(SPAN_SCAN_MAX_SPREAD, |value| value.parse().unwrap()),
+        // `PROFILE_FULL_LABELS` reads every stream's full labels.
+        project_labels: std::env::var("PROFILE_FULL_LABELS").is_err(),
+        tuning: profile_tuning(),
         rolled: tokio::sync::RwLock::new(HashMap::new()),
         rollup_lock: Mutex::new(()),
         merge_holds: Default::default(),
         retention: config.retention,
+    }
+}
+
+/// [`ReadTuning::default`] with `PROFILE_LIST_CONCURRENCY`,
+/// `PROFILE_READ_CONCURRENCY`, `PROFILE_POSTINGS_VALIDATE` and
+/// `PROFILE_OVERLAP_RUNS` (`0` or `1`) overriding its fields.
+fn profile_tuning() -> ReadTuning {
+    fn var<T: std::str::FromStr<Err: std::fmt::Debug>>(name: &str) -> Option<T> {
+        std::env::var(name).ok().map(|value| value.parse().unwrap())
+    }
+    let flag = |name: &str| var(name).map(|value: u8| value != 0);
+    let default = ReadTuning::default();
+    ReadTuning {
+        list_concurrency: var("PROFILE_LIST_CONCURRENCY").unwrap_or(default.list_concurrency),
+        read_concurrency: var("PROFILE_READ_CONCURRENCY").unwrap_or(default.read_concurrency),
+        postings_validate: flag("PROFILE_POSTINGS_VALIDATE").unwrap_or(default.postings_validate),
+        overlap_runs: flag("PROFILE_OVERLAP_RUNS").unwrap_or(default.overlap_runs),
+    }
+}
+
+/// Times `request` `runs` times, each on fresh cold readers: the whole
+/// query on one, then on another its `scan_targets` and the load of what it
+/// listed; then the query warm on the last. Prints each run and the median,
+/// min and max of every measure.
+async fn cold_runs(
+    config: &Config,
+    latency: Duration,
+    namespace: &Namespace,
+    request: &QueryRequest,
+    runs: usize,
+) {
+    let options = QueryOptions::default();
+    let parsed = crate::logql::parse(&request.query).unwrap();
+    let plan = crate::query::ScanPlan::new(request, &parsed, &options).unwrap();
+    println!("tuning: {:?} latency {latency:?}", profile_tuning());
+    // `PROFILE_SEGMENT_TIMES` lists each segment alone, then all at once,
+    // each on a fresh cold reader.
+    if std::env::var("PROFILE_SEGMENT_TIMES").is_ok() {
+        let now_unix_ms = unix_time_ms().unwrap();
+        let range = (plan.scan_start, request.end_ns);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let db = cold_reader(config, latency, &gets).await;
+        let segments = db.visible_segment_ids(namespace, range, false).unwrap();
+        gets.store(0, Ordering::Relaxed);
+        for segment in &segments {
+            let started = Instant::now();
+            let streams = db
+                .segment_streams(namespace, *segment, &plan.streams, range, now_unix_ms)
+                .await
+                .unwrap();
+            println!(
+                "  alone {}: {:.0}ms gets {} streams {} runs {}",
+                segment.start_ns,
+                ms(started.elapsed()),
+                gets.swap(0, Ordering::Relaxed),
+                streams.len(),
+                streams
+                    .iter()
+                    .map(|stream| stream.runs.len())
+                    .sum::<usize>(),
+            );
+        }
+        db.close().await.unwrap();
+        let db = cold_reader(config, latency, &gets).await;
+        let started = Instant::now();
+        let filter = &plan.streams;
+        let done = futures::future::join_all(segments.iter().map(|segment| {
+            let db = &db;
+            async move {
+                db.segment_streams(namespace, *segment, filter, range, now_unix_ms)
+                    .await
+                    .unwrap();
+                ms(started.elapsed())
+            }
+        }))
+        .await;
+        println!("  together, done at: {done:.0?}");
+        db.close().await.unwrap();
+    }
+    let names = [
+        "total ms",
+        "total gets",
+        "scan ms",
+        "scan gets",
+        "load ms",
+        "load gets",
+        "warm ms",
+        "warmscan ms",
+    ];
+    let mut measures = vec![Vec::new(); names.len()];
+    for run in 0..runs {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let db = cold_reader(config, latency, &gets).await;
+        gets.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        db.query(namespace, request, options.clone()).await.unwrap();
+        let total = (ms(started.elapsed()), gets.swap(0, Ordering::Relaxed));
+        db.close().await.unwrap();
+
+        let db = cold_reader(config, latency, &gets).await;
+        gets.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let targets = db
+            .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
+            .await
+            .unwrap();
+        let scan = (ms(started.elapsed()), gets.swap(0, Ordering::Relaxed));
+        let estimate = targets.estimate(plan.is_lineless());
+        let started = Instant::now();
+        plan.load_targets(
+            &db,
+            namespace,
+            &PageBudget::new(estimate.read_units),
+            targets,
+        )
+        .await
+        .unwrap();
+        let load = (ms(started.elapsed()), gets.swap(0, Ordering::Relaxed));
+        let warm_runs =
+            std::env::var("PROFILE_WARM_RUNS").map_or(3, |value| value.parse().unwrap());
+        let mut warm = Vec::new();
+        let mut warm_scan = Vec::new();
+        for _ in 0..warm_runs {
+            let started = Instant::now();
+            db.query(namespace, request, options.clone()).await.unwrap();
+            warm.push(ms(started.elapsed()));
+            let started = Instant::now();
+            db.scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
+                .await
+                .unwrap();
+            warm_scan.push(ms(started.elapsed()));
+        }
+        warm.sort_by(f64::total_cmp);
+        warm_scan.sort_by(f64::total_cmp);
+        db.close().await.unwrap();
+        let values = [
+            total.0,
+            total.1 as f64,
+            scan.0,
+            scan.1 as f64,
+            load.0,
+            load.1 as f64,
+            warm[warm.len() / 2],
+            warm_scan[warm_scan.len() / 2],
+        ];
+        println!(
+            "  run {run}: {}",
+            names
+                .iter()
+                .zip(values)
+                .map(|(name, value)| format!("{name} {value:.0}"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        for (measure, value) in measures.iter_mut().zip(values) {
+            measure.push(value);
+        }
+    }
+    for (name, mut values) in names.iter().zip(measures) {
+        values.sort_by(f64::total_cmp);
+        println!(
+            "  {name}: median {:.0} min {:.0} max {:.0}",
+            values[values.len() / 2],
+            values[0],
+            values[values.len() - 1]
+        );
     }
 }
 
@@ -1131,8 +1301,9 @@ async fn profile_cluster_day() {
     let marker = store.join("ingested");
     if !marker.exists() {
         std::fs::create_dir_all(&store).unwrap();
+        let ingested_end = profile_end(FLUSH_SECONDS);
         ingest_clusters(&config, &namespace, hours).await;
-        std::fs::write(&marker, b"").unwrap();
+        std::fs::write(&marker, ingested_end.to_string()).unwrap();
     }
 
     if std::env::var("PROFILE_ROLLUP").is_ok() && !store.join("rolled").exists() {
@@ -1186,16 +1357,40 @@ async fn profile_cluster_day() {
         }
     }
 
-    let end = profile_end(step);
+    // `PROFILE_END=ingested` ends the day where the ingest did, so every run
+    // against one store reads the same segments.
+    let end = match std::env::var("PROFILE_END").as_deref() {
+        Ok("ingested") => {
+            let ingested: i64 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+            ingested / (step * SECOND) * (step * SECOND)
+        }
+        _ => profile_end(step),
+    };
     let start = end - 86_400 * SECOND;
-    let request = QueryRequest::range(
-        format!(r#"sum(count_over_time({{cluster="{cluster}"}} [{step}s]))"#),
-        start,
-        end,
-        step * SECOND,
-    )
-    .frontend_step_aligned();
+    // `PROFILE_QUERY` overrides the query, with `CLUSTER` and `STEP` filled in.
+    let query = std::env::var("PROFILE_QUERY").map_or_else(
+        |_| format!(r#"sum(count_over_time({{cluster="{cluster}"}} [{step}s]))"#),
+        |query| {
+            query
+                .replace("CLUSTER", &cluster)
+                .replace("STEP", &step.to_string())
+        },
+    );
+    println!("query: {query}");
+    let request = QueryRequest::range(query, start, end, step * SECOND).frontend_step_aligned();
     let options = QueryOptions::default();
+    // `PROFILE_COLD_RUNS` only times that many cold runs.
+    if let Ok(runs) = std::env::var("PROFILE_COLD_RUNS") {
+        cold_runs(
+            &config,
+            latency,
+            &namespace,
+            &request,
+            runs.parse().unwrap(),
+        )
+        .await;
+        return;
+    }
 
     let gets = Arc::new(AtomicUsize::new(0));
     let mut db = cold_reader(&config, latency, &gets).await;
@@ -1304,6 +1499,140 @@ async fn profile_cluster_day() {
         ms(started.elapsed()),
         cold_gets.load(Ordering::Relaxed)
     );
+
+    // Stream selection by phase on fresh cold readers: postings, then the
+    // forward labels of the streams they found, then those labels again
+    // warm, and the labels alone on a reader that read no postings first.
+    let segments = cold
+        .visible_segment_ids(&namespace, (plan.scan_start, request.end_ns), false)
+        .unwrap();
+    let (exact, namespace) = (&plan.streams.exact, &namespace);
+    let postings = async |db: &LogDb| {
+        futures::stream::iter(segments.iter().copied())
+            .map(|segment| async move {
+                let ids = db.stream_ids(namespace, segment, exact).await?;
+                Ok::<_, Error>((segment, ids))
+            })
+            .buffered(SEGMENT_LIST_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    };
+    let labels = async |db: &LogDb, ids: &[(SegmentId, Vec<StreamId>)]| {
+        futures::stream::iter(ids.iter().cloned())
+            .map(|(segment, ids)| db.stream_labels(namespace, segment, ids))
+            .buffered(SEGMENT_LIST_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    };
+    let phase_gets = Arc::new(AtomicUsize::new(0));
+    let mut phased = cold_reader(&config, latency, &phase_gets).await;
+    let counting = Arc::new(common::storage::counting::CountingStorage::new(
+        phased.storage.clone(),
+        classify_key,
+    ));
+    phased.storage = counting.clone();
+    phase_gets.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    let ids = postings(&phased).await;
+    let postings_cold = (started.elapsed(), phase_gets.swap(0, Ordering::Relaxed));
+    let started = Instant::now();
+    let labelled = labels(&phased, &ids).await;
+    let labels_cold = (started.elapsed(), phase_gets.swap(0, Ordering::Relaxed));
+    let started = Instant::now();
+    labels(&phased, &ids).await;
+    let labels_warm = started.elapsed();
+    let io = counting.take();
+    let alone_gets = Arc::new(AtomicUsize::new(0));
+    let alone = cold_reader(&config, latency, &alone_gets).await;
+    alone_gets.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    labels(&alone, &ids).await;
+    let labels_alone = (started.elapsed(), alone_gets.load(Ordering::Relaxed));
+    // The same streams' labels built from postings, as the query projects
+    // them, on a reader that read the postings first.
+    let projected = async |db: &LogDb, ids: &[(SegmentId, Vec<StreamId>)]| {
+        let Some(names) = &plan.streams.labels else {
+            return (0, 0);
+        };
+        let built = futures::stream::iter(ids.iter().cloned())
+            .map(|(segment, ids)| async move {
+                db.projected_labels(namespace, segment, exact, &ids, names)
+                    .await
+            })
+            .buffered(SEGMENT_LIST_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let fallbacks = built.iter().filter(|built| built.is_none()).count();
+        (built.len() - fallbacks, fallbacks)
+    };
+    let projected_gets = Arc::new(AtomicUsize::new(0));
+    let mut projecting = cold_reader(&config, latency, &projected_gets).await;
+    let projected_io = Arc::new(common::storage::counting::CountingStorage::new(
+        projecting.storage.clone(),
+        classify_key,
+    ));
+    projecting.storage = projected_io.clone();
+    postings(&projecting).await;
+    projected_io.take();
+    projected_gets.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    let (built, fallbacks) = projected(&projecting, &ids).await;
+    let projected_cold = (started.elapsed(), projected_gets.load(Ordering::Relaxed));
+    println!(
+        "    projected labels {:?}: segments {built} (fell back {fallbacks}) after postings cold {:.0}ms gets {}",
+        plan.streams.labels,
+        ms(projected_cold.0),
+        projected_cold.1,
+    );
+    for ((op, class), stats) in projected_io.take() {
+        println!(
+            "      {op}/{class}: calls {} records {} bytes {} summed {:.0}ms",
+            stats.calls,
+            stats.records,
+            stats.bytes,
+            ms(stats.elapsed)
+        );
+    }
+    projecting.close().await.unwrap();
+    let label_bytes: usize = labelled
+        .iter()
+        .flatten()
+        .map(|(_, labels)| {
+            labels
+                .iter()
+                .map(|label| label.name.len() + label.value.len())
+                .sum::<usize>()
+        })
+        .sum();
+    println!(
+        "selection phases: segments {} streams {} label bytes {label_bytes}",
+        segments.len(),
+        labelled.iter().map(Vec::len).sum::<usize>(),
+    );
+    println!(
+        "    postings cold {:.0}ms gets {} | labels after postings cold {:.0}ms gets {} | labels warm {:.1}ms | labels alone cold {:.0}ms gets {}",
+        ms(postings_cold.0),
+        postings_cold.1,
+        ms(labels_cold.0),
+        labels_cold.1,
+        ms(labels_warm),
+        ms(labels_alone.0),
+        labels_alone.1,
+    );
+    for ((op, class), stats) in io {
+        println!(
+            "    {op}/{class}: calls {} records {} bytes {} summed {:.0}ms",
+            stats.calls,
+            stats.records,
+            stats.bytes,
+            ms(stats.elapsed)
+        );
+    }
+    phased.close().await.unwrap();
+    alone.close().await.unwrap();
     db.close().await.unwrap();
     cold.close().await.unwrap();
 }

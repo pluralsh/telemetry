@@ -13,13 +13,13 @@ use common::storage::ReadHints;
 use super::*;
 use crate::codec::{
     StoredRun, decode_object, decode_rollup_forward_key, decode_run, decode_run_key, directory_key,
-    segment_run_prefix, stream_run_prefix,
+    posting_name_prefix, segment_run_prefix, stream_run_prefix,
 };
 use crate::object::{
-    Block, ReadNeeds, RowSample, block_header, decode_block_rows, decode_block_where,
-    decode_samples_where, read_blocks,
+    Block, FieldSelection, ReadNeeds, RowSample, block_header, decode_block_rows,
+    decode_block_where, decode_samples_where, read_blocks,
 };
-use crate::query::{BatchSlice, ColumnBatch, StreamBatches, Tie};
+use crate::query::{BatchSlice, ColumnBatch, StreamBatches, Tie, is_error_label};
 use crate::search::{self, TermStats};
 
 #[cfg(test)]
@@ -197,7 +197,7 @@ impl LogDb {
                     }
                     Ok::<_, Error>(selected)
                 })
-                .buffer_unordered(SEGMENT_LIST_CONCURRENCY)
+                .buffer_unordered(self.tuning.list_concurrency)
                 .try_collect()
                 .await?;
         let mut result = BTreeSet::new();
@@ -404,7 +404,7 @@ impl LogDb {
                 .await?;
             Ok::<_, Error>((segment, streams))
         })
-        .buffered(SEGMENT_LIST_CONCURRENCY)
+        .buffered(self.tuning.list_concurrency)
         .try_collect()
         .await?;
         Ok(ScanTargets {
@@ -457,7 +457,7 @@ impl LogDb {
                 let width = u64::try_from(segment.width_ns / base.max(1)).unwrap_or(u64::MAX);
                 Ok::<_, Error>((segment, next.map(|next| next | (width.min(0xff) << 56))))
             })
-            .buffer_unordered(SEGMENT_LIST_CONCURRENCY)
+            .buffer_unordered(self.tuning.list_concurrency)
             .try_collect::<HashMap<_, _>>()
             .await?;
         Ok(resolved
@@ -1301,7 +1301,13 @@ impl LogDb {
 
     /// Streams in `segment` selected by `filter`, each with its live runs
     /// overlapping `[start_ns, end_ns]`. Labels are checked before any run
-    /// record is scanned, so non-exact matchers prune streams without I/O.
+    /// record is scanned, so non-exact matchers prune streams without I/O;
+    /// with [`ReadTuning::overlap_runs`], streams the exact labels alone
+    /// select have their runs read while their labels are.
+    ///
+    /// With [`StreamFilter::labels`], streams may carry only those labels,
+    /// except one that may fail the query: its rows' merge order, by its
+    /// labels' hash, picks the failure reported.
     async fn segment_streams(
         &self,
         namespace: &Namespace,
@@ -1315,78 +1321,288 @@ impl LogDb {
                 && run.max_timestamp_ns >= start_ns
                 && run.min_timestamp_ns <= end_ns
         };
-        let labelled = self
-            .exact_streams(namespace, segment, &filter.exact)
+        let projection = filter.labels.as_ref().filter(|_| self.project_labels);
+        let ((selected, projected), runs) = match self
+            .select_streams(namespace, segment, &filter.exact, projection)
             .await?
+        {
+            Selection::Labelled(streams, projected) => ((streams, projected), None),
+            Selection::Listed(stream_ids, version)
+                if self.tuning.overlap_runs && filter.selects_exact() =>
+            {
+                let (selected, runs) = futures::future::try_join(
+                    self.label_streams(
+                        namespace,
+                        segment,
+                        &filter.exact,
+                        projection,
+                        stream_ids.clone(),
+                        version,
+                    ),
+                    self.segment_runs(namespace, segment, stream_ids, live),
+                )
+                .await?;
+                (selected, Some(runs))
+            }
+            Selection::Listed(stream_ids, version) => (
+                self.label_streams(
+                    namespace,
+                    segment,
+                    &filter.exact,
+                    projection,
+                    stream_ids,
+                    version,
+                )
+                .await?,
+                None,
+            ),
+        };
+        let labelled = selected
             .1
             .iter()
             .filter(|(_, labels)| filter.matches(labels))
             .map(|(stream_id, labels)| (*stream_id, Arc::clone(labels)))
             .collect::<Vec<_>>();
-        let stream_ids = labelled.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let runs = match runs {
+            Some(runs) => runs,
+            None => {
+                let stream_ids = labelled.iter().map(|(id, _)| *id).collect();
+                self.segment_runs(namespace, segment, stream_ids, live)
+                    .await?
+            }
+        };
+        debug_assert_eq!(labelled.len(), runs.len());
+        let mut streams = labelled
+            .into_iter()
+            .zip(runs)
+            .map(|((stream_id, labels), runs)| SegmentStream {
+                stream_id,
+                labels,
+                runs,
+            })
+            .collect::<Vec<_>>();
+        if projected {
+            let failing = streams
+                .iter()
+                .filter(|stream| stream.may_fail())
+                .map(|stream| stream.stream_id)
+                .collect::<Vec<_>>();
+            if !failing.is_empty() {
+                let mut full = self
+                    .stream_labels(namespace, segment, failing)
+                    .await?
+                    .into_iter();
+                for stream in streams.iter_mut().filter(|stream| stream.may_fail()) {
+                    let (stream_id, labels) = full.next().ok_or_else(|| {
+                        Error::Corrupt("posting references missing forward labels".to_owned())
+                    })?;
+                    debug_assert_eq!(stream_id, stream.stream_id);
+                    stream.labels = labels;
+                }
+            }
+        }
+        Ok(streams)
+    }
+
+    /// Runs of `stream_ids` (ascending) passing `keep`, in input order.
+    async fn segment_runs(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        stream_ids: Vec<StreamId>,
+        keep: impl Fn(&StoredRun) -> bool + Copy + Send + Sync + 'static,
+    ) -> Result<Vec<Vec<(u64, StoredRun)>>> {
         if let Some(spans) = self.span_scans(&stream_ids) {
             let mut runs = self
-                .spanned_runs(namespace, segment, spans, stream_ids, live)
+                .spanned_runs(namespace, segment, spans, stream_ids.clone(), keep)
                 .await?;
-            return Ok(labelled
-                .into_iter()
-                .map(|(stream_id, labels)| SegmentStream {
-                    stream_id,
-                    labels,
-                    runs: runs.remove(&stream_id).unwrap_or_default(),
-                })
+            return Ok(stream_ids
+                .iter()
+                .map(|stream_id| runs.remove(stream_id).unwrap_or_default())
                 .collect());
         }
-        futures::stream::iter(labelled)
-            .map(|(stream_id, labels)| async move {
-                let runs = self
-                    .stream_runs(namespace, segment, stream_id, live)
-                    .await?;
-                Ok::<_, Error>(SegmentStream {
-                    stream_id,
-                    labels,
-                    runs,
-                })
-            })
+        futures::stream::iter(stream_ids)
+            .map(|stream_id| self.stream_runs(namespace, segment, stream_id, keep))
             .buffered(STREAM_METADATA_CONCURRENCY)
             .try_collect()
             .await
     }
 
-    /// Streams of `segment` holding every `exact` label, in ID order, cached
-    /// while the segment's stream counter is unchanged.
-    async fn exact_streams(
+    /// Streams of `segment` holding every `exact` label, in ID order: cached,
+    /// with whether they carry only the labels `projection` names, or else
+    /// their IDs and the segment's stream counter, read before them, for
+    /// [`Self::label_streams`]. A cached listing is current while the
+    /// segment's stream counter is unchanged or, with
+    /// [`ReadTuning::postings_validate`] and exact labels, while their
+    /// postings select the same streams: a stream's labels never change, and
+    /// a new stream holding them joins the postings.
+    async fn select_streams(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         exact: &[Label],
-    ) -> Result<SegmentStreams> {
+        projection: Option<&Arc<[String]>>,
+    ) -> Result<Selection> {
+        let full_key = (namespace.clone(), segment, exact.to_vec(), None);
+        // Listing every stream reads every forward label anyway.
+        let projected_key = projection.filter(|_| !exact.is_empty()).map(|names| {
+            (
+                namespace.clone(),
+                segment,
+                exact.to_vec(),
+                Some(Arc::clone(names)),
+            )
+        });
+        let cached = |current: &dyn Fn(&SegmentStreams) -> bool| {
+            if let Some(key) = &projected_key
+                && let Some(streams) = self
+                    .caches
+                    .streams
+                    .get(key)
+                    .filter(|cached| current(cached))
+            {
+                return Some(Selection::Labelled(streams, true));
+            }
+            self.caches
+                .streams
+                .get(&full_key)
+                .filter(|cached| current(cached))
+                .map(|streams| Selection::Labelled(streams, false))
+        };
+        if self.tuning.postings_validate && !exact.is_empty() {
+            let stream_ids = self.stream_ids(namespace, segment, exact).await?;
+            let same = |cached: &SegmentStreams| {
+                cached
+                    .1
+                    .iter()
+                    .map(|(stream_id, _)| *stream_id)
+                    .eq(stream_ids.iter().copied())
+            };
+            return Ok(cached(&same).unwrap_or(Selection::Listed(stream_ids, None)));
+        }
         let version = self
             .partition_version(namespace, Partition::Segment(segment))
             .await?;
-        let key = (namespace.clone(), segment, exact.to_vec());
-        if let Some(streams) = self
-            .caches
-            .streams
-            .get(&key)
-            .filter(|cached| cached.0 == version)
-        {
-            return Ok(streams);
+        if let Some(selection) = cached(&|cached: &SegmentStreams| cached.0 == version) {
+            return Ok(selection);
         }
-        let labelled = if exact.is_empty() {
-            self.scan_labels(
-                forward_prefix(namespace, segment),
-                BytesRange::unbounded(),
-                decode_forward_key,
-            )
-            .await?
-        } else {
-            let stream_ids = self.stream_ids(namespace, segment, exact).await?;
-            self.stream_labels(namespace, segment, stream_ids).await?
-        };
+        if exact.is_empty() {
+            let labelled = self
+                .scan_labels(
+                    forward_prefix(namespace, segment),
+                    BytesRange::unbounded(),
+                    decode_forward_key,
+                )
+                .await?;
+            let streams = Arc::new((version, labelled));
+            self.caches.streams.insert(full_key, Arc::clone(&streams));
+            return Ok(Selection::Labelled(streams, false));
+        }
+        let stream_ids = self.stream_ids(namespace, segment, exact).await?;
+        Ok(Selection::Listed(stream_ids, version))
+    }
+
+    /// Labels `stream_ids`, listed by [`Self::select_streams`], and caches
+    /// them tagged with `version`. Projected streams are built from postings
+    /// unless [`Self::projected_labels`] finds forward labels cheaper.
+    async fn label_streams(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        exact: &[Label],
+        projection: Option<&Arc<[String]>>,
+        stream_ids: Vec<StreamId>,
+        version: PartitionVersion,
+    ) -> Result<(SegmentStreams, bool)> {
+        if let Some(names) = projection
+            && let Some(labelled) = self
+                .projected_labels(namespace, segment, exact, &stream_ids, names)
+                .await?
+        {
+            let key = (
+                namespace.clone(),
+                segment,
+                exact.to_vec(),
+                Some(Arc::clone(names)),
+            );
+            let streams = Arc::new((version, labelled));
+            self.caches.streams.insert(key, Arc::clone(&streams));
+            return Ok((streams, true));
+        }
+        let labelled = self.stream_labels(namespace, segment, stream_ids).await?;
         let streams = Arc::new((version, labelled));
-        self.caches.streams.insert(key, Arc::clone(&streams));
-        Ok(streams)
+        self.caches.streams.insert(
+            (namespace.clone(), segment, exact.to_vec(), None),
+            Arc::clone(&streams),
+        );
+        Ok((streams, false))
+    }
+
+    /// Labels of `stream_ids` (ascending), each holding every `exact` label,
+    /// limited to `names`: exact labels as matched, other names' values from
+    /// one scan of each name's postings in `segment`, a stream lacking the
+    /// label when no posting holds it. `None` once the scans have read more
+    /// postings than there are streams, as forward labels, at least one
+    /// record per stream, then cost no more.
+    async fn projected_labels(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        exact: &[Label],
+        stream_ids: &[StreamId],
+        names: &[String],
+    ) -> Result<Option<Vec<(StreamId, Arc<Labels>)>>> {
+        if stream_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let selected = stream_ids.iter().copied().collect::<RoaringBitmap>();
+        let read = AtomicUsize::new(0);
+        let (selected, read) = (&selected, &read);
+        let scans = names
+            .iter()
+            .filter(|name| !exact.iter().any(|label| label.name == **name))
+            .map(|name| async move {
+                let prefix = posting_name_prefix(namespace, segment, name);
+                let prefix_len = prefix.len();
+                let mut records = self
+                    .storage
+                    .scan_prefix_iter(prefix, BytesRange::unbounded(), None)
+                    .await?;
+                let mut values = Vec::new();
+                while let Some(record) = records.next().await? {
+                    if read.fetch_add(1, Ordering::Relaxed) >= stream_ids.len() {
+                        return Ok(None);
+                    }
+                    let holding = decode_postings(&record.value)? & selected;
+                    if holding.is_empty() {
+                        continue;
+                    }
+                    let value = std::str::from_utf8(&record.key[prefix_len..])
+                        .map_err(|_| Error::Corrupt("posting value is not UTF-8".to_owned()))?;
+                    values.push((Label::new(name, value), holding));
+                }
+                Ok::<_, Error>(Some(values))
+            });
+        let mut labels = vec![exact.to_vec(); stream_ids.len()];
+        for values in futures::future::try_join_all(scans).await? {
+            let Some(values) = values else {
+                return Ok(None);
+            };
+            for (label, holding) in values {
+                for stream_id in &holding {
+                    let index = stream_ids.binary_search(&stream_id).map_err(|_| {
+                        Error::Corrupt("posting intersection left the selection".to_owned())
+                    })?;
+                    labels[index].push(label.clone());
+                }
+            }
+        }
+        stream_ids
+            .iter()
+            .zip(labels)
+            .map(|(stream_id, labels)| Ok((*stream_id, Arc::new(Labels::new(labels)?))))
+            .collect::<Result<_>>()
+            .map(Some)
     }
 
     /// Runs of `stream_ids` (ascending) passing `keep`, from one scan over
@@ -1546,6 +1762,15 @@ struct SegmentStream {
     labels: Arc<Labels>,
     /// Live overlapping runs with their object IDs.
     runs: Vec<(u64, StoredRun)>,
+}
+
+impl SegmentStream {
+    /// Whether a row may fail a metric query: it may carry `__error__`
+    /// metadata, or the stream an error label.
+    fn may_fail(&self) -> bool {
+        self.runs.iter().any(|(_, run)| run.error_metadata)
+            || self.labels.iter().any(|label| is_error_label(&label.name))
+    }
 }
 
 /// A selected run, as read by one [`ReadUnit`].
@@ -1731,12 +1956,61 @@ pub(crate) struct Boundaries {
     pub count: u64,
 }
 
+/// Which structured metadata a [`SampleRead`] needs. Metric queries promote
+/// metadata to labels, so a field is needed when it can become a label the
+/// query's series keep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataNeeds {
+    None,
+    /// Only fields that can become one of these labels, sorted and unique.
+    Names(Vec<String>),
+    All,
+}
+
+impl MetadataNeeds {
+    /// The fields a stream labelled `labels` needs read. Metadata `m` is
+    /// promoted to label `m`, or to `m_extracted` when a label `m` exists,
+    /// whether a stream label or promoted from metadata earlier in name
+    /// order. So label `n` can come from metadata `n` when the stream has no
+    /// label `n`, and from metadata `n` with any number of `_extracted`
+    /// suffixes stripped.
+    pub(super) fn fields(&self, labels: &Labels) -> FieldSelection {
+        let names = match self {
+            Self::None => return FieldSelection::None,
+            Self::All => return FieldSelection::All,
+            Self::Names(names) => names,
+        };
+        let mut fields = Vec::new();
+        for name in names {
+            if !labels.iter().any(|label| label.name == *name) {
+                fields.push(name.clone());
+            }
+            let mut stripped = name.as_str();
+            while let Some(shorter) = stripped
+                .strip_suffix(EXTRACTED_SUFFIX)
+                .filter(|shorter| !shorter.is_empty())
+            {
+                fields.push(shorter.to_owned());
+                stripped = shorter;
+            }
+        }
+        if fields.is_empty() {
+            return FieldSelection::None;
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        FieldSelection::Only(fields.into())
+    }
+}
+
+const EXTRACTED_SUFFIX: &str = "_extracted";
+
 /// What [`LogDb::read_samples`] reads for a metric query that needs no line
 /// content.
 #[derive(Clone, Debug)]
 pub(crate) struct SampleRead {
-    /// Whether rows' structured metadata is needed.
-    pub metadata: bool,
+    /// Which of rows' structured metadata is needed.
+    pub metadata: MetadataNeeds,
     /// Every boundary of every evaluation window `(start, end]`: each
     /// window's start and end.
     pub boundaries: Vec<Boundaries>,
@@ -1794,8 +2068,8 @@ impl LogDb {
     /// Reads `targets` for a metric query that needs no line content, as
     /// lineless batches whose rows each stand for stored rows that every
     /// evaluation window holds all or none of, deduplicated as queries
-    /// require. Structured metadata is read only with
-    /// [`SampleRead::metadata`].
+    /// require. Only the structured metadata [`SampleRead::metadata`] needs
+    /// is read.
     ///
     /// Queries drop rows of a stream that repeat an earlier row's timestamp,
     /// line and structured metadata. A run that is duplicate-free and whose
@@ -1804,7 +2078,8 @@ impl LogDb {
     /// otherwise each of its blocks is counted from its header or, when split,
     /// decoded from its meta value alone. Other runs are decoded from their
     /// meta values, and their lines are read only for a stream where two rows
-    /// share a timestamp, line length and, if read, structured metadata.
+    /// share a timestamp, line length and the structured metadata read, if
+    /// any: rows that differ in that differ in their full metadata too.
     /// Each read unit is charged to `budget`, as a full read would charge it.
     pub(crate) async fn read_samples(
         &self,
@@ -1851,15 +2126,21 @@ impl LogDb {
         consume: &mut impl FnMut(&mut StreamBatches) -> Result<()>,
     ) -> Result<()> {
         let mut isolated = HashSet::new();
-        let mut with_metadata = HashSet::new();
+        let mut with_metadata = HashMap::new();
         let mut decoded = HashSet::new();
         for stream in &streams {
-            // `__error__` metadata fails the query, so a stream holding any
-            // reads all of its runs' metadata; deduplication compares rows
-            // across runs, so it must see the same fields of each.
-            let metadata = read.metadata || stream.runs.iter().any(|(_, run)| run.error_metadata);
+            // `__error__` metadata fails the query, and an errored row keeps
+            // every error label, so a stream that may hold one reads all of
+            // its runs' metadata; deduplication compares rows across runs, so
+            // it must see the same fields of each.
+            let fields = if stream.may_fail() {
+                FieldSelection::All
+            } else {
+                read.metadata.fields(&stream.labels)
+            };
+            let metadata = !fields.is_none();
             if metadata {
-                with_metadata.insert(stream.stream_id);
+                with_metadata.insert(stream.stream_id, fields);
             }
             let alone = isolated_runs(&stream.runs);
             for (&(object_id, run), alone) in stream.runs.iter().zip(alone) {
@@ -1920,9 +2201,12 @@ impl LogDb {
                         .runs
                         .into_iter()
                         .map(|run| {
-                            let metadata = with_metadata.contains(&run.stream_id);
+                            let fields = with_metadata
+                                .get(&run.stream_id)
+                                .cloned()
+                                .unwrap_or(FieldSelection::None);
                             let alone = isolated.contains(&(run.stream_id, run.object_id));
-                            (run, metadata, alone)
+                            (run, fields, alone)
                         })
                         .collect::<Vec<_>>();
                     // Decoded on a task of its own: polled here, every unit of
@@ -1930,15 +2214,15 @@ impl LogDb {
                     let first_block = unit.first_block;
                     let runs = tokio::spawn(async move {
                         runs.into_iter()
-                            .map(|(run, metadata, alone)| {
+                            .map(|(run, fields, alone)| {
                                 let first = (run.run.first_block - first_block) as usize;
                                 let blocks = &blocks[first..first + run.run.blocks as usize];
                                 let samples = if alone {
                                     RunSamples::Isolated(isolated_samples(
-                                        blocks, range, &read, metadata,
+                                        blocks, range, &read, &fields,
                                     )?)
                                 } else {
-                                    RunSamples::Unsure(run_samples(blocks, range, metadata)?)
+                                    RunSamples::Unsure(run_samples(blocks, range, &fields)?)
                                 };
                                 Ok::<_, Error>((run, samples))
                             })
@@ -1977,8 +2261,10 @@ impl LogDb {
         }
         drop(loaded);
         for (stream_id, runs) in unsure {
-            let metadata = with_metadata.contains(&stream_id);
-            self.deduplicated_samples(namespace, segment, runs, range, metadata, batches)
+            let fields = with_metadata
+                .get(&stream_id)
+                .unwrap_or(&FieldSelection::None);
+            self.deduplicated_samples(namespace, segment, runs, range, fields, batches)
                 .await?;
             consume(batches)?;
         }
@@ -1986,14 +2272,15 @@ impl LogDb {
     }
 
     /// Adds samples of one stream's runs that may hold duplicates to
-    /// `batches`, deduplicated.
+    /// `batches`, deduplicated by their full structured metadata, whose
+    /// `fields` the samples hold.
     async fn deduplicated_samples(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         runs: Vec<(UnitRun, Vec<RowSample>)>,
         range: (i64, i64),
-        metadata: bool,
+        fields: &FieldSelection,
         batches: &mut StreamBatches,
     ) -> Result<()> {
         let Some(labels) = runs.first().map(|(run, _)| Arc::clone(&run.labels)) else {
@@ -2047,18 +2334,13 @@ impl LogDb {
                 })
         });
         entries.dedup();
-        let none = crate::Fields::default();
         for entry in &entries {
             push_sample(
                 batches,
                 &labels,
                 entry.timestamp_ns,
                 (1, entry.line.len() as u64),
-                if metadata {
-                    &entry.structured_metadata
-                } else {
-                    &none
-                },
+                &fields.select(&entry.structured_metadata),
             );
         }
         Ok(())
@@ -2120,7 +2402,7 @@ fn isolated_samples(
     blocks: &[Block],
     range: (i64, i64),
     read: &SampleRead,
-    metadata: bool,
+    fields: &FieldSelection,
 ) -> Result<Vec<WeightedSample>> {
     let mut samples = Vec::new();
     for block in blocks {
@@ -2128,7 +2410,7 @@ fn isolated_samples(
         if !header.overlaps(range.0, range.1) {
             continue;
         }
-        if !metadata && !read.splits(header.min_timestamp_ns, header.max_timestamp_ns) {
+        if fields.is_none() && !read.splits(header.min_timestamp_ns, header.max_timestamp_ns) {
             samples.push(WeightedSample {
                 timestamp_ns: header.min_timestamp_ns,
                 weight: (header.rows, header.line_bytes.into()),
@@ -2140,7 +2422,7 @@ fn isolated_samples(
             block,
             range,
             |_| true,
-            metadata,
+            fields,
             |_, sample| {
                 samples.push(WeightedSample {
                     timestamp_ns: sample.timestamp_ns,
@@ -2168,7 +2450,11 @@ enum RunSamples {
 }
 
 /// Every row sample of a run's blocks in `range`, from their meta values.
-fn run_samples(blocks: &[Block], range: (i64, i64), metadata: bool) -> Result<Vec<RowSample>> {
+fn run_samples(
+    blocks: &[Block],
+    range: (i64, i64),
+    fields: &FieldSelection,
+) -> Result<Vec<RowSample>> {
     let mut samples = Vec::new();
     for block in blocks {
         if !block_header(&block.meta)?.overlaps(range.0, range.1) {
@@ -2178,7 +2464,7 @@ fn run_samples(blocks: &[Block], range: (i64, i64), metadata: bool) -> Result<Ve
             block,
             range,
             |_| true,
-            metadata,
+            fields,
             |_, sample| {
                 samples.push(sample);
             },
@@ -2538,6 +2824,12 @@ impl PendingReads for PendingBatches {
     }
 }
 
+/// Output of [`LogDb::select_streams`].
+enum Selection {
+    Labelled(SegmentStreams, bool),
+    Listed(Vec<StreamId>, PartitionVersion),
+}
+
 /// Stream selection for a query: postings intersect `exact`, then a stream is
 /// kept when any selector matches its labels (or when there are none).
 pub(crate) struct StreamFilter {
@@ -2547,6 +2839,10 @@ pub(crate) struct StreamFilter {
     /// may then skip rows whose postings lack one; such rows are dropped by
     /// the query's line filter anyway.
     line_terms: Option<Vec<String>>,
+    /// Sorted names of the only stream labels the query depends on, every
+    /// label the selectors match on among them. Selected streams may then
+    /// carry just these labels.
+    labels: Option<Arc<[String]>>,
 }
 
 impl StreamFilter {
@@ -2555,11 +2851,19 @@ impl StreamFilter {
             exact,
             selectors: Vec::new(),
             line_terms: None,
+            labels: None,
         }
     }
 
     pub(crate) fn with_line_terms(self, line_terms: Option<Vec<String>>) -> Self {
         Self { line_terms, ..self }
+    }
+
+    pub(crate) fn with_labels(self, labels: Option<Vec<String>>) -> Self {
+        Self {
+            labels: labels.map(Arc::from),
+            ..self
+        }
     }
 
     pub(crate) fn new<'a>(
@@ -2573,6 +2877,7 @@ impl StreamFilter {
                 .map(SeriesSelector::from_matchers)
                 .collect::<Result<_>>()?,
             line_terms: None,
+            labels: None,
         })
     }
 
@@ -2582,6 +2887,17 @@ impl StreamFilter {
                 .selectors
                 .iter()
                 .any(|selector| selector.matches(labels))
+    }
+
+    /// Whether every stream holding the exact labels [`Self::matches`].
+    fn selects_exact(&self) -> bool {
+        self.selectors.is_empty()
+            || self.selectors.iter().any(|selector| {
+                selector.matchers.iter().all(|matcher| {
+                    matches!(matcher, SeriesMatcher::Equal(name, value)
+                        if self.exact.iter().any(|label| label.name == *name && label.value == *value))
+                })
+            })
     }
 }
 

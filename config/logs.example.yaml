@@ -22,6 +22,7 @@ storage:
 
 segment_duration_seconds: 3600
 retention_seconds: 1209600 # 14 days, the default; `null` keeps data forever.
+stream_locality_labels: [cluster, k8s_cluster_name, namespace, k8s_namespace_name]
 page:
   target_size_bytes: 1048576
   max_rows: 8192

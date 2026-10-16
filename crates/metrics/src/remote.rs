@@ -102,6 +102,27 @@ impl RemoteShardSource {
     pub(crate) fn new(read: pb::ShardRead, query: Arc<dyn MetricsShardQuery>) -> Self {
         Self { read, query }
     }
+
+    fn resolve_remote(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        projection: Option<&[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, SourceQueryError>> + Send + use<> {
+        let request = pb::ResolveRequest {
+            read: Some(self.read.clone()),
+            selector: Some(selector_to_wire(selector)),
+            start_ms: time_range.start_ms,
+            end_ms_exclusive: time_range.end_ms_exclusive,
+            projection: projection.map(|names| pb::LabelProjection {
+                names: names.to_vec(),
+            }),
+        };
+        self.query
+            .resolve(request)
+            .map_err(to_source_error)
+            .and_then(|chunk| async move { chunk_from_wire(chunk) })
+    }
 }
 
 impl SeriesSource for RemoteShardSource {
@@ -110,16 +131,16 @@ impl SeriesSource for RemoteShardSource {
         selector: &VectorSelector,
         time_range: TimeRange,
     ) -> impl Stream<Item = Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
-        let request = pb::ResolveRequest {
-            read: Some(self.read.clone()),
-            selector: Some(selector_to_wire(selector)),
-            start_ms: time_range.start_ms,
-            end_ms_exclusive: time_range.end_ms_exclusive,
-        };
-        self.query
-            .resolve(request)
-            .map_err(to_source_error)
-            .and_then(|chunk| async move { chunk_from_wire(chunk) })
+        self.resolve_remote(selector, time_range, None)
+    }
+
+    fn resolve_projected(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
+        self.resolve_remote(selector, time_range, Some(&projection))
     }
 
     fn samples(
@@ -266,6 +287,13 @@ fn chunk_to_wire(chunk: ResolvedSeriesChunk) -> pb::ResolvedChunk {
             .iter()
             .map(|series| series.metric_name.to_string())
             .collect(),
+        fingerprints: chunk
+            .fingerprints
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|fingerprint| fingerprint.to_be_bytes())
+            .collect(),
     }
 }
 
@@ -274,6 +302,21 @@ fn chunk_from_wire(chunk: pb::ResolvedChunk) -> Result<ResolvedSeriesChunk, Sour
     if chunk.labels.len() != count || chunk.metric_names.len() != count {
         return Err(corrupt("resolved chunk columns differ in length"));
     }
+    let fingerprints = if chunk.fingerprints.is_empty() {
+        None
+    } else if chunk.fingerprints.len() != count * 16 {
+        return Err(corrupt("resolved chunk fingerprints differ in length"));
+    } else {
+        Some(
+            chunk
+                .fingerprints
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|bytes| u128::from_be_bytes(*bytes))
+                .collect(),
+        )
+    };
     let bucket_id = chunk.bucket_id;
     Ok(ResolvedSeriesChunk {
         bucket_id,
@@ -286,6 +329,7 @@ fn chunk_from_wire(chunk: pb::ResolvedChunk) -> Result<ResolvedSeriesChunk, Sour
                 ResolvedSeriesRef::new(bucket_id, series_id, Arc::from(metric_name))
             })
             .collect(),
+        fingerprints,
     })
 }
 
@@ -647,12 +691,23 @@ impl ShardedMetrics {
         let (shard, namespace, ranges) = self.served_read(request.read).await?;
         let selector = selector_from_wire(request.selector.unwrap_or_default())?;
         let time_range = TimeRange::new(request.start_ms, request.end_ms_exclusive);
+        let projection = request.projection.map(|projection| {
+            let mut names = projection.names;
+            names.sort_unstable();
+            names.dedup();
+            Arc::<[String]>::from(names)
+        });
         let permit = self.admit_shard_read().await?;
         let source = self.local_source(shard, &namespace, &ranges).await?;
         let (mut sender, receiver) = mpsc::channel(4);
         tokio::spawn(async move {
             let _permit = permit;
-            let mut stream = pin!(source.resolve(&selector, time_range));
+            let mut stream = match projection {
+                Some(projection) => source
+                    .resolve_projected(&selector, time_range, projection)
+                    .boxed(),
+                None => source.resolve(&selector, time_range).boxed(),
+            };
             while let Some(chunk) = stream.next().await {
                 let message = chunk.map(chunk_to_wire).map_err(from_source_error);
                 let failed = message.is_err();
@@ -843,6 +898,37 @@ mod tests {
         assert!(crate::is_stale_nan(decoded.samples.values[0][7]));
         assert_eq!(decoded.samples.histogram_timestamps[1], vec![42]);
         assert_eq!(*decoded.samples.histograms[1][0], histogram);
+    }
+
+    #[test]
+    fn resolved_chunks_carry_fingerprints_only_when_projected() {
+        let chunk = |fingerprints: Option<Arc<[u128]>>| ResolvedSeriesChunk {
+            bucket_id: 3,
+            labels: Arc::from(vec![
+                Labels::new(vec![Label::new("job", "api")]),
+                Labels::new(vec![Label::new("job", "api")]),
+            ]),
+            series: Arc::from(vec![
+                ResolvedSeriesRef::new(3, 1, Arc::from("up")),
+                ResolvedSeriesRef::new(3, 2, Arc::from("up")),
+            ]),
+            fingerprints,
+        };
+        let fingerprints: Arc<[u128]> = Arc::from(vec![u128::MAX - 1, 7]);
+
+        let full = chunk_to_wire(chunk(None));
+        let projected = chunk_to_wire(chunk(Some(fingerprints.clone())));
+
+        assert!(full.fingerprints.is_empty());
+        assert_eq!(chunk_from_wire(full).unwrap().fingerprints, None);
+        assert_eq!(projected.fingerprints.len(), 32);
+        let mut truncated = projected.clone();
+        truncated.fingerprints.pop();
+        assert!(chunk_from_wire(truncated).is_err());
+        assert_eq!(
+            chunk_from_wire(projected).unwrap().fingerprints,
+            Some(fingerprints)
+        );
     }
 
     #[test]

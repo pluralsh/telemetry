@@ -637,6 +637,26 @@ impl Labels {
     pub(crate) fn as_slice(&self) -> &[Label] {
         &self.labels
     }
+
+    /// The series' stable identity: blake3 over the length-prefixed sorted
+    /// labels, `__name__` included (see [`crate::util::Fingerprint`]).
+    /// Stored as [`crate::serde::RecordType::SeriesFingerprint`] and sent
+    /// between readers, so the encoding must never change.
+    pub(crate) fn series_fingerprint(&self) -> SeriesFingerprint {
+        crate::util::Fingerprint::fingerprint(self.as_slice())
+    }
+
+    /// The labels named in `names`, which must be sorted.
+    pub(crate) fn project(&self, names: &[String]) -> Labels {
+        debug_assert!(names.is_sorted());
+        Labels::new(
+            self.labels
+                .iter()
+                .filter(|label| names.binary_search(&label.name).is_ok())
+                .cloned()
+                .collect(),
+        )
+    }
 }
 
 impl fmt::Debug for Labels {
@@ -940,6 +960,40 @@ pub(crate) fn covering_bucket(bucket: TimeBucket, sealed: &[TimeBucket]) -> Time
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_fingerprint_is_pinned() {
+        let labels = Labels::sorted(vec![
+            Label::metric_name("container_cpu_usage_seconds_total"),
+            Label::new("namespace", "default"),
+            Label::new("pod", "api-0"),
+        ]);
+        assert_eq!(labels.series_fingerprint(), PINNED_FINGERPRINT);
+        assert_eq!(
+            Labels::empty().series_fingerprint(),
+            PINNED_EMPTY_FINGERPRINT
+        );
+    }
+
+    // Stored as series fingerprint records: changing them orphans every
+    // record already written.
+    const PINNED_FINGERPRINT: u128 = 0x12fc43ee5a586b9f21896c94d762d9b8;
+    const PINNED_EMPTY_FINGERPRINT: u128 = 0x49c9dc36ea4d40a0a6a1f9f5b94913af;
+
+    #[test]
+    fn project_keeps_named_labels_in_order() {
+        let labels = Labels::sorted(vec![
+            Label::metric_name("m"),
+            Label::new("a", "1"),
+            Label::new("b", "2"),
+        ]);
+        let names = ["__name__".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            labels.project(&names),
+            Labels::new(vec![Label::metric_name("m"), Label::new("b", "2")])
+        );
+        assert!(labels.project(&[]).is_empty());
+    }
 
     #[test]
     fn should_create_label() {
