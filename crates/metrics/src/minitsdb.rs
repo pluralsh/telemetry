@@ -15,7 +15,7 @@ const WRITE_CHANNEL: &str = "write";
 
 use crate::Namespace;
 use crate::active_series::ActiveSeriesTracker;
-use crate::delta::{TsdbContext, TsdbWriteDelta};
+use crate::delta::{TsdbContext, TsdbWrite, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
@@ -1387,22 +1387,8 @@ impl MiniTsdb {
             "Starting MiniTsdb batch ingest"
         );
 
-        let handle = self.write_coordinator.handle(WRITE_CHANNEL);
-        let mut write_handle = match timeout {
-            Some(t) => handle
-                .write_timeout(series_list.to_vec(), t)
-                .await
-                .map_err(|e| map_write_error(e.discard_inner()))?,
-            None => handle
-                .try_write(series_list.to_vec())
-                .await
-                .map_err(|e| map_write_error(e.discard_inner()))?,
-        };
-
-        write_handle
-            .wait(Durability::Applied)
-            .await
-            .map_err(map_write_error)?;
+        self.write(TsdbWrite::Samples(series_list.to_vec()), timeout)
+            .await?;
 
         tracing::debug!(
             bucket = ?self.bucket,
@@ -1412,6 +1398,35 @@ impl MiniTsdb {
         );
 
         Ok(())
+    }
+
+    /// Registers `series` without their samples, waiting up to `timeout`
+    /// for queue space.
+    pub(crate) async fn register_batch(
+        &self,
+        series: Vec<Series>,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.write(TsdbWrite::Register(series), Some(timeout)).await
+    }
+
+    async fn write(&self, write: TsdbWrite, timeout: Option<Duration>) -> Result<()> {
+        let handle = self.write_coordinator.handle(WRITE_CHANNEL);
+        let mut write_handle = match timeout {
+            Some(t) => handle
+                .write_timeout(write, t)
+                .await
+                .map_err(|e| map_write_error(e.discard_inner()))?,
+            None => handle
+                .try_write(write)
+                .await
+                .map_err(|e| map_write_error(e.discard_inner()))?,
+        };
+
+        write_handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(map_write_error)
     }
 
     /// Ingest a single series with samples.
@@ -1604,8 +1619,14 @@ mod tests {
 
     #[tokio::test]
     async fn should_scan_samples_of_a_metric_interleaved_with_others() {
-        // given - 20 metrics written host-major, so each metric's series IDs
-        // are 20 apart: too sparse for an ID-span check alone
+        // given - 20 metrics written host-major and numbered in arrival
+        // order, so each metric's series IDs are 20 apart: too sparse for an
+        // ID-span check alone
+        let _layout = crate::read_tuning::override_write_layout(crate::read_tuning::WriteLayout {
+            sorted_series_ids: false,
+            ..crate::read_tuning::WriteLayout::DEFAULT
+        })
+        .await;
         let bucket = TimeBucket::hour(60);
         let storage = test_storage().await;
         let mini = load_with_config(bucket, storage.clone(), 16).await;
@@ -1856,11 +1877,11 @@ mod tests {
         // fill the queue
         let handle = mini.write_coordinator.handle(WRITE_CHANNEL);
         let _wh1 = handle
-            .try_write(vec![test_series("cpu", 3_700_000, 1.0)])
+            .try_write(vec![test_series("cpu", 3_700_000, 1.0)].into())
             .await
             .unwrap();
         let _wh2 = handle
-            .try_write(vec![test_series("cpu", 3_700_001, 2.0)])
+            .try_write(vec![test_series("cpu", 3_700_001, 2.0)].into())
             .await
             .unwrap();
 

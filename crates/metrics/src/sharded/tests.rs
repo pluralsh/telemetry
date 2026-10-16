@@ -945,6 +945,7 @@ async fn reader_groups_answer_like_a_reader_with_every_shard_open() {
 #[tokio::test]
 async fn remote_shards_answer_projected_aggregations_whether_or_not_they_project() {
     use std::sync::atomic::Ordering;
+    let _tuning = crate::read_tuning::override_index_projection().await;
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
         storage: SlateDbStorageConfig {

@@ -268,6 +268,7 @@ async fn should_answer_projected_aggregations_as_full_ones() {
 
 #[tokio::test]
 async fn should_resolve_the_cpu_query_from_the_index_without_the_forward_index() {
+    let _tuning = crate::read_tuning::override_index_projection().await;
     let (tsdb, _storage) = fixture().await;
 
     let (projected, full) = assert_same(&tsdb, CPU_QUERY).await;
@@ -281,7 +282,26 @@ async fn should_resolve_the_cpu_query_from_the_index_without_the_forward_index()
 }
 
 #[tokio::test]
+async fn should_resolve_dense_candidates_from_the_forward_index() {
+    // given: series numbered by metric and labels, so the cpu query's
+    // candidates are contiguous
+    let _layout =
+        crate::read_tuning::override_write_layout(crate::read_tuning::WriteLayout::DEFAULT).await;
+    let _tuning =
+        crate::read_tuning::override_read_tuning(crate::read_tuning::ReadTuning::DEFAULT).await;
+    let (tsdb, _storage) = fixture().await;
+
+    // when
+    let (projected, _) = assert_same(&tsdb, CPU_QUERY).await;
+
+    // then
+    assert!(projected.forward_index_calls > 0, "{projected:?}");
+    assert_eq!(projected.fingerprint_calls, 0, "{projected:?}");
+}
+
+#[tokio::test]
 async fn should_answer_the_same_over_buckets_without_fingerprints() {
+    let _tuning = crate::read_tuning::override_index_projection().await;
     for query in QUERIES {
         let (tsdb, storage) = fixture().await;
         forget_fingerprints(&tsdb, &storage, hour(0)).await;

@@ -22,6 +22,15 @@ pub struct Config {
     /// distinct values first. Selectors on a leading label then read a
     /// narrow ID range. Empty groups by value counts alone.
     pub stream_locality_labels: Vec<String>,
+    /// Stream IDs reserved at once, at least, for the streams of a segment
+    /// or rollup period sharing their leading locality label (the first of
+    /// `stream_locality_labels` they carry), so a key's streams first seen
+    /// in later flushes still get IDs next to its earlier ones. A key's next
+    /// block doubles what it reserved; its first is sized by the key's
+    /// streams in the preceding partition when the writer still holds it.
+    /// Zero, or empty `stream_locality_labels`, gives every stream the next
+    /// unreserved ID.
+    pub stream_id_block_size: u32,
     /// How long data is kept, counted from ingestion; `None` keeps it
     /// forever.
     pub retention: Option<Duration>,
@@ -56,6 +65,9 @@ pub const DEFAULT_STREAM_LOCALITY_LABELS: [&str; 4] = [
     "namespace",
     "k8s_namespace_name",
 ];
+
+/// Default [`Config::stream_id_block_size`].
+pub const DEFAULT_STREAM_ID_BLOCK_SIZE: u32 = 256;
 
 /// Every write-buffer flush cuts at least one page per written stream; these
 /// limits split larger flushes further.
@@ -107,6 +119,7 @@ impl Default for Config {
             segment_duration: Duration::from_secs(60 * 60),
             discovery_rollup: Some(Duration::from_secs(24 * 60 * 60)),
             stream_locality_labels: DEFAULT_STREAM_LOCALITY_LABELS.map(String::from).to_vec(),
+            stream_id_block_size: DEFAULT_STREAM_ID_BLOCK_SIZE,
             retention: Some(DEFAULT_RETENTION),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),

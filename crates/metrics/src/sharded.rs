@@ -239,7 +239,13 @@ impl ShardedMetrics {
         let shard_cache = block_cache.clone();
         let opener = shard_opener(move |shard| {
             let storage = shard_storage(&config, shard);
-            let reader_options = reader_options.clone();
+            let mut reader_options = reader_options.clone();
+            // A disk cache evicts by scanning its whole directory, so
+            // shards sharing one would evict each other's parts.
+            let disk_cache = &mut reader_options.object_store_cache_options.root_folder;
+            if let Some(root) = disk_cache.take() {
+                *disk_cache = Some(root.join(&storage.path));
+            }
             let cache = shard_cache.clone();
             let object_store = object_store.clone();
             async move {

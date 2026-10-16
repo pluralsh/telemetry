@@ -87,6 +87,13 @@ retention_seconds: 5184000 # 60 days, the default. `null` keeps data forever.
 # Per-shard query-cache capacity, counted in time-bucket entries (not bytes).
 reader_cache_capacity: 268435456
 
+# Optional SlateDB disk cache of what reader shards read from the object store,
+# a directory per shard under path; off unless path is set. Put it on a volume
+# that outlives restarts so a restarted reader skips the reads that filled it.
+# reader_disk_cache:
+#   path: /var/cache/metrics-reads
+#   max_bytes_per_shard: 17179869184 # Optional; SlateDB's default, 16 GiB.
+
 # Bytes of resolved selector postings (bucket + sorted matchers -> series ids)
 # shared across queries, per namespace on each storage shard; 64 MiB.
 # Entries are dropped once their bucket gains series.

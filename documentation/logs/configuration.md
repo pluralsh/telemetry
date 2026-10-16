@@ -90,6 +90,13 @@ retention_seconds: 1209600 # Logical retention; 14 days, the default. `null` kee
 # Alloy's Loki pushes and OTLP resources name them. `[]` disables it; changing
 # it only affects streams created afterwards.
 stream_locality_labels: [cluster, k8s_cluster_name, namespace, k8s_namespace_name]
+# IDs reserved at once for the new streams of a segment sharing their first
+# `stream_locality_labels` label (e.g. one cluster), so streams first seen
+# late in the segment still land next to their cluster's; `0` disables it.
+# The config parser rejects unknown fields, so binaries older than this
+# option refuse a config that sets it: leave it unset (256) during a rolling
+# upgrade or rollback. Either setting can resume data the other wrote.
+# stream_id_block_size: 256
 
 # Each write-buffer flush packs every written stream of a segment into
 # multi-stream objects; these limits cut larger flushes into several objects.

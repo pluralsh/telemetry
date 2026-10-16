@@ -98,6 +98,27 @@ rollup segment's IDs follow that order however the streams were spread over
 its sources. The order only affects how many records a read scans: readers
 treat stream IDs as opaque, and existing IDs are never renumbered.
 
+Locality order only spans one write, and a segment's low-volume streams
+first appear in later flushes. So the writer also reserves blocks of IDs
+(`stream_id_block_size`, 256 by default) for each **leading locality
+label**: the first `stream_locality_labels` name a stream carries, with its
+value, such as `cluster="mgmt"`. The first stream of a key in a segment or
+rollup period reserves a block at the counter, sized by the key's streams in
+the preceding partition (plus a quarter) when the writer still holds it.
+Later streams of the key take the block's next ID, and an exhausted key
+reserves another block of the size it has reserved so far. Streams without
+such a label, keys past the 4,096th, and blocks that would pass half the ID
+space take the next unreserved ID instead. Unused reserved IDs have no
+records, so a scan over a span skips them.
+
+Reservations are not stored. The counter is always written past every
+reserved block, in the same write as the records of the IDs it covers, so a
+writer that resumes a segment (including one without blocks, which takes the
+counter as its next ID) never hands out an ID that a block may already have
+handed out; the rest of the lost blocks stay unused. The counter is also the
+discovery caches' version of a partition, so a write that only takes
+reserved IDs still advances it by one ID.
+
 ## Objects, runs and blocks
 
 Log rows are stored in **objects**. An object holds the rows written together

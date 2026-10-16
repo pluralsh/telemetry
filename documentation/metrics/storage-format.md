@@ -47,7 +47,12 @@ fallback or backfill.
 
 Series IDs are dense `u32` values allocated per bucket within each storage
 shard, starting at `0`. They are only meaningful inside one shard's bucket;
-cross-shard queries join series by label fingerprint, never by ID.
+cross-shard queries join series by label fingerprint, never by ID. Each
+flush numbers the series new to a bucket in (metric name, labels) order, so a
+metric's forward-index and fingerprint records sit together, and a rollup
+registers every series of its sources before copying samples so the rolled
+bucket is numbered the same way. Readers never depend on that order: IDs
+from older writers, numbered as series arrived, read the same.
 
 | ID | Record | Purpose |
 | --- | --- | --- |

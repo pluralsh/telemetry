@@ -70,6 +70,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
         segment_duration: Duration::from_secs(if production { 3600 } else { 60 }),
         discovery_rollup: Some(Duration::from_secs(24 * 3600)),
         stream_locality_labels: Vec::new(),
+        stream_id_block_size: 0,
         retention: None,
         page: if production {
             PageConfig::default()
@@ -840,6 +841,9 @@ fn production_config(store: &std::path::Path) -> Config {
     if let Ok(rows) = std::env::var("PROFILE_OBJECT_ROWS") {
         config.compaction.max_object_rows = rows.parse().unwrap();
     }
+    if let Ok(ids) = std::env::var("PROFILE_STREAM_ID_BLOCK") {
+        config.stream_id_block_size = ids.parse().unwrap();
+    }
     config.compaction.min_age = Duration::ZERO;
     config.write_buffer.flush_interval = Duration::from_secs(3600);
     // The operator's reader caches: 512 MiB of SST blocks, 128 MiB of
@@ -1156,16 +1160,32 @@ async fn cold_runs(
         let gets = Arc::new(AtomicUsize::new(0));
         let db = cold_reader(config, latency, &gets).await;
         let segments = db.visible_segment_ids(namespace, range, false).unwrap();
+        let manifest = db.storage.slate_read().map(|slate| slate.manifest());
         gets.store(0, Ordering::Relaxed);
         for segment in &segments {
+            // L0 SSTs and sorted runs a cold read of the segment may walk.
+            let prefix = segment_prefix(namespace, *segment);
+            let shape = manifest
+                .as_ref()
+                .and_then(|manifest| {
+                    manifest
+                        .segments()
+                        .iter()
+                        .find(|live| live.prefix().as_ref() == prefix.as_ref())
+                        .map(|live| (live.l0().len(), live.compacted().len()))
+                })
+                .unwrap_or_default();
+            take_get_keys();
             let started = Instant::now();
             let streams = db
                 .segment_streams(namespace, *segment, &plan.streams, range, now_unix_ms)
                 .await
                 .unwrap();
             println!(
-                "  alone {}: {:.0}ms gets {} streams {} runs {}",
+                "  alone {}: l0 {} sorted runs {} {:.0}ms gets {} streams {} runs {} ({})",
                 segment.start_ns,
+                shape.0,
+                shape.1,
                 ms(started.elapsed()),
                 gets.swap(0, Ordering::Relaxed),
                 streams.len(),
@@ -1173,6 +1193,7 @@ async fn cold_runs(
                     .iter()
                     .map(|stream| stream.runs.len())
                     .sum::<usize>(),
+                take_get_keys(),
             );
         }
         db.close().await.unwrap();
@@ -1202,13 +1223,48 @@ async fn cold_runs(
         "warm ms",
         "warmscan ms",
     ];
+    // `PROFILE_PREWARM=N` warms the filters and indexes of the newest N
+    // segments in range that have several SSTs (all with a non-number) while
+    // the query runs, as the continuous cache warmer would have beforehand.
+    let prewarm = async |db: &LogDb| {
+        if std::env::var("PROFILE_PREWARM").is_err() {
+            return;
+        }
+        let Some(slate) = db.storage.slate_read() else {
+            return;
+        };
+        let range = (plan.scan_start, request.end_ns);
+        let newest: usize = std::env::var("PROFILE_PREWARM")
+            .unwrap()
+            .parse()
+            .unwrap_or(usize::MAX);
+        let segments = db.visible_segment_ids(namespace, range, false).unwrap();
+        let open: Vec<Bytes> = segments
+            .iter()
+            .rev()
+            .take(newest)
+            .map(|segment| segment_prefix(namespace, *segment))
+            .filter(|prefix| {
+                slate.manifest().segments().iter().any(|live| {
+                    live.prefix().as_ref() == prefix.as_ref()
+                        && live.l0().len() + live.compacted().len() > 1
+                })
+            })
+            .collect();
+        slate
+            .warm_prefixes("logs", &open, false, 64, &CancellationToken::new(), None)
+            .await
+            .unwrap();
+    };
     let mut measures = vec![Vec::new(); names.len()];
     for run in 0..runs {
         let gets = Arc::new(AtomicUsize::new(0));
         let db = cold_reader(config, latency, &gets).await;
         gets.store(0, Ordering::Relaxed);
         let started = Instant::now();
-        db.query(namespace, request, options.clone()).await.unwrap();
+        let (result, ()) =
+            tokio::join!(db.query(namespace, request, options.clone()), prewarm(&db));
+        result.unwrap();
         let total = (ms(started.elapsed()), gets.swap(0, Ordering::Relaxed));
         db.close().await.unwrap();
 

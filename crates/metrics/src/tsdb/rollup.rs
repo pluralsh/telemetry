@@ -10,7 +10,7 @@
 //! it replaces the buckets it covers, which compaction then drains. A
 //! rollup interrupted before its seal resumes on the next pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use common::serde::scope::Segment;
@@ -122,6 +122,10 @@ impl Tsdb {
         }
         let snapshot = self.storage.snapshot().await?;
         let mini = self.get_or_create_for_ingest(wide).await?;
+        if crate::read_tuning::write_layout().rollup_presort {
+            self.register_sources(&snapshot, &sources, &mini, config.copy_buffer_bytes)
+                .await?;
+        }
         let mut queued = 0;
         for source in sources {
             self.copy_bucket(
@@ -161,6 +165,61 @@ impl Tsdb {
         self.discovery_cache.clear();
         tracing::info!(namespace = %self.namespace, bucket = ?wide, "sealed rollup bucket");
         Ok(())
+    }
+
+    /// Registers every series of `sources` in `mini` before any sample is
+    /// copied. Each flush numbers its new series in (metric, labels) order,
+    /// so a series first seen in a later source gets an ID next to its
+    /// metric's instead of one in a tail after every series of the earlier
+    /// sources. Registrations are flushed once `buffer` bytes of them queue.
+    /// A retried rollup finds the series it registered in the bucket's
+    /// dictionary and registers only the rest.
+    async fn register_sources(
+        &self,
+        snapshot: &StorageSnapshot,
+        sources: &[TimeBucket],
+        mini: &MiniTsdb,
+        buffer: u64,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut batch = Vec::with_capacity(COPY_BATCH);
+        let mut queued = 0;
+        for &source in sources {
+            let forward = snapshot.get_forward_index(&self.namespace, source).await?;
+            let mut specs: Vec<_> = forward.series.into_iter().map(|(_, spec)| spec).collect();
+            specs.sort_unstable_by(|a, b| {
+                a.labels
+                    .metric_name()
+                    .cmp(b.labels.metric_name())
+                    .then_with(|| a.labels.as_slice().cmp(b.labels.as_slice()))
+            });
+            for spec in &specs {
+                if !seen.insert(spec.labels.series_fingerprint()) {
+                    continue;
+                }
+                queued += series_bytes(spec.labels.iter(), &SeriesData::default());
+                batch.push(Series {
+                    labels: spec.labels.iter().cloned().collect(),
+                    metric_type: spec.metric_type,
+                    unit: spec.unit.clone(),
+                    description: None,
+                    samples: Vec::new(),
+                    histograms: Vec::new(),
+                });
+                if batch.len() == COPY_BATCH || queued >= buffer {
+                    mini.register_batch(std::mem::take(&mut batch), COPY_WRITE_TIMEOUT)
+                        .await?;
+                }
+                if queued >= buffer {
+                    mini.flush_written().await?;
+                    queued = 0;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            mini.register_batch(batch, COPY_WRITE_TIMEOUT).await?;
+        }
+        mini.flush_written().await
     }
 
     /// Copies `source` into `mini`. `ingest_batch` waits only until the
@@ -505,6 +564,145 @@ mod tests {
             .collect();
         assert_eq!(sealed(&storage).await, halves);
         assert_eq!(samples(&tsdb).await, before);
+    }
+
+    const SAMPLES_PER_HOUR: i64 = 30;
+
+    /// Two metrics' series written interleaved over the day, with a host
+    /// that first appears at noon, so a rollup first sees it in a later
+    /// source.
+    async fn write_churning_day(tsdb: &Tsdb, storage: &Storage) {
+        let mut batch = Vec::new();
+        for hour in 0..24_i64 {
+            let start = day().start_ms() + hour * HOUR_MS;
+            let hosts = ["a", "b", "c"]
+                .into_iter()
+                .chain((hour >= 12).then_some("late"));
+            for host in hosts {
+                for metric in ["other_metric", "rollup_metric"] {
+                    let mut series = series(host, start, hour as f64);
+                    series.labels[0] = Label::new("__name__", metric);
+                    series.samples = (0..SAMPLES_PER_HOUR)
+                        .map(|at| Sample::new(start + at * 120_000, (hour * 100 + at) as f64))
+                        .collect();
+                    batch.push(series);
+                }
+            }
+        }
+        tsdb.ingest_samples(batch, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+        storage.flush_memtable().await.unwrap();
+    }
+
+    /// Room for every registration of [`write_churning_day`] but a fraction
+    /// of one hour's copied samples, as a production day's registrations
+    /// fit a copy buffer its samples overflow many times.
+    fn churning_config() -> RollupConfig {
+        RollupConfig {
+            copy_buffer_bytes: 4_096,
+            ..config(u64::MAX)
+        }
+    }
+
+    async fn stored_samples(storage: &Storage) -> usize {
+        let snapshot = storage.snapshot().await.unwrap();
+        let mut records = snapshot
+            .scan_prefix(TimeSeriesKey::bucket_prefix(&Namespace::default(), &day()))
+            .await
+            .unwrap();
+        let mut stored = 0;
+        while let Some(record) = records.next().await.unwrap() {
+            stored += SeriesData::decode(&record.value).unwrap().timestamps.len();
+        }
+        stored
+    }
+
+    const CHURNING_SAMPLES: usize = 2 * (3 * 24 + 12) * SAMPLES_PER_HOUR as usize;
+
+    #[tokio::test]
+    async fn numbers_each_metric_contiguously_only_when_presorted() {
+        use crate::read_tuning::WriteLayout;
+        use crate::tsdb::layout_tests::{SORTED, contiguous, dense_ids, metric_ids};
+        for (layout, presorted) in [(SORTED, false), (WriteLayout::DEFAULT, true)] {
+            // given
+            let _layout = crate::read_tuning::override_write_layout(layout).await;
+            let storage = Arc::new(in_memory_storage().await);
+            let tsdb = Tsdb::with_retention(storage.clone(), None);
+            write_churning_day(&tsdb, &storage).await;
+            let before = samples(&tsdb).await;
+
+            // when
+            tsdb.rollup(&churning_config(), after_delay())
+                .await
+                .unwrap();
+
+            // then
+            assert_eq!(sealed(&storage).await, vec![day()]);
+            assert_eq!(samples(&tsdb).await, before);
+            assert_eq!(stored_samples(&storage).await, CHURNING_SAMPLES);
+            assert_eq!(dense_ids(&storage, day()).await.len(), 8);
+            for metric in ["other_metric", "rollup_metric"] {
+                let ids = metric_ids(&storage, day(), metric).await;
+                assert_eq!(ids.len(), 4);
+                assert_eq!(contiguous(&ids), presorted, "{metric} {layout:?}: {ids:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finishes_an_interrupted_rollup_under_the_other_layout() {
+        use crate::read_tuning::WriteLayout;
+        use crate::tsdb::layout_tests::{ARRIVAL, dense_ids};
+        let swaps = [
+            (WriteLayout::DEFAULT, ARRIVAL),
+            (ARRIVAL, WriteLayout::DEFAULT),
+        ];
+        for ((interrupted_on, resumed_on), copied) in
+            swaps.into_iter().flat_map(|swap| [(swap, 0), (swap, 5)])
+        {
+            // given: a rollup that registered its series (if its binary
+            // does) and copied `copied` hours, then stopped before its seal
+            let layout = crate::read_tuning::override_write_layout(interrupted_on).await;
+            let storage = Arc::new(in_memory_storage().await);
+            let interrupted = Tsdb::with_retention(storage.clone(), None);
+            write_churning_day(&interrupted, &storage).await;
+            let before = samples(&interrupted).await;
+            interrupted.rolled.write().await.insert(day());
+            let snapshot = storage.snapshot().await.unwrap();
+            let mini = interrupted.get_or_create_for_ingest(day()).await.unwrap();
+            let hours: Vec<TimeBucket> = day().hours().collect();
+            if interrupted_on.rollup_presort {
+                interrupted
+                    .register_sources(&snapshot, &hours, &mini, 4_096)
+                    .await
+                    .unwrap();
+            }
+            for &hour in hours.iter().take(copied) {
+                interrupted
+                    .copy_bucket(&snapshot, hour, &mini, 4_096, &mut 0)
+                    .await
+                    .unwrap();
+            }
+            interrupted.flush().await.unwrap();
+            storage.flush_memtable().await.unwrap();
+            drop((snapshot, mini, interrupted));
+
+            // when: a writer on the other binary resumes it
+            layout.set(resumed_on);
+            let resumed = Tsdb::with_retention(storage.clone(), None);
+            let sealed_now = resumed
+                .rollup(&churning_config(), after_delay())
+                .await
+                .unwrap();
+
+            // then
+            let case = format!("{interrupted_on:?} -> {resumed_on:?} after {copied}h");
+            assert_eq!(sealed_now, 1, "{case}");
+            assert_eq!(sealed(&storage).await, vec![day()], "{case}");
+            assert_eq!(samples(&resumed).await, before, "{case}");
+            assert_eq!(stored_samples(&storage).await, CHURNING_SAMPLES, "{case}");
+            assert_eq!(dense_ids(&storage, day()).await.len(), 8, "{case}");
+        }
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ fn config(path: &str, enabled: bool) -> Config {
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),
         stream_locality_labels: Vec::new(),
+        stream_id_block_size: 0,
         retention: None,
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,

@@ -117,6 +117,11 @@ async fn should_ingest_and_query_single_bucket() {
 async fn should_match_per_series_reads_for_batched_scans() {
     // given: two metrics with interleaved series ids, so `m`'s forward-index
     // id range also covers `other`'s series
+    let _layout = crate::read_tuning::override_write_layout(crate::read_tuning::WriteLayout {
+        sorted_series_ids: false,
+        ..crate::read_tuning::WriteLayout::DEFAULT
+    })
+    .await;
     let storage = Arc::new(in_memory_storage().await);
     let tsdb = Tsdb::new(storage);
     let bucket = TimeBucket::hour(60);

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::codec::{decode_dictionary_key, dictionary_prefix, rollup_dictionary_prefix};
-use crate::model::locality_order;
+use crate::model::{locality_key, locality_order};
 
 /// How long a segment's or rollup period's IDs stay in memory after its
 /// last write. A later write reloads them.
@@ -33,11 +33,48 @@ pub(super) struct DirectWriter {
     periods: HashMap<(Namespace, SegmentId), StreamIds>,
 }
 
+/// Most locality keys one segment or rollup period reserves ID blocks for;
+/// streams of further keys take plain IDs.
+const MAX_BLOCK_KEYS: usize = 4_096;
+/// Largest block of stream IDs reserved at once.
+const MAX_BLOCK_IDS: u32 = 1 << 16;
+/// Blocks are only reserved below this ID, which leaves half the ID space
+/// to plain allocation however many IDs blocks leave unused.
+const BLOCK_ID_LIMIT: StreamId = StreamId::MAX / 2;
+
+/// The leading stream locality label a stream carries, the first of
+/// [`Config::stream_locality_labels`] it has, with its value. Streams
+/// sharing one take their IDs from the same blocks.
+type LocalityKey = Label;
+
 /// Stream IDs allocated in one segment or rollup period.
+///
+/// With ID blocks, a stream whose [`LocalityKey`] is new to the partition
+/// reserves a block of IDs for its key at `next`, and later streams of the
+/// key take the block's next ID, so a key's streams stay in a few dense
+/// ranges however many flushes they arrive over. `next` stays past every
+/// reserved ID, and every write that adds a stream moves it, as discovery
+/// caches take the persisted counter for the partition's version. Blocks
+/// live only in memory: a recovered partition resumes at the counter, so
+/// IDs left in its blocks are never handed out.
 struct StreamIds {
     ids: HashMap<StreamFingerprint, StreamId>,
     next: StreamId,
+    blocks: HashMap<LocalityKey, Block>,
     touched: Instant,
+}
+
+/// The IDs one locality key reserved in a partition.
+#[derive(Default)]
+struct Block {
+    /// The next ID its streams take, while below `end`.
+    next: StreamId,
+    end: StreamId,
+    /// IDs its blocks reserved so far, the size of its next block.
+    reserved: u32,
+    /// Streams given IDs from its blocks, which sizes its first block in the
+    /// next partition.
+    streams: u32,
 }
 
 impl StreamIds {
@@ -63,6 +100,7 @@ impl StreamIds {
         Ok(Self {
             ids,
             next,
+            blocks: HashMap::new(),
             touched: Instant::now(),
         })
     }
@@ -71,12 +109,82 @@ impl StreamIds {
         if let Some(id) = self.ids.get(&fingerprint) {
             return Ok(*id);
         }
+        let id = self.plain_id()?;
+        self.ids.insert(fingerprint, id);
+        Ok(id)
+    }
+
+    fn plain_id(&mut self) -> Result<StreamId> {
         let id = self.next;
         self.next = id
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("segment exhausted stream IDs".to_owned()))?;
-        self.ids.insert(fingerprint, id);
         Ok(id)
+    }
+
+    /// Gives `fingerprint` an ID unless it has one: from its `key`'s block
+    /// when `block_ids` is positive, reserving one of at least `block_ids`
+    /// IDs, or of `hint` for a key's first, when the key has none left.
+    /// Returns whether it allocated.
+    fn allocate(
+        &mut self,
+        fingerprint: StreamFingerprint,
+        key: Option<LocalityKey>,
+        block_ids: u32,
+        hint: impl FnOnce(&LocalityKey) -> Option<u32>,
+    ) -> Result<bool> {
+        if self.ids.contains_key(&fingerprint) {
+            return Ok(false);
+        }
+        let id = match key.filter(|_| block_ids > 0) {
+            Some(key) => self.block_id(key, block_ids, hint)?,
+            None => self.plain_id()?,
+        };
+        self.ids.insert(fingerprint, id);
+        Ok(true)
+    }
+
+    fn block_id(
+        &mut self,
+        key: LocalityKey,
+        block_ids: u32,
+        hint: impl FnOnce(&LocalityKey) -> Option<u32>,
+    ) -> Result<StreamId> {
+        if let Some(block) = self.blocks.get_mut(&key)
+            && block.next < block.end
+        {
+            let id = block.next;
+            block.next += 1;
+            block.streams += 1;
+            return Ok(id);
+        }
+        let reserved = match self.blocks.get(&key) {
+            Some(block) => block.reserved,
+            None if self.blocks.len() >= MAX_BLOCK_KEYS => return self.plain_id(),
+            None => hint(&key).map_or(0, |streams| streams.saturating_add(streams / 4)),
+        };
+        let size = reserved.max(block_ids).min(MAX_BLOCK_IDS);
+        let start = self.next;
+        let Some(end) = start.checked_add(size).filter(|end| *end <= BLOCK_ID_LIMIT) else {
+            return self.plain_id();
+        };
+        self.next = end;
+        let block = self.blocks.entry(key).or_default();
+        block.next = start + 1;
+        block.end = end;
+        block.reserved = block.reserved.saturating_add(size);
+        block.streams += 1;
+        Ok(start)
+    }
+
+    /// Ends a write that allocated IDs while the counter was `before`: one
+    /// that only took IDs from reserved blocks still moves the counter, so
+    /// every write that adds a stream changes it.
+    fn finish_allocation(&mut self, before: StreamId) -> Result<()> {
+        if self.next == before {
+            self.plain_id()?;
+        }
+        Ok(())
     }
 }
 
@@ -260,36 +368,50 @@ impl DirectWriter {
             }
         }
         let priority = &self.config.stream_locality_labels;
-        let ordered = |streams: Vec<(StreamFingerprint, &Labels)>| -> Vec<StreamFingerprint> {
+        let block_ids = self.config.stream_id_block_size;
+        fn ordered<'a>(
+            streams: Vec<(StreamFingerprint, &'a Labels)>,
+            priority: &[String],
+        ) -> Vec<(StreamFingerprint, &'a Labels)> {
             let labels: Vec<&Labels> = streams.iter().map(|(_, labels)| *labels).collect();
             locality_order(&labels, priority)
                 .into_iter()
-                .map(|position| streams[position].0)
+                .map(|position| streams[position])
                 .collect()
-        };
-        let segments: Vec<_> = segments
-            .into_iter()
-            .map(|(segment, streams)| (segment, ordered(streams)))
-            .collect();
-        let periods: Vec<_> = periods
-            .into_iter()
-            .map(|(period, mut streams)| {
-                streams.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
-                streams.dedup_by_key(|(fingerprint, _)| *fingerprint);
-                (period, ordered(streams))
-            })
-            .collect();
-        for (segment, fingerprints) in segments {
-            let ids = &mut self.segment_ids(namespace, segment).streams;
-            for fingerprint in fingerprints {
-                ids.resolve(fingerprint)?;
-            }
         }
-        for (period, fingerprints) in periods {
-            let ids = self.period_ids(namespace, period);
-            for fingerprint in fingerprints {
-                ids.resolve(fingerprint)?;
-            }
+        for (segment, streams) in segments {
+            let streams = ordered(streams, priority);
+            let key = (namespace.clone(), segment);
+            let mut ids = self
+                .segments
+                .remove(&key)
+                .expect("load_ids loads every written segment");
+            ids.streams.touched = Instant::now();
+            let previous = preceding(segment).and_then(|previous| {
+                self.segments
+                    .get(&(namespace.clone(), previous))
+                    .map(|ids| &ids.streams)
+            });
+            let allocated =
+                allocate_streams(&mut ids.streams, previous, &streams, priority, block_ids);
+            self.segments.insert(key, ids);
+            allocated?;
+        }
+        for (period, mut streams) in periods {
+            streams.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+            streams.dedup_by_key(|(fingerprint, _)| *fingerprint);
+            let streams = ordered(streams, priority);
+            let key = (namespace.clone(), period);
+            let mut ids = self
+                .periods
+                .remove(&key)
+                .expect("load_ids loads every written period");
+            ids.touched = Instant::now();
+            let previous = preceding(period)
+                .and_then(|previous| self.periods.get(&(namespace.clone(), previous)));
+            let allocated = allocate_streams(&mut ids, previous, &streams, priority, block_ids);
+            self.periods.insert(key, ids);
+            allocated?;
         }
         Ok(())
     }
@@ -501,6 +623,43 @@ impl DirectWriter {
             })
             .transpose()
     }
+}
+
+/// Gives `streams`, in locality order, the IDs they lack in `ids`. With
+/// `block_ids` positive, a key's first block in `ids` is sized by how many
+/// of its streams `previous`, the preceding partition, gave IDs.
+fn allocate_streams(
+    ids: &mut StreamIds,
+    previous: Option<&StreamIds>,
+    streams: &[(StreamFingerprint, &Labels)],
+    priority: &[String],
+    block_ids: u32,
+) -> Result<()> {
+    let before = ids.next;
+    let mut allocated = false;
+    for (fingerprint, labels) in streams {
+        if ids.ids.contains_key(fingerprint) {
+            continue;
+        }
+        let key = (block_ids > 0)
+            .then(|| locality_key(labels, priority))
+            .flatten();
+        allocated |= ids.allocate(*fingerprint, key, block_ids, |key| {
+            previous?.blocks.get(key).map(|block| block.streams)
+        })?;
+    }
+    if allocated {
+        ids.finish_allocation(before)?;
+    }
+    Ok(())
+}
+
+/// The partition of the same width just before `partition`.
+fn preceding(partition: SegmentId) -> Option<SegmentId> {
+    partition
+        .start_ns
+        .checked_sub(partition.width_ns)
+        .map(|start_ns| SegmentId::new(start_ns, partition.width_ns))
 }
 
 pub(super) type StreamGroups = BTreeMap<(SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
@@ -753,7 +912,9 @@ impl PendingWrite {
 
 #[cfg(test)]
 mod tests {
-    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
+    };
 
     use super::*;
     use crate::config::CompactionConfig;
@@ -849,6 +1010,374 @@ mod tests {
                     assert_eq!(contiguous(ids), grouped, "{priority:?} {cluster} {ids:?}");
                 }
             }
+            db.close().await.unwrap();
+        }
+    }
+
+    fn empty_ids() -> StreamIds {
+        StreamIds {
+            ids: HashMap::new(),
+            next: 0,
+            blocks: HashMap::new(),
+            touched: Instant::now(),
+        }
+    }
+
+    fn fingerprint(index: usize) -> StreamFingerprint {
+        let mut fingerprint = [0; 16];
+        fingerprint[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        fingerprint
+    }
+
+    fn key(cluster: &str) -> Option<LocalityKey> {
+        Some(Label::new("cluster", cluster))
+    }
+
+    #[test]
+    fn stream_ids_reserve_blocks_that_grow_then_fall_back_to_plain_ids() {
+        let mut ids = empty_ids();
+        let mut index = 0;
+        let mut allocate = |ids: &mut StreamIds, key: Option<LocalityKey>, hint: Option<u32>| {
+            index += 1;
+            assert!(ids.allocate(fingerprint(index), key, 4, |_| hint).unwrap());
+            ids.ids[&fingerprint(index)]
+        };
+        let taken: Vec<_> = (0..4).map(|_| allocate(&mut ids, key("a"), None)).collect();
+        assert_eq!(taken, vec![0, 1, 2, 3]);
+        assert_eq!(allocate(&mut ids, key("b"), None), 4);
+        assert_eq!(ids.next, 8);
+        // Exhausted, `a` reserves what it has reserved so far, then twice it.
+        assert_eq!(allocate(&mut ids, key("a"), None), 8);
+        assert_eq!(ids.next, 12);
+        for expected in 9..12 {
+            assert_eq!(allocate(&mut ids, key("a"), None), expected);
+        }
+        assert_eq!(allocate(&mut ids, key("a"), None), 12);
+        assert_eq!(ids.next, 20);
+        assert_eq!(allocate(&mut ids, key("b"), None), 5);
+        // Streams without a key take the next unreserved ID.
+        assert_eq!(allocate(&mut ids, None, None), 20);
+        // A new key's first block holds its hinted streams and a quarter more.
+        assert_eq!(allocate(&mut ids, key("c"), Some(8)), 21);
+        assert_eq!(ids.next, 31);
+        assert_eq!(allocate(&mut ids, key("d"), Some(1 << 20)), 31);
+        assert_eq!(ids.next, 31 + MAX_BLOCK_IDS);
+        // An existing stream keeps its ID.
+        assert!(!ids.allocate(fingerprint(1), key("b"), 4, |_| None).unwrap());
+        assert_eq!(ids.ids[&fingerprint(1)], 0);
+
+        // A write that only took reserved IDs still moves the counter.
+        let before = ids.next;
+        allocate(&mut ids, key("a"), None);
+        ids.finish_allocation(before).unwrap();
+        assert_eq!(ids.next, before + 1);
+        let before = ids.next;
+        allocate(&mut ids, None, None);
+        ids.finish_allocation(before).unwrap();
+        assert_eq!(ids.next, before + 1);
+
+        // Past `MAX_BLOCK_KEYS` keys, new keys take plain IDs while the
+        // others keep their blocks.
+        let mut ids = empty_ids();
+        for cluster in 0..MAX_BLOCK_KEYS {
+            allocate(&mut ids, key(&format!("k{cluster}")), None);
+        }
+        let next = ids.next;
+        assert_eq!(allocate(&mut ids, key("new"), None), next);
+        assert_eq!(allocate(&mut ids, key("new"), None), next + 1);
+        assert_eq!(allocate(&mut ids, key("k0"), None), 1);
+        assert_eq!(ids.next, next + 2);
+
+        // Blocks stay below `BLOCK_ID_LIMIT`.
+        let mut ids = empty_ids();
+        ids.next = BLOCK_ID_LIMIT - 2;
+        assert_eq!(allocate(&mut ids, key("a"), None), BLOCK_ID_LIMIT - 2);
+        assert_eq!(allocate(&mut ids, key("a"), None), BLOCK_ID_LIMIT - 1);
+        assert_eq!(ids.next, BLOCK_ID_LIMIT);
+        assert!(ids.blocks.is_empty());
+    }
+
+    fn pod(cluster: &str, pod: usize) -> Labels {
+        Labels::new(vec![
+            Label::new("cluster", cluster),
+            Label::new("pod", format!("{cluster}-{pod}")),
+        ])
+        .unwrap()
+    }
+
+    /// Writes a row at `at` for each of `pods`, `(cluster, pod)`, in one
+    /// durable flush.
+    async fn write_pods(db: &LogDb, namespace: &Namespace, at: i64, pods: &[(&str, usize)]) {
+        let batches = pods
+            .iter()
+            .map(|(cluster, index)| {
+                LogBatch::new(
+                    pod(cluster, *index),
+                    vec![LogEntry::new(at, format!("{cluster} {index}"))],
+                )
+            })
+            .collect();
+        db.write_with_durability(namespace, batches, Durability::Durable)
+            .await
+            .unwrap();
+        db.flush_memtable().await.unwrap();
+    }
+
+    /// Each cluster's stream IDs in the dictionary under `prefix`, ascending,
+    /// and the counter at `counter`.
+    async fn pod_ids(
+        db: &LogDb,
+        prefix: Bytes,
+        counter: Bytes,
+    ) -> (BTreeMap<String, Vec<StreamId>>, StreamId) {
+        let mut clusters = HashMap::new();
+        for cluster in ["a", "b", "c"] {
+            for index in 0..64 {
+                clusters.insert(pod(cluster, index).fingerprint(), cluster);
+            }
+        }
+        let ids = cluster_ids(db, prefix, &clusters).await;
+        let all: Vec<StreamId> = ids.values().flatten().copied().collect();
+        assert_eq!(
+            all.iter().collect::<BTreeSet<_>>().len(),
+            all.len(),
+            "IDs are unique: {ids:?}"
+        );
+        let counter = decode_stream_id(&db.storage.get(counter).await.unwrap().unwrap().value);
+        (ids, counter.unwrap())
+    }
+
+    fn pods(cluster: &'static str, range: Range<usize>) -> Vec<(&'static str, usize)> {
+        range.map(|index| (cluster, index)).collect()
+    }
+
+    fn segment() -> SegmentId {
+        SegmentId::new(DAY, HOUR)
+    }
+
+    async fn segment_ids_of(
+        db: &LogDb,
+        namespace: &Namespace,
+    ) -> (BTreeMap<String, Vec<StreamId>>, StreamId) {
+        pod_ids(
+            db,
+            dictionary_prefix(namespace, segment()),
+            next_stream_id_key(namespace, segment()),
+        )
+        .await
+    }
+
+    async fn rows_of(db: &LogDb, namespace: &Namespace, cluster: &str) -> usize {
+        db.read(
+            namespace,
+            DAY,
+            DAY + HOUR - 1,
+            &[Label::new("cluster", cluster)],
+        )
+        .await
+        .unwrap()
+        .len()
+    }
+
+    #[tokio::test]
+    async fn keeps_a_clusters_streams_in_its_blocks_across_flushes() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let db = LogDb::open(Config {
+            stream_id_block_size: 8,
+            ..config(&["cluster"])
+        })
+        .await
+        .unwrap();
+        let at = DAY + HOUR / 2;
+        write_pods(&db, &namespace, at, &[("a", 0), ("a", 1), ("b", 0)]).await;
+        write_pods(&db, &namespace, at, &[("a", 2), ("b", 1), ("c", 0)]).await;
+        write_pods(&db, &namespace, at, &pods("a", 3..10)).await;
+        // Only reserved IDs, so the counter still moves.
+        write_pods(&db, &namespace, at, &[("b", 2)]).await;
+        let expected: BTreeMap<String, Vec<StreamId>> = [
+            ("a", vec![0, 1, 2, 3, 4, 5, 6, 7, 24, 25]),
+            ("b", vec![8, 9, 10]),
+            ("c", vec![16]),
+        ]
+        .into_iter()
+        .map(|(cluster, ids)| (cluster.to_owned(), ids))
+        .collect();
+        assert_eq!(
+            segment_ids_of(&db, &namespace).await,
+            (expected.clone(), 33)
+        );
+        let period = SegmentId::new(DAY, 24 * HOUR);
+        assert_eq!(
+            pod_ids(
+                &db,
+                rollup_dictionary_prefix(&namespace, period),
+                rollup_next_stream_id_key(&namespace, period),
+            )
+            .await,
+            (expected, 33)
+        );
+        assert_eq!(rows_of(&db, &namespace, "a").await, 10);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sizes_a_clusters_first_block_by_its_streams_in_the_previous_segment() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let db = LogDb::open(Config {
+            stream_id_block_size: 8,
+            ..config(&["cluster"])
+        })
+        .await
+        .unwrap();
+        write_pods(&db, &namespace, DAY + HOUR / 2, &pods("a", 0..20)).await;
+        // The next hour's streams of `a` arrive around a new cluster's.
+        let next = SegmentId::new(DAY + HOUR, HOUR);
+        let at = DAY + HOUR + HOUR / 2;
+        write_pods(&db, &namespace, at, &[("a", 0)]).await;
+        write_pods(&db, &namespace, at, &[("b", 0)]).await;
+        write_pods(&db, &namespace, at, &pods("a", 1..25)).await;
+        let (ids, counter) = pod_ids(
+            &db,
+            dictionary_prefix(&namespace, next),
+            next_stream_id_key(&namespace, next),
+        )
+        .await;
+        assert_eq!(ids["a"], (0..25).collect::<Vec<_>>());
+        assert_eq!(ids["b"], vec![25]);
+        assert_eq!(counter, 34);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocates_as_before_without_locality_labels_or_blocks() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let mut dictionaries = Vec::new();
+        for (labels, block) in [(&[][..], 0), (&[][..], 256), (&["cluster"][..], 0)] {
+            let db = LogDb::open(Config {
+                stream_id_block_size: block,
+                ..config(labels)
+            })
+            .await
+            .unwrap();
+            let at = DAY + HOUR / 2;
+            write_pods(&db, &namespace, at, &[("b", 0), ("a", 0), ("b", 1)]).await;
+            write_pods(&db, &namespace, at, &[("a", 1), ("c", 0)]).await;
+            write_pods(&db, &namespace, at, &[("b", 2), ("a", 2)]).await;
+            let (ids, counter) = segment_ids_of(&db, &namespace).await;
+            let mut all: Vec<StreamId> = ids.values().flatten().copied().collect();
+            all.sort_unstable();
+            assert_eq!(all, (0..7).collect::<Vec<_>>(), "{labels:?} {block}");
+            assert_eq!(counter, 7);
+            dictionaries.push(ids);
+            db.close().await.unwrap();
+        }
+        assert_eq!(dictionaries[0], dictionaries[1]);
+    }
+
+    fn local_config(
+        directory: &std::path::Path,
+        stream_locality_labels: &[&str],
+        stream_id_block_size: u32,
+    ) -> Config {
+        Config {
+            storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "logs-write-test".to_owned(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: directory.display().to_string(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+                disk: Default::default(),
+            }),
+            stream_id_block_size,
+            ..config(stream_locality_labels)
+        }
+    }
+
+    #[tokio::test]
+    async fn resumes_a_segment_with_partial_blocks_without_reusing_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = Namespace::new("tenant").unwrap();
+        let at = DAY + HOUR / 2;
+        let db = LogDb::open(local_config(directory.path(), &["cluster"], 8))
+            .await
+            .unwrap();
+        write_pods(&db, &namespace, at, &[("a", 0), ("a", 1), ("b", 0)]).await;
+        write_pods(&db, &namespace, at, &[("a", 2)]).await;
+        let (before, counter) = segment_ids_of(&db, &namespace).await;
+        assert_eq!(counter, 17);
+        // A crash loses the blocks, which only the writer's memory holds.
+        drop(db);
+
+        let db = LogDb::open(local_config(directory.path(), &["cluster"], 8))
+            .await
+            .unwrap();
+        write_pods(
+            &db,
+            &namespace,
+            at,
+            &[("a", 0), ("a", 3), ("a", 4), ("b", 1)],
+        )
+        .await;
+        write_pods(&db, &namespace, at, &[("c", 0), ("a", 5)]).await;
+        let (after, counter) = segment_ids_of(&db, &namespace).await;
+        // Existing streams keep their IDs; new ones get blocks past the
+        // counter, as the IDs left in the lost blocks may have been used.
+        assert_eq!(after["a"], vec![0, 1, 2, 17, 18, 19]);
+        assert_eq!(after["b"], vec![8, 25]);
+        assert_eq!(after["c"], vec![33]);
+        assert_eq!(counter, 41);
+        assert!(
+            before
+                .iter()
+                .all(|(cluster, ids)| after[cluster].starts_with(ids))
+        );
+        assert_eq!(rows_of(&db, &namespace, "a").await, 7);
+        assert_eq!(rows_of(&db, &namespace, "b").await, 2);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumes_segments_written_under_another_block_setting() {
+        let namespace = Namespace::new("tenant").unwrap();
+        let at = DAY + HOUR / 2;
+        for (first, second) in [(8, 0), (0, 8)] {
+            let directory = tempfile::tempdir().unwrap();
+            let db = LogDb::open(local_config(directory.path(), &["cluster"], first))
+                .await
+                .unwrap();
+            write_pods(&db, &namespace, at, &[("a", 0), ("b", 0)]).await;
+            write_pods(&db, &namespace, at, &[("a", 1)]).await;
+            let (before, counter) = segment_ids_of(&db, &namespace).await;
+            db.close().await.unwrap();
+
+            // Without blocks, as binaries before them do, the writer resumes
+            // at the counter, past every block; with them, it reserves its
+            // first blocks there.
+            let db = LogDb::open(local_config(directory.path(), &["cluster"], second))
+                .await
+                .unwrap();
+            write_pods(&db, &namespace, at, &[("a", 2), ("b", 1), ("c", 0)]).await;
+            let (after, _) = segment_ids_of(&db, &namespace).await;
+            let reserved = if first == 0 { 3 } else { 17 };
+            assert_eq!(counter, reserved, "{first} -> {second}");
+            let added: Vec<StreamId> = ["a", "b", "c"]
+                .iter()
+                .map(|cluster| *after[*cluster].last().unwrap())
+                .collect();
+            let expected = if second == 0 {
+                vec![reserved, reserved + 1, reserved + 2]
+            } else {
+                vec![reserved, reserved + 8, reserved + 16]
+            };
+            assert_eq!(added, expected, "{first} -> {second}");
+            assert!(
+                before
+                    .iter()
+                    .all(|(cluster, ids)| after[cluster].starts_with(ids))
+            );
+            assert_eq!(rows_of(&db, &namespace, "a").await, 3);
             db.close().await.unwrap();
         }
     }

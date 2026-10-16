@@ -336,19 +336,93 @@ mod tests {
         assert_eq!(prometheus_json_float(f64::NEG_INFINITY), "-Inf");
     }
 
+    /// Exact decimal ties between the two nearest shortest candidates: Go's
+    /// `FormatFloat` (and so Prometheus and Loki) rounds them half to even.
+    #[test]
+    fn should_round_shortest_ties_half_to_even_like_go() {
+        // Integer part plus an exact binary fraction: clippy rejects these
+        // values as literals because their shortest spelling is shorter.
+        let cases = [
+            (-150_477_958_226_304.0, -0.125, "-150477958226304.12"),
+            (150_477_958_226_304.0, 0.125, "150477958226304.12"),
+            (150_477_958_226_304.0, 0.375, "150477958226304.38"),
+            (150_477_958_226_304.0, 0.625, "150477958226304.62"),
+            (-150_477_958_226_304.0, -0.875, "-150477958226304.88"),
+            (2_251_799_813_685_247.0, 0.75, "2251799813685247.8"),
+            (-2_251_799_813_685_246.0, -0.25, "-2251799813685246.2"),
+            (1e15, 0.125, "1000000000000000.1"),
+            (4_503_599_627_370_495.0, 0.5, "4503599627370495.5"),
+        ];
+        for (integer, fraction, expected) in cases {
+            let value: f64 = integer + fraction;
+            assert_eq!(value - integer, fraction, "{expected} is exact");
+            assert_eq!(prometheus_float(value), expected);
+            assert_eq!(prometheus_json_float(value), expected);
+        }
+        let seed = f64::from_bits(14_042_535_333_177_077_764);
+        assert_eq!(seed, -150_477_958_226_304.0 - 0.125);
+        assert_eq!(prometheus_float(seed), "-150477958226304.12");
+        assert_eq!(
+            prometheus_float(9_007_199_254_740_993.0),
+            "9007199254740992"
+        );
+    }
+
+    /// `core`'s `Display` / `LowerExp` spelling of `value` with exact ties
+    /// rounded half to even, as Go does. `core` picks the same shortest digit
+    /// count but breaks a tie between the two nearest candidates upwards,
+    /// while its fixed-precision formatting rounds the exact value half to
+    /// even.
+    fn round_ties_to_even(value: f64, core: String) -> String {
+        let mantissa_end = core.find('e').unwrap_or(core.len());
+        let significant = core[..mantissa_end]
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .map(char::from)
+            .collect::<String>();
+        let significant = significant.trim_matches('0');
+        if significant.is_empty() {
+            return core;
+        }
+        let abs = value.abs();
+        let exact = format!("{abs:.1100e}");
+        let exact = exact[..exact.find('e').unwrap()].replace('.', "");
+        let exact = exact.trim_end_matches('0');
+        let nearest_even = format!("{abs:.*e}", significant.len() - 1);
+        let even = nearest_even[..nearest_even.find('e').unwrap()].replace('.', "");
+        let tie = exact.len() == significant.len() + 1 && exact.ends_with('5');
+        if !tie || even == significant || nearest_even.parse::<f64>() != Ok(abs) {
+            return core;
+        }
+        let last = core[..mantissa_end]
+            .rfind(|c: char| c.is_ascii_digit() && c != '0')
+            .unwrap();
+        let mut rounded = core.into_bytes();
+        rounded[last] -= 1;
+        let rounded = String::from_utf8(rounded).unwrap();
+        let digits = rounded[..mantissa_end].replace(['-', '.'], "");
+        assert_eq!(
+            digits.trim_matches('0'),
+            even,
+            "{value:?} is a tie between adjacent candidates"
+        );
+        rounded
+    }
+
     proptest::proptest! {
         #[test]
-        fn float_text_matches_core_display(bits in proptest::num::u64::ANY) {
+        fn float_text_matches_go_format_float(bits in proptest::num::u64::ANY) {
             let value = f64::from_bits(bits);
             proptest::prop_assume!(value.is_finite());
+            let display = round_ties_to_even(value, value.to_string());
             let text = FloatText::prometheus(value);
-            proptest::prop_assert_eq!(text.as_str(), value.to_string());
+            proptest::prop_assert_eq!(text.as_str(), &display);
             let abs = value.abs();
             let json = FloatText::prometheus_json(value);
             if abs == 0.0 || (1e-6..1e21).contains(&abs) {
-                proptest::prop_assert_eq!(json.as_str(), value.to_string());
+                proptest::prop_assert_eq!(json.as_str(), &display);
             } else {
-                let lower = format!("{value:e}");
+                let lower = round_ties_to_even(value, format!("{value:e}"));
                 let (mantissa, exponent) = lower.split_once('e').unwrap();
                 let (sign, digits) = match exponent.strip_prefix('-') {
                     Some(digits) => ('-', digits),

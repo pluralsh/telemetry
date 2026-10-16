@@ -123,6 +123,19 @@ pub(crate) fn locality_order<'a>(streams: &[&'a Labels], priority: &[String]) ->
     order.into_iter().map(|(_, position)| position).collect()
 }
 
+/// The leading locality label of `labels`: the first `priority` name it
+/// carries, with its value. [`locality_order`] sorts streams by it first,
+/// so streams sharing it are allocated together.
+pub(crate) fn locality_key(labels: &Labels, priority: &[String]) -> Option<Label> {
+    priority.iter().find_map(|name| {
+        labels
+            .0
+            .binary_search_by(|label| label.name.as_str().cmp(name))
+            .ok()
+            .map(|position| labels.0[position].clone())
+    })
+}
+
 /// One structured metadata field attached to a log entry.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Field {

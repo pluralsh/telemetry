@@ -284,6 +284,20 @@ async fn resolve_candidates<R: QueryReader + ?Sized>(
         return Ok(None);
     }
 
+    let resolution = Arc::new(full_resolution(reader, index_cache, bucket, candidates).await?);
+    reader
+        .cache_selector_resolution(&bucket, key, resolution.clone())
+        .await;
+    Ok(resolved_chunk(bucket, resolution, None))
+}
+
+/// The labels of non-empty `candidates` from the forward index.
+async fn full_resolution<R: QueryReader + ?Sized>(
+    reader: &R,
+    index_cache: &IndexCache,
+    bucket: TimeBucket,
+    candidates: Vec<SeriesId>,
+) -> Result<CachedSeriesResolution, QueryError> {
     // One batched forward-index read through the index cache, which the
     // storage reader serves with a key-range scan when the ids are dense.
     let slots = index_cache
@@ -302,15 +316,11 @@ async fn resolve_candidates<R: QueryReader + ?Sized>(
         labels_vec.push(spec.labels.clone());
     }
 
-    let resolution = Arc::new(CachedSeriesResolution {
+    Ok(CachedSeriesResolution {
         series_ids: Arc::from(candidates),
         labels: Arc::from(labels_vec),
         fingerprints: None,
-    });
-    reader
-        .cache_selector_resolution(&bucket, key, resolution.clone())
-        .await;
-    Ok(resolved_chunk(bucket, resolution, None))
+    })
 }
 
 /// [`resolve_one_bucket`] reading only the `projection` labels, from the
@@ -348,6 +358,22 @@ async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
     if candidates.is_empty() {
         return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
     }
+    if crate::read_tuning::read_tuning().unproject_dense && dense(&candidates) {
+        let full = full_resolution(reader, index_cache, bucket, candidates).await?;
+        let resolution = Arc::new(CachedSeriesResolution {
+            fingerprints: Some(full.labels.iter().map(Labels::series_fingerprint).collect()),
+            labels: full
+                .labels
+                .iter()
+                .map(|labels| labels.project(projection))
+                .collect(),
+            series_ids: full.series_ids,
+        });
+        reader
+            .cache_selector_resolution(&bucket, &projected_key, resolution.clone())
+            .await;
+        return Ok(resolved_chunk(bucket, resolution, Some(&metric_name)));
+    }
     let Some(fingerprints) = stored_fingerprints(reader, &bucket, &candidates).await? else {
         return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
     };
@@ -369,6 +395,20 @@ async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
         .cache_selector_resolution(&bucket, &projected_key, resolution.clone())
         .await;
     Ok(resolved_chunk(bucket, resolution, Some(&metric_name)))
+}
+
+/// A projected resolution reads a postings list per value of each
+/// projected label, however few candidates there are; a full one reads the
+/// candidates' forward-index entries, a few cluster scans once their IDs
+/// span at most this many per candidate.
+const DENSE_MAX_SPAN_PER_CANDIDATE: u64 = 2;
+
+/// Whether `candidates` (ascending) are dense enough to resolve in full.
+fn dense(candidates: &[SeriesId]) -> bool {
+    let (Some(first), Some(last)) = (candidates.first(), candidates.last()) else {
+        return false;
+    };
+    u64::from(last - first) < candidates.len() as u64 * DENSE_MAX_SPAN_PER_CANDIDATE
 }
 
 /// Every candidate's stored fingerprint, or `None` when any is missing

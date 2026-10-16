@@ -595,9 +595,9 @@ mod tests {
         for streams in ids.values_mut() {
             streams.sort_unstable();
         }
-        let first = ids["c0"][0].min(ids["c1"][0]);
-        assert_eq!(ids["c0"], (first..first + 8).collect::<Vec<_>>());
-        assert_eq!(ids["c1"], (first + 8..first + 16).collect::<Vec<_>>());
+        for streams in ids.values() {
+            assert_eq!(*streams, (streams[0]..streams[0] + 8).collect::<Vec<_>>());
+        }
         db.close().await.unwrap();
     }
 
@@ -825,8 +825,26 @@ mod tests {
 
     #[tokio::test]
     async fn finishes_a_rollup_interrupted_under_another_stream_order() {
+        let default = Config::default();
+        let blocks = (default.stream_locality_labels, default.stream_id_block_size);
+        let plain = (blocks.0.clone(), 0);
+        // An older binary, ordering by value counts alone, then the default;
+        // with stream ID blocks, then a binary without them; and back.
+        for (first, second) in [
+            ((Vec::new(), 0), blocks.clone()),
+            (blocks.clone(), plain.clone()),
+            (plain, blocks.clone()),
+        ] {
+            finish_a_rollup_interrupted_under(first, second).await;
+        }
+    }
+
+    async fn finish_a_rollup_interrupted_under(
+        first: (Vec<String>, u32),
+        second: (Vec<String>, u32),
+    ) {
         let directory = tempfile::tempdir().unwrap();
-        let config = |stream_locality_labels: Vec<String>| Config {
+        let config = |(stream_locality_labels, stream_id_block_size): (Vec<String>, u32)| Config {
             storage: StorageConfig::SlateDb(SlateDbStorageConfig {
                 path: "logs-rollup-test".to_owned(),
                 object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
@@ -838,6 +856,7 @@ mod tests {
                 disk: Default::default(),
             }),
             stream_locality_labels,
+            stream_id_block_size,
             ..config()
         };
         // `container` has fewer values than `cluster`, so the two orders
@@ -869,9 +888,9 @@ mod tests {
             ids
         };
 
-        // An older binary, ordering by value counts alone, registered the
-        // day's streams and copied a few hours before it stopped.
-        let db = LogDb::open(config(Vec::new())).await.unwrap();
+        // The first binary registered the day's streams and copied a few
+        // hours before it stopped.
+        let db = LogDb::open(config(first.clone())).await.unwrap();
         db.write(&namespace(), batches).await.unwrap();
         db.flush_memtable().await.unwrap();
         let before = rows(&db).await;
@@ -911,15 +930,29 @@ mod tests {
                 .unwrap();
         }
         db.flush_memtable().await.unwrap();
-        let registered = wide_ids(&db).await;
-        assert_eq!(registered.len(), 12);
+        let mut registered = wide_ids(&db).await;
+        assert_eq!(registered.len(), 12, "{first:?}");
         db.close().await.unwrap();
 
-        // The retry, by a binary with the default order, keeps every
-        // stream's ID and copies each row once.
-        let db = LogDb::open(config(Config::default().stream_locality_labels))
-            .await
-            .unwrap();
+        // The retry, by the second binary, keeps every stream's ID and
+        // copies each row once; a stream new to the day, written to it
+        // before the retry, gets an ID none of them has.
+        let db = LogDb::open(config(second.clone())).await.unwrap();
+        let late = Labels::new(vec![
+            Label::new("env", "prod"),
+            Label::new("cluster", "c1"),
+            Label::new("pod", "late"),
+        ])
+        .unwrap();
+        db.write(
+            &namespace(),
+            vec![LogBatch::new(
+                late.clone(),
+                vec![LogEntry::new(DAY + 2 * HOUR, "late")],
+            )],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             db.rollup_at(&RollupConfig::default(), after_delay())
                 .await
@@ -927,9 +960,18 @@ mod tests {
             1
         );
         assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
-        assert_eq!(wide_ids(&db).await, registered);
-        assert_eq!(rows(&db).await, before);
-        assert_eq!(queried(&db).await, before.len());
+        let mut ids = wide_ids(&db).await;
+        let late_id = ids.remove(&late).unwrap();
+        assert!(
+            registered.values().all(|id| *id < late_id),
+            "{first:?} -> {second:?}"
+        );
+        assert_eq!(ids, registered);
+        registered.insert(late, late_id);
+        let mut rows_after = rows(&db).await;
+        rows_after.retain(|(_, _, line)| line != "late");
+        assert_eq!(rows_after, before);
+        assert_eq!(queried(&db).await, before.len() + 1);
         db.close().await.unwrap();
     }
 

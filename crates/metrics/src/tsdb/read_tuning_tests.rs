@@ -1,12 +1,16 @@
-//! Every read tuning must answer exactly as the defaults do, with or
-//! without label projection, and must fail no query that loading one chunk
-//! at a time would answer within its memory limit.
+//! Every read tuning and write layout must answer exactly as the defaults
+//! do, with or without label projection, and no read tuning may fail a
+//! query that loading one chunk at a time would answer within its memory
+//! limit.
 
 use super::*;
 use crate::model::{MetricType, Sample};
 use crate::promql::memory::MemoryReservation;
 use crate::promql::plan::LoweringContext;
-use crate::read_tuning::{ReadTuning, every_tuning, override_read_tuning};
+use crate::read_tuning::{
+    ReadTuning, WriteLayout, every_layout, every_tuning, override_read_tuning,
+    override_write_layout,
+};
 use crate::storage::in_memory_storage;
 
 const MINUTE_MS: i64 = 60_000;
@@ -123,6 +127,70 @@ async fn run_with(
 ) -> std::result::Result<Answer, QueryError> {
     let _tuning = override_read_tuning(tuning).await;
     run(storage, query, projection, memory).await
+}
+
+/// [`fixture`] written under `layout`, then rolled up into its 4h window
+/// when `rolled`.
+async fn fixture_with(layout: WriteLayout, rolled: bool) -> Arc<Storage> {
+    let _layout = override_write_layout(layout).await;
+    let storage = fixture().await;
+    if rolled {
+        storage.flush_memtable().await.unwrap();
+        let tsdb = Tsdb::with_retention(storage.clone(), None);
+        let config = crate::RollupConfig {
+            copy_buffer_bytes: 64 << 10,
+            ..Default::default()
+        };
+        let sealed = tsdb.rollup(&config, START_MS + 4 * HOUR_MS).await.unwrap();
+        assert_eq!(sealed, 1);
+    }
+    storage
+}
+
+#[tokio::test]
+async fn should_answer_the_same_under_every_write_layout() {
+    let baseline = fixture_with(every_layout()[0], false).await;
+    let mut expected = Vec::new();
+    for query in QUERIES {
+        for projection in [false, true] {
+            let answer = run_with(
+                ReadTuning::DEFAULT,
+                &baseline,
+                query,
+                projection,
+                DEFAULT_MEMORY_CAP_BYTES,
+            )
+            .await
+            .unwrap();
+            expected.push(answer);
+        }
+    }
+    for layout in every_layout() {
+        for rolled in [false, true] {
+            let storage = fixture_with(layout, rolled).await;
+            let mut expected = expected.iter();
+            for query in QUERIES {
+                for projection in [false, true] {
+                    let expected = expected.next().unwrap();
+                    for tuning in [ReadTuning::DEFAULT, every_tuning()[0]] {
+                        let answer = run_with(
+                            tuning,
+                            &storage,
+                            query,
+                            projection,
+                            DEFAULT_MEMORY_CAP_BYTES,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            &answer, expected,
+                            "{query} projection={projection} {layout:?} rolled={rolled} {tuning:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn over_limit(error: &QueryError) -> bool {

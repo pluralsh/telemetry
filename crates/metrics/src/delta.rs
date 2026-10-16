@@ -53,6 +53,20 @@ impl FrozenTsdbDelta {
     }
 }
 
+/// One write through a bucket's coordinator.
+pub(crate) enum TsdbWrite {
+    Samples(Vec<Series>),
+    /// Series registered without their samples, which a rollup copies
+    /// afterwards; their samples and metadata are ignored.
+    Register(Vec<Series>),
+}
+
+impl From<Vec<Series>> for TsdbWrite {
+    fn from(series: Vec<Series>) -> Self {
+        Self::Samples(series)
+    }
+}
+
 /// Delta implementation for the write coordinator.
 ///
 /// Uses the Arc base + HashMap overlay pattern: the base series dictionary
@@ -69,6 +83,9 @@ pub(crate) struct TsdbWriteDelta {
     metadata: HashMap<String, MetricMetadata>,
     /// Samples keyed by series_id, with metric name for key encoding.
     samples: HashMap<SeriesId, SeriesSamples>,
+    /// The first ID this delta allocated: its new series hold
+    /// `first_series_id..next_series_id`.
+    first_series_id: u32,
     next_series_id: u32,
     active_series: Arc<ActiveSeriesTracker>,
 }
@@ -111,7 +128,22 @@ impl TsdbWriteDelta {
         if samples.is_empty() && histograms.is_empty() {
             return Ok(());
         }
-        let id = self.resolve_series(&labels, fingerprint, &unit, metric_type, &description)?;
+        if let Some(metric_name) = labels
+            .iter()
+            .find(|label| label.name == "__name__")
+            .map(|label| label.value.clone())
+        {
+            self.metadata.insert(
+                metric_name.clone(),
+                MetricMetadata {
+                    metric_name,
+                    metric_type,
+                    description,
+                    unit: unit.clone(),
+                },
+            );
+        }
+        let id = self.resolve_series(&labels, fingerprint, &unit, metric_type)?;
         let entry = self.samples.entry(id).or_insert_with(|| SeriesSamples {
             metric_name: labels
                 .iter()
@@ -126,6 +158,16 @@ impl TsdbWriteDelta {
         Ok(())
     }
 
+    /// Registers `series` without its samples: they arrive later through
+    /// [`Self::ingest`], which also records the metric's metadata.
+    fn register(&mut self, series: Series) -> Result<()> {
+        let mut labels = series.labels;
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
+        let fingerprint = labels.fingerprint();
+        self.resolve_series(&labels, fingerprint, &series.unit, series.metric_type)?;
+        Ok(())
+    }
+
     /// Looks up the series ID, registering the series and its indexes if new.
     fn resolve_series(
         &mut self,
@@ -133,23 +175,7 @@ impl TsdbWriteDelta {
         fingerprint: SeriesFingerprint,
         unit: &Option<String>,
         metric_type: Option<MetricType>,
-        description: &Option<String>,
     ) -> Result<SeriesId> {
-        if let Some(metric_name) = labels
-            .iter()
-            .find(|label| label.name == "__name__")
-            .map(|label| label.value.clone())
-        {
-            self.metadata.insert(
-                metric_name.clone(),
-                MetricMetadata {
-                    metric_name,
-                    metric_type,
-                    description: description.clone(),
-                    unit: unit.clone(),
-                },
-            );
-        }
         if let Some(&id) = self
             .series_dict_delta
             .get(&fingerprint)
@@ -182,11 +208,62 @@ impl TsdbWriteDelta {
 
         Ok(id)
     }
+
+    /// Renumbers this delta's new series within the IDs they hold, in
+    /// (metric, labels) order, so a metric's records are contiguous rather
+    /// than interleaved in arrival order. Nothing outside the delta has seen
+    /// these IDs, and they reach storage in one batch once frozen, so IDs
+    /// stay dense and become visible in order.
+    fn sort_new_series(&mut self) {
+        let first = self.first_series_id;
+        let count = (self.next_series_id - first) as usize;
+        if count < 2 || self.forward_index.series.len() != count {
+            return;
+        }
+        let mut order: Vec<(SeriesId, Labels)> = self
+            .forward_index
+            .series
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().labels.clone()))
+            .collect();
+        order.sort_unstable_by(|(_, a), (_, b)| {
+            a.metric_name()
+                .cmp(b.metric_name())
+                .then_with(|| a.as_slice().cmp(b.as_slice()))
+        });
+        let mut renumbered = vec![0; count];
+        for (rank, (id, _)) in (first..).zip(&order) {
+            renumbered[(id - first) as usize] = rank;
+        }
+        if renumbered.iter().copied().eq(first..self.next_series_id) {
+            return;
+        }
+        let renumber = |id: SeriesId| {
+            id.checked_sub(first)
+                .and_then(|offset| renumbered.get(offset as usize))
+                .copied()
+                .unwrap_or(id)
+        };
+        for (id, spec) in std::mem::take(&mut self.forward_index.series) {
+            self.forward_index.series.insert(renumber(id), spec);
+        }
+        for mut postings in self.inverted_index.postings.iter_mut() {
+            let ids: roaring::RoaringBitmap = postings.value().iter().map(renumber).collect();
+            *postings.value_mut() = ids;
+        }
+        self.samples = std::mem::take(&mut self.samples)
+            .into_iter()
+            .map(|(id, samples)| (renumber(id), samples))
+            .collect();
+        for id in self.series_dict_delta.values_mut() {
+            *id = renumber(*id);
+        }
+    }
 }
 
 impl Delta for TsdbWriteDelta {
     type Context = TsdbContext;
-    type Write = Vec<Series>;
+    type Write = TsdbWrite;
     type Frozen = FrozenTsdbDelta;
     type FrozenView = ();
     type ApplyResult = ();
@@ -208,16 +285,22 @@ impl Delta for TsdbWriteDelta {
             inverted_index: InvertedIndex::default(),
             metadata: HashMap::new(),
             samples: HashMap::new(),
+            first_series_id: context.next_series_id,
             next_series_id: context.next_series_id,
             active_series: context.active_series,
         }
     }
 
     fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
-        for series in write {
-            self.ingest(series).map_err(|error| error.to_string())?;
+        match write {
+            TsdbWrite::Samples(series) => series
+                .into_iter()
+                .try_for_each(|series| self.ingest(series)),
+            TsdbWrite::Register(series) => series
+                .into_iter()
+                .try_for_each(|series| self.register(series)),
         }
-        Ok(())
+        .map_err(|error| error.to_string())
     }
 
     fn estimate_size(&self) -> usize {
@@ -241,7 +324,10 @@ impl Delta for TsdbWriteDelta {
             + self.inverted_index.postings.len() * 64
     }
 
-    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+    fn freeze(mut self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        if crate::read_tuning::write_layout().sorted_series_ids {
+            self.sort_new_series();
+        }
         // Merge base + delta into new Arc for the next context
         let merged_dict = if self.series_dict_delta.is_empty() {
             // O(1) when no new series
@@ -319,7 +405,7 @@ mod tests {
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1);
@@ -335,22 +421,88 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
 
         delta
-            .apply(vec![
-                create_test_series("a", vec![("env", "prod")], create_test_sample()),
-                create_test_series(
-                    "b",
-                    vec![("env", "prod")],
-                    Sample {
-                        timestamp_ms: 60_000_002,
-                        value: 1.0,
-                    },
-                ),
-            ])
+            .apply(
+                vec![
+                    create_test_series("a", vec![("env", "prod")], create_test_sample()),
+                    create_test_series(
+                        "b",
+                        vec![("env", "prod")],
+                        Sample {
+                            timestamp_ms: 60_000_002,
+                            value: 1.0,
+                        },
+                    ),
+                ]
+                .into(),
+            )
             .unwrap();
 
         assert!(delta.samples.contains_key(&17));
         assert!(delta.samples.contains_key(&18));
         assert_eq!(delta.next_series_id, 19);
+    }
+
+    #[tokio::test]
+    async fn should_number_a_flushs_new_series_by_metric_then_labels() {
+        // given: a known series, then two metrics' series arriving interleaved
+        let _layout = crate::read_tuning::override_write_layout(crate::read_tuning::WriteLayout {
+            sorted_series_ids: true,
+            rollup_presort: false,
+        })
+        .await;
+        let mut base = HashMap::new();
+        base.insert(7u128, 0u32);
+        let ctx = TsdbContext {
+            series_dict: Arc::new(base),
+            next_series_id: 1,
+            ..create_test_context()
+        };
+        let mut delta = TsdbWriteDelta::init(ctx);
+        let arrivals = [("b", "2"), ("a", "2"), ("b", "1"), ("a", "1")];
+        for (at, (name, host)) in arrivals.into_iter().enumerate() {
+            let sample = Sample {
+                timestamp_ms: 60_000_001,
+                value: at as f64,
+            };
+            let series = create_test_series(name, vec![("host", host)], sample);
+            delta.apply(vec![series].into()).unwrap();
+        }
+
+        // when
+        let (frozen, _, context) = delta.freeze();
+
+        // then: a{1}, a{2}, b{1}, b{2} hold 1..5, and every per-series
+        // structure follows the new numbering
+        let fingerprint = |name: &str, host: &str| {
+            let mut labels = vec![Label::new("__name__", name), Label::new("host", host)];
+            labels.sort_by(|a, b| a.name.cmp(&b.name));
+            labels.fingerprint()
+        };
+        let sorted = [
+            ("a", "1", 3.0),
+            ("a", "2", 1.0),
+            ("b", "1", 2.0),
+            ("b", "2", 0.0),
+        ];
+        for ((name, host, value), id) in sorted.into_iter().zip(1u32..) {
+            let fingerprint = fingerprint(name, host);
+            assert_eq!(frozen.series_dict_delta[&fingerprint], id);
+            assert_eq!(context.series_dict[&fingerprint], id);
+            let spec = frozen.forward_index.series.get(&id).unwrap();
+            assert_eq!(spec.labels.metric_name(), name);
+            assert_eq!(spec.labels.get("host"), Some(host));
+            assert_eq!(frozen.samples[&id].points[0].value, value);
+            assert!(
+                frozen
+                    .inverted_index
+                    .postings
+                    .get(&Label::new("host", host))
+                    .unwrap()
+                    .contains(id)
+            );
+        }
+        assert_eq!(context.series_dict[&7], 0);
+        assert_eq!(context.next_series_id, 5);
     }
 
     #[test]
@@ -370,8 +522,8 @@ mod tests {
         let series2 = create_test_series("http_requests", vec![("env", "prod")], sample2);
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1].into()).unwrap();
+        delta.apply(vec![series2].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1); // Only one series created
@@ -388,7 +540,7 @@ mod tests {
         let joined = create_test_series("m", vec![("a", "1b2")], create_test_sample());
 
         // when
-        delta.apply(vec![split, joined]).unwrap();
+        delta.apply(vec![split, joined].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 2);
@@ -402,7 +554,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // when: freeze and create new delta
         let (frozen, _, new_ctx) = delta.freeze();
@@ -414,7 +566,7 @@ mod tests {
             value: 99.0,
         };
         let series2 = create_test_series("http_requests", vec![("env", "prod")], sample2);
-        delta2.apply(vec![series2]).unwrap();
+        delta2.apply(vec![series2].into()).unwrap();
 
         // then: should reuse series_id from frozen context
         assert_eq!(delta2.next_series_id, 1); // No new ID allocated
@@ -438,7 +590,7 @@ mod tests {
         let series = create_test_series("http_requests", vec![("env", "prod")], bad_sample);
 
         // when
-        let result = delta.apply(vec![series]);
+        let result = delta.apply(vec![series].into());
 
         // then
         assert!(result.is_err());
@@ -458,7 +610,7 @@ mod tests {
                 value: i as f64,
             };
             let series = create_test_series("metric", vec![("k", "v")], sample);
-            delta.apply(vec![series]).unwrap();
+            delta.apply(vec![series].into()).unwrap();
         }
 
         // then
@@ -505,8 +657,8 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1].into()).unwrap();
+        delta.apply(vec![series2].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 2);
@@ -536,8 +688,8 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series1]).unwrap();
-        delta.apply(vec![series2]).unwrap();
+        delta.apply(vec![series1].into()).unwrap();
+        delta.apply(vec![series2].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1); // Same series_id reused
@@ -562,7 +714,7 @@ mod tests {
         });
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then
         let series_spec = delta.forward_index.series.get(&0).unwrap();
@@ -591,7 +743,7 @@ mod tests {
         );
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then: __name__ label + 3 explicit labels = 4
         assert_eq!(delta.inverted_index.postings.len(), 4);
@@ -615,7 +767,7 @@ mod tests {
         let series = create_test_series("metric", vec![], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 1);
@@ -639,7 +791,7 @@ mod tests {
         series.metric_type = Some(MetricType::Gauge);
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then
         let series_spec = delta.forward_index.series.get(&0).unwrap();
@@ -671,7 +823,7 @@ mod tests {
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
 
         // when
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
 
         // then
         assert_eq!(delta.next_series_id, 4138); // No new ID allocated

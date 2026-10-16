@@ -122,10 +122,12 @@ impl AppState {
                     metrics_config,
                     options,
                     reader_shards,
-                    slatedb::config::DbReaderOptions {
-                        skip_wal_replay: false,
-                        ..slatedb::config::DbReaderOptions::default()
-                    },
+                    config
+                        .reader_disk_cache
+                        .apply(slatedb::config::DbReaderOptions {
+                            skip_wal_replay: false,
+                            ..slatedb::config::DbReaderOptions::default()
+                        }),
                     config.reader_cache_capacity,
                 )
                 .await?,

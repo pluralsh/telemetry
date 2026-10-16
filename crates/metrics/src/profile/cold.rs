@@ -6,7 +6,10 @@
 //! once and reused. `PROFILE_LATENCY_MS` (comma-separated, default `20`),
 //! `PROFILE_RUNS` (default 5), `PROFILE_QUERIES` (indexes into [`QUERIES`]),
 //! `PROFILE_PROJECTION` (`on`, `off` or `both`) and `PROFILE_WARM` pick the
-//! runs; `PROFILE_OUT` receives one JSON line per run.
+//! runs; `PROFILE_OUT` receives one JSON line per run. `PROFILE_LAYOUT`
+//! (see [`write_layout`]) picks how a new store is written, and
+//! `PROFILE_VARIANTS` read tunings and reader starts (see [`tuning`] and
+//! [`Start`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -25,7 +28,7 @@ use sharding::{ShardId, ShardingOptions};
 use slatedb::object_store::{self, ObjectStore, path::Path as ObjectPath};
 
 use crate::model::{Label, Sample, Series, TimeBucket};
-use crate::read_tuning::ReadTuning;
+use crate::read_tuning::{ReadTuning, WriteLayout};
 use crate::sharded::ShardedMetrics;
 use crate::storage::StorageReader;
 use crate::{Config, Namespace, RangeSample, TimeSeriesDb, Visibility};
@@ -311,6 +314,26 @@ struct Meta {
     end_ms: i64,
     namespaces: usize,
     ingest_ms: f64,
+    /// The [`write_layout`] switches the store was written with.
+    #[serde(default)]
+    layout: String,
+}
+
+/// `arrival`, `sorted` (series IDs only) or `default` for
+/// [`WriteLayout::DEFAULT`].
+fn write_layout(name: &str) -> WriteLayout {
+    match name {
+        "arrival" => WriteLayout {
+            sorted_series_ids: false,
+            rollup_presort: false,
+        },
+        "sorted" => WriteLayout {
+            sorted_series_ids: true,
+            rollup_presort: false,
+        },
+        "default" => WriteLayout::DEFAULT,
+        other => panic!("unknown layout {other}"),
+    }
 }
 
 fn storage_config(dir: &Path, path: String) -> SlateDbStorageConfig {
@@ -343,7 +366,8 @@ fn default_end_ms() -> i64 {
 /// Ingests 25 hours ending at `end_ms` through the write path, flushing
 /// each simulated minute and rolling up each simulated hour as the
 /// production rollup task would at that time.
-async fn ingest(dir: &Path, end_ms: i64, namespaces: usize) {
+async fn ingest(dir: &Path, end_ms: i64, namespaces: usize, layout: String) {
+    let _layout = crate::read_tuning::override_write_layout(write_layout(&layout)).await;
     let shard_path = ShardingOptions::shard_path(BASE_PATH, ShardId::new(0));
     let config = Config {
         storage: storage_config(dir, shard_path),
@@ -432,6 +456,7 @@ async fn ingest(dir: &Path, end_ms: i64, namespaces: usize) {
         end_ms,
         namespaces,
         ingest_ms: ms(started.elapsed()),
+        layout,
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
 }
@@ -557,6 +582,23 @@ impl ObjectStore for SlowStore {
 /// A reader process with empty caches whose object store sleeps `latency`
 /// per read, wrapped the way production wraps S3.
 async fn cold_reader(dir: &Path, latency: Duration, result_cache: bool) -> ShardedMetrics {
+    reader(dir, latency, result_cache, None).await
+}
+
+/// A [`cold_reader`] whose SST reads go through SlateDB's on-disk object
+/// store cache at `disk_cache`, kept across readers as a persistent volume
+/// keeps it across restarts.
+async fn reader(
+    dir: &Path,
+    latency: Duration,
+    result_cache: bool,
+    disk_cache: Option<&Path>,
+) -> ShardedMetrics {
+    let mut options = slatedb::config::DbReaderOptions::default();
+    options.object_store_cache_options.root_folder = disk_cache.map(Path::to_path_buf);
+    if let Some(part) = env("PROFILE_DISK_PART_BYTES") {
+        options.object_store_cache_options.part_size_bytes = part;
+    }
     let mut config = Config {
         storage: storage_config(dir, BASE_PATH.to_string()),
         ..Default::default()
@@ -571,7 +613,7 @@ async fn cold_reader(dir: &Path, latency: Duration, result_cache: bool) -> Shard
         config,
         ShardingOptions::new(1, sharding::DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
         [ShardId::new(0)],
-        slatedb::config::DbReaderOptions::default(),
+        options,
         READER_CACHE_CAPACITY,
         Some(store),
     )
@@ -636,10 +678,44 @@ fn bucket_name(bucket: TimeBucket) -> String {
 
 // ── Runs ─────────────────────────────────────────────────────────────
 
-/// A `+`-joined set of switches over the all-off baseline (`base`), or
-/// `default` for [`ReadTuning::DEFAULT`].
+/// How a cold run's reader starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// With empty caches.
+    Cold,
+    /// After warming the filters and indexes of the queried day in
+    /// process, as the cache warmer's metadata-only pass does.
+    MetaWarm,
+    /// Over a disk cache a previous reader's metadata warm filled.
+    DiskMeta,
+    /// Over a disk cache a previous reader running the same query filled.
+    DiskWarm,
+}
+
+fn start_switch(switch: &str) -> Option<Start> {
+    match switch {
+        "metawarm" => Some(Start::MetaWarm),
+        "diskmeta" => Some(Start::DiskMeta),
+        "diskwarm" => Some(Start::DiskWarm),
+        _ => None,
+    }
+}
+
+fn start(variant: &str) -> Start {
+    variant
+        .split('+')
+        .find_map(start_switch)
+        .unwrap_or(Start::Cold)
+}
+
+/// A `+`-joined set of switches over the all-off baseline (`base`) or
+/// [`ReadTuning::DEFAULT`] (`default`), plus at most one [`Start`].
 fn tuning(variant: &str) -> ReadTuning {
-    if variant == "default" {
+    let switches: Vec<&str> = variant
+        .split('+')
+        .filter(|switch| start_switch(switch).is_none())
+        .collect();
+    if switches == ["default"] {
         return ReadTuning::DEFAULT;
     }
     let mut tuning = ReadTuning {
@@ -647,11 +723,13 @@ fn tuning(variant: &str) -> ReadTuning {
         point_get_concurrency: 64,
         chunk_prefetch: 0,
         scan_watermark: false,
+        unproject_dense: false,
     };
-    for switch in variant.split('+').filter(|switch| *switch != "base") {
+    for switch in switches.into_iter().filter(|switch| *switch != "base") {
         match switch {
             "clusters" => tuning.cluster_scans = true,
             "watermark" => tuning.scan_watermark = true,
+            "dense" => tuning.unproject_dense = true,
             concurrency if concurrency.starts_with("conc") => {
                 tuning.point_get_concurrency = concurrency["conc".len()..].parse().unwrap();
             }
@@ -664,6 +742,67 @@ fn tuning(variant: &str) -> ReadTuning {
     tuning
 }
 
+fn day_range(end_ms: i64) -> std::ops::RangeInclusive<std::time::SystemTime> {
+    let end = UNIX_EPOCH + Duration::from_millis(end_ms as u64);
+    end - Duration::from_millis(DAY_MS as u64)..=end
+}
+
+/// Warms the filters and indexes of every bucket from an hour before the
+/// queried day to now.
+async fn warm_metadata(db: &ShardedMetrics, end_ms: i64) {
+    let since = common::time::now_ms() - (end_ms - DAY_MS - HOUR_MS);
+    db.warm_recent(
+        &[namespace()],
+        Duration::from_millis(since as u64),
+        false,
+        16,
+        &tokio_util::sync::CancellationToken::new(),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// A reader started as `start` says, and the milliseconds its warming took
+/// (in a previous reader, for the disk starts).
+async fn started_reader(
+    dir: &Path,
+    latency: Duration,
+    start: Start,
+    text: &str,
+    end_ms: i64,
+    projection: bool,
+) -> (ShardedMetrics, f64) {
+    let disk_cache = dir.with_extension("diskcache");
+    let started = Instant::now();
+    match start {
+        Start::Cold => (cold_reader(dir, latency, true).await, 0.0),
+        Start::MetaWarm => {
+            let db = cold_reader(dir, latency, true).await;
+            warm_metadata(&db, end_ms).await;
+            (db, ms(started.elapsed()))
+        }
+        Start::DiskMeta | Start::DiskWarm => {
+            let _ = std::fs::remove_dir_all(&disk_cache);
+            std::fs::create_dir_all(&disk_cache).unwrap();
+            let previous = reader(dir, latency, false, Some(&disk_cache))
+                .await
+                .with_label_projection(projection);
+            if start == Start::DiskMeta {
+                warm_metadata(&previous, end_ms).await;
+            } else {
+                previous
+                    .query_range_with_trace(&namespace(), text, day_range(end_ms), STEP, false)
+                    .await
+                    .unwrap();
+            }
+            previous.close().await.unwrap();
+            let warm_ms = ms(started.elapsed());
+            (reader(dir, latency, true, Some(&disk_cache)).await, warm_ms)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct Run {
     variant: String,
@@ -672,6 +811,8 @@ struct Run {
     latency_ms: u64,
     cold: bool,
     total_ms: f64,
+    /// Spent warming before the query, outside `total_ms`.
+    warm_ms: f64,
     reader_setup_ms: f64,
     build_physical_ms: f64,
     execute_ms: f64,
@@ -727,8 +868,7 @@ async fn run_once(
     cold: bool,
     ssts: &HashMap<String, (TimeBucket, bool)>,
 ) -> Run {
-    let end = UNIX_EPOCH + Duration::from_millis(end_ms as u64);
-    let range = end - Duration::from_millis(DAY_MS as u64)..=end;
+    let range = day_range(end_ms);
     start_recording();
     let started = Instant::now();
     let (result, trace) = db
@@ -830,6 +970,7 @@ async fn run_once(
         latency_ms,
         cold,
         total_ms: ms(total),
+        warm_ms: 0.0,
         reader_setup_ms: phase("reader_setup"),
         build_physical_ms: phase("build_physical"),
         execute_ms: execute,
@@ -894,12 +1035,13 @@ fn stats(values: impl IntoIterator<Item = f64>) -> String {
 fn summarize(runs: &[Run]) {
     let first = &runs[0];
     eprintln!(
-        "{:<8} proj={:<5} lat={:>2}ms {}: total {} | setup {} plan {} exec {} | gets {} (plan {}, exec {}, peak {}) {:.1} MB | {} series {} samples",
+        "{:<8} proj={:<5} lat={:>2}ms {}: total {} | prewarm {} setup {} plan {} exec {} | gets {} (plan {}, exec {}, peak {}) {:.1} MB | {} series {} samples",
         first.query,
         first.projection,
         first.latency_ms,
         if first.cold { "cold" } else { "warm" },
         stats(runs.iter().map(|run| run.total_ms)),
+        stats(runs.iter().map(|run| run.warm_ms)),
         stats(runs.iter().map(|run| run.reader_setup_ms)),
         stats(runs.iter().map(|run| run.build_physical_ms)),
         stats(runs.iter().map(|run| run.execute_ms)),
@@ -942,13 +1084,15 @@ async fn profile_cold_queries() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let namespaces = env("PROFILE_NAMESPACES").unwrap_or(40);
-        ingest(&dir, default_end_ms(), namespaces).await;
+        let layout = std::env::var("PROFILE_LAYOUT").unwrap_or("default".to_string());
+        ingest(&dir, default_end_ms(), namespaces, layout).await;
     }
     let meta: Meta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     eprintln!(
-        "store {} ({} namespaces, ingested in {:.0}s)",
+        "store {} ({} namespaces, {} layout, ingested in {:.0}s)",
         dir.display(),
         meta.namespaces,
+        meta.layout,
         meta.ingest_ms / 1000.0
     );
     if std::env::var("PROFILE_INGEST_ONLY").is_ok() {
@@ -1003,10 +1147,17 @@ async fn profile_cold_queries() {
             for &projection in projections {
                 let mut cold = Vec::new();
                 for _ in 0..runs {
-                    let db = cold_reader(&dir, latency, true)
-                        .await
-                        .with_label_projection(projection);
-                    let run = run_once(
+                    let (db, warm_ms) = started_reader(
+                        &dir,
+                        latency,
+                        start(variant),
+                        text,
+                        meta.end_ms,
+                        projection,
+                    )
+                    .await;
+                    let db = db.with_label_projection(projection);
+                    let mut run = run_once(
                         &db,
                         name,
                         text,
@@ -1017,6 +1168,7 @@ async fn profile_cold_queries() {
                         &ssts,
                     )
                     .await;
+                    run.warm_ms = warm_ms;
                     db.close().await.unwrap();
                     cold.push(run);
                 }
@@ -1088,4 +1240,5 @@ async fn profile_cold_queries() {
             }
         }
     }
+    let _ = std::fs::remove_dir_all(dir.with_extension("diskcache"));
 }

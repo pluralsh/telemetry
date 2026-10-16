@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fs, net::SocketAddr, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use common::{CacheWarmerConfig, storage::config::SlateDbStorageConfig};
 use serde::{Deserialize, Serialize};
@@ -174,6 +179,32 @@ impl RollupConfig {
     }
 }
 
+/// SlateDB's on-disk cache of what reader shards read from the object
+/// store, a directory per shard under `path`. Off unless `path` is set; on
+/// a volume that outlives restarts, a restarted reader skips the reads that
+/// filled it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReaderDiskCacheConfig {
+    pub path: Option<PathBuf>,
+    /// SlateDB's default (16 GiB) when unset.
+    pub max_bytes_per_shard: Option<usize>,
+}
+
+impl ReaderDiskCacheConfig {
+    pub fn apply(
+        &self,
+        mut options: slatedb::config::DbReaderOptions,
+    ) -> slatedb::config::DbReaderOptions {
+        let cache = &mut options.object_store_cache_options;
+        cache.root_folder = self.path.clone();
+        if let Some(max_bytes) = self.max_bytes_per_shard {
+            cache.max_cache_size_bytes = Some(max_bytes);
+        }
+        options
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -186,6 +217,7 @@ pub struct Config {
     /// default, `null` keeps data forever.
     pub retention_seconds: Option<u64>,
     pub reader_cache_capacity: u64,
+    pub reader_disk_cache: ReaderDiskCacheConfig,
     /// Byte budget of each namespace's selector-matcher cache, per shard.
     pub matcher_cache_capacity_bytes: u64,
     /// Byte budget for forward-index entries and resolved selectors, per shard.
@@ -211,6 +243,7 @@ impl Default for Config {
             storage: SlateDbStorageConfig::default(),
             retention_seconds: Some(plural_metrics::DEFAULT_RETENTION.as_secs()),
             reader_cache_capacity: 256 * 1024 * 1024,
+            reader_disk_cache: ReaderDiskCacheConfig::default(),
             matcher_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
                 .matcher_capacity_bytes,
             forward_index_cache_capacity_bytes: plural_metrics::QueryCacheConfig::default()
@@ -399,6 +432,26 @@ auth:
         token: { source: literal, value: stale-token }
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn reader_disk_cache_is_off_unless_a_path_is_set() {
+        let defaults = slatedb::config::ObjectStoreCacheOptions::default();
+        let omitted: Config = serde_yaml::from_str("{}").unwrap();
+        let options = omitted.reader_disk_cache.apply(Default::default());
+        assert_eq!(options.object_store_cache_options.root_folder, None);
+
+        let set: Config = serde_yaml::from_str(
+            "reader_disk_cache:\n  path: /var/cache/metrics\n  max_bytes_per_shard: 1073741824\n",
+        )
+        .unwrap();
+        let cache = set
+            .reader_disk_cache
+            .apply(Default::default())
+            .object_store_cache_options;
+        assert_eq!(cache.root_folder, Some(PathBuf::from("/var/cache/metrics")));
+        assert_eq!(cache.max_cache_size_bytes, Some(1 << 30));
+        assert_eq!(cache.part_size_bytes, defaults.part_size_bytes);
     }
 
     #[test]

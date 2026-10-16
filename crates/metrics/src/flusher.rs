@@ -397,7 +397,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
         let (frozen, _, _) = delta.freeze();
 
         // when
@@ -434,7 +434,7 @@ mod tests {
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
         series.description = Some("HTTP requests".to_owned());
         series.unit = Some("requests".to_owned());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
         let (frozen, _, _) = delta.freeze();
 
         flusher.flush_delta(frozen, &(1..2)).await.unwrap();
@@ -513,7 +513,7 @@ mod tests {
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
             create_test_series("http_requests", vec![("env", "prod")], create_test_sample());
-        delta.apply(vec![series]).unwrap();
+        delta.apply(vec![series].into()).unwrap();
         let (frozen, _, _) = delta.freeze();
         frozen
     }
@@ -683,11 +683,14 @@ mod tests {
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         delta
-            .apply(vec![create_test_series(
-                "m",
-                vec![("env", "prod")],
-                create_test_sample(),
-            )])
+            .apply(
+                vec![create_test_series(
+                    "m",
+                    vec![("env", "prod")],
+                    create_test_sample(),
+                )]
+                .into(),
+            )
             .unwrap();
         let (frozen, _, _) = delta.freeze();
 
@@ -725,14 +728,17 @@ mod tests {
             };
             let mut delta = TsdbWriteDelta::init(ctx);
             delta
-                .apply(vec![create_test_series(
-                    name,
-                    vec![("env", "prod")],
-                    Sample {
-                        timestamp_ms: 60_000_000 + i as i64,
-                        value: i as f64,
-                    },
-                )])
+                .apply(
+                    vec![create_test_series(
+                        name,
+                        vec![("env", "prod")],
+                        Sample {
+                            timestamp_ms: 60_000_000 + i as i64,
+                            value: i as f64,
+                        },
+                    )]
+                    .into(),
+                )
                 .unwrap();
             let (frozen, _, _) = delta.freeze();
 
@@ -777,7 +783,7 @@ mod tests {
                 value: 99.0,
             },
         );
-        delta.apply(vec![series1, series2]).unwrap();
+        delta.apply(vec![series1, series2].into()).unwrap();
         let (frozen, _, _) = delta.freeze();
 
         // when

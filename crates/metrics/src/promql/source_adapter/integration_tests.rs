@@ -697,6 +697,7 @@ async fn should_match_regex_or_group() {
 async fn should_resolve_projections_from_the_index_only_where_fingerprints_are_stored() {
     // given: two buckets of one metric, one series lacking `env`, and the
     // older bucket written before fingerprints were stored
+    let _tuning = crate::read_tuning::override_index_projection().await;
     let mut b = MockMultiBucketQueryReaderBuilder::new();
     for bucket in [h0(), h60()] {
         let at = bucket.start_ms() + 1_000;

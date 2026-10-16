@@ -167,6 +167,12 @@ pub struct Config {
     /// cluster and namespace labels by default, `[]` to group by value
     /// counts alone.
     pub stream_locality_labels: Vec<String>,
+    /// Stream IDs reserved at once, at least, for the new streams of a
+    /// segment sharing their first `stream_locality_labels` label, so they
+    /// stay in one ID range however late in the segment they appear; `0`
+    /// gives every stream the next unreserved ID. Binaries before this
+    /// option reject configs that set it.
+    pub stream_id_block_size: u32,
     /// How long data is kept, counted from ingestion; 14 days by default,
     /// `null` keeps it forever.
     pub retention_seconds: Option<u64>,
@@ -201,6 +207,7 @@ impl Default for Config {
             segment_duration_seconds: core.segment_duration.as_secs(),
             discovery_rollup_seconds: core.discovery_rollup.map(|value| value.as_secs()),
             stream_locality_labels: core.stream_locality_labels,
+            stream_id_block_size: core.stream_id_block_size,
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
@@ -348,6 +355,7 @@ impl Config {
             segment_duration: Duration::from_secs(self.segment_duration_seconds),
             discovery_rollup: self.discovery_rollup_seconds.map(Duration::from_secs),
             stream_locality_labels: self.stream_locality_labels.clone(),
+            stream_id_block_size: self.stream_id_block_size,
             retention: self.retention_seconds.map(Duration::from_secs),
             page: plural_logs::PageConfig {
                 target_size_bytes: self.page.target_size_bytes,

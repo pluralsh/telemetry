@@ -26,6 +26,7 @@ fn test_config() -> Config {
         segment_duration: Duration::from_secs(10),
         discovery_rollup: Some(Duration::from_secs(20)),
         stream_locality_labels: Vec::new(),
+        stream_id_block_size: 0,
         retention: Some(Duration::from_secs(60)),
         page: PageConfig {
             target_size_bytes: 64,
@@ -1447,11 +1448,45 @@ async fn span_scans_skip_wide_gaps_between_dense_groups() {
     db.close().await.unwrap();
 }
 
+/// [`test_config`] and, apart from it, with each environment's streams
+/// given IDs from reserved blocks.
+fn id_block_configs() -> [Config; 2] {
+    [
+        test_config(),
+        Config {
+            stream_locality_labels: vec!["environment".to_owned()],
+            stream_id_block_size: 64,
+            ..test_config()
+        },
+    ]
+}
+
 #[tokio::test]
 async fn span_scans_and_point_reads_select_the_same_rows() {
-    let mut db = LogDb::open(test_config()).await.unwrap();
+    let mut by_config = Vec::new();
+    for config in id_block_configs() {
+        by_config.push(span_and_point_rows(config).await);
+    }
+    assert_eq!(by_config[0], by_config[1]);
+}
+
+/// Rows each selector reads from forty streams, by span scans and point
+/// reads alike.
+async fn span_and_point_rows(config: Config) -> Vec<Vec<(i64, String, Arc<Labels>)>> {
+    let mut db = LogDb::open(config).await.unwrap();
     let namespace = Namespace::default();
     write_forty_streams(&db, &namespace).await;
+    // Streams first seen in a later flush.
+    db.flush_memtable().await.unwrap();
+    db.write(
+        &namespace,
+        vec![
+            LogBatch::new(labels("s40", "staging"), vec![LogEntry::new(1_040, "l")]),
+            LogBatch::new(labels("s41", "prod"), vec![LogEntry::new(1_041, "l")]),
+        ],
+    )
+    .await
+    .unwrap();
     let selectors = [
         vec![],
         vec![Label::new("environment", "prod")],
@@ -1466,6 +1501,7 @@ async fn span_scans_and_point_reads_select_the_same_rows() {
             Label::new("environment", "staging"),
         ],
     ];
+    let mut selected = Vec::new();
     for matchers in &selectors {
         let mut by_path = Vec::new();
         for min_streams in [usize::MAX, 1] {
@@ -1479,6 +1515,70 @@ async fn span_scans_and_point_reads_select_the_same_rows() {
         }
         assert!(!by_path[0].is_empty() || matchers.len() == 2);
         assert_eq!(by_path[0], by_path[1], "{matchers:?}");
+        selected.push(by_path.swap_remove(0));
+    }
+    db.close().await.unwrap();
+    selected
+}
+
+/// A stream added inside its environment's reserved ID block still moves
+/// the segment's stream counter, so discovery cached before it sees it.
+#[tokio::test]
+async fn discovery_sees_streams_added_inside_a_reserved_block() {
+    let [_, config] = id_block_configs();
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::default();
+    write_forty_streams(&db, &namespace).await;
+    db.flush_memtable().await.unwrap();
+    let selector = [r#"{environment="prod"}"#.to_owned()];
+    // Within one segment, then within its rollup period.
+    for end in [9_000_000_000, 19_000_000_000] {
+        assert_eq!(
+            db.series(&namespace, &selector, 0, end)
+                .await
+                .unwrap()
+                .len(),
+            20
+        );
+        let services = db
+            .label_values(&namespace, "service", 0, end)
+            .await
+            .unwrap();
+        assert_eq!(services.len(), 40);
+    }
+    let version = |partition| db.partition_version(&namespace, partition);
+    let before = version(Partition::Segment(seg(0))).await.unwrap();
+    let ids = db
+        .stream_ids(&namespace, seg(0), &[Label::new("environment", "prod")])
+        .await
+        .unwrap();
+    assert_eq!(ids, (0..20).collect::<Vec<_>>());
+
+    db.write(
+        &namespace,
+        vec![LogBatch::new(
+            labels("s40", "prod"),
+            vec![LogEntry::new(1_040, "line 40")],
+        )],
+    )
+    .await
+    .unwrap();
+    db.flush_memtable().await.unwrap();
+    let ids = db
+        .stream_ids(&namespace, seg(0), &[Label::new("environment", "prod")])
+        .await
+        .unwrap();
+    assert_eq!(ids, (0..21).collect::<Vec<_>>());
+    assert_ne!(version(Partition::Segment(seg(0))).await.unwrap(), before);
+    for end in [9_000_000_000, 19_000_000_000] {
+        let series = db.series(&namespace, &selector, 0, end).await.unwrap();
+        assert_eq!(series.len(), 21, "{end}");
+        assert!(series.contains(&labels("s40", "prod")));
+        let services = db
+            .label_values(&namespace, "service", 0, end)
+            .await
+            .unwrap();
+        assert!(services.contains(&"s40".to_owned()), "{end}");
     }
     db.close().await.unwrap();
 }
@@ -1635,7 +1735,8 @@ impl StorageRead for PausingStorage {
 
 /// A stream written while a listing reads its segment, before or after
 /// the stream counter or the postings it is selected by, is read by the
-/// next query: the cached listing is never current for the segment with it.
+/// next query: the cached listing is never current for the segment with it,
+/// also when the stream takes an ID its environment reserved.
 #[tokio::test]
 async fn streams_written_during_a_listing_are_read_next() {
     let prod = Label::new("environment", "prod");
@@ -1646,10 +1747,13 @@ async fn streams_written_during_a_listing_are_read_next() {
         segment_run_prefix(&namespace, seg(0)),
         forward_prefix(&namespace, seg(0)),
     ];
-    for tuning in read_tunings() {
+    for (tuning, config) in read_tunings()
+        .into_iter()
+        .flat_map(|tuning| id_block_configs().map(|config| (tuning, config)))
+    {
         for (index, prefix) in watched.iter().enumerate() {
             for min_streams in [usize::MAX, 1] {
-                let mut db = LogDb::open(test_config()).await.unwrap();
+                let mut db = LogDb::open(config.clone()).await.unwrap();
                 db.tuning = tuning;
                 db.span_scan_min_streams = min_streams;
                 write_forty_streams(&db, &namespace).await;

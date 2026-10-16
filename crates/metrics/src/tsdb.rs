@@ -700,6 +700,8 @@ impl TsdbReadEngine for Tsdb {
 // ── TsdbEngine: unified read/write or read-only dispatch ────────────
 
 #[cfg(test)]
+pub(crate) mod layout_tests;
+#[cfg(test)]
 mod projection_tests;
 #[cfg(test)]
 mod read_tuning_tests;
