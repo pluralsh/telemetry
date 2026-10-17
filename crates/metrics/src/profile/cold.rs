@@ -33,6 +33,8 @@ use crate::sharded::ShardedMetrics;
 use crate::storage::StorageReader;
 use crate::{Config, Namespace, RangeSample, TimeSeriesDb, Visibility};
 
+mod memory;
+
 const STORE_DIR: &str = "/tmp/metrics-coldpath/store";
 const BASE_PATH: &str = "metrics";
 const SCRAPE_MS: i64 = 30_000;
@@ -343,13 +345,14 @@ fn storage_config(dir: &Path, path: String) -> SlateDbStorageConfig {
             path: dir.display().to_string(),
         }),
         settings_path: std::env::var("PROFILE_SLATEDB_SETTINGS").ok(),
-        // The metrics example config: 512 MiB of blocks, 128 MiB of metadata.
+        // The metrics example config unless overridden: 512 MiB of blocks,
+        // 128 MiB of metadata.
         block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-            capacity: 512 << 20,
+            capacity: env("PROFILE_BLOCK_CACHE_BYTES").unwrap_or(512 << 20),
             shards: None,
         })),
         meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-            capacity: 128 << 20,
+            capacity: env("PROFILE_META_CACHE_BYTES").unwrap_or(128 << 20),
             shards: None,
         })),
         disk: Default::default(),
@@ -753,11 +756,14 @@ async fn warm_metadata(db: &ShardedMetrics, end_ms: i64) {
     let since = common::time::now_ms() - (end_ms - DAY_MS - HOUR_MS);
     db.warm_recent(
         &[namespace()],
-        Duration::from_millis(since as u64),
-        false,
+        common::WarmWindow {
+            metadata: Some(Duration::from_millis(since as u64)),
+            payloads: None,
+        },
         16,
         &tokio_util::sync::CancellationToken::new(),
-        None,
+        &common::storage::slate::warm::WarmLedger::new(true),
+        100,
     )
     .await
     .unwrap();
@@ -1241,4 +1247,185 @@ async fn profile_cold_queries() {
         }
     }
     let _ = std::fs::remove_dir_all(dir.with_extension("diskcache"));
+}
+
+/// Discovery calls over the queried day: `(name, kind, label, matcher)`,
+/// where `kind` is `series`, `labels` or `values`.
+const DISCOVERY: &[(&str, &str, &str, &str)] = &[
+    (
+        "series",
+        "series",
+        "",
+        r#"{namespace="namespace-01", __name__=~"container_cpu_usage_seconds_total|container_memory_working_set_bytes"}"#,
+    ),
+    (
+        "labels",
+        "labels",
+        "",
+        r#"{job=~"kubelet|kube-state-metrics"}"#,
+    ),
+    (
+        "values_pod",
+        "values",
+        "pod",
+        "container_cpu_usage_seconds_total",
+    ),
+    (
+        "values_namespace",
+        "values",
+        "namespace",
+        r#"{job=~"kubelet|kube-state-metrics"}"#,
+    ),
+];
+
+/// The longest chain of GETs where each starts after the previous one
+/// ended: a lower bound on dependent round trips.
+fn waves(gets: &[Get]) -> usize {
+    let mut by_end: Vec<&Get> = gets.iter().collect();
+    by_end.sort_by_key(|get| get.end);
+    let mut chain: Vec<usize> = Vec::with_capacity(by_end.len());
+    for (index, get) in by_end.iter().enumerate() {
+        let prior = by_end[..index]
+            .iter()
+            .zip(&chain)
+            .filter(|(earlier, _)| earlier.end <= get.start)
+            .map(|(_, length)| *length)
+            .max()
+            .unwrap_or(0);
+        chain.push(prior + 1);
+    }
+    chain.into_iter().max().unwrap_or(0)
+}
+
+/// Times [`DISCOVERY`] calls on fresh readers over the [`profile_cold_queries`]
+/// store. `PROFILE_DISCOVERY` picks calls by name (default all),
+/// `PROFILE_LATENCY_MS`, `PROFILE_RUNS`, `PROFILE_VARIANTS`, `PROFILE_TIMELINE`
+/// and `PROFILE_OUT` as there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_cold_discovery() {
+    let dir = PathBuf::from(std::env::var("PROFILE_STORE_DIR").unwrap_or(STORE_DIR.to_string()));
+    let meta_path = dir.join("meta.json");
+    if !meta_path.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let namespaces = env("PROFILE_NAMESPACES").unwrap_or(40);
+        let layout = std::env::var("PROFILE_LAYOUT").unwrap_or("default".to_string());
+        ingest(&dir, default_end_ms(), namespaces, layout).await;
+    }
+    let meta: Meta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    let ssts = sst_buckets(&dir).await;
+    let latency_ms: u64 = env("PROFILE_LATENCY_MS").unwrap_or(20);
+    let runs: usize = env("PROFILE_RUNS").unwrap_or(5);
+    let picked = std::env::var("PROFILE_DISCOVERY").ok();
+    let variants: Vec<String> = std::env::var("PROFILE_VARIANTS")
+        .unwrap_or("default".to_string())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let mut out = std::env::var("PROFILE_OUT").ok().map(|path| {
+        std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap(),
+        )
+    });
+    let tag = std::env::var("PROFILE_TAG").unwrap_or_default();
+    let range = day_range(meta.end_ms);
+    let mut answers: HashMap<&str, usize> = HashMap::new();
+    for variant in &variants {
+        let _tuning = crate::read_tuning::override_read_tuning(tuning(variant)).await;
+        for &(name, kind, label, matcher) in DISCOVERY {
+            if picked
+                .as_deref()
+                .is_some_and(|picked| !picked.split(',').any(|item| item == name))
+            {
+                continue;
+            }
+            let mut totals = Vec::new();
+            for _ in 0..runs {
+                let db = cold_reader(&dir, Duration::from_millis(latency_ms), false).await;
+                match start(variant) {
+                    Start::Cold => {}
+                    Start::MetaWarm => warm_metadata(&db, meta.end_ms).await,
+                    other => panic!("{other:?} is not supported for discovery"),
+                }
+                start_recording();
+                let started = Instant::now();
+                let matchers = [matcher];
+                let found = match kind {
+                    "series" => db
+                        .series(&namespace(), &matchers, range.clone())
+                        .await
+                        .unwrap()
+                        .len(),
+                    "labels" => db
+                        .labels(&namespace(), Some(&matchers), range.clone())
+                        .await
+                        .unwrap()
+                        .len(),
+                    _ => db
+                        .label_values(&namespace(), label, Some(&matchers), range.clone())
+                        .await
+                        .unwrap()
+                        .len(),
+                };
+                let total = started.elapsed();
+                let gets = stop_recording();
+                let expected = *answers.entry(name).or_insert(found);
+                assert_eq!(found, expected, "{name}: answers differ");
+                let mut per_bucket: BTreeMap<String, usize> = BTreeMap::new();
+                for get in &gets {
+                    let file = get.path.rsplit('/').next().unwrap_or_default();
+                    let id = file.trim_end_matches(".sst").trim_start_matches('0');
+                    let key = match ssts.get(id) {
+                        Some(&(bucket, l0)) => format!(
+                            "{} {}h{}",
+                            bucket_name(bucket),
+                            bucket.size,
+                            if l0 { " l0" } else { "" }
+                        ),
+                        None => "other".to_string(),
+                    };
+                    *per_bucket.entry(key).or_default() += 1;
+                }
+                eprintln!(
+                    "[{variant}] {name:<16} {:>7.1}ms found {found:>6} gets {:>4} {:>8.1}KB waves {:>3} peak {:>3} buckets {}",
+                    ms(total),
+                    gets.len(),
+                    gets.iter().map(|get| get.bytes).sum::<u64>() as f64 / 1024.0,
+                    waves(&gets),
+                    peak(&gets),
+                    per_bucket.len(),
+                );
+                if std::env::var("PROFILE_TIMELINE").is_ok() {
+                    for (bucket, count) in &per_bucket {
+                        eprintln!("    bucket {bucket}: {count} gets");
+                    }
+                    print_timeline(&gets, &ssts, latency_ms.max(1));
+                }
+                if let Some(out) = out.as_mut() {
+                    let row = serde_json::json!({
+                        "tag": tag,
+                        "variant": variant,
+                        "query": name,
+                        "total_ms": ms(total),
+                        "found": found,
+                        "gets": gets.len(),
+                        "get_bytes": gets.iter().map(|get| get.bytes).sum::<u64>(),
+                        "waves": waves(&gets),
+                        "peak": peak(&gets),
+                        "buckets": per_bucket,
+                    });
+                    writeln!(out, "{row}").unwrap();
+                    out.flush().unwrap();
+                }
+                totals.push(ms(total));
+                db.close().await.unwrap();
+            }
+            eprintln!("[{variant}] {name:<16} p50 {}", stats(totals));
+        }
+    }
 }

@@ -221,6 +221,8 @@ def render_entry(entry: dict[str, Any]) -> str:
             lines.append(f"- … {results['notes_truncated']} more")
     lines += ["", "## Correctness", "", "| outcome | cases |", "| --- | ---: |"]
     lines += [_row((name, count)) for name, count in results["outcomes"].items()]
+    if results.get("cold"):
+        lines += _cold_section(results["cold"])
     latency = results["latency"]
     lines += [
         "",
@@ -318,6 +320,73 @@ def render_entry(entry: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _kib(value: Any) -> str:
+    return "-" if value is None else f"{value / 1024:.0f}"
+
+
+def _cold_section(cold: dict[str, Any]) -> list[str]:
+    dataset = ", ".join(f"{name} {value}" for name, value in cold["dataset"].items())
+    lines = [
+        "",
+        "## Cold reads from object storage",
+        "",
+        f"{cold['measured']} of {cold['planned']} planned measurements "
+        f"({cold['repeats']} per battery query) over "
+        f"{_duration(cold['span_s'])} of data ({dataset or '-'}). Before every "
+        "measurement the answering side restarts with empty local caches and "
+        f"disks; MinIO adds {_num(cold['first_byte_ms'])} ms to every first "
+        "byte. GETs and KiB are the object-store reads the query itself made "
+        "(medians); warm is the same query re-sent at once.",
+        "",
+        "| family | n | impl cold p50 / p99 ms | oracle cold p50 / p99 ms "
+        "| warm p50 ms impl / oracle | GETs impl / oracle | GET KiB impl / oracle |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for family, stats in cold["families"].items():
+        impl, oracle = stats["impl"], stats["oracle"]
+        lines.append(
+            _row(
+                (
+                    family,
+                    stats["cases"],
+                    _pair(_ms(impl["cold_ms"]["p50"]), _ms(impl["cold_ms"]["p99"])),
+                    _pair(_ms(oracle["cold_ms"]["p50"]), _ms(oracle["cold_ms"]["p99"])),
+                    _pair(_ms(impl["warm_ms"]["p50"]), _ms(oracle["warm_ms"]["p50"])),
+                    _pair(_num(impl["get"]["p50"]), _num(oracle["get"]["p50"])),
+                    _pair(
+                        _kib(impl["get_bytes"]["p50"]), _kib(oracle["get_bytes"]["p50"])
+                    ),
+                )
+            )
+        )
+    if cold.get("startup"):
+        lines += [
+            "",
+            "| side | restarts | ready p50 / max s | settle p50 / max s "
+            "| startup GETs p50 / max |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+        for side, stats in cold["startup"].items():
+            lines.append(
+                _row(
+                    (
+                        side,
+                        stats["restarts"],
+                        _pair(
+                            _num(stats["ready_s"]["p50"], 1),
+                            _num(stats["ready_s"]["max"], 1),
+                        ),
+                        _pair(
+                            _num(stats["settle_s"]["p50"], 1),
+                            _num(stats["settle_s"]["max"], 1),
+                        ),
+                        _pair(_num(stats["get"]["p50"]), _num(stats["get"]["max"])),
+                    )
+                )
+            )
+    return lines
+
+
 def _newest_first(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(entries, key=lambda e: (e["started_at"], e["name"]), reverse=True)
 
@@ -392,12 +461,29 @@ def render_index(products: list[str], entries: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _cold_record(cold: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "measured": cold["measured"],
+        "families": {
+            family: {
+                side: {
+                    "cold_ms_p50": stats[side]["cold_ms"]["p50"],
+                    "get_p50": stats[side]["get"]["p50"],
+                }
+                for side in ("impl", "oracle")
+            }
+            for family, stats in cold["families"].items()
+        },
+    }
+
+
 def _index_record(entry: dict[str, Any]) -> dict[str, Any]:
     results = entry["results"]
     git = entry.get("git") or {}
     host = entry.get("host") or {}
     docker = host.get("docker") or {}
     product, name = entry["product"], entry["name"]
+    cold = results.get("cold")
     return {
         "name": name,
         "product": product,
@@ -441,6 +527,7 @@ def _index_record(entry: dict[str, Any]) -> dict[str, Any]:
             for role in _ROLES
             if _role(entry, role)
         },
+        **({"cold": _cold_record(cold)} if cold else {}),
     }
 
 

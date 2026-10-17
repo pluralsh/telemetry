@@ -455,7 +455,7 @@ fn count_u32(count: usize) -> Result<u32> {
 /// The flush's directory entries form new fragments keyed by their first
 /// block, and the term's statistics grow by a merge operand.
 pub(crate) fn term_index_ops(
-    ops: &mut Vec<RecordOp>,
+    ops: &mut impl Extend<RecordOp>,
     (namespace, segment): (&Namespace, SegmentId),
     term: &str,
     mut postings: Vec<Posting>,
@@ -473,27 +473,27 @@ pub(crate) fn term_index_ops(
         }
         let block = first_block | index as u64;
         entries.push(BlockDirectoryEntry::describe(block, chunk)?);
-        ops.push(RecordOp::put_with_ttl(
+        ops.extend([RecordOp::put_with_ttl(
             term_posting_block_key(namespace, segment, term, block),
             encode_postings(chunk)?,
             ttl,
-        ));
+        )]);
     }
     for fragment in entries.chunks(DIRECTORY_ENTRIES) {
-        ops.push(RecordOp::put_with_ttl(
+        ops.extend([RecordOp::put_with_ttl(
             term_directory_key(namespace, segment, term, fragment[0].block),
             encode_directory(fragment)?,
             ttl,
-        ));
+        )]);
     }
-    ops.push(RecordOp::merge_with_ttl(
+    ops.extend([RecordOp::merge_with_ttl(
         term_stats_key(namespace, segment, term),
         encode_term_stats(TermStats {
             documents: postings.len() as u64,
             blocks: count_u32(entries.len())?,
         }),
         ttl,
-    ));
+    )]);
     Ok(())
 }
 

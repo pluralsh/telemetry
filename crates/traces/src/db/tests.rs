@@ -661,6 +661,233 @@ async fn catalog_deduplicates_pages_and_segments_without_payload_reads() {
     db.close().await.unwrap();
 }
 
+/// A one-span trace numbered `index`, for tests that need more than 255.
+fn numbered(
+    index: u32,
+    start_ns: u64,
+    resource_attributes: Vec<KeyValue>,
+    span_attributes: Vec<KeyValue>,
+) -> Trace {
+    let mut id = [0xA5; 16];
+    id[..4].copy_from_slice(&index.to_be_bytes());
+    let trace_id = TraceId::new(id).unwrap();
+    Trace::new(
+        trace_id,
+        vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: id.to_vec(),
+                    span_id: id[..8].to_vec(),
+                    name: "op".to_owned(),
+                    start_time_unix_nano: start_ns,
+                    end_time_unix_nano: start_ns + 100,
+                    attributes: span_attributes,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    )
+    .unwrap()
+}
+
+/// Held by tests that compare [`override_read_shape`] settings, so one never
+/// changes them under another. Other tests may run with them changed: they
+/// only change how many reads run at once, never answers.
+static READ_SHAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Sets [`CATALOG_CONCURRENCY_OVERRIDE`] and [`SEARCH_BATCH_OVERRIDE`].
+fn override_read_shape(catalog: usize, search_batch: usize) {
+    CATALOG_CONCURRENCY_OVERRIDE.store(catalog, std::sync::atomic::Ordering::Relaxed);
+    SEARCH_BATCH_OVERRIDE.store(search_batch, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every segment's catalog read one at a time and read concurrently give the
+/// same names and values. Each read uses its own namespace holding the same
+/// data, so neither answers from the other's per-segment cache.
+#[tokio::test]
+async fn concurrent_segment_catalogs_match_sequential_ones() {
+    let _shape = READ_SHAPE.lock().await;
+    const SEGMENTS: u64 = 40;
+    let mut config = test_config();
+    config.retention = None;
+    let db = TraceDb::open(config).await.unwrap();
+    let namespaces = [
+        Namespace::new("catalog-sequential").unwrap(),
+        Namespace::new("catalog-concurrent").unwrap(),
+    ];
+    let traces = (0..SEGMENTS * 3)
+        .map(|index| {
+            let segment = index / 3;
+            numbered(
+                u32::try_from(index).unwrap(),
+                segment * 10_000_000_000 + index % 3 + 1,
+                vec![attr(
+                    "service.name",
+                    any_value::Value::StringValue(format!("svc-{}", segment % 7)),
+                )],
+                vec![attr(
+                    &format!("attr-{segment}"),
+                    any_value::Value::IntValue(i64::try_from(index).unwrap()),
+                )],
+            )
+        })
+        .collect::<Vec<_>>();
+    for namespace in &namespaces {
+        db.write(namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+    }
+    let end = SEGMENTS * 10_000_000_000;
+    let mut answers = Vec::new();
+    for (namespace, concurrency) in namespaces.iter().zip([1, 0]) {
+        override_read_shape(concurrency, 0);
+        answers.push((
+            db.catalog_names(namespace, 0, end, None).await.unwrap(),
+            db.catalog_names(namespace, 0, end, Some(AttributeScope::Span))
+                .await
+                .unwrap(),
+            db.catalog_values(
+                namespace,
+                0,
+                end,
+                Some(AttributeScope::Resource),
+                "service.name",
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    override_read_shape(0, 0);
+    assert_eq!(answers[0], answers[1]);
+    let (names, span_names, values) = &answers[1];
+    assert_eq!(names.len(), SEGMENTS as usize + 1);
+    assert_eq!(span_names.len(), SEGMENTS as usize);
+    assert_eq!(
+        values,
+        &(0..7)
+            .map(|n| DiscoveryValue::String(format!("svc-{n}")))
+            .collect::<Vec<_>>()
+    );
+    db.close().await.unwrap();
+}
+
+/// The cross-segment byte cap of a values lookup stops at the same segment
+/// whether segments are read one at a time or ahead of it.
+#[tokio::test]
+async fn concurrent_catalog_values_stop_at_the_same_byte_cap() {
+    let _shape = READ_SHAPE.lock().await;
+    const SEGMENTS: u64 = 26;
+    const PER_SEGMENT: u64 = 100;
+    const VALUE_BYTES: usize = 4 << 10;
+    let mut config = test_config();
+    config.retention = None;
+    let db = TraceDb::open(config).await.unwrap();
+    let namespaces = [
+        Namespace::new("capped-sequential").unwrap(),
+        Namespace::new("capped-concurrent").unwrap(),
+    ];
+    let traces = (0..SEGMENTS * PER_SEGMENT)
+        .map(|index| {
+            let segment = index / PER_SEGMENT;
+            let mut blob = format!("{index:08}");
+            blob.extend(std::iter::repeat_n('x', VALUE_BYTES - blob.len()));
+            numbered(
+                u32::try_from(index).unwrap(),
+                segment * 10_000_000_000 + index % PER_SEGMENT + 1,
+                vec![attr("blob", any_value::Value::StringValue(blob))],
+                Vec::new(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for namespace in &namespaces {
+        for chunk in traces.chunks(PER_SEGMENT as usize) {
+            db.write(namespace, vec![TraceBatch::new(chunk.to_vec())])
+                .await
+                .unwrap();
+        }
+    }
+    let end = SEGMENTS * 10_000_000_000;
+    let mut answers = Vec::new();
+    for (namespace, concurrency) in namespaces.iter().zip([1, 0]) {
+        override_read_shape(concurrency, 0);
+        answers.push(
+            db.catalog_values(namespace, 0, end, Some(AttributeScope::Resource), "blob")
+                .await
+                .unwrap(),
+        );
+    }
+    override_read_shape(0, 0);
+    assert_eq!(answers[0], answers[1]);
+    let total = (SEGMENTS * PER_SEGMENT) as usize;
+    assert!(
+        answers[1].len() < total,
+        "the cap must cut the listing short"
+    );
+    assert!(answers[1].len() * VALUE_BYTES > CATALOG_VALUES_MAX_BYTES);
+    db.close().await.unwrap();
+}
+
+/// Search rounds capped at the old batch size and at [`SEARCH_BATCH_MAX`]
+/// return the same traces when the limit cuts the matches short.
+#[tokio::test]
+async fn wide_search_rounds_return_what_narrow_ones_do() {
+    let _shape = READ_SHAPE.lock().await;
+    const TRACES: u32 = 1_500;
+    let mut config = test_config();
+    config.retention = None;
+    let db = TraceDb::open(config).await.unwrap();
+    let namespaces = [
+        Namespace::new("search-narrow").unwrap(),
+        Namespace::new("search-wide").unwrap(),
+    ];
+    let traces = (0..TRACES)
+        .map(|index| {
+            numbered(
+                index,
+                u64::from(index) * 1_000_000 + 1,
+                vec![attr(
+                    "service.name",
+                    any_value::Value::StringValue("cart".to_owned()),
+                )],
+                vec![attr(
+                    "http.status_code",
+                    any_value::Value::IntValue(if index % 4 == 0 { 200 } else { 503 }),
+                )],
+            )
+        })
+        .collect::<Vec<_>>();
+    for namespace in &namespaces {
+        db.write(namespace, vec![TraceBatch::new(traces.clone())])
+            .await
+            .unwrap();
+    }
+    let options = QueryOptions {
+        limit: 1_000,
+        max_candidate_traces: 10_000,
+        ..QueryOptions::default()
+    };
+    let source = r#"{ resource.service.name = "cart" && span.http.status_code = 503 }"#;
+    let mut answers = Vec::new();
+    for (namespace, cap) in namespaces.iter().zip([MATERIALIZE_BATCH, 0]) {
+        override_read_shape(0, cap);
+        answers.push(
+            db.search_traceql(namespace, 0, u64::MAX, source, options)
+                .await
+                .unwrap(),
+        );
+    }
+    override_read_shape(0, 0);
+    assert_eq!(answers[0].len(), 1_000);
+    assert_eq!(answers[0], answers[1]);
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn reader_catalog_sees_late_writes_to_closed_segments() {
     const SECOND: u64 = 1_000_000_000;

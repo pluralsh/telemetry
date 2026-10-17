@@ -211,6 +211,11 @@ spec:
                     type: object
                   cacheWarmer:
                     properties:
+                      blockReadiness:
+                        description: |-
+                          BlockReadiness holds readiness until the startup pass ends. Unset
+                          keeps the server default, false.
+                        type: boolean
                       concurrency:
                         default: 2
                         format: int32
@@ -231,25 +236,60 @@ spec:
                             format: int64
                             minimum: 1
                             type: integer
+                          payloadWarmRangeSeconds:
+                            description: |-
+                              PayloadWarmRangeSeconds is CacheWarmerSpec.PayloadWarmRangeSeconds
+                              for new SSTs.
+                            format: int64
+                            minimum: 1
+                            type: integer
                           warmRangeSeconds:
-                            default: 7200
+                            description: WarmRangeSeconds is CacheWarmerSpec.WarmRangeSeconds
+                              for new SSTs.
                             format: int64
                             minimum: 1
                             type: integer
                         type: object
                       enabled:
-                        default: false
+                        description: |-
+                          Enabled runs a startup pass over recent SSTs. Defaults to true for
+                          readers, which warm filters and indexes in the background; Logs
+                          readers that skip filters warm only indexes.
                         type: boolean
                       includePayloads:
                         default: false
                         type: boolean
+                      metadataBudgetPercent:
+                        description: |-
+                          MetadataBudgetPercent is the share of the metadata cache warming may
+                          fill before it stops; the server default is 75.
+                        format: int32
+                        maximum: 100
+                        minimum: 0
+                        type: integer
+                      payloadWarmRangeSeconds:
+                        description: |-
+                          PayloadWarmRangeSeconds is the recent window whose payloads the
+                          startup pass warms when IncludePayloads is set. Unset uses
+                          WarmRangeSeconds when that is set, otherwise 7200. Servers older than
+                          this field reject it, so set it only once every reader runs a server
+                          that knows it.
+                        format: int64
+                        minimum: 1
+                        type: integer
                       timeoutSeconds:
                         default: 30
                         format: int64
                         minimum: 1
                         type: integer
                       warmRangeSeconds:
-                        default: 7200
+                        description: |-
+                          WarmRangeSeconds is the recent window whose metadata the startup pass
+                          warms. Unset covers all live data, which retention bounds, and the
+                          metadata budget bounds what is held. A set value bounds payloads too
+                          unless PayloadWarmRangeSeconds is set. 7200, the default of earlier
+                          CRDs that the API server stored in existing resources, is read as
+                          unset.
                         format: int64
                         minimum: 1
                         type: integer

@@ -154,11 +154,11 @@ fn config(path: &std::path::Path) -> Config {
             }),
             settings_path: None,
             block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-                capacity: 64 << 20,
+                capacity: env_bytes("PROFILE_BLOCK_CACHE_BYTES").unwrap_or(64 << 20),
                 shards: None,
             })),
             meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-                capacity: 16 << 20,
+                capacity: env_bytes("PROFILE_META_CACHE_BYTES").unwrap_or(16 << 20),
                 shards: None,
             })),
             disk: Default::default(),
@@ -173,6 +173,10 @@ fn config(path: &std::path::Path) -> Config {
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn env_bytes(name: &str) -> Option<u64> {
+    std::env::var(name).ok().map(|value| value.parse().unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -805,4 +809,760 @@ fn continue_trace(rng: &mut StdRng, trace_id: TraceId, start_ns: u64) -> Trace {
         span.trace_id = trace_id.as_bytes().to_vec();
     }
     Trace::new(trace_id, extra.resource_spans).unwrap()
+}
+
+// ── Cold reads ───────────────────────────────────────────────────────
+
+/// One object-store read: path, bytes, and milliseconds since the
+/// operation began.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ColdGet {
+    path: String,
+    bytes: u64,
+    start_ms: f64,
+    end_ms: f64,
+}
+
+static COLD_GETS: std::sync::Mutex<Option<(Instant, Vec<ColdGet>)>> = std::sync::Mutex::new(None);
+
+/// An object store that sleeps `latency` before every read, as S3's first
+/// byte does, and records the reads made while [`COLD_GETS`] is set.
+#[derive(Debug)]
+struct SlowStore {
+    inner: Arc<dyn slatedb::object_store::ObjectStore>,
+    latency: Duration,
+}
+
+impl std::fmt::Display for SlowStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl slatedb::object_store::ObjectStore for SlowStore {
+    async fn put_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        payload: slatedb::object_store::PutPayload,
+        opts: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        opts: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        let began = Instant::now();
+        tokio::time::sleep(self.latency).await;
+        let result = self.inner.get_opts(location, options).await;
+        if let Some((origin, gets)) = COLD_GETS.lock().unwrap().as_mut() {
+            let bytes = result
+                .as_ref()
+                .map_or(0, |result| result.range.end - result.range.start);
+            gets.push(ColdGet {
+                path: location.to_string(),
+                bytes,
+                start_ms: ms(began.saturating_duration_since(*origin)),
+                end_ms: ms(origin.elapsed()),
+            });
+        }
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::path::Path>,
+    > {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::ObjectMeta>,
+    > {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &slatedb::object_store::path::Path,
+        to: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The longest chain of reads where each starts after the previous one
+/// ended: a lower bound on the operation's dependent round trips.
+fn cold_waves(gets: &[ColdGet]) -> usize {
+    let mut by_end: Vec<&ColdGet> = gets.iter().collect();
+    by_end.sort_by(|a, b| a.end_ms.total_cmp(&b.end_ms));
+    let mut chain: Vec<usize> = Vec::with_capacity(by_end.len());
+    let mut best = 0;
+    for (index, get) in by_end.iter().enumerate() {
+        let prior = by_end[..index]
+            .iter()
+            .zip(&chain)
+            .filter(|(earlier, _)| earlier.end_ms <= get.start_ms)
+            .map(|(_, length)| *length)
+            .max()
+            .unwrap_or(0);
+        chain.push(prior + 1);
+        best = best.max(prior + 1);
+    }
+    best
+}
+
+fn cold_peak(gets: &[ColdGet]) -> usize {
+    let mut edges: Vec<(f64, i32)> = gets
+        .iter()
+        .flat_map(|get| [(get.start_ms, 1), (get.end_ms, -1)])
+        .collect();
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let (mut live, mut most) = (0, 0);
+    for (_, delta) in edges {
+        live += delta;
+        most = most.max(live);
+    }
+    most as usize
+}
+
+/// A day of hourly segments shaped like the fuzz harness's cold battery.
+fn cold_trace(rng: &mut StdRng, start_ns: u64) -> Trace {
+    let mut trace = random_trace(rng, start_ns);
+    let tag = format!("t{}", rng.random_range(0..1_000u64));
+    for resource in &mut trace.resource_spans {
+        for span in resource
+            .scope_spans
+            .iter_mut()
+            .flat_map(|scope| &mut scope.spans)
+        {
+            span.attributes
+                .push(kv("fuzz.tag", any_value::Value::StringValue(tag.clone())));
+        }
+    }
+    trace
+}
+
+/// Operations of the cold battery a profile can run.
+async fn cold_op(db: &TraceDb, namespace: &Namespace, op: &str, start: u64, end: u64) -> usize {
+    let options = |limit| QueryOptions {
+        limit,
+        max_candidate_traces: 10_000,
+        max_spans_per_trace: 100_000,
+        max_concurrency: 8,
+    };
+    match op {
+        // `/api/v2/search/tags` with no scope: resource names, then span names.
+        "names" => {
+            let mut names = 0;
+            for scope in [AttributeScope::Resource, AttributeScope::Span] {
+                names += db
+                    .catalog_names(namespace, start, end, Some(scope))
+                    .await
+                    .unwrap()
+                    .len();
+            }
+            names
+        }
+        "names_joined" => {
+            let (resource, span) = futures::future::try_join(
+                db.catalog_names(namespace, start, end, Some(AttributeScope::Resource)),
+                db.catalog_names(namespace, start, end, Some(AttributeScope::Span)),
+            )
+            .await
+            .unwrap();
+            resource.len() + span.len()
+        }
+        "values" => db
+            .catalog_values(
+                namespace,
+                start,
+                end,
+                Some(AttributeScope::Resource),
+                "service.name",
+            )
+            .await
+            .unwrap()
+            .len(),
+        "broad" => db
+            .query_traceql(
+                namespace,
+                start,
+                end,
+                &format!(r#"{{ resource.fuzz.run = "{RUN}" }}"#),
+                options(20),
+            )
+            .await
+            .unwrap()
+            .len(),
+        "selective" => db
+            .query_traceql(
+                namespace,
+                start,
+                end,
+                &format!(
+                    r#"{{ resource.fuzz.run = "{RUN}" && resource.service.name = "cart" && span.http.status_code = 500 }}"#
+                ),
+                options(1_000),
+            )
+            .await
+            .unwrap()
+            .len(),
+        "tag" => db
+            .query_traceql(
+                namespace,
+                start,
+                end,
+                &format!(r#"{{ resource.fuzz.run = "{RUN}" && span.fuzz.tag = "t7" }}"#),
+                options(1_000),
+            )
+            .await
+            .unwrap()
+            .len(),
+        other => panic!("unknown cold op {other}"),
+    }
+}
+
+/// Times cold-battery operations on fresh readers over a store whose reads
+/// each sleep `PROFILE_LATENCY_MS` (default 20). `PROFILE_STORE` (default
+/// `/tmp/traces-coldpath/store`) is ingested once with `PROFILE_TRACES`
+/// (default 30000) traces over `PROFILE_HOURS` (default 22) hourly segments,
+/// flushed hour by hour, rolled up as the server would when `PROFILE_ROLLUP`
+/// is set. `PROFILE_OPS` picks operations (see [`cold_op`]), `PROFILE_RUNS`
+/// the cold runs of each, `PROFILE_TIMELINE` prints every read, and
+/// `PROFILE_OUT` receives one JSON line per run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_cold_catalog() {
+    use std::io::Write as _;
+
+    let env = |name: &str| std::env::var(name).ok();
+    let store = std::path::PathBuf::from(
+        env("PROFILE_STORE").unwrap_or("/tmp/traces-coldpath/store".to_owned()),
+    );
+    let hours: u64 = env("PROFILE_HOURS").map_or(22, |value| value.parse().unwrap());
+    let total: u64 = env("PROFILE_TRACES").map_or(30_000, |value| value.parse().unwrap());
+    let latency =
+        Duration::from_millis(env("PROFILE_LATENCY_MS").map_or(20, |value| value.parse().unwrap()));
+    let runs: usize = env("PROFILE_RUNS").map_or(3, |value| value.parse().unwrap());
+    let namespace = Namespace::new("regression").unwrap();
+    let mut config = config(&store);
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_size_bytes: 4 << 20,
+        max_traces: 1024,
+    };
+    config.retention = Some(Duration::from_secs(86_400));
+    let hour_ns = 3_600 * 1_000_000_000u64;
+    let marker = store.join("ingested.json");
+    if !marker.exists() {
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        let now = common::time::now_ns().unsigned_abs();
+        let end = now / hour_ns * hour_ns;
+        let writer = TraceDb::open(config.clone()).await.unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        for hour in 0..hours {
+            let base = end - (hours - hour) * hour_ns;
+            let traces: Vec<Trace> = (0..total / hours)
+                .map(|_| {
+                    let offset = rng.random_range(0..3_590u64) * 1_000_000_000;
+                    cold_trace(&mut rng, base + offset)
+                })
+                .collect();
+            for chunk in traces.chunks(500) {
+                writer
+                    .write_with_durability(
+                        &namespace,
+                        vec![TraceBatch::new(chunk.to_vec())],
+                        Durability::Durable,
+                    )
+                    .await
+                    .unwrap();
+            }
+            writer
+                .rollup_writer()
+                .unwrap()
+                .flush_memtable()
+                .await
+                .unwrap();
+        }
+        if env("PROFILE_ROLLUP").is_some() {
+            let sealed = writer
+                .rollup_at(
+                    &common::storage::rollup::RollupConfig {
+                        merge_wait: Duration::from_secs(5),
+                        ..Default::default()
+                    },
+                    common::time::now_ns(),
+                )
+                .await
+                .unwrap();
+            println!("rollup: sealed {sealed}");
+        }
+        writer.close().await.unwrap();
+        std::fs::write(&marker, serde_json::json!({ "end_ns": end }).to_string()).unwrap();
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    let end = meta["end_ns"].as_u64().unwrap();
+    let start = end - 24 * hour_ns;
+    let ops = env("PROFILE_OPS").unwrap_or("names,values,broad,selective,tag".to_owned());
+    let mut out = env("PROFILE_OUT").map(|path| {
+        std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap(),
+        )
+    });
+    let tag = env("PROFILE_TAG").unwrap_or_default();
+    // A variant is `default` or `+`-joined switches: `seq` reads segment
+    // catalogs one at a time, as before they were read concurrently, and
+    // `batchN` caps TraceQL search rounds at N candidates (256 before).
+    let variants = env("PROFILE_VARIANTS").unwrap_or("default".to_owned());
+    for (variant, op) in variants
+        .split(',')
+        .flat_map(|variant| ops.split(',').map(move |op| (variant, op)))
+    {
+        let (mut catalog, mut batch) = (0, 0);
+        for switch in variant.split('+') {
+            match switch {
+                "default" => {}
+                "seq" => catalog = 1,
+                cap if cap.starts_with("batch") => batch = cap["batch".len()..].parse().unwrap(),
+                other => panic!("unknown switch {other}"),
+            }
+        }
+        CATALOG_CONCURRENCY_OVERRIDE.store(catalog, std::sync::atomic::Ordering::Relaxed);
+        SEARCH_BATCH_OVERRIDE.store(batch, std::sync::atomic::Ordering::Relaxed);
+        let mut totals = Vec::new();
+        for _ in 0..runs {
+            let inner = common::create_object_store(match &config.storage {
+                StorageConfig::SlateDb(slate) => &slate.object_store,
+                _ => unreachable!(),
+            })
+            .unwrap();
+            let slow: Arc<dyn slatedb::object_store::ObjectStore> =
+                Arc::new(SlowStore { inner, latency });
+            let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+                common::storage::coalescing::CoalescingObjectStore::new(slow, "s3:profile"),
+            );
+            let mut db = TraceDb::open_reader(config.clone(), DbReaderOptions::default())
+                .await
+                .unwrap();
+            db.storage = create_storage_read(
+                &config.storage,
+                StorageReaderRuntime::new().with_object_store(store),
+                storage_semantics(),
+                DbReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            *COLD_GETS.lock().unwrap() = Some((Instant::now(), Vec::new()));
+            let started = Instant::now();
+            let results = cold_op(&db, &namespace, op, start, end).await;
+            let total_ms = ms(started.elapsed());
+            let gets = COLD_GETS.lock().unwrap().take().unwrap().1;
+            let bytes: u64 = gets.iter().map(|get| get.bytes).sum();
+            println!(
+                "[{variant}] {op:<12} {total_ms:>7.1}ms results {results:>5} gets {:>4} bytes {bytes:>9} waves {:>3} peak {:>3}",
+                gets.len(),
+                cold_waves(&gets),
+                cold_peak(&gets),
+            );
+            if env("PROFILE_TIMELINE").is_some() {
+                for get in &gets {
+                    println!(
+                        "    {:>7.1}-{:>7.1}ms {:>8}B {}",
+                        get.start_ms, get.end_ms, get.bytes, get.path
+                    );
+                }
+            }
+            if let Some(out) = out.as_mut() {
+                let row = serde_json::json!({
+                    "tag": tag,
+                    "variant": variant,
+                    "op": op,
+                    "total_ms": total_ms,
+                    "results": results,
+                    "gets": gets.len(),
+                    "bytes": bytes,
+                    "waves": cold_waves(&gets),
+                    "peak": cold_peak(&gets),
+                    "timeline": gets,
+                });
+                writeln!(out, "{row}").unwrap();
+            }
+            totals.push(total_ms);
+            db.close().await.unwrap();
+        }
+        totals.sort_by(f64::total_cmp);
+        println!(
+            "[{variant}] {op:<12} p50 {:>7.1}ms over {runs}",
+            totals[totals.len() / 2]
+        );
+    }
+    CATALOG_CONCURRENCY_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SEARCH_BATCH_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── Warmer memory ────────────────────────────────────────────────────
+
+fn rss(system: &mut sysinfo::System, pid: sysinfo::Pid) -> u64 {
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map_or(0, |process| process.memory())
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1u32 << 20)
+}
+
+/// The cold catalog store's config, ingesting `PROFILE_TRACES` traces over
+/// `PROFILE_HOURS` hourly segments into `PROFILE_STORE` when missing.
+async fn warm_memory_store() -> (std::path::PathBuf, Config, u64) {
+    let env = |name: &str| std::env::var(name).ok();
+    let store = std::path::PathBuf::from(
+        env("PROFILE_STORE").unwrap_or("/tmp/warm-mt/traces-store".to_owned()),
+    );
+    let hours: u64 = env("PROFILE_HOURS").map_or(22, |value| value.parse().unwrap());
+    let total: u64 = env("PROFILE_TRACES").map_or(300_000, |value| value.parse().unwrap());
+    let retention_hours: u64 =
+        env("PROFILE_RETENTION_HOURS").map_or(24, |value| value.parse().unwrap());
+    let mut config = config(&store);
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_size_bytes: 4 << 20,
+        max_traces: 1024,
+    };
+    config.retention = Some(Duration::from_secs(retention_hours * 3_600));
+    let hour_ns = 3_600 * 1_000_000_000u64;
+    let marker = store.join("ingested.json");
+    if !marker.exists() {
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        let end = common::time::now_ns().unsigned_abs() / hour_ns * hour_ns;
+        let writer = TraceDb::open(config.clone()).await.unwrap();
+        let namespace = Namespace::new("regression").unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        for hour in 0..hours {
+            write_hour(
+                &writer,
+                &namespace,
+                &mut rng,
+                end - (hours - hour) * hour_ns,
+                total / hours,
+            )
+            .await;
+            eprintln!("ingested hour {hour}");
+        }
+        writer.close().await.unwrap();
+        std::fs::write(&marker, serde_json::json!({ "end_ns": end }).to_string()).unwrap();
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    (store, config, meta["end_ns"].as_u64().unwrap())
+}
+
+async fn write_hour(
+    writer: &TraceDb,
+    namespace: &Namespace,
+    rng: &mut StdRng,
+    base: u64,
+    traces: u64,
+) {
+    let traces: Vec<Trace> = (0..traces)
+        .map(|_| {
+            let offset = rng.random_range(0..3_590u64) * 1_000_000_000;
+            cold_trace(rng, base + offset)
+        })
+        .collect();
+    for chunk in traces.chunks(500) {
+        writer
+            .write_with_durability(
+                namespace,
+                vec![TraceBatch::new(chunk.to_vec())],
+                Durability::Durable,
+            )
+            .await
+            .unwrap();
+    }
+    writer
+        .rollup_writer()
+        .unwrap()
+        .flush_memtable()
+        .await
+        .unwrap();
+}
+
+/// A reader's resident set size, metadata cache usage and warmer ledger
+/// over the store of [`warm_memory_store`]: after opening, after the
+/// startup pass (`PROFILE_WARM_PERCENT` of the metadata cache, sized by
+/// `PROFILE_META_CACHE_BYTES`), after each of `PROFILE_CYCLES` continuous
+/// passes `PROFILE_CYCLE_SECONDS` apart, and while `PROFILE_QUERY_TASKS`
+/// tasks run the cold operations for `PROFILE_QUERY_SECONDS`. Run
+/// [`profile_warm_memory_writer`] alongside so passes see SSTs removed.
+/// `PROFILE_OUT` receives one JSON line per phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_warm_memory() {
+    use common::storage::slate::warm::{
+        WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned,
+    };
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    let env = |name: &str| std::env::var(name).ok();
+    let parse =
+        |name: &str, default: u64| env(name).map_or(default, |value| value.parse().unwrap());
+    let (_store, config, end) = warm_memory_store().await;
+    let latency = Duration::from_millis(parse("PROFILE_LATENCY_MS", 20));
+    let percent = parse("PROFILE_WARM_PERCENT", 75) as u8;
+    let concurrency = parse("PROFILE_WARM_CONCURRENCY", 2) as usize;
+    let cycles = parse("PROFILE_CYCLES", 18);
+    let cycle = Duration::from_secs(parse("PROFILE_CYCLE_SECONDS", 10));
+    let query_tasks = parse("PROFILE_QUERY_TASKS", 8);
+    let query_time = Duration::from_secs(parse("PROFILE_QUERY_SECONDS", 60));
+    let payloads = env("PROFILE_CONTINUOUS_PAYLOADS").as_deref() != Some("off");
+    let metadata = match parse("PROFILE_WARM_RANGE_SECONDS", 26 * 3_600) {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds)),
+    };
+    let namespace = Namespace::new("regression").unwrap();
+    let namespaces = [namespace.clone()];
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let peak = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = std::thread::spawn({
+        let (peak, stop) = (Arc::clone(&peak), Arc::clone(&stop));
+        move || {
+            let pid = sysinfo::get_current_pid().unwrap();
+            let mut system = sysinfo::System::new();
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(rss(&mut system, pid), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    });
+    let mut out = env("PROFILE_OUT").map(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+    });
+    let pid = sysinfo::get_current_pid().unwrap();
+    let mut system = sysinfo::System::new();
+    let began = Instant::now();
+    let queries = Arc::new(AtomicUsize::new(0));
+
+    let cache = SharedDbCache::from_config(&config.storage).await.unwrap();
+    let inner = common::create_object_store(match &config.storage {
+        StorageConfig::SlateDb(slate) => &slate.object_store,
+        _ => unreachable!(),
+    })
+    .unwrap();
+    let slow: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(SlowStore { inner, latency });
+    let mut db =
+        TraceDb::open_reader_with_cache(config.clone(), DbReaderOptions::default(), &cache)
+            .await
+            .unwrap();
+    db.storage = create_storage_read(
+        &config.storage,
+        StorageReaderRuntime::new()
+            .with_object_store(slow)
+            .with_shared_cache(&cache),
+        storage_semantics(),
+        DbReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    let db = Arc::new(db);
+    let ledger = WarmLedger::new(true);
+    let budget = WarmBudget::of(&cache, percent).unwrap();
+
+    let mut record = |phase: &str, report: WarmReport, gets: &[ColdGet], elapsed: Duration| {
+        let meta = cache.meta().and_then(|meta| meta.usage.as_ref());
+        let now = rss(&mut system, pid);
+        let row = serde_json::json!({
+            "phase": phase,
+            "unix_ms": common::time::now_ms(),
+            "at_s": began.elapsed().as_secs_f64(),
+            "rss_mib": mib(now),
+            "peak_rss_mib": mib(peak.swap(0, Ordering::Relaxed).max(now)),
+            "meta_usage_mib": mib(meta.map_or(0, |meta| meta.usage_bytes())),
+            "meta_capacity_mib": mib(meta.map_or(0, |meta| meta.capacity_bytes())),
+            "meta_evictions": meta.map_or(0, |meta| meta.evictions()),
+            "data_usage_mib": mib(cache.data_usage().map_or(0, |data| data.usage_bytes())),
+            "budget_mib": mib(budget.bytes),
+            "ledger_mib": mib(ledger.bytes()),
+            "ledger_ssts": ledger.ssts(),
+            "planned_ssts": report.planned_ssts,
+            "planned_mib": mib(report.planned_bytes),
+            "warmed_ssts": report.warmed_ssts,
+            "warmed_mib": mib(report.warmed_bytes),
+            "skipped_ssts": report.skipped_ssts,
+            "skipped_mib": mib(report.skipped_bytes),
+            "evicted_ssts": report.evicted_ssts,
+            "displaced_ssts": report.displaced_ssts,
+            "gets": gets.len(),
+            "get_mib": mib(gets.iter().map(|get| get.bytes).sum()),
+            "elapsed_ms": ms(elapsed),
+            "queries": queries.load(Ordering::Relaxed),
+        });
+        eprintln!("{row}");
+        if let Some(out) = out.as_mut() {
+            writeln!(out, "{row}").unwrap();
+        }
+    };
+    let pass = |include_payloads: bool| {
+        let (db, ledger, cancel, namespaces) = (&db, &ledger, &cancel, &namespaces);
+        let window = common::WarmWindow {
+            metadata,
+            payloads: include_payloads.then(|| {
+                Duration::from_secs(common::storage::config::DEFAULT_PAYLOAD_WARM_RANGE_SECONDS)
+            }),
+        };
+        async move {
+            let mut plan = WarmPlan::default();
+            db.plan_warm(namespaces, window, &mut plan).await.unwrap();
+            warm_planned(
+                "traces",
+                plan,
+                budget,
+                include_payloads,
+                concurrency,
+                cancel,
+                ledger,
+            )
+            .await
+        }
+    };
+
+    record("opened", WarmReport::default(), &[], Duration::ZERO);
+    *COLD_GETS.lock().unwrap() = Some((Instant::now(), Vec::new()));
+    let started = Instant::now();
+    let report = pass(false).await;
+    let gets = COLD_GETS.lock().unwrap().take().unwrap().1;
+    record("startup", report, &gets, started.elapsed());
+    for n in 0..cycles {
+        tokio::time::sleep(cycle).await;
+        *COLD_GETS.lock().unwrap() = Some((Instant::now(), Vec::new()));
+        let started = Instant::now();
+        let report = pass(payloads).await;
+        let gets = COLD_GETS.lock().unwrap().take().unwrap().1;
+        record(&format!("cycle-{n}"), report, &gets, started.elapsed());
+    }
+
+    let deadline = Instant::now() + query_time;
+    let start = end - 24 * 3_600 * 1_000_000_000;
+    let ops: Arc<Vec<String>> = Arc::new(
+        env("PROFILE_OPS")
+            .unwrap_or("names,values,broad,selective,tag".to_owned())
+            .split(',')
+            .map(str::to_owned)
+            .collect(),
+    );
+    let tasks: Vec<_> = (0..query_tasks)
+        .map(|task| {
+            let (db, namespace, queries, ops) = (
+                Arc::clone(&db),
+                namespace.clone(),
+                Arc::clone(&queries),
+                Arc::clone(&ops),
+            );
+            tokio::spawn(async move {
+                let mut n = task as usize;
+                while Instant::now() < deadline {
+                    cold_op(&db, &namespace, &ops[n % ops.len()], start, end).await;
+                    queries.fetch_add(1, Ordering::Relaxed);
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    let mut n = 0;
+    while Instant::now() < deadline {
+        tokio::time::sleep(cycle.min(deadline.saturating_duration_since(Instant::now()))).await;
+        let started = Instant::now();
+        let report = pass(payloads).await;
+        record(&format!("queries-{n}"), report, &[], started.elapsed());
+        n += 1;
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    record("after-queries", WarmReport::default(), &[], Duration::ZERO);
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+}
+
+/// Keeps writing [`warm_memory_store`]'s current hour: `PROFILE_WRITER_ROUNDS`
+/// rounds, one every `PROFILE_WRITER_PACE_SECONDS`, each a quarter hour's
+/// traces flushed to a new L0 SST and followed by a rollup as of now, so
+/// readers see new SSTs while compaction, rollups and retention remove old
+/// ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_warm_memory_writer() {
+    let env = |name: &str| std::env::var(name).ok();
+    let parse =
+        |name: &str, default: u64| env(name).map_or(default, |value| value.parse().unwrap());
+    let (_store, config, end) = warm_memory_store().await;
+    let rounds = parse("PROFILE_WRITER_ROUNDS", 8);
+    let pace = Duration::from_secs(parse("PROFILE_WRITER_PACE_SECONDS", 15));
+    let per_round = parse("PROFILE_TRACES", 300_000) / parse("PROFILE_HOURS", 22) / 4;
+    let writer = TraceDb::open(config).await.unwrap();
+    let namespace = Namespace::new("regression").unwrap();
+    let mut rng = StdRng::seed_from_u64(common::time::now_ns().unsigned_abs());
+    let rollup = common::storage::rollup::RollupConfig {
+        merge_wait: Duration::from_secs(5),
+        ..Default::default()
+    };
+    for round in 0..rounds {
+        let started = Instant::now();
+        write_hour(&writer, &namespace, &mut rng, end, per_round).await;
+        let sealed = writer
+            .rollup_at(&rollup, common::time::now_ns())
+            .await
+            .unwrap();
+        eprintln!("round {round}: wrote {per_round} traces, sealed {sealed}");
+        tokio::time::sleep(pace.saturating_sub(started.elapsed())).await;
+    }
+    writer.close().await.unwrap();
 }

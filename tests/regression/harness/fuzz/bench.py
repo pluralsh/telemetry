@@ -4,7 +4,9 @@ PYTHONPATH=tests/regression python -m harness.fuzz.bench --duration 30m
 
 With `--scenarios recent,historical` every product runs once per scenario.
 Recent-scenario metrics runs once per `--metrics-oracles` entry (Prometheus and
-Mimir by default); historical metrics always compares against `mimir-blocks`.
+Mimir by default); historical and cold metrics always compare against
+`mimir-blocks`. The `cold` scenario runs only for logs, metrics and traces
+(`COLD_PRODUCTS`); give it `--duration 40m` or more per product.
 Implementations run with `--config production` (what the operator deploys) by
 default; `--config regression` uses the small pages, segments and caches that
 exercise boundaries, for a quick correctness pass rather than a benchmark.
@@ -64,6 +66,8 @@ class Plan:
 IMPL_CONFIGS = ("production", "regression", "production-sharded")
 # Logs only deploys standalone.
 SHARDED_PRODUCTS = ("metrics", "traces")
+# Products with an object-store oracle and a cold battery (`cold.py`).
+COLD_PRODUCTS = ("logs", "metrics", "traces")
 DEFAULT_METRICS_ORACLES = ("prometheus", "mimir")
 
 
@@ -225,6 +229,8 @@ def jobs(plan: Plan) -> list[Job]:
     planned = []
     for scenario in plan.scenarios:
         for product in plan.products:
+            if scenario == "cold" and product not in COLD_PRODUCTS:
+                continue
             if product == "metrics" and scenario == "recent":
                 planned += [Job(product, scenario, o) for o in plan.metrics_oracles]
             else:

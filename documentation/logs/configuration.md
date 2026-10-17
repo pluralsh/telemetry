@@ -157,9 +157,23 @@ write:
   # up to two frozen deltas, and queued request payloads.
   buffer_queue_capacity: 10000
   buffer_flush_interval_milliseconds: 30000
-  buffer_size_threshold_bytes: 67108864 # 64 MiB.
+  # 16 MiB. The write budget below flushes a buffer at its size whatever
+  # this threshold is.
+  buffer_size_threshold_bytes: 16777216
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
+
+memory:
+  # Process-wide bound on the bytes queries decode at once; defaults to
+  # request.max_in_flight_query_bytes.
+  decode_bytes: 214748364
+  # Process-wide bound on applied writes not yet in storage, 16 MiB by
+  # default. Each flush costs about 23 times its bytes while it builds its
+  # storage writes, and a reader replaying the writer's WAL holds about one
+  # flush, so this bounds both. Ingest beyond it is answered with HTTP 429
+  # and Retry-After (gRPC UNAVAILABLE); requests larger than a quarter of it
+  # are written a quarter at a time, and rollup copies use at most half.
+  write_bytes: 16777216
 
 sharding:
   # Storage-shard count fixed when the dataset is created.
@@ -214,6 +228,7 @@ request:
   max_structured_metadata_fields: 128 # Per-entry metadata field limit.
   query_concurrency: 16 # Concurrent query work.
   max_in_flight_query_bytes: 134217728 # Query memory budget; 128 MiB, or a size from the memory limit under the operator.
+  max_in_flight_body_bytes: 536870912 # Bytes all in-flight request bodies hold at once, HTTP and gRPC: as received, decoded, and parsed (twice the decoded size). Over it, requests get 429 with Retry-After (gRPC UNAVAILABLE); one that alone needs more gets 413. 512 MiB; the operator renders 512 MiB for writers and 64 MiB for readers, less when a small limit caps the reservation.
 
 # Mapping for Elasticsearch _bulk documents; see the Logs APIs page.
 # Per-request _msg_field, _time_field, and _stream_fields parameters override it.

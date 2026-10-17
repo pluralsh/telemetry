@@ -412,7 +412,8 @@ class Runner:
 
 
 def run_fuzz(product_type: type[FuzzProduct]) -> Summary:
-    """Build config from the environment, bring up the stack, and fuzz it.
+    """Build config from the environment, bring up the stack, and fuzz it
+    (or, in the `cold` scenario, run the cold battery; see `cold.py`).
 
     The budget covers fuzzing only; image builds and stack startup happen
     before it starts, so bound those with the CI job timeout instead.
@@ -427,9 +428,17 @@ def run_fuzz(product_type: type[FuzzProduct]) -> Summary:
         layout: dict[str, Any] = {"docker": collect_docker()}
         if isinstance(project, ComposeProject) and project.cpu_layout is not None:
             layout["cpus"] = project.cpu_layout.describe()
-        summary = Runner(
-            product, config, _sampler(project, product, config), layout=layout
-        ).run()
+        sampler = _sampler(project, product, config)
+        if config.cold is not None:
+            from .cold import ColdRunner
+
+            if not isinstance(project, ComposeProject):
+                raise ValueError(
+                    "FUZZ_SCENARIO=cold restarts services: FUZZ_STACK=compose"
+                )
+            summary = ColdRunner(product, config, project, sampler, layout).run()
+        else:
+            summary = Runner(product, config, sampler, layout=layout).run()
         if root is not None and isinstance(project, ComposeProject):
             images = collect_images(project.name)
     if root is not None:

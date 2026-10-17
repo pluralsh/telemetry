@@ -14,23 +14,23 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{
     Delta, Durability as CoordinatorDurability, Flusher, WriteCoordinator, WriteCoordinatorHandle,
-    WriteError,
+    WriteError, WriteHandle,
 };
 use common::discovery::{
     CatalogBatch, DiscoveryCache, DiscoveryValue, names as catalog_names, values as catalog_values,
 };
 use common::storage::compaction::{MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
+use common::storage::slate::warm::WarmPlan;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
-    BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
-    StorageSemantics, create_storage_read,
+    BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics, WarmWindow,
+    create_storage_read,
 };
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use slatedb::config::DbReaderOptions;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
-use tokio_util::sync::CancellationToken;
 
 use crate::Namespace;
 use crate::analyzer::DEFAULT_ANALYZER;
@@ -45,6 +45,7 @@ use crate::codec::{
 use crate::compaction::{Compactor, WrittenObject};
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::memory::{BudgetPermit, MemoryBudget, WritePermit, Writer};
 use crate::model::{
     Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
 };
@@ -56,12 +57,14 @@ use crate::search::{
 mod block_cache;
 mod query;
 mod rollup;
+mod unfiltered;
 mod write;
 
 pub(crate) use block_cache::BlockCache;
 #[cfg(feature = "bench-internals")]
 pub(crate) use query::run_entries;
 pub(crate) use query::{Boundaries, MetadataNeeds, SampleRead, ScanTargets, StreamFilter};
+use unfiltered::UnfilteredReads;
 use write::*;
 
 /// Read units fetched concurrently within one query segment.
@@ -88,6 +91,14 @@ const SEGMENT_LIST_CONCURRENCY: usize = 32;
 /// object-store round trips, which segments read together overlap, and
 /// [`DECODE_BYTES_IN_FLIGHT`] bounds what they hold.
 const SEGMENT_READ_CONCURRENCY: usize = 16;
+/// Segments past the one being consumed whose streams an early-stopping log
+/// read selects ahead. Cold, a segment's selection is a few dependent
+/// object-store round trips, so selecting segment by segment costs a day's
+/// read those round trips 24 times over; each selected segment holds only
+/// its stream metadata and the read units [`PIPELINE_UNITS`] admits.
+const SEGMENT_LOOKAHEAD: usize = 4;
+/// Read units an early-stopping log read keeps in flight across segments.
+const PIPELINE_UNITS: usize = 2 * PAGE_READ_CONCURRENCY;
 /// Estimated decoded bytes a budget's read units may hold at once, which
 /// bounds the memory concurrent segments add.
 const DECODE_BYTES_IN_FLIGHT: u32 = 256 << 20;
@@ -113,6 +124,13 @@ pub(crate) struct ReadTuning {
     /// Whether the runs of streams the exact labels alone select are read
     /// while their labels are.
     pub(crate) overlap_runs: bool,
+    /// [`SEGMENT_LOOKAHEAD`]; zero reads segment by segment, selecting only
+    /// the next segment's streams meanwhile.
+    pub(crate) segment_lookahead: usize,
+    /// [`PIPELINE_UNITS`].
+    pub(crate) pipeline_units: usize,
+    /// Whether queries read through [`UnfilteredReads`].
+    pub(crate) unfiltered_reads: bool,
 }
 
 impl Default for ReadTuning {
@@ -122,6 +140,9 @@ impl Default for ReadTuning {
             read_concurrency: SEGMENT_READ_CONCURRENCY,
             postings_validate: true,
             overlap_runs: true,
+            segment_lookahead: SEGMENT_LOOKAHEAD,
+            pipeline_units: PIPELINE_UNITS,
+            unfiltered_reads: true,
         }
     }
 }
@@ -131,6 +152,22 @@ pub struct WriteReport {
     pub streams: usize,
     pub pages: usize,
     pub rows: usize,
+}
+
+/// An applied write and the budget it holds.
+struct AppliedWrite {
+    handle: WriteHandle<WriteReport>,
+    permit: WritePermit,
+}
+
+impl AppliedWrite {
+    /// Frees the write's budget once it is in storage, or the writer has
+    /// failed or stopped, so the budget covers every applied delta still in
+    /// memory.
+    async fn written(mut self) {
+        let _ = self.handle.wait(CoordinatorDurability::Written).await;
+        drop(self.permit);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -147,6 +184,19 @@ pub(crate) struct PageBudget {
     limit: usize,
     remaining: AtomicUsize,
     decoding: Semaphore,
+    /// Taken while a unit acquires its permits, so this budget's units take
+    /// both its and the process's in the order they first ask. A unit then
+    /// only ever waits behind units it reads after, or other budgets', and
+    /// those holding permits release them without waiting on it.
+    admission: Mutex<()>,
+}
+
+/// A read unit's share of its [`PageBudget`] and of the process's
+/// [`MemoryBudget`].
+#[derive(Debug)]
+pub(crate) struct DecodePermit<'a> {
+    _budget: SemaphorePermit<'a>,
+    _process: BudgetPermit,
 }
 
 impl PageBudget {
@@ -155,19 +205,27 @@ impl PageBudget {
             limit,
             remaining: AtomicUsize::new(limit),
             decoding: Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize),
+            admission: Mutex::new(()),
         }
     }
 
-    /// Holds `bytes` of decoding until the permit drops. A unit larger than
-    /// the whole allowance waits for it all rather than forever.
-    async fn decode(&self, bytes: u64) -> Result<SemaphorePermit<'_>> {
+    /// Holds `bytes` of decoding in this budget and in `memory` until the
+    /// permit drops. A unit larger than either allowance waits for all of
+    /// it rather than forever.
+    async fn decode(&self, memory: &MemoryBudget, bytes: u64) -> Result<DecodePermit<'_>> {
         let weight = u32::try_from(bytes)
             .unwrap_or(u32::MAX)
             .clamp(1, DECODE_BYTES_IN_FLIGHT);
-        self.decoding
+        let _admission = self.admission.lock().await;
+        let budget = self
+            .decoding
             .acquire_many(weight)
             .await
-            .map_err(|_| Error::Query("decode budget closed".into()))
+            .map_err(|_| Error::Query("decode budget closed".into()))?;
+        Ok(DecodePermit {
+            _budget: budget,
+            _process: memory.decode(u64::from(weight)).await?,
+        })
     }
 
     pub(crate) fn limit(&self) -> usize {
@@ -215,6 +273,8 @@ pub struct LogDb {
     blocks: BlockCache,
     /// This database's ID in `blocks`.
     database_id: u64,
+    /// The process's read and write memory budgets, shared like `blocks`.
+    memory: MemoryBudget,
     /// [`SPAN_SCAN_MIN_STREAMS`], overridable so tests cover both read paths.
     span_scan_min_streams: usize,
     /// [`SPAN_SCAN_MAX_SPREAD`], overridable for profiling.
@@ -312,37 +372,43 @@ impl LogDb {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
-        Self::open_with_cache(config, &cache, &blocks).await
+        let memory = MemoryBudget::new(&config.memory);
+        Self::open_with_cache(config, &cache, &blocks, &memory).await
     }
 
-    /// Opens a writer that uses `cache` and `blocks` instead of building its
-    /// own.
+    /// Opens a writer that uses `cache`, `blocks` and `memory` instead of
+    /// building its own.
     pub(crate) async fn open_with_cache(
         config: Config,
         cache: &SharedDbCache,
         blocks: &BlockCache,
+        memory: &MemoryBudget,
     ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
         let merge_holds = MergeHolds::default();
-        let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(
-                storage_semantics().with_segment_compaction(
-                    SegmentCompaction::new(crate::codec::segment_span)
-                        .with_retention(config.retention)
-                        .with_holds(merge_holds.clone())
-                        .with_superseded(common::storage::rollup::superseded(
-                            crate::codec::KEY_SCOPE,
-                            segment_ns,
-                        ))
-                        .with_unsealed(common::storage::rollup::unsealed(
-                            crate::codec::KEY_SCOPE,
-                            segment_ns,
-                        )),
-                ),
-            )
-            .build()
-            .await?;
+        let storage = StorageBuilder::with_cache_over(
+            &config.storage,
+            cache,
+            crate::memory::slatedb_settings(),
+        )?
+        .with_semantics(
+            storage_semantics().with_segment_compaction(
+                SegmentCompaction::new(crate::codec::segment_span)
+                    .with_retention(config.retention)
+                    .with_holds(merge_holds.clone())
+                    .with_superseded(common::storage::rollup::superseded(
+                        crate::codec::KEY_SCOPE,
+                        segment_ns,
+                    ))
+                    .with_unsealed(common::storage::rollup::unsealed(
+                        crate::codec::KEY_SCOPE,
+                        segment_ns,
+                    )),
+            ),
+        )
+        .build()
+        .await?;
         let storage_read = storage.clone();
         let rolled = storage_read
             .slate_read()
@@ -392,6 +458,7 @@ impl LogDb {
             caches: DiscoveryCaches::new(),
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),
+            memory: memory.clone(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
             project_labels: true,
@@ -403,58 +470,37 @@ impl LogDb {
         })
     }
 
-    /// Warms SlateDB caches for recent log segments in this shard, skipping
-    /// SSTs `tracker` has already warmed.
-    pub async fn warm_recent(
-        &self,
-        namespace: &Namespace,
-        warm_range: Duration,
-        include_payloads: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> Result<()> {
+    /// Adds to `plan` this shard's SSTs of `namespaces`' segments, hourly or
+    /// rolled up, that overlap `window`, each ranked by its segment's end so
+    /// the newest data warms first, with payloads for those overlapping its
+    /// payload window. Filters, about 95% of Logs SST metadata, are left out
+    /// when reads skip them.
+    pub fn plan_warm(&self, namespaces: &[Namespace], window: WarmWindow, plan: &mut WarmPlan) {
         let Some(slate) = self.storage.slate_read() else {
-            return Ok(());
+            return;
         };
         let end_ns = common::time::now_ns();
-        let range_ns = i64::try_from(warm_range.as_nanos()).unwrap_or(i64::MAX);
-        let segments = self.discovery_segments(end_ns.saturating_sub(range_ns), end_ns)?;
-        // A period whose first segment is in range is warmed with it.
-        let periods = self
-            .rollup_periods(&segments)
+        let start_ns = window.metadata_since(end_ns, 1_000_000_000);
+        let payloads_since = window.payloads_since(end_ns, 1_000_000_000);
+        let (recent, older): (Vec<_>, Vec<_>) = slate
+            .segment_sizes()
             .into_iter()
-            .filter(|period| segments.binary_search(period).is_err());
-        let prefixes = segments
-            .iter()
-            .map(|segment| segment_prefix(namespace, *segment))
-            .chain(periods.map(|period| rollup_prefix(namespace, period)))
-            .collect::<Vec<_>>();
-        slate
-            .warm_prefixes(
-                "logs",
-                &prefixes,
-                include_payloads,
-                concurrency,
-                cancel,
-                tracker,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Rollup periods holding `segments`; empty without a rollup.
-    fn rollup_periods<'a>(
-        &self,
-        segments: impl IntoIterator<Item = &'a SegmentId>,
-    ) -> BTreeSet<SegmentId> {
-        let Some(rollup_ns) = self.rollup_ns else {
-            return BTreeSet::new();
-        };
-        segments
-            .into_iter()
-            .map(|segment| segment_for(segment.start_ns, rollup_ns))
-            .collect()
+            .filter_map(|(prefix, _)| {
+                let (namespace, segment, len) = crate::codec::KEY_SCOPE.parse(&prefix).ok()?;
+                let segment_end = segment.end_ns().unwrap_or(i64::MAX);
+                (len == prefix.len()
+                    && namespaces.contains(&namespace)
+                    && segment.start_ns < end_ns
+                    && segment_end > start_ns)
+                    .then_some((prefix, Some(segment_end / 1_000_000)))
+            })
+            .partition(|(_, end_ms)| {
+                payloads_since
+                    .is_some_and(|since| end_ms.is_some_and(|end_ms| end_ms > since / 1_000_000))
+            });
+        let filters = !self.tuning.unfiltered_reads;
+        slate.plan_prefix_metadata(&recent, filters, true, plan);
+        slate.plan_prefix_metadata(&older, filters, false, plan);
     }
 
     #[cfg(test)]
@@ -463,17 +509,25 @@ impl LogDb {
         reader_options: DbReaderOptions,
     ) -> Result<Self> {
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
-        Self::open_reader_with_cache(config, reader_options, &SharedDbCache::default(), &blocks)
-            .await
+        let memory = MemoryBudget::new(&config.memory);
+        Self::open_reader_with_cache(
+            config,
+            reader_options,
+            &SharedDbCache::default(),
+            &blocks,
+            &memory,
+        )
+        .await
     }
 
-    /// Opens a reader that uses `cache` and `blocks`; an empty `cache` falls
-    /// back to the config's own cache settings.
+    /// Opens a reader that uses `cache`, `blocks` and `memory`; an empty
+    /// `cache` falls back to the config's own cache settings.
     pub(crate) async fn open_reader_with_cache(
         config: Config,
         reader_options: DbReaderOptions,
         cache: &SharedDbCache,
         blocks: &BlockCache,
+        memory: &MemoryBudget,
     ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
@@ -494,6 +548,7 @@ impl LogDb {
             caches: DiscoveryCaches::new(),
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),
+            memory: memory.clone(),
             span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
             span_scan_max_spread: SPAN_SCAN_MAX_SPREAD,
             project_labels: true,
@@ -503,6 +558,15 @@ impl LogDb {
             merge_holds: MergeHolds::default(),
             retention: config.retention,
         })
+    }
+
+    /// The storage queries read.
+    fn reads(&self) -> Arc<dyn StorageRead> {
+        if self.tuning.unfiltered_reads {
+            Arc::new(UnfilteredReads(Arc::clone(&self.storage)))
+        } else {
+            Arc::clone(&self.storage)
+        }
     }
 
     /// Segments a query reads at once.
@@ -557,7 +621,30 @@ impl LogDb {
         if groups.is_empty() {
             return Ok(WriteReport::default());
         }
-        let report = self.apply_groups(namespace, groups, None).await?;
+        // Every flush is a subset of what the write budget holds, so a
+        // request larger than a chunk of it is applied a chunk at a time. A
+        // retry after a later chunk fails rewrites the earlier rows, which
+        // reads deduplicate.
+        let mut report = WriteReport {
+            streams: groups.len(),
+            ..WriteReport::default()
+        };
+        let mut chunks = split_groups(groups, self.memory.write_chunk_bytes()).into_iter();
+        while let Some(chunk) = chunks.next() {
+            let (applied, write) = self.apply_write(namespace, chunk, Vec::new(), None).await?;
+            report.pages += applied.pages;
+            report.rows += applied.rows;
+            if chunks.len() == 0 {
+                tokio::spawn(write.written());
+            } else {
+                // A request holds one chunk of the budget at a time.
+                self.write_handle()?
+                    .flush(false)
+                    .await
+                    .map_err(map_write_error)?;
+                write.written().await;
+            }
+        }
         drop(rolled);
 
         if durability != Durability::Applied {
@@ -590,21 +677,67 @@ impl LogDb {
         ops: Vec<RecordOp>,
         wait: Option<Duration>,
     ) -> Result<WriteReport> {
+        let (report, write) = self.apply_write(namespace, groups, ops, wait).await?;
+        tokio::spawn(write.written());
+        Ok(report)
+    }
+
+    async fn apply_write(
+        &self,
+        namespace: &Namespace,
+        groups: StreamGroups,
+        ops: Vec<RecordOp>,
+        wait: Option<Duration>,
+    ) -> Result<(WriteReport, AppliedWrite)> {
         let write = LogsWrite {
             namespace: namespace.clone(),
             groups,
             ops,
         };
         let handle = self.write_handle()?;
+        let permit = self.write_budget(handle, &write, wait).await?;
         let mut write_handle = match wait {
             Some(timeout) => handle.write_timeout(write, timeout).await,
             None => handle.try_write(write).await,
         }
         .map_err(map_write_error)?;
-        write_handle
+        let report = write_handle
             .wait(CoordinatorDurability::Applied)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error)?;
+        Ok((
+            report,
+            AppliedWrite {
+                handle: write_handle,
+                permit,
+            },
+        ))
+    }
+
+    /// Holds `write`'s bytes in the process's write budget: a rollup copy,
+    /// which has a `wait`, waits up to it for room in its half; ingest fails
+    /// at once without room. Only written deltas free the budget, so a write
+    /// that finds its share full first asks for the applied ones to be
+    /// flushed rather than wait for the flush interval; a copy holding its
+    /// whole half would otherwise wait out its timeout on its own writes.
+    async fn write_budget(
+        &self,
+        handle: &WriteCoordinatorHandle<LogsWriteDelta>,
+        write: &LogsWrite,
+        wait: Option<Duration>,
+    ) -> Result<WritePermit> {
+        let bytes = write.estimated_bytes();
+        let writer = if wait.is_some() {
+            Writer::Copy
+        } else {
+            Writer::Ingest
+        };
+        if !self.memory.write_fits(writer, bytes) {
+            handle.flush(false).await.map_err(map_write_error)?;
+        }
+        self.memory
+            .write(writer, bytes, wait.unwrap_or(Duration::ZERO))
+            .await
     }
 
     /// Writes every applied delta to storage.
@@ -639,5 +772,7 @@ fn unix_time_ms() -> Result<u64> {
     common::time::checked_now_ms().map_err(|error| Error::Invalid(error.to_string()))
 }
 
+#[cfg(test)]
+mod memory_profile;
 #[cfg(test)]
 mod tests;

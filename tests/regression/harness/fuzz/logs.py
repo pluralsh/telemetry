@@ -10,6 +10,7 @@ import re
 import time
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any
 
 from ..canonical import assert_equivalent
 from ..compose import ComposeProject
+from . import cold
+from .cold import ColdProduct, ColdService, ColdStack, scrape
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
 from .rand import (
@@ -55,6 +58,42 @@ SENTINELS = 4
 PUSH_BYTES = 1_000_000
 METADATA_LOOKBACK = 24 * 3600 * SECOND
 FLUSH_TIMEOUT_S = 120
+LOKI_CONFIGS = {
+    "recent": "loki-fuzz.yaml",
+    "historical": "loki-fuzz-historical.yaml",
+    "cold": "loki-fuzz-cold.yaml",
+}
+HOUR = 3600 * SECOND
+DAY = 24 * HOUR
+
+# The cold scenario's day of logs: a fixed set of Kubernetes-style streams
+# (namespace x app x pod x container) writing logfmt request logs at skewed
+# rates, pushed hour by hour.
+COLD_JOB = "fuzz-cold"
+COLD_NAMESPACES = ("payments", "checkout", "search", "identity", "platform", "data")
+COLD_APPS = ("api", "worker", "gateway")
+COLD_CONTAINERS = ("app", "proxy")
+COLD_PODS = 4
+COLD_ENTRIES = 1_000_000
+# A token in about one line in 2000: a needle search reads every chunk but
+# returns few lines.
+COLD_NEEDLE = "deadline_exceeded"
+COLD_NEEDLE_RATE = 0.0005
+COLD_LIMIT = 1000
+COLD_STEPS = {1: 60, 6: 300, 24: 900}
+# Logs counts no rollup passes, so the cold rollup settle reads its log: the
+# rollup module logs every segment it starts and seals at info, and the
+# server a failed pass at warn.
+ROLLUP_LOG = "error,plural_logs_server=warn,plural_logs::db::rollup=info"
+ROLLUP_STARTED = "starting logs rollup segment"
+ROLLUP_SEALED = "sealed logs rollup segment"
+ROLLUP_FAILED = "Logs segment rollup failed"
+# Loki's compactor first runs one `compaction_interval` (10 minutes) after it
+# starts; settling restarts Loki with this interval instead and waits for two
+# successful runs, the second finding the first's work done.
+LOKI_COMPACTION_INTERVAL = "10s"
+LOKI_COMPACTIONS = "loki_boltdb_shipper_compact_tables_operation_total"
+LOKI_COMPACTION_TIMEOUT_S = 600.0
 
 APPS = ("checkout", "cart", "search", "auth", "billing", "gateway", "worker", "cron")
 ENVS = ("prod", "staging", "dev")
@@ -266,7 +305,69 @@ def _gauge(exposition: str, name: str) -> float:
     return total
 
 
-class LogsFuzz(FuzzProduct):
+def rollup_progress(log: str) -> tuple[int, int, int]:
+    """Rollup segments a Logs server's log shows started and sealed, and
+    rollup passes that failed."""
+    lines = log.splitlines()
+    return (
+        sum(ROLLUP_STARTED in line for line in lines),
+        sum(ROLLUP_SEALED in line for line in lines),
+        sum(ROLLUP_FAILED in line for line in lines),
+    )
+
+
+class RollupLogWatch:
+    """Whether a Logs server started with `ROLLUP_LOG` has rolled up all it
+    will: every rollup segment it started is sealed, and nothing new started
+    for `quiet_s`, longer than two rollup intervals, so a whole pass found
+    nothing left. The quiet time counts from the first call, made once the
+    server is ready."""
+
+    def __init__(
+        self,
+        read_log: Callable[[], str],
+        quiet_s: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.read_log = read_log
+        self.quiet_s = quiet_s
+        self.clock = clock
+        self.progress: tuple[int, int, int] | None = None
+        self.changed = 0.0
+
+    def __call__(self) -> bool:
+        progress = rollup_progress(self.read_log())
+        started, sealed, failed = progress
+        if failed:
+            raise RuntimeError(f"{failed} Logs rollup passes failed while settling")
+        now = self.clock()
+        if progress != self.progress:
+            self.progress, self.changed = progress, now
+        return started == sealed and now - self.changed >= self.quiet_s
+
+
+def loki_compactions(scrape: str) -> float:
+    """Successful Loki compactor runs in a Prometheus scrape."""
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in scrape.splitlines()
+        if line.startswith(LOKI_COMPACTIONS + "{") and 'status="success"' in line
+    )
+
+
+def loki_compactor_config(config: Path) -> str:
+    """Loki's `config` with its compactor running every
+    `LOKI_COMPACTION_INTERVAL`."""
+    text = config.read_text()
+    if re.search(r"^compactor:", text, re.MULTILINE):
+        raise ValueError(f"{config} already configures the compactor")
+    return (
+        f"{text.rstrip()}\ncompactor:\n"
+        f"  compaction_interval: {LOKI_COMPACTION_INTERVAL}\n"
+    )
+
+
+class LogsFuzz(FuzzProduct, ColdProduct):
     name = "logs"
     default_window = "20m"
     resource_roles = {"loki-fuzz": "oracle", "logs": "impl", "logs-s3": "impl"}
@@ -285,8 +386,10 @@ class LogsFuzz(FuzzProduct):
             raise ValueError(
                 "FUZZ_LOGS_CONFIG=production requires FUZZ_LOGS_STORAGE=s3"
             )
-        if config.historical and self.storage != "s3":
-            raise ValueError("FUZZ_SCENARIO=historical requires FUZZ_LOGS_STORAGE=s3")
+        if config.object_store and self.storage != "s3":
+            raise ValueError(
+                f"FUZZ_SCENARIO={config.scenario} requires FUZZ_LOGS_STORAGE=s3"
+            )
         namespace = os.environ.get("FUZZ_LOGS_NAMESPACE", "regression")
         self.impl_service = "logs-s3" if self.storage == "s3" else "logs"
         self.impl_url = service_url(
@@ -309,15 +412,15 @@ class LogsFuzz(FuzzProduct):
         self.unaligned_rate = float(os.environ.get("FUZZ_LOGS_UNALIGNED_RATE", "0.5"))
         self.window_ns = int(config.window_s * SECOND)
         self.catalog = Catalog()
+        self.cold_end = 0
+        self.cold_counts: dict[str, int] = defaultdict(int)
 
     def stack(self) -> AbstractContextManager[object]:
         services = ["loki-fuzz", self.impl_service]
         if self.storage == "s3":
             services[1:1] = ["minio", "minio-init"]
         os.environ["LOGS_CONFIG_DIR"] = IMPL_CONFIG_DIRS[self.impl_config]
-        os.environ["LOKI_FUZZ_CONFIG"] = (
-            "loki-fuzz-historical.yaml" if self.config.historical else "loki-fuzz.yaml"
-        )
+        os.environ["LOKI_FUZZ_CONFIG"] = LOKI_CONFIGS[self.config.scenario]
         return fuzz_stack(
             self.config,
             lambda: ComposeProject(
@@ -334,7 +437,11 @@ class LogsFuzz(FuzzProduct):
         if not self.config.historical:
             return
         # Loki skips the ingesters here, so a round is only visible once every
-        # chunk it touched is in MinIO. /flush is asynchronous.
+        # chunk it touched is in MinIO.
+        self._flush_loki(f"round {index}")
+
+    def _flush_loki(self, what: str) -> None:
+        """/flush is asynchronous: waits until Loki holds no chunk in memory."""
         request = urllib.request.Request(f"{self.loki_url}/flush", method="POST")
         with urllib.request.urlopen(request, timeout=30):
             pass
@@ -347,9 +454,7 @@ class LogsFuzz(FuzzProduct):
             ):
                 return
             time.sleep(0.2)
-        raise RuntimeError(
-            f"Loki did not flush round {index} within {FLUSH_TIMEOUT_S}s"
-        )
+        raise RuntimeError(f"Loki did not flush {what} within {FLUSH_TIMEOUT_S}s")
 
     def floor_urls(self) -> dict[str, str]:
         urls = {
@@ -366,6 +471,307 @@ class LogsFuzz(FuzzProduct):
             "storage": self.storage,
             "impl_config": self.impl_config,
         }
+
+    # Cold reads --------------------------------------------------------------
+
+    def cold_services(self) -> dict[str, ColdService]:
+        return {
+            "impl": ColdService(
+                self.impl_service,
+                f"{self.impl_url}/-/ready",
+                metrics_url=f"{self.impl_url}/metrics",
+            ),
+            "oracle": ColdService(
+                "loki-fuzz", f"{self.loki_url}/ready", "loki-fuzz-data"
+            ),
+        }
+
+    def _cold_selector(self, **matchers: str) -> str:
+        labels = {**matchers, "job": COLD_JOB, "fuzz_run": self.config.run_id}
+        return "{" + ", ".join(f"{k}={quote(v)}" for k, v in labels.items()) + "}"
+
+    def _cold_streams(self, rng: random.Random) -> list[tuple[dict[str, str], float]]:
+        pods = max(1, round(COLD_PODS * self.config.scale))
+        streams = []
+        for rank, namespace in enumerate(COLD_NAMESPACES):
+            for app in COLD_APPS:
+                for pod in range(pods):
+                    for container in COLD_CONTAINERS:
+                        labels = {
+                            "fuzz_run": self.config.run_id,
+                            "job": COLD_JOB,
+                            "namespace": namespace,
+                            "app": app,
+                            "pod": f"{namespace}-{app}-{pod}",
+                            "container": container,
+                        }
+                        weight = (3.0 if container == "app" else 1.0) / (1 + rank)
+                        streams.append((labels, weight * rng.uniform(0.5, 1.5)))
+        return streams
+
+    def cold_load(self, rng: random.Random, end_ns: int) -> Iterator[Batch]:
+        assert self.config.cold is not None
+        span = int(self.config.cold.span_s * SECOND)
+        start = end_ns - span
+        streams = self._cold_streams(rng)
+        weights = sum(weight for _, weight in streams)
+        total = round(COLD_ENTRIES * self.config.scale)
+        rates = [total * weight / weights / span for _, weight in streams]
+        carry = [0.0] * len(streams)
+        self.cold_end = end_ns
+        self.cold_counts.clear()
+        self.cold_counts["streams"] = len(streams)
+        for low in range(start, end_ns, HOUR):
+            high = min(low + HOUR, end_ns)
+            pushed = []
+            for index, (labels, _) in enumerate(streams):
+                exact = rates[index] * (high - low) + carry[index]
+                count = int(exact)
+                carry[index] = exact - count
+                if not count:
+                    continue
+                step = (high - low) / count
+                values = [
+                    [str(low + int((k + rng.random()) * step)), self._cold_line(rng)]
+                    for k in range(count)
+                ]
+                pushed.append({"stream": labels, "values": values})
+                self.cold_counts["entries"] += count
+                self.cold_counts["bytes"] += sum(len(value[1]) for value in values)
+            yield from self._batches(pushed, f"cold-{(low - start) // HOUR:02d}")
+
+    def _cold_line(self, rng: random.Random) -> str:
+        level = weighted(
+            rng, [(1, "debug"), (6, "info"), (1.5, "warn"), (0.5, "error")]
+        )
+        if level == "error":
+            status = rng.choice((500, 502, 503))
+        else:
+            status = weighted(
+                rng, [(10, 200), (2, 201), (1, 204), (1, 404), (0.3, 429)]
+            )
+        message = " ".join(rng.choices(WORDS, k=rng.randint(2, 6)))
+        if chance(rng, COLD_NEEDLE_RATE):
+            message += f" {COLD_NEEDLE}"
+            self.cold_counts["needles"] += 1
+        return (
+            f"level={level} method={zipf(rng, METHODS)} path={zipf(rng, PATHS)} "
+            f"status={status} latency_ms={round(rng.lognormvariate(3, 1.0), 1)} "
+            f"bytes={rng.randint(0, 50_000)} trace_id={rng.getrandbits(64):016x} "
+            f"msg={quote(message)}"
+        )
+
+    def cold_flush(self, stack: ColdStack) -> None:
+        assert self.config.cold is not None
+        self._flush_loki("the cold dataset")
+        # Loki builds TSDB index files from its head of flushed series every
+        # 15 minutes and when it stops, and uploads them on stop; queriers
+        # without that local head find series only in uploaded files.
+        settings = self.config.cold
+        services = self.cold_services()
+        oracle, impl = services["oracle"], services["impl"]
+        stack.stop(oracle)
+        listing = stack.mc("ls", "--recursive", "local/loki-fuzz/index/")
+        first = (self.cold_end - int(settings.span_s * SECOND)) // DAY
+        missing = [
+            table
+            for table in range(first, (self.cold_end - 1) // DAY + 1)
+            if f"index_{table}/" not in listing
+        ]
+        if missing:
+            raise RuntimeError(f"Loki uploaded no TSDB index for day tables {missing}")
+        report: dict[str, Any] = {
+            "before": self._cold_layout(stack, impl),
+            "settle_s": {},
+        }
+        timings = report["settle_s"]
+        ready_timeout_s = settings.ready_timeout_s
+        if settings.compaction:
+            loki_config = PRODUCT_DIR / LOKI_CONFIGS["cold"]
+            loki_metrics = f"{self.loki_url}/metrics"
+            timings["loki_compactor"] = stack.settle_on(
+                oracle,
+                config=loki_config,
+                text=loki_compactor_config(loki_config),
+                env="LOKI_FUZZ_CONFIG_PATH",
+                settled=lambda: loki_compactions(scrape(loki_metrics)) >= 2,
+                wipe=True,
+                ready_timeout_s=ready_timeout_s,
+                timeout_s=LOKI_COMPACTION_TIMEOUT_S,
+                poll_s=2.0,
+                what="its compactor",
+            )
+        else:
+            stack.start(oracle, wipe=True, ready_timeout_s=ready_timeout_s)
+        if settings.rollups:
+            config_dir = PRODUCT_DIR / IMPL_CONFIG_DIRS[self.impl_config]
+            timings["rollups"] = stack.settle_rollups(
+                impl,
+                config=config_dir / "logs-s3.yaml",
+                env="LOGS_S3_CONFIG",
+                settled=RollupLogWatch(
+                    lambda: stack.service_log(impl),
+                    quiet_s=2 * cold.ROLLUP_SETTLE_INTERVAL_S + 5,
+                ),
+                environment={"LOGS_RUST_LOG": ROLLUP_LOG},
+                ready_timeout_s=ready_timeout_s,
+            )
+        if settings.compaction:
+            assert impl.metrics_url is not None
+            timings["impl_compaction"], report["impl_compaction"] = (
+                stack.settle_compaction(impl, metrics_url=impl.metrics_url)
+            )
+        report["settle_s"] = {name: round(value, 1) for name, value in timings.items()}
+        if timings:
+            report["after"] = self._cold_layout(stack, impl)
+        print(f"cold logs: settled {report['settle_s']}", flush=True)
+        for when in ("before", "after"):
+            if when in report:
+                summary = report[when]["summary"]
+                print(f"cold logs: layout {when} settling: {summary}", flush=True)
+        path = self.config.output_dir / "cold_settle.json"
+        path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    def _cold_layout(self, stack: ColdStack, impl: ColdService) -> dict[str, Any]:
+        """Both sides' objects in MinIO, the implementation's SlateDB layout
+        as its manifest has it, and a one-line summary of the two."""
+        assert impl.metrics_url is not None
+        objects = {
+            "impl": stack.bucket_layout("local/logs-fuzz/"),
+            "oracle": stack.bucket_layout("local/loki-fuzz/index/"),
+        }
+        manifest = cold.compaction_state(scrape(impl.metrics_url))
+
+        def total(side: str, match: Callable[[str], bool]) -> dict[str, int]:
+            entries = [v for k, v in objects[side].items() if match(k)]
+            return {
+                "objects": sum(e["objects"] for e in entries),
+                "mib": sum(e["bytes"] for e in entries) >> 20,
+                "largest_mib": max((e["largest"] for e in entries), default=0) >> 20,
+            }
+
+        return {
+            "objects": objects,
+            "manifest": manifest,
+            "summary": {
+                "impl_ssts": total("impl", lambda key: key.endswith("/compacted")),
+                "impl_wal": total("impl", lambda key: key.endswith("/wal")),
+                "impl_manifest": {
+                    name.removeprefix("slatedb_db_"): int(manifest.get(name, 0))
+                    for name in cold.SLATEDB_LAYOUT[:3]
+                },
+                "loki_index_files": total("oracle", lambda key: True),
+            },
+        }
+
+    def cold_probes(self) -> list[Probe]:
+        assert self.config.cold is not None
+        expected = self.cold_counts["entries"]
+        hours = math.ceil(self.config.cold.span_s / 3600) + 1
+        query = f"sum(count_over_time({self._cold_selector()} [{hours}h]))"
+
+        def ready(exchange: Exchange) -> bool:
+            if not exchange.ok():
+                return False
+            try:
+                result = exchange.json()["data"]["result"]
+                return bool(result) and float(result[0]["value"][1]) == expected
+            except (ValueError, KeyError, IndexError, TypeError):
+                return False
+
+        return [
+            Probe(
+                "entries",
+                Request(
+                    "GET",
+                    "/loki/api/v1/query",
+                    (("query", query), ("time", str(self.cold_end))),
+                ),
+                ready,
+            )
+        ]
+
+    def cold_battery(self, rng: random.Random) -> list[Case]:
+        end = self.cold_end
+        busy = rng.choice(COLD_NAMESPACES[:3])
+        everything = self._cold_selector()
+        namespace = self._cold_selector(namespace=busy)
+
+        def logs(family: str, query: str, hours: int) -> Case:
+            params = (
+                ("query", query),
+                ("start", str(end - hours * HOUR)),
+                ("end", str(end)),
+                ("limit", str(COLD_LIMIT)),
+                ("direction", "backward"),
+            )
+            return Case(
+                f"{family}.{hours}h",
+                query,
+                Request("GET", "/loki/api/v1/query_range", params),
+                loki_comparator(COLD_LIMIT),
+            )
+
+        def metric(family: str, template: str, hours: int) -> Case:
+            step = COLD_STEPS[hours]
+            query = template.replace("{range}", f"{step}s")
+            high = end - end % (step * SECOND)
+            params = (
+                ("query", query),
+                ("start", str(high - hours * HOUR)),
+                ("end", str(high)),
+                ("step", str(step)),
+            )
+            return Case(
+                f"{family}.{hours}h",
+                query,
+                Request("GET", "/loki/api/v1/query_range", params),
+                _metric_comparator(query),
+            )
+
+        day = (("start", str(end - DAY)), ("end", str(end)))
+        needle = f"{everything} |= {quote(COLD_NEEDLE)}"
+        errors = f'{namespace} |= "level=error"'
+        by_level = (
+            "sum by (level) (count_over_time("
+            + everything
+            + " | logfmt | keep level [{range}]))"
+        )
+        by_namespace = (
+            "sum by (namespace) (count_over_time("
+            + everything
+            + ' |= "level=error" [{range}]))'
+        )
+        by_app = "sum by (app) (rate(" + namespace + " [{range}]))"
+        return [
+            logs("log.needle", needle, 1),
+            logs("log.needle", needle, 24),
+            *(logs("log.errors.namespace", errors, hours) for hours in (1, 6, 24)),
+            *(metric("metric.count_by_level", by_level, hours) for hours in (6, 24)),
+            metric("metric.errors_by_namespace", by_namespace, 24),
+            *(metric("metric.rate_by_app", by_app, hours) for hours in (1, 6)),
+            Case(
+                "series.namespace.24h",
+                namespace,
+                Request("GET", "/loki/api/v1/series", (("match[]", namespace), *day)),
+                loki_comparator(None),
+            ),
+            Case(
+                "labels.24h",
+                "labels",
+                Request("GET", "/loki/api/v1/labels", day),
+                loki_comparator(None),
+            ),
+            Case(
+                "label_values.pod.24h",
+                "pod",
+                Request("GET", "/loki/api/v1/label/pod/values", day),
+                loki_comparator(None),
+            ),
+        ]
+
+    def cold_stats(self) -> dict[str, Any]:
+        return dict(self.cold_counts)
 
     # Data generation ---------------------------------------------------------
 

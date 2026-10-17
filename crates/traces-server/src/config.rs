@@ -143,6 +143,9 @@ pub struct Config {
     pub write: WriteConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
+    /// Merged over [`server_common::warmer::reader_warmer_defaults`]: keys a
+    /// config leaves out keep the reader defaults.
+    #[serde(deserialize_with = "server_common::warmer::deserialize_reader_warmer")]
     pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub usage_reporting: UsageReportingConfig,
@@ -165,7 +168,7 @@ impl Default for Config {
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
-            cache_warmer: CacheWarmerConfig::default(),
+            cache_warmer: server_common::warmer::reader_warmer_defaults(),
             auth: AuthConfig::default(),
             usage_reporting: UsageReportingConfig::default(),
             namespaces: vec![NamespaceConfig {

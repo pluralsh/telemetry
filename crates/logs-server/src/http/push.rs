@@ -5,11 +5,13 @@ use super::*;
 pub(super) async fn loki_push(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    ticket: Option<Extension<BodyTicket>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_namespace(&state, &namespace, &headers, Permission::Write).await?;
     let request = &state.config.request;
+    let ticket = ticket.as_ref().map(|ticket| &ticket.0);
     let content_type = content_type(&headers).unwrap_or("application/x-protobuf");
     let protobuf = matches!(
         content_type,
@@ -17,12 +19,14 @@ pub(super) async fn loki_push(
     );
     check_content_encoding(&headers, protobuf)?;
     let batches = if content_type == "application/json" {
+        hold_parsed(ticket, body.len())?;
         parse_json_push(&body, request.max_structured_metadata_fields)?
     } else if protobuf {
         parse_protobuf_push(
             &body,
             request.max_structured_metadata_fields,
             request.max_decoded_request_bytes,
+            ticket,
         )?
     } else {
         return Err(ApiError::unsupported_media(
@@ -135,7 +139,11 @@ fn parse_protobuf_push(
     body: &[u8],
     metadata_limit: usize,
     decoded_limit: usize,
+    ticket: Option<&BodyTicket>,
 ) -> Result<Vec<LogBatch>, ApiError> {
+    let length = snappy_decoded_len(body, decoded_limit)?;
+    body_budget::reserve(ticket, length)?;
+    hold_parsed(ticket, length)?;
     let decoded = unsnappy_bounded(body, decoded_limit)?;
     let request = PushRequest::decode(decoded.as_slice()).map_err(ApiError::bad_request)?;
     request
@@ -182,11 +190,13 @@ fn parse_protobuf_push(
 pub(super) async fn otlp_logs(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    ticket: Option<Extension<BodyTicket>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let json_request = content_type(&headers) == Some("application/json");
-    match otlp_logs_result(&state, namespace, headers, body).await {
+    let ticket = ticket.as_ref().map(|ticket| &ticket.0);
+    match otlp_logs_result(&state, namespace, headers, body, ticket).await {
         Ok(response) => response,
         Err(error) => error.into_otlp_response(json_request),
     }
@@ -197,9 +207,11 @@ async fn otlp_logs_result(
     namespace: String,
     headers: HeaderMap,
     body: Bytes,
+    ticket: Option<&BodyTicket>,
 ) -> Result<Response, ApiError> {
     authorize_namespace(state, &namespace, &headers, Permission::Write).await?;
     check_content_encoding(&headers, false)?;
+    hold_parsed(ticket, body.len())?;
     let json_request = content_type(&headers) == Some("application/json");
     let request: ExportLogsServiceRequest = if json_request {
         serde_json::from_slice(&body).map_err(ApiError::bad_request)?

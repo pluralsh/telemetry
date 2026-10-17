@@ -14,6 +14,7 @@ mod config;
 mod db;
 mod error;
 pub mod logql;
+mod memory;
 mod merge;
 mod model;
 mod object;
@@ -29,10 +30,11 @@ pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
 pub use config::{
     CompactionConfig, Config, DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
     DEFAULT_RESULT_CACHE_CAPACITY_BYTES, DEFAULT_RETENTION, DEFAULT_STREAM_ID_BLOCK_SIZE,
-    DEFAULT_STREAM_LOCALITY_LABELS, PageConfig,
+    DEFAULT_STREAM_LOCALITY_LABELS, MemoryConfig, PageConfig,
 };
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
+pub use memory::{DEFAULT_DECODE_BUDGET_BYTES, DEFAULT_WRITE_BUDGET_BYTES};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};
 pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,

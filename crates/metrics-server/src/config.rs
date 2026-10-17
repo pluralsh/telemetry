@@ -225,6 +225,9 @@ pub struct Config {
     pub result_cache: ResultCacheConfig,
     pub query: QueryConfig,
     pub rollup: RollupConfig,
+    /// Merged over [`server_common::warmer::reader_warmer_defaults`]: keys a
+    /// config leaves out keep the reader defaults.
+    #[serde(deserialize_with = "server_common::warmer::deserialize_reader_warmer")]
     pub cache_warmer: CacheWarmerConfig,
     pub write: WriteConfig,
     pub request: RequestConfig,
@@ -251,7 +254,7 @@ impl Default for Config {
             result_cache: ResultCacheConfig::default(),
             query: QueryConfig::default(),
             rollup: RollupConfig::default(),
-            cache_warmer: CacheWarmerConfig::default(),
+            cache_warmer: server_common::warmer::reader_warmer_defaults(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),
             sharding: ShardingConfig::default(),

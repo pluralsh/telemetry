@@ -88,15 +88,18 @@ retention_seconds: 5184000 # 60 days.
 reader_cache_capacity: 268435456
 
 cache_warmer:
-  enabled: false
-  warm_range_seconds: 7200
+  enabled: true
+  block_readiness: false
+  warm_range_seconds: 0 # 0 = all live data, bounded by metadata_budget_percent
   timeout_seconds: 30
   concurrency: 2
   include_payloads: false
+  metadata_budget_percent: 75
   continuous:
     enabled: true
     interval_seconds: 10
-    warm_range_seconds: 7200
+    warm_range_seconds: 0
+    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
     include_payloads: true
 
 write:

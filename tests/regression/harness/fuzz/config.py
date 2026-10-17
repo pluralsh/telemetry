@@ -19,9 +19,14 @@ DEFAULT_FAIL_ON = frozenset(
     {"mismatch", "impl_error", "impl_timeout", "unstable_impl", "ingest"}
 )
 
-SCENARIOS = ("recent", "historical")
-# MinIO listens here in the historical scenario, behind the latency proxy.
+SCENARIOS = ("recent", "historical", "cold")
+# Every oracle reads only object storage, behind the MinIO latency proxy.
+OBJECT_STORE_SCENARIOS = ("historical", "cold")
+# MinIO listens here in object-store scenarios, behind the latency proxy.
 HISTORICAL_ENVIRONMENT = {"MINIO_ADDRESS": ":9010"}
+# First-byte delays (`MINIO_FIRST_BYTE_MS`) when unset: the historical
+# scenario keeps its original value; cold reads use a typical S3 GET.
+FIRST_BYTE_MS = {"historical": 15.0, "cold": 20.0}
 
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
 _UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
@@ -108,6 +113,101 @@ def endpoint_from_env(product: str, role: str, default: Endpoint) -> Endpoint:
 
 
 @dataclass(frozen=True)
+class ColdConfig:
+    """The `cold` scenario: a fixed query battery where every measured query
+    goes to a freshly started process with empty caches."""
+
+    # Data spans this much time before the load. Production Logs and Traces
+    # retain 24h, so the default leaves room for the run itself.
+    span_s: float = 22 * 3600.0
+    # Cold measurements of every battery query.
+    repeats: int = 3
+    # Least pause after a restarted service reports ready, before the query
+    # (which also waits for its object-store requests to stop).
+    settle_s: float = 5.0
+    # Re-send each query once on the now-warm process.
+    warm: bool = True
+    ready_timeout_s: float = 300.0
+    # Before measuring, both sides must upload less than `QUIESCE_BYTES` over
+    # a window this long (flushes and compactions done); longer than the
+    # oracles' 30s compaction cycles during settling.
+    quiesce_s: float = 45.0
+    quiesce_timeout_s: float = 900.0
+    first_byte_ms: float = FIRST_BYTE_MS["cold"]
+    # Family-name prefixes to run; empty runs the whole battery.
+    families: tuple[str, ...] = ()
+    # Record every object-store request of each measurement (startup and
+    # query) into `cold_timeline.jsonl`; the proxy reads FUZZ_COLD_TIMELINE too.
+    timeline: bool = False
+    # Run the implementation's rollups to completion while settling, as the
+    # oracles' compactors are, so 24h queries read the rolled-up layout a
+    # long-running server would have instead of a day of hour segments.
+    rollups: bool = True
+    # Let compaction finish while settling, as it does continuously in
+    # production: the implementation's SlateDB compaction until it is
+    # quiescent, and Loki's compactor, which otherwise waits a 10-minute
+    # interval no cold process lives for.
+    compaction: bool = True
+    # Measure the implementation once per start, each on a fresh process:
+    # `off` with startup cache warming disabled, `ready` sending the query as
+    # soon as it is ready, `warm` after its startup warm pass ended, `idle`
+    # as without this setting. Empty measures `idle` alone.
+    impl_starts: tuple[str, ...] = ()
+
+    @classmethod
+    def from_env(cls) -> ColdConfig:
+        value = cls(
+            span_s=parse_duration(_env("FUZZ_COLD_SPAN", "22h")),
+            repeats=int(_env("FUZZ_COLD_REPEATS", "3")),
+            settle_s=parse_duration(_env("FUZZ_COLD_SETTLE", "5s")),
+            warm=_flag("FUZZ_COLD_WARM", True),
+            ready_timeout_s=parse_duration(_env("FUZZ_COLD_READY_TIMEOUT", "5m")),
+            quiesce_s=parse_duration(_env("FUZZ_COLD_QUIESCE", "45s")),
+            quiesce_timeout_s=parse_duration(_env("FUZZ_COLD_QUIESCE_TIMEOUT", "15m")),
+            first_byte_ms=float(
+                _env("MINIO_FIRST_BYTE_MS", f"{FIRST_BYTE_MS['cold']:g}")
+            ),
+            families=tuple(
+                item.strip()
+                for item in _env("FUZZ_COLD_FAMILIES", "").split(",")
+                if item.strip()
+            ),
+            timeline=_flag("FUZZ_COLD_TIMELINE", False),
+            rollups=_flag("FUZZ_COLD_ROLLUPS", True),
+            compaction=_flag("FUZZ_COLD_COMPACTION", True),
+            impl_starts=tuple(
+                item.strip()
+                for item in _env("FUZZ_COLD_IMPL_STARTS", "").split(",")
+                if item.strip()
+            ),
+        )
+        if value.repeats < 1:
+            raise ValueError("FUZZ_COLD_REPEATS must be at least 1")
+        unknown = set(value.impl_starts) - {"off", "ready", "warm", "idle"}
+        if unknown:
+            raise ValueError(f"FUZZ_COLD_IMPL_STARTS: unknown starts {sorted(unknown)}")
+        if value.span_s < 3600:
+            raise ValueError("FUZZ_COLD_SPAN must be at least 1h")
+        return value
+
+    def selected(self, family: str) -> bool:
+        return not self.families or family.startswith(self.families)
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "span_s": self.span_s,
+            "repeats": self.repeats,
+            "settle_s": self.settle_s,
+            "warm": self.warm,
+            "first_byte_ms": self.first_byte_ms,
+            "family_filter": list(self.families),
+            "rollups": self.rollups,
+            "compaction": self.compaction,
+            "impl_starts": list(self.impl_starts),
+        }
+
+
+@dataclass(frozen=True)
 class FuzzConfig:
     product: str
     duration_s: float
@@ -133,8 +233,11 @@ class FuzzConfig:
     record_data: bool
     # `recent` reads what production serves from memory and fresh storage;
     # `historical` forces every oracle onto object-store reads and puts a
-    # first-byte delay in front of MinIO for both sides.
+    # first-byte delay in front of MinIO for both sides; `cold` does the same
+    # and runs `ColdConfig`'s battery against restarted processes instead of
+    # the randomized round loop.
     scenario: str = "recent"
+    cold: ColdConfig | None = None
 
     @classmethod
     def from_env(cls, product: str, *, default_window: str) -> FuzzConfig:
@@ -168,7 +271,10 @@ class FuzzConfig:
             queries_per_round=parse_range(_env("FUZZ_QUERIES_PER_ROUND", "40-160")),
             max_rounds=int(_env("FUZZ_MAX_ROUNDS", "0")),
             max_cases=int(_env("FUZZ_MAX_CASES", "0")),
-            request_timeout_s=parse_duration(_env("FUZZ_REQUEST_TIMEOUT", "30s")),
+            # Cold day-long scans legitimately take tens of seconds.
+            request_timeout_s=parse_duration(
+                _env("FUZZ_REQUEST_TIMEOUT", "120s" if scenario == "cold" else "30s")
+            ),
             visibility_timeout_s=parse_duration(_env("FUZZ_VISIBILITY_TIMEOUT", "90s")),
             settle_s=parse_duration(_env("FUZZ_SETTLE", "1s")),
             latency_ratio=float(_env("FUZZ_LATENCY_RATIO", "10")),
@@ -179,11 +285,17 @@ class FuzzConfig:
             artifact_bytes=int(_env("FUZZ_ARTIFACT_BYTES", str(256 * 1024))),
             record_data=_flag("FUZZ_RECORD_DATA", True),
             scenario=scenario,
+            cold=ColdConfig.from_env() if scenario == "cold" else None,
         )
 
     @property
     def historical(self) -> bool:
         return self.scenario == "historical"
+
+    @property
+    def object_store(self) -> bool:
+        """Whether every oracle reads only object storage, behind the proxy."""
+        return self.scenario in OBJECT_STORE_SCENARIOS
 
     def describe(self) -> dict[str, object]:
         return {
@@ -205,6 +317,7 @@ class FuzzConfig:
             "latency_floor_ms": self.latency_floor_ms,
             "recheck": self.recheck,
             "fail_on": sorted(self.fail_on),
+            **({"cold": self.cold.describe()} if self.cold else {}),
         }
 
 

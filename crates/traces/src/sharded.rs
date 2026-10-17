@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, OnceLock},
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
-use common::{SharedDbCache, SstWarmTracker};
+use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::{SharedDbCache, WarmWindow};
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
     shard_opener,
@@ -150,37 +150,50 @@ impl ShardedTraces {
             .find(|remote| remote.shard == shard)
     }
 
-    /// Warms recent cache blocks for every open shard and namespace, skipping
-    /// SSTs `tracker` has already warmed.
+    /// Warms the SSTs of `window` across every open shard and namespace,
+    /// newest segment first, into `budget_percent` of the metadata cache.
+    /// SSTs `ledger` holds are skipped, and those compaction removed are
+    /// evicted; see [`warm_planned`]. Without a metadata cache only the
+    /// payload window is warmed.
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
-        warm_range: Duration,
-        include_payloads: bool,
+        window: WarmWindow,
         concurrency: usize,
         cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> Result<()> {
-        self.shards
-            .warm(concurrency, cancel, |database, concurrency| async move {
-                for namespace in namespaces {
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    database
-                        .warm_recent(
-                            namespace,
-                            warm_range,
-                            include_payloads,
-                            concurrency,
-                            cancel,
-                            tracker,
-                        )
-                        .await?;
-                }
-                Ok(())
-            })
-            .await
+        ledger: &WarmLedger,
+        budget_percent: u8,
+    ) -> Result<WarmReport> {
+        let budget = WarmBudget::of(&self.cache, budget_percent);
+        let window = if budget.is_some() {
+            window
+        } else {
+            window.payloads_only()
+        };
+        if budget.is_none() && window.payloads.is_none() {
+            return Ok(WarmReport::default());
+        }
+        let Some((_permits, concurrency)) = self.shards.reserve_io(concurrency, cancel).await?
+        else {
+            return Ok(WarmReport::default());
+        };
+        let mut plan = WarmPlan::default();
+        for database in self.shards.databases().await {
+            if cancel.is_cancelled() {
+                return Ok(WarmReport::default());
+            }
+            database.plan_warm(namespaces, window, &mut plan).await?;
+        }
+        Ok(warm_planned(
+            "traces",
+            plan,
+            budget.unwrap_or(WarmBudget::UNBOUNDED),
+            window.payloads.is_some(),
+            concurrency,
+            cancel,
+            ledger,
+        )
+        .await)
     }
 
     /// Writes to shards opened locally; every routed shard must be open.

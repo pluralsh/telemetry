@@ -518,63 +518,59 @@ async fn should_warm_buckets_resolved_from_segments() {
         .unwrap();
     assert!(buckets.contains(&bucket));
 
-    // when / then: warming the live bucket (with and without samples), an
-    // empty set, and an unknown bucket all succeed. Resolution and the
-    // per-SST fanout run; `warm_sst` itself no-ops because the in-memory
-    // config has no block cache.
-    let cancel = CancellationToken::new();
-    storage
-        .warm(&namespace, buckets.clone(), true, 2, &cancel, None)
-        .await
-        .unwrap();
-    let tracker = common::SstWarmTracker::new(true);
-    storage
-        .warm(
-            &namespace,
-            buckets.clone(),
-            true,
-            2,
-            &cancel,
-            Some(&tracker),
-        )
-        .await
-        .unwrap();
-    tracker.finish_pass();
-    storage
-        .warm(&namespace, buckets, false, 2, &cancel, Some(&tracker))
-        .await
-        .unwrap();
-    storage
-        .warm(&namespace, vec![], true, 2, &cancel, None)
-        .await
-        .unwrap();
-    storage
-        .warm(
-            &namespace,
+    // when / then: the live bucket plans its SSTs, an empty set and an
+    // unknown bucket plan none, and every plan warms without error;
+    // `warm_sst` itself no-ops because the in-memory config has no block
+    // cache.
+    use common::storage::slate::warm::{WarmBudget, WarmLedger, warm_planned};
+    use tokio_util::sync::CancellationToken;
+    let planned = |wanted: Vec<TimeBucket>, include_samples: bool| {
+        let mut plan = WarmPlan::default();
+        storage.plan_warm(
+            &[(namespace.clone(), wanted.into_iter().collect())],
+            include_samples,
+            &mut plan,
+        );
+        plan
+    };
+    assert!(!planned(buckets.clone(), true).is_empty());
+    assert!(planned(vec![], true).is_empty());
+    assert!(
+        planned(
             vec![TimeBucket {
                 start: 999_999,
                 size: 1,
             }],
-            false,
-            2,
-            &cancel,
-            None,
+            false
         )
-        .await
-        .unwrap();
+        .is_empty()
+    );
 
-    // an already-cancelled token short-circuits the warm and still
-    // returns Ok.
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    let buckets = storage
-        .get_buckets_in_range(&namespace, None, None)
-        .await
-        .unwrap();
-    storage
-        .warm(&namespace, buckets, true, 2, &cancelled, None)
-        .await
-        .unwrap();
+    let cancel = CancellationToken::new();
+    let ledger = WarmLedger::new(true);
+    let report = warm_planned(
+        "metrics",
+        planned(buckets.clone(), true),
+        WarmBudget::UNBOUNDED,
+        true,
+        2,
+        &cancel,
+        &ledger,
+    )
+    .await;
+    assert_eq!(report.failed_ssts, 0);
+    assert!(report.warmed_ssts > 0);
+    let again = warm_planned(
+        "metrics",
+        planned(buckets, false),
+        WarmBudget::UNBOUNDED,
+        false,
+        2,
+        &cancel,
+        &ledger,
+    )
+    .await;
+    assert_eq!(again.warmed_ssts, 0, "warmed SSTs are not warmed again");
 
     storage.close().await.unwrap();
 }

@@ -44,6 +44,7 @@ criterion.workspace = true
 mimalloc.workspace = true
 proptest.workspace = true
 serde_yaml.workspace = true
+sysinfo = { version = "0.35.2", default-features = false, features = ["system"] }
 tempfile.workspace = true
 
 [[bench]]

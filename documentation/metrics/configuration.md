@@ -142,6 +142,28 @@ rollup:
   interval_seconds: 300
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
 
+# Readers warm the SST filters and indexes of recent buckets into meta_cache,
+# newest bucket first, in the background: they are ready at once, and queries
+# during the pass find the cache partly warm. Warming stops once it holds
+# metadata_budget_percent of meta_cache, counting what did not fit, and evicts
+# what it warmed of SSTs compaction or rollups removed. Writers never warm.
+# A section that sets only some keys keeps these defaults for the rest. See
+# "Metadata warming" below.
+cache_warmer:
+  enabled: true # Startup pass; false leaves only continuous warming.
+  block_readiness: false # true holds readiness until the pass ends or times out.
+  timeout_seconds: 30 # Applies only with block_readiness.
+  warm_range_seconds: 0 # 0 = all live data, bounded by metadata_budget_percent
+  concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
+  include_payloads: false # true also warms hour buckets' sample blocks into block_cache.
+  metadata_budget_percent: 75
+  continuous: # Every interval, warms SSTs that appeared since the last pass.
+    enabled: true
+    interval_seconds: 10
+    warm_range_seconds: 0
+    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
+    include_payloads: true
+
 write:
   # applied: memory only; written: mutable SlateDB state; durable: object store.
   durability: applied
@@ -246,6 +268,254 @@ namespaces:
 
 The checked-in [`metrics.example.yaml`](../../config/metrics.example.yaml) is a
 runnable local variant of this configuration.
+
+## Metadata warming
+
+Metrics and Traces readers (and standalone servers) warm SST metadata by
+default. This applies to both products; Traces documents its keys in
+[Traces configuration](../traces/configuration.md).
+
+### Where metadata lives
+
+SlateDB's cache splits by entry kind:
+
+- Data blocks go to `storage.block_cache`.
+- SST indexes, bloom filters and SST stats go to `storage.meta_cache`.
+
+Without a `meta_cache`, metadata is not cached at all, and metadata-only
+warming does nothing.
+
+An in-memory cache (`FoyerMemory`) weighs each entry at its payload size plus
+320 bytes. The 320 bytes cover the cache record, its key, its index slot and
+the `Arc` around the decoded index or filter.
+
+A fetched entry is clamped to its logical size, so a filter decoded from a
+larger read buffer does not keep that buffer alive.
+
+Foyer splits a cache's capacity evenly across its shards, and an entry larger
+than its shard's share is evicted as soon as it is inserted. SlateDB's
+default is one shard per CPU, so a small `meta_cache` on a large node could
+not hold a single large index or filter. Unless `meta_cache.shards` is set,
+`meta_cache` therefore uses at most one shard per 16 MiB of capacity (at
+least one).
+
+### The warm pass
+
+A startup pass, and every continuous pass after it, works as follows:
+
+1. It lists the live SSTs of the buckets (Traces: segments, plus the trace
+   locator) inside `warm_range_seconds`. The default, `0`, lists all live
+   data, so metadata warming covers retention and the budget decides how
+   much of it is held. Payloads, when included, are warmed only for the
+   buckets inside the payload range (`payload_warm_range_seconds`, or
+   `warm_range_seconds` when set, or 7200 s): they share `block_cache` with
+   queries, so a long payload range would churn it.
+2. It orders them newest first. Metrics uses the bucket's end; Traces uses
+   the segment's end, and the locator's SST creation time.
+3. It warms each SST's index and filter, up to `concurrency` SSTs at a time,
+   out of `sharding.io_concurrency_limit`.
+
+A ledger records the bytes each warm added to `meta_cache`. These are
+measured, not estimated: every metadata entry the warm fetched is attributed
+to it, whether the warm loaded the entry or found it already cached.
+
+Before an SST starts, its estimate is reserved against the budget, which is
+`metadata_budget_percent` of `meta_cache`. The estimate is the index length
+(×3 when compressed), plus the filter length, plus the per-entry overhead.
+
+When the next SST does not fit:
+
+- At startup, the pass stops. It reports that SST and every older one as
+  skipped for budget, rather than churning the cache by evicting what it just
+  warmed.
+- On a continuous pass, a newer SST takes the room of the oldest SSTs the
+  ledger holds. Their entries stay cached until the cache's own LRU evicts
+  them. When even that is not enough, the pass stops as above.
+
+On every pass, SSTs that are no longer live are forgotten and evicted from
+`meta_cache`, so nothing the warmer did pins them. This covers SSTs removed by
+compaction, by a rollup replacing a bucket, or by retention. The warmer holds
+SST ids only, never cache handles.
+
+Readiness does not wait for the pass unless `block_readiness: true`, which
+also brings back `timeout_seconds`. Queries during the pass read whatever is
+warm by then; because the newest buckets warm first, the dashboards' "last
+hour" queries benefit first.
+
+`continuous.include_payloads` (default `true`) still warms the sample blocks
+of new hour buckets inside the payload range into `block_cache`. Those
+blocks are bounded by `block_cache` and are not counted against the
+metadata budget.
+
+With the default range, `n` below is every live SST, so planning walks the
+whole live set each pass. That is in-memory bookkeeping, about 150 bytes per
+SST; SSTs the ledger already holds are skipped without I/O, and those that do
+not fit the budget are counted without I/O. Startup I/O is bounded by what
+fits the budget: about two reads per warmed SST.
+
+### Memory accounting
+
+In the table below:
+
+- `C` is `meta_cache` capacity and `B = C × metadata_budget_percent / 100`.
+- `D` is `block_cache`'s memory capacity.
+- `N` is the number of live SSTs in all shards.
+- `n` is the number of SSTs inside the warm range: all live SSTs by
+  default.
+- `k` is `concurrency`.
+
+The default-sizing values are what the operator renders for a 4Gi reader
+(`C` = 184 MiB, `D` = 676 MiB). The large-deployment values are for a 16Gi
+reader (`C` = 737 MiB, `D` = 2.7 GiB) over 30 days of 1M series, or heavy
+traces, with about 10k live SSTs.
+
+| Component | Bound | 4Gi reader | 16Gi reader, 30d, 1M series |
+|---|---|---|---|
+| Warmed metadata (part of `meta_cache`) | ≤ `B` | ≤ 138 MiB | ≤ 553 MiB |
+| `meta_cache` (warmed + query-fetched) | ≤ `C` | ≤ 184 MiB | ≤ 737 MiB |
+| Ledger (SST id, bytes, recency per warmed SST) | ≈ 100 B × warmed SSTs ≤ 100 B × `n` | < 1 MiB | ≈ 1 MiB |
+| Plan per pass (SST id, estimate, live-set entry) | ≈ 150 B × `N`, freed after the pass | < 1 MiB | ≈ 1.5 MiB |
+| In-flight warm reads | `k` × (largest index × 4 + largest filter) | ≈ 10 MiB | ≈ 25 MiB |
+| Data blocks from continuous payload warming | ≤ `D`, shared with queries | ≤ 676 MiB | ≤ 2.7 GiB |
+
+Nothing in the table grows with retention or series count beyond the
+per-SST bookkeeping. More metadata than `B` means more SSTs are skipped and
+read cold, not more memory.
+
+The bounds are in weighed cache bytes. In process memory, a warmed byte costs
+about 2 bytes (see below), so plan for up to `2 × B` of footprint from warming,
+and up to `2 × C` for a full `meta_cache` whoever filled it.
+
+### Measured memory
+
+The native profiles measure process footprint (`phys_footprint`, which also
+counts compressed and swapped pages) next to the cache gauges. They live in
+`crates/metrics/src/profile/cold/memory.rs` and
+`crates/traces/src/db/profile.rs`, are `#[ignore]`d, and are run on a store
+whose metadata exceeds the budget:
+
+- Metrics: 27 SSTs, 4.5 MiB of metadata. `meta_cache` is 2 MiB (`B` =
+  1.5 MiB) and `block_cache` 512 MiB.
+- Traces: 3M traces, 109 SSTs, 20.7 MiB of metadata.
+
+Results:
+
+- The ledger always equals `foyer_memory_usage{name="slatedb_meta_cache"}`
+  and the estimate is within 0.1%.
+- Metrics, with a writer adding hours and rolling them up across 60
+  continuous passes:
+  - The ledger stayed at 1.34–1.50 MiB with about 18 SSTs skipped for budget.
+  - Removed SSTs were evicted on most passes.
+  - `meta_cache` never exceeded 2 MiB.
+  - Footprint plateaued at 578 MiB once `block_cache` reached its 512 MiB cap,
+    against 528 MiB predicted.
+  - The writer's WAL replay added up to 200 MiB transiently.
+- Traces: footprint grows linearly with the budget and stays flat across
+  rollup cycles:
+
+  | Budget | Warmed | Footprint over warming off |
+  |---|---|---|
+  | 6 MiB | 5.7 MiB | +9.5 MiB |
+  | 12 MiB | 10.7 MiB | +16 MiB |
+  | 48 MiB (all metadata) | 20.7 MiB | +31 MiB |
+
+- Under concurrent queries the query working set (1–2.5 GiB in these debug
+  builds) dominates, and warming's share is within run-to-run noise.
+
+Each warmed byte costs 1.5–1.7 bytes of footprint. This gap is live memory,
+not allocator retention: it does not change with `MIMALLOC_PURGE_DELAY=0`.
+The weights count only the index and filter buffers, so the likely causes are
+allocator size classes and copies held while a pass runs. The cause has not
+been pinned down, which is why the sizing above uses 2×.
+
+### Measured latency
+
+The cold battery (`FUZZ_SCENARIO=cold`, scale 1, 3 repeats, MinIO +20 ms first
+byte) compares three starts per query with `FUZZ_COLD_IMPL_STARTS=off,ready,warm`:
+warming off, a query right after ready, and a query after the startup pass.
+It ran in both start orders:
+
+| Product | Start | Cold p50 | GETs per query (p50) |
+|---|---|---|---|
+| Metrics | off | 193–206 ms | 24–33 |
+| Metrics | after warm | 164–176 ms | 20–27 |
+| Traces | off | 506–716 ms | 89–106 |
+| Traces | after warm | 360–380 ms | 73–87 |
+
+A query right after ready makes slightly more GETs than with warming off,
+because it fetches metadata the pass is still loading. It was as fast as or
+faster than a query after warm, likely because it runs before the idle settle
+and finds open connections. At this scale the startup pass finishes in under
+0.2 s after ready. It costs 4–6 more startup GETs (20 KiB) for Metrics and
+18 more (260–280 KiB) for Traces.
+
+### Metrics
+
+Each metric is labeled with `product`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `telemetry_cache_warmer_budget_bytes` | gauge | `B` |
+| `telemetry_cache_warmer_warmed_bytes` | gauge | Bytes the ledger holds after the last pass |
+| `telemetry_cache_warmer_warmed_ssts` | gauge | SSTs the ledger holds after the last pass |
+| `telemetry_cache_warmer_planned_bytes` | gauge | Estimated metadata of every SST the last pass considered |
+| `telemetry_cache_warmer_skipped_ssts{reason="budget"}` | gauge | What the last pass left cold because it did not fit |
+| `telemetry_cache_warmer_skipped_bytes{reason="budget"}` | gauge | The skipped SSTs' estimated bytes |
+| `telemetry_cache_warmer_displaced_ssts_total` | counter | Older SSTs forgotten to make room for newer ones |
+| `telemetry_cache_warmer_evicted_ssts_total{status}` | counter | Removed SSTs evicted from `meta_cache` |
+| `telemetry_cache_warmer_ssts_total{status}` | counter | SST warms by outcome |
+| `telemetry_cache_warmer_runs_total{mode,status}` | counter | Passes by mode (`startup`, `continuous`) and outcome |
+| `telemetry_cache_warmer_duration_seconds{mode}` | histogram | Duration of each pass |
+| `foyer_memory_usage{name}` | gauge | Weighed usage of `slatedb_data_cache` and `slatedb_meta_cache` |
+| `foyer_memory_entries{name}` | gauge | Their entry counts |
+| `telemetry_slatedb_cache_capacity_bytes{cache}` | gauge | Their capacities (`cache` is the same name) |
+| `telemetry_slatedb_cache_evictions_total{cache}` | counter | Their evictions |
+
+### Compatibility
+
+- Storage formats are unchanged.
+- The server configs reject unknown keys, so the new keys
+  (`block_readiness`, `metadata_budget_percent`) have defaults and older
+  configs keep parsing.
+- A `cache_warmer` section that sets only some keys keeps the reader
+  defaults for the rest. For example, `cache_warmer: {concurrency: 4}` keeps
+  warming on and readiness non-blocking.
+- To get the earlier behaviour back:
+  - `enabled: false` turns startup warming off. Continuous warming then
+    records the live SSTs on its first pass and warms only newer ones, as
+    before.
+  - `block_readiness: true` holds readiness for the pass.
+- The operator's `cacheWarmer` spec no longer defaults `enabled` to `false`.
+  An unset value renders the product default (on for Metrics and Traces, off
+  for Logs). Specs that set `enabled: false` explicitly keep warming off.
+  Earlier CRDs defaulted it, so a resource that had a `cacheWarmer` section
+  under them has `enabled: false` stored by the API server: remove the field
+  to get the product default.
+
+#### Warm ranges and rolling upgrades
+
+- `warm_range_seconds` used to default to 7200 s for both passes. Its
+  default is now `0`, all live data. An explicit value keeps its meaning:
+  it bounds metadata and, unless `payload_warm_range_seconds` is set,
+  payloads, so a config with `warm_range_seconds: 600` warms exactly what
+  it did before.
+- `payload_warm_range_seconds` is new. Servers that predate it reject it
+  as an unknown key, so the operator renders it only when
+  `payloadWarmRangeSeconds` is set. Set it once every reader runs a server
+  that knows it.
+- The operator renders `warm_range_seconds` only when `warmRangeSeconds`
+  is set to something other than 7200. Earlier CRDs defaulted it to 7200
+  and the API server stored that in existing resources, so 7200 is read as
+  unset; choose 7199 or 7201 to pin a two-hour metadata range. Leaving the
+  key out is safe for every server: older ones apply their own 7200
+  default, newer ones warm all live data.
+- So in any upgrade order, every server parses the config it is given:
+  - Old operator, new servers: the operator still renders 7200, which new
+    servers read as before.
+  - New operator, old servers (for example pods not yet rolled): the key is
+    left out and old servers default to 7200, as before.
+  - New operator, new servers: metadata covers all live data, payloads the
+    last 7200 s.
 
 ## SlateDB defaults
 

@@ -24,20 +24,33 @@ pub(super) async fn bulk(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
     Query(params): Query<BulkParams>,
+    ticket: Option<Extension<BodyTicket>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    bulk_result(&state, namespace, None, params, &headers, &body).await
+    let ticket = ticket.as_ref().map(|ticket| &ticket.0);
+    bulk_result(&state, namespace, None, params, &headers, &body, ticket).await
 }
 
 pub(super) async fn index_bulk(
     State(state): State<AppState>,
     Path((namespace, index)): Path<(String, String)>,
     Query(params): Query<BulkParams>,
+    ticket: Option<Extension<BodyTicket>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    bulk_result(&state, namespace, Some(index), params, &headers, &body).await
+    let ticket = ticket.as_ref().map(|ticket| &ticket.0);
+    bulk_result(
+        &state,
+        namespace,
+        Some(index),
+        params,
+        &headers,
+        &body,
+        ticket,
+    )
+    .await
 }
 
 /// `GET /`, which clients use to detect the server version and product.
@@ -83,9 +96,11 @@ async fn bulk_result(
     params: BulkParams,
     headers: &HeaderMap,
     body: &[u8],
+    ticket: Option<&BodyTicket>,
 ) -> Result<Response, ApiError> {
     authorize_namespace(state, &namespace, headers, Permission::Write).await?;
     check_content_encoding(headers, false)?;
+    hold_parsed(ticket, body.len())?;
     let started = Instant::now();
     let mapping = Mapping::new(
         &state.config.elasticsearch,

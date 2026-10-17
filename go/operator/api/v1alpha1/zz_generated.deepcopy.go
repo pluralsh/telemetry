@@ -297,6 +297,11 @@ func (in *CacheWarmerSpec) DeepCopyInto(out *CacheWarmerSpec) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.PayloadWarmRangeSeconds != nil {
+		in, out := &in.PayloadWarmRangeSeconds, &out.PayloadWarmRangeSeconds
+		*out = new(int64)
+		**out = **in
+	}
 	if in.TimeoutSeconds != nil {
 		in, out := &in.TimeoutSeconds, &out.TimeoutSeconds
 		*out = new(int64)
@@ -310,6 +315,16 @@ func (in *CacheWarmerSpec) DeepCopyInto(out *CacheWarmerSpec) {
 	if in.IncludePayloads != nil {
 		in, out := &in.IncludePayloads, &out.IncludePayloads
 		*out = new(bool)
+		**out = **in
+	}
+	if in.BlockReadiness != nil {
+		in, out := &in.BlockReadiness, &out.BlockReadiness
+		*out = new(bool)
+		**out = **in
+	}
+	if in.MetadataBudgetPercent != nil {
+		in, out := &in.MetadataBudgetPercent, &out.MetadataBudgetPercent
+		*out = new(int32)
 		**out = **in
 	}
 	if in.Continuous != nil {
@@ -344,6 +359,11 @@ func (in *ContinuousCacheWarmerSpec) DeepCopyInto(out *ContinuousCacheWarmerSpec
 	}
 	if in.WarmRangeSeconds != nil {
 		in, out := &in.WarmRangeSeconds, &out.WarmRangeSeconds
+		*out = new(int64)
+		**out = **in
+	}
+	if in.PayloadWarmRangeSeconds != nil {
+		in, out := &in.PayloadWarmRangeSeconds, &out.PayloadWarmRangeSeconds
 		*out = new(int64)
 		**out = **in
 	}

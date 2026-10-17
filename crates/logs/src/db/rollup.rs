@@ -86,7 +86,10 @@ impl LogDb {
         wide: SegmentId,
         config: &RollupConfig,
     ) -> Result<()> {
-        let buffer = config.copy_buffer_bytes;
+        // Half the write budget at most, so ingest keeps the rest of it.
+        let buffer = config
+            .copy_buffer_bytes
+            .min(self.memory.write_capacity() / 2);
         let writer = self.writer()?;
         let ttl = self.marker_ttl()?;
         let prefix = segment_prefix(namespace, wide);
@@ -217,13 +220,15 @@ impl LogDb {
                     "rollup copy step did not contain exactly one stream".to_owned(),
                 ));
             };
-            let (sender, mut rows) = tokio::sync::mpsc::channel(1);
             let budget = PageBudget::new(usize::MAX);
+            let (sender, mut rows) = tokio::sync::mpsc::channel(1);
             let read = self.read_bounded_chunks(namespace, read, &budget, sender);
             let write = async {
                 let mut pending = VecDeque::new();
                 let mut batch = 0u64;
-                while let Some(rows) = rows.recv().await {
+                // Each chunk's decode permit is held until its whole batches
+                // are applied, from when the write budget holds them.
+                while let Some((rows, _decoding)) = rows.recv().await {
                     pending.extend(rows);
                     while pending.len() >= COPY_ROWS {
                         let rows = pending.drain(..COPY_ROWS).collect();
@@ -510,6 +515,93 @@ mod tests {
         assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
 
         assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(rows(&db).await, before);
+        db.close().await.unwrap();
+    }
+
+    /// A copy holds each chunk's decode share until its rows are in the
+    /// write buffer, then their write share until they are written; budgets
+    /// smaller than one unit and one batch serialize that rather than
+    /// deadlock it, and the copy returns all of both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_within_budgets_smaller_than_one_unit_and_one_batch() {
+        let db = LogDb::open(Config {
+            memory: crate::MemoryConfig {
+                decode_bytes: 1,
+                write_bytes: 1,
+            },
+            ..config()
+        })
+        .await
+        .unwrap();
+        write_day(&db).await;
+        let before = rows(&db).await;
+
+        let rolled = tokio::time::timeout(
+            Duration::from_secs(60),
+            db.rollup_at(&RollupConfig::default(), after_delay()),
+        )
+        .await
+        .expect("the copy makes progress within its budgets");
+        assert_eq!(rolled.unwrap(), 1);
+
+        assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(rows(&db).await, before);
+        assert_eq!(queried(&db).await, before.len());
+        assert_eq!(db.memory.decode_available(), 1);
+        for _ in 0..100 {
+            if db.memory.write_available() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(db.memory.write_available(), 1);
+        db.close().await.unwrap();
+    }
+
+    /// A read chunk holding more copy batches than the copy's half of the
+    /// write budget fits writes the earlier ones out to make room, instead
+    /// of waiting out the copy timeout for room they hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_chunks_larger_than_the_copy_budget_without_waiting_it_out() {
+        let db = LogDb::open(Config {
+            memory: crate::MemoryConfig {
+                write_bytes: 1 << 20,
+                ..crate::MemoryConfig::default()
+            },
+            write_buffer: common::coordinator::WriteCoordinatorConfig {
+                flush_interval: 2 * COPY_WRITE_TIMEOUT,
+                ..Default::default()
+            },
+            ..config()
+        })
+        .await
+        .unwrap();
+        // Batches of a quarter of the budget: two fill the copy's half while
+        // the budget still has room for the next.
+        for part in 0..100 {
+            let entries = (0..100)
+                .map(|row| {
+                    let at = DAY + (1 + part % 2) * HOUR + (part * 100 + row) * 1_000_000;
+                    LogEntry::new(at, format!("{part}-{row} {}", "x".repeat(160)))
+                })
+                .collect();
+            db.write(&namespace(), vec![LogBatch::new(stream("api"), entries)])
+                .await
+                .unwrap();
+            db.flush_written().await.unwrap();
+        }
+        db.flush_memtable().await.unwrap();
+        let before = rows(&db).await;
+        assert_eq!(before.len(), 10_000);
+
+        let rolled = tokio::time::timeout(
+            Duration::from_secs(20),
+            db.rollup_at(&RollupConfig::default(), after_delay()),
+        )
+        .await
+        .expect("the copy flushes its own writes to make room");
+        assert_eq!(rolled.unwrap(), 1);
         assert_eq!(rows(&db).await, before);
         db.close().await.unwrap();
     }

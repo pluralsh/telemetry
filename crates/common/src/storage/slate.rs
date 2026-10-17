@@ -8,8 +8,8 @@ use crate::{
     BytesRange, CheckpointInfo, ReadHints, Record, StorageError, StorageIterator, StorageRead,
     StorageResult, Ttl,
     storage::{
-        MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot,
-        WriteOptions, WriteResult,
+        BatchOps, MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageBatch,
+        StorageSnapshot, WriteOptions, WriteResult,
     },
 };
 use async_trait::async_trait;
@@ -254,6 +254,104 @@ impl SlateReadHandle {
         }
         .map_err(StorageError::from_storage)
     }
+
+    /// Adds to `plan` the SSTs of live segments matching `prefixes`, with
+    /// every SST the manifest holds as this database's live set.
+    ///
+    /// Each prefix carries its recency for [`warm::warm_planned`]; a prefix
+    /// without one, such as a segment spanning all time, ranks each SST by
+    /// when it was written. Targets are those of [`Self::warm_prefixes`].
+    pub fn plan_prefixes(
+        &self,
+        prefixes: &[(Bytes, Option<i64>)],
+        include_data: bool,
+        plan: &mut warm::WarmPlan,
+    ) {
+        self.plan_prefix_metadata(prefixes, true, include_data, plan);
+    }
+
+    /// [`Self::plan_prefixes`], warming filters only when `filters` is set:
+    /// a reader that never consults filters warms just indexes, and its
+    /// budget counts only them.
+    pub fn plan_prefix_metadata(
+        &self,
+        prefixes: &[(Bytes, Option<i64>)],
+        filters: bool,
+        include_data: bool,
+        plan: &mut warm::WarmPlan,
+    ) {
+        let manifest = self.source.manifest();
+        let mut live: Vec<_> = manifest
+            .l0()
+            .iter()
+            .chain(
+                manifest
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.sst_views.iter()),
+            )
+            .map(|view| view.sst.id)
+            .collect();
+        let mut planned = Vec::new();
+        for segment in manifest.segments() {
+            let views: Vec<_> = segment
+                .l0()
+                .iter()
+                .chain(
+                    segment
+                        .compacted()
+                        .iter()
+                        .flat_map(|run| run.sst_views.iter()),
+                )
+                .collect();
+            live.extend(views.iter().map(|view| view.sst.id));
+            let Some((prefix, recency)) = prefixes
+                .iter()
+                .find(|(prefix, _)| segment.prefix() == prefix.as_ref())
+            else {
+                continue;
+            };
+            let mut targets = if filters {
+                vec![CacheTarget::Filters, CacheTarget::Index]
+            } else {
+                vec![CacheTarget::Index]
+            };
+            if include_data {
+                targets.push(CacheTarget::data::<Bytes, _>(BytesRange::prefix(
+                    prefix.clone(),
+                )));
+            }
+            let targets: Arc<[CacheTarget]> = targets.into();
+            planned.extend(views.into_iter().map(|view| {
+                let recency = recency.unwrap_or_else(|| written_ms(&view.sst.id));
+                let estimate = if filters {
+                    warm::metadata_estimate(&view.sst.info)
+                } else {
+                    warm::index_estimate(&view.sst.info)
+                };
+                (view.sst.id, Arc::clone(&targets), recency, estimate)
+            }));
+        }
+        let db: warm::WarmDb = match &self.source {
+            ManifestSource::Db(db) => Arc::clone(db) as warm::WarmDb,
+            ManifestSource::Reader(reader) => Arc::clone(reader) as warm::WarmDb,
+        };
+        let db = plan.add_database(db, live);
+        for (id, targets, recency, estimate) in planned {
+            plan.push(db, id, targets, recency, estimate);
+        }
+    }
+}
+
+/// When an SST was written, in epoch milliseconds: compacted SST ids are
+/// ULIDs. WAL SSTs rank first.
+fn written_ms(id: &slatedb::manifest::SsTableId) -> i64 {
+    match id {
+        slatedb::manifest::SsTableId::Compacted(ulid) => {
+            i64::try_from(ulid.timestamp_ms()).unwrap_or(i64::MAX)
+        }
+        slatedb::manifest::SsTableId::Wal(_) => i64::MAX,
+    }
 }
 
 /// SlateDB-backed implementation of the Storage trait.
@@ -310,7 +408,41 @@ pub fn spawn_memtable_flusher(db: Weak<Db>, unflushed: Arc<AtomicBool>, every: D
     });
 }
 
+/// Adds `op` to `batch`. Puts hand over their key and value, which merges
+/// and deletes copy, as SlateDB has no owned form of them.
+pub(crate) fn push_op(batch: &mut WriteBatch, op: RecordOp) {
+    match op {
+        RecordOp::Put(op) => {
+            batch.put_bytes_with_options(op.record.key, op.record.value, &op.options.into())
+        }
+        RecordOp::Merge(op) => {
+            batch.merge_with_options(op.record.key, op.record.value, &op.options.into())
+        }
+        RecordOp::Delete(key) => batch.delete(key),
+    }
+}
+
 impl SlateDbStorage {
+    async fn write_batch(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
+        let slate_options = SlateDbWriteOptions {
+            await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
+        };
+        let write_handle = self
+            .db
+            .write_with_options(batch, &slate_options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        self.unflushed.store(true, Ordering::Release);
+        Ok(WriteResult {
+            seqnum: write_handle.seqnum(),
+        })
+    }
+
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
         let slate_rx = db.subscribe();
@@ -585,29 +717,24 @@ impl Storage for SlateDbStorage {
     ) -> StorageResult<WriteResult> {
         let mut batch = WriteBatch::new();
         for op in records {
-            match op {
-                RecordOp::Put(op) => {
-                    batch.put_with_options(op.record.key, op.record.value, &op.options.into())
-                }
-                RecordOp::Merge(op) => {
-                    batch.merge_with_options(op.record.key, op.record.value, &op.options.into())
-                }
-                RecordOp::Delete(key) => batch.delete(key),
-            }
+            push_op(&mut batch, op);
         }
-        let slate_options = SlateDbWriteOptions {
-            await_durable: options.await_durable,
-            ..SlateDbWriteOptions::default()
-        };
-        let write_handle = self
-            .db
-            .write_with_options(batch, &slate_options)
-            .await
-            .map_err(StorageError::from_storage)?;
-        self.unflushed.store(true, Ordering::Release);
-        Ok(WriteResult {
-            seqnum: write_handle.seqnum(),
-        })
+        self.write_batch(batch, options).await
+    }
+
+    fn new_batch(&self) -> StorageBatch {
+        StorageBatch::slate()
+    }
+
+    async fn apply_batch(
+        &self,
+        batch: StorageBatch,
+        options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
+        match batch.0 {
+            BatchOps::Slate { batch, .. } => self.write_batch(batch, options).await,
+            BatchOps::Ops(ops) => self.apply_with_options(ops, options).await,
+        }
     }
 
     async fn put_with_options(

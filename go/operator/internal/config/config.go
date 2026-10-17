@@ -150,7 +150,7 @@ func Render(input Input) (Result, error) {
 			MatcherCacheCapacityBytes:      plan.matcherCache(),
 			ResultCache:                    renderResultCache{CapacityBytes: plan.resultCache()},
 			Query:                          renderMetricsQuery(input.Metrics.Spec.Config.Query, plan),
-			CacheWarmer:                    renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer),
+			CacheWarmer:                    renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer, true),
 			Write:                          renderWriteConfig(input.Metrics.Spec.Config.Write),
 			Request: renderMetricsRequest{
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
@@ -318,7 +318,11 @@ func renderLogs(input Input) (Result, error) {
 		if component == modeReader {
 			workload = logs.Spec.Reader
 		}
-		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(component))}
+		plan := memoryPlan{
+			limit:    resources.MemoryLimit(workload, descriptor, resources.Component(component)),
+			reserved: lo.Ternary(component == modeReader, logsReaderReserved, logsWriterReserved),
+			bodies:   lo.Ternary(component == modeReader, logsReaderBodies, logsWriterBodies),
+		}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
 			PathPrefix: logs.Spec.Ingress.PathPrefix,
@@ -342,7 +346,7 @@ func renderLogs(input Input) (Result, error) {
 				FlushIntervalSeconds:            int64Value(spec.Write.FlushIntervalSeconds, defaultFlushIntervalSeconds),
 				BufferQueueCapacity:             int32Value(spec.Write.BufferQueueCapacity, 10000),
 				BufferFlushIntervalMilliseconds: int64Value(spec.Write.BufferFlushIntervalMilliseconds, 30000),
-				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, 67108864),
+				BufferSizeThresholdBytes:        int64Value(spec.Write.BufferSizeThresholdBytes, logsBufferSizeThresholdBytes),
 				RemoteConcurrency:               int32Value(spec.Write.RemoteConcurrency, 16),
 				RemoteRetries:                   int32Value(spec.Write.RemoteRetries, 2),
 			},
@@ -355,13 +359,14 @@ func renderLogs(input Input) (Result, error) {
 				MaxStructuredMetadataFields: int64Value(spec.Request.MaxStructuredMetadataFields, 128),
 				QueryConcurrency:            int32Value(spec.Request.QueryConcurrency, 16),
 				MaxInFlightQueryBytes:       int64Value(spec.Request.MaxInFlightQueryBytes, plan.logsInFlightQuery()),
+				MaxInFlightBodyBytes:        plan.bodyBudget(),
 			},
 			Elasticsearch: renderElasticsearch{
 				MessageFields: lo.Ternary(spec.Elasticsearch.MessageFields == nil, []string{"message", "log", "msg"}, spec.Elasticsearch.MessageFields),
 				TimeField:     lo.CoalesceOrEmpty(spec.Elasticsearch.TimeField, "@timestamp"),
 				StreamFields:  lo.Ternary(spec.Elasticsearch.StreamFields == nil, []string{}, spec.Elasticsearch.StreamFields),
 			},
-			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
+			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer, true),
 			Auth:        renderAuth{Unauthenticated: logs.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:  namespaces,
 		})
@@ -461,7 +466,7 @@ func renderTraces(input Input) (Result, error) {
 			},
 			Sharding:    renderShardingConfig(traces.Name, traces.Namespace, spec.Sharding, workload, resources.GRPCPort(traces), component),
 			Request:     renderTracesRequest{MaxRequestBytes: int64Value(spec.Request.MaxRequestBytes, defaultMaxRequestBytes), MaxDecodedRequestBytes: int64Value(spec.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes), RequestConcurrency: int32Value(spec.Request.RequestConcurrency, 64), QueryConcurrency: int32Value(spec.Request.QueryConcurrency, 8), MaxCandidates: int64Value(spec.Request.MaxCandidates, 10000), MaxSpansPerTrace: int64Value(spec.Request.MaxSpansPerTrace, 100000), MaxQueryLimit: int64Value(spec.Request.MaxQueryLimit, 1000)},
-			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer),
+			CacheWarmer: renderCacheWarmerConfig(spec.CacheWarmer, true),
 			Auth:        renderAuth{Unauthenticated: spec.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:  namespaces,
 		})
@@ -567,37 +572,57 @@ func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor r
 	return result
 }
 
-func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec) renderCacheWarmer {
+// renderCacheWarmerConfig renders spec over the product's defaults:
+// enabledByDefault is whether readers warm metadata at startup when spec
+// leaves it unset.
+func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec, enabledByDefault bool) renderCacheWarmer {
 	if spec == nil {
 		return renderCacheWarmer{
-			Enabled:          false,
-			WarmRangeSeconds: 7200,
-			TimeoutSeconds:   30,
-			Concurrency:      2,
-			IncludePayloads:  false,
-			Continuous:       renderContinuousCacheWarmerConfig(nil),
+			Enabled:         enabledByDefault,
+			TimeoutSeconds:  30,
+			Concurrency:     2,
+			IncludePayloads: false,
+			Continuous:      renderContinuousCacheWarmerConfig(nil),
 		}
 	}
 	return renderCacheWarmer{
-		Enabled:          boolValue(spec.Enabled, false),
-		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
-		TimeoutSeconds:   int64Value(spec.TimeoutSeconds, 30),
-		Concurrency:      int32Value(spec.Concurrency, 2),
-		IncludePayloads:  boolValue(spec.IncludePayloads, false),
-		Continuous:       renderContinuousCacheWarmerConfig(spec.Continuous),
+		Enabled:                 boolValue(spec.Enabled, enabledByDefault),
+		WarmRangeSeconds:        warmRangeSeconds(spec.WarmRangeSeconds),
+		PayloadWarmRangeSeconds: spec.PayloadWarmRangeSeconds,
+		TimeoutSeconds:          int64Value(spec.TimeoutSeconds, 30),
+		Concurrency:             int32Value(spec.Concurrency, 2),
+		IncludePayloads:         boolValue(spec.IncludePayloads, false),
+		BlockReadiness:          spec.BlockReadiness,
+		MetadataBudgetPercent:   spec.MetadataBudgetPercent,
+		Continuous:              renderContinuousCacheWarmerConfig(spec.Continuous),
 	}
 }
 
 func renderContinuousCacheWarmerConfig(spec *telemetryv1alpha1.ContinuousCacheWarmerSpec) renderContinuousCacheWarmer {
 	if spec == nil {
-		return renderContinuousCacheWarmer{Enabled: true, IntervalSeconds: defaultFlushIntervalSeconds, WarmRangeSeconds: 7200, IncludePayloads: true}
+		return renderContinuousCacheWarmer{Enabled: true, IntervalSeconds: defaultFlushIntervalSeconds, IncludePayloads: true}
 	}
 	return renderContinuousCacheWarmer{
-		Enabled:          boolValue(spec.Enabled, true),
-		IntervalSeconds:  int64Value(spec.IntervalSeconds, defaultFlushIntervalSeconds),
-		WarmRangeSeconds: int64Value(spec.WarmRangeSeconds, 7200),
-		IncludePayloads:  boolValue(spec.IncludePayloads, true),
+		Enabled:                 boolValue(spec.Enabled, true),
+		IntervalSeconds:         int64Value(spec.IntervalSeconds, defaultFlushIntervalSeconds),
+		WarmRangeSeconds:        warmRangeSeconds(spec.WarmRangeSeconds),
+		PayloadWarmRangeSeconds: spec.PayloadWarmRangeSeconds,
+		IncludePayloads:         boolValue(spec.IncludePayloads, true),
 	}
+}
+
+// legacyWarmRangeSeconds is the warm range earlier CRDs defaulted, which the
+// API server stored in resources created under them.
+const legacyWarmRangeSeconds = 7200
+
+// warmRangeSeconds renders a warm range only when it was chosen: unset, and
+// the legacy default, leave the key out so servers warm metadata over all
+// live data, and servers predating that keep their own 7200 default.
+func warmRangeSeconds(seconds *int64) *int64 {
+	if seconds == nil || *seconds == legacyWarmRangeSeconds {
+		return nil
+	}
+	return seconds
 }
 
 func renderObjectStoreConfig(spec telemetryv1alpha1.ObjectStoreSpec, objectType, objectPath string) renderObjectStore {
@@ -706,22 +731,58 @@ func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.Wo
 // runtime, memtables and write buffers, request and response buffers, query
 // state outside the budgets, and allocator slack. Small pods need a larger
 // fraction of that, so it is a quarter of the limit but at least 768 MiB,
-// and at most half. Each cache and budget gets a share of the rest, and
-// every product's shares sum to at most all of it, so the rendered bounds
-// and the headroom fit the limit; the floors matter only for limits too
-// small to run well.
+// and at most half. It then holds back what a product reserves for memory
+// its own fixed bounds cap. Each cache and budget gets a share of the rest,
+// and every product's shares sum to at most all of it, so the rendered
+// bounds, the reservation and the headroom fit the limit; the floors matter
+// only for limits too small to run well.
 type memoryPlan struct {
-	limit int64
+	limit    int64
+	reserved int64
+	// bodies is the part of reserved that bounds request bodies.
+	bodies int64
 }
 
 const mebibyte = int64(1024 * 1024)
+
+// Logs memory outside its caches and budgets that the server's fixed
+// defaults bound: a writer's flushes of its 16 MiB write budget (about 23
+// resident bytes per byte while they build storage writes), its SlateDB
+// memtables (128 MiB unflushed at about 2.5 bytes per byte) and compactor,
+// and a reader's replay of the writer's WAL not yet in L0, bounded by the
+// same 128 MiB and one flush. Each is the peak measured under rollups and
+// ingest bursts, rounded up. Each also holds its request body budget: a
+// writer's admits one largest write (32 MiB received, 128 MiB decoded, and
+// twice that parsed and re-encoded) beside smaller ones, and a reader's
+// query forms and shard queries.
+const (
+	logsWriterBodies   = 512 * mebibyte
+	logsReaderBodies   = 64 * mebibyte
+	logsWriterReserved = 1024*mebibyte + logsWriterBodies
+	logsReaderReserved = 576*mebibyte + logsReaderBodies
+)
 
 func (plan memoryPlan) headroom() int64 {
 	return min(max(plan.limit/4, 768*mebibyte), plan.limit/2)
 }
 
+// reservation is what the product reserves, but at most half of what the
+// headroom leaves, so limits too small for it still fit their shares.
+func (plan memoryPlan) reservation() int64 {
+	return min(plan.reserved, (plan.limit-plan.headroom())/2)
+}
+
+// bodyBudget is the request body budget, shrunk with the reservation when
+// the limit caps it.
+func (plan memoryPlan) bodyBudget() int64 {
+	if plan.reserved == 0 {
+		return plan.bodies
+	}
+	return plan.reservation() / mebibyte * plan.bodies / plan.reserved * mebibyte
+}
+
 func (plan memoryPlan) share(percent, floor int64) int64 {
-	return max((plan.limit-plan.headroom())/100*percent, floor)
+	return max((plan.limit-plan.headroom()-plan.reservation())/100*percent, floor)
 }
 
 func (plan memoryPlan) blockCache() int64 { return plan.share(22, 64*mebibyte) }
@@ -811,6 +872,9 @@ func uniqueDataKey(data map[string][]byte, base string) string {
 const (
 	defaultMaxRequestBytes        = 33554432
 	defaultMaxDecodedRequestBytes = 134217728
+	// The Logs server's write budget, which flushes a buffer at that size
+	// whatever its threshold.
+	logsBufferSizeThresholdBytes = 16777216
 )
 
 func int64Value(value *int64, fallback int64) int64 { return lo.FromPtrOr(value, fallback) }
@@ -962,20 +1026,25 @@ type renderLogsRequest struct {
 	MaxStructuredMetadataFields int64 `json:"max_structured_metadata_fields"`
 	QueryConcurrency            int32 `json:"query_concurrency"`
 	MaxInFlightQueryBytes       int64 `json:"max_in_flight_query_bytes"`
+	MaxInFlightBodyBytes        int64 `json:"max_in_flight_body_bytes"`
 }
 type renderCacheWarmer struct {
-	Enabled          bool                        `json:"enabled"`
-	WarmRangeSeconds int64                       `json:"warm_range_seconds"`
-	TimeoutSeconds   int64                       `json:"timeout_seconds"`
-	Concurrency      int32                       `json:"concurrency"`
-	IncludePayloads  bool                        `json:"include_payloads"`
-	Continuous       renderContinuousCacheWarmer `json:"continuous"`
+	Enabled                 bool                        `json:"enabled"`
+	WarmRangeSeconds        *int64                      `json:"warm_range_seconds,omitempty"`
+	PayloadWarmRangeSeconds *int64                      `json:"payload_warm_range_seconds,omitempty"`
+	TimeoutSeconds          int64                       `json:"timeout_seconds"`
+	Concurrency             int32                       `json:"concurrency"`
+	IncludePayloads         bool                        `json:"include_payloads"`
+	BlockReadiness          *bool                       `json:"block_readiness,omitempty"`
+	MetadataBudgetPercent   *int32                      `json:"metadata_budget_percent,omitempty"`
+	Continuous              renderContinuousCacheWarmer `json:"continuous"`
 }
 type renderContinuousCacheWarmer struct {
-	Enabled          bool  `json:"enabled"`
-	IntervalSeconds  int64 `json:"interval_seconds"`
-	WarmRangeSeconds int64 `json:"warm_range_seconds"`
-	IncludePayloads  bool  `json:"include_payloads"`
+	Enabled                 bool   `json:"enabled"`
+	IntervalSeconds         int64  `json:"interval_seconds"`
+	WarmRangeSeconds        *int64 `json:"warm_range_seconds,omitempty"`
+	PayloadWarmRangeSeconds *int64 `json:"payload_warm_range_seconds,omitempty"`
+	IncludePayloads         bool   `json:"include_payloads"`
 }
 type renderListeners struct {
 	HTTP       string `json:"http"`

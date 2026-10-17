@@ -15,7 +15,7 @@ use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::read_groups::ReadGroups;
 use server_common::reload::{self, Live, LiveConfig};
-use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
+use server_common::warmer::{WarmPass, readiness_waits, spawn_cache_warmer, warming_enabled};
 use sharding::{
     AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
     server::owned_shards, shard_request_id,
@@ -130,7 +130,8 @@ impl AppState {
                 token,
             )))));
         }
-        let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
+        let cache_warmed =
+            !readiness_waits(&config.cache_warmer, config.mode != ServerMode::Writer);
         let router = WriteRouter::new(
             local_owner,
             Arc::new(RwLock::new(assignment)),
@@ -313,13 +314,14 @@ impl AppState {
                     database
                         .warm_recent(
                             &namespaces,
-                            pass.range,
-                            pass.include_payloads,
+                            pass.window,
                             pass.concurrency,
                             &pass.cancel,
-                            pass.tracker.as_deref(),
+                            &pass.ledger,
+                            pass.metadata_budget_percent,
                         )
                         .await
+                        .map(drop)
                 }
             },
         );
@@ -489,6 +491,10 @@ impl AppState {
                             () = state.cancellation.cancelled() => break,
                             rolled = state.db.rollup(&rollup) => rolled,
                         };
+                        common::storage::rollup::record_pass(
+                            "traces",
+                            rolled.as_ref().ok().copied(),
+                        );
                         if let Err(error) = rolled {
                             tracing::warn!(%error, "Traces segment rollup failed");
                         }

@@ -1,6 +1,7 @@
 //! Plumbing shared by the Metrics, Logs, and Traces servers.
 
 pub mod auth;
+pub mod body_budget;
 pub mod config;
 pub mod http;
 pub mod ingest;

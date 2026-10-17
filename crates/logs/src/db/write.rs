@@ -7,9 +7,11 @@
 
 use std::time::Instant;
 
+use common::storage::StorageBatch;
+
 use super::*;
 use crate::codec::{decode_dictionary_key, dictionary_prefix, rollup_dictionary_prefix};
-use crate::model::{locality_key, locality_order};
+use crate::model::{Field, locality_key, locality_order};
 
 /// How long a segment's or rollup period's IDs stay in memory after its
 /// last write. A later write reloads them.
@@ -222,6 +224,11 @@ impl SegmentIds {
     }
 }
 
+/// Storage operations every flush in the process has written, for profiles.
+#[cfg(test)]
+pub(super) static FLUSHED_OPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl DirectWriter {
     pub(super) fn new(
         storage: Arc<dyn StorageRead>,
@@ -256,7 +263,8 @@ impl DirectWriter {
                 .or_default()
                 .insert((segment, fingerprint), group);
         }
-        let mut all_ops = ops;
+        let mut batch = self.writer.new_batch();
+        batch.extend(ops);
         let mut written = Vec::new();
         let mut next_objects = Vec::new();
         for (namespace, groups) in by_namespace {
@@ -322,12 +330,14 @@ impl DirectWriter {
                     stored,
                 }
             }));
-            all_ops.extend(self.finish_write(write, &namespace)?);
+            self.finish_write(write, &namespace, &mut batch)?;
         }
-        if !all_ops.is_empty() {
+        #[cfg(test)]
+        FLUSHED_OPS.fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
+        if !batch.is_empty() {
             self.writer
-                .apply_with_options(
-                    all_ops,
+                .apply_batch(
+                    batch,
                     WriteOptions {
                         await_durable: false,
                     },
@@ -509,18 +519,24 @@ impl DirectWriter {
         Ok(next)
     }
 
-    /// Emits the records accumulated across streams: stream ID counters,
-    /// label postings, and the full-text index.
-    fn finish_write(&self, write: PendingWrite, namespace: &Namespace) -> Result<Vec<RecordOp>> {
+    /// Adds to `ops` the records accumulated across streams: stream ID
+    /// counters, label postings, and the full-text index.
+    fn finish_write(
+        &self,
+        write: PendingWrite,
+        namespace: &Namespace,
+        ops: &mut StorageBatch,
+    ) -> Result<()> {
         let PendingWrite {
             ttl,
-            mut ops,
+            ops: object_ops,
             postings,
             rollup_postings,
             search_deltas,
             flush_objects,
             ..
         } = write;
+        ops.extend(object_ops);
         let mut catalogs: BTreeMap<SegmentId, CatalogBatch> = BTreeMap::new();
         let mut counters: BTreeSet<SegmentId> = BTreeSet::new();
         for (segment, label) in postings.keys() {
@@ -587,7 +603,7 @@ impl DirectWriter {
             let flush_object = flush_objects[&segment];
             for (term, postings) in delta.postings {
                 term_index_ops(
-                    &mut ops,
+                    ops,
                     (namespace, segment),
                     &term,
                     postings,
@@ -596,7 +612,7 @@ impl DirectWriter {
                 )?;
             }
         }
-        Ok(ops)
+        Ok(())
     }
 
     fn ttl(&self) -> Result<Ttl> {
@@ -670,6 +686,84 @@ pub(super) struct LogsWrite {
     pub(super) namespace: Namespace,
     pub(super) groups: StreamGroups,
     pub(super) ops: Vec<RecordOp>,
+}
+
+fn labels_bytes(labels: &Labels) -> usize {
+    labels
+        .iter()
+        .map(|label| size_of::<Label>() + label.name.len() + label.value.len())
+        .sum()
+}
+
+fn entry_bytes(entry: &LogEntry) -> usize {
+    size_of::<LogEntry>()
+        + entry.line.len()
+        + entry
+            .structured_metadata
+            .iter()
+            .map(|field| size_of::<Field>() + field.name.len() + field.value.len())
+            .sum::<usize>()
+}
+
+/// Splits `groups` into parts of at most `limit` [`LogsWrite::estimated_bytes`]
+/// each, keeping each stream's entries in order; a part exceeds it only to
+/// hold one entry.
+pub(super) fn split_groups(groups: StreamGroups, limit: u64) -> Vec<StreamGroups> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut parts = Vec::new();
+    let mut part = StreamGroups::new();
+    let mut bytes = 0usize;
+    for (key, (labels, entries)) in groups {
+        let labels_bytes = labels_bytes(&labels);
+        let mut taken = Vec::new();
+        for entry in entries {
+            let entry_bytes = entry_bytes(&entry);
+            let adds = entry_bytes + if taken.is_empty() { labels_bytes } else { 0 };
+            if bytes > 0 && bytes + adds > limit {
+                if !taken.is_empty() {
+                    part.insert(key, (labels.clone(), std::mem::take(&mut taken)));
+                }
+                parts.push(std::mem::take(&mut part));
+                bytes = 0;
+            }
+            bytes += entry_bytes + if taken.is_empty() { labels_bytes } else { 0 };
+            taken.push(entry);
+        }
+        if taken.is_empty() {
+            bytes += labels_bytes;
+        }
+        part.insert(key, (labels, taken));
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+impl LogsWrite {
+    /// Bytes this write holds once applied: its entries with their line and
+    /// structured metadata, each stream's labels, and its ops.
+    pub(super) fn estimated_bytes(&self) -> u64 {
+        let groups: usize = self
+            .groups
+            .values()
+            .map(|(labels, entries)| {
+                labels_bytes(labels) + entries.iter().map(entry_bytes).sum::<usize>()
+            })
+            .sum();
+        let ops: usize = self
+            .ops
+            .iter()
+            .map(|op| {
+                64 + match op {
+                    RecordOp::Put(put) => put.record.key.len() + put.record.value.len(),
+                    RecordOp::Merge(merge) => merge.record.key.len() + merge.record.value.len(),
+                    RecordOp::Delete(key) => key.len(),
+                }
+            })
+            .sum();
+        (groups + ops) as u64
+    }
 }
 
 pub(super) struct FrozenLogsWriteDelta {
@@ -1380,5 +1474,54 @@ mod tests {
             assert_eq!(rows_of(&db, &namespace, "a").await, 3);
             db.close().await.unwrap();
         }
+    }
+
+    #[test]
+    fn split_groups_bounds_each_part_and_keeps_every_entry_in_order() {
+        let segment = SegmentId::new(DAY, HOUR);
+        let mut groups = StreamGroups::new();
+        for (stream, rows) in [("a", 10), ("b", 0), ("c", 25), ("d", 1)] {
+            let labels = Labels::new(vec![Label::new("app", stream)]).unwrap();
+            let entries = (0..rows)
+                .map(|row| LogEntry::new(DAY + row, format!("{stream} line {row:04}")))
+                .collect();
+            groups.insert((segment, labels.fingerprint()), (labels, entries));
+        }
+        let estimate = |groups: &StreamGroups| {
+            LogsWrite {
+                namespace: Namespace::new("tenant").unwrap(),
+                groups: groups.clone(),
+                ops: Vec::new(),
+            }
+            .estimated_bytes()
+        };
+        let total = estimate(&groups);
+        let limit = total / 5;
+
+        let parts = split_groups(groups.clone(), limit);
+        assert!(parts.len() >= 5, "{} parts", parts.len());
+        assert!(parts.iter().all(|part| estimate(part) <= limit));
+        let mut joined = StreamGroups::new();
+        for part in parts {
+            for (key, (labels, mut entries)) in part {
+                joined
+                    .entry(key)
+                    .or_insert_with(|| (labels, Vec::new()))
+                    .1
+                    .append(&mut entries);
+            }
+        }
+        assert_eq!(joined, groups);
+
+        assert_eq!(split_groups(groups.clone(), u64::MAX), vec![groups.clone()]);
+        // A part holds one entry even when it alone is over the limit.
+        let parts = split_groups(groups, 1);
+        assert!(parts.len() >= 36);
+        assert!(parts.iter().all(|part| {
+            part.values()
+                .map(|(_, entries)| entries.len())
+                .sum::<usize>()
+                <= 1
+        }));
     }
 }

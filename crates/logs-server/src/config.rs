@@ -95,6 +95,11 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Room for one largest write held at once: 32 MiB received, 128 MiB
+/// decoded, and twice that parsed and re-encoded for forwarding, plus
+/// smaller writes beside it.
+pub const DEFAULT_MAX_IN_FLIGHT_BODY_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestConfig {
@@ -107,6 +112,10 @@ pub struct RequestConfig {
     pub max_structured_metadata_fields: usize,
     pub query_concurrency: usize,
     pub max_in_flight_query_bytes: usize,
+    /// Bytes every in-flight request body may hold at once, across HTTP and
+    /// gRPC: as received, gunzipped or unsnappied, and parsed. Requests over
+    /// it wait for others with 429; one that alone needs more gets 413.
+    pub max_in_flight_body_bytes: usize,
 }
 
 impl Default for RequestConfig {
@@ -119,6 +128,7 @@ impl Default for RequestConfig {
             max_structured_metadata_fields: 128,
             query_concurrency: 16,
             max_in_flight_query_bytes: 128 * 1024 * 1024,
+            max_in_flight_body_bytes: DEFAULT_MAX_IN_FLIGHT_BODY_BYTES,
         }
     }
 }
@@ -187,9 +197,15 @@ pub struct Config {
     /// disables it.
     pub result_cache_capacity: u64,
     pub write: WriteConfig,
+    /// Process-wide memory budgets of reads and unwritten writes.
+    #[serde(skip_serializing_if = "MemoryConfig::is_unset")]
+    pub memory: MemoryConfig,
     pub sharding: ShardingConfig,
     pub request: RequestConfig,
     pub elasticsearch: ElasticsearchConfig,
+    /// Merged over [`server_common::warmer::reader_warmer_defaults`]: keys a
+    /// config leaves out keep the reader defaults.
+    #[serde(deserialize_with = "server_common::warmer::deserialize_reader_warmer")]
     pub cache_warmer: CacheWarmerConfig,
     pub auth: AuthConfig,
     pub usage_reporting: UsageReportingConfig,
@@ -215,10 +231,11 @@ impl Default for Config {
             reader_cache_capacity: core.block_cache_capacity_bytes,
             result_cache_capacity: core.result_cache_capacity_bytes,
             write: WriteConfig::default(),
+            memory: MemoryConfig::default(),
             sharding: ShardingConfig::default(),
             request: RequestConfig::default(),
             elasticsearch: ElasticsearchConfig::default(),
-            cache_warmer: CacheWarmerConfig::default(),
+            cache_warmer: server_common::warmer::reader_warmer_defaults(),
             auth: AuthConfig::default(),
             usage_reporting: UsageReportingConfig::default(),
             namespaces: vec![NamespaceConfig {
@@ -260,7 +277,10 @@ impl Config {
             || self.request.max_structured_metadata_fields == 0
             || self.request.query_concurrency == 0
             || self.request.max_in_flight_query_bytes == 0
+            || self.request.max_in_flight_body_bytes == 0
             || self.write.has_zero_limit()
+            || self.memory.decode_bytes == Some(0)
+            || self.memory.write_bytes == Some(0)
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
@@ -375,7 +395,48 @@ impl Config {
             write_buffer: self.write.write_buffer(),
             block_cache_capacity_bytes: self.reader_cache_capacity,
             result_cache_capacity_bytes: self.result_cache_capacity,
+            memory: self.memory_config(),
         }
+    }
+
+    /// The process-wide memory budgets: `memory` where set, otherwise reads
+    /// decode within `request.max_in_flight_query_bytes`, which deployments
+    /// already size to their memory, and writes not yet written within
+    /// [`plural_logs::DEFAULT_WRITE_BUDGET_BYTES`].
+    fn memory_config(&self) -> plural_logs::MemoryConfig {
+        plural_logs::MemoryConfig {
+            decode_bytes: self
+                .memory
+                .decode_bytes
+                .unwrap_or(self.request.max_in_flight_query_bytes as u64),
+            write_bytes: self
+                .memory
+                .write_bytes
+                .unwrap_or(plural_logs::DEFAULT_WRITE_BUDGET_BYTES),
+        }
+    }
+}
+
+/// Overrides of the process-wide memory budgets. Binaries before this
+/// option reject configs that set it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Estimated decoded bytes every read in the process holds at once:
+    /// queries, sample reads and rollup copies. Defaults to
+    /// `request.max_in_flight_query_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_bytes: Option<u64>,
+    /// Estimated bytes of writes applied but not yet written to storage,
+    /// and so the most one flush holds; ingest past it is rejected with 429
+    /// and rollups wait. Defaults to 16 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_bytes: Option<u64>,
+}
+
+impl MemoryConfig {
+    fn is_unset(&self) -> bool {
+        self.decode_bytes.is_none() && self.write_bytes.is_none()
     }
 }
 
@@ -433,6 +494,53 @@ mod tests {
             ..RequestConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn memory_budgets_default_from_deployed_limits_and_stay_out_of_serialized_configs() {
+        let config = Config {
+            request: RequestConfig {
+                max_in_flight_query_bytes: 737 << 20,
+                ..RequestConfig::default()
+            },
+            ..Config::default()
+        };
+        let memory = config.logs_config().memory;
+        assert_eq!(memory.decode_bytes, 737 << 20);
+        assert_eq!(memory.write_bytes, plural_logs::DEFAULT_WRITE_BUDGET_BYTES);
+        // Binaries without budgets reject unknown keys, so configs that
+        // leave them unset must not name them.
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("memory"), "{yaml}");
+
+        let config =
+            Config::from_yaml("memory:\n  decode_bytes: 1024\n  write_bytes: 2048\n").unwrap();
+        let memory = config.logs_config().memory;
+        assert_eq!((memory.decode_bytes, memory.write_bytes), (1024, 2048));
+        assert!(Config::from_yaml("memory:\n  write_bytes: 0\n").is_err());
+    }
+
+    #[test]
+    fn readers_warm_metadata_in_the_background_by_default() {
+        let absent: Config = serde_yaml::from_str("mode: reader").unwrap();
+        assert_eq!(
+            absent.cache_warmer,
+            server_common::warmer::reader_warmer_defaults()
+        );
+        assert!(absent.cache_warmer.enabled && !absent.cache_warmer.block_readiness);
+        assert!(!absent.cache_warmer.include_payloads);
+        let partial: Config =
+            serde_yaml::from_str("cache_warmer:\n  concurrency: 4\n  warm_range_seconds: 86400")
+                .unwrap();
+        assert!(partial.cache_warmer.enabled && !partial.cache_warmer.block_readiness);
+        assert_eq!(partial.cache_warmer.concurrency, 4);
+        assert_eq!(partial.cache_warmer.warm_range_seconds, 86_400);
+        let blocking: Config =
+            serde_yaml::from_str("cache_warmer:\n  block_readiness: true").unwrap();
+        assert!(server_common::warmer::readiness_waits(
+            &blocking.cache_warmer,
+            true
+        ));
     }
 
     #[test]

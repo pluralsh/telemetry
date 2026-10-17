@@ -130,6 +130,7 @@ fn spawn_rollup(
             tokio::select! {
                 () = stop.cancelled() => return,
                 result = tenants.rollup(&config, common::time::now_ms()) => {
+                    common::storage::rollup::record_pass("metrics", result.as_ref().ok().copied());
                     if let Err(err) = result {
                         tracing::warn!(error = %err, "metrics rollup pass failed");
                     }

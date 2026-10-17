@@ -5,7 +5,7 @@ use proto::logs::internal::v1::{
     WriteBatchRequest, WriteBatchResponse,
     internal_writer_server::{InternalWriter, InternalWriterServer},
 };
-use server_common::internal_rpc;
+use server_common::{body_budget::GrpcBodyBudget, internal_rpc};
 use sharding::ShardId;
 use tonic::{Request, Response, Status};
 
@@ -200,10 +200,17 @@ fn logs_status(error: plural_logs::Error) -> Status {
     }
 }
 
-pub fn grpc_service(state: AppState) -> InternalWriterServer<AppState> {
-    InternalWriterServer::new(state)
-        .max_decoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
-        .max_encoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+/// The peer write service. Forwarded writes have no message size limit, but
+/// their bodies and decoded messages are held under the process's body
+/// budget.
+pub fn grpc_service(state: AppState) -> GrpcBodyBudget<InternalWriterServer<AppState>> {
+    let bodies = state.bodies.clone();
+    GrpcBodyBudget::new(
+        InternalWriterServer::new(state)
+            .max_decoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+            .max_encoding_message_size(server_common::internal_rpc::MAX_INTERNAL_MESSAGE_BYTES),
+        bodies,
+    )
 }
 
 #[cfg(test)]

@@ -13,6 +13,25 @@ export type BenchFamily = {
 
 export type BenchUsage = { cpuMean: number; cpuP95: number; memMean: number; memP95: number };
 
+/** One side of a cold-read family: latency on a freshly restarted process, and the object-store reads that query made. */
+export type ColdSide = { cold: Latency; warmP50?: number; getP50?: number; getBytesP50?: number };
+
+export type ColdFamily = { name: string; cases: number; impl: ColdSide; oracle: ColdSide };
+
+export type ColdStartup = { restarts: number; readyP50?: number; getP50?: number };
+
+export type BenchCold = {
+  spanS: number;
+  repeats: number;
+  firstByteMs: number;
+  planned: number;
+  measured: number;
+  dataset: Record<string, number>;
+  families: ColdFamily[];
+  totals: { impl: ColdSide; oracle: ColdSide };
+  startup: { impl: ColdStartup; oracle: ColdStartup };
+};
+
 export type BenchRun = {
   name: string;
   startedAt: string;
@@ -37,4 +56,6 @@ export type BenchRun = {
   usage: { impl: BenchUsage; oracle: BenchUsage };
   host: string;
   markdownUrl: string;
+  /** Only `cold`-scenario runs: every measured query hit a restarted process with empty caches. */
+  cold?: BenchCold;
 };

@@ -1,8 +1,10 @@
-use server_common::http::{check_content_encoding, check_size, content_type, unsnappy_bounded};
+use server_common::http::{
+    check_content_encoding, check_size, content_type, snappy_decoded_len, unsnappy_bounded,
+};
 use std::collections::BTreeMap;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
@@ -23,6 +25,9 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use server_common::auth::{Permission, authorize};
+use server_common::body_budget::{
+    self, BodyLimits, BodyTicket, PARSED_BYTES_PER_DECODED_BYTE, budget_request_bodies,
+};
 use tower_http::compression::CompressionLayer;
 
 use crate::{AppState, config::NamespaceConfig};
@@ -32,13 +37,12 @@ const CATEGORIZE_LABELS: &str = "categorize-labels";
 
 pub fn router(state: AppState) -> Router {
     let request = &state.config.request;
-    let limits = |router| {
-        server_common::http::limit_request_bodies(
-            router,
-            request.max_request_bytes,
-            request.max_decoded_request_bytes,
-        )
+    let body_limits = BodyLimits {
+        budget: state.bodies.clone(),
+        max_request: request.max_request_bytes,
+        max_decoded: request.max_decoded_request_bytes,
     };
+    let limits = |router| budget_request_bodies(router, &body_limits);
     let reads = Router::new()
         .route(
             "/read/ns/{namespace}/loki/api/v1/query",
@@ -106,6 +110,15 @@ pub fn router(state: AppState) -> Router {
         app.nest(&state.config.path_prefix, public)
     };
     app.with_state(state)
+}
+
+/// Holds room on the request's body budget for the batches parsed from
+/// `decoded` body bytes and their re-encoding when forwarded to peers.
+fn hold_parsed(ticket: Option<&BodyTicket>, decoded: usize) -> Result<(), ApiError> {
+    Ok(body_budget::reserve(
+        ticket,
+        decoded.saturating_mul(PARSED_BYTES_PER_DECODED_BYTE),
+    )?)
 }
 
 #[derive(Debug, Deserialize)]

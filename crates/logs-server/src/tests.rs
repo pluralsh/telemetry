@@ -246,6 +246,203 @@ async fn pushes_are_bounded_by_wire_and_decoded_limits() {
     state.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn request_bodies_share_one_process_budget() {
+    const MIB: usize = 1 << 20;
+    let mut config = Config {
+        storage: StorageConfig::InMemory,
+        namespaces: vec![namespace("tenant")],
+        ..Config::default()
+    };
+    config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
+    config.write.flush_interval_seconds = 3600;
+    config.request.max_request_bytes = 4 * MIB;
+    config.request.max_decoded_request_bytes = 8 * MIB;
+    config.request.max_in_flight_body_bytes = 16 * MIB;
+    let state = AppState::open(config).await.unwrap();
+    let budget = state.bodies.clone();
+    let json_push = |bytes: usize| {
+        let line = "x".repeat(1024);
+        let values = (0..bytes / 1040)
+            .map(|index| json!([(index + 1).to_string(), line]))
+            .collect::<Vec<_>>();
+        json!({"streams":[{"stream":{"app":"api"},"values":values}]})
+            .to_string()
+            .into_bytes()
+    };
+    let snappy_push = |bytes: usize| {
+        let push = proto_push(bytes / 1040, &"x".repeat(1024));
+        snap::raw::Encoder::new().compress_vec(&push).unwrap()
+    };
+    let send = |path: &'static str,
+                body: Vec<u8>,
+                content_type: &'static str,
+                encoding: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            let mut request = Request::post(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, body.len());
+            if let Some(encoding) = encoding {
+                request = request.header(header::CONTENT_ENCODING, encoding);
+            }
+            let response = router(state)
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let retry = response.headers().get(header::RETRY_AFTER).cloned();
+            (response.status(), retry)
+        }
+    };
+    const PUSH: &str = "/write/ns/tenant/loki/api/v1/push";
+    const OTLP: &str = "/write/ns/tenant/otlp/v1/logs";
+
+    // 3 MiB held as received and 6 MiB for its parsed form fit in 16 MiB.
+    assert_eq!(
+        send(PUSH, json_push(3 * MIB), "application/json", None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    // While other requests hold most of the budget, the same push waits.
+    let others = budget.ticket();
+    others.reserve(10 * MIB).unwrap();
+    let (status, retry) = send(PUSH, json_push(3 * MIB), "application/json", None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry.unwrap(), "1");
+    // So does a snappy body, by its declared decoded length, and OTLP.
+    assert_eq!(
+        send(PUSH, snappy_push(3 * MIB), "application/x-protobuf", None)
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        send(OTLP, otlp_push(3 * MIB), "application/x-protobuf", None)
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(others);
+    assert_eq!(
+        send(PUSH, snappy_push(3 * MIB), "application/x-protobuf", None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    // 7 MiB decoded and 14 MiB parsed can never fit: 413, not 429.
+    assert_eq!(
+        send(
+            PUSH,
+            gzip(&json_push(7 * MIB)),
+            "application/json",
+            Some("gzip")
+        )
+        .await
+        .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    // A gzip bomb stops at the decoded cap.
+    assert_eq!(
+        send(
+            PUSH,
+            gzip(&vec![b' '; 64 * MIB]),
+            "application/json",
+            Some("gzip")
+        )
+        .await
+        .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    // Concurrent pushes either fit or get 429; none exceed the budget.
+    let statuses = futures::future::join_all(
+        (0..6).map(|_| send(PUSH, json_push(3 * MIB), "application/json", None)),
+    )
+    .await;
+    assert!(
+        statuses.iter().all(|(status, _)| matches!(
+            *status,
+            StatusCode::NO_CONTENT | StatusCode::TOO_MANY_REQUESTS
+        )),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|(status, _)| *status == StatusCode::NO_CONTENT)
+    );
+    assert_eq!(budget.available(), budget.capacity());
+    state.shutdown().await.unwrap();
+}
+
+fn proto_push(entries: usize, line: &str) -> Vec<u8> {
+    #[derive(Clone, PartialEq, Message)]
+    struct Push {
+        #[prost(message, repeated, tag = "1")]
+        streams: Vec<Stream>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Stream {
+        #[prost(string, tag = "1")]
+        labels: String,
+        #[prost(message, repeated, tag = "2")]
+        entries: Vec<Entry>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Entry {
+        #[prost(message, optional, tag = "1")]
+        timestamp: Option<Timestamp>,
+        #[prost(string, tag = "2")]
+        line: String,
+    }
+    #[derive(Clone, Copy, PartialEq, Message)]
+    struct Timestamp {
+        #[prost(int64, tag = "1")]
+        seconds: i64,
+        #[prost(int32, tag = "2")]
+        nanos: i32,
+    }
+    Push {
+        streams: vec![Stream {
+            labels: r#"{app="api"}"#.to_owned(),
+            entries: (0..entries)
+                .map(|index| Entry {
+                    timestamp: Some(Timestamp {
+                        seconds: index as i64 + 1,
+                        nanos: 0,
+                    }),
+                    line: line.to_owned(),
+                })
+                .collect(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn otlp_push(bytes: usize) -> Vec<u8> {
+    let line = "x".repeat(1024);
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: (0..bytes / 1040)
+                    .map(|index| LogRecord {
+                        time_unix_nano: index as u64 + 1,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(line.clone())),
+                        }),
+                        ..LogRecord::default()
+                    })
+                    .collect(),
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
 async fn bulk(state: &AppState, path: &str, body: &str) -> (StatusCode, Value) {
     let body = gzip(body.as_bytes());
     let response = router(state.clone())

@@ -23,7 +23,7 @@ use bytes::Bytes;
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{SharedDbCache, sst_block_size};
 use common::storage::metrics_recorder::MetricsRsRecorder;
-use common::storage::slate::warm::{SstWarmTracker, warm_ssts};
+use common::storage::slate::warm::{WarmDb, WarmPlan, metadata_estimate};
 use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
 use common::storage::{
     CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
@@ -41,7 +41,6 @@ use slatedb::{
     CacheTarget, Db, DbBuilder, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps, DbReader,
     DbSnapshot, IterationOrder, WriteBatch,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
 
@@ -396,47 +395,30 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
 /// (over a `DbSnapshot`) has no cache-manager handle and so cannot warm; the
 /// blanket impl below is gated on `Db: DbMetadataOps + DbCacheManagerOps`,
 /// which `Db` and `DbReader` satisfy but `DbSnapshot` does not.
-#[async_trait::async_trait]
 pub(crate) trait WarmStorage: StorageRead {
-    /// Warms the block cache for the SSTs backing the given buckets, including
-    /// the sample data blocks only when `include_samples` is set, and aborting
-    /// promptly if `cancel` fires. See [`StorageReaderInner::warm`].
-    async fn warm(
+    /// Plans warming the SSTs backing the `wanted` buckets, including the
+    /// sample data blocks only when `include_samples` is set. See
+    /// [`StorageReaderInner::plan_warm`].
+    fn plan_warm(
         &self,
-        namespace: &Namespace,
-        buckets: Vec<TimeBucket>,
+        wanted: &[(Namespace, HashSet<TimeBucket>)],
         include_samples: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> StorageResult<()>;
+        plan: &mut WarmPlan,
+    );
 }
 
-#[async_trait::async_trait]
 impl<H> WarmStorage for H
 where
     H: HasReader + Send + Sync,
-    H::Db: DbMetadataOps + DbCacheManagerOps,
+    H::Db: DbMetadataOps + DbCacheManagerOps + 'static,
 {
-    async fn warm(
+    fn plan_warm(
         &self,
-        namespace: &Namespace,
-        buckets: Vec<TimeBucket>,
+        wanted: &[(Namespace, HashSet<TimeBucket>)],
         include_samples: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> StorageResult<()> {
-        self.reader()
-            .warm(
-                namespace,
-                buckets,
-                include_samples,
-                concurrency,
-                cancel,
-                tracker,
-            )
-            .await
+        plan: &mut WarmPlan,
+    ) {
+        self.reader().plan_warm(wanted, include_samples, plan);
     }
 }
 

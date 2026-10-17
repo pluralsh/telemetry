@@ -41,6 +41,7 @@ fn test_config() -> Config {
         // Read-counting tests count storage reads.
         block_cache_capacity_bytes: 0,
         result_cache_capacity_bytes: 0,
+        memory: Default::default(),
     }
 }
 
@@ -488,6 +489,112 @@ async fn limited_log_queries_stop_within_a_segment() {
     db.close().await.unwrap();
 }
 
+/// Early-stopping log reads that plan segments ahead and keep read units in
+/// flight across them answer as reads segment by segment do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_log_reads_match_reads_segment_by_segment() {
+    use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
+
+    let mut db = LogDb::open(Config {
+        retention: None,
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    let namespace = Namespace::new("pipelined").unwrap();
+    let second = 1_000_000_000;
+    // Eight 10s segments; `api` writes every segment, `worker` every other.
+    for segment in 0..8_i64 {
+        let entries = |service: &str, every: i64| {
+            (0..10)
+                .filter(|row| row % every == 0)
+                .map(|row| {
+                    let timestamp = segment * 10 * second + row * second + 1;
+                    let word = if (segment + row) % 3 == 0 {
+                        "needle"
+                    } else {
+                        "hay"
+                    };
+                    LogEntry::new(timestamp, format!("{service} {word} row={row}"))
+                })
+                .collect()
+        };
+        let mut batches = vec![LogBatch::new(labels("api", "prod"), entries("api", 1))];
+        if segment % 2 == 0 {
+            batches.push(LogBatch::new(
+                labels("worker", "prod"),
+                entries("worker", 2),
+            ));
+        }
+        db.write(&namespace, batches).await.unwrap();
+    }
+    let queries = [
+        r#"{environment="prod"}"#,
+        r#"{service="worker"}"#,
+        r#"{environment="prod"} |= "needle""#,
+        r#"{environment="prod"} |= "edl""#,
+        r#"{environment="prod"} != "needle" | logfmt"#,
+    ];
+    let QueryResult::Streams(streams) = db
+        .query(
+            &namespace,
+            &QueryRequest::range(queries[0], 3 * second, 75 * second, second),
+            QueryOptions {
+                limit: 1_000,
+                ..QueryOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected streams");
+    };
+    // Every segment's rows in the window: api's 72, worker's 18.
+    let rows = streams
+        .iter()
+        .map(|stream| stream.entries.len())
+        .sum::<usize>();
+    assert_eq!(rows, 90);
+    let tunings = [(0, 1), (1, 1), (1, 4), (3, 2), (8, 32)].map(|(lookahead, units)| ReadTuning {
+        segment_lookahead: lookahead,
+        pipeline_units: units,
+        ..ReadTuning::default()
+    });
+    for query in queries {
+        for direction in [Direction::Forward, Direction::Backward] {
+            for limit in [1, 7, 25, 1_000] {
+                let request = QueryRequest::range(query, 3 * second, 75 * second, second);
+                let mut results = Vec::new();
+                for tuning in tunings {
+                    db.tuning = tuning;
+                    db.caches.streams.invalidate_all();
+                    results.push(format!(
+                        "{:?}",
+                        db.query(
+                            &namespace,
+                            &request,
+                            QueryOptions {
+                                limit,
+                                direction,
+                                ..QueryOptions::default()
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    ));
+                }
+                for (tuning, result) in tunings.iter().zip(&results) {
+                    assert_eq!(
+                        *result, results[0],
+                        "{tuning:?} {query} {direction:?} {limit}"
+                    );
+                }
+            }
+        }
+    }
+    db.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn limited_backward_queries_keep_the_newest_rows_of_a_large_page() {
     use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
@@ -643,6 +750,162 @@ async fn applied_writes_coalesce_before_flush() {
         run_count += 1;
     }
     assert_eq!(run_count, 1);
+    db.close().await.unwrap();
+}
+
+/// Waits for the tasks releasing written writes' budget to run.
+async fn settled_write_budget(db: &LogDb) -> u64 {
+    for _ in 0..100 {
+        if db.memory.write_available() == db.memory.write_capacity() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    db.memory.write_available()
+}
+
+#[tokio::test]
+async fn applied_writes_hold_the_write_budget_until_written() {
+    let mut config = test_config();
+    config.memory.write_bytes = 4_096;
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("budgeted").unwrap();
+    let batch = |timestamp| {
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            vec![LogEntry::new(timestamp, "x".repeat(3_000))],
+        )]
+    };
+
+    db.write_with_durability(&namespace, batch(1), Durability::Applied)
+        .await
+        .unwrap();
+    assert!(db.memory.write_available() < 1_024);
+    // Neither fits beside the unwritten first; ingest is turned away rather
+    // than buffered past the budget.
+    assert!(matches!(
+        db.write_with_durability(&namespace, batch(2), Durability::Applied)
+            .await,
+        Err(Error::Backpressure)
+    ));
+
+    db.flush_written().await.unwrap();
+    assert_eq!(settled_write_budget(&db).await, 4_096);
+    db.write_with_durability(&namespace, batch(2), Durability::Written)
+        .await
+        .unwrap();
+    assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
+    assert_eq!(settled_write_budget(&db).await, 4_096);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn databases_opened_with_one_budget_share_it() {
+    let config = test_config();
+    let memory = MemoryBudget::new(&crate::MemoryConfig {
+        decode_bytes: 1 << 20,
+        write_bytes: 4_096,
+    });
+    let cache = SharedDbCache::default();
+    let blocks = BlockCache::new(0);
+    let open = |path: &str| {
+        let mut config = config.clone();
+        if let StorageConfig::SlateDb(storage) = &mut config.storage {
+            storage.path = path.to_owned();
+        }
+        LogDb::open_with_cache(config, &cache, &blocks, &memory)
+    };
+    let (first, second) = (
+        open("shard-0").await.unwrap(),
+        open("shard-1").await.unwrap(),
+    );
+    let namespace = Namespace::new("shared").unwrap();
+    let batch = vec![LogBatch::new(
+        labels("api", "prod"),
+        vec![LogEntry::new(1, "x".repeat(3_000))],
+    )];
+
+    first
+        .write_with_durability(&namespace, batch.clone(), Durability::Applied)
+        .await
+        .unwrap();
+    assert!(matches!(
+        second
+            .write_with_durability(&namespace, batch.clone(), Durability::Applied)
+            .await,
+        Err(Error::Backpressure)
+    ));
+    first.flush_written().await.unwrap();
+    assert_eq!(settled_write_budget(&second).await, 4_096);
+    second
+        .write_with_durability(&namespace, batch, Durability::Written)
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+}
+
+/// A decode budget smaller than one read unit serializes reads instead of
+/// deadlocking them, across concurrent queries sharing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_queries_finish_within_a_decode_budget_smaller_than_one_unit() {
+    use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
+
+    let mut config = test_config();
+    config.memory.decode_bytes = 1;
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("decode-budget").unwrap();
+    let batches = ["api", "worker", "web"]
+        .map(|service| {
+            LogBatch::new(
+                labels(service, "prod"),
+                (0..40)
+                    .map(|timestamp| LogEntry::new(timestamp, format!("{service} {timestamp}")))
+                    .collect(),
+            )
+        })
+        .to_vec();
+    db.write(&namespace, batches).await.unwrap();
+
+    let query = |limit, direction| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            let result = db
+                .query(
+                    namespace,
+                    &QueryRequest::range(r#"{environment="prod"}"#, 0, 40, 1),
+                    QueryOptions {
+                        limit,
+                        direction,
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let QueryResult::Streams(streams) = result else {
+                panic!("expected streams");
+            };
+            streams
+                .iter()
+                .map(|stream| stream.entries.len())
+                .sum::<usize>()
+        }
+    };
+    let queries = (0..16).map(|index| {
+        let direction = if index % 2 == 0 {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        };
+        query(if index % 4 < 2 { 1_000 } else { 5 }, direction)
+    });
+    let counts = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(queries))
+        .await
+        .expect("queries sharing the decode budget finish");
+    for (index, count) in counts.into_iter().enumerate() {
+        assert_eq!(count, if index % 4 < 2 { 120 } else { 5 });
+    }
+    assert_eq!(db.memory.decode_available(), 1);
     db.close().await.unwrap();
 }
 
@@ -1357,6 +1620,14 @@ impl StorageRead for CountingStorage {
         range: BytesRange,
     ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
     {
+        // How `UnfilteredReads` issues gets and prefix scans.
+        if let std::ops::Bound::Included(start) = &range.start {
+            let one_key = matches!(
+                &range.end,
+                std::ops::Bound::Excluded(end) if end[..] == [&start[..], &[0]].concat()[..]
+            );
+            self.record(if one_key { &self.gets } else { &self.scans }, start);
+        }
         self.inner.scan_iter(range).await
     }
 
@@ -1401,6 +1672,176 @@ async fn write_forty_streams(db: &LogDb, namespace: &Namespace) {
         })
         .collect();
     db.write(namespace, batches).await.unwrap();
+}
+
+#[tokio::test]
+async fn warming_plans_filters_only_for_readers_that_consult_them() {
+    use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, warm_planned};
+
+    async fn planned(db: &LogDb, namespace: &Namespace) -> (usize, u64) {
+        let mut plan = WarmPlan::default();
+        let window = common::WarmWindow {
+            metadata: None,
+            payloads: None,
+        };
+        db.plan_warm(std::slice::from_ref(namespace), window, &mut plan);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let report = warm_planned(
+            "logs",
+            plan,
+            WarmBudget::UNBOUNDED,
+            false,
+            1,
+            &cancel,
+            &WarmLedger::new(true),
+        )
+        .await;
+        (report.planned_ssts, report.planned_bytes)
+    }
+
+    let namespace = Namespace::new("tenant").unwrap();
+    let mut db = LogDb::open(test_config()).await.unwrap();
+    // Enough keys that the SST has filters at all.
+    let batches = (0..1_500)
+        .map(|index| {
+            LogBatch::new(
+                labels(&format!("s{index}"), "prod"),
+                vec![LogEntry::new(index, format!("line {index}"))],
+            )
+        })
+        .collect();
+    db.write(&namespace, batches).await.unwrap();
+    db.flush().await.unwrap();
+    db.flush_memtable().await.unwrap();
+    assert!(db.tuning.unfiltered_reads);
+    let (ssts, indexes) = planned(&db, &namespace).await;
+    db.tuning.unfiltered_reads = false;
+    let (filtered_ssts, metadata) = planned(&db, &namespace).await;
+    assert!(ssts > 0);
+    assert_eq!(ssts, filtered_ssts);
+    assert!(indexes < metadata, "{indexes} >= {metadata}");
+}
+
+#[tokio::test]
+async fn unfiltered_reads_match_filtered_reads() {
+    async fn collect(
+        records: common::storage::StorageResult<
+            Box<dyn common::storage::StorageIterator + Send + 'static>,
+        >,
+    ) -> Vec<(Bytes, Bytes)> {
+        let mut records = records.unwrap();
+        let mut collected = Vec::new();
+        while let Some(record) = records.next().await.unwrap() {
+            collected.push((record.key, record.value));
+        }
+        collected
+    }
+
+    let namespace = Namespace::new("tenant").unwrap();
+    let db = LogDb::open(test_config()).await.unwrap();
+    // Postings and counters merged across two SSTs and the memtable.
+    write_forty_streams(&db, &namespace).await;
+    db.flush().await.unwrap();
+    let more = |offset: i64| {
+        (0..6)
+            .map(|index| {
+                LogBatch::new(
+                    labels(&format!("t{index}"), "prod"),
+                    vec![LogEntry::new(offset + index, format!("more {index}"))],
+                )
+            })
+            .collect()
+    };
+    db.write(&namespace, more(3_000)).await.unwrap();
+    db.flush().await.unwrap();
+    db.write(&namespace, more(25_000)).await.unwrap();
+
+    use common::storage::ReadHints;
+    let filtered = Arc::clone(&db.storage);
+    let unfiltered = UnfilteredReads(Arc::clone(&filtered));
+    let keys = collect(filtered.scan_iter(BytesRange::unbounded()).await)
+        .await
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert!(keys.len() > 100, "{} keys", keys.len());
+    let absent = |key: &Bytes| {
+        let mut longer = key.to_vec();
+        longer.push(0);
+        [Bytes::from(longer), key.slice(..key.len() - 1)]
+    };
+    for key in keys.iter().cloned().chain(keys.iter().flat_map(absent)) {
+        let expected = filtered.get(key.clone()).await.unwrap();
+        for found in [
+            unfiltered.get(key.clone()).await.unwrap(),
+            unfiltered
+                .get_with(key.clone(), ReadHints::default())
+                .await
+                .unwrap(),
+            unfiltered
+                .get_with(key.clone(), ReadHints::UNCACHED)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(
+                found.map(|record| (record.key, record.value)),
+                expected.clone().map(|record| (record.key, record.value)),
+                "{key:?}"
+            );
+        }
+    }
+    let prefixes = keys
+        .iter()
+        .flat_map(|key| [4, 12, 20, key.len()].map(|len| key.slice(..len.min(key.len()))))
+        .collect::<BTreeSet<_>>();
+    let subranges = [
+        BytesRange::unbounded(),
+        BytesRange::new(
+            std::ops::Bound::Included(Bytes::from_static(&[0, 0, 0, 5])),
+            std::ops::Bound::Excluded(Bytes::from_static(&[0, 0, 0, 9])),
+        ),
+        BytesRange::new(
+            std::ops::Bound::Excluded(Bytes::from_static(&[1])),
+            std::ops::Bound::Unbounded,
+        ),
+    ];
+    for prefix in prefixes {
+        for subrange in &subranges {
+            let expected = collect(
+                filtered
+                    .scan_prefix_iter(prefix.clone(), subrange.clone(), None)
+                    .await,
+            )
+            .await;
+            assert_eq!(
+                collect(
+                    unfiltered
+                        .scan_prefix_iter(prefix.clone(), subrange.clone(), None)
+                        .await
+                )
+                .await,
+                expected,
+                "{prefix:?} {subrange:?}"
+            );
+            assert_eq!(
+                collect(
+                    unfiltered
+                        .scan_prefix_iter_with(
+                            prefix.clone(),
+                            subrange.clone(),
+                            None,
+                            ReadHints::default()
+                        )
+                        .await
+                )
+                .await,
+                expected,
+                "{prefix:?} {subrange:?}"
+            );
+        }
+    }
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1634,10 +2075,13 @@ fn read_tunings() -> Vec<ReadTuning> {
     [false, true]
         .into_iter()
         .flat_map(|postings_validate| {
-            [false, true].map(|overlap_runs| ReadTuning {
-                postings_validate,
-                overlap_runs,
-                ..ReadTuning::default()
+            [false, true].into_iter().flat_map(move |overlap_runs| {
+                [false, true].map(|unfiltered_reads| ReadTuning {
+                    postings_validate,
+                    overlap_runs,
+                    unfiltered_reads,
+                    ..ReadTuning::default()
+                })
             })
         })
         .collect()
@@ -1716,6 +2160,9 @@ impl StorageRead for PausingStorage {
         range: BytesRange,
     ) -> common::storage::StorageResult<Box<dyn common::storage::StorageIterator + Send + 'static>>
     {
+        if let std::ops::Bound::Included(start) = &range.start {
+            self.pause(start).await;
+        }
         self.inner.scan_iter(range).await
     }
 
@@ -2048,41 +2495,53 @@ async fn cross_stream_merges_keep_write_order_for_out_of_order_rows() {
     db.close().await.unwrap();
 }
 
+/// Read segment by segment, a satisfied read selects at most one segment
+/// ahead; pipelined, at most `segment_lookahead + 1`.
 #[tokio::test]
-async fn a_satisfied_read_selects_at_most_one_segment_ahead() {
-    let mut db = LogDb::open(test_config()).await.unwrap();
-    let namespace = Namespace::default();
-    let segment_ns = db.segment_ns;
-    let segments = (0..6).map(|index| index * segment_ns).collect::<Vec<_>>();
-    for &segment in &segments {
-        write_line(&db, &namespace, "api", segment + 1, "line").await;
+async fn a_satisfied_read_selects_a_bounded_number_of_segments_ahead() {
+    for lookahead in [0, 1, 2] {
+        let mut db = LogDb::open(test_config()).await.unwrap();
+        db.tuning.segment_lookahead = lookahead;
+        let namespace = Namespace::default();
+        let segment_ns = db.segment_ns;
+        let segments = (0..6).map(|index| index * segment_ns).collect::<Vec<_>>();
+        for &segment in &segments {
+            write_line(&db, &namespace, "api", segment + 1, "line").await;
+        }
+        let counting = count_reads(
+            &mut db,
+            segments
+                .iter()
+                .map(|&segment| segment_run_prefix(&namespace, seg(segment)))
+                .collect(),
+        );
+        db.read_segments(
+            &namespace,
+            (0, segments[5] + segment_ns - 1),
+            &StreamFilter::exact(Vec::new()),
+            &PageBudget::new(usize::MAX),
+            false,
+            |_| Ok(ControlFlow::Break(())),
+        )
+        .await
+        .unwrap();
+        let scans = counting
+            .take()
+            .into_iter()
+            .map(|(_, scans)| scans)
+            .collect::<Vec<_>>();
+        let ahead = lookahead + 1;
+        assert_eq!(scans[0], 1, "lookahead {lookahead}");
+        assert!(
+            scans[1..=ahead].iter().all(|&scans| scans <= 1),
+            "lookahead {lookahead}: {scans:?}"
+        );
+        assert!(
+            scans[ahead + 1..].iter().all(|&scans| scans == 0),
+            "lookahead {lookahead}: {scans:?}"
+        );
+        db.close().await.unwrap();
     }
-    let counting = count_reads(
-        &mut db,
-        segments
-            .iter()
-            .map(|&segment| segment_run_prefix(&namespace, seg(segment)))
-            .collect(),
-    );
-    db.read_segments(
-        &namespace,
-        (0, segments[5] + segment_ns - 1),
-        &StreamFilter::exact(Vec::new()),
-        &PageBudget::new(usize::MAX),
-        false,
-        |_| Ok(ControlFlow::Break(())),
-    )
-    .await
-    .unwrap();
-    let scans = counting
-        .take()
-        .into_iter()
-        .map(|(_, scans)| scans)
-        .collect::<Vec<_>>();
-    assert_eq!(scans[0], 1);
-    assert!(scans[1] <= 1);
-    assert_eq!(scans[2..], [0, 0, 0, 0]);
-    db.close().await.unwrap();
 }
 
 /// Deterministic xorshift, so failures reproduce from the seed.

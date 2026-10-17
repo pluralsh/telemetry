@@ -12,6 +12,8 @@ workspace = true
 
 [features]
 bench-internals = []
+# Builds the manual profiles on the system allocator.
+profile-system-allocator = []
 
 [dependencies]
 async-trait.workspace = true

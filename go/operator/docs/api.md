@@ -236,11 +236,14 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `enabled` _boolean_ |  | false |  |
-| `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
+| `enabled` _boolean_ | Enabled runs a startup pass over recent SSTs. Defaults to true for<br />readers, which warm filters and indexes in the background; Logs<br />readers that skip filters warm only indexes. |  |  |
+| `warmRangeSeconds` _integer_ | WarmRangeSeconds is the recent window whose metadata the startup pass<br />warms. Unset covers all live data, which retention bounds, and the<br />metadata budget bounds what is held. A set value bounds payloads too<br />unless PayloadWarmRangeSeconds is set. 7200, the default of earlier<br />CRDs that the API server stored in existing resources, is read as<br />unset. |  | Minimum: 1 <br /> |
+| `payloadWarmRangeSeconds` _integer_ | PayloadWarmRangeSeconds is the recent window whose payloads the<br />startup pass warms when IncludePayloads is set. Unset uses<br />WarmRangeSeconds when that is set, otherwise 7200. Servers older than<br />this field reject it, so set it only once every reader runs a server<br />that knows it. |  | Minimum: 1 <br /> |
 | `timeoutSeconds` _integer_ |  | 30 | Minimum: 1 <br /> |
 | `concurrency` _integer_ |  | 2 | Minimum: 1 <br /> |
 | `includePayloads` _boolean_ |  | false |  |
+| `blockReadiness` _boolean_ | BlockReadiness holds readiness until the startup pass ends. Unset<br />keeps the server default, false. |  |  |
+| `metadataBudgetPercent` _integer_ | MetadataBudgetPercent is the share of the metadata cache warming may<br />fill before it stops; the server default is 75. |  | Maximum: 100 <br />Minimum: 0 <br /> |
 | `continuous` _[ContinuousCacheWarmerSpec](#continuouscachewarmerspec)_ | Continuous warms SSTs that appear in reader manifests after startup. |  |  |
 
 
@@ -259,7 +262,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `enabled` _boolean_ |  | true |  |
 | `intervalSeconds` _integer_ |  | 10 | Minimum: 1 <br /> |
-| `warmRangeSeconds` _integer_ |  | 7200 | Minimum: 1 <br /> |
+| `warmRangeSeconds` _integer_ | WarmRangeSeconds is CacheWarmerSpec.WarmRangeSeconds for new SSTs. |  | Minimum: 1 <br /> |
+| `payloadWarmRangeSeconds` _integer_ | PayloadWarmRangeSeconds is CacheWarmerSpec.PayloadWarmRangeSeconds<br />for new SSTs. |  | Minimum: 1 <br /> |
 | `includePayloads` _boolean_ |  | true |  |
 
 

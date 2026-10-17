@@ -8,6 +8,8 @@ use std::time::Duration;
 use common::coordinator::WriteCoordinatorConfig;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, StorageConfig};
 
+pub use crate::memory::MemoryConfig;
+
 /// Single-node Logs storage and immutable-page tuning.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -45,6 +47,9 @@ pub struct Config {
     /// repeated query evaluate only the steps whose segments changed since.
     /// Zero disables it.
     pub result_cache_capacity_bytes: u64,
+    /// Process-wide budgets of the memory reads decode into and of writes
+    /// not yet written, shared by every shard like the block cache.
+    pub memory: MemoryConfig,
 }
 
 /// Default [`Config::result_cache_capacity_bytes`]: 128 MiB.
@@ -126,6 +131,7 @@ impl Default for Config {
             write_buffer: WriteCoordinatorConfig::default(),
             block_cache_capacity_bytes: DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
             result_cache_capacity_bytes: DEFAULT_RESULT_CACHE_CAPACITY_BYTES,
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -197,6 +203,11 @@ impl Config {
         {
             return Err(crate::Error::Invalid(
                 "compaction max_object_bytes and max_object_rows must be positive".to_owned(),
+            ));
+        }
+        if self.memory.decode_bytes == 0 || self.memory.write_bytes == 0 {
+            return Err(crate::Error::Invalid(
+                "memory decode_bytes and write_bytes must be positive".to_owned(),
             ));
         }
         Ok(())

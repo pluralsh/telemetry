@@ -15,26 +15,46 @@ pub const DEFAULT_FLUSH_INTERVAL_SECONDS: u64 = 10;
 pub struct CacheWarmerConfig {
     /// Whether startup warming is enabled.
     pub enabled: bool,
-    /// Recent wall-clock window to warm.
+    /// Recent wall-clock window whose metadata is warmed; 0 warms all live
+    /// data, which retention bounds, and the metadata budget bounds what
+    /// is held. Payloads use it too unless `payload_warm_range_seconds`
+    /// is set; see [`Self::window`].
     pub warm_range_seconds: u64,
-    /// Maximum time startup warming may delay readiness.
+    /// Recent wall-clock window whose payloads are warmed when
+    /// `include_payloads` is set; 0 derives it from `warm_range_seconds`.
+    pub payload_warm_range_seconds: u64,
+    /// Maximum time startup warming may delay readiness, when it does.
     pub timeout_seconds: u64,
     /// Maximum number of SSTs warmed concurrently.
     pub concurrency: usize,
     /// Whether to warm payload/sample blocks in addition to indexes and metadata.
     pub include_payloads: bool,
+    /// Whether readiness waits (up to `timeout_seconds`) for the startup
+    /// pass. When false the server is ready at once and warms in the
+    /// background, newest data first.
+    pub block_readiness: bool,
+    /// Share of the metadata cache's memory the warmer may fill, so queries
+    /// keep the rest. Metrics and traces stop warming metadata there and
+    /// count what did not fit; logs ignores it.
+    pub metadata_budget_percent: u8,
     /// Periodic warming of SSTs that appear after startup.
     pub continuous: ContinuousCacheWarmerConfig,
 }
+
+/// [`CacheWarmerConfig::metadata_budget_percent`] unless configured.
+pub const DEFAULT_METADATA_BUDGET_PERCENT: u8 = 75;
 
 impl Default for CacheWarmerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            warm_range_seconds: 7_200,
+            warm_range_seconds: 0,
+            payload_warm_range_seconds: 0,
             timeout_seconds: 30,
             concurrency: 2,
             include_payloads: false,
+            block_readiness: true,
+            metadata_budget_percent: DEFAULT_METADATA_BUDGET_PERCENT,
             continuous: ContinuousCacheWarmerConfig::default(),
         }
     }
@@ -43,10 +63,8 @@ impl Default for CacheWarmerConfig {
 impl CacheWarmerConfig {
     /// Rejects zero ranges, timeouts, intervals and concurrency for enabled warmers.
     pub fn validate(&self) -> Result<(), String> {
-        if self.enabled && self.warm_range_seconds == 0 {
-            return Err(
-                "cache_warmer.warm_range_seconds must be greater than zero when enabled".to_owned(),
-            );
+        if self.metadata_budget_percent > 100 {
+            return Err("cache_warmer.metadata_budget_percent must be at most 100".to_owned());
         }
         if self.enabled && self.timeout_seconds == 0 {
             return Err(
@@ -64,14 +82,77 @@ impl CacheWarmerConfig {
                     .to_owned(),
             );
         }
-        if self.continuous.enabled && self.continuous.warm_range_seconds == 0 {
-            return Err(
-                "cache_warmer.continuous.warm_range_seconds must be greater than zero when enabled"
-                    .to_owned(),
-            );
-        }
         Ok(())
     }
+
+    /// What the startup pass warms.
+    pub fn window(&self) -> WarmWindow {
+        WarmWindow::new(
+            self.warm_range_seconds,
+            self.payload_warm_range_seconds,
+            self.include_payloads,
+        )
+    }
+}
+
+/// Payload range when neither range is configured. Payloads churn the data
+/// cache, so unlike metadata they stay limited to the most recent data.
+pub const DEFAULT_PAYLOAD_WARM_RANGE_SECONDS: u64 = 7_200;
+
+/// What one warming pass plans, as ages back from now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmWindow {
+    /// Data whose metadata is warmed; `None` is all live data.
+    pub metadata: Option<std::time::Duration>,
+    /// Data whose payloads are warmed too; `None` warms no payloads.
+    pub payloads: Option<std::time::Duration>,
+}
+
+impl WarmWindow {
+    /// The window of a warmer configured with these keys, where 0 means
+    /// unset: a set `warm_range_seconds` bounds payloads too, as it did
+    /// before payloads had their own range.
+    pub fn new(warm_range_seconds: u64, payload_warm_range_seconds: u64, payloads: bool) -> Self {
+        let seconds = |seconds: u64| (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+        let payload_seconds = [payload_warm_range_seconds, warm_range_seconds]
+            .into_iter()
+            .find(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT_PAYLOAD_WARM_RANGE_SECONDS);
+        Self {
+            metadata: seconds(warm_range_seconds),
+            payloads: payloads.then(|| std::time::Duration::from_secs(payload_seconds)),
+        }
+    }
+
+    /// This window for a reader without a metadata cache, where warming
+    /// metadata holds nothing: only what payload warming covers.
+    pub fn payloads_only(self) -> Self {
+        Self {
+            metadata: self.payloads,
+            ..self
+        }
+    }
+
+    /// The oldest timestamp, in the unit of `now`, whose metadata is
+    /// warmed; `units_per_second` converts the window.
+    pub fn metadata_since(&self, now: i64, units_per_second: i64) -> i64 {
+        since(now, self.metadata, units_per_second)
+    }
+
+    /// [`Self::metadata_since`] for payloads, or `None` without payloads.
+    pub fn payloads_since(&self, now: i64, units_per_second: i64) -> Option<i64> {
+        self.payloads
+            .map(|range| since(now, Some(range), units_per_second))
+    }
+}
+
+fn since(now: i64, range: Option<std::time::Duration>, units_per_second: i64) -> i64 {
+    let Some(range) = range else {
+        return i64::MIN;
+    };
+    let millis = i128::try_from(range.as_millis()).unwrap_or(i128::MAX);
+    let units = i128::from(units_per_second).saturating_mul(millis) / 1_000;
+    i64::try_from(i128::from(now).saturating_sub(units)).unwrap_or(i64::MIN)
 }
 
 /// Readers poll their in-memory manifest every `interval_seconds` and warm
@@ -82,8 +163,10 @@ impl CacheWarmerConfig {
 pub struct ContinuousCacheWarmerConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
-    /// Recent wall-clock window whose new SSTs are warmed.
+    /// As [`CacheWarmerConfig::warm_range_seconds`], for new SSTs.
     pub warm_range_seconds: u64,
+    /// As [`CacheWarmerConfig::payload_warm_range_seconds`], for new SSTs.
+    pub payload_warm_range_seconds: u64,
     pub include_payloads: bool,
 }
 
@@ -92,9 +175,21 @@ impl Default for ContinuousCacheWarmerConfig {
         Self {
             enabled: true,
             interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,
-            warm_range_seconds: 7_200,
+            warm_range_seconds: 0,
+            payload_warm_range_seconds: 0,
             include_payloads: true,
         }
+    }
+}
+
+impl ContinuousCacheWarmerConfig {
+    /// What each continuous pass warms.
+    pub fn window(&self) -> WarmWindow {
+        WarmWindow::new(
+            self.warm_range_seconds,
+            self.payload_warm_range_seconds,
+            self.include_payloads,
+        )
     }
 }
 
@@ -446,18 +541,101 @@ mod tests {
             CacheWarmerConfig::default(),
             CacheWarmerConfig {
                 enabled: false,
-                warm_range_seconds: 7_200,
+                warm_range_seconds: 0,
+                payload_warm_range_seconds: 0,
                 timeout_seconds: 30,
                 concurrency: 2,
                 include_payloads: false,
+                block_readiness: true,
+                metadata_budget_percent: 75,
                 continuous: ContinuousCacheWarmerConfig {
                     enabled: true,
                     interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,
-                    warm_range_seconds: 7_200,
+                    warm_range_seconds: 0,
+                    payload_warm_range_seconds: 0,
                     include_payloads: true,
                 },
             }
         );
+    }
+
+    #[test]
+    fn metadata_covers_all_live_data_and_payloads_stay_recent_by_default() {
+        let hours = |hours: u64| Some(std::time::Duration::from_secs(hours * 3_600));
+        let config = CacheWarmerConfig::default();
+        assert_eq!(
+            config.window(),
+            WarmWindow {
+                metadata: None,
+                payloads: None
+            }
+        );
+        assert_eq!(
+            config.continuous.window(),
+            WarmWindow {
+                metadata: None,
+                payloads: hours(2)
+            }
+        );
+        assert_eq!(
+            WarmWindow::new(600, 0, true),
+            WarmWindow {
+                metadata: Some(std::time::Duration::from_secs(600)),
+                payloads: Some(std::time::Duration::from_secs(600))
+            }
+        );
+        assert_eq!(
+            WarmWindow::new(86_400, 0, true).payloads,
+            hours(24),
+            "an explicit range keeps bounding payloads"
+        );
+        assert_eq!(
+            WarmWindow::new(0, 1_800, true),
+            WarmWindow {
+                metadata: None,
+                payloads: Some(std::time::Duration::from_secs(1_800))
+            }
+        );
+        assert_eq!(
+            WarmWindow::new(0, 0, true).payloads_only().metadata,
+            hours(2)
+        );
+    }
+
+    #[test]
+    fn warm_windows_convert_to_timestamps() {
+        let window = WarmWindow::new(0, 3_600, true);
+        assert_eq!(window.metadata_since(10_000, 1), i64::MIN);
+        assert_eq!(window.payloads_since(10_000, 1), Some(6_400));
+        assert_eq!(
+            window.payloads_since(10_000_000_000_000, 1_000_000_000),
+            Some(10_000_000_000_000 - 3_600_000_000_000)
+        );
+        assert_eq!(WarmWindow::new(1, 0, false).payloads_since(5, 1), None);
+        assert_eq!(
+            WarmWindow::new(u64::MAX, 0, false).metadata_since(0, 1_000_000_000),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn old_cache_warmer_sections_parse_unchanged() {
+        let old: CacheWarmerConfig = serde_yaml::from_str(
+            "enabled: true\nwarm_range_seconds: 7200\ninclude_payloads: false\ncontinuous:\n  warm_range_seconds: 7200\n  include_payloads: true\n",
+        )
+        .unwrap();
+        assert!(old.validate().is_ok());
+        assert_eq!(
+            old.window().metadata,
+            Some(std::time::Duration::from_secs(7_200))
+        );
+        assert_eq!(
+            old.continuous.window().payloads,
+            Some(std::time::Duration::from_secs(7_200))
+        );
+        let zero: CacheWarmerConfig =
+            serde_yaml::from_str("enabled: true\nwarm_range_seconds: 0\n").unwrap();
+        assert!(zero.validate().is_ok());
     }
 
     #[test]

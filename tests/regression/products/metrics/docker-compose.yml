@@ -49,11 +49,12 @@ services:
     volumes: ["minio-data:/data"]
     ports: ["19000:9000"]
 
-  # Historical scenario only: owns MinIO's address inside MinIO's network
-  # namespace, so every client's `minio:9000` goes through it, and forwards to
-  # MinIO on :9010 with a fixed first-byte delay.
+  # Historical and cold scenarios only: owns MinIO's address inside MinIO's
+  # network namespace, so every client's `minio:9000` goes through it, and
+  # forwards to MinIO on :9010 with a fixed first-byte delay. Per-client
+  # request counts are served on :9020.
   minio-latency:
-    profiles: ["historical"]
+    profiles: ["historical", "cold"]
     image: python:3.13-slim
     network_mode: service:minio
     command:
@@ -62,6 +63,10 @@ services:
       - --listen=9000
       - --upstream=9010
       - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+      - --stats-port=9020
+    # FUZZ_COLD_TIMELINE=1: also record every request (served on :9020/timeline).
+    environment:
+      PROXY_TIMELINE: ${FUZZ_COLD_TIMELINE:-0}
     volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
     depends_on: [minio]
 
@@ -108,8 +113,14 @@ services:
       - -distributor.ingestion-rate-limit=1000000000
       - -distributor.ingestion-burst-size=1000000000
       - -ingester.max-global-series-per-user=0
-      # Rounds rewrite up to 30m of history after earlier rounds were flushed.
-      - -ingester.out-of-order-time-window=2h
+      # Rounds rewrite up to 30m of history after earlier rounds were flushed;
+      # the cold scenario backfills a whole day.
+      - -ingester.out-of-order-time-window=${MIMIR_OUT_OF_ORDER_WINDOW:-2h}
+      # Mimir's defaults unless the cold scenario overrides them, so a day of
+      # backfilled blocks compacts once before measuring instead of during it.
+      - -compactor.compaction-interval=${MIMIR_COMPACTION_INTERVAL:-1h}
+      - -compactor.first-level-compaction-wait-period=${MIMIR_FIRST_LEVEL_COMPACTION_WAIT:-25m}
+      - -compactor.deletion-delay=${MIMIR_COMPACTOR_DELETION_DELAY:-12h}
       # Query sharding (on by default) caches head postings for 10s, so a
       # selector queried just before a write misses the series it creates.
       - -blocks-storage.tsdb.head-postings-for-matchers-cache-ttl=0s
@@ -185,7 +196,8 @@ services:
     profiles: ["standalone-s3"]
     command: ["--config", "/app/regression/standalone-s3.yaml"]
     volumes:
-      - ./production/standalone-s3.yaml:/app/regression/standalone-s3.yaml:ro
+      # The cold battery swaps in a copy that rolls up sooner while settling.
+      - ${METRICS_S3_CONFIG:-./production/standalone-s3.yaml}:/app/regression/standalone-s3.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18084:8080"]
 

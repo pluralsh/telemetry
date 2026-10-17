@@ -6,6 +6,7 @@ pub mod counting;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;
+pub mod metered_cache;
 pub mod metrics_recorder;
 pub mod rollup;
 pub mod settings;
@@ -176,6 +177,66 @@ impl RecordOp {
             Record::new(key, value),
             MergeOptions { ttl },
         ))
+    }
+}
+
+/// Operations for one atomic [`Storage::apply_batch`], built by
+/// [`Storage::new_batch`].
+///
+/// A SlateDB batch converts each operation as it is pushed, so a large
+/// write holds its operations once instead of in a `Vec` and again in the
+/// engine's batch.
+pub struct StorageBatch(BatchOps);
+
+enum BatchOps {
+    Ops(Vec<RecordOp>),
+    Slate {
+        batch: slatedb::WriteBatch,
+        len: usize,
+    },
+}
+
+impl StorageBatch {
+    /// A batch any [`Storage`] applies through [`Storage::apply_with_options`].
+    pub fn ops() -> Self {
+        Self(BatchOps::Ops(Vec::new()))
+    }
+
+    pub(crate) fn slate() -> Self {
+        Self(BatchOps::Slate {
+            batch: slatedb::WriteBatch::new(),
+            len: 0,
+        })
+    }
+
+    pub fn push(&mut self, op: RecordOp) {
+        match &mut self.0 {
+            BatchOps::Ops(ops) => ops.push(op),
+            BatchOps::Slate { batch, len } => {
+                slate::push_op(batch, op);
+                *len += 1;
+            }
+        }
+    }
+
+    /// Operations pushed so far.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            BatchOps::Ops(ops) => ops.len(),
+            BatchOps::Slate { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Extend<RecordOp> for StorageBatch {
+    fn extend<T: IntoIterator<Item = RecordOp>>(&mut self, ops: T) {
+        for op in ops {
+            self.push(op);
+        }
     }
 }
 
@@ -413,6 +474,26 @@ pub trait Storage: StorageRead {
         ops: Vec<RecordOp>,
         options: WriteOptions,
     ) -> StorageResult<WriteResult>;
+
+    /// An empty batch for [`Self::apply_batch`].
+    fn new_batch(&self) -> StorageBatch {
+        StorageBatch::ops()
+    }
+
+    /// Applies `batch`, from [`Self::new_batch`] or [`StorageBatch::ops`],
+    /// atomically as [`Self::apply_with_options`] does.
+    async fn apply_batch(
+        &self,
+        batch: StorageBatch,
+        options: WriteOptions,
+    ) -> StorageResult<WriteResult> {
+        match batch.0 {
+            BatchOps::Ops(ops) => self.apply_with_options(ops, options).await,
+            BatchOps::Slate { .. } => Err(StorageError::Internal(
+                "a SlateDB batch applied to another storage".to_owned(),
+            )),
+        }
+    }
 
     /// Writes records to storage.
     ///

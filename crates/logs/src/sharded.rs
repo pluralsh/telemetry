@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
-use common::{SharedDbCache, SstWarmTracker};
+use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::{SharedDbCache, WarmWindow};
 use sharding::{
     ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
     shard_opener,
@@ -15,6 +15,7 @@ use futures::future::{try_join, try_join_all};
 use proto::logs::internal::v1 as pb;
 
 use crate::db::BlockCache;
+use crate::memory::MemoryBudget;
 use crate::query::{ShardSource, query_databases, serve_shard_query};
 use crate::remote::{
     LogsShardClient, RemoteShard, labels_to_wire, namespace_from_wire, query_from_wire,
@@ -95,11 +96,13 @@ impl ShardedLogs {
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+        let memory = MemoryBudget::new(&config.memory);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let cache = shard_cache.clone();
             let blocks = blocks.clone();
-            async move { LogDb::open_with_cache(config, &cache, &blocks).await }
+            let memory = memory.clone();
+            async move { LogDb::open_with_cache(config, &cache, &blocks, &memory).await }
         });
         Self::new(
             ShardSet::open(ShardRole::Writer, options, opener, shards).await,
@@ -120,12 +123,17 @@ impl ShardedLogs {
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
         let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+        let memory = MemoryBudget::new(&config.memory);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let reader_options = reader_options.clone();
             let cache = shard_cache.clone();
             let blocks = blocks.clone();
-            async move { LogDb::open_reader_with_cache(config, reader_options, &cache, &blocks).await }
+            let memory = memory.clone();
+            async move {
+                LogDb::open_reader_with_cache(config, reader_options, &cache, &blocks, &memory)
+                    .await
+            }
         });
         Self::new(
             ShardSet::open(ShardRole::Reader, options, opener, shards).await,
@@ -182,37 +190,50 @@ impl ShardedLogs {
             .collect()
     }
 
-    /// Warms recent cache blocks for every open shard and namespace, skipping
-    /// SSTs `tracker` has already warmed.
+    /// Warms the SSTs of `window` across every open shard and namespace,
+    /// newest segment first, into `budget_percent` of the metadata cache.
+    /// SSTs `ledger` holds are skipped, and those compaction or a rollup
+    /// removed are evicted; see [`warm_planned`]. Without a metadata cache
+    /// only the payload window is warmed.
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
-        warm_range: Duration,
-        include_payloads: bool,
+        window: WarmWindow,
         concurrency: usize,
         cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> Result<()> {
-        self.shards
-            .warm(concurrency, cancel, |database, concurrency| async move {
-                for namespace in namespaces {
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    database
-                        .warm_recent(
-                            namespace,
-                            warm_range,
-                            include_payloads,
-                            concurrency,
-                            cancel,
-                            tracker,
-                        )
-                        .await?;
-                }
-                Ok(())
-            })
-            .await
+        ledger: &WarmLedger,
+        budget_percent: u8,
+    ) -> Result<WarmReport> {
+        let budget = WarmBudget::of(&self.cache, budget_percent);
+        let window = if budget.is_some() {
+            window
+        } else {
+            window.payloads_only()
+        };
+        if budget.is_none() && window.payloads.is_none() {
+            return Ok(WarmReport::default());
+        }
+        let Some((_permits, concurrency)) = self.shards.reserve_io(concurrency, cancel).await?
+        else {
+            return Ok(WarmReport::default());
+        };
+        let mut plan = WarmPlan::default();
+        for database in self.shards.databases().await {
+            if cancel.is_cancelled() {
+                return Ok(WarmReport::default());
+            }
+            database.plan_warm(namespaces, window, &mut plan);
+        }
+        Ok(warm_planned(
+            "logs",
+            plan,
+            budget.unwrap_or(WarmBudget::UNBOUNDED),
+            window.payloads.is_some(),
+            concurrency,
+            cancel,
+            ledger,
+        )
+        .await)
     }
 
     /// Writes to shards opened locally; every routed shard must be open.
@@ -846,6 +867,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(streams(read), 2);
+        readers.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readers_warm_recent_segments_metadata_within_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = |meta_capacity: u64| Config {
+            storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "logs".to_owned(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: tmp.path().join("objects").to_str().unwrap().to_owned(),
+                }),
+                settings_path: None,
+                block_cache: Some(BlockCacheConfig::FoyerMemory(
+                    common::storage::config::FoyerMemoryCacheConfig {
+                        capacity: 8 << 20,
+                        shards: None,
+                    },
+                )),
+                meta_cache: Some(BlockCacheConfig::FoyerMemory(
+                    common::storage::config::FoyerMemoryCacheConfig {
+                        capacity: meta_capacity,
+                        shards: None,
+                    },
+                )),
+                disk: Default::default(),
+            }),
+            ..Config::default()
+        };
+        let options = ShardingOptions::new(1, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+        let shards = [ShardId::new(0)];
+        let routing = assignment(1);
+        let namespace = Namespace::new("tenant").unwrap();
+        let other = Namespace::new("other").unwrap();
+        let now = common::time::now_ns();
+        let hour = 3_600_000_000_000;
+        let writers = ShardedLogs::open(config(1 << 20), options, shards)
+            .await
+            .unwrap();
+        // Three segments an hour apart now, one three days old, and one of
+        // another namespace.
+        for (namespace, at) in [
+            (&namespace, now - 3 * 24 * hour),
+            (&namespace, now - 2 * hour),
+            (&namespace, now - hour),
+            (&namespace, now),
+            (&other, now),
+        ] {
+            let entries = (0..200)
+                .map(|row| LogEntry::new(at + row, format!("line {row}")))
+                .collect();
+            writers
+                .write(
+                    &routing,
+                    namespace,
+                    vec![LogBatch::new(labels(&[("app", "api")]), entries)],
+                    Durability::Written,
+                )
+                .await
+                .unwrap();
+            writers.flush().await.unwrap();
+        }
+        writers.close().await.unwrap();
+
+        let hours = |hours: u64| Some(std::time::Duration::from_secs(hours * 3600));
+        async fn warm(
+            readers: &ShardedLogs,
+            ledger: &WarmLedger,
+            hours: u64,
+        ) -> Result<WarmReport> {
+            let window = WarmWindow {
+                metadata: Some(std::time::Duration::from_secs(hours * 3600)),
+                payloads: None,
+            };
+            warm_window(readers, ledger, window).await
+        }
+        async fn warm_window(
+            readers: &ShardedLogs,
+            ledger: &WarmLedger,
+            window: WarmWindow,
+        ) -> Result<WarmReport> {
+            readers
+                .warm_recent(
+                    &[Namespace::new("tenant").unwrap()],
+                    window,
+                    2,
+                    &CancellationToken::new(),
+                    ledger,
+                    75,
+                )
+                .await
+        }
+        let readers =
+            ShardedLogs::open_readers(config(1 << 20), options, shards, DbReaderOptions::default())
+                .await
+                .unwrap();
+        let ledger = WarmLedger::new(true);
+        let recent = warm(&readers, &ledger, 3).await.unwrap();
+        assert!(recent.warmed_ssts >= 3, "{recent:?}");
+        assert_eq!(recent.planned_ssts, recent.warmed_ssts);
+        assert_eq!(recent.skipped_ssts, 0);
+        assert!(ledger.bytes() > 0);
+        assert!(ledger.bytes() <= (1 << 20) / 100 * 75);
+        // A wider window adds only the old segment's SSTs.
+        let week = warm(&readers, &ledger, 7 * 24).await.unwrap();
+        assert!(week.warmed_ssts >= 1, "{week:?}");
+        assert_eq!(week.planned_ssts, recent.planned_ssts + week.warmed_ssts);
+        let again = warm(&readers, &ledger, 7 * 24).await.unwrap();
+        assert_eq!(again.warmed_ssts, 0, "{again:?}");
+        readers.close().await.unwrap();
+
+        // An unbounded metadata window plans every live segment, and
+        // payloads only load the data blocks of those in their window.
+        let mut data = Vec::new();
+        for payloads in [hours(3), hours(7 * 24)] {
+            let readers = ShardedLogs::open_readers(
+                config(1 << 20),
+                options,
+                shards,
+                DbReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            let window = WarmWindow {
+                metadata: None,
+                payloads,
+            };
+            let all = warm_window(&readers, &WarmLedger::new(true), window)
+                .await
+                .unwrap();
+            assert_eq!(all.planned_ssts, week.planned_ssts, "{all:?}");
+            assert_eq!(all.warmed_ssts, all.planned_ssts, "{all:?}");
+            data.push(readers.cache.data_usage().unwrap().usage_bytes());
+            readers.close().await.unwrap();
+        }
+        assert!(0 < data[0] && data[0] < data[1], "{data:?}");
+
+        // A metadata cache too small for all of it warms the newest and
+        // skips the rest instead of evicting what it warmed.
+        let readers =
+            ShardedLogs::open_readers(config(2048), options, shards, DbReaderOptions::default())
+                .await
+                .unwrap();
+        let ledger = WarmLedger::new(true);
+        let small = warm(&readers, &ledger, 7 * 24).await.unwrap();
+        assert!(small.skipped_ssts > 0, "{small:?}");
+        assert!(ledger.bytes() <= 2048 / 100 * 75);
         readers.close().await.unwrap();
     }
 

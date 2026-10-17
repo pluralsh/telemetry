@@ -102,6 +102,18 @@ pub async fn await_merge(
     }
 }
 
+/// Counts one finished periodic rollup pass of `product`: `sealed` rollups,
+/// or `None` when the pass failed.
+pub fn record_pass(product: &'static str, sealed: Option<usize>) {
+    let outcome = if sealed.is_some() { "ok" } else { "error" };
+    metrics::counter!("telemetry_rollup_passes_total", "product" => product, "outcome" => outcome)
+        .increment(1);
+    if let Some(sealed) = sealed {
+        metrics::counter!("telemetry_rollup_segments_sealed_total", "product" => product)
+            .increment(u64::try_from(sealed).unwrap_or(u64::MAX));
+    }
+}
+
 impl Default for RollupConfig {
     fn default() -> Self {
         Self {

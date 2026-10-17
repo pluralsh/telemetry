@@ -12,7 +12,7 @@ import struct
 import time
 import urllib.request
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +28,7 @@ from ..metrics.normalize import (
 )
 from ..metrics.wire import remote_write_body
 from ..process import wait_http
+from .cold import ColdProduct, ColdService, ColdStack
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
 from .rand import chance, quote, regex_escape, sample, scaled, weighted, zipf
@@ -105,6 +106,51 @@ RANGES = ("30s", "47s", "1m", "2m", "3m17s", "5m", "10m", "15m")
 STEPS_S = (1, 5, 7, 10, 13, 15, 30, 60, 90)
 # `round(v, to_nearest)` as `_vector` generates it.
 FUSED_ROUND = re.compile(r", (0\.5|10|0\.1)\)")
+
+# The cold scenario's day of metrics, scraped every 30s: request counters, a
+# classic latency histogram and memory gauges per namespace/service/instance,
+# plus short-lived high-cardinality session series that churn through the day.
+COLD_INTERVAL_MS = 30_000
+HOUR_MS = 3_600_000
+COLD_NAMESPACES = ("payments", "checkout", "search", "identity", "platform", "data")
+COLD_SERVICES = ("api", "web", "worker", "cache")
+COLD_METHODS = ("GET", "POST")
+COLD_CODES = ("200", "404", "500")
+COLD_INSTANCES = 3
+COLD_SESSIONS = 2000
+COLD_BOUNDS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+COLD_REQUESTS = "fuzz_cold_http_requests_total"
+COLD_DURATION = "fuzz_cold_request_duration_seconds"
+COLD_MEMORY = "fuzz_cold_memory_bytes"
+COLD_SESSION = "fuzz_cold_session_active"
+COLD_STEPS = {1: 60, 6: 300, 24: 900}
+# Mimir compacts the backfilled blocks every 30s while settling and deletes
+# compacted-away blocks at once, so no restart loads them; the battery
+# restarts Mimir with its default interval so no compaction overlaps a
+# measurement.
+MIMIR_COLD_ENVIRONMENT = {
+    "MIMIR_COMPACTION_INTERVAL": "30s",
+    "MIMIR_FIRST_LEVEL_COMPACTION_WAIT": "0s",
+    "MIMIR_COMPACTOR_DELETION_DELAY": "0s",
+}
+MIMIR_COMPACTION_TIMEOUT_S = 900
+
+
+@dataclass
+class ColdSeries:
+    """One cold-scenario series (or, for a histogram, its bucket, sum and
+    count series) and the running state its samples continue from."""
+
+    kind: str
+    labels: tuple[tuple[str, str], ...]
+    offset_ms: int
+    rate: float = 0.0
+    value: float = 0.0
+    live: tuple[int, int] = (0, 1 << 62)
+    fractions: tuple[float, ...] = ()
+    counts: list[float] = field(default_factory=list)
+    mean: float = 0.0
+
 
 PROFILES = (
     (3.0, "mixed"),
@@ -290,7 +336,7 @@ def discovery_comparator(oracle: Exchange, impl: Exchange) -> None:
     assert_json_data_equivalent("discovery", json_body(oracle), json_body(impl))
 
 
-class MetricsFuzz(FuzzProduct):
+class MetricsFuzz(FuzzProduct, ColdProduct):
     name = "metrics"
     resource_roles = {
         "prometheus": "oracle",
@@ -309,7 +355,7 @@ class MetricsFuzz(FuzzProduct):
         # Tokens must outlive the run, not just the regression suite's hour.
         expires_from = int(time.time() + config.duration_s)
         self.oracle = os.environ.get("FUZZ_METRICS_ORACLE") or (
-            "mimir-blocks" if config.historical else "prometheus"
+            "mimir-blocks" if config.object_store else "prometheus"
         )
         if self.oracle not in ORACLES:
             raise ValueError(f"FUZZ_METRICS_ORACLE must be one of {ORACLES}")
@@ -321,12 +367,13 @@ class MetricsFuzz(FuzzProduct):
         self.storage = os.environ.get("FUZZ_METRICS_STORAGE") or "s3"
         if self.storage not in STORAGES:
             raise ValueError(f"FUZZ_METRICS_STORAGE must be one of {STORAGES}")
-        if config.historical and (
+        if config.object_store and (
             self.oracle != "mimir-blocks" or self.storage != "s3"
         ):
             raise ValueError(
-                "FUZZ_SCENARIO=historical needs FUZZ_METRICS_ORACLE=mimir-blocks "
-                "and FUZZ_METRICS_STORAGE=s3, so both sides read object storage"
+                f"FUZZ_SCENARIO={config.scenario} needs "
+                "FUZZ_METRICS_ORACLE=mimir-blocks and FUZZ_METRICS_STORAGE=s3, "
+                "so both sides read object storage"
             )
         self.impl_config = os.environ.get("FUZZ_METRICS_CONFIG") or "regression"
         if self.impl_config not in IMPL_CONFIGS:
@@ -367,6 +414,9 @@ class MetricsFuzz(FuzzProduct):
         )
         self.window_ms = int(config.window_s * 1000)
         self.catalog = Catalog()
+        self.cold_end_ms = 0
+        self.cold_counts: dict[str, int] = defaultdict(int)
+        self.cold_samples: dict[str, int] = defaultdict(int)
 
     def stack(self) -> AbstractContextManager[object]:
         def start_reader(project: ComposeProject) -> None:
@@ -389,6 +439,10 @@ class MetricsFuzz(FuzzProduct):
             if self.oracle == "mimir-blocks":
                 # Read by compose when interpolating the mimir service flags.
                 os.environ.update(MIMIR_BLOCKS_ENVIRONMENT)
+            if self.config.cold is not None:
+                os.environ.update(MIMIR_COLD_ENVIRONMENT)
+                hours = math.ceil(self.config.cold.span_s / 3600) + 2
+                os.environ["MIMIR_OUT_OF_ORDER_WINDOW"] = f"{hours}h"
         services: tuple[str, ...] = (oracle_service,)
         if self.storage == "s3" or self.oracle != "prometheus":
             services += ("minio", "minio-init")
@@ -502,6 +556,350 @@ class MetricsFuzz(FuzzProduct):
             "impl_config": self.impl_config,
             **super().describe(),
         }
+
+    # Cold reads --------------------------------------------------------------
+
+    def cold_services(self) -> dict[str, ColdService]:
+        if self.impl_config == "production":
+            impl = ColdService(
+                "metrics-s3",
+                f"{STANDALONE_S3_URL}/-/ready",
+                metrics_url=f"{STANDALONE_S3_URL}/metrics",
+                config=PRODUCT_DIR / "production" / "standalone-s3.yaml",
+                config_env="METRICS_S3_CONFIG",
+            )
+        else:
+            impl = ColdService("metrics-reader", f"{READER_URL}/-/ready")
+        return {
+            "impl": impl,
+            "oracle": ColdService("mimir", f"{MIMIR_URL}/ready", "mimir-data"),
+        }
+
+    def _cold_entries(
+        self, rng: random.Random, start: int, end: int
+    ) -> list[ColdSeries]:
+        scale = self.config.scale
+        base = (("fuzz_run", self.config.run_id), ("job", "fuzz-cold"))
+
+        def labels(name: str, **values: str) -> tuple[tuple[str, str], ...]:
+            return tuple(sorted((("__name__", name), *base, *values.items())))
+
+        def offset() -> int:
+            return rng.randrange(COLD_INTERVAL_MS)
+
+        entries = []
+        instances = max(1, round(COLD_INSTANCES * scale))
+        for rank, namespace in enumerate(COLD_NAMESPACES):
+            for service in COLD_SERVICES:
+                traffic = rng.uniform(1, 20) / (1 + rank)
+                for number in range(instances):
+                    instance = f"{namespace}-{service}-{number}"
+                    for method in COLD_METHODS:
+                        for code in COLD_CODES:
+                            share = {"200": 0.9, "404": 0.07, "500": 0.03}[code]
+                            entries.append(
+                                ColdSeries(
+                                    "counter",
+                                    labels(
+                                        COLD_REQUESTS,
+                                        namespace=namespace,
+                                        service=service,
+                                        instance=instance,
+                                        method=method,
+                                        code=code,
+                                    ),
+                                    offset(),
+                                    rate=traffic * share,
+                                )
+                            )
+                    entries.append(
+                        ColdSeries(
+                            "gauge",
+                            labels(
+                                COLD_MEMORY,
+                                namespace=namespace,
+                                service=service,
+                                instance=instance,
+                            ),
+                            offset(),
+                            value=rng.uniform(1e8, 4e9),
+                        )
+                    )
+                median = rng.uniform(0.01, 0.5)
+                entries.append(
+                    ColdSeries(
+                        "histogram",
+                        labels(COLD_DURATION, namespace=namespace, service=service),
+                        offset(),
+                        rate=traffic * instances,
+                        fractions=tuple(
+                            0.5
+                            * (1 + math.erf(math.log(bound / median) / math.sqrt(2)))
+                            for bound in COLD_BOUNDS
+                        ),
+                        counts=[0.0] * (len(COLD_BOUNDS) + 1),
+                        mean=median * 1.6,
+                    )
+                )
+        for number in range(round(COLD_SESSIONS * scale)):
+            born = rng.randint(start, end - HOUR_MS)
+            entries.append(
+                ColdSeries(
+                    "session",
+                    labels(
+                        COLD_SESSION,
+                        namespace=zipf(rng, COLD_NAMESPACES),
+                        session_id=f"s-{number:05d}",
+                    ),
+                    offset(),
+                    live=(born, min(end, born + rng.randint(1, 3) * HOUR_MS)),
+                )
+            )
+        return entries
+
+    def _cold_slice(
+        self, rng: random.Random, entry: ColdSeries, low: int, high: int
+    ) -> list[Series]:
+        low, high = max(low, entry.live[0]), min(high, entry.live[1])
+        if low >= high:
+            return []
+        first = low + (entry.offset_ms - low) % COLD_INTERVAL_MS
+        timestamps = range(first, high, COLD_INTERVAL_MS)
+        interval_s = COLD_INTERVAL_MS / 1000
+        if entry.kind == "session":
+            return [Series(entry.labels, tuple(Sample(t, 1.0) for t in timestamps))]
+        if entry.kind == "gauge":
+            return [
+                Series(
+                    entry.labels,
+                    tuple(
+                        Sample(
+                            t,
+                            round(
+                                entry.value
+                                * (1 + 0.2 * math.sin(2 * math.pi * t / (24 * HOUR_MS)))
+                                + rng.gauss(0, entry.value * 0.01)
+                            ),
+                        )
+                        for t in timestamps
+                    ),
+                )
+            ]
+        if entry.kind == "counter":
+            samples = []
+            for t in timestamps:
+                entry.value += round(rng.uniform(0, 2) * entry.rate * interval_s)
+                samples.append(Sample(t, entry.value))
+            return [Series(entry.labels, tuple(samples))]
+        bounds = (*(f"{bound:g}" for bound in COLD_BOUNDS), "+Inf")
+        fractions = (*entry.fractions, 1.0)
+        buckets: list[list[Sample]] = [[] for _ in bounds]
+        sums, counts = [], []
+        for t in timestamps:
+            observed = round(rng.uniform(0, 2) * entry.rate * interval_s)
+            for position, fraction in enumerate(fractions):
+                entry.counts[position] += round(observed * fraction)
+                buckets[position].append(Sample(t, entry.counts[position]))
+            entry.value += observed * entry.mean * rng.uniform(0.8, 1.2)
+            sums.append(Sample(t, round(entry.value, 3)))
+            counts.append(Sample(t, entry.counts[-1]))
+        common = tuple(item for item in entry.labels if item[0] != "__name__")
+
+        def series(name: str, extra: tuple, samples: list[Sample]) -> Series:
+            return Series(
+                tuple(sorted((("__name__", name), *common, *extra))), tuple(samples)
+            )
+
+        return [
+            *(
+                series(f"{COLD_DURATION}_bucket", (("le", bound),), values)
+                for bound, values in zip(bounds, buckets, strict=True)
+            ),
+            series(f"{COLD_DURATION}_sum", (), sums),
+            series(f"{COLD_DURATION}_count", (), counts),
+        ]
+
+    def cold_load(self, rng: random.Random, end_ns: int) -> Iterator[Batch]:
+        assert self.config.cold is not None
+        end = end_ns // 1_000_000
+        start = end - int(self.config.cold.span_s * 1000)
+        entries = self._cold_entries(rng, start, end)
+        self.cold_end_ms = end
+        self.cold_counts.clear()
+        self.cold_samples.clear()
+        names: dict[str, set[tuple]] = defaultdict(set)
+        for low in range(start, end, HOUR_MS):
+            pushed = [
+                series
+                for entry in entries
+                for series in self._cold_slice(rng, entry, low, min(low + HOUR_MS, end))
+            ]
+            for series in pushed:
+                name = dict(series.labels)["__name__"]
+                names[name].add(series.labels)
+                self.cold_samples[name] += len(series.samples)
+            yield from self._batches(0, pushed, f"cold-{(low - start) // HOUR_MS:02d}")
+        self.cold_counts.update(
+            series=sum(len(values) for values in names.values()),
+            samples=sum(self.cold_samples.values()),
+            **{f"series.{name}": len(values) for name, values in sorted(names.items())},
+        )
+
+    def cold_flush(self, stack: ColdStack) -> None:
+        self.after_ingest(0)
+        # One compactor run can start before the flush lands; the second
+        # plans every block the flush shipped.
+        target = self._compactor_runs() + 2
+        deadline = time.monotonic() + MIMIR_COMPACTION_TIMEOUT_S
+        while self._compactor_runs() < target:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Mimir's compactor did not finish two runs within "
+                    f"{MIMIR_COMPACTION_TIMEOUT_S}s"
+                )
+            time.sleep(5)
+        os.environ.pop("MIMIR_COMPACTION_INTERVAL", None)
+        assert self.config.cold is not None
+        if self.config.cold.rollups and self.impl_config == "production":
+            waited = stack.settle_rollups(
+                self.cold_services()["impl"],
+                product="metrics",
+                config=PRODUCT_DIR / "production" / "standalone-s3.yaml",
+                env="METRICS_S3_CONFIG",
+                metrics_url=f"{STANDALONE_S3_URL}/metrics",
+                ready_timeout_s=self.config.cold.ready_timeout_s,
+            )
+            print(f"cold metrics: rollups settled in {waited:.0f}s", flush=True)
+
+    def _compactor_runs(self) -> float:
+        with urllib.request.urlopen(f"{MIMIR_URL}/metrics", timeout=30) as response:
+            text = response.read().decode()
+        return sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in text.splitlines()
+            if line.startswith("cortex_compactor_runs_completed_total")
+        )
+
+    def cold_probes(self) -> list[Probe]:
+        assert self.config.cold is not None
+        hours = math.ceil(self.config.cold.span_s / 3600) + 1
+        at = f"{self.cold_end_ms / 1000:.3f}"
+        run = quote(self.config.run_id)
+
+        def probe(name: str, expected: int) -> Probe:
+            query = f"sum(count_over_time({name}{{fuzz_run={run}}}[{hours}h]))"
+
+            def ready(exchange: Exchange) -> bool:
+                if not exchange.ok():
+                    return False
+                try:
+                    result = exchange.json()["data"]["result"]
+                    return bool(result) and float(result[0]["value"][1]) == expected
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return False
+
+            return Probe(
+                f"samples:{name}",
+                Request("GET", "/api/v1/query", (("query", query), ("time", at))),
+                ready,
+            )
+
+        return [probe(name, count) for name, count in sorted(self.cold_samples.items())]
+
+    def cold_battery(self, rng: random.Random) -> list[Case]:
+        end_s = self.cold_end_ms // 1000
+        run = f"fuzz_run={quote(self.config.run_id)}"
+        namespace = rng.choice(COLD_NAMESPACES[:3])
+        requests = f"{COLD_REQUESTS}{{{run}}}"
+        errors = f'{COLD_REQUESTS}{{{run}, code=~"5.."}}'
+        buckets = f"{COLD_DURATION}_bucket{{{run}}}"
+        sessions = f"{COLD_SESSION}{{{run}}}"
+        memory = f"{COLD_MEMORY}{{{run}}}"
+
+        def ranged(family: str, template: str, hours: int) -> Case:
+            step = COLD_STEPS[hours]
+            query = template.replace("{range}", f"{max(step, 300)}s")
+            high = end_s - end_s % step
+            return Case(
+                f"{family}.{hours}h",
+                query,
+                Request(
+                    "GET",
+                    "/api/v1/query_range",
+                    (
+                        ("query", query),
+                        ("start", str(high - hours * 3600)),
+                        ("end", str(high)),
+                        ("step", str(step)),
+                    ),
+                ),
+                _comparator(query),
+                oracle_quirk=self._oracle_quirk,
+            )
+
+        # Store-gateways answer metadata at block granularity, so these cover
+        # the whole day rather than cutting through blocks.
+        day = (("start", str(end_s - 25 * 3600)), ("end", str(end_s + 60)))
+
+        def discovery(family: str, path: str, match: str) -> Case:
+            return Case(
+                family,
+                f"{path} {match}",
+                Request("GET", path, (("match[]", match), *day)),
+                discovery_comparator,
+            )
+
+        by_service = "sum by (service) (rate(" + requests + "[{range}]))"
+        error_ratio = (
+            "sum by (namespace) (rate(" + errors + "[{range}])) / "
+            "sum by (namespace) (rate(" + requests + "[{range}]))"
+        )
+        p99 = (
+            "histogram_quantile(0.99, sum by (le, service) (rate("
+            + buckets
+            + "[{range}])))"
+        )
+        by_namespace = f"count by (namespace) ({sessions})"
+        max_memory = f"max by (service) (max_over_time({memory}[24h]))"
+        return [
+            *(ranged("agg.rate_by_service", by_service, hours) for hours in (1, 24)),
+            ranged("agg.error_ratio_by_namespace", error_ratio, 24),
+            ranged("histogram.p99_by_service", p99, 6),
+            *(
+                ranged("highcard.sessions_by_namespace", by_namespace, hours)
+                for hours in (1, 24)
+            ),
+            ranged("raw.memory", f'{COLD_MEMORY}{{{run}, namespace="{namespace}"}}', 1),
+            Case(
+                "instant.max_memory.24h",
+                max_memory,
+                Request(
+                    "GET",
+                    "/api/v1/query",
+                    (("query", max_memory), ("time", str(end_s))),
+                ),
+                _comparator(max_memory),
+                oracle_quirk=self._oracle_quirk,
+            ),
+            discovery(
+                "label_values.instance.24h", "/api/v1/label/instance/values", requests
+            ),
+            discovery(
+                "label_values.session_id.24h",
+                "/api/v1/label/session_id/values",
+                sessions,
+            ),
+            discovery(
+                "series.namespace.24h",
+                "/api/v1/series",
+                f'{{{run}, namespace="{namespace}", '
+                f'__name__=~"{COLD_REQUESTS}|{COLD_MEMORY}"}}',
+            ),
+            discovery("label_names.24h", "/api/v1/labels", f"{{{run}}}"),
+        ]
+
+    def cold_stats(self) -> dict[str, Any]:
+        return dict(self.cold_counts)
 
     # Data generation ---------------------------------------------------------
 

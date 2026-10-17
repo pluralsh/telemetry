@@ -156,8 +156,19 @@ the seed, although wall-clock time still shifts the data windows.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `FUZZ_SEED` | random | Seed for data and query generation |
-| `FUZZ_SCENARIO` | `recent` | `recent` (each product's default oracle) or `historical` (every oracle answers from object storage, behind a MinIO latency proxy; see below) |
-| `MINIO_FIRST_BYTE_MS` | `15` | Historical scenario: delay added before the first byte of every MinIO response |
+| `FUZZ_SCENARIO` | `recent` | `recent` (each product's default oracle), `historical` (every oracle answers from object storage, behind a MinIO latency proxy), or `cold` (a fixed battery over a day of object-store data, each query against freshly restarted processes with empty caches; logs, metrics and traces only); see below |
+| `MINIO_FIRST_BYTE_MS` | `15` (historical), `20` (cold) | Object-store scenarios: delay added before the first byte of every MinIO response |
+| `FUZZ_COLD_SPAN` | `22h` | Cold scenario: time the dataset spans, ending at the load; at least `1h`, and keep it under the 24h retention of production Logs and Traces |
+| `FUZZ_COLD_REPEATS` | `3` | Cold scenario: cold measurements of every battery query per side |
+| `FUZZ_COLD_SETTLE` | `5s` | Cold scenario: least pause after a restarted service is ready; the harness then also waits until it moves less than 64 KiB to or from object storage over 2s (at most 60s longer), so only metadata polling is left |
+| `FUZZ_COLD_WARM` | `1` | Cold scenario: re-send each query once to the now-warm process and report it as `warm` |
+| `FUZZ_COLD_FAMILIES` | unset (all) | Cold scenario: comma-separated family-name prefixes to run, such as `log.,labels` |
+| `FUZZ_COLD_ROLLUPS` | `1` | Cold scenario: run the Logs and the standalone Metrics and Traces servers' rollups to completion while settling, as the oracles' compactors are; `0` measures the unrolled hour segments |
+| `FUZZ_COLD_COMPACTION` | `1` | Cold scenario: while settling, wait until Logs' SlateDB compaction is quiescent and run Loki's compactor (which otherwise first runs 10 minutes after a start, longer than any cold process lives); `0` measures whatever layout loading left |
+| `FUZZ_COLD_TIMELINE` | `0` | Cold scenario: `1` makes the latency proxy record every object-store request (client, method, key, `Range`, status, bytes, start/first-byte/end ms) and writes each measurement's startup and query requests, with their dependent-round-trip `waves`, to `cold_timeline.jsonl` |
+| `FUZZ_COLD_IMPL_STARTS` | unset | Cold scenario, standalone Metrics and Traces (`FUZZ_<PRODUCT>_CONFIG=production`): measure the implementation once per comma-separated start, each on a fresh process: `off` (startup cache warming disabled, as before it was on by default), `ready` (query as soon as it is ready, while warming runs), `warm` (after `telemetry_cache_warmer_runs_total{mode="startup"}` counts the pass, then the usual idle wait), `idle` (the default behaviour). The last start is the measurement of record; `summary.json` reports each under `cold.impl_starts` |
+| `FUZZ_COLD_READY_TIMEOUT` | `5m` | Cold scenario: how long a restarted service may take to report ready |
+| `FUZZ_COLD_QUIESCE`, `FUZZ_COLD_QUIESCE_TIMEOUT` | `45s`, `15m` | Cold scenario: before measuring, both sides must upload less than 1 MiB per window this long; fail after the timeout |
 | `FUZZ_PIN_CPUS` | `1` | Pin shared services, the runner, the implementation, and the oracle to disjoint cpusets (needs at least 4 Docker CPUs); `0` disables |
 | `FUZZ_CPU_RANGE` | unset | Confine pinning to these cores (such as `6-11`); set per lane by `bench --lanes` |
 | `FUZZ_SCALE` | `1` | Multiplier on data volume per round |
@@ -241,7 +252,8 @@ only compare runs with the same mode.
 `documentation/benchmarks/fuzz`, writes full outputs to
 `target/fuzz/bench-<timestamp>/<product>`, continues after a failing
 product, and exits non-zero if any failed. `--scenarios recent,historical`
-runs every product once per scenario, into `<product>-<scenario>`.
+runs every product once per scenario, into `<product>-<scenario>`; `cold`
+runs only for logs, metrics and traces.
 `bench` sets `FUZZ_<PRODUCT>_CONFIG` from `--config`, `production` by default
 so numbers reflect a deployed configuration; `--config regression` with a short
 `--duration` is the quick correctness pass over page, segment and cache
@@ -257,6 +269,66 @@ ships (every 15 minutes), so the logs fuzz skips series cases there. In every
 product, MinIO moves to `:9010` and `products/latency-proxy/proxy.py` takes over
 `minio:9000` inside MinIO's network namespace, delaying the first byte of each
 response by `MINIO_FIRST_BYTE_MS` for both sides.
+
+The `cold` scenario measures first-query latency over a realistic amount of
+object-store data instead of fuzzing. It runs against the same oracles as
+`historical` (Loki with `products/logs/loki-fuzz-cold.yaml`, `mimir-blocks`,
+and `tempo-s3`), loads `FUZZ_COLD_SPAN` of backdated data hour by hour
+(at `FUZZ_SCALE=1`: about 1M logfmt entries over 144 streams; 2840 metric
+series, including 2000 short-lived high-cardinality ones, at a 30s interval,
+about 2.7M samples; 30k traces of 1-12 spans), then:
+
+1. Flushes both sides to MinIO: Loki flushes its ingester and ships the TSDB
+   index on a graceful stop (each run checks that every day's index table is
+   in the bucket), Mimir flushes its ingester and compacts with a 30s
+   interval and deletes compacted-away blocks at once, and Tempo is flushed
+   after every hour, so each hour is its own block, as if ingested live.
+   The Logs and the standalone Metrics and Traces servers are restarted once
+   with their rollup task running every 10s instead of every 5 minutes
+   (which no measured process lives for), and the harness waits for two
+   successful passes (`telemetry_rollup_passes_total`; Logs counts no
+   passes, so it is restarted with rollup logging on and the harness waits
+   until every rollup segment it started is sealed and none started for
+   25s), so 24h queries read the window and day rollups a long-running
+   server would have made rather than a day of hour segments.
+   `FUZZ_COLD_ROLLUPS=0` skips this. Logs then has to show a quiescent
+   SlateDB compaction for 30s (`slatedb_db_sst_count`, `l0_sst_count`,
+   `sorted_run_count`, `sst_view_count` and
+   `storage_segment_compactions_total` unchanged, nothing being compacted,
+   under 1 MiB uploaded), and Loki is restarted once with its compactor
+   running every 10s until two runs succeeded
+   (`loki_boltdb_shipper_compact_tables_operation_total`), since it
+   otherwise first runs 10 minutes after a start. Both sides' object layout
+   before and after settling is written to `cold_settle.json`.
+   `FUZZ_COLD_COMPACTION=0` skips both.
+2. Waits until each side uploads less than 1 MiB per `FUZZ_COLD_QUIESCE`, so
+   no flush or compaction is still running.
+3. Checks exact counts on both sides (entries, samples per metric, one
+   sentinel trace per hour, and trace lookups by ID across the span).
+4. Runs every battery query `FUZZ_COLD_REPEATS` times per side in seeded
+   random order. Before each measurement the service is stopped, its data
+   volume (Loki, Mimir, Tempo) is emptied, and it is recreated, so in-memory
+   caches, local block copies, and the implementation's disk cache (in the
+   container's `/tmp`) start empty. The harness waits for readiness, for
+   `FUZZ_COLD_SETTLE`, and until startup object-store traffic is down to
+   metadata polling, then sends the query. The other side stays idle.
+
+The latency proxy counts requests, response bytes and uploaded bytes per
+client IP and method (`--stats-port`, `9020`), so each measured query
+reports the GETs and bytes it read from object storage, and startup traffic
+is reported separately. Answers are still compared and classified as in the
+fuzz. Results land in `summary.json` and `summary.md` under `cold`, one line
+per measurement in `cold.jsonl`, and the history entry under `results.cold`.
+Cold restarts need `FUZZ_STACK=compose`. A measurement takes 20-50 seconds,
+mostly restarts (Loki needs about 11s to become ready, Tempo 16s), so with
+the defaults logs takes about 25 minutes, metrics 15 and traces 30;
+`FUZZ_COLD_REPEATS=1` takes about a third of that. If the budget runs out,
+the remaining measurements are skipped and noted in the summary. Only startup warming the operator does by default counts: Metrics
+and Traces warm SST filters and indexes in the background once started
+(readiness does not wait, so the idle wait above usually covers the pass;
+`FUZZ_COLD_IMPL_STARTS` measures around it), Logs does not warm on startup,
+and every continuous cache warmer's first pass after an unwarmed start only
+records the SSTs already live.
 
 Every round also times a trivial readiness request against each service and
 reports it as the "Request floor" in `summary.md`, the per-request overhead

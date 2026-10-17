@@ -4,7 +4,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use common::{SharedDbCache, SstWarmTracker};
+use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::{SharedDbCache, WarmWindow};
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
@@ -89,33 +90,32 @@ fn shard_storage(config: &Config, shard: ShardId) -> common::storage::config::Sl
     storage
 }
 
-async fn warm_storage<S: StorageRead + WarmStorage>(
+/// Plans the buckets of `window` ending at `end`: samples of those inside
+/// its payload window, metadata of the rest.
+async fn plan_storage<S: StorageRead + WarmStorage>(
     storage: S,
     namespaces: &[Namespace],
-    (start, end): (i64, i64),
-    include_samples: bool,
-    concurrency: usize,
-    cancel: &CancellationToken,
-    tracker: Option<&SstWarmTracker>,
+    window: WarmWindow,
+    end: i64,
+    plan: &mut WarmPlan,
 ) -> Result<()> {
+    let start = window.metadata.map(|_| window.metadata_since(end, 1));
+    let payloads_since = window.payloads_since(end, 1);
+    let mut recent = Vec::with_capacity(namespaces.len());
+    let mut older = Vec::with_capacity(namespaces.len());
     for namespace in namespaces {
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        let buckets = storage
-            .get_buckets_in_range(namespace, Some(start), Some(end))
-            .await?;
-        storage
-            .warm(
-                namespace,
-                buckets,
-                include_samples,
-                concurrency,
-                cancel,
-                tracker,
-            )
-            .await?;
+        let (with_samples, without): (HashSet<_>, HashSet<_>) = storage
+            .get_buckets_in_range(namespace, start, Some(end))
+            .await?
+            .into_iter()
+            .partition(|bucket| {
+                payloads_since.is_some_and(|since| bucket.end_ms() / 1_000 > since)
+            });
+        recent.push((namespace.clone(), with_samples));
+        older.push((namespace.clone(), without));
     }
+    storage.plan_warm(&recent, true, plan);
+    storage.plan_warm(&older, false, plan);
     Ok(())
 }
 
@@ -285,6 +285,11 @@ impl ShardedMetrics {
         self.remote.set(client).is_ok()
     }
 
+    /// The block and metadata cache every shard shares.
+    pub fn db_cache(&self) -> &SharedDbCache {
+        &self.block_cache
+    }
+
     /// The shards this reader reads remotely. Never includes an open shard:
     /// a local shard is always read in process.
     pub(crate) fn remote_shards(&self) -> Vec<RemoteShard> {
@@ -301,52 +306,58 @@ impl ShardedMetrics {
             .collect()
     }
 
-    /// Warms recent cache blocks for every open shard and namespace, skipping
-    /// SSTs `tracker` has already warmed.
+    /// Warms the SSTs of `window` across every open shard and namespace,
+    /// newest bucket first, into `budget_percent` of the metadata cache.
+    /// SSTs `ledger` holds are skipped, and those compaction removed are
+    /// evicted; see [`warm_planned`]. Without a metadata cache only the
+    /// payload window is warmed.
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
-        warm_range: Duration,
-        include_samples: bool,
+        window: WarmWindow,
         concurrency: usize,
         cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> Result<()> {
+        ledger: &WarmLedger,
+        budget_percent: u8,
+    ) -> Result<WarmReport> {
+        let budget = WarmBudget::of(&self.block_cache, budget_percent);
+        let window = if budget.is_some() {
+            window
+        } else {
+            window.payloads_only()
+        };
+        if budget.is_none() && window.payloads.is_none() {
+            return Ok(WarmReport::default());
+        }
+        let Some((_permits, concurrency)) = self.shards.reserve_io(concurrency, cancel).await?
+        else {
+            return Ok(WarmReport::default());
+        };
         let end = common::time::now_secs();
-        let start = end.saturating_sub(i64::try_from(warm_range.as_secs()).unwrap_or(i64::MAX));
-        self.shards
-            .warm(concurrency, cancel, |shard, concurrency| async move {
-                let range = (start, end);
-                match &*shard {
-                    MetricsShard::Writer(db) => {
-                        let storage = db.storage_read();
-                        warm_storage(
-                            storage,
-                            namespaces,
-                            range,
-                            include_samples,
-                            concurrency,
-                            cancel,
-                            tracker,
-                        )
-                        .await
-                    }
-                    MetricsShard::Reader(db) => {
-                        let storage = db.storage_read();
-                        warm_storage(
-                            storage,
-                            namespaces,
-                            range,
-                            include_samples,
-                            concurrency,
-                            cancel,
-                            tracker,
-                        )
-                        .await
-                    }
+        let mut plan = WarmPlan::default();
+        for shard in self.shards.databases().await {
+            if cancel.is_cancelled() {
+                return Ok(WarmReport::default());
+            }
+            match &*shard {
+                MetricsShard::Writer(db) => {
+                    plan_storage(db.storage_read(), namespaces, window, end, &mut plan).await?
                 }
-            })
-            .await
+                MetricsShard::Reader(db) => {
+                    plan_storage(db.storage_read(), namespaces, window, end, &mut plan).await?
+                }
+            }
+        }
+        Ok(warm_planned(
+            "metrics",
+            plan,
+            budget.unwrap_or(WarmBudget::UNBOUNDED),
+            window.payloads.is_some(),
+            concurrency,
+            cancel,
+            ledger,
+        )
+        .await)
     }
 
     pub async fn write_shard(

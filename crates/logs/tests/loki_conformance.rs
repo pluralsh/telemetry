@@ -471,6 +471,7 @@ async fn open_database() -> LogDb {
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         result_cache_capacity_bytes: plural_logs::DEFAULT_RESULT_CACHE_CAPACITY_BYTES,
+        memory: Default::default(),
         page: PageConfig::default(),
         compaction: CompactionConfig {
             enabled: false,

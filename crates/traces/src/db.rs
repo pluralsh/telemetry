@@ -17,10 +17,11 @@ use common::coordinator::{
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
 use common::storage::compaction::{MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
+use common::storage::slate::warm::WarmPlan;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::{
-    BytesRange, SharedDbCache, SstWarmTracker, StorageBuilder, StorageReaderRuntime,
-    StorageSemantics, create_storage_read,
+    BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics, WarmWindow,
+    create_storage_read,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use opentelemetry_proto::tonic::{
@@ -30,7 +31,6 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use slatedb::config::DbReaderOptions;
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
     LOCATOR_SEGMENT, PageRef, PageTrace, StoredPageMetadata, TraceHead, TraceLocator,
@@ -48,6 +48,50 @@ const READ_CONCURRENCY: usize = 32;
 const MATERIALIZE_BATCH: usize = 256;
 /// Segments whose metadata or postings are scanned concurrently.
 const SEGMENT_SCAN_CONCURRENCY: usize = 8;
+/// Segments whose discovery catalogs one tag lookup reads at once.
+const CATALOG_SEGMENT_CONCURRENCY: usize = READ_CONCURRENCY;
+
+#[cfg(not(test))]
+fn catalog_concurrency() -> usize {
+    CATALOG_SEGMENT_CONCURRENCY
+}
+
+/// Overrides [`CATALOG_SEGMENT_CONCURRENCY`] in tests when non-zero.
+#[cfg(test)]
+static CATALOG_CONCURRENCY_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn catalog_concurrency() -> usize {
+    match CATALOG_CONCURRENCY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => CATALOG_SEGMENT_CONCURRENCY,
+        overridden => overridden,
+    }
+}
+
+/// Most candidates one TraceQL search round decides at once. Rounds double
+/// up to this while they come up short of the limit, and each costs a few
+/// dependent reads, so a large limit takes a few wide rounds.
+const SEARCH_BATCH_MAX: usize = 4 * MATERIALIZE_BATCH;
+
+#[cfg(not(test))]
+fn search_batch_max() -> usize {
+    SEARCH_BATCH_MAX
+}
+
+/// Overrides [`SEARCH_BATCH_MAX`] in tests when non-zero.
+#[cfg(test)]
+static SEARCH_BATCH_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn search_batch_max() -> usize {
+    match SEARCH_BATCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => SEARCH_BATCH_MAX,
+        overridden => overridden,
+    }
+}
+
 /// Encoded value bytes one tag-values lookup reads, per segment and across
 /// segments, so a high-cardinality attribute is never listed whole.
 const CATALOG_VALUES_MAX_BYTES: usize = 8 << 20;
@@ -152,39 +196,50 @@ pub struct TraceDb {
 }
 
 impl TraceDb {
-    /// Warms SlateDB caches for recent trace segments in this shard, skipping
-    /// SSTs `tracker` has already warmed.
-    pub async fn warm_recent(
+    /// Adds to `plan` this shard's SSTs of the trace segments overlapping
+    /// `window`, each ranked by its segment's end, and of the locator
+    /// segment, ranked by when each SST was written. Payloads are planned
+    /// for the segments overlapping its payload window and the locator.
+    pub async fn plan_warm(
         &self,
-        namespace: &Namespace,
-        warm_range: Duration,
-        include_payloads: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
+        namespaces: &[Namespace],
+        window: WarmWindow,
+        plan: &mut WarmPlan,
     ) -> Result<()> {
         let Some(slate) = self.storage.slate_read() else {
             return Ok(());
         };
-        let end_ns = common::time::now_ns().unsigned_abs();
-        let range_ns = u64::try_from(warm_range.as_nanos()).unwrap_or(u64::MAX);
-        let mut prefixes = self
-            .catalog_segments(namespace, end_ns.saturating_sub(range_ns), end_ns)
-            .await?
-            .into_iter()
-            .map(|segment| segment_prefix(namespace, segment))
-            .collect::<Vec<_>>();
-        prefixes.push(segment_prefix(namespace, LOCATOR_SEGMENT));
-        slate
-            .warm_prefixes(
-                "traces",
-                &prefixes,
-                include_payloads,
-                concurrency,
-                cancel,
-                tracker,
-            )
-            .await?;
+        let now_ns = common::time::now_ns();
+        let end_ns = now_ns.unsigned_abs();
+        let start_ns = window
+            .metadata_since(now_ns, 1_000_000_000)
+            .max(0)
+            .unsigned_abs();
+        let payloads_since = window.payloads_since(now_ns, 1_000_000_000);
+        let mut recent = Vec::new();
+        let mut older = Vec::new();
+        for namespace in namespaces {
+            for segment in self.catalog_segments(namespace, start_ns, end_ns).await? {
+                let segment_end_ns = segment.end_ns().unwrap_or(i64::MAX);
+                let prefix = (
+                    segment_prefix(namespace, segment),
+                    Some(segment_end_ns / 1_000_000),
+                );
+                if payloads_since.is_some_and(|since| segment_end_ns > since) {
+                    recent.push(prefix);
+                } else {
+                    older.push(prefix);
+                }
+            }
+            let locator = (segment_prefix(namespace, LOCATOR_SEGMENT), None);
+            if payloads_since.is_some() {
+                recent.push(locator);
+            } else {
+                older.push(locator);
+            }
+        }
+        slate.plan_prefixes(&recent, true, plan);
+        slate.plan_prefixes(&older, false, plan);
         Ok(())
     }
 

@@ -11,6 +11,7 @@ use super::config::{
     BlockCacheConfig, DiskPerformance, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
 };
 use super::in_memory::InMemoryStorage;
+use super::metered_cache::{CacheUsage, MeteredCache};
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::settings::{base_settings, load_settings_over};
 use super::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage, SlateDbStorageReader};
@@ -90,11 +91,22 @@ impl StorageBuilder {
     /// Like [`Self::new`], but uses `cache` instead of building one from the
     /// config's `block_cache` / `meta_cache`.
     pub fn with_cache(config: &StorageConfig, cache: &SharedDbCache) -> StorageResult<Self> {
+        Self::with_cache_over(config, cache, base_settings())
+    }
+
+    /// Like [`Self::with_cache`], but a settings file or `SLATEDB_`
+    /// environment variables override `base` rather than [`base_settings`],
+    /// for databases with defaults of their own.
+    pub fn with_cache_over(
+        config: &StorageConfig,
+        cache: &SharedDbCache,
+        base: Settings,
+    ) -> StorageResult<Self> {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
                 let object_store = create_object_store(&slate_config.object_store)?;
-                let mut settings = load_slatedb_settings(slate_config)?;
+                let mut settings = load_settings_over(base, slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
@@ -564,7 +576,22 @@ pub async fn create_storage_read(
 /// [`Self::close`] after every database using the cache has closed so a
 /// hybrid cache flushes its memory tier.
 #[derive(Clone, Default)]
-pub struct SharedDbCache(Option<Arc<dyn DbCache>>);
+pub struct SharedDbCache {
+    cache: Option<Arc<dyn DbCache>>,
+    meta: Option<MetaCacheInfo>,
+    data: Option<CacheUsage>,
+}
+
+/// The memory side of a [`SharedDbCache`]'s metadata cache.
+#[derive(Clone, Debug)]
+pub struct MetaCacheInfo {
+    /// In-memory capacity: a `FoyerMemory` capacity or a `FoyerHybrid`
+    /// memory capacity.
+    pub capacity_bytes: u64,
+    /// Present when the cache is a [`MeteredCache`], which also attributes
+    /// warmed bytes exactly; see [`super::metered_cache::attributing`].
+    pub usage: Option<CacheUsage>,
+}
 
 impl SharedDbCache {
     /// Builds the cache described by `config`; empty for in-memory storage or
@@ -577,17 +604,27 @@ impl SharedDbCache {
     }
 
     pub async fn from_slatedb_config(config: &SlateDbStorageConfig) -> StorageResult<Self> {
-        Ok(Self(
-            build_split_cache(&config.block_cache, &config.meta_cache).await?,
-        ))
+        let (cache, meta, data) =
+            build_split_cache_parts(&config.block_cache, &config.meta_cache).await?;
+        Ok(Self { cache, meta, data })
     }
 
     pub fn cache(&self) -> Option<Arc<dyn DbCache>> {
-        self.0.clone()
+        self.cache.clone()
+    }
+
+    /// The metadata cache, when one is configured.
+    pub fn meta(&self) -> Option<&MetaCacheInfo> {
+        self.meta.as_ref()
+    }
+
+    /// Usage of the data-block cache, when it is in memory only.
+    pub fn data_usage(&self) -> Option<&CacheUsage> {
+        self.data.as_ref()
     }
 
     pub async fn close(&self) -> StorageResult<()> {
-        if let Some(cache) = &self.0 {
+        if let Some(cache) = &self.cache {
             cache.close().await.map_err(StorageError::from_storage)?;
         }
         Ok(())
@@ -614,8 +651,21 @@ pub async fn build_split_cache(
     data: &Option<BlockCacheConfig>,
     meta: &Option<BlockCacheConfig>,
 ) -> StorageResult<Option<Arc<dyn DbCache>>> {
+    Ok(build_split_cache_parts(data, meta).await?.0)
+}
+
+type SplitCacheParts = (
+    Option<Arc<dyn DbCache>>,
+    Option<MetaCacheInfo>,
+    Option<CacheUsage>,
+);
+
+async fn build_split_cache_parts(
+    data: &Option<BlockCacheConfig>,
+    meta: &Option<BlockCacheConfig>,
+) -> StorageResult<SplitCacheParts> {
     if data.is_none() && meta.is_none() {
-        return Ok(None);
+        return Ok((None, None, None));
     }
     if let (Some(BlockCacheConfig::FoyerHybrid(data)), Some(BlockCacheConfig::FoyerHybrid(meta))) =
         (data, meta)
@@ -626,25 +676,37 @@ pub async fn build_split_cache(
             data.disk_path
         )));
     }
-    let data_cache = build_cache(data, "data").await?;
-    let meta_cache = build_cache(meta, "meta").await?;
+    let (data_cache, data_usage) = build_cache(data, "data").await?;
+    let (meta_cache, meta_usage) = build_cache(meta, "meta").await?;
+    let meta_info = meta.as_ref().map(|config| MetaCacheInfo {
+        capacity_bytes: match config {
+            BlockCacheConfig::FoyerHybrid(hybrid) => hybrid.memory_capacity,
+            BlockCacheConfig::FoyerMemory(memory) => memory.capacity,
+        },
+        usage: meta_usage,
+    });
     let split = SplitCache::new()
         .with_block_cache(data_cache)
         .with_meta_cache(meta_cache)
         .build();
-    Ok(Some(Arc::new(split) as Arc<dyn DbCache>))
+    Ok((
+        Some(Arc::new(split) as Arc<dyn DbCache>),
+        meta_info,
+        data_usage,
+    ))
 }
 
-/// Builds a single [`DbCache`] from one cache config, or `None` when absent.
+/// Builds a single [`DbCache`] from one cache config, or `None` when absent,
+/// with the usage of an in-memory one.
 ///
 /// `label` distinguishes the data vs metadata cache in logs and in the foyer
 /// cache name.
 async fn build_cache(
     config: &Option<BlockCacheConfig>,
     label: &str,
-) -> StorageResult<Option<Arc<dyn DbCache>>> {
+) -> StorageResult<(Option<Arc<dyn DbCache>>, Option<CacheUsage>)> {
     let Some(config) = config else {
-        return Ok(None);
+        return Ok((None, None));
     };
     match config {
         BlockCacheConfig::FoyerHybrid(foyer_config) => {
@@ -736,33 +798,44 @@ async fn build_cache(
                 "hybrid cache enabled"
             );
 
-            Ok(Some(
-                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>
+            Ok((
+                Some(Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>),
+                None,
             ))
         }
         BlockCacheConfig::FoyerMemory(mem_config) => {
-            let max_capacity = mem_config.capacity;
-            let opts = match mem_config.shards {
-                Some(shards) => FoyerCacheOptions {
-                    max_capacity,
-                    shards,
-                },
-                None => FoyerCacheOptions {
-                    max_capacity,
-                    ..FoyerCacheOptions::default()
-                },
-            };
+            let capacity = mem_config.capacity;
+            let shards = mem_config
+                .shards
+                .unwrap_or_else(|| default_shards(label, capacity));
             info!(
                 cache = label,
-                capacity_mb = max_capacity / (1024 * 1024),
-                shards = opts.shards,
+                capacity_mb = capacity / (1024 * 1024),
+                shards,
                 "in-memory cache enabled"
             );
-            Ok(Some(
-                Arc::new(FoyerCache::new_with_opts(opts)) as Arc<dyn DbCache>
-            ))
+            let cache = MeteredCache::new(label, capacity, shards);
+            let usage = cache.usage();
+            Ok((Some(Arc::new(cache) as Arc<dyn DbCache>), Some(usage)))
         }
     }
+}
+
+/// Least capacity of each shard of an in-memory metadata cache whose shard
+/// count is not configured. Foyer splits capacity evenly between shards and
+/// evicts within one, so a shard smaller than an SST's index or filter (MiBs
+/// for large compacted SSTs) evicts them as soon as they are inserted.
+const META_SHARD_MIN_BYTES: u64 = 16 << 20;
+
+/// One shard per CPU, SlateDB's default, but for a metadata cache no more
+/// than leaves each shard [`META_SHARD_MIN_BYTES`].
+fn default_shards(label: &str, capacity: u64) -> usize {
+    let per_cpu = FoyerCacheOptions::default().shards;
+    if label != "meta" {
+        return per_cpu;
+    }
+    let fitting = usize::try_from(capacity / META_SHARD_MIN_BYTES).unwrap_or(usize::MAX);
+    per_cpu.min(fitting).max(1)
 }
 
 #[cfg(test)]
@@ -1167,7 +1240,16 @@ mod tests {
         let result = build_split_cache(&None, &None).await.unwrap();
         assert!(result.is_none());
         // And the single-cache builder returns None for an absent config.
-        assert!(build_cache(&None, "data").await.unwrap().is_none());
+        assert!(build_cache(&None, "data").await.unwrap().0.is_none());
+    }
+
+    #[test]
+    fn metadata_cache_shards_hold_at_least_sixteen_mebibytes() {
+        let per_cpu = FoyerCacheOptions::default().shards;
+        assert_eq!(default_shards("meta", 6 << 20), 1);
+        assert_eq!(default_shards("meta", 184 << 20), per_cpu.min(11));
+        assert_eq!(default_shards("meta", 64 << 30), per_cpu);
+        assert_eq!(default_shards("data", 6 << 20), per_cpu);
     }
 
     #[tokio::test]

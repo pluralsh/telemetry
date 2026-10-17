@@ -452,83 +452,64 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
 /// (`warm_sst`), so this impl deliberately does not cover it.
 impl<T> StorageReaderInner<T>
 where
-    T: DbReadOps + DbMetadataOps + DbCacheManagerOps + Send + Sync,
+    T: DbReadOps + DbMetadataOps + DbCacheManagerOps + Send + Sync + 'static,
 {
-    /// Warms the block cache for the SSTs backing `buckets`.
+    /// Adds to `plan` the SSTs backing `wanted` buckets, newest bucket
+    /// first, with every SST the manifest holds as this database's live set.
     ///
-    /// Each timeseries bucket is its own SlateDB segment (RFC-0024). This
-    /// resolves the requested buckets to the SSTs currently live in the
-    /// manifest and warms, for each, the SST filters and index plus the data
-    /// blocks of the bucket when `include_samples` is set. Metadata-only
-    /// warming deliberately stays in SlateDB's metadata cache so application
-    /// index records cannot evict sample payloads from the data cache.
-    ///
-    /// SSTs are warmed up to the caller-provided concurrency. Warming is a
-    /// no-op for buckets with no live segment, and SlateDB itself treats
-    /// `warm_sst` as a no-op when no block cache is configured. With a
-    /// `tracker`, SSTs it has already warmed are skipped.
-    ///
-    /// If `cancel` fires the warm stops promptly, dropping (and thereby
-    /// cancelling) any in-flight per-SST warms, and returns `Ok(())` with
-    /// whatever was warmed so far — cancellation is an expected shutdown
-    /// signal, not an error.
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub(super) async fn warm(
+    /// Each timeseries bucket is its own SlateDB segment (RFC-0024). Each
+    /// planned SST warms its filters and index, plus the bucket's data
+    /// blocks when `include_samples` is set and the bucket is an hour.
+    /// Metadata-only warming stays in SlateDB's metadata cache so index
+    /// records cannot evict sample payloads from the data cache.
+    pub(super) fn plan_warm(
         &self,
-        namespace: &Namespace,
-        buckets: Vec<TimeBucket>,
+        wanted: &[(Namespace, HashSet<TimeBucket>)],
         include_samples: bool,
-        concurrency: usize,
-        cancel: &CancellationToken,
-        tracker: Option<&SstWarmTracker>,
-    ) -> StorageResult<()> {
-        let wanted: HashSet<TimeBucket> = buckets.into_iter().collect();
-
+        plan: &mut WarmPlan,
+    ) {
         let manifest = self.db.status().current_manifest;
-        let work: Vec<_> = manifest
-            .segments()
-            .iter()
-            .filter_map(|segment| {
-                let (segment_namespace, bucket) = parse_bucket(segment.prefix())?;
-                if &segment_namespace != namespace {
-                    return None;
-                }
-                if !wanted.contains(&bucket) {
-                    return None;
-                }
-                // A rollup bucket's samples dwarf the cache budget for the
-                // hours a warm is meant to keep hot.
-                let include_samples = include_samples && bucket.size == 1;
-                let targets: Arc<[CacheTarget]> =
-                    bucket_cache_targets(namespace, &bucket, include_samples).into();
-                let ids = segment
-                    .l0()
-                    .iter()
-                    .map(|view| view.sst.id)
-                    .chain(
-                        segment
-                            .compacted()
-                            .iter()
-                            .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
-                    )
-                    .map(move |id| (id, targets.clone()))
-                    .collect::<Vec<_>>();
-                Some(ids)
-            })
-            .flatten()
-            .collect();
-
-        warm_ssts(
-            self.db.as_ref(),
-            "metrics",
-            work,
-            include_samples,
-            concurrency,
-            cancel,
-            tracker,
-        )
-        .await
-        .map_err(StorageError::from_storage)
+        let mut live = Vec::new();
+        let mut planned = Vec::new();
+        for segment in manifest.segments() {
+            let views: Vec<_> = segment
+                .l0()
+                .iter()
+                .chain(
+                    segment
+                        .compacted()
+                        .iter()
+                        .flat_map(|run| run.sst_views.iter()),
+                )
+                .collect();
+            live.extend(views.iter().map(|view| view.sst.id));
+            let Some((namespace, bucket)) = parse_bucket(segment.prefix()) else {
+                continue;
+            };
+            if !wanted
+                .iter()
+                .any(|(wanted, buckets)| *wanted == namespace && buckets.contains(&bucket))
+            {
+                continue;
+            }
+            // A rollup bucket's samples dwarf the cache budget for the hours a
+            // warm is meant to keep hot.
+            let include_samples = include_samples && bucket.size == 1;
+            let targets: Arc<[CacheTarget]> =
+                bucket_cache_targets(&namespace, &bucket, include_samples).into();
+            planned.extend(views.into_iter().map(|view| {
+                (
+                    view.sst.id,
+                    Arc::clone(&targets),
+                    bucket.end_ms(),
+                    metadata_estimate(&view.sst.info),
+                )
+            }));
+        }
+        let db = plan.add_database(Arc::clone(&self.db) as WarmDb, live);
+        for (id, targets, recency, estimate) in planned {
+            plan.push(db, id, targets, recency, estimate);
+        }
     }
 }
 

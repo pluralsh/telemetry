@@ -64,6 +64,7 @@ proptest.workspace = true
 rstest.workspace = true
 slatedb = { workspace = true, features = ["test-util"] }
 slatedb-common = { workspace = true, features = ["test-util"] }
+sysinfo = { version = "0.35.2", default-features = false, features = ["system"] }
 tempfile.workspace = true
 
 [[bench]]

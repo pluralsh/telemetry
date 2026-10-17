@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import random
 import time
+import urllib.request
+from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -38,6 +40,7 @@ from ..traces.normalize import (
     normalize_trace,
 )
 from ..traces.wire import protobuf_body
+from .cold import ColdProduct, ColdService, ColdStack
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
 from .rand import ODD_STRINGS, chance, quote, regex_escape, scaled, weighted, zipf
@@ -75,6 +78,18 @@ WRITER_1_URL = service_url("traces-writer-1", 3200, 13202)
 READER_URL = service_url("traces-reader", 3200, 13203)
 STANDALONE_S3_URL = service_url("traces-s3", 3200, 13205)
 RESERVOIR = 5000
+TEMPO_URL = service_url("tempo", 3200, 13200)
+HOUR = 3600 * SECOND
+# The cold scenario's day of traces, loaded hour by hour with one sentinel
+# trace per hour. Each hour is `fuzz.round`; Tempo loads and compacts it with
+# tempo-s3.yaml and answers the battery with tempo-cold.yaml.
+COLD_TRACES = 30_000
+COLD_SPANS = (1, 12)
+COLD_TEMPO_CONFIG = "tempo-cold.yaml"
+# Tempo is flushed after every hour and given longer than its 2s
+# `max_block_duration`, so each hour is its own block, as when the day was
+# ingested live, instead of the whole span landing in one block.
+COLD_BLOCK_PAUSE_S = 3.0
 
 SERVICES = (
     "frontend",
@@ -317,7 +332,7 @@ def tag_values_comparator(*, partial: bool):
     return compare
 
 
-class TracesFuzz(FuzzProduct):
+class TracesFuzz(FuzzProduct, ColdProduct):
     name = "traces"
     default_window = "10m"
     resource_roles = {
@@ -377,18 +392,22 @@ class TracesFuzz(FuzzProduct):
         self.window_ns = int(config.window_s * SECOND)
         self.catalog = Catalog()
         self.oracle = os.environ.get("FUZZ_TRACES_ORACLE") or (
-            "tempo-s3" if config.historical else "tempo"
+            "tempo-s3" if config.object_store else "tempo"
         )
         if self.oracle not in ORACLE_CONFIGS:
             raise ValueError(
                 f"FUZZ_TRACES_ORACLE must be one of {tuple(ORACLE_CONFIGS)}"
             )
-        if config.historical and self.oracle != "tempo-s3":
+        if config.object_store and self.oracle != "tempo-s3":
             raise ValueError(
-                "FUZZ_SCENARIO=historical needs FUZZ_TRACES_ORACLE=tempo-s3"
+                f"FUZZ_SCENARIO={config.scenario} needs FUZZ_TRACES_ORACLE=tempo-s3"
             )
         self._project: ComposeProject | None = None
         self._reader_started = False
+        self.cold_end_ns = 0
+        self.cold_hours = 0
+        self.cold_counts: dict[str, int] = defaultdict(int)
+        self.cold_trace_ids: dict[int, str] = {}
 
     def describe(self) -> dict[str, object]:
         return {
@@ -455,6 +474,199 @@ class TracesFuzz(FuzzProduct):
             self._project.up("traces-reader")
             wait_http(f"{READER_URL}/-/ready")
             self._reader_started = True
+
+    # Cold reads --------------------------------------------------------------
+
+    def cold_services(self) -> dict[str, ColdService]:
+        if self.standalone:
+            impl = ColdService(
+                "traces-s3",
+                f"{STANDALONE_S3_URL}/-/ready",
+                metrics_url=f"{STANDALONE_S3_URL}/metrics",
+                config=PRODUCT_DIR / "production" / "standalone-s3.yaml",
+                config_env="TRACES_S3_CONFIG",
+            )
+        else:
+            impl = ColdService("traces-reader", f"{READER_URL}/-/ready")
+        return {
+            "impl": impl,
+            "oracle": ColdService("tempo", f"{TEMPO_URL}/ready", "tempo-data"),
+        }
+
+    def cold_load(self, rng: random.Random, end_ns: int) -> Iterator[Batch]:
+        assert self.config.cold is not None
+        span = int(self.config.cold.span_s * SECOND)
+        start = end_ns - span
+        per_hour = round(COLD_TRACES * self.config.scale) * HOUR / span
+        self.cold_end_ns = end_ns
+        self.cold_counts.clear()
+        self.cold_trace_ids.clear()
+        carry = 0.0
+        for hour, low in enumerate(range(start, end_ns, HOUR)):
+            high = min(low + HOUR, end_ns)
+            exact = per_hour * (high - low) / HOUR + carry
+            count = int(exact) if high - low > 60 * SECOND else 0
+            carry = exact - count
+            pieces = [self._cold_sentinel(rng, hour, high)]
+            for _ in range(count):
+                trace_id = rng.randbytes(16)
+                self.cold_trace_ids.setdefault(hour, trace_id.hex())
+                spans = self._trace(rng, "mixed", trace_id, low, high, *COLD_SPANS)
+                pieces.extend(self._resources(rng, hour, "mixed", spans)[0])
+                self.cold_counts["traces"] += 1
+                self.cold_counts["spans"] += len(spans)
+            self.cold_hours = hour + 1
+            rng.shuffle(pieces)
+            yield from self._batches(pieces, f"cold-{hour:02d}")
+            if self._project is not None:
+                self._flush_tempo()
+                time.sleep(COLD_BLOCK_PAUSE_S)
+
+    def _flush_tempo(self) -> None:
+        request = urllib.request.Request(f"{TEMPO_URL}/flush", method="POST")
+        with urllib.request.urlopen(request, timeout=60):
+            pass
+
+    def _cold_sentinel(self, rng: random.Random, hour: int, high: int) -> ResourceSpans:
+        span = Span(
+            trace_id=rng.randbytes(16),
+            span_id=rng.randbytes(8),
+            name=f"sentinel-{hour}",
+            kind=Span.SPAN_KIND_SERVER,
+            start_time_unix_nano=high - SECOND,
+            end_time_unix_nano=high - SECOND + 1_000_000,
+        )
+        attributes = {
+            "service.name": "fuzz-sentinel",
+            "fuzz.run": self.config.run_id,
+            "fuzz.round": hour,
+        }
+        return self._resource(attributes, [span])
+
+    def cold_flush(self, stack: ColdStack) -> None:
+        self.after_ingest(0)
+        self._flush_tempo()
+        os.environ["TEMPO_CONFIG"] = COLD_TEMPO_CONFIG
+        assert self.config.cold is not None
+        if self.config.cold.rollups and self.standalone:
+            waited = stack.settle_rollups(
+                self.cold_services()["impl"],
+                product="traces",
+                config=PRODUCT_DIR / "production" / "standalone-s3.yaml",
+                env="TRACES_S3_CONFIG",
+                metrics_url=f"{STANDALONE_S3_URL}/metrics",
+                ready_timeout_s=self.config.cold.ready_timeout_s,
+            )
+            print(f"cold traces: rollups settled in {waited:.0f}s", flush=True)
+
+    def cold_probes(self) -> list[Probe]:
+        assert self.config.cold is not None
+        end = self.cold_end_ns // SECOND
+        start = end - int(self.config.cold.span_s)
+        query = (
+            '{ resource.service.name = "fuzz-sentinel" && '
+            f"resource.fuzz.run = {quote(self.config.run_id)} }}"
+        )
+
+        def sentinels(exchange: Exchange) -> bool:
+            if not exchange.ok():
+                return False
+            try:
+                return len(exchange.json().get("traces", ())) == self.cold_hours
+            except (ValueError, AttributeError):
+                return False
+
+        ids = sorted(self.cold_trace_ids.items())
+        return [
+            Probe(
+                "sentinels",
+                Request(
+                    "GET",
+                    "/api/search",
+                    (
+                        ("q", query),
+                        ("start", str(start - 60)),
+                        ("end", str(end + 60)),
+                        ("limit", "100"),
+                    ),
+                ),
+                sentinels,
+            ),
+            *(
+                Probe(
+                    f"trace:{hour}",
+                    Request("GET", f"/api/v2/traces/{trace_id}"),
+                    _trace_found,
+                )
+                for hour, trace_id in (ids[0], ids[len(ids) // 2], ids[-1])
+            ),
+        ]
+
+    def cold_battery(self, rng: random.Random) -> list[Case]:
+        end = self.cold_end_ns // SECOND
+        run = quote(self.config.run_id)
+
+        def search(family: str, query: str, hours: int, limit: int) -> Case:
+            params = (
+                ("q", query),
+                ("start", str(end - hours * 3600)),
+                ("end", str(end)),
+                ("limit", str(limit)),
+            )
+            return Case(
+                f"{family}.{hours}h",
+                query,
+                Request("GET", "/api/search", params),
+                search_comparator(limit),
+            )
+
+        service = rng.choice(SERVICES[:4])
+        broad = f"{{ resource.fuzz.run = {run} }}"
+        selective = (
+            f"{{ resource.fuzz.run = {run} && "
+            f'resource.service.name = "{service}" && span.http.status_code = 503 }}'
+        )
+        slow = f"{{ resource.fuzz.run = {run} && duration > 20s }}"
+        tag = (
+            f"{{ resource.fuzz.run = {run} && "
+            f'span.fuzz.tag = "t{rng.randrange(1000)}" }}'
+        )
+        ids = sorted(self.cold_trace_ids.items())
+        day = (("start", str(end - 24 * 3600)), ("end", str(end)))
+        return [
+            *(search("search.broad", broad, hours, 20) for hours in (1, 6, 24)),
+            *(
+                search("search.selective", selective, hours, MAX_LIMIT)
+                for hours in (6, 24)
+            ),
+            search("search.duration", slow, 6, MAX_LIMIT),
+            search("search.tag", tag, 24, MAX_LIMIT),
+            *(
+                Case(
+                    f"trace.by_id.{age}",
+                    trace_id,
+                    Request("GET", f"/api/v2/traces/{trace_id}"),
+                    trace_comparator,
+                    ok_statuses=frozenset({200, 404}),
+                )
+                for age, (_, trace_id) in (("old", ids[0]), ("mid", ids[len(ids) // 2]))
+            ),
+            Case(
+                "tags.values.service.24h",
+                "resource.service.name",
+                Request("GET", "/api/v2/search/tag/resource.service.name/values", day),
+                tag_values_comparator(partial=False),
+            ),
+            Case(
+                "tags.names.24h",
+                "all",
+                Request("GET", "/api/v2/search/tags", day),
+                tag_names_comparator(partial=False),
+            ),
+        ]
+
+    def cold_stats(self) -> dict[str, Any]:
+        return {**self.cold_counts, "hours": self.cold_hours}
 
     # Data generation ---------------------------------------------------------
 

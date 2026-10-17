@@ -2,17 +2,22 @@
 
 use std::time::{Duration, Instant};
 
+use common::WarmWindow;
 use common::storage::config::{
     BlockCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
     SlateDbStorageConfig, StorageConfig,
 };
+use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
 use slatedb::config::DbReaderOptions;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::config::{CompactionConfig, PageConfig};
 use crate::{Direction, LogBatch, LogEntry, QueryOptions, QueryRequest};
 
 // The server's allocator, so profiles weigh allocation as it does.
+// `profile-system-allocator` measures live memory without its retention.
+#[cfg(not(feature = "profile-system-allocator"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -88,6 +93,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
         write_buffer: Default::default(),
         block_cache_capacity_bytes: crate::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         result_cache_capacity_bytes: 0,
+        memory: Default::default(),
     }
 }
 
@@ -844,6 +850,13 @@ fn production_config(store: &std::path::Path) -> Config {
     if let Ok(ids) = std::env::var("PROFILE_STREAM_ID_BLOCK") {
         config.stream_id_block_size = ids.parse().unwrap();
     }
+    // `PROFILE_DECODE_MB` and `PROFILE_WRITE_MB` override the memory budgets.
+    if let Ok(mb) = std::env::var("PROFILE_DECODE_MB") {
+        config.memory.decode_bytes = mb.parse::<u64>().unwrap() << 20;
+    }
+    if let Ok(mb) = std::env::var("PROFILE_WRITE_MB") {
+        config.memory.write_bytes = mb.parse::<u64>().unwrap() << 20;
+    }
     config.compaction.min_age = Duration::ZERO;
     config.write_buffer.flush_interval = Duration::from_secs(3600);
     // The operator's reader caches: 512 MiB of SST blocks, 128 MiB of
@@ -958,6 +971,9 @@ async fn ingest_clusters(config: &Config, namespace: &Namespace, hours: i64) {
 /// An object store that sleeps before every read, as S3's first-byte latency
 /// does, and counts them.
 static GET_KEYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Every [`SlowStore`] read's start, end and key, for wave analysis.
+static GET_SPANS: std::sync::Mutex<Vec<(Instant, Instant, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Distinct object-store reads since the last call, and the most repeated.
 fn take_get_keys() -> String {
@@ -1021,12 +1037,16 @@ impl slatedb::object_store::ObjectStore for SlowStore {
         options: slatedb::object_store::GetOptions,
     ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
         self.gets.fetch_add(1, Ordering::Relaxed);
-        GET_KEYS
+        let key = format!("{location} {:?}", options.range);
+        GET_KEYS.lock().unwrap().push(key.clone());
+        let started = Instant::now();
+        tokio::time::sleep(self.latency).await;
+        let result = self.inner.get_opts(location, options).await;
+        GET_SPANS
             .lock()
             .unwrap()
-            .push(format!("{location} {:?}", options.range));
-        tokio::time::sleep(self.latency).await;
-        self.inner.get_opts(location, options).await
+            .push((started, Instant::now(), key));
+        result
     }
 
     fn delete_stream(
@@ -1056,8 +1076,14 @@ impl slatedb::object_store::ObjectStore for SlowStore {
         &self,
         prefix: Option<&slatedb::object_store::path::Path>,
     ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        let started = Instant::now();
         tokio::time::sleep(self.latency).await;
-        self.inner.list_with_delimiter(prefix).await
+        let result = self.inner.list_with_delimiter(prefix).await;
+        GET_SPANS
+            .lock()
+            .unwrap()
+            .push((started, Instant::now(), format!("LIST {prefix:?}")));
+        result
     }
 
     async fn copy_opts(
@@ -1073,6 +1099,15 @@ impl slatedb::object_store::ObjectStore for SlowStore {
 /// A reader with empty caches whose object store sleeps `latency` per
 /// request, as a cold read against S3 does.
 async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>) -> LogDb {
+    cold_reader_cached(config, latency, gets).await.0
+}
+
+/// [`cold_reader`] with the SlateDB cache it reads through.
+async fn cold_reader_cached(
+    config: &Config,
+    latency: Duration,
+    gets: &Arc<AtomicUsize>,
+) -> (LogDb, SharedDbCache) {
     let StorageConfig::SlateDb(slate) = &config.storage else {
         unreachable!("profiles run on SlateDB");
     };
@@ -1089,11 +1124,16 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
             .with_shared_cache(&cache)
             .with_object_store(store),
         storage_semantics(),
-        DbReaderOptions::default(),
+        // `PROFILE_SKIP_WAL` opens without replaying the WAL, for stores
+        // whose WAL is already compacted.
+        DbReaderOptions {
+            skip_wal_replay: std::env::var("PROFILE_SKIP_WAL").is_ok(),
+            ..DbReaderOptions::default()
+        },
     )
     .await
     .unwrap();
-    LogDb {
+    let db = LogDb {
         storage,
         writer: None,
         segment_ns: duration_ns(config.segment_duration).unwrap(),
@@ -1107,6 +1147,7 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
         caches: DiscoveryCaches::new(),
         blocks: BlockCache::new(config.block_cache_capacity_bytes),
         database_id: block_cache::next_database_id(),
+        memory: MemoryBudget::new(&config.memory),
         span_scan_min_streams: SPAN_SCAN_MIN_STREAMS,
         span_scan_max_spread: std::env::var("PROFILE_SPAN_SPREAD")
             .map_or(SPAN_SCAN_MAX_SPREAD, |value| value.parse().unwrap()),
@@ -1117,7 +1158,8 @@ async fn cold_reader(config: &Config, latency: Duration, gets: &Arc<AtomicUsize>
         rollup_lock: Mutex::new(()),
         merge_holds: Default::default(),
         retention: config.retention,
-    }
+    };
+    (db, cache)
 }
 
 /// [`ReadTuning::default`] with `PROFILE_LIST_CONCURRENCY`,
@@ -1134,6 +1176,9 @@ fn profile_tuning() -> ReadTuning {
         read_concurrency: var("PROFILE_READ_CONCURRENCY").unwrap_or(default.read_concurrency),
         postings_validate: flag("PROFILE_POSTINGS_VALIDATE").unwrap_or(default.postings_validate),
         overlap_runs: flag("PROFILE_OVERLAP_RUNS").unwrap_or(default.overlap_runs),
+        segment_lookahead: var("PROFILE_SEGMENT_LOOKAHEAD").unwrap_or(default.segment_lookahead),
+        pipeline_units: var("PROFILE_PIPELINE_UNITS").unwrap_or(default.pipeline_units),
+        unfiltered_reads: flag("PROFILE_UNFILTERED_READS").unwrap_or(default.unfiltered_reads),
     }
 }
 
@@ -2015,4 +2060,654 @@ async fn profile_query_ranges() {
     }
     profile_ranges("after", &writer, &config, &namespace, latency, end).await;
     writer.close().await.unwrap();
+}
+
+/// The shape of timed object-store reads, as the cold battery's
+/// `request_waves` reports the proxy's: reads, wall span from the first
+/// start to the last end, time with at least one in flight, the most in
+/// flight at once, and the longest chain of reads each starting after the
+/// previous ended, a lower bound on dependent round trips.
+#[derive(Debug, Default, serde::Serialize)]
+struct Waves {
+    reads: usize,
+    span_ms: f64,
+    busy_ms: f64,
+    peak: usize,
+    waves: usize,
+}
+
+fn waves(spans: &[(Instant, Instant, String)]) -> Waves {
+    let mut timed = spans
+        .iter()
+        .map(|(start, end, _)| (*start, *end))
+        .collect::<Vec<_>>();
+    timed.sort();
+    let Some(&(first, _)) = timed.first() else {
+        return Waves::default();
+    };
+    let last = timed.iter().map(|(_, end)| *end).max().unwrap_or(first);
+    let (mut busy, mut open) = (Duration::ZERO, timed[0]);
+    for &(start, end) in &timed[1..] {
+        if start > open.1 {
+            busy += open.1 - open.0;
+            open = (start, end);
+        } else {
+            open.1 = open.1.max(end);
+        }
+    }
+    busy += open.1 - open.0;
+    let mut edges = timed
+        .iter()
+        .flat_map(|&(start, end)| [(start, 1i32), (end, -1)])
+        .collect::<Vec<_>>();
+    edges.sort();
+    let (mut inflight, mut peak) = (0i32, 0i32);
+    for (_, step) in edges {
+        inflight += step;
+        peak = peak.max(inflight);
+    }
+    // Longest chain, by end time: a read extends the best chain of those
+    // that ended before it started.
+    let mut by_end = timed.clone();
+    by_end.sort_by_key(|&(_, end)| end);
+    let mut best = Vec::<(Instant, usize)>::with_capacity(by_end.len());
+    for &(start, end) in &by_end {
+        let before = best.partition_point(|&(ended, _)| ended <= start);
+        let chain = 1 + if before == 0 { 0 } else { best[before - 1].1 };
+        let running = best.last().map_or(0, |&(_, longest)| longest);
+        best.push((end, chain.max(running)));
+    }
+    Waves {
+        reads: timed.len(),
+        span_ms: ms(last - first),
+        busy_ms: ms(busy),
+        peak: usize::try_from(peak).unwrap_or(0),
+        waves: best.last().map_or(0, |&(_, longest)| longest),
+    }
+}
+
+#[test]
+fn waves_count_dependent_reads() {
+    let origin = Instant::now();
+    let at = |from: u64, to: u64| {
+        (
+            origin + Duration::from_millis(from),
+            origin + Duration::from_millis(to),
+            String::new(),
+        )
+    };
+    // Two overlapping reads, then one after both, then a gap and a fourth.
+    let shape = waves(&[at(0, 20), at(5, 25), at(25, 45), at(60, 80)]);
+    assert_eq!((shape.reads, shape.peak, shape.waves), (4, 2, 3));
+    assert!((shape.busy_ms - 65.0).abs() < 1e-6);
+    assert!((shape.span_ms - 80.0).abs() < 1e-6);
+    assert_eq!(waves(&[]).reads, 0);
+}
+
+/// Replays cold-battery cases (`PROFILE_CASES`, a JSON list of
+/// [`FuzzCase`]s) against a copy of a cold-battery store (`PROFILE_STORE`,
+/// a local object-store root, holding the database at `PROFILE_DATA_PATH`),
+/// each `PROFILE_RUNS` (3) times on a fresh reader whose object store waits
+/// `PROFILE_LATENCY_MS` (20) per read, then once warm. Prints, and writes
+/// as JSON lines to `PROFILE_OUT`, each case's median cold time, its reads'
+/// wave shape and its storage operations by record type; `PROFILE_TIMELINE`
+/// also prints every read of the last run. `PROFILE_FILTER` keeps cases
+/// whose ID or family contains it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual profiling"]
+async fn profile_cold_store() {
+    use std::io::Write as _;
+
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let cases: Vec<FuzzCase> =
+        serde_json::from_slice(&std::fs::read(std::env::var("PROFILE_CASES").unwrap()).unwrap())
+            .unwrap();
+    let runs: usize = std::env::var("PROFILE_RUNS").map_or(3, |value| value.parse().unwrap());
+    let latency = Duration::from_millis(
+        std::env::var("PROFILE_LATENCY_MS").map_or(20, |value| value.parse().unwrap()),
+    );
+    let filter = std::env::var("PROFILE_FILTER").ok();
+    let namespace = Namespace::new(
+        std::env::var("PROFILE_NAMESPACE").unwrap_or_else(|_| "regression".to_owned()),
+    )
+    .unwrap();
+    let mut config = production_config(&store);
+    if let StorageConfig::SlateDb(storage) = &mut config.storage {
+        storage.path =
+            std::env::var("PROFILE_DATA_PATH").unwrap_or_else(|_| "fuzz/shard-0000".to_owned());
+    }
+    let mut out = std::env::var("PROFILE_OUT")
+        .ok()
+        .map(|path| std::io::BufWriter::new(std::fs::File::create(path).unwrap()));
+    println!("tuning: {:?} latency {latency:?}", profile_tuning());
+    for case in cases.iter().filter(|case| {
+        filter
+            .as_deref()
+            .is_none_or(|filter| case.id.contains(filter) || case.family.contains(filter))
+    }) {
+        let mut cold = Vec::new();
+        let mut last = None;
+        for _ in 0..runs {
+            let gets = Arc::new(AtomicUsize::new(0));
+            let mut db = cold_reader(&config, latency, &gets).await;
+            let counting = Arc::new(common::storage::counting::CountingStorage::new(
+                db.storage.clone(),
+                classify_key,
+            ));
+            db.storage = counting.clone();
+            GET_SPANS.lock().unwrap().clear();
+            GET_KEYS.lock().unwrap().clear();
+            let started = Instant::now();
+            let results = run_case(&db, &namespace, case).await.unwrap();
+            let elapsed = ms(started.elapsed());
+            let spans = std::mem::take(&mut *GET_SPANS.lock().unwrap());
+            let io = counting.take();
+            let warm = Instant::now();
+            run_case(&db, &namespace, case).await.unwrap();
+            let warm = ms(warm.elapsed());
+            db.close().await.unwrap();
+            cold.push(elapsed);
+            last = Some((elapsed, warm, results, spans, io, started));
+        }
+        cold.sort_by(f64::total_cmp);
+        let median = cold[cold.len() / 2];
+        let (_, warm, results, spans, io, started) = last.unwrap();
+        let shape = waves(&spans);
+        let first_read = spans
+            .iter()
+            .map(|(start, _, _)| ms(*start - started))
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "{:<32} cold {median:>7.1}ms (runs {cold:.0?}) warm {warm:>6.1}ms results {results} | reads {} waves {} busy {:.0}ms span {:.0}ms peak {} first read at {first_read:.1}ms",
+            case.family, shape.reads, shape.waves, shape.busy_ms, shape.span_ms, shape.peak,
+        );
+        let mut classes = io.into_iter().collect::<Vec<_>>();
+        classes.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.elapsed));
+        for ((op, class), stats) in &classes {
+            println!(
+                "    {op}/{class}: calls {} records {} bytes {} summed {:.0}ms",
+                stats.calls,
+                stats.records,
+                stats.bytes,
+                ms(stats.elapsed)
+            );
+        }
+        if std::env::var("PROFILE_TIMELINE").is_ok() {
+            let mut spans = spans;
+            spans.sort_by_key(|(start, _, _)| *start);
+            for (start, end, key) in &spans {
+                println!(
+                    "      {:>8.1} {:>6.1} {key}",
+                    ms(*start - started),
+                    ms(*end - *start)
+                );
+            }
+        }
+        if let Some(out) = &mut out {
+            let row = serde_json::json!({
+                "id": case.id,
+                "family": case.family,
+                "cold_ms": median,
+                "runs_ms": cold,
+                "warm_ms": warm,
+                "results": results,
+                "waves": shape,
+                "io": classes
+                    .iter()
+                    .map(|((op, class), stats)| {
+                        (
+                            format!("{op}/{class}"),
+                            serde_json::json!({
+                                "calls": stats.calls,
+                                "records": stats.records,
+                                "bytes": stats.bytes,
+                                "ms": ms(stats.elapsed),
+                            }),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
+            });
+            writeln!(out, "{row}").unwrap();
+        }
+    }
+    if let Some(out) = &mut out {
+        out.flush().unwrap();
+    }
+}
+
+/// This process's resident set in MiB, as `ps` reports it.
+fn rss_mib() -> u64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        / 1024
+}
+
+/// Metadata cache bytes in use and evictions so far, when it is metered.
+fn meta_usage(cache: &SharedDbCache) -> (u64, u64) {
+    cache
+        .meta()
+        .and_then(|meta| meta.usage.as_ref())
+        .map_or((0, 0), |usage| {
+            (usage.usage_bytes() >> 20, usage.evictions())
+        })
+}
+
+/// SSTs, data bytes and planned metadata of the segments of the last
+/// `hours`, without warming anything.
+async fn plan_window(db: &LogDb, namespace: &Namespace, hours: i64) -> (usize, u64, u64, u64) {
+    let window = WarmWindow {
+        metadata: Some(Duration::from_secs(hours.unsigned_abs() * 3600)),
+        payloads: None,
+    };
+    let mut plan = WarmPlan::default();
+    db.plan_warm(std::slice::from_ref(namespace), window, &mut plan);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let report = warm_planned(
+        "logs",
+        plan,
+        WarmBudget::UNBOUNDED,
+        false,
+        1,
+        &cancel,
+        &WarmLedger::new(true),
+    )
+    .await;
+    let end = common::time::now_ns();
+    let start = end - hours * 3600 * SECOND;
+    let (mut data, mut l0, mut filters, mut index) = (0u64, 0u64, 0u64, 0u64);
+    let slate = db.storage.slate_read().unwrap();
+    let manifest = slate.manifest();
+    for segment in manifest.segments() {
+        let Ok((parsed, id, _)) = crate::codec::KEY_SCOPE.parse(segment.prefix()) else {
+            continue;
+        };
+        if &parsed != namespace || id.start_ns >= end || id.end_ns().unwrap_or(i64::MAX) <= start {
+            continue;
+        }
+        for view in segment.l0().iter().chain(
+            segment
+                .compacted()
+                .iter()
+                .flat_map(|run| run.sst_views.iter()),
+        ) {
+            filters += view.sst.info.filter_len;
+            index += view.sst.info.index_len;
+        }
+        l0 += segment.l0().len() as u64;
+        data += segment
+            .l0()
+            .iter()
+            .map(|view| view.estimate_size())
+            .sum::<u64>();
+        data += segment
+            .compacted()
+            .iter()
+            .map(|run| run.estimate_size())
+            .sum::<u64>();
+    }
+    println!(
+        "  window {hours:>2}h encoded filters {:.2} MiB index {:.2} MiB",
+        filters as f64 / f64::from(1 << 20),
+        index as f64 / f64::from(1 << 20)
+    );
+    (report.planned_ssts, data, report.planned_bytes, l0)
+}
+
+/// One budgeted metadata warm pass over the last `PROFILE_WARM_HOURS` (24)
+/// into `PROFILE_WARM_PERCENT` (75) of the metadata cache, with data blocks
+/// too under `PROFILE_WARM_PAYLOADS`.
+async fn warm_pass(
+    db: &LogDb,
+    cache: &SharedDbCache,
+    namespace: &Namespace,
+    ledger: &WarmLedger,
+    cancel: &CancellationToken,
+) -> WarmReport {
+    let hours: u64 = std::env::var("PROFILE_WARM_HOURS").map_or(24, |value| value.parse().unwrap());
+    let percent: u8 =
+        std::env::var("PROFILE_WARM_PERCENT").map_or(75, |value| value.parse().unwrap());
+    let payloads = std::env::var("PROFILE_WARM_PAYLOADS").is_ok();
+    let mut plan = WarmPlan::default();
+    let range = Duration::from_secs(hours * 3600);
+    let window = WarmWindow {
+        metadata: Some(range),
+        payloads: payloads.then_some(range),
+    };
+    db.plan_warm(std::slice::from_ref(namespace), window, &mut plan);
+    warm_planned(
+        "logs",
+        plan,
+        WarmBudget::of(cache, percent).unwrap(),
+        payloads,
+        2,
+        cancel,
+        ledger,
+    )
+    .await
+}
+
+/// Queries a Console-like workload sends: cluster charts, a needle search
+/// and one pod's recent lines, each over its range ending at `end`.
+fn warm_queries(end: i64) -> Vec<(&'static str, QueryRequest, QueryOptions)> {
+    let chart = |range: i64, step: i64| {
+        QueryRequest::range(
+            format!(r#"sum by (namespace) (count_over_time({{cluster="mgmt"}} [{step}s]))"#),
+            end - range * SECOND,
+            end,
+            step * SECOND,
+        )
+        .frontend_step_aligned()
+    };
+    let logs = |query: &str, range: i64| {
+        QueryRequest::range(
+            query,
+            end - range * SECOND,
+            end,
+            (range / 100).max(1) * SECOND,
+        )
+    };
+    let options = QueryOptions {
+        limit: 100,
+        direction: Direction::Backward,
+        ..QueryOptions::default()
+    };
+    vec![
+        ("chart.1h", chart(3600, 60), options.clone()),
+        ("chart.6h", chart(6 * 3600, 300), options.clone()),
+        ("chart.24h", chart(86_400, 1800), options.clone()),
+        (
+            "needle.1h",
+            logs(r#"{cluster="demo-prod"} |= "trace_id=00000""#, 3600),
+            options.clone(),
+        ),
+        (
+            "needle.24h",
+            logs(r#"{cluster="demo-prod"} |= "trace_id=00000""#, 86_400),
+            options.clone(),
+        ),
+        (
+            "pod.1h",
+            logs(r#"{cluster="mgmt", pod="mgmt-pod-7"}"#, 3600),
+            options.clone(),
+        ),
+        (
+            "pod.24h",
+            logs(
+                r#"{cluster="gke-fleet-dev", pod="gke-fleet-dev-pod-40"}"#,
+                86_400,
+            ),
+            options.clone(),
+        ),
+    ]
+}
+
+/// Metadata warming over a production-shaped store at `PROFILE_STORE`,
+/// ingesting `PROFILE_HOURS` (24) first if it is empty and rolling it up
+/// once with `PROFILE_ROLLUP`. `PROFILE_MODE` picks the measurement:
+///
+/// - `shape`: SSTs, data and planned metadata of the last 1 to 24 hours,
+///   then one unbounded pass into a `PROFILE_META_CACHE` cache measuring
+///   what the metadata really weighs, with RSS before and after.
+/// - `arms` (default): each query on a fresh cold reader with
+///   `PROFILE_LATENCY_MS` (20) per object-store read, reading through
+///   `PROFILE_UNFILTERED_READS`. `PROFILE_WARM=1` first runs a budgeted
+///   warm pass to completion; `PROFILE_WARM=ready` starts it in the
+///   background and queries at once, as right after readiness.
+/// - `cycles`: one reader warming every `PROFILE_INTERVAL_S` (10) for
+///   `PROFILE_MINUTES` (20), printing RSS, cache use and the ledger after
+///   each pass, while a `writer` run ingests and rolls up beside it.
+/// - `writer`: ingests the hour ending now and runs a rollup pass, over and
+///   over for `PROFILE_MINUTES`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_metadata_warm() {
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let hours: i64 = std::env::var("PROFILE_HOURS").map_or(24, |value| value.parse().unwrap());
+    let latency = Duration::from_millis(
+        std::env::var("PROFILE_LATENCY_MS").map_or(20, |value| value.parse().unwrap()),
+    );
+    let minutes: u64 = std::env::var("PROFILE_MINUTES").map_or(20, |value| value.parse().unwrap());
+    let mode = std::env::var("PROFILE_MODE").unwrap_or_else(|_| "arms".to_owned());
+    let namespace = Namespace::new("default").unwrap();
+    let config = production_config(&store);
+    let started = Instant::now();
+    if !store.join("ingested").exists() {
+        std::fs::create_dir_all(&store).unwrap();
+        ingest_clusters(&config, &namespace, hours).await;
+        let writer = LogDb::open(config.clone()).await.unwrap();
+        let settled = settle(&writer, Duration::from_secs(10), Duration::from_secs(300)).await;
+        writer.close().await.unwrap();
+        std::fs::write(store.join("ingested"), common::time::now_ns().to_string()).unwrap();
+        println!(
+            "ingest: {hours}h in {:.0}s (settled {:.0}s), store {:.2} GiB",
+            started.elapsed().as_secs_f64(),
+            settled.as_secs_f64(),
+            dir_bytes(&store) as f64 / f64::from(1 << 30)
+        );
+    }
+    if std::env::var("PROFILE_ROLLUP").is_ok() && !store.join("rolled").exists() {
+        let writer = LogDb::open(config.clone()).await.unwrap();
+        let timed = Instant::now();
+        let sealed = writer
+            .rollup_at(
+                &common::storage::rollup::RollupConfig::default(),
+                common::time::now_ns(),
+            )
+            .await
+            .unwrap();
+        let settled = settle(&writer, Duration::from_secs(10), Duration::from_secs(600)).await;
+        writer.close().await.unwrap();
+        std::fs::write(store.join("rolled"), "").unwrap();
+        println!(
+            "rollup: sealed {sealed} in {:.0}s (settled {:.0}s)",
+            timed.elapsed().as_secs_f64(),
+            settled.as_secs_f64()
+        );
+    }
+    let ingested_end: i64 = std::fs::read_to_string(store.join("ingested"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let end = ingested_end / (60 * SECOND) * (60 * SECOND);
+    match mode.as_str() {
+        "shape" => {
+            let gets = Arc::new(AtomicUsize::new(0));
+            let (db, cache) = cold_reader_cached(&config, Duration::ZERO, &gets).await;
+            for window in [1, 2, 4, 8, 12, 24, 48] {
+                let (ssts, data, meta, l0) = plan_window(&db, &namespace, window).await;
+                println!(
+                    "window {window:>2}h: ssts {ssts:>5} (l0 {l0:>4}) data {:>8.1} MiB planned metadata {:>7.2} MiB ({:.2}% of data)",
+                    data as f64 / f64::from(1 << 20),
+                    meta as f64 / f64::from(1 << 20),
+                    meta as f64 * 100.0 / data.max(1) as f64,
+                );
+            }
+            let before = rss_mib();
+            let timed = Instant::now();
+            let ledger = WarmLedger::new(true);
+            let report =
+                warm_pass(&db, &cache, &namespace, &ledger, &CancellationToken::new()).await;
+            let (used, evictions) = meta_usage(&cache);
+            println!(
+                "warm: {:.1}s planned {} ssts {:.2} MiB, warmed {} ssts {:.2} MiB measured, skipped {} ({:.2} MiB), cache {used} MiB evictions {evictions}, rss {before} -> {} MiB",
+                timed.elapsed().as_secs_f64(),
+                report.planned_ssts,
+                report.planned_bytes as f64 / f64::from(1 << 20),
+                report.warmed_ssts,
+                report.warmed_bytes as f64 / f64::from(1 << 20),
+                report.skipped_ssts,
+                report.skipped_bytes as f64 / f64::from(1 << 20),
+                rss_mib(),
+            );
+            db.close().await.unwrap();
+        }
+        "arms" => {
+            let warm = std::env::var("PROFILE_WARM").unwrap_or_else(|_| "0".to_owned());
+            let runs: usize =
+                std::env::var("PROFILE_RUNS").map_or(3, |value| value.parse().unwrap());
+            println!(
+                "arm: unfiltered {} warm {warm} latency {latency:?}",
+                profile_tuning().unfiltered_reads
+            );
+            let mut peak = 0;
+            for (name, request, options) in warm_queries(end) {
+                let mut cold = Vec::new();
+                let mut summary = String::new();
+                for _ in 0..runs {
+                    let gets = Arc::new(AtomicUsize::new(0));
+                    let (db, cache) = cold_reader_cached(&config, latency, &gets).await;
+                    let db = Arc::new(db);
+                    let ledger = Arc::new(WarmLedger::new(true));
+                    let cancel = CancellationToken::new();
+                    let mut warmed = None;
+                    let mut background = None;
+                    match warm.as_str() {
+                        "1" => {
+                            let timed = Instant::now();
+                            let report = warm_pass(&db, &cache, &namespace, &ledger, &cancel).await;
+                            warmed = Some((timed.elapsed(), report));
+                        }
+                        "ready" => {
+                            let (db, cache, ledger, cancel, namespace) = (
+                                Arc::clone(&db),
+                                cache.clone(),
+                                Arc::clone(&ledger),
+                                cancel.clone(),
+                                namespace.clone(),
+                            );
+                            background = Some(tokio::spawn(async move {
+                                warm_pass(&db, &cache, &namespace, &ledger, &cancel).await
+                            }));
+                        }
+                        _ => {}
+                    }
+                    let warm_gets = gets.swap(0, Ordering::Relaxed);
+                    let timed = Instant::now();
+                    let rows = match db
+                        .query(&namespace, &request, options.clone())
+                        .await
+                        .unwrap()
+                    {
+                        crate::QueryResult::Streams(streams) => streams.len(),
+                        crate::QueryResult::Vector(samples) => samples.len(),
+                        crate::QueryResult::Matrix(series) => series.len(),
+                        crate::QueryResult::Scalar(_) => 1,
+                    };
+                    let elapsed = ms(timed.elapsed());
+                    let query_gets = gets.swap(0, Ordering::Relaxed);
+                    let timed = Instant::now();
+                    db.query(&namespace, &request, options.clone())
+                        .await
+                        .unwrap();
+                    let hot = ms(timed.elapsed());
+                    cancel.cancel();
+                    if let Some(task) = background {
+                        task.await.unwrap();
+                    }
+                    let rss = rss_mib();
+                    peak = peak.max(rss);
+                    let (used, _) = meta_usage(&cache);
+                    summary = format!(
+                        "rows {rows} gets {query_gets} hot {hot:.0}ms meta {used} MiB rss {rss} MiB{}",
+                        warmed.map_or(
+                            String::new(),
+                            |(took, report): (Duration, WarmReport)| format!(
+                                " | warm {:.1}s {} ssts {:.1} MiB skipped {} gets {warm_gets}",
+                                took.as_secs_f64(),
+                                report.warmed_ssts,
+                                report.warmed_bytes as f64 / f64::from(1 << 20),
+                                report.skipped_ssts,
+                            )
+                        )
+                    );
+                    cold.push(elapsed);
+                    Arc::into_inner(db).unwrap().close().await.unwrap();
+                }
+                let mut sorted = cold.clone();
+                sorted.sort_by(f64::total_cmp);
+                println!(
+                    "{name:<11} cold p50 {:>7.1}ms runs {cold:.0?} {summary}",
+                    sorted[sorted.len() / 2]
+                );
+            }
+            println!("peak rss {peak} MiB");
+        }
+        "cycles" => {
+            let interval = Duration::from_secs(
+                std::env::var("PROFILE_INTERVAL_S").map_or(10, |value| value.parse().unwrap()),
+            );
+            let gets = Arc::new(AtomicUsize::new(0));
+            let (db, cache) = cold_reader_cached(&config, Duration::ZERO, &gets).await;
+            let ledger = WarmLedger::new(true);
+            let cancel = CancellationToken::new();
+            let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+            let queries = warm_queries(common::time::now_ns() / SECOND * SECOND);
+            let mut pass = 0usize;
+            println!("cycles: open rss {} MiB", rss_mib());
+            while Instant::now() < deadline {
+                let timed = Instant::now();
+                let report = warm_pass(&db, &cache, &namespace, &ledger, &cancel).await;
+                let took = timed.elapsed();
+                let warm_gets = gets.swap(0, Ordering::Relaxed);
+                let (name, request, options) = &queries[pass % queries.len()];
+                db.query(&namespace, request, options.clone())
+                    .await
+                    .unwrap();
+                let (used, evictions) = meta_usage(&cache);
+                let l0: usize = db
+                    .storage
+                    .slate_read()
+                    .unwrap()
+                    .manifest()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.l0().len())
+                    .sum();
+                println!(
+                    "t={:>5.0}s pass {pass:>3} {:.1}s gets {warm_gets:>5} warmed {:>3} evicted {:>3} displaced {:>3} skipped {:>4} ledger {:>3} ssts {:>6.1} MiB | meta {used} MiB evictions {evictions} l0 {l0} | {name} | rss {} MiB",
+                    started.elapsed().as_secs_f64(),
+                    took.as_secs_f64(),
+                    report.warmed_ssts,
+                    report.evicted_ssts,
+                    report.displaced_ssts,
+                    report.skipped_ssts,
+                    ledger.ssts(),
+                    ledger.bytes() as f64 / f64::from(1 << 20),
+                    rss_mib(),
+                );
+                pass += 1;
+                tokio::time::sleep(interval.saturating_sub(took)).await;
+            }
+            db.close().await.unwrap();
+        }
+        "writer" => {
+            let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+            let mut round = 0;
+            while Instant::now() < deadline {
+                ingest_clusters(&config, &namespace, 1).await;
+                let writer = LogDb::open(config.clone()).await.unwrap();
+                let sealed = writer
+                    .rollup_at(
+                        &common::storage::rollup::RollupConfig::default(),
+                        common::time::now_ns(),
+                    )
+                    .await;
+                writer.close().await.unwrap();
+                println!(
+                    "t={:>5.0}s writer round {round} sealed {sealed:?}",
+                    started.elapsed().as_secs_f64()
+                );
+                round += 1;
+            }
+        }
+        other => panic!("unknown PROFILE_MODE {other}"),
+    }
 }

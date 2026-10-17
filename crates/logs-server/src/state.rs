@@ -13,11 +13,12 @@ use plural_logs::{
 };
 use proto::logs::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
+use server_common::body_budget::{BodyBudget, GrpcBodyBudget};
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::read_groups::ReadGroups;
 use server_common::reload::{self, Live, LiveConfig};
-use server_common::warmer::{WarmPass, spawn_cache_warmer, warming_enabled};
+use server_common::warmer::{WarmPass, readiness_waits, spawn_cache_warmer, warming_enabled};
 use sharding::{
     AssignmentGeneration, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
     server::owned_shards, shard_request_id,
@@ -47,6 +48,8 @@ pub struct AppState {
     pub(crate) router: Arc<WriteRouter>,
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(crate) ingest: IngestPipeline,
+    /// Shared by every request body, HTTP and gRPC.
+    pub(crate) bodies: BodyBudget,
     channels: Arc<ChannelPool>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
@@ -127,7 +130,8 @@ impl AppState {
                 token,
             )))));
         }
-        let cache_warmed = !config.cache_warmer.enabled || config.mode == ServerMode::Writer;
+        let cache_warmed =
+            !readiness_waits(&config.cache_warmer, config.mode != ServerMode::Writer);
         let router = WriteRouter::new(
             local_owner,
             Arc::new(tokio::sync::RwLock::new(assignment)),
@@ -148,6 +152,7 @@ impl AppState {
             &cancellation,
         )?;
         let state = Self {
+            bodies: BodyBudget::new(config.request.max_in_flight_body_bytes),
             live: Arc::new(Live::new(live_config(&config))),
             warmer: Arc::default(),
             config: Arc::new(config),
@@ -197,8 +202,10 @@ impl AppState {
         &self,
     ) -> anyhow::Result<
         Option<
-            proto::logs::internal::v1::shard_reader_server::ShardReaderServer<
-                crate::shard_reader::ShardReaderService,
+            GrpcBodyBudget<
+                proto::logs::internal::v1::shard_reader_server::ShardReaderServer<
+                    crate::shard_reader::ShardReaderService,
+                >,
             >,
         >,
     > {
@@ -212,9 +219,9 @@ impl AppState {
             .as_ref()
             .map(|secret| secret.expose())
             .transpose()?;
-        Ok(Some(crate::shard_reader::shard_reader_service(
-            Arc::clone(&self.db),
-            token,
+        Ok(Some(GrpcBodyBudget::new(
+            crate::shard_reader::shard_reader_service(Arc::clone(&self.db), token),
+            self.bodies.clone(),
         )))
     }
 
@@ -308,13 +315,14 @@ impl AppState {
                     database
                         .warm_recent(
                             &namespaces,
-                            pass.range,
-                            pass.include_payloads,
+                            pass.window,
                             pass.concurrency,
                             &pass.cancel,
-                            pass.tracker.as_deref(),
+                            &pass.ledger,
+                            pass.metadata_budget_percent,
                         )
                         .await
+                        .map(drop)
                 }
             },
         );

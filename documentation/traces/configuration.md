@@ -103,6 +103,29 @@ rollup:
   interval_seconds: 300 # How often closed windows and days are looked for.
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
 
+# Readers warm the SST filters and indexes of recent segments and the trace
+# locator into meta_cache, newest segment first, in the background: they are
+# ready at once, and queries during the pass find the cache partly warm.
+# Warming stops once it holds metadata_budget_percent of meta_cache, counting
+# what did not fit, and evicts what it warmed of SSTs that compaction,
+# rollups or retention removed. Writers never warm. A section that sets only
+# some keys keeps these defaults for the rest; see "Metadata warming" in
+# [Metrics configuration](../metrics/configuration.md#metadata-warming).
+cache_warmer:
+  enabled: true # Startup pass; false leaves only continuous warming.
+  block_readiness: false # true holds readiness until the pass ends or times out.
+  timeout_seconds: 30 # Applies only with block_readiness.
+  warm_range_seconds: 0 # 0 = all live data, bounded by metadata_budget_percent
+  concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
+  include_payloads: false # true also warms segments' data blocks into block_cache.
+  metadata_budget_percent: 75
+  continuous: # Every interval, warms SSTs that appeared since the last pass.
+    enabled: true
+    interval_seconds: 10
+    warm_range_seconds: 0
+    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
+    include_payloads: true
+
 # Decoded read caches of each storage shard; 0 disables one. The defaults are
 # below; the operator sizes them from the memory limit.
 read_cache:

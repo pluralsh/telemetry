@@ -367,8 +367,13 @@ class Recorder:
         return reasons
 
     def finish(
-        self, *, elapsed_s: float, resources: dict[str, Any] | None = None
+        self,
+        *,
+        elapsed_s: float,
+        resources: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> Summary:
+        """`extra` adds scenario-specific top-level sections, such as `cold`."""
         for handle in (self._cases, self._ingest, self._rounds):
             handle.close()
         reasons = self._failure_reasons()
@@ -421,6 +426,7 @@ class Recorder:
             "families": families,
             "failures": self.failures[:100],
             "resources": resources,
+            **(extra or {}),
         }
         (self.root / "summary.json").write_text(
             json.dumps(value, indent=2, ensure_ascii=False)
@@ -534,6 +540,8 @@ def render_markdown(value: dict[str, Any]) -> str:
                 f"| {role} | {', '.join(stats['services'])} | "
                 f"{stats['cpu_seconds']} | {core_text} | {memory_text} |"
             )
+    if cold := value.get("cold"):
+        lines += cold_markdown(cold)
     if latency["top_outliers"]:
         lines += ["", "Slowest relative to the oracle:", ""]
         for item in latency["top_outliers"][:10]:
@@ -550,6 +558,51 @@ def render_markdown(value: dict[str, Any]) -> str:
                 f"`{_inline(item['query'])}` — {detail}"
             )
     return "\n".join(lines) + "\n"
+
+
+def _kib(value: float | None) -> str:
+    return "-" if value is None else f"{value / 1024:.0f}"
+
+
+def cold_markdown(cold: dict[str, Any]) -> list[str]:
+    """The cold scenario's per-family table: cold and warm latency and the
+    object-store GETs each side made per query (medians)."""
+    lines = [
+        "",
+        f"Cold reads: {cold['measured']} of {cold['planned']} measurements "
+        f"({cold['repeats']} per query), data span {cold['span_s'] / 3600:g}h, "
+        f"MinIO first byte +{cold['first_byte_ms']:g} ms, settle "
+        f"{cold['settle_s']:g}s after ready. Every measurement restarts the "
+        "answering side with empty caches.",
+        "",
+        "| family | n | impl cold p50/p99 ms | oracle cold p50/p99 ms "
+        "| impl / oracle warm p50 ms | impl / oracle GETs p50 "
+        "| impl / oracle GET KiB p50 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for family, stats in cold["families"].items():
+        impl, oracle = stats["impl"], stats["oracle"]
+        lines.append(
+            f"| {family} | {stats['cases']} | "
+            f"{_ms(impl['cold_ms']['p50'])}/{_ms(impl['cold_ms']['p99'])} | "
+            f"{_ms(oracle['cold_ms']['p50'])}/{_ms(oracle['cold_ms']['p99'])} | "
+            f"{_ms(impl['warm_ms']['p50'])} / {_ms(oracle['warm_ms']['p50'])} | "
+            f"{_num(impl['get']['p50'])} / {_num(oracle['get']['p50'])} | "
+            f"{_kib(impl['get_bytes']['p50'])} / {_kib(oracle['get_bytes']['p50'])} |"
+        )
+    startup = cold["startup"]
+    lines += [
+        "",
+        "Restart to ready (s) and object-store GETs while starting, per side: "
+        + "; ".join(
+            f"{side} p50 {_num(startup[side]['ready_s']['p50'], 1)}s, "
+            f"max {_num(startup[side]['ready_s']['max'], 1)}s, "
+            f"{_num(startup[side]['get']['p50'])} GETs"
+            for side in ("impl", "oracle")
+        )
+        + ".",
+    ]
+    return lines
 
 
 def _inline(value: str) -> str:

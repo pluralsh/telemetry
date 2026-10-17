@@ -46,11 +46,12 @@ services:
       MINIO_ROOT_PASSWORD: traces-regression-secret
     volumes: ["minio-data:/data"]
 
-  # Historical scenario only: owns MinIO's address inside MinIO's network
-  # namespace, so every client's `minio:9000` goes through it, and forwards to
-  # MinIO on :9010 with a fixed first-byte delay.
+  # Historical and cold scenarios only: owns MinIO's address inside MinIO's
+  # network namespace, so every client's `minio:9000` goes through it, and
+  # forwards to MinIO on :9010 with a fixed first-byte delay. Per-client
+  # request counts are served on :9020.
   minio-latency:
-    profiles: ["historical"]
+    profiles: ["historical", "cold"]
     image: python:3.13-slim
     network_mode: service:minio
     command:
@@ -59,6 +60,10 @@ services:
       - --listen=9000
       - --upstream=9010
       - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+      - --stats-port=9020
+    # FUZZ_COLD_TIMELINE=1: also record every request (served on :9020/timeline).
+    environment:
+      PROXY_TIMELINE: ${FUZZ_COLD_TIMELINE:-0}
     volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
     depends_on: [minio]
 
@@ -137,7 +142,8 @@ services:
     profiles: ["standalone-s3"]
     command: ["--config", "/app/regression/standalone-s3.yaml"]
     volumes:
-      - ./production/standalone-s3.yaml:/app/regression/standalone-s3.yaml:ro
+      # The cold battery swaps in a copy that rolls up sooner while settling.
+      - ${TRACES_S3_CONFIG:-./production/standalone-s3.yaml}:/app/regression/standalone-s3.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports:
       - "13205:3200"

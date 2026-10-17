@@ -166,11 +166,25 @@ type CacheSpec struct {
 }
 
 type CacheWarmerSpec struct {
-	// +kubebuilder:default=false
+	// Enabled runs a startup pass over recent SSTs. Defaults to true for
+	// readers, which warm filters and indexes in the background; Logs
+	// readers that skip filters warm only indexes.
 	Enabled *bool `json:"enabled,omitempty"`
+	// WarmRangeSeconds is the recent window whose metadata the startup pass
+	// warms. Unset covers all live data, which retention bounds, and the
+	// metadata budget bounds what is held. A set value bounds payloads too
+	// unless PayloadWarmRangeSeconds is set. 7200, the default of earlier
+	// CRDs that the API server stored in existing resources, is read as
+	// unset.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=7200
 	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
+	// PayloadWarmRangeSeconds is the recent window whose payloads the
+	// startup pass warms when IncludePayloads is set. Unset uses
+	// WarmRangeSeconds when that is set, otherwise 7200. Servers older than
+	// this field reject it, so set it only once every reader runs a server
+	// that knows it.
+	// +kubebuilder:validation:Minimum=1
+	PayloadWarmRangeSeconds *int64 `json:"payloadWarmRangeSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=30
 	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
@@ -179,6 +193,14 @@ type CacheWarmerSpec struct {
 	Concurrency *int32 `json:"concurrency,omitempty"`
 	// +kubebuilder:default=false
 	IncludePayloads *bool `json:"includePayloads,omitempty"`
+	// BlockReadiness holds readiness until the startup pass ends. Unset
+	// keeps the server default, false.
+	BlockReadiness *bool `json:"blockReadiness,omitempty"`
+	// MetadataBudgetPercent is the share of the metadata cache warming may
+	// fill before it stops; the server default is 75.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	MetadataBudgetPercent *int32 `json:"metadataBudgetPercent,omitempty"`
 	// Continuous warms SSTs that appear in reader manifests after startup.
 	Continuous *ContinuousCacheWarmerSpec `json:"continuous,omitempty"`
 }
@@ -189,9 +211,13 @@ type ContinuousCacheWarmerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=10
 	IntervalSeconds *int64 `json:"intervalSeconds,omitempty"`
+	// WarmRangeSeconds is CacheWarmerSpec.WarmRangeSeconds for new SSTs.
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=7200
 	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
+	// PayloadWarmRangeSeconds is CacheWarmerSpec.PayloadWarmRangeSeconds
+	// for new SSTs.
+	// +kubebuilder:validation:Minimum=1
+	PayloadWarmRangeSeconds *int64 `json:"payloadWarmRangeSeconds,omitempty"`
 	// +kubebuilder:default=true
 	IncludePayloads *bool `json:"includePayloads,omitempty"`
 }

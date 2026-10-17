@@ -23,7 +23,6 @@ const (
 	testFlushIntervalConfig = "flush_interval_seconds: 10"
 	testCopyBufferPath      = "rollup.copy_buffer_bytes"
 	testCacheWarmerConfig   = "cache_warmer:"
-	testWarmRangeConfig     = "warm_range_seconds: 7200"
 	testWarmTimeoutConfig   = "timeout_seconds: 30"
 	testWarmConcurrency     = "concurrency: 2"
 	testWarmPayloadsConfig  = "include_payloads: false"
@@ -65,7 +64,7 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 		"result_cache:\n  capacity_bytes: 386547054",
 		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 1030792144\n  memory_budget_bytes: 2061584288\n  queue_timeout_seconds: 30",
 		"rollup:\n  copy_buffer_bytes: 257698036",
-		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
+		testCacheWarmerConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
 		"type: Local", "path: /var/lib/metrics/data",
@@ -206,7 +205,6 @@ func TestRenderTracesShardedConfig(t *testing.T) {
 		testFlushIntervalConfig,
 		"max_candidates: 10000",
 		testCacheWarmerConfig,
-		testWarmRangeConfig,
 		testWarmTimeoutConfig,
 		testWarmConcurrency,
 		testWarmPayloadsConfig,
@@ -319,7 +317,7 @@ func TestRenderLogsStandaloneAndShardedServerConfig(t *testing.T) {
 		"mode: standalone", "http: 0.0.0.0:3100", "grpc: 0.0.0.0:9091",
 		"type: SlateDb", "path: logs", "path: /var/lib/logs/data", "disk_path: /var/cache/logs",
 		"segment_duration_seconds: 3600", testFlushIntervalConfig,
-		testCacheWarmerConfig, "enabled: false", testWarmRangeConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
+		testCacheWarmerConfig, "enabled: true", testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"target_size_bytes: 1048576", "max_request_bytes: 33554432", "max_decoded_request_bytes: 134217728",
 		"elasticsearch:\n  message_fields:\n  - message\n  - log\n  - msg\n  stream_fields: []\n  time_field: '@timestamp'",
@@ -452,6 +450,54 @@ func TestRenderRejectsFoyerCapacityLargerThanVolume(t *testing.T) {
 	}
 }
 
+func renderedCacheWarmer(t *testing.T, rendered []byte) map[string]any {
+	t.Helper()
+	var config struct {
+		CacheWarmer map[string]any `json:"cache_warmer"`
+	}
+	if err := yaml.Unmarshal(rendered, &config); err != nil {
+		t.Fatal(err)
+	}
+	return config.CacheWarmer
+}
+
+func TestRenderCacheWarmerDefaultsPerProduct(t *testing.T) {
+	for _, product := range []struct {
+		input   Input
+		key     string
+		enabled bool
+	}{
+		{Input{Metrics: &telemetryv1alpha1.Metrics{}}, MetricsKey, true},
+		{Input{Traces: &telemetryv1alpha1.Traces{}}, TracesKey, true},
+		{Input{Logs: &telemetryv1alpha1.Logs{}}, LogsKey, true},
+	} {
+		result, err := Render(product.input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		warmer := renderedCacheWarmer(t, result.Data[product.key])
+		if warmer["enabled"] != product.enabled {
+			t.Errorf("%s cache_warmer.enabled = %v, want %v", product.key, warmer["enabled"], product.enabled)
+		}
+		for _, absent := range []string{"block_readiness", "metadata_budget_percent"} {
+			if _, ok := warmer[absent]; ok {
+				t.Errorf("%s cache_warmer renders %s without a spec value", product.key, absent)
+			}
+		}
+	}
+
+	partial := &telemetryv1alpha1.CacheWarmerSpec{Concurrency: lo.ToPtr(int32(4))}
+	result, err := Render(Input{Metrics: &telemetryv1alpha1.Metrics{
+		Spec: telemetryv1alpha1.MetricsSpec{Config: telemetryv1alpha1.MetricsConfigSpec{CacheWarmer: partial}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warmer := renderedCacheWarmer(t, result.Data[MetricsKey]); warmer["enabled"] != true {
+		t.Errorf("a partial Metrics cacheWarmer disabled warming: %v", warmer)
+	}
+}
+
 func TestRenderCacheWarmerOverrides(t *testing.T) {
 	enabled, includePayloads := true, true
 	warmRangeSeconds := int64(3600)
@@ -459,17 +505,23 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 	concurrency := int32(4)
 	continuousInterval, continuousRange := int64(20), int64(5400)
 	continuousPayloads := false
+	blockReadiness, budgetPercent := true, int32(50)
+	payloadRange, continuousPayloadRange := int64(1800), int64(900)
 	cacheWarmer := &telemetryv1alpha1.CacheWarmerSpec{
-		Enabled:          &enabled,
-		WarmRangeSeconds: &warmRangeSeconds,
-		TimeoutSeconds:   &timeoutSeconds,
-		Concurrency:      &concurrency,
-		IncludePayloads:  &includePayloads,
+		Enabled:                 &enabled,
+		WarmRangeSeconds:        &warmRangeSeconds,
+		PayloadWarmRangeSeconds: &payloadRange,
+		TimeoutSeconds:          &timeoutSeconds,
+		Concurrency:             &concurrency,
+		IncludePayloads:         &includePayloads,
+		BlockReadiness:          &blockReadiness,
+		MetadataBudgetPercent:   &budgetPercent,
 		Continuous: &telemetryv1alpha1.ContinuousCacheWarmerSpec{
-			Enabled:          &enabled,
-			IntervalSeconds:  &continuousInterval,
-			WarmRangeSeconds: &continuousRange,
-			IncludePayloads:  &continuousPayloads,
+			Enabled:                 &enabled,
+			IntervalSeconds:         &continuousInterval,
+			WarmRangeSeconds:        &continuousRange,
+			PayloadWarmRangeSeconds: &continuousPayloadRange,
+			IncludePayloads:         &continuousPayloads,
 		},
 	}
 	products := []struct {
@@ -523,12 +575,53 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 				"interval_seconds: 20",
 				"warm_range_seconds: 5400",
 				"include_payloads: false",
+				"block_readiness: true",
+				"metadata_budget_percent: 50",
+				"payload_warm_range_seconds: 1800",
+				"payload_warm_range_seconds: 900",
 			} {
 				if !strings.Contains(rendered, expected) {
 					t.Errorf("rendered config missing %q:\n%s", expected, rendered)
 				}
 			}
 		})
+	}
+}
+
+func TestRenderWarmRangesOnlyWhenChosen(t *testing.T) {
+	render := func(cacheWarmer *telemetryv1alpha1.CacheWarmerSpec) string {
+		result, err := Render(Input{Logs: &telemetryv1alpha1.Logs{
+			Spec: telemetryv1alpha1.LogsSpec{
+				Config: telemetryv1alpha1.LogsConfigSpec{CacheWarmer: cacheWarmer},
+			},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(result.Data[LogsKey])
+	}
+	legacy, chosen := int64(7200), int64(600)
+	for name, cacheWarmer := range map[string]*telemetryv1alpha1.CacheWarmerSpec{
+		"absent": nil,
+		"unset":  {Continuous: &telemetryv1alpha1.ContinuousCacheWarmerSpec{}},
+		"legacy default": {
+			WarmRangeSeconds: &legacy,
+			Continuous:       &telemetryv1alpha1.ContinuousCacheWarmerSpec{WarmRangeSeconds: &legacy},
+		},
+	} {
+		rendered := render(cacheWarmer)
+		for _, key := range []string{"warm_range_seconds", "payload_warm_range_seconds"} {
+			if strings.Contains(rendered, key) {
+				t.Errorf("%s: rendered %q, which servers predating it reject or which fixes the range:\n%s", name, key, rendered)
+			}
+		}
+	}
+	rendered := render(&telemetryv1alpha1.CacheWarmerSpec{
+		WarmRangeSeconds: &chosen,
+		Continuous:       &telemetryv1alpha1.ContinuousCacheWarmerSpec{WarmRangeSeconds: &chosen},
+	})
+	if strings.Count(rendered, "warm_range_seconds: 600") != 2 || strings.Contains(rendered, "payload_warm_range_seconds") {
+		t.Errorf("an explicit range must render as is, without a payload range:\n%s", rendered)
 	}
 }
 
@@ -746,12 +839,58 @@ func TestRenderSizesMetricsMemoryFromTheLimit(t *testing.T) {
 	}
 }
 
-func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
+func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
+	limit := func(quantity string) telemetryv1alpha1.WorkloadSpec {
+		return telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+		}}
+	}
+	result, err := Render(Input{Logs: &telemetryv1alpha1.Logs{
+		ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
+		Spec: telemetryv1alpha1.LogsSpec{
+			Mode:   telemetryv1alpha1.ProductModeSharded,
+			Writer: limit("6Gi"),
+			Reader: limit("2Gi"),
+		},
+	}, InternalToken: []byte("token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Writer: (6Gi - 1.5Gi headroom - 1.5Gi reserved) / 100 per percent,
+	// with 512Mi of the reservation for request bodies.
+	// Reader: (2Gi - 768Mi headroom - 640Mi reserved) / 100 per percent,
+	// with 64Mi of it for request bodies.
+	for key, expected := range map[string][]string{
+		LogsKey: {
+			"reader_cache_capacity: 773094096", "result_cache_capacity: 193273524",
+			"max_in_flight_query_bytes: 515396064", "max_in_flight_body_bytes: 536870912",
+			"buffer_size_threshold_bytes: 16777216",
+		},
+		ReaderKey: {
+			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",
+			"result_cache_capacity: 40265316", "max_in_flight_query_bytes: 107374176",
+			"max_in_flight_body_bytes: 67108864",
+		},
+	} {
+		rendered := string(result.Data[key])
+		for _, value := range expected {
+			if !strings.Contains(rendered, value) {
+				t.Errorf("%s missing %q:\n%s", key, value, rendered)
+			}
+		}
+	}
+}
+
+func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 	storage := []string{"storage.block_cache.memory_capacity", "storage.meta_cache.capacity"}
 	products := []struct {
 		name   string
 		bounds []string
-		input  func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
+		// reserved is what a rendered config holds back for its own fixed
+		// bounds, including any of the reservedBounds within it.
+		reserved       func(key string) int64
+		reservedBounds []string
+		input          func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
 	}{
 		{
 			name: testMetricsProduct,
@@ -769,6 +908,10 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 		{
 			name:   testLogsProduct,
 			bounds: []string{"reader_cache_capacity", "result_cache_capacity", "request.max_in_flight_query_bytes", testCopyBufferPath},
+			reserved: func(key string) int64 {
+				return lo.Ternary(key == ReaderKey, logsReaderReserved, logsWriterReserved)
+			},
+			reservedBounds: []string{"request.max_in_flight_body_bytes"},
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Logs: &telemetryv1alpha1.Logs{
 					ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
@@ -813,7 +956,10 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 							t.Fatal(err)
 						}
 						plan := memoryPlan{limit: quantity.Value()}
-						total := plan.headroom()
+						if product.reserved != nil {
+							plan.reserved = product.reserved(key)
+						}
+						total := plan.headroom() + plan.reservation()
 						for _, path := range append(product.bounds, storage...) {
 							value, found := lookupPath(rendered, path)
 							if !found && !strings.HasPrefix(path, "storage.") {
@@ -821,8 +967,19 @@ func TestRenderedMemoryBoundsAndHeadroomFitTheLimit(t *testing.T) {
 							}
 							total += int64(value)
 						}
+						var reservedTotal int64
+						for _, path := range product.reservedBounds {
+							value, found := lookupPath(rendered, path)
+							if !found || value <= 0 {
+								t.Fatalf("%s is missing %s:\n%s", key, path, data)
+							}
+							reservedTotal += int64(value)
+						}
+						if reservedTotal > plan.reservation() {
+							t.Fatalf("%s reserved bounds total %d, over the %d reservation:\n%s", key, reservedTotal, plan.reservation(), data)
+						}
 						if total > plan.limit {
-							t.Fatalf("%s bounds and headroom total %d, over the %d limit:\n%s", key, total, plan.limit, data)
+							t.Fatalf("%s bounds, reservation and headroom total %d, over the %d limit:\n%s", key, total, plan.limit, data)
 						}
 					}
 				})

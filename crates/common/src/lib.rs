@@ -16,6 +16,7 @@ pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
     BlockCacheConfig, CacheWarmerConfig, ContinuousCacheWarmerConfig,
     DEFAULT_FLUSH_INTERVAL_SECONDS, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
+    WarmWindow,
 };
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, SharedDbCache, StorageBuilder, StorageReaderRuntime,

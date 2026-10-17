@@ -569,22 +569,28 @@ impl TraceDb {
         scope: Option<AttributeScope>,
     ) -> Result<Vec<String>> {
         let segments = self.catalog_segments(namespace, start_ns, end_ns).await?;
-        let mut names = BTreeSet::new();
-        for (segment, through) in self.written_segments(namespace, segments).await? {
-            let key = (namespace.clone(), segment, scope);
-            let segment_names = match self.catalog_names_cache.get(&key) {
-                Some(cached) if cached.0 == through => cached,
-                _ => {
-                    let names = discovery::names(
-                        self.storage.as_ref(),
-                        &segment_prefix(namespace, segment),
-                        scope.map(catalog_scope),
-                    )
-                    .await?;
-                    self.catalog_names_cache
-                        .insert(key, (through, names), false)
+        let written = self.written_segments(namespace, segments).await?;
+        let mut per_segment = stream::iter(written)
+            .map(|(segment, through)| async move {
+                let key = (namespace.clone(), segment, scope);
+                if let Some(cached) = self.catalog_names_cache.get(&key)
+                    && cached.0 == through
+                {
+                    return Ok::<_, Error>(cached);
                 }
-            };
+                let names = discovery::names(
+                    self.storage.as_ref(),
+                    &segment_prefix(namespace, segment),
+                    scope.map(catalog_scope),
+                )
+                .await?;
+                Ok(self
+                    .catalog_names_cache
+                    .insert(key, (through, names), false))
+            })
+            .buffer_unordered(catalog_concurrency());
+        let mut names = BTreeSet::new();
+        while let Some(segment_names) = per_segment.try_next().await? {
             names.extend(segment_names.1.iter().cloned());
         }
         Ok(names.into_iter().collect())
@@ -606,37 +612,44 @@ impl TraceDb {
             Some(AttributeScope::Span) => &[AttributeScope::Span],
             None => &[AttributeScope::Resource, AttributeScope::Span],
         };
+        let written = self.written_segments(namespace, segments).await?;
+        // In segment order, so the byte cap stops at the same segment however
+        // many are read ahead.
+        let mut per_segment = stream::iter(written)
+            .map(|(segment, through)| async move {
+                let key = (namespace.clone(), segment, scope, name.to_owned());
+                if let Some(cached) = self.catalog_values_cache.get(&key)
+                    && cached.0 == through
+                {
+                    return Ok::<_, Error>(cached);
+                }
+                let prefix = segment_prefix(namespace, segment);
+                let prefix = &prefix;
+                let found = futures::future::try_join_all(scopes.iter().map(|scope| {
+                    discovery::values_within(
+                        self.storage.as_ref(),
+                        prefix,
+                        catalog_scope(*scope),
+                        name,
+                        CATALOG_VALUES_MAX_BYTES,
+                    )
+                }))
+                .await?
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+                Ok(self.catalog_values_cache.insert(
+                    key,
+                    (through, found.into_iter().collect()),
+                    false,
+                ))
+            })
+            .buffered(catalog_concurrency());
         let mut values = BTreeSet::new();
         let mut bytes = 0usize;
-        for (segment, through) in self.written_segments(namespace, segments).await? {
-            if bytes > CATALOG_VALUES_MAX_BYTES {
-                break;
-            }
-            let key = (namespace.clone(), segment, scope, name.to_owned());
-            let segment_values = match self.catalog_values_cache.get(&key) {
-                Some(cached) if cached.0 == through => cached,
-                _ => {
-                    let prefix = segment_prefix(namespace, segment);
-                    let mut found = BTreeSet::new();
-                    for scope in scopes {
-                        found.extend(
-                            discovery::values_within(
-                                self.storage.as_ref(),
-                                &prefix,
-                                catalog_scope(*scope),
-                                name,
-                                CATALOG_VALUES_MAX_BYTES,
-                            )
-                            .await?,
-                        );
-                    }
-                    self.catalog_values_cache.insert(
-                        key,
-                        (through, found.into_iter().collect()),
-                        false,
-                    )
-                }
-            };
+        while bytes <= CATALOG_VALUES_MAX_BYTES
+            && let Some(segment_values) = per_segment.try_next().await?
+        {
             for value in segment_values.1.iter() {
                 if values.insert(value.clone()) {
                     bytes = bytes.saturating_add(value.weight());
@@ -1726,7 +1739,7 @@ pub(crate) async fn execute_traceql<T: Hit>(
         let wanted = (options.limit - results.len())
             .max(options.max_concurrency)
             .max(previous * 2)
-            .min(MATERIALIZE_BATCH);
+            .min(search_batch_max());
         previous = wanted;
         let batch = remaining.by_ref().take(wanted).collect::<Vec<_>>();
         if batch.is_empty() {

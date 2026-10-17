@@ -53,7 +53,8 @@ services:
     image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
     command: ["-config.file=/etc/loki/fuzz.yaml"]
     volumes:
-      - ./${LOKI_FUZZ_CONFIG:-loki-fuzz.yaml}:/etc/loki/fuzz.yaml:ro
+      # LOKI_FUZZ_CONFIG_PATH: the cold scenario's compactor settle config.
+      - ${LOKI_FUZZ_CONFIG_PATH:-./${LOKI_FUZZ_CONFIG:-loki-fuzz.yaml}}:/etc/loki/fuzz.yaml:ro
       - loki-fuzz-data:/loki
     ports: ["13110:3100"]
 
@@ -66,11 +67,12 @@ services:
       MINIO_ROOT_PASSWORD: logs-fuzz-secret
     volumes: ["minio-data:/data"]
 
-  # Historical scenario only: owns MinIO's address inside MinIO's network
-  # namespace, so every client's `minio:9000` goes through it, and forwards to
-  # MinIO on :9010 with a fixed first-byte delay.
+  # Historical and cold scenarios only: owns MinIO's address inside MinIO's
+  # network namespace, so every client's `minio:9000` goes through it, and
+  # forwards to MinIO on :9010 with a fixed first-byte delay. Per-client
+  # request counts are served on :9020.
   minio-latency:
-    profiles: ["historical"]
+    profiles: ["historical", "cold"]
     image: python:3.13-slim
     network_mode: service:minio
     command:
@@ -79,6 +81,10 @@ services:
       - --listen=9000
       - --upstream=9010
       - --first-byte-ms=${MINIO_FIRST_BYTE_MS:-15}
+      - --stats-port=9020
+    # FUZZ_COLD_TIMELINE=1: also record every request (served on :9020/timeline).
+    environment:
+      PROXY_TIMELINE: ${FUZZ_COLD_TIMELINE:-0}
     volumes: ["../latency-proxy/proxy.py:/proxy.py:ro"]
     depends_on: [minio]
 
@@ -105,12 +111,15 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       AWS_ENDPOINT: http://minio:9000
       AWS_ALLOW_HTTP: "true"
+      # The cold scenario's rollup settle logs rollup progress at info.
+      RUST_LOG: ${LOGS_RUST_LOG:-error}
     depends_on:
       minio-init:
         condition: service_completed_successfully
     command: ["--config", "/app/regression/logs-s3.yaml"]
     volumes:
-      - ./${LOGS_CONFIG_DIR:-.}/logs-s3.yaml:/app/regression/logs-s3.yaml:ro
+      # LOGS_S3_CONFIG: the cold scenario's rollup settle config.
+      - ${LOGS_S3_CONFIG:-./${LOGS_CONFIG_DIR:-.}/logs-s3.yaml}:/app/regression/logs-s3.yaml:ro
     ports: ["13111:3100"]
 
   # Two static-shard writers and one reader group per shard over MinIO.

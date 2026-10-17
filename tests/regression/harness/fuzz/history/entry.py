@@ -34,6 +34,7 @@ _QUERY_PERCENTILES = ("p50", "p90", "p99", "p99.9", "max")
 _FAMILY_PERCENTILES = ("p50", "p90", "p99")
 _INGEST_PERCENTILES = ("p50", "p90", "p99", "max")
 _MAX_NOTES = 20
+_SIDES = ("impl", "oracle")
 
 
 def normalize(value: Any) -> Any:
@@ -134,12 +135,64 @@ def _resources(resources: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _cold_side(stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "cold_ms": _pick(stats.get("cold_ms"), _FAMILY_PERCENTILES),
+        "warm_ms": _pick(stats.get("warm_ms"), ("p50",)),
+        "get": _pick(stats.get("get"), ("p50", "max")),
+        "get_bytes": _pick(stats.get("get_bytes"), ("p50", "max")),
+        "requests": _pick(stats.get("requests"), ("p50", "max")),
+    }
+
+
+def _cold(cold: dict[str, Any]) -> dict[str, Any]:
+    """The cold scenario's per-family cold latency and object-store traffic
+    (`cold.summarize`), without per-measurement detail."""
+    return {
+        "span_s": cold.get("span_s"),
+        "repeats": cold.get("repeats"),
+        "settle_s": cold.get("settle_s"),
+        "first_byte_ms": cold.get("first_byte_ms"),
+        "dataset": cold.get("dataset", {}),
+        "planned": cold.get("planned", 0),
+        "measured": cold.get("measured", 0),
+        "answered": cold.get("answered", 0),
+        "timings_s": cold.get("timings_s", {}),
+        "families": {
+            family: {
+                "cases": stats.get("cases", 0),
+                **{side: _cold_side(stats.get(side) or {}) for side in _SIDES},
+            }
+            for family, stats in sorted(cold.get("families", {}).items())
+        },
+        "totals": {
+            side: {
+                **_cold_side(stats),
+                "get_total": stats.get("get_total"),
+                "get_bytes_total": stats.get("get_bytes_total"),
+            }
+            for side, stats in sorted((cold.get("totals") or {}).items())
+        },
+        "startup": {
+            side: {
+                "restarts": stats.get("restarts", 0),
+                "ready_s": _pick(stats.get("ready_s"), ("p50", "max")),
+                "settle_s": _pick(stats.get("settle_s"), ("p50", "max")),
+                "get": _pick(stats.get("get"), ("p50", "max")),
+                "get_bytes": _pick(stats.get("get_bytes"), ("p50", "max")),
+            }
+            for side, stats in sorted((cold.get("startup") or {}).items())
+        },
+    }
+
+
 def results(summary: dict[str, Any]) -> dict[str, Any]:
     counts = summary.get("outcomes", {})
     cases = summary.get("cases", sum(counts.values()))
     ingest = summary.get("ingest", {})
     latency = summary.get("latency", {})
     notes = summary.get("notes", [])
+    cold = summary.get("cold")
     return {
         "status": "failed" if summary.get("failed") else "passed",
         "reasons": list(summary.get("reasons", [])),
@@ -169,6 +222,7 @@ def results(summary: dict[str, Any]) -> dict[str, Any]:
             for service, stats in sorted((summary.get("floor") or {}).items())
         },
         "resources": _resources(summary.get("resources")),
+        **({"cold": _cold(cold)} if cold else {}),
     }
 
 
@@ -199,7 +253,10 @@ def build_entry(
         "git": git,
         "host": host,
         "ci": ci,
-        "config": {key: config.get(key) for key in _CONFIG_KEYS},
+        "config": {
+            **{key: config.get(key) for key in _CONFIG_KEYS},
+            **({"cold": config["cold"]} if config.get("cold") else {}),
+        },
         "settings": settings(run.get("endpoints", {})),
         "environment": dict(sorted((environment or {}).items())),
         "images": dict(sorted((images or {}).items())),

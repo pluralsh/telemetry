@@ -49,8 +49,8 @@ the end if any did. Options:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `--products` | `logs,metrics,traces` | Products to run, in order |
-| `--scenarios` | `FUZZ_SCENARIO`, else `recent` | Scenarios every product runs in |
-| `--metrics-oracles` | `FUZZ_METRICS_ORACLE`, else `prometheus,mimir` | One recent-scenario metrics run per oracle; historical always uses `mimir-blocks` |
+| `--scenarios` | `FUZZ_SCENARIO`, else `recent` | Scenarios every product runs in: `recent`, `historical`, `cold` (logs, metrics and traces only) |
+| `--metrics-oracles` | `FUZZ_METRICS_ORACLE`, else `prometheus,mimir` | One recent-scenario metrics run per oracle; historical and cold always use `mimir-blocks` |
 | `--duration` | `FUZZ_DURATION`, else `30m` | Fuzzing budget per run (excludes image builds and stack startup) |
 | `--lanes` | `1` | Runs at once, each on its own slice of the Docker CPUs |
 | `--seed` | random per run | Shared `FUZZ_SEED`, to repeat a benchmark on the same data |
@@ -112,6 +112,58 @@ PYTHONPATH=tests/regression mise exec -- python -m harness.fuzz.history rebuild
 PYTHONPATH=tests/regression mise exec -- python -m harness.fuzz.history rebuild --check
 ```
 
+## Cold reads
+
+The fuzz measures queries against processes that have been running for the
+whole run, so after the first round most reads hit warm caches. The `cold`
+scenario instead measures the first query after a restart, over about a day
+of data that only exists in object storage:
+
+```sh
+PYTHONPATH=tests/regression mise exec -- \
+  python -m harness.fuzz.bench --scenarios cold --duration 40m
+```
+
+Each product loads `FUZZ_COLD_SPAN` (22h) of backdated data into both sides
+hour by hour, flushes and compacts everything to MinIO (Loki ships its TSDB
+index and runs its compactor, Mimir compacts its 2h blocks, Tempo cuts one
+block per hour; Logs, Metrics and Traces run their rollups, and Logs waits
+until its SlateDB compaction is quiescent), waits
+until neither side uploads anything, and checks exact counts on both.
+Production processes do this work continuously; a process restarted before
+every query never would, so without settling the implementations would be
+measured on a day of unmerged hour segments and Loki on an uncompacted
+index (`FUZZ_COLD_ROLLUPS=0` and `FUZZ_COLD_COMPACTION=0` measure that). It then sends a fixed, seeded
+battery of queries (11-13 per product, from 1h to 24h ranges: needle and
+filter searches, aggregations, high-cardinality series, discovery endpoints,
+and trace lookups by ID), each `FUZZ_COLD_REPEATS` (3) times per side in
+random order. Only object-store systems take part: Logs against Loki reading
+chunks and TSDB index from MinIO, Metrics against the Mimir store-gateway,
+and Traces against Tempo on MinIO, all behind the same latency proxy
+(`MINIO_FIRST_BYTE_MS`, 20 ms here).
+
+"Cold" means the same thing on both sides. Before every measured query the
+service is stopped, its data volume is emptied (Loki's, Mimir's and Tempo's
+local index, block and WAL directories; the implementation keeps its disk
+cache in the container's `/tmp`, which recreating the container discards),
+and it is recreated. The query is sent once the service is ready and has
+moved less than 64 KiB to or from object storage over 2 seconds (what is
+left is metadata polling, such as SlateDB looking for a new manifest), so
+startup work such as Mimir
+syncing block indexes or Tempo polling its blocklist is excluded from the
+query and reported separately as startup GETs and seconds to ready. The
+implementations run their production configs, which do not warm caches on
+startup; the continuous cache warmer's first pass only records access
+patterns, so it reads nothing before the query.
+
+Results show cold p50 and p99 per family for both sides, the warm latency of
+an immediate repeat, and GETs and bytes each side read from MinIO per query,
+counted by the proxy per client IP. Answers are still compared. With the
+defaults a run takes about 25 minutes for logs, 15 for metrics and 30 for
+traces, most of it restarts. These are
+first-query numbers and are not comparable to fuzz-scenario latency; with
+few repeats per family, p99 is close to the maximum.
+
 ## Reading the history
 
 ```
@@ -143,7 +195,9 @@ Each JSON entry has `schema_version` 1 and holds:
   service.
 - `results`: status and failure reasons, rounds, cases, outcome counts,
   overall and per-family latency percentiles with ratios, ingest latency,
-  and per-role and per-service CPU and memory.
+  and per-role and per-service CPU and memory. Cold runs add `cold`: the
+  dataset, per-family cold and warm latency and object-store traffic per
+  side, totals, and startup cost.
 
 Per-case data, response bodies, and datasets stay in the run's output
 directory and are not copied into the history.
@@ -206,6 +260,13 @@ tag value).
 - **Randomized workloads.** Seeds change the data shapes and query mix, so
   per-family numbers move between runs even on the same code. Pass `--seed`
   to compare two builds on the same workload.
+- **Cold reads.** The cold scenario excludes startup from the measured
+  query, which favours systems that do heavy work at startup (Mimir's
+  store-gateway loads block index headers, Tempo polls its blocklist);
+  startup GETs and time to ready are reported next to the query numbers.
+  The oracles run as single binaries with their default in-process caches,
+  so a restart empties them too; a deployment with external memcached
+  would keep those across restarts.
 - **Small datasets.** Each round holds minutes to tens of minutes of data at
   `FUZZ_SCALE=1`; latency here reflects query planning and small-scan
   overheads more than large-scale throughput.

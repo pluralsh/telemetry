@@ -153,18 +153,38 @@ not bytes. Default `268435456`.
 
 ## `cache_warmer`
 
-The opt-in startup cache warmer applies to Metrics, Logs, and Traces readers and standalone servers.
-It runs in the background while health checks remain available; readiness remains false until
-warming finishes. Writer-only processes skip warming. Errors are logged and do not permanently
-block readiness. Warming consumes permits from the same pod-wide storage I/O budget as queries.
-Metadata-only warming is restricted to SlateDB filters and SST indexes, which use the dedicated
-metadata cache and cannot evict payload blocks from the data cache.
+The startup cache warmer applies to Metrics, Logs, and Traces readers and standalone servers.
+Writer-only processes skip warming. Errors are logged and do not permanently block readiness.
+Warming consumes permits from the same pod-wide storage I/O budget as queries. Metadata-only
+warming is restricted to SlateDB filters and SST indexes, which use the dedicated metadata cache
+and cannot evict payload blocks from the data cache. It warms the newest SSTs first and stops once
+what it warmed reaches `metadata_budget_percent` of the metadata cache, counting the SSTs that did
+not fit; later passes forget, and evict from the cache, what they warmed of SSTs compaction,
+rollups or retention removed. With no metadata cache configured nothing is cached, so
+metadata-only warming does nothing.
 
-- `cache_warmer.enabled`: enables startup warming. Default `false`.
-- `cache_warmer.warm_range_seconds`: recent time range to warm. Default `7200`; must be greater
-  than zero when warming is enabled.
-- `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false. Default `30`;
-  timeout is fail-open.
+Metrics and Traces warm by default, in the background: the server is ready at once and queries
+during the pass find the cache partly warm. Logs keeps the earlier default of no startup warming,
+and when enabled holds readiness until the pass ends. A `cache_warmer` section that sets only some
+keys keeps the product's defaults for the rest (the configs reject unknown keys, so older configs
+keep parsing and new keys need no migration).
+
+- `cache_warmer.enabled`: enables startup warming. Default `true` for Metrics and Traces, `false`
+  for Logs.
+- `cache_warmer.block_readiness`: hold readiness false until the startup pass ends or times out.
+  Default `false` for Metrics and Traces, `true` for Logs.
+- `cache_warmer.metadata_budget_percent`: the share of the metadata cache warming may fill, `0` to
+  `100`. Default `75`, which leaves the rest for metadata queries fetch.
+- `cache_warmer.warm_range_seconds`: recent time range whose filters and indexes are warmed.
+  Default `0`, which warms all live data: retention bounds what is live, and
+  `metadata_budget_percent` bounds what is held, newest first. A set value also bounds payloads
+  unless `payload_warm_range_seconds` is set, as it did before payloads had their own range.
+- `cache_warmer.payload_warm_range_seconds`: recent time range whose payloads are warmed when
+  `include_payloads` is set. Default `0`, which uses `warm_range_seconds` when that is set and
+  `7200` otherwise. Payloads fill the data cache that queries share, so this range stays short.
+  Servers older than this key reject it.
+- `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false, with
+  `block_readiness`. Default `30`; timeout is fail-open.
 - `cache_warmer.concurrency`: maximum concurrent SST warm operations and number of permits reserved
   from the pod-wide storage I/O budget. Default `2`; must be greater than zero when warming is enabled.
 - `cache_warmer.include_payloads`: also warms metric samples, log pages, and trace pages. When
@@ -182,10 +202,18 @@ affect readiness.
 - `cache_warmer.continuous.enabled`: enables continuous warming. Default `true`.
 - `cache_warmer.continuous.interval_seconds`: seconds between passes. Default `10`; must be greater
   than zero when enabled.
-- `cache_warmer.continuous.warm_range_seconds`: recent time range whose new SSTs are warmed.
-  Default `7200`; must be greater than zero when enabled.
+- `cache_warmer.continuous.warm_range_seconds`: as `cache_warmer.warm_range_seconds`, for new
+  SSTs. Default `0`, all live data.
+- `cache_warmer.continuous.payload_warm_range_seconds`: as
+  `cache_warmer.payload_warm_range_seconds`, for new SSTs. Default `0`, which is `7200` unless
+  `continuous.warm_range_seconds` is set.
 - `cache_warmer.continuous.include_payloads`: also warms metric samples, log pages, and trace
-  pages. Default `true`.
+  pages of the SSTs inside the payload range. Default `true`.
+
+The metadata range used to default to `7200` for both passes. It predates the metadata budget,
+which now bounds memory however wide the range is; a wider range only means older SSTs compete for
+the budget, newest first, and what does not fit is skipped and counted. Configs that set
+`warm_range_seconds` explicitly keep their meaning for metadata and payloads alike.
 
 ## `write`
 

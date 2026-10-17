@@ -6,18 +6,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{CacheWarmerConfig, SstWarmTracker};
+use common::storage::slate::warm::WarmLedger;
+use common::{CacheWarmerConfig, SstWarmTracker, WarmWindow};
+use serde::Deserialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// One warming pass over a product's recent data.
 pub struct WarmPass {
-    pub range: Duration,
-    pub include_payloads: bool,
+    pub window: WarmWindow,
     pub concurrency: usize,
     pub cancel: CancellationToken,
     /// Present for continuous warming, and for the startup pass before it.
     pub tracker: Option<Arc<SstWarmTracker>>,
+    /// What every pass of this warmer has warmed, for budgeted warming.
+    pub ledger: Arc<WarmLedger>,
+    /// See [`CacheWarmerConfig::metadata_budget_percent`].
+    pub metadata_budget_percent: u8,
 }
 
 /// Whether a server in this role and configuration runs any warming at all.
@@ -25,10 +30,56 @@ pub fn warming_enabled(config: &CacheWarmerConfig, serves_reads: bool) -> bool {
     serves_reads && (config.enabled || config.continuous.enabled)
 }
 
+/// Whether readiness waits for the startup pass of a server in this role.
+pub fn readiness_waits(config: &CacheWarmerConfig, serves_reads: bool) -> bool {
+    serves_reads && config.enabled && config.block_readiness
+}
+
+/// The warmer of metrics and traces readers: a metadata-only startup pass
+/// in the background, without delaying readiness.
+pub fn reader_warmer_defaults() -> CacheWarmerConfig {
+    CacheWarmerConfig {
+        enabled: true,
+        block_readiness: false,
+        ..CacheWarmerConfig::default()
+    }
+}
+
+/// Deserializes a `cache_warmer` section over [`reader_warmer_defaults`],
+/// so a section naming only some keys keeps the reader defaults for the
+/// rest.
+pub fn deserialize_reader_warmer<'de, D>(deserializer: D) -> Result<CacheWarmerConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let section = serde_json::Value::deserialize(deserializer)?;
+    let mut merged =
+        serde_json::to_value(reader_warmer_defaults()).map_err(serde::de::Error::custom)?;
+    merge(&mut merged, section);
+    serde_json::from_value(merged).map_err(serde::de::Error::custom)
+}
+
+fn merge(base: &mut serde_json::Value, over: serde_json::Value) {
+    match (base, over) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(over)) => {
+            for (key, value) in over {
+                match base.get_mut(&key) {
+                    Some(slot) => merge(slot, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over,
+    }
+}
+
 /// Spawns the startup pass (when enabled) and then, when continuous warming
 /// is enabled, a pass every `continuous.interval_seconds` that warms only SSTs
 /// that appeared since the previous pass. `cache_warmed` is set once the
-/// startup pass ends, whatever its outcome.
+/// startup pass ends, whatever its outcome; a startup pass that does not
+/// block readiness has no timeout.
 pub fn spawn_cache_warmer<W, Fut, E>(
     product: &'static str,
     config: &CacheWarmerConfig,
@@ -46,25 +97,23 @@ where
         .continuous
         .enabled
         .then(|| Arc::new(SstWarmTracker::new(config.enabled)));
+    let ledger = Arc::new(WarmLedger::new(config.enabled));
     tokio::spawn(async move {
         if config.enabled {
-            let timeout = Duration::from_secs(config.timeout_seconds);
+            let timeout = config
+                .block_readiness
+                .then(|| Duration::from_secs(config.timeout_seconds));
             metrics::gauge!("telemetry_cache_warmer_active", "product" => product).set(1.0);
             let pass = WarmPass {
-                range: Duration::from_secs(config.warm_range_seconds),
-                include_payloads: config.include_payloads,
+                window: config.window(),
                 concurrency: config.concurrency,
                 cancel: cancellation.clone(),
                 tracker: tracker.clone(),
+                ledger: Arc::clone(&ledger),
+                metadata_budget_percent: config.metadata_budget_percent,
             };
-            let status = run_pass(
-                product,
-                "startup",
-                Some(timeout),
-                tracker.as_deref(),
-                warm(pass),
-            )
-            .await;
+            let status =
+                run_pass(product, "startup", timeout, tracker.as_deref(), warm(pass)).await;
             metrics::gauge!("telemetry_cache_warmer_active", "product" => product).set(0.0);
             if status != "success" {
                 tracing::warn!(product, status, "startup cache warming did not complete");
@@ -82,11 +131,12 @@ where
                 _ = ticker.tick() => {}
             }
             let pass = WarmPass {
-                range: Duration::from_secs(continuous.warm_range_seconds),
-                include_payloads: continuous.include_payloads,
+                window: continuous.window(),
                 concurrency: config.concurrency,
                 cancel: cancellation.clone(),
                 tracker: Some(Arc::clone(&tracker)),
+                ledger: Arc::clone(&ledger),
+                metadata_budget_percent: config.metadata_budget_percent,
             };
             run_pass(product, "continuous", None, Some(&tracker), warm(pass)).await;
         }
@@ -166,11 +216,10 @@ mod tests {
             cancellation.clone(),
             Arc::clone(&cache_warmed),
             move |pass: WarmPass| {
-                recorded.lock().unwrap().push((
-                    pass.range,
-                    pass.include_payloads,
-                    pass.tracker.is_some(),
-                ));
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((pass.window, pass.tracker.is_some()));
                 async { Ok::<(), String>(()) }
             },
         );
@@ -181,16 +230,21 @@ mod tests {
         task.await.unwrap();
 
         let passes = passes.lock().unwrap();
-        assert_eq!(passes[0], (Duration::from_secs(7_200), false, true));
+        let startup = WarmWindow {
+            metadata: None,
+            payloads: None,
+        };
+        assert_eq!(passes[0], (startup, true));
         assert!(
             passes.len() >= 3,
             "expected continuous passes, got {passes:?}"
         );
-        assert!(
-            passes[1..]
-                .iter()
-                .all(|pass| *pass == (Duration::from_secs(600), true, true))
-        );
+        let ten_minutes = Some(Duration::from_secs(600));
+        let continuous = WarmWindow {
+            metadata: ten_minutes,
+            payloads: ten_minutes,
+        };
+        assert!(passes[1..].iter().all(|pass| *pass == (continuous, true)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -219,5 +273,84 @@ mod tests {
 
         assert!(cache_warmed.load(Ordering::Acquire));
         assert_eq!(*passes.lock().unwrap(), 1);
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReaderConfig {
+        #[serde(
+            default = "reader_warmer_defaults",
+            deserialize_with = "deserialize_reader_warmer"
+        )]
+        cache_warmer: CacheWarmerConfig,
+    }
+
+    #[test]
+    fn reader_sections_merge_over_reader_defaults() {
+        let absent: ReaderConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.cache_warmer, reader_warmer_defaults());
+        assert!(absent.cache_warmer.enabled && !absent.cache_warmer.block_readiness);
+
+        let partial: ReaderConfig = serde_json::from_str(
+            r#"{"cache_warmer": {"concurrency": 4, "continuous": {"interval_seconds": 30}}}"#,
+        )
+        .unwrap();
+        let mut expected = reader_warmer_defaults();
+        expected.concurrency = 4;
+        expected.continuous.interval_seconds = 30;
+        assert_eq!(partial.cache_warmer, expected);
+
+        let disabled: ReaderConfig =
+            serde_json::from_str(r#"{"cache_warmer": {"enabled": false}}"#).unwrap();
+        assert!(!disabled.cache_warmer.enabled);
+
+        let unknown = serde_json::from_str::<ReaderConfig>(r#"{"cache_warmer": {"bogus": 1}}"#);
+        assert!(unknown.is_err());
+        let nested = serde_json::from_str::<ReaderConfig>(
+            r#"{"cache_warmer": {"continuous": {"bogus": 1}}}"#,
+        );
+        assert!(nested.is_err());
+    }
+
+    #[test]
+    fn readiness_waits_only_when_asked() {
+        assert!(!readiness_waits(&reader_warmer_defaults(), true));
+        let blocking = CacheWarmerConfig {
+            enabled: true,
+            ..CacheWarmerConfig::default()
+        };
+        assert!(readiness_waits(&blocking, true));
+        assert!(!readiness_waits(&blocking, false));
+        assert!(!readiness_waits(&CacheWarmerConfig::default(), true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_startup_pass_has_no_timeout() {
+        let mut config = reader_warmer_defaults();
+        config.continuous.enabled = false;
+        config.timeout_seconds = 1;
+        let cache_warmed = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        let percent = config.metadata_budget_percent;
+        spawn_cache_warmer(
+            "test",
+            &config,
+            CancellationToken::new(),
+            Arc::clone(&cache_warmed),
+            move |pass: WarmPass| {
+                assert_eq!(pass.metadata_budget_percent, percent);
+                let done = Arc::clone(&done);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    done.store(true, Ordering::Release);
+                    Ok::<(), String>(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        assert!(cache_warmed.load(Ordering::Acquire));
     }
 }

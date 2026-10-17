@@ -70,7 +70,7 @@ impl LogDb {
             return Ok(names);
         }
         let names = catalog_names(
-            self.storage.as_ref(),
+            self.reads().as_ref(),
             &catalog_prefix(namespace, partition),
             Some(""),
         )
@@ -89,7 +89,7 @@ impl LogDb {
             Partition::Segment(segment) => next_stream_id_key(namespace, segment),
             Partition::Rollup(period) => rollup_next_stream_id_key(namespace, period),
         };
-        self.storage
+        self.reads()
             .get(key)
             .await?
             .map(|record| decode_stream_id(&record.value))
@@ -128,7 +128,7 @@ impl LogDb {
             return Ok(values);
         }
         let values = catalog_values(
-            self.storage.as_ref(),
+            self.reads().as_ref(),
             &catalog_prefix(namespace, partition),
             "",
             name,
@@ -266,10 +266,12 @@ impl LogDb {
             let labelled = scan(BytesRange::unbounded()).await?;
             return Ok(labelled.into_iter().map(|(_, labels)| labels).collect());
         }
-        let records = futures::future::try_join_all(exact.iter().map(|label| {
-            self.storage
-                .get(rollup_posting_key(namespace, period, label))
-        }))
+        let reads = self.reads();
+        let records = futures::future::try_join_all(
+            exact
+                .iter()
+                .map(|label| reads.get(rollup_posting_key(namespace, period, label))),
+        )
         .await?;
         let mut selected: Option<RoaringBitmap> = None;
         for record in records {
@@ -294,7 +296,7 @@ impl LogDb {
         }
         let labelled: Vec<Option<Arc<Labels>>> = futures::stream::iter(ids)
             .map(|id| async move {
-                self.storage
+                self.reads()
                     .get(rollup_forward_key(namespace, period, id))
                     .await?
                     .map(|record| decode_labels(&record.value).map(Arc::new))
@@ -449,7 +451,7 @@ impl LogDb {
         let generations = futures::stream::iter(distinct)
             .map(|segment| async move {
                 let next = self
-                    .storage
+                    .reads()
                     .get(next_object_id_key(namespace, segment))
                     .await?
                     .map(|record| decode_object_id(&record.value))
@@ -613,13 +615,17 @@ impl LogDb {
     }
 
     /// Sends each decoded row chunk before reading more. Used by rollup so
-    /// copying a hot stream never retains all of its rows at once.
-    pub(super) async fn read_bounded_chunks(
+    /// copying a hot stream never retains all of its rows at once. Each
+    /// chunk goes with the decode permit of the unit that released it,
+    /// which the receiver holds until it is done with the rows. Rows a unit
+    /// leaves pending go out under a later chunk's permit, so no unit waits
+    /// on permits that rows read before it hold.
+    pub(super) async fn read_bounded_chunks<'a>(
         &self,
         namespace: &Namespace,
         targets: ScanTargets,
-        budget: &PageBudget,
-        sender: tokio::sync::mpsc::Sender<Vec<LogRow>>,
+        budget: &'a PageBudget,
+        sender: tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit<'a>)>,
     ) -> Result<()> {
         for (ordinal, (segment, streams)) in (targets.first_ordinal..).zip(targets.segments) {
             self.read_segment_chunks(
@@ -635,14 +641,14 @@ impl LogDb {
         Ok(())
     }
 
-    async fn read_segment_chunks(
+    async fn read_segment_chunks<'a>(
         &self,
         namespace: &Namespace,
         (segment, ordinal): (SegmentId, usize),
         streams: Vec<SegmentStream>,
         range: (i64, i64),
-        budget: &PageBudget,
-        sender: &tokio::sync::mpsc::Sender<Vec<LogRow>>,
+        budget: &'a PageBudget,
+        sender: &tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit<'a>)>,
     ) -> Result<()> {
         let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
         let units = plan_reads(&streams, false, COALESCE_GAP_BLOCKS);
@@ -650,7 +656,7 @@ impl LogDb {
         let mut decoded = futures::stream::iter(units)
             .map(|unit| async move {
                 budget.take()?;
-                let decoding = budget.decode(unit.decode_bytes(true)).await?;
+                let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
                 let blocks = self
                     .load_blocks(
                         namespace,
@@ -682,12 +688,11 @@ impl LogDb {
             for (run, decoded) in runs {
                 pending.push(run, decoded);
             }
-            drop(decoding);
             if let Some(ready) =
                 <PendingRows as PendingReads>::release(&mut pending, bounds.get(fetched).copied())
             {
                 sender
-                    .send(ready)
+                    .send((ready, decoding))
                     .await
                     .map_err(|_| Error::Invalid("rollup row consumer stopped".into()))?;
             }
@@ -785,6 +790,18 @@ impl LogDb {
         reverse: bool,
         mut consume: impl FnMut(P::Chunk) -> Result<ControlFlow<()>>,
     ) -> Result<()> {
+        if self.tuning.segment_lookahead > 0 {
+            return self
+                .read_segments_pipelined::<P>(
+                    namespace,
+                    (start_ns, end_ns),
+                    filter,
+                    budget,
+                    reverse,
+                    consume,
+                )
+                .await;
+        }
         let now_unix_ms = unix_time_ms()?;
         let select_streams = |segment| {
             self.segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
@@ -835,23 +852,9 @@ impl LogDb {
         consume: &mut impl FnMut(P::Chunk) -> Result<ControlFlow<()>>,
     ) -> Result<ControlFlow<()>> {
         let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
-        let mut streams = streams;
-        let candidates = match line_terms {
-            Some(terms) => {
-                self.line_candidates(namespace, segment, &streams, terms)
-                    .await?
-            }
-            None => None,
-        };
-        if let Some(candidates) = &candidates {
-            for stream in &mut streams {
-                stream.runs.retain(|(object_id, _)| {
-                    candidates.contains_key(&(stream.stream_id, *object_id))
-                });
-            }
-            streams.retain(|stream| !stream.runs.is_empty());
-        }
-        let candidates = Arc::new(candidates);
+        let (streams, candidates) = self
+            .narrow_to_candidates(namespace, segment, streams, line_terms)
+            .await?;
         let units = plan_reads(&streams, reverse, COALESCE_GAP_BLOCKS);
         let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
         let mut decoded = futures::stream::iter(units)
@@ -862,7 +865,7 @@ impl LogDb {
                     // Held until the unit's rows are pending. Units ask the fair
                     // semaphore in read order, so a segment's earliest holder
                     // never waits behind a later one.
-                    let decoding = budget.decode(unit.decode_bytes(true)).await?;
+                    let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
                     let blocks = self
                         .load_blocks(
                             namespace,
@@ -911,6 +914,159 @@ impl LogDb {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// `streams` without the runs [`Self::line_candidates`] rules out for
+    /// `line_terms`, and the candidate rows of those left.
+    async fn narrow_to_candidates(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        mut streams: Vec<SegmentStream>,
+        line_terms: Option<&[String]>,
+    ) -> Result<(Vec<SegmentStream>, Arc<Option<Candidates>>)> {
+        let candidates = match line_terms {
+            Some(terms) => {
+                self.line_candidates(namespace, segment, &streams, terms)
+                    .await?
+            }
+            None => None,
+        };
+        if let Some(candidates) = &candidates {
+            for stream in &mut streams {
+                stream.runs.retain(|(object_id, _)| {
+                    candidates.contains_key(&(stream.stream_id, *object_id))
+                });
+            }
+            streams.retain(|stream| !stream.runs.is_empty());
+        }
+        Ok((streams, Arc::new(candidates)))
+    }
+
+    /// [`Self::read_segments_pending`] with segments pipelined: up to
+    /// [`ReadTuning::segment_lookahead`] segments past the one being
+    /// consumed have their streams and candidates selected, and read units
+    /// of later segments start as soon as fewer than
+    /// [`ReadTuning::pipeline_units`] are in flight, so a read that needs
+    /// many segments costs a few dependent round trips rather than a few
+    /// per segment. Rows are released exactly as segment by segment: in
+    /// scan order, a segment's last unit releasing all its rows. Breaking
+    /// drops the reads still in flight.
+    async fn read_segments_pipelined<P: PendingReads>(
+        &self,
+        namespace: &Namespace,
+        (start_ns, end_ns): (i64, i64),
+        filter: &StreamFilter,
+        budget: &PageBudget,
+        reverse: bool,
+        mut consume: impl FnMut(P::Chunk) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        let now_unix_ms = unix_time_ms()?;
+        let segments = self.visible_segment_ids(namespace, (start_ns, end_ns), reverse)?;
+        let line_terms = filter.line_terms.as_deref();
+        let plans = futures::stream::iter((0u32..).zip(segments))
+            .map(|(ordinal, segment)| async move {
+                let streams = self
+                    .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
+                    .await?;
+                let (streams, candidates) = self
+                    .narrow_to_candidates(namespace, segment, streams, line_terms)
+                    .await?;
+                let units = plan_reads(&streams, reverse, COALESCE_GAP_BLOCKS);
+                let mut bounds = units
+                    .iter()
+                    .skip(1)
+                    .map(|unit| Some(unit.bound))
+                    .collect::<Vec<_>>();
+                bounds.push(None);
+                Ok::<_, Error>(
+                    units
+                        .into_iter()
+                        .zip(bounds)
+                        .map(move |(unit, next_bound)| PipelinedUnit {
+                            segment,
+                            ordinal,
+                            next_bound,
+                            candidates: Arc::clone(&candidates),
+                            unit,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .buffered(self.tuning.segment_lookahead.max(1));
+        // Planning runs beside the reads rather than as their source, so it
+        // keeps going while the reads have no room for another unit.
+        let (planned, mut receiver) = tokio::sync::mpsc::channel(1);
+        let plan = async move {
+            let mut plans = std::pin::pin!(plans);
+            while let Some(plan) = plans.next().await {
+                let failed = plan.is_err();
+                if planned.send(plan).await.is_err() || failed {
+                    return;
+                }
+            }
+        };
+        let units = futures::stream::poll_fn(move |context| receiver.poll_recv(context))
+            .map_ok(|units| futures::stream::iter(units.into_iter().map(Ok)))
+            .try_flatten()
+            .map(|unit: Result<PipelinedUnit>| async move {
+                let PipelinedUnit {
+                    segment,
+                    ordinal,
+                    next_bound,
+                    candidates,
+                    unit,
+                } = unit?;
+                budget.take()?;
+                let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
+                let blocks = self
+                    .load_blocks(
+                        namespace,
+                        segment,
+                        unit.object,
+                        unit.first_block..unit.end_block,
+                        ReadNeeds { lines: true },
+                    )
+                    .await?;
+                let runs = tokio::spawn(async move {
+                    let mut runs = Vec::with_capacity(unit.runs.len());
+                    for run in unit.runs {
+                        let first = (run.run.first_block - unit.first_block) as usize;
+                        let blocks = &blocks[first..first + run.run.blocks as usize];
+                        let rows = candidates
+                            .as_ref()
+                            .as_ref()
+                            .and_then(|candidates| candidates.get(&(run.stream_id, run.object_id)));
+                        let decoded = P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
+                        runs.push((run, decoded));
+                    }
+                    Ok::<_, Error>(runs)
+                })
+                .await
+                .map_err(|error| Error::Invalid(format!("page decode task failed: {error}")))??;
+                Ok::<_, Error>((ordinal, next_bound, decoding, runs))
+            })
+            .buffered(self.tuning.pipeline_units.max(1));
+        let read = async move {
+            let mut units = std::pin::pin!(units);
+            let mut pending = P::new(reverse);
+            while let Some((_, next_bound, decoding, runs)) = units.try_next().await? {
+                for (run, decoded) in runs {
+                    pending.push(run, decoded);
+                }
+                drop(decoding);
+                if let Some(ready) = pending.release(next_bound)
+                    && consume(ready)?.is_break()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        };
+        match futures::future::select(std::pin::pin!(read), std::pin::pin!(plan)).await {
+            futures::future::Either::Left((read, _)) => read,
+            futures::future::Either::Right(((), read)) => read.await,
+        }
     }
 
     /// Uses the segment-local term index to identify pages and rows before
@@ -1017,7 +1173,7 @@ impl LogDb {
         }
         let allowed_leaves = leaves.keys().copied().collect::<HashSet<_>>();
         let Some(scores) = block_max_scores(
-            self.storage.as_ref(),
+            self.reads().as_ref(),
             namespace,
             segment,
             terms,
@@ -1050,8 +1206,9 @@ impl LogDb {
         segment: SegmentId,
         streams: &[SegmentStream],
         terms: &[String],
-    ) -> Result<Option<HashMap<(StreamId, u64), HashSet<u32>>>> {
-        let storage = self.storage.as_ref();
+    ) -> Result<Option<Candidates>> {
+        let reads = self.reads();
+        let storage = reads.as_ref();
         let Some(field) = search::field_stats(storage, namespace, segment).await? else {
             return Ok(None);
         };
@@ -1121,7 +1278,7 @@ impl LogDb {
         let directories: HashMap<ObjectRef, StoredObject> = futures::stream::iter(merged)
             .map(|object| async move {
                 let record = self
-                    .storage
+                    .reads()
                     .get(directory_key(namespace, segment, object))
                     .await?
                     .ok_or_else(|| Error::Corrupt("run has no object directory".to_owned()))?;
@@ -1176,7 +1333,7 @@ impl LogDb {
             return Ok(blocks);
         }
         let blocks = read_blocks(
-            self.storage.as_ref(),
+            self.reads().as_ref(),
             namespace,
             segment,
             object,
@@ -1224,7 +1381,7 @@ impl LogDb {
         if matchers.is_empty() {
             let mut result = Vec::new();
             let mut iterator = self
-                .storage
+                .reads()
                 .scan_prefix_iter(
                     forward_prefix(namespace, segment),
                     BytesRange::unbounded(),
@@ -1237,10 +1394,11 @@ impl LogDb {
             return Ok(result);
         }
 
+        let reads = self.reads();
         let records = futures::future::try_join_all(
             matchers
                 .iter()
-                .map(|matcher| self.storage.get(posting_key(namespace, segment, matcher))),
+                .map(|matcher| reads.get(posting_key(namespace, segment, matcher))),
         )
         .await?;
         let mut result: Option<RoaringBitmap> = None;
@@ -1286,7 +1444,7 @@ impl LogDb {
         futures::stream::iter(stream_ids)
             .map(|stream_id| async move {
                 let record = self
-                    .storage
+                    .reads()
                     .get(forward_key(namespace, segment, stream_id))
                     .await?
                     .ok_or_else(|| {
@@ -1565,7 +1723,7 @@ impl LogDb {
                 let prefix = posting_name_prefix(namespace, segment, name);
                 let prefix_len = prefix.len();
                 let mut records = self
-                    .storage
+                    .reads()
                     .scan_prefix_iter(prefix, BytesRange::unbounded(), None)
                     .await?;
                 let mut values = Vec::new();
@@ -1617,7 +1775,7 @@ impl LogDb {
         stream_ids: Vec<StreamId>,
         keep: impl Fn(&StoredRun) -> bool + Send + Sync + 'static,
     ) -> Result<HashMap<StreamId, Vec<(u64, StoredRun)>>> {
-        let storage = Arc::clone(&self.storage);
+        let storage = self.reads();
         let prefix = segment_run_prefix(namespace, segment);
         tokio::spawn(async move {
             let (stream_ids, keep) = (&stream_ids, &keep);
@@ -1663,7 +1821,7 @@ impl LogDb {
     ) -> Result<Vec<(u64, StoredRun)>> {
         let mut runs = Vec::new();
         let mut records = self
-            .storage
+            .reads()
             .scan_prefix_iter(
                 stream_run_prefix(namespace, segment, stream_id),
                 BytesRange::unbounded(),
@@ -1688,7 +1846,7 @@ impl LogDb {
         range: BytesRange,
         decode_id: impl Fn(&[u8]) -> Result<StreamId>,
     ) -> Result<Vec<(StreamId, Arc<Labels>)>> {
-        let mut iterator = self.storage.scan_prefix_iter(prefix, range, None).await?;
+        let mut iterator = self.reads().scan_prefix_iter(prefix, range, None).await?;
         let mut labelled = Vec::new();
         while let Some(record) = iterator.next().await? {
             labelled.push((
@@ -1815,6 +1973,19 @@ impl ReadUnit {
         let encoded = bytes.saturating_mul(span) / blocks.max(1);
         encoded.saturating_mul(2) + if lines { line_bytes } else { 0 }
     }
+}
+
+/// Candidate rows by `(stream, object)` run, from [`LogDb::line_candidates`].
+type Candidates = HashMap<(StreamId, u64), HashSet<u32>>;
+
+/// A read unit of [`LogDb::read_segments_pipelined`], with its segment and
+/// the bound of the segment's next unit, `None` for its last.
+struct PipelinedUnit {
+    segment: SegmentId,
+    ordinal: u32,
+    next_bound: Option<i64>,
+    candidates: Arc<Option<Candidates>>,
+    unit: ReadUnit,
 }
 
 /// Unselected blocks a read unit may span between two selected runs: a
@@ -2187,7 +2358,9 @@ impl LogDb {
                 let read = Arc::clone(&shared_read);
                 async move {
                     budget.take()?;
-                    let decoding = budget.decode(unit.decode_bytes(false)).await?;
+                    let decoding = budget
+                        .decode(&self.memory, unit.decode_bytes(false))
+                        .await?;
                     let blocks = self
                         .load_blocks(
                             namespace,

@@ -12,7 +12,7 @@ import { FamilyTable, HistoryChart, OutcomeBar, PercentileChart, UsageBars, type
 import { fmtDate, fmtMs, fmtRatio, ratioTone } from "./format";
 import { RunPicker, StatusDot } from "./run-picker";
 
-function Stat({ label, value, sub, tone = "text-ink" }: { label: string; value: React.ReactNode; sub?: React.ReactNode; tone?: string }) {
+export function Stat({ label, value, sub, tone = "text-ink" }: { label: string; value: React.ReactNode; sub?: React.ReactNode; tone?: string }) {
   return (
     <div className="border-line px-4 py-3.5 [&:not(:first-child)]:border-l">
       <div className={`whitespace-nowrap font-serif text-[20px] font-light tabular-nums ${tone}`}>{value}</div>
@@ -22,7 +22,7 @@ function Stat({ label, value, sub, tone = "text-ink" }: { label: string; value: 
   );
 }
 
-function Legend({ series }: { series: Series[] }) {
+export function Legend({ series }: { series: Series[] }) {
   return (
     <div className="flex flex-wrap gap-4 font-mono text-[11.5px] text-fg">
       {series.map((s) => (

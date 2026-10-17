@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..compose import ComposeProject
-from .config import HISTORICAL_ENVIRONMENT, FuzzConfig
+from .config import FIRST_BYTE_MS, HISTORICAL_ENVIRONMENT, FuzzConfig
 from .cpus import CpuPinner
 
 
@@ -57,10 +57,13 @@ def _managed(
     roles: Mapping[str, str],
     after_start: Callable[[ComposeProject], None] | None,
 ) -> Iterator[ComposeProject]:
-    if config.historical:
+    if config.object_store:
         os.environ.update(HISTORICAL_ENVIRONMENT)
+        os.environ.setdefault(
+            "MINIO_FIRST_BYTE_MS", f"{FIRST_BYTE_MS[config.scenario]:g}"
+        )
         compose.services += ("minio-latency",)
-        compose.profiles += ("historical",)
+        compose.profiles += (config.scenario,)
     else:
         for name in HISTORICAL_ENVIRONMENT:
             os.environ.pop(name, None)

@@ -253,8 +253,15 @@ pub fn check_content_encoding(headers: &HeaderMap, allow_snappy: bool) -> Result
 /// Fails with 413 when a raw snappy block declares a decoded length above
 /// `limit`, which the decoder would otherwise allocate up front.
 pub fn check_snappy_size(body: &[u8], limit: usize) -> Result<(), ApiError> {
+    snappy_decoded_len(body, limit).map(drop)
+}
+
+/// The decoded length a raw snappy block declares, failing with 413 when it
+/// is above `limit`.
+pub fn snappy_decoded_len(body: &[u8], limit: usize) -> Result<usize, ApiError> {
     let length = snap::raw::decompress_len(body).map_err(ApiError::bad_request)?;
-    check_size(length, limit)
+    check_size(length, limit)?;
+    Ok(length)
 }
 
 /// Decodes a raw snappy block of at most `limit` decoded bytes.
