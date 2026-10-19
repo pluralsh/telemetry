@@ -330,10 +330,7 @@ mod tests {
 
     #[test]
     fn reads_the_sst_and_block_of_slatedb_cache_keys() {
-        for id in [
-            SsTableId::Compacted(ulid::Ulid::new()),
-            SsTableId::Wal(7),
-        ] {
+        for id in [SsTableId::Compacted(ulid::Ulid::new()), SsTableId::Wal(7)] {
             assert_eq!(sst_block(&CachedKey::from((id, 42))), Some((id, 42)));
         }
     }
