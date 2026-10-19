@@ -1762,6 +1762,7 @@ async fn unfiltered_reads_match_filtered_reads_with(meta_cache: bool) {
     // Postings and counters merged across two SSTs and the memtable.
     write_forty_streams(&db, &namespace).await;
     db.flush().await.unwrap();
+    db.flush_memtable().await.unwrap();
     let more = |offset: i64| {
         (0..6)
             .map(|index| {
@@ -1774,6 +1775,7 @@ async fn unfiltered_reads_match_filtered_reads_with(meta_cache: bool) {
     };
     db.write(&namespace, more(3_000)).await.unwrap();
     db.flush().await.unwrap();
+    db.flush_memtable().await.unwrap();
     db.write(&namespace, more(25_000)).await.unwrap();
 
     use common::storage::ReadHints;
