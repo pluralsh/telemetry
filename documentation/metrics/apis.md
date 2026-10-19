@@ -32,7 +32,10 @@ parameters, and the remaining gaps.
 
 `GET /-/healthy`, `GET /-/ready`, and `GET /metrics` are unprefixed and not
 namespace-scoped. Writers also expose an internal gRPC service on
-`listeners.grpc`; it is for shard forwarding, not client ingestion.
+`listeners.grpc`; it is for shard forwarding, not client ingestion. Both
+probes return `503` once a SlateDB handle closes with an error (a background
+task panic or fencing), since only a restart recovers it; the
+`storage_closed{db,reason}` gauge is `1` while that lasts.
 
 Reader mode serves reads only, writer mode serves writes and internal gRPC,
 and standalone mode serves both.

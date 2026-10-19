@@ -2,13 +2,13 @@
   "schema_version": 1,
   "products": {
     "logs": {
-      "runs": 6,
-      "latest": "2026-10-12T1650Z-1d5ac9dbd4-dirty-6266b5e9",
+      "runs": 7,
+      "latest": "2026-10-18T0206Z-b7041ee877-a5efa26d",
       "readme": "history/logs/README.md"
     },
     "metrics": {
-      "runs": 8,
-      "latest": "2026-10-12T2240Z-1d5ac9dbd4-dirty-9210767e",
+      "runs": 9,
+      "latest": "2026-10-18T0255Z-b7041ee877-dirty-a991ff0b",
       "readme": "history/metrics/README.md"
     },
     "pseudofs": {
@@ -17,8 +17,8 @@
       "readme": "history/pseudofs/README.md"
     },
     "traces": {
-      "runs": 4,
-      "latest": "2026-10-12T1721Z-1d5ac9dbd4-dirty-56bfeb88",
+      "runs": 5,
+      "latest": "2026-10-18T0318Z-b7041ee877-dirty-bc7f0783",
       "readme": "history/traces/README.md"
     }
   },
@@ -462,6 +462,210 @@
         "shared": {
           "cpu_cores_mean": 0.045,
           "memory_mib_p95": 288.1
+        }
+      }
+    },
+    {
+      "name": "2026-10-18T0206Z-b7041ee877-a5efa26d",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, scenario=cold, pinned",
+      "batch": "bench-20261018T0215Z-cold",
+      "started_at": "2026-10-18T02:06:27Z",
+      "finished_at": "2026-10-18T02:31:14Z",
+      "json": "history/logs/2026-10-18T0206Z-b7041ee877-a5efa26d.json",
+      "markdown": "history/logs/2026-10-18T0206Z-b7041ee877-a5efa26d.md",
+      "git": {
+        "commit": "b7041ee8779eaa03ec248f250443c65a975487ce",
+        "short": "b7041ee877",
+        "branch": "main",
+        "dirty": false
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 5400.0,
+        "seed": 2783945325,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 1,
+      "cases": 39,
+      "mismatch": 0,
+      "non_match": 6,
+      "outcomes": {
+        "match": 33,
+        "inconclusive": 6
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 130.599,
+          "p90": 664.376,
+          "p99": 771.025
+        },
+        "oracle_ms": {
+          "p50": 275.88,
+          "p90": 1602.346,
+          "p99": 1957.028
+        },
+        "ratio_p50": 0.461
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.059,
+          "memory_mib_p95": 964.8
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.07,
+          "memory_mib_p95": 318.7
+        },
+        "shared": {
+          "cpu_cores_mean": 0.072,
+          "memory_mib_p95": 475.4
+        }
+      },
+      "cold": {
+        "measured": 39,
+        "families": {
+          "label_values.pod.24h": {
+            "impl": {
+              "cold_ms_p50": 72.195,
+              "get_p50": 10
+            },
+            "oracle": {
+              "cold_ms_p50": 90.989,
+              "get_p50": 6
+            }
+          },
+          "labels.24h": {
+            "impl": {
+              "cold_ms_p50": 70.361,
+              "get_p50": 11
+            },
+            "oracle": {
+              "cold_ms_p50": 100.418,
+              "get_p50": 6
+            }
+          },
+          "log.errors.namespace.1h": {
+            "impl": {
+              "cold_ms_p50": 80.983,
+              "get_p50": 9
+            },
+            "oracle": {
+              "cold_ms_p50": 184.588,
+              "get_p50": 53
+            }
+          },
+          "log.errors.namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 167.835,
+              "get_p50": 34
+            },
+            "oracle": {
+              "cold_ms_p50": 389.569,
+              "get_p50": 213
+            }
+          },
+          "log.errors.namespace.6h": {
+            "impl": {
+              "cold_ms_p50": 127.1,
+              "get_p50": 20
+            },
+            "oracle": {
+              "cold_ms_p50": 252.828,
+              "get_p50": 120
+            }
+          },
+          "log.needle.1h": {
+            "impl": {
+              "cold_ms_p50": 120.019,
+              "get_p50": 11
+            },
+            "oracle": {
+              "cold_ms_p50": 375.898,
+              "get_p50": 271
+            }
+          },
+          "log.needle.24h": {
+            "impl": {
+              "cold_ms_p50": 629.095,
+              "get_p50": 77
+            },
+            "oracle": {
+              "cold_ms_p50": 1609.715,
+              "get_p50": 1044
+            }
+          },
+          "metric.count_by_level.24h": {
+            "impl": {
+              "cold_ms_p50": 738.536,
+              "get_p50": 79
+            },
+            "oracle": {
+              "cold_ms_p50": 1602.346,
+              "get_p50": 1105
+            }
+          },
+          "metric.count_by_level.6h": {
+            "impl": {
+              "cold_ms_p50": 381.652,
+              "get_p50": 40
+            },
+            "oracle": {
+              "cold_ms_p50": 1267.445,
+              "get_p50": 654
+            }
+          },
+          "metric.errors_by_namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 525.032,
+              "get_p50": 79
+            },
+            "oracle": {
+              "cold_ms_p50": 1159.661,
+              "get_p50": 1188
+            }
+          },
+          "metric.rate_by_app.1h": {
+            "impl": {
+              "cold_ms_p50": 95.22,
+              "get_p50": 7
+            },
+            "oracle": {
+              "cold_ms_p50": 222.851,
+              "get_p50": 51
+            }
+          },
+          "metric.rate_by_app.6h": {
+            "impl": {
+              "cold_ms_p50": 138.113,
+              "get_p50": 16
+            },
+            "oracle": {
+              "cold_ms_p50": 248.607,
+              "get_p50": 110
+            }
+          },
+          "series.namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 66.13,
+              "get_p50": 10
+            },
+            "oracle": {
+              "cold_ms_p50": 113.761,
+              "get_p50": 3
+            }
+          }
         }
       }
     },
@@ -1050,6 +1254,201 @@
       }
     },
     {
+      "name": "2026-10-18T0255Z-b7041ee877-dirty-a991ff0b",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=mimir-blocks, storage=s3, scenario=cold, pinned",
+      "batch": "bench-20261018T0215Z-cold",
+      "started_at": "2026-10-18T02:55:43Z",
+      "finished_at": "2026-10-18T03:17:35Z",
+      "json": "history/metrics/2026-10-18T0255Z-b7041ee877-dirty-a991ff0b.json",
+      "markdown": "history/metrics/2026-10-18T0255Z-b7041ee877-dirty-a991ff0b.md",
+      "git": {
+        "commit": "b7041ee8779eaa03ec248f250443c65a975487ce",
+        "short": "b7041ee877",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 6000.0,
+        "seed": 2844917515,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "mimir-blocks",
+        "storage": "s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 1,
+      "cases": 36,
+      "mismatch": 0,
+      "non_match": 1,
+      "outcomes": {
+        "match": 35,
+        "oracle_error": 1
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 115.852,
+          "p90": 212.123,
+          "p99": 256.513
+        },
+        "oracle_ms": {
+          "p50": 189.584,
+          "p90": 328.553,
+          "p99": 394.719
+        },
+        "ratio_p50": 0.625
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.011,
+          "memory_mib_p95": 197.7
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.019,
+          "memory_mib_p95": 129.8
+        },
+        "shared": {
+          "cpu_cores_mean": 0.064,
+          "memory_mib_p95": 363.2
+        }
+      },
+      "cold": {
+        "measured": 36,
+        "families": {
+          "agg.error_ratio_by_namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 212.123,
+              "get_p50": 36
+            },
+            "oracle": {
+              "cold_ms_p50": 315.08,
+              "get_p50": 82
+            }
+          },
+          "agg.rate_by_service.1h": {
+            "impl": {
+              "cold_ms_p50": 114.226,
+              "get_p50": 8
+            },
+            "oracle": {
+              "cold_ms_p50": 189.62,
+              "get_p50": 41
+            }
+          },
+          "agg.rate_by_service.24h": {
+            "impl": {
+              "cold_ms_p50": 249.385,
+              "get_p50": 33
+            },
+            "oracle": {
+              "cold_ms_p50": 280.876,
+              "get_p50": 81
+            }
+          },
+          "highcard.sessions_by_namespace.1h": {
+            "impl": {
+              "cold_ms_p50": 103.463,
+              "get_p50": 8
+            },
+            "oracle": {
+              "cold_ms_p50": 201.683,
+              "get_p50": 41
+            }
+          },
+          "highcard.sessions_by_namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 128.896,
+              "get_p50": 14
+            },
+            "oracle": {
+              "cold_ms_p50": 364.462,
+              "get_p50": 82
+            }
+          },
+          "histogram.p99_by_service.6h": {
+            "impl": {
+              "cold_ms_p50": 150.65,
+              "get_p50": 31
+            },
+            "oracle": {
+              "cold_ms_p50": 328.553,
+              "get_p50": 82
+            }
+          },
+          "instant.max_memory.24h": {
+            "impl": {
+              "cold_ms_p50": 148.537,
+              "get_p50": 26
+            },
+            "oracle": {
+              "cold_ms_p50": 189.584,
+              "get_p50": 68
+            }
+          },
+          "label_names.24h": {
+            "impl": {
+              "cold_ms_p50": 92.096,
+              "get_p50": 12
+            },
+            "oracle": {
+              "cold_ms_p50": 120.41,
+              "get_p50": 6
+            }
+          },
+          "label_values.instance.24h": {
+            "impl": {
+              "cold_ms_p50": 53.525,
+              "get_p50": 5
+            },
+            "oracle": {
+              "cold_ms_p50": 111.472,
+              "get_p50": 6
+            }
+          },
+          "label_values.session_id.24h": {
+            "impl": {
+              "cold_ms_p50": 67.962,
+              "get_p50": 6
+            },
+            "oracle": {
+              "cold_ms_p50": 111.152,
+              "get_p50": 6
+            }
+          },
+          "raw.memory.1h": {
+            "impl": {
+              "cold_ms_p50": 109.578,
+              "get_p50": 9
+            },
+            "oracle": {
+              "cold_ms_p50": 128.064,
+              "get_p50": 5
+            }
+          },
+          "series.namespace.24h": {
+            "impl": {
+              "cold_ms_p50": 115.852,
+              "get_p50": 22
+            },
+            "oracle": {
+              "cold_ms_p50": 122.173,
+              "get_p50": 6
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
       "product": "pseudofs",
       "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned",
@@ -1527,6 +1926,190 @@
         "shared": {
           "cpu_cores_mean": 0.184,
           "memory_mib_p95": 376.9
+        }
+      }
+    },
+    {
+      "name": "2026-10-18T0318Z-b7041ee877-dirty-bc7f0783",
+      "product": "traces",
+      "variant": "impl_config=production, oracle=tempo-s3, scenario=cold, pinned",
+      "batch": "bench-20261018T0215Z-cold",
+      "started_at": "2026-10-18T03:18:15Z",
+      "finished_at": "2026-10-18T03:53:11Z",
+      "json": "history/traces/2026-10-18T0318Z-b7041ee877-dirty-bc7f0783.json",
+      "markdown": "history/traces/2026-10-18T0318Z-b7041ee877-dirty-bc7f0783.md",
+      "git": {
+        "commit": "b7041ee8779eaa03ec248f250443c65a975487ce",
+        "short": "b7041ee877",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 6000.0,
+        "seed": 3162441603,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "tempo-s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 1,
+      "cases": 33,
+      "mismatch": 0,
+      "non_match": 15,
+      "outcomes": {
+        "match": 18,
+        "inconclusive": 15
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 306.308,
+          "p90": 1304.187,
+          "p99": 1460.482
+        },
+        "oracle_ms": {
+          "p50": 596.072,
+          "p90": 1046.753,
+          "p99": 1280.065
+        },
+        "ratio_p50": 0.598
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.023,
+          "memory_mib_p95": 371.1
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.017,
+          "memory_mib_p95": 185.8
+        },
+        "shared": {
+          "cpu_cores_mean": 0.063,
+          "memory_mib_p95": 440.3
+        }
+      },
+      "cold": {
+        "measured": 33,
+        "families": {
+          "search.broad.1h": {
+            "impl": {
+              "cold_ms_p50": 216.67,
+              "get_p50": 49
+            },
+            "oracle": {
+              "cold_ms_p50": 521.192,
+              "get_p50": 19
+            }
+          },
+          "search.broad.24h": {
+            "impl": {
+              "cold_ms_p50": 306.308,
+              "get_p50": 74
+            },
+            "oracle": {
+              "cold_ms_p50": 623.533,
+              "get_p50": 418
+            }
+          },
+          "search.broad.6h": {
+            "impl": {
+              "cold_ms_p50": 339.594,
+              "get_p50": 81
+            },
+            "oracle": {
+              "cold_ms_p50": 534.794,
+              "get_p50": 114
+            }
+          },
+          "search.duration.6h": {
+            "impl": {
+              "cold_ms_p50": 559.813,
+              "get_p50": 205
+            },
+            "oracle": {
+              "cold_ms_p50": 508.87,
+              "get_p50": 114
+            }
+          },
+          "search.selective.24h": {
+            "impl": {
+              "cold_ms_p50": 1388.814,
+              "get_p50": 308
+            },
+            "oracle": {
+              "cold_ms_p50": 670.62,
+              "get_p50": 462
+            }
+          },
+          "search.selective.6h": {
+            "impl": {
+              "cold_ms_p50": 878.063,
+              "get_p50": 275
+            },
+            "oracle": {
+              "cold_ms_p50": 630.558,
+              "get_p50": 126
+            }
+          },
+          "search.tag.24h": {
+            "impl": {
+              "cold_ms_p50": 550.39,
+              "get_p50": 207
+            },
+            "oracle": {
+              "cold_ms_p50": 563.311,
+              "get_p50": 425
+            }
+          },
+          "tags.names.24h": {
+            "impl": {
+              "cold_ms_p50": 118.139,
+              "get_p50": 10
+            },
+            "oracle": {
+              "cold_ms_p50": 810.113,
+              "get_p50": 396
+            }
+          },
+          "tags.values.service.24h": {
+            "impl": {
+              "cold_ms_p50": 73.321,
+              "get_p50": 12
+            },
+            "oracle": {
+              "cold_ms_p50": 139.286,
+              "get_p50": 66
+            }
+          },
+          "trace.by_id.mid": {
+            "impl": {
+              "cold_ms_p50": 143.818,
+              "get_p50": 10
+            },
+            "oracle": {
+              "cold_ms_p50": 352.369,
+              "get_p50": 175
+            }
+          },
+          "trace.by_id.old": {
+            "impl": {
+              "cold_ms_p50": 96.046,
+              "get_p50": 3
+            },
+            "oracle": {
+              "cold_ms_p50": 363.086,
+              "get_p50": 175
+            }
+          }
         }
       }
     }

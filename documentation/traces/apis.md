@@ -30,7 +30,10 @@ with `Accept` for protobuf. TraceQL metrics query range is routed but returns
 `501 Not Implemented`.
 
 `GET /-/healthy` and `GET /-/ready` are operational endpoints. The internal
-gRPC listener (default `9092`) is for shard forwarding.
+gRPC listener (default `9092`) is for shard forwarding. Both probes return
+`503` once a SlateDB handle closes with an error (a background task panic or
+fencing), since only a restart recovers it; the `storage_closed{db,reason}`
+gauge is `1` while that lasts.
 
 The current operator-generated Service exposes HTTP and internal gRPC only.
 Expose pod ports `4317` and `14250` separately before sending OTLP or Jaeger

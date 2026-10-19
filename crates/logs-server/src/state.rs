@@ -8,12 +8,14 @@ use std::{
     time::Duration,
 };
 
+use common::storage::health::StorageHealth;
 use plural_logs::{
     Durability as LogsDurability, LogBatch, Namespace, ShardedLogs, ShardingOptions,
 };
 use proto::logs::internal::v1::internal_writer_client::InternalWriterClient;
 use server_common::auth::JwtAuthenticator;
 use server_common::body_budget::{BodyBudget, GrpcBodyBudget};
+use server_common::health::ErrorThrottle;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::read_groups::ReadGroups;
@@ -54,6 +56,7 @@ pub struct AppState {
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     cache_warmed: Arc<AtomicBool>,
+    pub(crate) storage_health: StorageHealth,
     cancellation: CancellationToken,
     tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -165,6 +168,7 @@ impl AppState {
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
+            storage_health: StorageHealth::global().clone(),
             cancellation,
             tasks: Arc::new(tokio::sync::Mutex::new(ingest_tasks)),
         };
@@ -501,17 +505,28 @@ impl AppState {
         let state = self.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(seconds));
+            let mut failures = ErrorThrottle::flush();
             interval.tick().await;
             loop {
                 tokio::select! {
                     () = state.cancellation.cancelled() => break,
                     _ = interval.tick() => {
-                        if state.dirty.swap(false, Ordering::AcqRel)
-                            && let Err(error) = state.db.flush().await
-                        {
-                            state.ready.store(false, Ordering::Release);
-                            state.dirty.store(true, Ordering::Release);
-                            tracing::error!(%error, "Logs durable flush failed");
+                        if !state.dirty.swap(false, Ordering::AcqRel) {
+                            continue;
+                        }
+                        match state.db.flush().await {
+                            Ok(()) => failures.reset(),
+                            Err(error) => {
+                                state.ready.store(false, Ordering::Release);
+                                state.dirty.store(true, Ordering::Release);
+                                if let Some(suppressed) = failures.admit() {
+                                    tracing::error!(
+                                        %error,
+                                        suppressed,
+                                        "Logs durable flush failed"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

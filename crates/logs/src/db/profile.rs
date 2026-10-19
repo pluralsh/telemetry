@@ -661,6 +661,319 @@ async fn profile_fuzz_cases() {
     db.close().await.unwrap();
 }
 
+/// Replays a fuzz run as it ran: ingests `PROFILE_CASES/rounds.json` round
+/// by round into a writer configured as the production standalone server
+/// (1h segments, 512 MiB + 128 MiB SlateDB caches, page compaction) at a
+/// fresh `PROFILE_STORE`, and after each round runs that round's cases once
+/// per `PROFILE_ARMS` tuning, rotating the order case by case so the arms
+/// share data, caches and host noise. Arms are `;`-separated lists of
+/// `unfiltered=0|1`, `cached=0|1`, `lookahead=N`, `units=N`, `read=N` and
+/// `list=N`, empty for the default. Writes one JSON line per case and arm,
+/// and each round's SST layout, to `PROFILE_OUT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual profiling"]
+async fn profile_fuzz_progressive() {
+    use std::io::Write as _;
+
+    let input = std::path::PathBuf::from(std::env::var("PROFILE_CASES").unwrap());
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    assert!(!store.exists(), "PROFILE_STORE must not exist yet");
+    let arms: Vec<(String, ReadTuning)> = std::env::var("PROFILE_ARMS")
+        .unwrap_or_default()
+        .split(';')
+        .map(|spec| {
+            let mut tuning = ReadTuning::default();
+            for setting in spec.split(',').filter(|setting| !setting.is_empty()) {
+                let (name, value) = setting.split_once('=').unwrap();
+                let value: usize = value.parse().unwrap();
+                match name {
+                    "unfiltered" => tuning.unfiltered_reads = value != 0,
+                    "cached" => tuning.cached_filters = value != 0,
+                    "lookahead" => tuning.segment_lookahead = value,
+                    "units" => tuning.pipeline_units = value,
+                    "read" => tuning.read_concurrency = value,
+                    "list" => tuning.list_concurrency = value,
+                    other => panic!("unknown arm setting {other}"),
+                }
+            }
+            let name = if spec.is_empty() { "default" } else { spec };
+            (name.to_owned(), tuning)
+        })
+        .collect();
+    let namespace = Namespace::new("regression").unwrap();
+    let mut config = production_config(&store);
+    config.page = PageConfig {
+        target_size_bytes: 1 << 20,
+        max_rows: 8192,
+        rows_per_block: 256,
+    };
+    config.compaction = CompactionConfig::default();
+    config.write_buffer.flush_interval = Duration::from_secs(10);
+    config.stream_locality_labels = Config::default().stream_locality_labels;
+    config.stream_id_block_size = Config::default().stream_id_block_size;
+    if let Ok(ids) = std::env::var("PROFILE_STREAM_ID_BLOCK") {
+        config.stream_id_block_size = ids.parse().unwrap();
+    }
+    if let (Ok(shards), StorageConfig::SlateDb(storage)) =
+        (std::env::var("PROFILE_META_SHARDS"), &mut config.storage)
+        && let Some(BlockCacheConfig::FoyerMemory(meta)) = &mut storage.meta_cache
+    {
+        meta.shards = Some(shards.parse().unwrap());
+    }
+    let rounds: Vec<Vec<ReplayStream>> =
+        serde_json::from_slice(&std::fs::read(input.join("rounds.json")).unwrap()).unwrap();
+    let cases: Vec<FuzzCase> =
+        serde_json::from_slice(&std::fs::read(input.join("cases.json")).unwrap()).unwrap();
+    let round_of = |case: &FuzzCase| -> usize { case.id[1..5].parse().unwrap() };
+    let max_rounds: usize =
+        std::env::var("PROFILE_ROUNDS").map_or(usize::MAX, |value| value.parse().unwrap());
+    // Memtable flushes and compaction run on timers, so rounds are paced
+    // as the fuzz ran them (`PROFILE_ROUND_SECS`, 17) for its SST layout.
+    let pace = Duration::from_secs_f64(
+        std::env::var("PROFILE_ROUND_SECS").map_or(17.0, |value| value.parse().unwrap()),
+    );
+    // Every object-store read waits `PROFILE_LATENCY_MS` (2), as the fuzz
+    // stack's MinIO does, and is counted.
+    let StorageConfig::SlateDb(slate) = &config.storage else {
+        unreachable!("profiles run on SlateDB");
+    };
+    let gets = Arc::new(AtomicUsize::new(0));
+    let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(LatencyStore {
+        inner: common::storage::factory::create_object_store(&slate.object_store).unwrap(),
+        latency: Duration::from_secs_f64(
+            std::env::var("PROFILE_LATENCY_MS").map_or(2.0, |value| value.parse().unwrap())
+                / 1000.0,
+        ),
+        gets: Arc::clone(&gets),
+    });
+    let cache = SharedDbCache::from_config(&config.storage).await.unwrap();
+    let blocks = BlockCache::new(config.block_cache_capacity_bytes);
+    let memory = MemoryBudget::new(&config.memory);
+    let mut db = LogDb::open_over_store(config, &cache, &blocks, &memory, Some(store))
+        .await
+        .unwrap();
+    // Queries read through a tally of their storage calls by operation.
+    let counting = Arc::new(common::storage::counting::CountingStorage::new(
+        db.storage.clone(),
+        classify_key,
+    ));
+    db.storage = counting.clone();
+    // The server's continuous warm pass, run between cases every 10s
+    // unless `PROFILE_WARM=0`, with the first arm's tuning.
+    let warm = std::env::var("PROFILE_WARM").map_or(true, |value| value != "0");
+    let ledger = WarmLedger::new(true);
+    let cancel = CancellationToken::new();
+    let mut warmed_at = Instant::now();
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(std::env::var("PROFILE_OUT").unwrap()).unwrap(),
+    );
+    let started = Instant::now();
+    let mut turn = 0usize;
+    for (round, streams) in rounds.into_iter().enumerate().take(max_rounds) {
+        tokio::time::sleep_until((started + pace * u32::try_from(round).unwrap()).into()).await;
+        let batches = streams
+            .into_iter()
+            .map(|stream| {
+                let labels = Labels::new(
+                    stream
+                        .stream
+                        .into_iter()
+                        .map(|(name, value)| Label::new(name, value))
+                        .collect(),
+                )
+                .unwrap();
+                let mut entries = stream
+                    .values
+                    .into_iter()
+                    .map(|(ts, line)| LogEntry::new(ts.parse().unwrap(), line))
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|entry| entry.timestamp_ns);
+                LogBatch::new(labels, entries)
+            })
+            .collect();
+        db.write_with_durability(&namespace, batches, Durability::Written)
+            .await
+            .unwrap();
+        for case in cases.iter().filter(|case| round_of(case) == round) {
+            if warm && warmed_at.elapsed() >= Duration::from_secs(10) {
+                db.tuning = arms[0].1;
+                let mut plan = WarmPlan::default();
+                db.plan_warm(
+                    std::slice::from_ref(&namespace),
+                    common::storage::config::ContinuousCacheWarmerConfig::default().window(),
+                    &mut plan,
+                );
+                warm_planned(
+                    "logs",
+                    plan,
+                    WarmBudget::of(&cache, 75).unwrap_or(WarmBudget::UNBOUNDED),
+                    true,
+                    2,
+                    &cancel,
+                    &ledger,
+                )
+                .await;
+                warmed_at = Instant::now();
+            }
+            turn += 1;
+            for index in 0..arms.len() {
+                let (name, tuning) = &arms[(index + turn) % arms.len()];
+                db.tuning = *tuning;
+                let gets_before = gets.load(Ordering::Relaxed);
+                counting.take();
+                let case_started = Instant::now();
+                let outcome = run_case(&db, &namespace, case).await;
+                let elapsed = case_started.elapsed();
+                let mut ops = BTreeMap::<&str, (u64, u64)>::new();
+                for ((op, _), stats) in counting.take() {
+                    let entry = ops.entry(op).or_default();
+                    entry.0 += stats.calls;
+                    entry.1 += stats.records;
+                }
+                let row = serde_json::json!({
+                    "id": case.id,
+                    "round": round,
+                    "family": case.family,
+                    "arm": name,
+                    "ms": ms(elapsed),
+                    "ops": ops,
+                    "gets": gets.load(Ordering::Relaxed) - gets_before,
+                    "impl_ms": case.impl_ms,
+                    "results": outcome.as_ref().ok(),
+                    "error": outcome.as_ref().err().map(ToString::to_string),
+                });
+                writeln!(out, "{row}").unwrap();
+            }
+        }
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({ "round": round, "layout": slate_layout(&db) })
+        )
+        .unwrap();
+        if round % 10 == 9 {
+            out.flush().unwrap();
+            println!(
+                "round {} at {:.0}s, layout (l0 ssts, sorted runs, run ssts) per segment: {:?}",
+                round + 1,
+                started.elapsed().as_secs_f64(),
+                slate_layout(&db)
+            );
+        }
+    }
+    out.flush().unwrap();
+    db.close().await.unwrap();
+}
+
+/// An object store whose reads wait `latency` before starting, counted in
+/// `gets`.
+#[derive(Debug)]
+struct LatencyStore {
+    inner: Arc<dyn slatedb::object_store::ObjectStore>,
+    latency: Duration,
+    gets: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Display for LatencyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LatencyStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl slatedb::object_store::ObjectStore for LatencyStore {
+    async fn put_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        payload: slatedb::object_store::PutPayload,
+        opts: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        opts: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(self.latency).await;
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::path::Path>,
+    > {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        slatedb::object_store::Result<slatedb::object_store::ObjectMeta>,
+    > {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&slatedb::object_store::path::Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &slatedb::object_store::path::Path,
+        to: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// L0 SSTs, sorted runs and their SSTs of each SlateDB segment with any.
+fn slate_layout(db: &LogDb) -> Vec<(usize, usize, usize)> {
+    let Some(slate) = db.storage.slate_read() else {
+        return Vec::new();
+    };
+    slate
+        .manifest()
+        .segments()
+        .iter()
+        .filter(|segment| !segment.l0().is_empty() || !segment.compacted().is_empty())
+        .map(|segment| {
+            (
+                segment.l0().len(),
+                segment.compacted().len(),
+                segment
+                    .compacted()
+                    .iter()
+                    .map(|run| run.sst_views.len())
+                    .sum(),
+            )
+        })
+        .collect()
+}
+
 /// Runs one replay case (`PROFILE_CASE` id from `PROFILE_CASES/cases.json`)
 /// several times against the replay store and reports how results differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1179,6 +1492,7 @@ fn profile_tuning() -> ReadTuning {
         segment_lookahead: var("PROFILE_SEGMENT_LOOKAHEAD").unwrap_or(default.segment_lookahead),
         pipeline_units: var("PROFILE_PIPELINE_UNITS").unwrap_or(default.pipeline_units),
         unfiltered_reads: flag("PROFILE_UNFILTERED_READS").unwrap_or(default.unfiltered_reads),
+        cached_filters: flag("PROFILE_CACHED_FILTERS").unwrap_or(default.cached_filters),
     }
 }
 

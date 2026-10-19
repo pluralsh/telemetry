@@ -19,6 +19,9 @@
         "responses": {
           "200": {
             "description": "Process is healthy"
+          },
+          "503": {
+            "description": "A storage handle closed with an error; restart the process"
           }
         }
       }

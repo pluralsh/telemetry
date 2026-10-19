@@ -795,6 +795,13 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 			corev1.VolumeMount{Name: volumeInternalToken, MountPath: metrics.Descriptor.InternalTokenPath, SubPath: TokenKey, ReadOnly: true})
 	}
 	metricsContainer.VolumeMounts = mergeNamed(metricsContainer.VolumeMounts, func(item corev1.VolumeMount) string { return item.Name }, requiredMounts...)
+	// Servers listen only once storage is open, which includes WAL replay, so
+	// the startup probe holds liveness off for up to startupProbeFailures periods.
+	if metrics.Descriptor.GRPCOnly && metricsContainer.StartupProbe == nil {
+		metricsContainer.StartupProbe = grpcProbe(GRPCPort(metrics), 0, 10, 2, startupProbeFailures)
+	} else if metricsContainer.StartupProbe == nil {
+		metricsContainer.StartupProbe = httpProbe("/-/healthy", 0, 10, 2, startupProbeFailures)
+	}
 	if metrics.Descriptor.GRPCOnly && metricsContainer.LivenessProbe == nil {
 		metricsContainer.LivenessProbe = grpcProbe(GRPCPort(metrics), 10, 10, 2, 3)
 	} else if metricsContainer.LivenessProbe == nil {
@@ -1027,6 +1034,9 @@ func secureContainerContext(context *corev1.SecurityContext) *corev1.SecurityCon
 	}
 	return context
 }
+
+// startupProbeFailures allows 15 minutes for storage to open.
+const startupProbeFailures = 90
 
 func httpProbe(path string, initial, period, timeout, failures int32) *corev1.Probe {
 	return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstr.FromString(portHTTP)}}, InitialDelaySeconds: initial, PeriodSeconds: period, TimeoutSeconds: timeout, FailureThreshold: failures}

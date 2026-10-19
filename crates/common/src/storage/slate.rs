@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::storage::health::{self, StorageHealth};
+use crate::storage::metered_cache::CacheUsage;
 use crate::storage::sst_blocks;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
@@ -126,9 +128,60 @@ impl ManifestSource {
 pub struct SlateReadHandle {
     source: ManifestSource,
     sst_reader: Arc<SstReader>,
+    /// The database's metadata cache, when it tracks what it holds.
+    meta: Option<CacheUsage>,
+}
+
+/// Whether SlateDB would find cached the filter of every SST a read may
+/// consult, as of one manifest snapshot; see
+/// [`SlateReadHandle::filter_residency`].
+pub struct FilterResidency {
+    manifest: VersionedManifest,
+    meta: CacheUsage,
+}
+
+impl FilterResidency {
+    /// Whether every SST that may hold keys starting with `prefix` (a whole
+    /// key for a get) has no filter or a cached one, so a filtered read of
+    /// them fetches no filter from object storage. False for a prefix no
+    /// single segment holds.
+    pub fn cached(&self, prefix: &[u8]) -> bool {
+        let segments = self.manifest.segments();
+        let after = segments.partition_point(|segment| segment.prefix().as_ref() <= prefix);
+        let Some(segment) = after.checked_sub(1).map(|index| &segments[index]) else {
+            return false;
+        };
+        if !prefix.starts_with(segment.prefix()) {
+            return false;
+        }
+        let range = BytesRange::prefix(Bytes::copy_from_slice(prefix));
+        segment
+            .l0()
+            .iter()
+            .chain(
+                segment
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.tables_covering_range(range.clone())),
+            )
+            .all(|view| {
+                let info = &view.sst.info;
+                info.filter_len == 0 || self.meta.holds(view.sst.id, info.filter_offset)
+            })
+    }
 }
 
 impl SlateReadHandle {
+    /// A snapshot of the live manifest for asking which reads would find
+    /// their SSTs' filters cached; `None` when the metadata cache does not
+    /// track what it holds.
+    pub fn filter_residency(&self) -> Option<FilterResidency> {
+        Some(FilterResidency {
+            meta: self.meta.clone()?,
+            manifest: self.source.manifest(),
+        })
+    }
+
     /// Counts physical write operations in `range` by walking the live
     /// manifest's persisted SSTs. See [`sst_blocks::count_in_range`].
     pub async fn count_in_range(
@@ -369,6 +422,8 @@ pub struct SlateDbStorage {
     sst_reader: Option<Arc<SstReader>>,
     /// Set by every write, cleared by the periodic memtable flush.
     unflushed: Arc<AtomicBool>,
+    /// See [`Self::with_meta_cache`].
+    meta: Option<CacheUsage>,
 }
 
 /// How often a writer with new writes flushes its memtable to L0. A
@@ -445,6 +500,7 @@ impl SlateDbStorage {
 
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
+        StorageHealth::global().watch(health::unnamed("writer"), db.subscribe());
         let slate_rx = db.subscribe();
         let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
         let task = tokio::spawn({
@@ -470,6 +526,7 @@ impl SlateDbStorage {
             durable_bridge_abort: task.abort_handle(),
             sst_reader: None,
             unflushed: Arc::new(AtomicBool::new(false)),
+            meta: None,
         }
     }
 
@@ -484,6 +541,13 @@ impl SlateDbStorage {
     /// SST-walk count path. Built against the same path + object store as `db`.
     pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
         self.sst_reader = Some(Arc::new(sst_reader));
+        self
+    }
+
+    /// The metadata cache the database reads through, which
+    /// [`SlateReadHandle::filter_residency`] asks about cached filters.
+    pub fn with_meta_cache(mut self, meta: Option<CacheUsage>) -> Self {
+        self.meta = meta;
         self
     }
 
@@ -597,6 +661,7 @@ impl StorageRead for SlateDbStorage {
             // Live writer manifest: reflects everything flushed so far.
             source: ManifestSource::Db(Arc::clone(&self.db)),
             sst_reader: Arc::clone(sst_reader),
+            meta: self.meta.clone(),
         })
     }
 
@@ -870,14 +935,18 @@ pub struct SlateDbStorageReader {
     /// SST reader for the [`StorageRead::slate_read`] count path; see
     /// [`SlateDbStorage::sst_reader`].
     sst_reader: Option<Arc<SstReader>>,
+    /// See [`SlateDbStorage::with_meta_cache`].
+    meta: Option<CacheUsage>,
 }
 
 impl SlateDbStorageReader {
     /// Creates a new SlateDbStorageReader wrapping the given DbReader.
     pub fn new(reader: Arc<DbReader>) -> Self {
+        StorageHealth::global().watch(health::unnamed("reader"), reader.subscribe());
         Self {
             reader,
             sst_reader: None,
+            meta: None,
         }
     }
 
@@ -886,6 +955,12 @@ impl SlateDbStorageReader {
     /// `DbReader`.
     pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
         self.sst_reader = Some(Arc::new(sst_reader));
+        self
+    }
+
+    /// See [`SlateDbStorage::with_meta_cache`].
+    pub fn with_meta_cache(mut self, meta: Option<CacheUsage>) -> Self {
+        self.meta = meta;
         self
     }
 }
@@ -968,6 +1043,7 @@ impl StorageRead for SlateDbStorageReader {
             // read the same view, so count and scan stay consistent.
             source: ManifestSource::Reader(Arc::clone(&self.reader)),
             sst_reader: Arc::clone(sst_reader),
+            meta: self.meta.clone(),
         })
     }
 

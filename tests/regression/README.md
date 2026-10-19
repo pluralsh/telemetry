@@ -178,7 +178,7 @@ the seed, although wall-clock time still shifts the data windows.
 | `FUZZ_REQUEST_TIMEOUT` | `30s` | Per-request timeout; implementation timeouts fail the run |
 | `FUZZ_VISIBILITY_TIMEOUT` | `90s` | How long to wait for a round's data to become visible |
 | `FUZZ_LATENCY_RATIO`, `FUZZ_LATENCY_FLOOR_MS` | `10`, `250` | A case is a latency outlier when the implementation is more than this many times slower than the oracle and the gap exceeds this many ms |
-| `FUZZ_RECHECK` | `1` | Re-run mismatches once against both sides to detect flaky oracles |
+| `FUZZ_RECHECK` | `1` | Re-run mismatches once against both sides, then ask the oracle alone until two of its answers disagree (at most 5 oracle answers per mismatch) to detect flaky oracles |
 | `FUZZ_FAIL_ON` | `mismatch,impl_error,impl_timeout,unstable_impl,ingest` | Outcomes that fail the run |
 | `FUZZ_OUTPUT_DIR` | `target/fuzz/<product>-<run id>` | Report location |
 | `FUZZ_RECORD_DATA` | `1` | Store each round's generated dataset (gzip) |
@@ -210,7 +210,12 @@ line per query, with both latencies), `ingest.jsonl`, `rounds.jsonl`,
 `artifacts/` (full request and both responses for each non-matching case or
 latency outlier), and `data/` (generated datasets). Cases where both sides hit
 a result limit, or where either side fails a recheck against itself, are
-counted separately and do not count as mismatches.
+counted separately and do not count as mismatches. An oracle that disagrees
+with itself (`unstable_oracle`; Prometheus, for one, sums a binary operator's
+output in random order, so overflowing sums can come out NaN or -Inf) only
+excuses a case when every implementation answer equals one of the oracle's;
+otherwise the case stays a mismatch. The extra oracle answers are kept under
+`oracle_rechecks` in `cases.jsonl` and the case's artifact.
 
 ### Benchmark history
 

@@ -9,6 +9,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::storage::config::StorageConfig;
+use common::storage::health::{CloseReason, StorageHealth};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use http_body_util::BodyExt;
 use opentelemetry_proto::tonic::{
@@ -1373,6 +1374,31 @@ async fn health_and_readiness_are_available() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_and_readiness_fail_while_storage_is_closed() {
+    let mut state = state(vec![namespace("default")]).await;
+    state.storage_health = StorageHealth::new();
+    let closed = state
+        .storage_health
+        .record_closed("logs/shard-0", CloseReason::Panic);
+    for path in ["/-/healthy", "/-/ready"] {
+        let response = router(state.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
+    drop(closed);
+    for path in ["/-/healthy", "/-/ready"] {
+        let response = router(state.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
     state.shutdown().await.unwrap();
 }

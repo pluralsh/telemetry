@@ -72,6 +72,8 @@ enum StorageBuilderInner {
         /// Built alongside the writer so [`SlateDbStorage::slate_read`] can
         /// serve the count path from the same path/object store/cache.
         sst_reader: SstReader,
+        /// See [`SlateDbStorage::with_meta_cache`].
+        meta: Option<CacheUsage>,
     },
 }
 
@@ -102,10 +104,25 @@ impl StorageBuilder {
         cache: &SharedDbCache,
         base: Settings,
     ) -> StorageResult<Self> {
+        Self::with_cache_over_store(config, cache, base, None)
+    }
+
+    /// Like [`Self::with_cache_over`], but over `object_store`, when given,
+    /// instead of the one the config describes, as
+    /// [`StorageReaderRuntime::with_object_store`] does for readers.
+    pub fn with_cache_over_store(
+        config: &StorageConfig,
+        cache: &SharedDbCache,
+        base: Settings,
+        object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> StorageResult<Self> {
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
-                let object_store = create_object_store(&slate_config.object_store)?;
+                let object_store = match object_store {
+                    Some(object_store) => object_store,
+                    None => create_object_store(&slate_config.object_store)?,
+                };
                 let mut settings = load_settings_over(base, slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
@@ -117,6 +134,7 @@ impl StorageBuilder {
                             .with_options(options),
                     )
                 });
+                let meta = cache.meta_usage();
                 let cache = cache.cache();
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store.clone())
@@ -134,6 +152,7 @@ impl StorageBuilder {
                     compactor,
                     path: slate_config.path.clone(),
                     sst_reader,
+                    meta,
                 }
             }
         };
@@ -163,6 +182,7 @@ impl StorageBuilder {
             compactor,
             path,
             sst_reader,
+            meta,
         } = self.inner
         {
             self.inner = StorageBuilderInner::SlateDb {
@@ -170,6 +190,7 @@ impl StorageBuilder {
                 compactor,
                 path,
                 sst_reader,
+                meta,
             };
         }
         self
@@ -192,6 +213,7 @@ impl StorageBuilder {
                 compactor,
                 path,
                 sst_reader,
+                meta,
             } => {
                 let mut db_builder = *db_builder;
                 if let Some(mut compactor) = compactor.map(|compactor| *compactor) {
@@ -217,6 +239,7 @@ impl StorageBuilder {
                 Ok(Arc::new(
                     SlateDbStorage::new(Arc::new(db))
                         .with_sst_reader(sst_reader)
+                        .with_meta_cache(meta)
                         .with_memtable_flush(MEMTABLE_FLUSH_INTERVAL),
                 ))
             }
@@ -232,6 +255,9 @@ impl StorageBuilder {
 #[derive(Default, Clone)]
 pub struct StorageReaderRuntime {
     pub(crate) block_cache: Option<Arc<dyn DbCache>>,
+    /// The metadata side of `block_cache`, when it came from a
+    /// [`SharedDbCache`]; see [`SlateDbStorageReader::with_meta_cache`].
+    pub(crate) meta: Option<CacheUsage>,
     pub(crate) object_store: Option<Arc<dyn ObjectStore>>,
     pub(crate) checkpoint_id: Option<Uuid>,
 }
@@ -255,14 +281,16 @@ impl StorageReaderRuntime {
     /// This option only affects SlateDB storage; it is ignored for in-memory storage.
     pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
         self.block_cache = Some(cache);
+        self.meta = None;
         self
     }
 
     /// Uses `cache` when it holds a cache; otherwise the reader builds one
     /// from config, which yields none when `cache` came from the same config.
     pub fn with_shared_cache(mut self, cache: &SharedDbCache) -> Self {
-        if let Some(cache) = cache.cache() {
-            self.block_cache = Some(cache);
+        if let Some(block_cache) = cache.cache() {
+            self.block_cache = Some(block_cache);
+            self.meta = cache.meta_usage();
         }
         self
     }
@@ -526,10 +554,13 @@ pub async fn create_storage_read(
             // Prefer the runtime-provided cache (owned by the caller); fall
             // back to the config-driven split cache. The reader and its
             // count-path `SstReader` share this cache.
-            let cache = if let Some(cache) = runtime.block_cache {
-                Some(cache)
+            let (cache, meta) = if let Some(cache) = runtime.block_cache {
+                (Some(cache), runtime.meta)
             } else {
-                build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
+                let (cache, meta, _) =
+                    build_split_cache_parts(&slate_config.block_cache, &slate_config.meta_cache)
+                        .await?;
+                (cache, meta.and_then(|meta| meta.usage))
             };
 
             let mut builder = DbReader::builder(slate_config.path.clone(), object_store.clone())
@@ -557,7 +588,9 @@ pub async fn create_storage_read(
             })?;
             let sst_reader = SstReader::new(slate_config.path.clone(), object_store, cache, None);
             Ok(Arc::new(
-                SlateDbStorageReader::new(Arc::new(reader)).with_sst_reader(sst_reader),
+                SlateDbStorageReader::new(Arc::new(reader))
+                    .with_sst_reader(sst_reader)
+                    .with_meta_cache(meta),
             ))
         }
     }
@@ -616,6 +649,11 @@ impl SharedDbCache {
     /// The metadata cache, when one is configured.
     pub fn meta(&self) -> Option<&MetaCacheInfo> {
         self.meta.as_ref()
+    }
+
+    /// Usage of the metadata cache, when it is in memory only.
+    pub fn meta_usage(&self) -> Option<CacheUsage> {
+        self.meta.as_ref().and_then(|meta| meta.usage.clone())
     }
 
     /// Usage of the data-block cache, when it is in memory only.
@@ -1241,6 +1279,50 @@ mod tests {
         assert!(result.is_none());
         // And the single-cache builder returns None for an absent config.
         assert!(build_cache(&None, "data").await.unwrap().0.is_none());
+    }
+
+    /// A writer whose memtable flushed 2,000 keys into one L0 SST keeps that
+    /// SST's filter in its metadata cache; a reader with a cache of its own
+    /// does not have it.
+    #[tokio::test]
+    async fn metadata_cache_holds_the_filters_of_flushed_ssts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let StorageConfig::SlateDb(mut slate) = slatedb_config_with_local_dir(tmp.path()) else {
+            unreachable!()
+        };
+        slate.meta_cache = Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+            capacity: 64 << 20,
+            shards: Some(1),
+        }));
+        let config = StorageConfig::SlateDb(slate);
+        let cache = SharedDbCache::from_config(&config).await.unwrap();
+        let storage = StorageBuilder::with_cache(&config, &cache)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let records = (0..2_000u32)
+            .map(|i| Record::new(Bytes::from(format!("key-{i:06}")), Bytes::from("v")).into())
+            .collect();
+        storage.put(records).await.unwrap();
+        storage.flush_memtable().await.unwrap();
+        let manifest = storage.slate_read().unwrap().manifest();
+        let view = manifest.l0().front().expect("one L0 SST");
+        assert!(view.sst.info.filter_len > 0, "the SST has a filter");
+        let (id, offset) = (view.sst.id, view.sst.info.filter_offset);
+        assert!(cache.meta_usage().unwrap().holds(id, offset));
+        let cold = SharedDbCache::from_config(&config).await.unwrap();
+        let reader = create_storage_read(
+            &config,
+            StorageReaderRuntime::new().with_shared_cache(&cold),
+            StorageSemantics::new(),
+            slatedb::config::DbReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!cold.meta_usage().unwrap().holds(id, offset));
+        reader.close().await.unwrap();
+        storage.close().await.unwrap();
     }
 
     #[test]

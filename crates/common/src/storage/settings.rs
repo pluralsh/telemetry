@@ -138,4 +138,29 @@ mod tests {
         );
         assert!(settings.compactor_options.unwrap().enable_trivial_move);
     }
+
+    #[test]
+    fn a_settings_file_can_serialize_compactions_and_disable_trivial_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slatedb.yaml");
+        std::fs::write(
+            &path,
+            "compactor_options:\n  max_concurrent_compactions: 1\n  enable_trivial_move: false\n",
+        )
+        .unwrap();
+        let settings = load_settings_over(
+            base_settings(),
+            &config(Some(path.to_string_lossy().into_owned())),
+        )
+        .unwrap();
+        assert_eq!(
+            compacted_min_age(&settings),
+            Some(DEFAULT_COMPACTED_GC_MIN_AGE)
+        );
+        let compactor = settings.compactor_options.unwrap();
+        let defaults = base_settings().compactor_options.unwrap();
+        assert_eq!(compactor.max_concurrent_compactions, 1);
+        assert!(!compactor.enable_trivial_move);
+        assert_eq!(compactor.poll_interval, defaults.poll_interval);
+    }
 }

@@ -131,6 +131,9 @@ pub(crate) struct ReadTuning {
     pub(crate) pipeline_units: usize,
     /// Whether queries read through [`UnfilteredReads`].
     pub(crate) unfiltered_reads: bool,
+    /// Whether [`UnfilteredReads`] keeps reads filtered when every SST they
+    /// may consult has its filter cached.
+    pub(crate) cached_filters: bool,
 }
 
 impl Default for ReadTuning {
@@ -143,6 +146,7 @@ impl Default for ReadTuning {
             segment_lookahead: SEGMENT_LOOKAHEAD,
             pipeline_units: PIPELINE_UNITS,
             unfiltered_reads: true,
+            cached_filters: true,
         }
     }
 }
@@ -384,13 +388,26 @@ impl LogDb {
         blocks: &BlockCache,
         memory: &MemoryBudget,
     ) -> Result<Self> {
+        Self::open_over_store(config, cache, blocks, memory, None).await
+    }
+
+    /// [`Self::open_with_cache`] over `object_store`, when given, instead of
+    /// the configured one.
+    pub(crate) async fn open_over_store(
+        config: Config,
+        cache: &SharedDbCache,
+        blocks: &BlockCache,
+        memory: &MemoryBudget,
+        object_store: Option<Arc<dyn slatedb::object_store::ObjectStore>>,
+    ) -> Result<Self> {
         config.validate()?;
         let segment_ns = duration_ns(config.segment_duration)?;
         let merge_holds = MergeHolds::default();
-        let storage = StorageBuilder::with_cache_over(
+        let storage = StorageBuilder::with_cache_over_store(
             &config.storage,
             cache,
             crate::memory::slatedb_settings(),
+            object_store,
         )?
         .with_semantics(
             storage_semantics().with_segment_compaction(
@@ -563,7 +580,10 @@ impl LogDb {
     /// The storage queries read.
     fn reads(&self) -> Arc<dyn StorageRead> {
         if self.tuning.unfiltered_reads {
-            Arc::new(UnfilteredReads(Arc::clone(&self.storage)))
+            Arc::new(UnfilteredReads::new(
+                Arc::clone(&self.storage),
+                self.tuning.cached_filters,
+            ))
         } else {
             Arc::clone(&self.storage)
         }

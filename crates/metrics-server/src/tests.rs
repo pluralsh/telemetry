@@ -15,6 +15,7 @@ use axum::{
 };
 use base64::Engine;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use common::storage::health::{CloseReason, StorageHealth};
 use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use prost::Message as _;
@@ -91,6 +92,7 @@ fn state(mode: ServerMode) -> AppState {
         background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         flush_runs: Arc::new(AtomicU64::new(0)),
         cache_warmed: Arc::new(AtomicBool::new(true)),
+        storage_health: StorageHealth::new(),
     }
 }
 
@@ -284,6 +286,35 @@ async fn readiness_tracks_mode_resources_and_supported_routes() {
         .await
         .unwrap();
     assert_eq!(readiness.status(), StatusCode::OK);
+    standalone.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_and_readiness_fail_while_storage_is_closed() {
+    let mut standalone = live_standalone_state().await;
+    standalone.storage_health = StorageHealth::new();
+    let app = router(standalone.clone());
+    let status = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status("/-/healthy").await, StatusCode::OK);
+    assert_eq!(status("/-/ready").await, StatusCode::OK);
+
+    let closed = standalone
+        .storage_health
+        .record_closed("metrics-tests", CloseReason::Panic);
+    assert_eq!(status("/-/healthy").await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status("/-/ready").await, StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(closed);
+    assert_eq!(status("/-/healthy").await, StatusCode::OK);
+    assert_eq!(status("/-/ready").await, StatusCode::OK);
     standalone.shutdown().await.unwrap();
 }
 

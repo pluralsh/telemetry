@@ -1,0 +1,1182 @@
+{
+  "schema_version": 1,
+  "name": "2026-10-18T0255Z-b7041ee877-dirty-a991ff0b",
+  "product": "metrics",
+  "run_id": "20261018T025538Z-a991ff0b",
+  "batch": "bench-20261018T0215Z-cold",
+  "started_at": "2026-10-18T02:55:43Z",
+  "finished_at": "2026-10-18T03:17:35Z",
+  "git": {
+    "commit": "b7041ee8779eaa03ec248f250443c65a975487ce",
+    "short": "b7041ee877",
+    "branch": "main",
+    "dirty": true
+  },
+  "host": {
+    "label": null,
+    "os": "Darwin",
+    "os_release": "23.4.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 12,
+    "memory_gib": 18.0,
+    "python": "3.13.7",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 6000.0,
+    "seed": 2844917515,
+    "scale": 1.0,
+    "window_s": 1800.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 120.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "cold",
+    "isolated": true,
+    "cold": {
+      "span_s": 79200.0,
+      "repeats": 3,
+      "settle_s": 5.0,
+      "warm": true,
+      "first_byte_ms": 20.0,
+      "family_filter": [],
+      "rollups": true,
+      "compaction": true,
+      "impl_starts": [
+        "off",
+        "warm"
+      ]
+    }
+  },
+  "settings": {
+    "impl_config": "production",
+    "oracle": "mimir-blocks",
+    "storage": "s3"
+  },
+  "environment": {
+    "FUZZ_METRICS_CONFIG": "production",
+    "FUZZ_SCENARIO": "cold",
+    "MINIO_FIRST_BYTE_MS": "20",
+    "REGRESSION_BUILD": "0"
+  },
+  "images": {
+    "metrics-s3": {
+      "image": "telemetry-regression/plural-metrics-server:local",
+      "id": "b33706b65957"
+    },
+    "mimir": {
+      "image": "grafana/mimir:3.2.1",
+      "id": "240a14c8b33a"
+    },
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    },
+    "minio-latency": {
+      "image": "python:3.13-slim",
+      "id": "3874bc630edc"
+    }
+  },
+  "layout": {
+    "network": "host-ports",
+    "cpus": {
+      "docker_cpus": 12,
+      "pinned": true,
+      "cpusets": {
+        "shared": "0",
+        "impl": "1-5",
+        "oracle": "6-10"
+      }
+    }
+  },
+  "variant": "impl_config=production, oracle=mimir-blocks, storage=s3, scenario=cold, pinned",
+  "results": {
+    "status": "passed",
+    "reasons": [],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 1311.8,
+    "rounds": 1,
+    "invisible_rounds": 0,
+    "cases": 36,
+    "non_match": 1,
+    "outcomes": {
+      "match": 35,
+      "oracle_error": 1
+    },
+    "ingest": {
+      "batches": 151,
+      "outcomes": {
+        "ok": 151
+      },
+      "oracle_ms": {
+        "p50": 6.777,
+        "p90": 10.754,
+        "p99": 19.227,
+        "max": 24.578
+      },
+      "impl_ms": {
+        "p50": 2.913,
+        "p90": 4.193,
+        "p99": 8.794,
+        "max": 9.575
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": 189.584,
+        "p90": 328.553,
+        "p99": 394.719,
+        "p99.9": 394.719,
+        "max": 394.719
+      },
+      "impl_ms": {
+        "p50": 115.852,
+        "p90": 212.123,
+        "p99": 256.513,
+        "p99.9": 256.513,
+        "max": 256.513
+      },
+      "ratio": {
+        "p50": 0.625,
+        "p90": 0.956,
+        "p99": 30.849
+      },
+      "outliers": 0
+    },
+    "families": {
+      "agg.error_ratio_by_namespace.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 315.08,
+          "p90": 326.022,
+          "p99": 326.022
+        },
+        "impl_ms": {
+          "p50": 212.123,
+          "p90": 216.591,
+          "p99": 216.591
+        },
+        "ratio": {
+          "p50": 0.673,
+          "p90": 0.684
+        }
+      },
+      "agg.rate_by_service.1h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 189.62,
+          "p90": 199.359,
+          "p99": 199.359
+        },
+        "impl_ms": {
+          "p50": 114.226,
+          "p90": 115.931,
+          "p99": 115.931
+        },
+        "ratio": {
+          "p50": 0.611,
+          "p90": 0.625
+        }
+      },
+      "agg.rate_by_service.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 280.876,
+          "p90": 312.253,
+          "p99": 312.253
+        },
+        "impl_ms": {
+          "p50": 249.385,
+          "p90": 256.513,
+          "p99": 256.513
+        },
+        "ratio": {
+          "p50": 0.821,
+          "p90": 0.888
+        }
+      },
+      "highcard.sessions_by_namespace.1h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 201.683,
+          "p90": 204.443,
+          "p99": 204.443
+        },
+        "impl_ms": {
+          "p50": 103.463,
+          "p90": 117.256,
+          "p99": 117.256
+        },
+        "ratio": {
+          "p50": 0.513,
+          "p90": 0.574
+        }
+      },
+      "highcard.sessions_by_namespace.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 364.462,
+          "p90": 394.719,
+          "p99": 394.719
+        },
+        "impl_ms": {
+          "p50": 128.896,
+          "p90": 142.644,
+          "p99": 142.644
+        },
+        "ratio": {
+          "p50": 0.361,
+          "p90": 0.522
+        }
+      },
+      "histogram.p99_by_service.6h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 328.553,
+          "p90": 330.556,
+          "p99": 330.556
+        },
+        "impl_ms": {
+          "p50": 150.65,
+          "p90": 155.569,
+          "p99": 155.569
+        },
+        "ratio": {
+          "p50": 0.46,
+          "p90": 0.473
+        }
+      },
+      "instant.max_memory.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 189.584,
+          "p90": 233.724,
+          "p99": 233.724
+        },
+        "impl_ms": {
+          "p50": 148.537,
+          "p90": 184.438,
+          "p99": 184.438
+        },
+        "ratio": {
+          "p50": 0.768,
+          "p90": 0.973
+        }
+      },
+      "label_names.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 120.41,
+          "p90": 130.752,
+          "p99": 130.752
+        },
+        "impl_ms": {
+          "p50": 92.096,
+          "p90": 92.508,
+          "p99": 92.508
+        },
+        "ratio": {
+          "p50": 0.768,
+          "p90": 0.775
+        }
+      },
+      "label_values.instance.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 111.472,
+          "p90": 118.736,
+          "p99": 118.736
+        },
+        "impl_ms": {
+          "p50": 53.525,
+          "p90": 60.632,
+          "p99": 60.632
+        },
+        "ratio": {
+          "p50": 0.472,
+          "p90": 0.544
+        }
+      },
+      "label_values.session_id.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 111.152,
+          "p90": 112.624,
+          "p99": 112.624
+        },
+        "impl_ms": {
+          "p50": 67.962,
+          "p90": 68.755,
+          "p99": 68.755
+        },
+        "ratio": {
+          "p50": 0.603,
+          "p90": 0.619
+        }
+      },
+      "raw.memory.1h": {
+        "cases": 3,
+        "non_match": 1,
+        "outcomes": {
+          "match": 2,
+          "oracle_error": 1
+        },
+        "oracle_ms": {
+          "p50": 128.064,
+          "p90": 155.637,
+          "p99": 155.637
+        },
+        "impl_ms": {
+          "p50": 109.578,
+          "p90": 113.651,
+          "p99": 113.651
+        },
+        "ratio": {
+          "p50": 0.847,
+          "p90": 30.849
+        }
+      },
+      "series.namespace.24h": {
+        "cases": 3,
+        "non_match": 0,
+        "outcomes": {
+          "match": 3
+        },
+        "oracle_ms": {
+          "p50": 122.173,
+          "p90": 142.124,
+          "p99": 142.124
+        },
+        "impl_ms": {
+          "p50": 115.852,
+          "p90": 116.752,
+          "p99": 116.752
+        },
+        "ratio": {
+          "p50": 0.956,
+          "p90": 1.091
+        }
+      }
+    },
+    "floor": {},
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 1311.8,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "metrics-s3"
+          ],
+          "cpu_seconds": 13.8,
+          "cpu_cores": {
+            "mean": 0.011,
+            "p95": 0.036,
+            "max": 0.302
+          },
+          "memory_mib": {
+            "mean": 87.4,
+            "p95": 197.7,
+            "max": 286.6
+          }
+        },
+        "oracle": {
+          "services": [
+            "mimir"
+          ],
+          "cpu_seconds": 24.9,
+          "cpu_cores": {
+            "mean": 0.019,
+            "p95": 0.069,
+            "max": 0.395
+          },
+          "memory_mib": {
+            "mean": 78.4,
+            "p95": 129.8,
+            "max": 214.8
+          }
+        },
+        "shared": {
+          "services": [
+            "minio",
+            "minio-latency"
+          ],
+          "cpu_seconds": 84.0,
+          "cpu_cores": {
+            "mean": 0.064,
+            "p95": 0.155,
+            "max": 0.387
+          },
+          "memory_mib": {
+            "mean": 322.6,
+            "p95": 363.2,
+            "max": 373.9
+          }
+        }
+      },
+      "services": {
+        "metrics-s3": {
+          "cpu_seconds": 13.8,
+          "peak_memory_mib": 286.6
+        },
+        "mimir": {
+          "cpu_seconds": 24.9,
+          "peak_memory_mib": 214.8
+        },
+        "minio": {
+          "cpu_seconds": 34.4,
+          "peak_memory_mib": 345.1
+        },
+        "minio-latency": {
+          "cpu_seconds": 49.6,
+          "peak_memory_mib": 46.9
+        }
+      }
+    },
+    "cold": {
+      "span_s": 79200.0,
+      "repeats": 3,
+      "settle_s": 5.0,
+      "first_byte_ms": 20.0,
+      "dataset": {
+        "series": 2840,
+        "samples": 2686822,
+        "series.fuzz_cold_http_requests_total": 432,
+        "series.fuzz_cold_memory_bytes": 72,
+        "series.fuzz_cold_request_duration_seconds_bucket": 288,
+        "series.fuzz_cold_request_duration_seconds_count": 24,
+        "series.fuzz_cold_request_duration_seconds_sum": 24,
+        "series.fuzz_cold_session_active": 2000
+      },
+      "planned": 36,
+      "measured": 36,
+      "answered": 36,
+      "timings_s": {
+        "load_s": 3.6,
+        "settle_s": 124.9,
+        "prime_s": 5.4,
+        "battery_s": 1177.8
+      },
+      "families": {
+        "agg.error_ratio_by_namespace.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 212.123,
+              "p90": 216.591,
+              "p99": 216.591
+            },
+            "warm_ms": {
+              "p50": 2.345
+            },
+            "get": {
+              "p50": 36,
+              "max": 36
+            },
+            "get_bytes": {
+              "p50": 2689308,
+              "max": 2689637
+            },
+            "requests": {
+              "p50": 36,
+              "max": 36
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 315.08,
+              "p90": 326.022,
+              "p99": 326.022
+            },
+            "warm_ms": {
+              "p50": 162.947
+            },
+            "get": {
+              "p50": 82,
+              "max": 84
+            },
+            "get_bytes": {
+              "p50": 62475521,
+              "max": 62521141
+            },
+            "requests": {
+              "p50": 82,
+              "max": 85
+            }
+          }
+        },
+        "agg.rate_by_service.1h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 114.226,
+              "p90": 115.931,
+              "p99": 115.931
+            },
+            "warm_ms": {
+              "p50": 2.604
+            },
+            "get": {
+              "p50": 8,
+              "max": 8
+            },
+            "get_bytes": {
+              "p50": 856266,
+              "max": 856266
+            },
+            "requests": {
+              "p50": 8,
+              "max": 8
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 189.62,
+              "p90": 199.359,
+              "p99": 199.359
+            },
+            "warm_ms": {
+              "p50": 70.894
+            },
+            "get": {
+              "p50": 41,
+              "max": 41
+            },
+            "get_bytes": {
+              "p50": 4840210,
+              "max": 4840215
+            },
+            "requests": {
+              "p50": 41,
+              "max": 41
+            }
+          }
+        },
+        "agg.rate_by_service.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 249.385,
+              "p90": 256.513,
+              "p99": 256.513
+            },
+            "warm_ms": {
+              "p50": 3.08
+            },
+            "get": {
+              "p50": 33,
+              "max": 33
+            },
+            "get_bytes": {
+              "p50": 2744722,
+              "max": 2752343
+            },
+            "requests": {
+              "p50": 33,
+              "max": 33
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 280.876,
+              "p90": 312.253,
+              "p99": 312.253
+            },
+            "warm_ms": {
+              "p50": 139.788
+            },
+            "get": {
+              "p50": 81,
+              "max": 84
+            },
+            "get_bytes": {
+              "p50": 62475511,
+              "max": 62507109
+            },
+            "requests": {
+              "p50": 81,
+              "max": 84
+            }
+          }
+        },
+        "highcard.sessions_by_namespace.1h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 103.463,
+              "p90": 117.256,
+              "p99": 117.256
+            },
+            "warm_ms": {
+              "p50": 2.067
+            },
+            "get": {
+              "p50": 8,
+              "max": 8
+            },
+            "get_bytes": {
+              "p50": 398199,
+              "max": 398587
+            },
+            "requests": {
+              "p50": 8,
+              "max": 8
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 201.683,
+              "p90": 204.443,
+              "p99": 204.443
+            },
+            "warm_ms": {
+              "p50": 69.138
+            },
+            "get": {
+              "p50": 41,
+              "max": 43
+            },
+            "get_bytes": {
+              "p50": 697599,
+              "max": 698182
+            },
+            "requests": {
+              "p50": 41,
+              "max": 43
+            }
+          }
+        },
+        "highcard.sessions_by_namespace.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 128.896,
+              "p90": 142.644,
+              "p99": 142.644
+            },
+            "warm_ms": {
+              "p50": 2.732
+            },
+            "get": {
+              "p50": 14,
+              "max": 16
+            },
+            "get_bytes": {
+              "p50": 1187593,
+              "max": 1189069
+            },
+            "requests": {
+              "p50": 14,
+              "max": 16
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 364.462,
+              "p90": 394.719,
+              "p99": 394.719
+            },
+            "warm_ms": {
+              "p50": 144.517
+            },
+            "get": {
+              "p50": 82,
+              "max": 86
+            },
+            "get_bytes": {
+              "p50": 7806604,
+              "max": 7812256
+            },
+            "requests": {
+              "p50": 82,
+              "max": 88
+            }
+          }
+        },
+        "histogram.p99_by_service.6h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 150.65,
+              "p90": 155.569,
+              "p99": 155.569
+            },
+            "warm_ms": {
+              "p50": 2.367
+            },
+            "get": {
+              "p50": 31,
+              "max": 31
+            },
+            "get_bytes": {
+              "p50": 2159589,
+              "max": 2221987
+            },
+            "requests": {
+              "p50": 31,
+              "max": 31
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 328.553,
+              "p90": 330.556,
+              "p99": 330.556
+            },
+            "warm_ms": {
+              "p50": 134.777
+            },
+            "get": {
+              "p50": 82,
+              "max": 87
+            },
+            "get_bytes": {
+              "p50": 45111062,
+              "max": 45122037
+            },
+            "requests": {
+              "p50": 82,
+              "max": 89
+            }
+          }
+        },
+        "instant.max_memory.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 148.537,
+              "p90": 184.438,
+              "p99": 184.438
+            },
+            "warm_ms": {
+              "p50": 6.132
+            },
+            "get": {
+              "p50": 26,
+              "max": 28
+            },
+            "get_bytes": {
+              "p50": 2193768,
+              "max": 2195782
+            },
+            "requests": {
+              "p50": 26,
+              "max": 28
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 189.584,
+              "p90": 233.724,
+              "p99": 233.724
+            },
+            "warm_ms": {
+              "p50": 78.876
+            },
+            "get": {
+              "p50": 68,
+              "max": 69
+            },
+            "get_bytes": {
+              "p50": 9042053,
+              "max": 9042071
+            },
+            "requests": {
+              "p50": 68,
+              "max": 69
+            }
+          }
+        },
+        "label_names.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 92.096,
+              "p90": 92.508,
+              "p99": 92.508
+            },
+            "warm_ms": {
+              "p50": 3.267
+            },
+            "get": {
+              "p50": 12,
+              "max": 12
+            },
+            "get_bytes": {
+              "p50": 1775160,
+              "max": 1775160
+            },
+            "requests": {
+              "p50": 12,
+              "max": 12
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 120.41,
+              "p90": 130.752,
+              "p99": 130.752
+            },
+            "warm_ms": {
+              "p50": 3.659
+            },
+            "get": {
+              "p50": 6,
+              "max": 9
+            },
+            "get_bytes": {
+              "p50": 392191,
+              "max": 396000
+            },
+            "requests": {
+              "p50": 6,
+              "max": 10
+            }
+          }
+        },
+        "label_values.instance.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 53.525,
+              "p90": 60.632,
+              "p99": 60.632
+            },
+            "warm_ms": {
+              "p50": 2.533
+            },
+            "get": {
+              "p50": 5,
+              "max": 7
+            },
+            "get_bytes": {
+              "p50": 330756,
+              "max": 332232
+            },
+            "requests": {
+              "p50": 5,
+              "max": 7
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 111.472,
+              "p90": 118.736,
+              "p99": 118.736
+            },
+            "warm_ms": {
+              "p50": 3.656
+            },
+            "get": {
+              "p50": 6,
+              "max": 6
+            },
+            "get_bytes": {
+              "p50": 44190,
+              "max": 44191
+            },
+            "requests": {
+              "p50": 6,
+              "max": 6
+            }
+          }
+        },
+        "label_values.session_id.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 67.962,
+              "p90": 68.755,
+              "p99": 68.755
+            },
+            "warm_ms": {
+              "p50": 6.199
+            },
+            "get": {
+              "p50": 6,
+              "max": 8
+            },
+            "get_bytes": {
+              "p50": 462240,
+              "max": 463728
+            },
+            "requests": {
+              "p50": 6,
+              "max": 8
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 111.152,
+              "p90": 112.624,
+              "p99": 112.624
+            },
+            "warm_ms": {
+              "p50": 3.269
+            },
+            "get": {
+              "p50": 6,
+              "max": 6
+            },
+            "get_bytes": {
+              "p50": 66248,
+              "max": 66248
+            },
+            "requests": {
+              "p50": 6,
+              "max": 6
+            }
+          }
+        },
+        "raw.memory.1h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 109.578,
+              "p90": 113.651,
+              "p99": 113.651
+            },
+            "warm_ms": {
+              "p50": 3.015
+            },
+            "get": {
+              "p50": 9,
+              "max": 11
+            },
+            "get_bytes": {
+              "p50": 595179,
+              "max": 596655
+            },
+            "requests": {
+              "p50": 9,
+              "max": 11
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 128.064,
+              "p90": 155.637,
+              "p99": 155.637
+            },
+            "warm_ms": {
+              "p50": 28.242
+            },
+            "get": {
+              "p50": 5,
+              "max": 5
+            },
+            "get_bytes": {
+              "p50": 74768,
+              "max": 74769
+            },
+            "requests": {
+              "p50": 5,
+              "max": 5
+            }
+          }
+        },
+        "series.namespace.24h": {
+          "cases": 3,
+          "impl": {
+            "cold_ms": {
+              "p50": 115.852,
+              "p90": 116.752,
+              "p99": 116.752
+            },
+            "warm_ms": {
+              "p50": 3.075
+            },
+            "get": {
+              "p50": 22,
+              "max": 24
+            },
+            "get_bytes": {
+              "p50": 1388260,
+              "max": 1586642
+            },
+            "requests": {
+              "p50": 22,
+              "max": 24
+            }
+          },
+          "oracle": {
+            "cold_ms": {
+              "p50": 122.173,
+              "p90": 142.124,
+              "p99": 142.124
+            },
+            "warm_ms": {
+              "p50": 6.213
+            },
+            "get": {
+              "p50": 6,
+              "max": 7
+            },
+            "get_bytes": {
+              "p50": 223857,
+              "max": 224665
+            },
+            "requests": {
+              "p50": 6,
+              "max": 7
+            }
+          }
+        }
+      },
+      "totals": {
+        "impl": {
+          "cold_ms": {
+            "p50": 115.852,
+            "p90": 212.123,
+            "p99": 256.513
+          },
+          "warm_ms": {
+            "p50": 2.843
+          },
+          "get": {
+            "p50": 12,
+            "max": 36
+          },
+          "get_bytes": {
+            "p50": 1189069,
+            "max": 2752343
+          },
+          "requests": {
+            "p50": 12,
+            "max": 36
+          },
+          "get_total": 629,
+          "get_bytes_total": 50283371
+        },
+        "oracle": {
+          "cold_ms": {
+            "p50": 189.584,
+            "p90": 328.553,
+            "p99": 394.719
+          },
+          "warm_ms": {
+            "p50": 69.138
+          },
+          "get": {
+            "p50": 41,
+            "max": 87
+          },
+          "get_bytes": {
+            "p50": 698182,
+            "max": 62521141
+          },
+          "requests": {
+            "p50": 41,
+            "max": 89
+          },
+          "get_total": 1525,
+          "get_bytes_total": 579506840
+        }
+      },
+      "startup": {
+        "impl": {
+          "restarts": 36,
+          "ready_s": {
+            "p50": 1.3,
+            "max": 1.62
+          },
+          "settle_s": {
+            "p50": 7.231,
+            "max": 7.848
+          },
+          "get": {
+            "p50": 95,
+            "max": 99
+          },
+          "get_bytes": {
+            "p50": 277504,
+            "max": 295973
+          }
+        },
+        "oracle": {
+          "restarts": 36,
+          "ready_s": {
+            "p50": 2.053,
+            "max": 31.798
+          },
+          "settle_s": {
+            "p50": 7.243,
+            "max": 7.919
+          },
+          "get": {
+            "p50": 42,
+            "max": 87
+          },
+          "get_bytes": {
+            "p50": 113932,
+            "max": 156034
+          }
+        }
+      }
+    }
+  }
+}

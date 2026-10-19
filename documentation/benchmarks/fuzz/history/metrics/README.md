@@ -6,6 +6,7 @@
 
 | started | commit | variant | status | budget | cases | mismatch | non-match | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 | CPU cores impl / oracle | memory p95 MiB impl / oracle | entry |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-18 02:55Z | `b7041ee877` (dirty) | impl_config=production, oracle=mimir-blocks, storage=s3, scenario=cold, pinned | passed | 100m | 36 | 0 | 1 | 115.9 / 189.6 | 256.5 / 394.7 | 0.62x | 0.01 / 0.02 | 198 / 130 | [2026-10-18T0255Z-b7041ee877-dirty-a991ff0b](2026-10-18T0255Z-b7041ee877-dirty-a991ff0b.md) |
 | 2026-10-12 22:40Z | `1d5ac9dbd4` (dirty) | impl_config=production, oracle=prometheus, storage=s3, pinned | **FAILED** (1) | 30m | 17095 | 1 | 324 | 2.6 / 1.9 | 73.8 / 107.5 | 1.26x | 0.10 / 0.10 | 745 / 274 | [2026-10-12T2240Z-1d5ac9dbd4-dirty-9210767e](2026-10-12T2240Z-1d5ac9dbd4-dirty-9210767e.md) |
 | 2026-10-12 22:10Z | `1d5ac9dbd4` (dirty) | impl_config=production, oracle=prometheus, storage=s3, pinned | **FAILED** (1) | 30m | 16797 | 1 | 317 | 2.7 / 1.9 | 81.6 / 109.8 | 1.29x | 0.11 / 0.11 | 766 / 279 | [2026-10-12T2210Z-1d5ac9dbd4-dirty-9210767e](2026-10-12T2210Z-1d5ac9dbd4-dirty-9210767e.md) |
 | 2026-10-12 16:50Z | `1d5ac9dbd4` (dirty) | impl_config=production, oracle=mimir-blocks, storage=s3, scenario=historical, pinned | **FAILED** (1) | 30m | 3003 | 3 | 40 | 2.1 / 23.7 | 35.7 / 221.2 | 0.10x | 0.01 / 0.37 | 200 / 960 | [2026-10-12T1650Z-1d5ac9dbd4-dirty-9bf951c5](2026-10-12T1650Z-1d5ac9dbd4-dirty-9bf951c5.md) |

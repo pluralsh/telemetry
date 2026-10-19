@@ -7,13 +7,15 @@
 //! own and adds [`ENTRY_OVERHEAD_BYTES`] to its weight, so its capacity bounds
 //! the memory its entries keep alive.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use foyer::{Cache, CacheBuilder, Event, EventListener};
 use slatedb::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache};
+use slatedb::manifest::SsTableId;
 
 use super::metrics_recorder::MixtricsBridge;
 
@@ -43,9 +45,23 @@ pub async fn attributing<F: Future>(bytes: Arc<AtomicU64>, future: F) -> F::Outp
 pub struct CacheUsage {
     cache: Cache<CachedKey, CachedEntry>,
     evictions: Arc<AtomicU64>,
+    /// Present on a metadata cache; see [`Self::holds`].
+    resident: Option<Arc<Residency>>,
 }
 
 impl CacheUsage {
+    /// Whether the cache holds the block at `offset` of SST `id` for any
+    /// database sharing it, such as an SST's filter at its `filter_offset`.
+    /// Always false for a data cache, which does not track its entries.
+    pub fn holds(&self, id: SsTableId, offset: u64) -> bool {
+        self.resident.as_ref().is_some_and(|resident| {
+            resident
+                .keys(id, offset)
+                .iter()
+                .any(|key| self.cache.contains(key))
+        })
+    }
+
     pub fn usage_bytes(&self) -> u64 {
         self.cache.usage() as u64
     }
@@ -70,19 +86,95 @@ impl std::fmt::Debug for CacheUsage {
     }
 }
 
+/// The keys of the entries a cache was given, by SST and block offset.
+///
+/// SlateDB scopes every key to the database that made it and keeps the
+/// scope private, so a key cannot be built from an SST id alone; this keeps
+/// the keys the cache saw, and [`CacheUsage::holds`] asks the cache about
+/// them. Keys leave when their entries are evicted or removed, so it holds
+/// about as many keys as the cache does entries.
+#[derive(Default)]
+struct Residency(Mutex<HashMap<(SsTableId, u64), Vec<CachedKey>>>);
+
+impl Residency {
+    fn record(&self, key: &CachedKey) {
+        let Some(block) = sst_block(key) else {
+            return;
+        };
+        let mut keys = self.0.lock().expect("residency lock");
+        let keys = keys.entry(block).or_default();
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+
+    fn forget(&self, key: &CachedKey) {
+        let Some(block) = sst_block(key) else {
+            return;
+        };
+        let mut keys = self.0.lock().expect("residency lock");
+        if let Some(scoped) = keys.get_mut(&block) {
+            scoped.retain(|scoped| scoped != key);
+            if scoped.is_empty() {
+                keys.remove(&block);
+            }
+        }
+    }
+
+    /// Copied out so the cache is never asked while this is locked: foyer
+    /// may call [`EvictionCounter::on_leave`] under a lock of its own.
+    fn keys(&self, id: SsTableId, offset: u64) -> Vec<CachedKey> {
+        self.0
+            .lock()
+            .expect("residency lock")
+            .get(&(id, offset))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The SST and block offset of `key`, read from SlateDB's serialized key
+/// format, which disk caches persist and so keeps stable.
+fn sst_block(key: &CachedKey) -> Option<(SsTableId, u64)> {
+    #[derive(serde::Deserialize)]
+    enum Id {
+        Wal(u64),
+        Compacted(String),
+    }
+    #[derive(serde::Deserialize)]
+    enum Key {
+        V1(Id, u64),
+        V2(serde::de::IgnoredAny, Id, u64),
+    }
+    let (Key::V1(id, block) | Key::V2(_, id, block)) =
+        serde_json::from_value(serde_json::to_value(key).ok()?).ok()?;
+    let id = match id {
+        Id::Wal(id) => SsTableId::Wal(id),
+        Id::Compacted(id) => SsTableId::Compacted(ulid::Ulid::from_string(&id).ok()?),
+    };
+    Some((id, block))
+}
+
 struct EvictionCounter {
     evictions: Arc<AtomicU64>,
     counter: metrics::Counter,
+    resident: Option<Arc<Residency>>,
 }
 
 impl EventListener for EvictionCounter {
     type Key = CachedKey;
     type Value = CachedEntry;
 
-    fn on_leave(&self, reason: Event, _key: &CachedKey, _value: &CachedEntry) {
+    fn on_leave(&self, reason: Event, key: &CachedKey, _value: &CachedEntry) {
         if reason == Event::Evict {
             self.evictions.fetch_add(1, Ordering::Relaxed);
             self.counter.increment(1);
+        }
+        // A replaced entry's key stays in the cache.
+        if reason != Event::Replace
+            && let Some(resident) = &self.resident
+        {
+            resident.forget(key);
         }
     }
 }
@@ -95,9 +187,12 @@ pub struct MeteredCache {
 
 impl MeteredCache {
     /// A cache of `capacity` bytes named `slatedb_{label}_cache` in foyer's
-    /// metrics. Only a `meta` cache attributes its fetches.
+    /// metrics. Only a `meta` cache attributes its fetches and tracks which
+    /// SST blocks it holds ([`CacheUsage::holds`]).
     pub fn new(label: &str, capacity: u64, shards: usize) -> Self {
         let evictions = Arc::new(AtomicU64::new(0));
+        let meta = label == "meta";
+        let resident = meta.then(|| Arc::new(Residency::default()));
         let name = format!("slatedb_{label}_cache");
         let cache = CacheBuilder::new(usize::try_from(capacity).unwrap_or(usize::MAX))
             .with_name(name.clone())
@@ -106,14 +201,19 @@ impl MeteredCache {
             .with_event_listener(Arc::new(EvictionCounter {
                 evictions: Arc::clone(&evictions),
                 counter: metrics::counter!("telemetry_slatedb_cache_evictions_total", "cache" => name.clone()),
+                resident: resident.clone(),
             }))
             .with_metrics_registry(Box::new(MixtricsBridge))
             .build();
         metrics::gauge!("telemetry_slatedb_cache_capacity_bytes", "cache" => name)
             .set(capacity as f64);
         Self {
-            usage: CacheUsage { cache, evictions },
-            attributes: label == "meta",
+            usage: CacheUsage {
+                cache,
+                evictions,
+                resident,
+            },
+            attributes: meta,
         }
     }
 
@@ -134,11 +234,19 @@ impl MeteredCache {
             .attributes
             .then(|| ATTRIBUTION.try_with(Arc::clone).ok())
             .flatten();
+        let resident = self.usage.resident.clone();
+        let loaded = key.clone();
         let entry = self
             .usage
             .cache
             .get_or_fetch(&key, move || async move {
-                loader().await.map(|entry| entry.clamp_allocated_size())
+                let entry = loader().await.map(|entry| entry.clamp_allocated_size());
+                if entry.is_ok()
+                    && let Some(resident) = resident
+                {
+                    resident.record(&loaded);
+                }
+                entry
             })
             .await
             .map(|entry| entry.value().clone())
@@ -169,6 +277,9 @@ impl DbCache for MeteredCache {
     }
 
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        if let Some(resident) = &self.usage.resident {
+            resident.record(&key);
+        }
         self.usage.cache.insert(key, value);
     }
 
@@ -210,5 +321,20 @@ impl DbCache for MeteredCache {
         loader: CacheLoader,
     ) -> Result<CachedEntry, slatedb::Error> {
         self.fetch(key, loader).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_sst_and_block_of_slatedb_cache_keys() {
+        for id in [
+            SsTableId::Compacted(ulid::Ulid::new()),
+            SsTableId::Wal(7),
+        ] {
+            assert_eq!(sst_block(&CachedKey::from((id, 42))), Some((id, 42)));
+        }
     }
 }

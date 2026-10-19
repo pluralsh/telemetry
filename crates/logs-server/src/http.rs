@@ -92,16 +92,17 @@ pub fn router(state: AppState) -> Router {
     .route_layer(state.ingest.http_layer());
     let public = limits(public).merge(writes);
     let app = Router::new()
-        .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route(
+            "/-/healthy",
+            get(|State(state): State<AppState>| async move {
+                server_common::health::liveness(&state.storage_health)
+            }),
+        )
         .route("/metrics", get(server_common::runtime::scrape_metrics))
         .route(
             "/-/ready",
             get(|State(state): State<AppState>| async move {
-                if state.is_ready().await {
-                    StatusCode::OK
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
+                server_common::health::readiness(&state.storage_health, state.is_ready().await)
             }),
         );
     let app = if state.config.path_prefix.is_empty() {

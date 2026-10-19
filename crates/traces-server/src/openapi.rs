@@ -62,7 +62,10 @@ struct ZipkinAnnotation {
     get,
     path = "/-/healthy",
     tag = "operations",
-    responses((status = 200, description = "Process is healthy"))
+    responses(
+        (status = 200, description = "Process is healthy"),
+        (status = 503, description = "A storage handle closed with an error; restart the process")
+    )
 )]
 fn healthy() {}
 

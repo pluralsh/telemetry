@@ -4,6 +4,7 @@ import json
 import random
 import re
 import threading
+from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ from harness.fuzz.logs import PUSH_BYTES, LogsFuzz, _grouped_positional
 from harness.fuzz.metrics import MetricsFuzz, mqe_duplicate_series_quirk
 from harness.fuzz.rand import derive, quote, regex_escape
 from harness.fuzz.runner import (
+    ORACLE_ANSWERS,
     Batch,
     Case,
     FuzzProduct,
@@ -31,6 +33,7 @@ from harness.fuzz.runner import (
     Round,
     Runner,
     classify,
+    settle_mismatch,
 )
 from harness.fuzz.traces import TracesFuzz, format_duration
 from harness.fuzz.transport import Exchange, Request
@@ -171,6 +174,77 @@ def test_normalizer_assertions_count_as_mismatches() -> None:
     assert classify(_case(compare), _ok(1), _ok(1)) == (
         "mismatch",
         "AssertionError: labels differ",
+    )
+
+
+def _oracle_script(*answers: Exchange):
+    """An `ask_oracle` that replays `answers`, counting the requests made."""
+    pending = list(answers)
+    asked: list[Exchange] = []
+
+    def ask() -> Exchange | None:
+        if not pending:
+            return None
+        asked.append(pending.pop(0))
+        return asked[-1]
+
+    return ask, asked
+
+
+def test_stable_oracle_mismatch_stays_a_mismatch() -> None:
+    ask, asked = _oracle_script(*(_ok("nan") for _ in range(10)))
+    outcome, extra, rechecks = settle_mismatch(
+        _case(_equal), (_ok("-inf"), _ok("-inf")), (_ok("nan"), _ok("nan")), ask
+    )
+    assert (outcome, extra) == ("mismatch", None)
+    # Two answers came with the recheck pair; the oracle is asked at most
+    # ORACLE_ANSWERS times in all.
+    assert len(rechecks) == len(asked) == ORACLE_ANSWERS - 2
+
+
+def test_unstable_oracle_with_a_matching_impl_is_unstable_oracle() -> None:
+    ask, asked = _oracle_script(_ok("nan"), _ok("-inf"), _ok("nan"))
+    outcome, extra, rechecks = settle_mismatch(
+        _case(_equal), (_ok("-inf"), _ok("-inf")), (_ok("nan"), _ok("nan")), ask
+    )
+    assert outcome == "unstable_oracle"
+    assert extra and "equals one of them" in extra
+    # Stops as soon as two oracle answers disagree.
+    assert len(rechecks) == len(asked) == 2
+
+
+def test_unstable_oracle_with_an_impl_matching_none_is_a_mismatch() -> None:
+    ask, _ = _oracle_script(_ok("-inf"))
+    outcome, extra, _ = settle_mismatch(
+        _case(_equal), (_ok("+inf"), _ok("+inf")), (_ok("nan"), _ok("nan")), ask
+    )
+    assert outcome == "mismatch"
+    assert extra and "equals none of them" in extra
+    # Every implementation answer must equal some oracle answer.
+    ask, _ = _oracle_script()
+    assert (
+        settle_mismatch(
+            _case(_equal), (_ok("-inf"), _ok("+inf")), (_ok("nan"), _ok("-inf")), ask
+        )[0]
+        == "mismatch"
+    )
+
+
+def test_failed_oracle_answers_do_not_make_the_oracle_unstable() -> None:
+    failed = Exchange(503, b"busy", 1.0)
+    ask, asked = _oracle_script(failed, _ok("nan"), _ok("nan"))
+    outcome, _, _ = settle_mismatch(
+        _case(_equal), (_ok("-inf"), _ok("-inf")), (_ok("nan"), failed), ask
+    )
+    assert outcome == "mismatch"
+    assert len(asked) == ORACLE_ANSWERS - 2
+
+
+def test_stable_oracle_with_an_unstable_impl_is_unstable_impl() -> None:
+    ask, _ = _oracle_script(*(_ok(1) for _ in range(3)))
+    assert (
+        settle_mismatch(_case(_equal), (_ok(2), _ok(3)), (_ok(1), _ok(1)), ask)[0]
+        == "unstable_impl"
     )
 
 
@@ -326,18 +400,27 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply({"ready": True})
             return
         number = int(parse_qs(url.query)["n"][0])
-        divergent = self.server.divergent and number % 5 == 0  # type: ignore[attr-defined]
+        server = self.server
+        divergent = server.divergent and number % 5 == 0  # type: ignore[attr-defined]
+        if server.flaky and number % 5 == 0:  # type: ignore[attr-defined]
+            # Flips only on the third request, past the recheck pair.
+            server.asked[number] += 1  # type: ignore[attr-defined]
+            divergent = server.asked[number] == 3  # type: ignore[attr-defined]
         self._reply({"n": -number if divergent else number})
+
+
+def _serve(divergent: bool = False, flaky: bool = False) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server.divergent = divergent  # type: ignore[attr-defined]
+    server.flaky = flaky  # type: ignore[attr-defined]
+    server.asked = defaultdict(int)  # type: ignore[attr-defined]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 @pytest.fixture
 def servers() -> Iterator[tuple[str, str]]:
-    started = []
-    for divergent in (False, True):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        server.divergent = divergent  # type: ignore[attr-defined]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        started.append(server)
+    started = [_serve(), _serve(divergent=True)]
     yield tuple(f"http://127.0.0.1:{server.server_port}" for server in started)
     for server in started:
         server.shutdown()
@@ -389,11 +472,47 @@ def test_runner_records_outcomes_and_artifacts(servers, config) -> None:
         json.loads(line) for line in (root / "cases.jsonl").read_text().splitlines()
     ]
     assert len(cases) == 25
-    assert all("recheck" in case for case in cases if case["outcome"] == "mismatch")
+    mismatches = [case for case in cases if case["outcome"] == "mismatch"]
+    assert all("recheck" in case for case in mismatches)
+    # A stable oracle is asked ORACLE_ANSWERS times in all, never more.
+    assert all(
+        len(case["oracle_rechecks"]) == ORACLE_ANSWERS - 2 for case in mismatches
+    )
     assert len(list((root / "artifacts").iterdir())) == 5
     assert len(list((root / "data").iterdir())) == 3
     assert json.loads((root / "summary.json").read_text())["cases"] == 25
     assert "fake.echo" in (root / "summary.md").read_text()
+
+
+def test_runner_calls_an_unstable_oracle_unstable(config) -> None:
+    started = [_serve(flaky=True), _serve(divergent=True)]
+    oracle, impl = (f"http://127.0.0.1:{server.server_port}" for server in started)
+    settings = config(
+        "fake",
+        FUZZ_DURATION="20s",
+        FUZZ_MAX_CASES="25",
+        FUZZ_QUERIES_PER_ROUND="10",
+        FUZZ_SETTLE="0",
+    )
+    try:
+        summary = Runner(_FakeProduct(settings, oracle, impl), settings).run()
+    finally:
+        for server in started:
+            server.shutdown()
+    assert summary.outcomes == {"match": 20, "unstable_oracle": 5}
+    assert not summary.failed
+    root = settings.output_dir
+    unstable = [
+        json.loads(line)
+        for line in (root / "cases.jsonl").read_text().splitlines()
+        if json.loads(line)["outcome"] == "unstable_oracle"
+    ]
+    assert all(len(case["oracle_rechecks"]) == 1 for case in unstable)
+    artifact = json.loads(
+        (root / "artifacts" / f"{unstable[0]['id']}.json").read_text()
+    )
+    number = int(unstable[0]["query"])
+    assert [answer["body"]["n"] for answer in artifact["oracle_rechecks"]] == [-number]
 
 
 class _FakeDocker:

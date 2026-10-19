@@ -420,6 +420,91 @@ func TestStatefulSetsUseCanonicalImageSettings(t *testing.T) {
 	}
 }
 
+func TestWriterAndReaderPodsProbeStorageHealth(t *testing.T) {
+	products := map[string]func() StatefulSetInput{
+		"Metrics": func() StatefulSetInput {
+			return StatefulSetInput{Metrics: &telemetryv1alpha1.Metrics{
+				ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},
+				Spec:       telemetryv1alpha1.MetricsSpec{Mode: telemetryv1alpha1.MetricsModeSharded},
+			}}
+		},
+		"Logs": func() StatefulSetInput {
+			return StatefulSetInput{Logs: &telemetryv1alpha1.Logs{
+				ObjectMeta: metav1.ObjectMeta{Name: testLogsName, Namespace: testNamespace},
+				Spec:       telemetryv1alpha1.LogsSpec{Mode: telemetryv1alpha1.LogsModeSharded},
+			}}
+		},
+		"Traces": func() StatefulSetInput {
+			return StatefulSetInput{Traces: &telemetryv1alpha1.Traces{
+				ObjectMeta: metav1.ObjectMeta{Name: "traces", Namespace: testNamespace},
+				Spec:       telemetryv1alpha1.TracesSpec{Mode: telemetryv1alpha1.TracesModeSharded},
+			}}
+		},
+	}
+	assertProbe := func(t *testing.T, kind string, probe *corev1.Probe, path string, period, failures int32) {
+		t.Helper()
+		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Path != path || probe.HTTPGet.Port.StrVal != portHTTP ||
+			probe.PeriodSeconds != period || probe.FailureThreshold != failures {
+			t.Fatalf("%s probe = %#v, want GET %s every %ds failing after %d", kind, probe, path, period, failures)
+		}
+	}
+	for name, input := range products {
+		for _, component := range []Component{ComponentWriter, ComponentReader} {
+			t.Run(name+"/"+string(component), func(t *testing.T) {
+				input := input()
+				input.Component = component
+				input.ConfigSecretName = volumeConfig
+				input.InternalTokenSecretName = testTokenSecretName
+				input.InternalTokenSecretKey = TokenKey
+				statefulSet, err := StatefulSet(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				container := statefulSet.Spec.Template.Spec.Containers[0]
+				assertProbe(t, "startup", container.StartupProbe, "/-/healthy", 10, startupProbeFailures)
+				assertProbe(t, "liveness", container.LivenessProbe, "/-/healthy", 10, 3)
+				assertProbe(t, "readiness", container.ReadinessProbe, "/-/ready", 5, 6)
+			})
+		}
+	}
+
+	t.Run("user probes win", func(t *testing.T) {
+		custom := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}}
+		logs := &telemetryv1alpha1.Logs{
+			ObjectMeta: metav1.ObjectMeta{Name: testLogsName, Namespace: testNamespace},
+			Spec: telemetryv1alpha1.LogsSpec{
+				Writer: telemetryv1alpha1.WorkloadSpec{PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: LogsDescriptor.Name, StartupProbe: custom}},
+				}}},
+			},
+		}
+		statefulSet, err := StatefulSet(StatefulSetInput{
+			Logs: logs, Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+			InternalTokenSecretName: testTokenSecretName, InternalTokenSecretKey: TokenKey,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if probe := statefulSet.Spec.Template.Spec.Containers[0].StartupProbe; probe == nil || probe.Exec == nil {
+			t.Fatalf("startup probe = %#v, want the pod template's", probe)
+		}
+	})
+
+	t.Run("gRPC-only products probe gRPC", func(t *testing.T) {
+		statefulSet, err := StatefulSet(StatefulSetInput{
+			PseudoFS:  &telemetryv1alpha1.PseudoFS{ObjectMeta: metav1.ObjectMeta{Name: "files", Namespace: testNamespace}},
+			Component: ComponentStandalone, ConfigSecretName: volumeConfig,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if probe := statefulSet.Spec.Template.Spec.Containers[0].StartupProbe; probe == nil || probe.GRPC == nil ||
+			probe.FailureThreshold != startupProbeFailures {
+			t.Fatalf("PseudoFS startup probe = %#v, want gRPC", probe)
+		}
+	})
+}
+
 func TestStatefulSetUsesDeprecatedImageTagAlias(t *testing.T) {
 	metrics := &telemetryv1alpha1.Metrics{
 		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},

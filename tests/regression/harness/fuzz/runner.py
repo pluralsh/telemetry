@@ -6,7 +6,7 @@ import json
 import random
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -181,6 +181,71 @@ def _stable(case: Case, first: Exchange, second: Exchange) -> bool:
     if not first.ok(case.ok_statuses):
         return True
     return classify(case, first, second)[0] in ("match", "inconclusive")
+
+
+def _agrees(case: Case, oracle: Exchange, impl: Exchange) -> bool:
+    return classify(case, oracle, impl)[0] in ("match", "inconclusive")
+
+
+# Most oracle answers a mismatch collects before it counts the oracle stable.
+# Only mismatches pay for them, so they leave latency measurements alone.
+ORACLE_ANSWERS = 5
+
+
+def settle_mismatch(
+    case: Case,
+    impl_answers: Sequence[Exchange],
+    oracle_answers: Sequence[Exchange],
+    ask_oracle: Callable[[], Exchange | None],
+    limit: int = ORACLE_ANSWERS,
+) -> tuple[str, str | None, list[Exchange]]:
+    """Re-asks the oracle after a mismatch until two of its successful answers
+    disagree or it has been asked `limit` times in all, and returns the
+    outcome, an extra detail and the answers asked for here. A query whose
+    result depends on an order the oracle leaves unspecified (Prometheus sums
+    a binary operator's output in Go map order, so 1e308 + 1e308 + -Inf is NaN
+    or -Inf from run to run) is `unstable_oracle` only while every
+    implementation answer equals one of the oracle's; one equal to none of
+    them stays a mismatch.
+    `ask_oracle` returns None once no further request may be sent. A failed
+    oracle answer is no answer: it neither shows instability nor excuses one."""
+    answers = [answer for answer in oracle_answers if answer.ok(case.ok_statuses)]
+    asked: list[Exchange] = []
+
+    def disagree() -> bool:
+        return any(
+            not _stable(case, earlier, later)
+            for index, later in enumerate(answers)
+            for earlier in answers[:index]
+        )
+
+    while len(oracle_answers) + len(asked) < limit and not disagree():
+        answer = ask_oracle()
+        if answer is None:
+            break
+        asked.append(answer)
+        if answer.ok(case.ok_statuses):
+            answers.append(answer)
+    if disagree():
+        if all(
+            any(_agrees(case, oracle, impl) for oracle in answers)
+            for impl in impl_answers
+        ):
+            return (
+                "unstable_oracle",
+                f"the oracle gave {len(answers)} answers that disagree; the "
+                "implementation's equals one of them",
+                asked,
+            )
+        return (
+            "mismatch",
+            f"the oracle gave {len(answers)} answers that disagree, and the "
+            "implementation's equals none of them",
+            asked,
+        )
+    if any(not _stable(case, impl_answers[0], impl) for impl in impl_answers[1:]):
+        return "unstable_impl", None, asked
+    return "mismatch", None, asked
 
 
 FLOOR_SAMPLES = 5
@@ -371,19 +436,29 @@ class Runner:
             oracle = read(self.product.oracle_read, case.request)
         return oracle, impl
 
+    def _ask_oracle(self, case: Case) -> Callable[[], Exchange | None]:
+        def ask() -> Exchange | None:
+            if self._out_of_time():
+                return None
+            return self.transport.send(self.product.oracle_read, case.request)
+
+        return ask
+
     def _execute(self, case_id: str, index: int, rng: random.Random) -> None:
         case = self.product.next_case(rng)
         oracle, impl = self._pair(case)
         outcome, detail = classify(case, oracle, impl)
         recheck = None
+        oracle_rechecks: list[Exchange] = []
         recheck_allowed = self.config.recheck and case.idempotent
         if outcome == "mismatch" and recheck_allowed:
             oracle_again, impl_again = self._pair(case)
             recheck = (oracle_again, impl_again)
-            if not _stable(case, oracle, oracle_again):
-                outcome = "unstable_oracle"
-            elif not _stable(case, impl, impl_again):
-                outcome = "unstable_impl"
+            outcome, extra, oracle_rechecks = settle_mismatch(
+                case, (impl, impl_again), (oracle, oracle_again), self._ask_oracle(case)
+            )
+            if extra:
+                detail = f"{detail}; {extra}"
         elif recheck_allowed and self.product.reference_latency and _slow(oracle, impl):
             # Tells transient stalls apart from consistently slow queries.
             recheck = self._pair(case)
@@ -399,6 +474,7 @@ class Runner:
                 oracle=oracle,
                 impl=impl,
                 recheck=recheck,
+                oracle_rechecks=tuple(oracle_rechecks),
             )
         )
         if time.monotonic() - self._last_progress >= 60:

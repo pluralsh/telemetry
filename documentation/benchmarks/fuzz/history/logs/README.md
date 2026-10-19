@@ -6,6 +6,7 @@
 
 | started | commit | variant | status | budget | cases | mismatch | non-match | p50 ms impl / oracle | p99 ms impl / oracle | ratio p50 | CPU cores impl / oracle | memory p95 MiB impl / oracle | entry |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-10-18 02:06Z | `b7041ee877` | impl_config=production, storage=s3, scenario=cold, pinned | passed | 90m | 39 | 0 | 6 | 130.6 / 275.9 | 771.0 / 1957.0 | 0.46x | 0.06 / 0.07 | 965 / 319 | [2026-10-18T0206Z-b7041ee877-a5efa26d](2026-10-18T0206Z-b7041ee877-a5efa26d.md) |
 | 2026-10-12 16:50Z | `1d5ac9dbd4` (dirty) | impl_config=production, storage=s3, scenario=historical, pinned | **FAILED** (1) | 30m | 9413 | 10 | 428 | 8.4 / 12.2 | 191.8 / 514.5 | 0.53x | 0.17 / 0.39 | 823 / 821 | [2026-10-12T1650Z-1d5ac9dbd4-dirty-6266b5e9](2026-10-12T1650Z-1d5ac9dbd4-dirty-6266b5e9.md) |
 | 2026-10-12 15:50Z | `1d5ac9dbd4` (dirty) | impl_config=production, storage=s3, pinned | passed | 30m | 10488 | 0 | 412 | 8.2 / 9.4 | 198.7 / 493.8 | 0.66x | 0.20 / 0.34 | 895 / 1557 | [2026-10-12T1550Z-1d5ac9dbd4-dirty-e6ced2d6](2026-10-12T1550Z-1d5ac9dbd4-dirty-e6ced2d6.md) |
 | 2026-10-08 20:32Z | `0b54fe965a` (dirty) | impl_config=production, storage=s3, scenario=historical, pinned | **FAILED** (1) | 30m | 9154 | 2 | 353 | 10.1 / 11.9 | 252.2 / 539.2 | 0.54x | 0.23 / 0.40 | 743 / 695 | [2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82](2026-10-08T2032Z-0b54fe965a-dirty-d45e6b82.md) |

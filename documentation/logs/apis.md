@@ -104,7 +104,10 @@ output {
 ```
 
 `GET /-/healthy` and `GET /-/ready` are operational endpoints. The internal
-gRPC listener (default `9091`) carries shard-forwarded writes only.
+gRPC listener (default `9091`) carries shard-forwarded writes only. Both
+probes return `503` once a SlateDB handle closes with an error (a background
+task panic or fencing), since only a restart recovers it; the
+`storage_closed{db,reason}` gauge is `1` while that lasts.
 
 Authentication is evaluated separately for read and write routes. Reader mode
 does not ingest, writer mode does not query, and standalone mode enables both.

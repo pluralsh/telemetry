@@ -27,8 +27,15 @@
 //! - **Supersede**: with a [`Superseded`] hook, drop a segment the hook
 //!   reports as superseded (every record it holds is held by another
 //!   segment), also without rewriting it.
+//!
+//! Every proposal, size-tiered ones included, then passes [`admit`], which
+//! holds back the ones SlateDB would reject and all but one of those that
+//! finish without a worker; see there for why a second one panics SlateDB.
+
+mod admit;
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +46,8 @@ use slatedb::compactor::{
 };
 use slatedb::config::CompactorOptions;
 use slatedb::manifest::VersionedManifest;
+
+use admit::{Rejection, Tree, admit};
 
 /// The `[start_ms, end_ms)` span of the segment with this prefix, or `None`
 /// for a segment that isn't bounded in time.
@@ -254,6 +263,8 @@ impl CompactionSchedulerSupplier for Supplier {
             inner: SizeTieredCompactionSchedulerSupplier::new().compaction_scheduler(options),
             policy: self.policy.clone(),
             max_concurrent: options.max_concurrent_compactions,
+            trivial_moves: options.enable_trivial_move,
+            deferred: Mutex::default(),
             path: self.path.clone(),
         })
     }
@@ -263,11 +274,103 @@ struct Scheduler {
     inner: Box<dyn CompactionScheduler + Send + Sync>,
     policy: SegmentCompaction,
     max_concurrent: usize,
+    trivial_moves: bool,
+    /// Segments whose proposals the last poll deferred, which go first in the
+    /// next so that one kind of proposal can't hold back another for good.
+    deferred: Mutex<HashSet<Bytes>>,
     path: String,
 }
 
 impl CompactionScheduler for Scheduler {
+    /// A panic here would close the database, so a proposal that panics is
+    /// logged and dropped, and the next poll proposes again.
     fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
+        match catch_unwind(AssertUnwindSafe(|| self.admitted(state))) {
+            Ok(specs) => specs,
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(path = %self.path, %message, "compaction proposal panicked; skipping this poll");
+                self.rejected("panic");
+                Vec::new()
+            }
+        }
+    }
+
+    fn validate(
+        &self,
+        state: &CompactorStateView,
+        spec: &CompactionSpec,
+    ) -> Result<(), slatedb::Error> {
+        self.inner.validate(state, spec)
+    }
+}
+
+impl Scheduler {
+    fn rejected(&self, reason: &'static str) {
+        metrics::counter!(
+            "storage_compaction_proposals_rejected_total",
+            "path" => self.path.clone(),
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// [`Self::proposed`], less what [`admit`] holds back.
+    fn admitted(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
+        let (mut proposed, kinds) = self.proposed(state);
+        let mut deferred = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        proposed.sort_by_key(|spec| !deferred.contains(spec.segment()));
+        deferred.clear();
+        let manifest = state.manifest();
+        let trees: Vec<Tree> =
+            std::iter::once(Tree::new(Bytes::new(), manifest.l0(), manifest.compacted()))
+                .chain(manifest.segments().iter().map(|segment| {
+                    Tree::new(segment.prefix().clone(), segment.l0(), segment.compacted())
+                }))
+                .collect();
+        let active: Vec<_> = state
+            .compactions()
+            .into_iter()
+            .flat_map(|compactions| compactions.recent_compactions())
+            .filter(|compaction| compaction.active())
+            .map(|compaction| (compaction.spec().clone(), compaction.status()))
+            .collect();
+        let (specs, rejected) = admit(&trees, &active, proposed, self.trivial_moves);
+        for (spec, rejection) in rejected {
+            if rejection == Rejection::Deferred {
+                tracing::debug!(path = %self.path, %spec, "deferring compaction to the next poll");
+                deferred.insert(spec.segment().clone());
+            } else {
+                tracing::warn!(path = %self.path, %spec, reason = rejection.label(), "skipping invalid compaction proposal");
+            }
+            self.rejected(rejection.label());
+        }
+        for spec in &specs {
+            if let Some(kind) = kinds.get(spec.segment()) {
+                metrics::counter!(
+                    "storage_segment_compactions_total",
+                    "path" => self.path.clone(),
+                    "kind" => *kind
+                )
+                .increment(1);
+            }
+        }
+        specs
+    }
+
+    /// The size-tiered proposals plus this policy's, and the kind of each of
+    /// this policy's, by segment.
+    fn proposed(
+        &self,
+        state: &CompactorStateView,
+    ) -> (Vec<CompactionSpec>, HashMap<Bytes, &'static str>) {
         let now_ms = unix_ms(SystemTime::now());
         let mut specs = self.inner.propose(state);
         let active: Vec<_> = state
@@ -291,8 +394,9 @@ impl CompactionScheduler for Scheduler {
         let slots = self
             .max_concurrent
             .saturating_sub(active.len() + specs.len());
+        let mut kinds = HashMap::new();
         if slots == 0 {
-            return specs;
+            return (specs, kinds);
         }
         let busy: HashSet<Bytes> = active
             .iter()
@@ -355,23 +459,11 @@ impl CompactionScheduler for Scheduler {
                     superseded: true, ..
                 } => "supersede",
             };
-            metrics::counter!(
-                "storage_segment_compactions_total",
-                "path" => self.path.clone(),
-                "kind" => kind
-            )
-            .increment(1);
-            specs.push(planned.into_spec());
+            let spec = planned.into_spec();
+            kinds.insert(spec.segment().clone(), kind);
+            specs.push(spec);
         }
-        specs
-    }
-
-    fn validate(
-        &self,
-        state: &CompactorStateView,
-        spec: &CompactionSpec,
-    ) -> Result<(), slatedb::Error> {
-        self.inner.validate(state, spec)
+        (specs, kinds)
     }
 }
 

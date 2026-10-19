@@ -550,6 +550,8 @@ impl Storage {
                 .await
                 .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?,
         );
+        common::storage::health::StorageHealth::global()
+            .watch(slate_config.path.clone(), db.subscribe());
 
         let mut storage = Self::from_db(db);
         storage.merge_holds = merge_holds;

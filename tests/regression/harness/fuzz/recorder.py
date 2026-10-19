@@ -41,6 +41,8 @@ class CaseRecord:
     oracle: Exchange
     impl: Exchange
     recheck: tuple[Exchange, Exchange] | None = None
+    # Oracle-only answers a mismatch asked for after the recheck pair.
+    oracle_rechecks: tuple[Exchange, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,10 @@ class Recorder:
                 "oracle": record.recheck[0].describe(),
                 "impl": record.recheck[1].describe(),
             }
+        if record.oracle_rechecks:
+            line["oracle_rechecks"] = [
+                exchange.describe() for exchange in record.oracle_rechecks
+            ]
         self._cases.write(json.dumps(line, ensure_ascii=False) + "\n")
         summary = {
             "id": record.id,
@@ -261,6 +267,18 @@ class Recorder:
             "oracle": {**record.oracle.describe(), "body": body(record.oracle)},
             "impl": {**record.impl.describe(), "body": body(record.impl)},
         }
+        if record.recheck and record.outcome != "match":
+            value["recheck"] = {
+                side: {**exchange.describe(), "body": body(exchange)}
+                for side, exchange in zip(
+                    ("oracle", "impl"), record.recheck, strict=True
+                )
+            }
+        if record.oracle_rechecks:
+            value["oracle_rechecks"] = [
+                {**exchange.describe(), "body": body(exchange)}
+                for exchange in record.oracle_rechecks
+            ]
         path = self.root / "artifacts" / f"{record.id}.json"
         path.write_text(json.dumps(value, indent=2, ensure_ascii=False))
 

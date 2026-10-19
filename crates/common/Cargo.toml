@@ -25,6 +25,7 @@ metrics.workspace = true
 mixtrics.workspace = true
 ryu.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 slatedb.workspace = true
 slatedb-common.workspace = true
 thiserror.workspace = true
@@ -40,6 +41,7 @@ lz4_flex = "0.14.0"
 proptest.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
+tracing-subscriber = "0.3.23"
 slatedb = { workspace = true, features = ["test-util"] }
 slatedb-common = { workspace = true, features = ["test-util"] }
 zstd = "0.14.0"

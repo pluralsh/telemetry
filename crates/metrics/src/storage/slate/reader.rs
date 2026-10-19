@@ -605,6 +605,8 @@ impl StorageReader {
         })?;
 
         let reader = Arc::new(reader);
+        common::storage::health::StorageHealth::global()
+            .watch(slate_config.path.clone(), reader.subscribe());
         Ok(StorageReader {
             reader: StorageReaderInner {
                 db: reader.clone(),

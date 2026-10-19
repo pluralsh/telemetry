@@ -23,7 +23,7 @@ pub use storage::factory::{
     StorageSemantics, create_object_store, create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
-pub use storage::slate::{SlateReadHandle, SstWarmTracker};
+pub use storage::slate::{FilterResidency, SlateReadHandle, SstWarmTracker};
 pub use storage::sst_blocks::{
     BlockOpCounts, CountResult, L0Stats, SortedRunStats, WalkStats, count_in_range,
 };

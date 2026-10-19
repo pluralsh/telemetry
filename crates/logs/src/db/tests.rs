@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use common::storage::config::{
-    LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
+    BlockCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
+    SlateDbStorageConfig, StorageConfig,
 };
 
 use super::*;
@@ -1725,6 +1726,17 @@ async fn warming_plans_filters_only_for_readers_that_consult_them() {
 
 #[tokio::test]
 async fn unfiltered_reads_match_filtered_reads() {
+    unfiltered_reads_match_filtered_reads_with(false).await;
+}
+
+/// With a metadata cache, the writer's flushes leave their filters cached,
+/// so reads of the flushed segment use them.
+#[tokio::test]
+async fn unfiltered_reads_with_cached_filters_match_filtered_reads() {
+    unfiltered_reads_match_filtered_reads_with(true).await;
+}
+
+async fn unfiltered_reads_match_filtered_reads_with(meta_cache: bool) {
     async fn collect(
         records: common::storage::StorageResult<
             Box<dyn common::storage::StorageIterator + Send + 'static>,
@@ -1739,7 +1751,14 @@ async fn unfiltered_reads_match_filtered_reads() {
     }
 
     let namespace = Namespace::new("tenant").unwrap();
-    let db = LogDb::open(test_config()).await.unwrap();
+    let mut config = test_config();
+    if meta_cache && let StorageConfig::SlateDb(storage) = &mut config.storage {
+        storage.meta_cache = Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+            capacity: 64 << 20,
+            shards: Some(1),
+        }));
+    }
+    let db = LogDb::open(config).await.unwrap();
     // Postings and counters merged across two SSTs and the memtable.
     write_forty_streams(&db, &namespace).await;
     db.flush().await.unwrap();
@@ -1759,13 +1778,22 @@ async fn unfiltered_reads_match_filtered_reads() {
 
     use common::storage::ReadHints;
     let filtered = Arc::clone(&db.storage);
-    let unfiltered = UnfilteredReads(Arc::clone(&filtered));
+    let unfiltered = UnfilteredReads::new(Arc::clone(&filtered), true);
     let keys = collect(filtered.scan_iter(BytesRange::unbounded()).await)
         .await
         .into_iter()
         .map(|(key, _)| key)
         .collect::<Vec<_>>();
     assert!(keys.len() > 100, "{} keys", keys.len());
+    let cached = keys
+        .iter()
+        .filter(|key| unfiltered.filters_cached(key))
+        .count();
+    if meta_cache {
+        assert!(cached > 0, "no key's filters are cached");
+    } else {
+        assert_eq!(cached, 0);
+    }
     let absent = |key: &Bytes| {
         let mut longer = key.to_vec();
         longer.push(0);

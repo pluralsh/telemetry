@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod body_budget;
 pub mod config;
+pub mod health;
 pub mod http;
 pub mod ingest;
 pub mod internal_rpc;

@@ -3,6 +3,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use common::storage::config::StorageConfig;
+use common::storage::health::{CloseReason, StorageHealth};
 use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use opentelemetry_proto::tonic::{
@@ -74,6 +75,34 @@ async fn path_prefix_scopes_public_apis_but_not_health() {
             .unwrap();
         assert_eq!(response.status(), expected, "{path}");
     }
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_and_readiness_fail_while_storage_is_closed() {
+    let mut state = state(ServerMode::Standalone, true).await;
+    state.storage_health = StorageHealth::new();
+    let status = |path: &'static str| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status("/-/healthy").await, StatusCode::OK);
+    assert_eq!(status("/-/ready").await, StatusCode::OK);
+
+    let closed = state
+        .storage_health
+        .record_closed("traces/shard-0", CloseReason::Fenced);
+    assert_eq!(status("/-/healthy").await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status("/-/ready").await, StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(closed);
+    assert_eq!(status("/-/healthy").await, StatusCode::OK);
+    assert_eq!(status("/-/ready").await, StatusCode::OK);
     state.shutdown().await.unwrap();
 }
 

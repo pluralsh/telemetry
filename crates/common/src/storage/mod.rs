@@ -4,6 +4,7 @@ pub mod config;
 #[cfg(feature = "test-utils")]
 pub mod counting;
 pub mod factory;
+pub mod health;
 pub mod in_memory;
 pub mod loader;
 pub mod metered_cache;

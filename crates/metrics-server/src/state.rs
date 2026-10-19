@@ -6,8 +6,10 @@ use std::{
     time::Duration,
 };
 
+use common::storage::health::StorageHealth;
 use plural_metrics::{Namespace, Series, ShardedMetrics, ShardingOptions, Visibility};
 use proto::metrics::internal::v1::internal_writer_client::InternalWriterClient;
+use server_common::health::ErrorThrottle;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::reload::{self, Live, LiveConfig};
@@ -51,6 +53,7 @@ pub struct AppState {
     pub(crate) background_tasks: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     pub(crate) flush_runs: Arc<AtomicU64>,
     pub(crate) cache_warmed: Arc<AtomicBool>,
+    pub(crate) storage_health: StorageHealth,
 }
 
 impl AppState {
@@ -183,6 +186,7 @@ impl AppState {
             background_tasks: Arc::new(tokio::sync::Mutex::new(ingest_tasks)),
             flush_runs: Arc::new(AtomicU64::new(0)),
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
+            storage_health: StorageHealth::global().clone(),
         };
         #[cfg(feature = "kubernetes")]
         if let Some(runtime) = kubernetes {
@@ -223,13 +227,23 @@ impl AppState {
             let flush_task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut failures = ErrorThrottle::flush();
                 ticker.tick().await;
                 loop {
                     tokio::select! {
                         () = flush_cancel.cancelled() => return,
                         _ = ticker.tick() => {
-                            if let Err(error) = flush_state.flush_active_writers().await {
-                                tracing::error!(%error, "periodic durable flush failed");
+                            match flush_state.flush_active_writers().await {
+                                Ok(_) => failures.reset(),
+                                Err(error) => {
+                                    if let Some(suppressed) = failures.admit() {
+                                        tracing::error!(
+                                            %error,
+                                            suppressed,
+                                            "periodic durable flush failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

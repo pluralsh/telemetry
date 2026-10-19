@@ -73,7 +73,7 @@ pub fn router(state: AppState) -> Router {
         .layer(CompressionLayer::new());
     let public = Router::new().merge(writes).merge(reads);
     let app = Router::new()
-        .route("/-/healthy", get(|| async { StatusCode::OK }))
+        .route("/-/healthy", get(liveness))
         .route("/metrics", get(server_common::runtime::scrape_metrics))
         .route("/-/ready", get(readiness));
     let app = if state.config.path_prefix.is_empty() {
@@ -84,12 +84,12 @@ pub fn router(state: AppState) -> Router {
     app.with_state(state)
 }
 
+async fn liveness(State(state): State<AppState>) -> Response {
+    server_common::health::liveness(&state.storage_health)
+}
+
 async fn readiness(State(state): State<AppState>) -> StatusCode {
-    if state.is_ready().await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+    server_common::health::readiness(&state.storage_health, state.is_ready().await)
 }
 
 async fn otlp_http(

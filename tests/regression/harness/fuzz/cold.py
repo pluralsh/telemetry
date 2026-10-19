@@ -49,7 +49,7 @@ from .recorder import (
     percentile,
 )
 from .resources import ResourceSampler
-from .runner import Batch, Case, FuzzProduct, Probe, _stable, classify
+from .runner import Batch, Case, FuzzProduct, Probe, classify, settle_mismatch
 from .transport import Exchange, Transport
 
 SIDES = ("impl", "oracle")
@@ -890,11 +890,17 @@ class ColdRunner:
         oracle, impl = sides["oracle"]["cold"], sides["impl"]["cold"]
         outcome, detail = classify(case, oracle, impl)
         warm_oracle, warm_impl = sides["oracle"]["warm"], sides["impl"]["warm"]
+        oracle_rechecks: list[Exchange] = []
         if outcome == "mismatch" and case.idempotent and warm_oracle and warm_impl:
-            if not _stable(case, oracle, warm_oracle):
-                outcome = "unstable_oracle"
-            elif not _stable(case, impl, warm_impl):
-                outcome = "unstable_impl"
+            endpoint = self.endpoints["oracle"]
+            outcome, extra, oracle_rechecks = settle_mismatch(
+                case,
+                (impl, warm_impl),
+                (oracle, warm_oracle),
+                lambda: self.transport.send(endpoint, case.request),
+            )
+            if extra:
+                detail = f"{detail}; {extra}"
         self.recorder.record_case(
             CaseRecord(
                 id=case_id,
@@ -906,6 +912,7 @@ class ColdRunner:
                 detail=detail,
                 oracle=oracle,
                 impl=impl,
+                oracle_rechecks=tuple(oracle_rechecks),
             )
         )
         line = {
