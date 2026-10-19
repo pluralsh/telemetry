@@ -358,6 +358,13 @@ mise exec -- tests/kind/test.sh
 See [the regression harness documentation](tests/regression/README.md) for
 suite coverage, ports, and troubleshooting details.
 
+## License
+
+Plural Telemetry's source is licensed under the GNU AGPL v3.0, or a commercial
+license from Plural Labs, Inc. (commercial@plural.sh). Binaries and container
+images built by Plural are MIT licensed, and the operator (`go/operator/`) and
+Helm charts (`chart/`) are Apache 2.0. See [LICENSE](LICENSE) for the full terms.
+
 ## Attribution
 
 Parts of `common` are adapted from OpenData. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

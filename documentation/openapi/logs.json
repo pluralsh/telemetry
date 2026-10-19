@@ -4,8 +4,8 @@
     "title": "Logs HTTP API",
     "description": "Loki-compatible LogQL query and log ingestion API.",
     "license": {
-      "name": "Apache-2.0",
-      "identifier": "Apache-2.0"
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
     },
     "version": "0.1.0"
   },

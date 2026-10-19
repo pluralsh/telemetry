@@ -4,8 +4,8 @@
     "title": "Traces HTTP API",
     "description": "Tempo-compatible trace query and OTLP/Zipkin HTTP ingestion API. OTLP and Jaeger gRPC services are documented separately.",
     "license": {
-      "name": "Apache-2.0",
-      "identifier": "Apache-2.0"
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
     },
     "version": "0.1.0"
   },

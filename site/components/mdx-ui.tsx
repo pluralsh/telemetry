@@ -76,7 +76,7 @@ export function Hero() {
         </Link>
       </div>
       <p className="mt-4 flex items-center gap-1.5 text-[13px] text-muted">
-        Apache 2.0 · Kubernetes 1.28+ · sponsored by
+        AGPL v3 · Kubernetes 1.28+ · sponsored by
         <a href="https://plural.sh" className="inline-flex items-center gap-1 text-ink hover:underline">
           <span>
             <PluralMark size={12} />

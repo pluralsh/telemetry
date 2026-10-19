@@ -4,8 +4,8 @@
     "title": "Metrics HTTP API",
     "description": "Prometheus-compatible query and ingestion API. Configure path_prefix to prepend a common prefix to data routes.",
     "license": {
-      "name": "Apache-2.0",
-      "identifier": "Apache-2.0"
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
     },
     "version": "0.1.0"
   },

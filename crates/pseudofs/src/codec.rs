@@ -1,7 +1,6 @@
 // Copyright 2026 Plural, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::sync::Arc;
 
