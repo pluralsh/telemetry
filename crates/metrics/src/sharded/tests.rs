@@ -2,6 +2,7 @@ use super::*;
 use crate::routing::{route, split};
 use crate::{Label, Sample};
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use futures::TryStreamExt;
 use sharding::{DEFAULT_IO_CONCURRENCY_LIMIT, DEFAULT_SHARDS};
 
 const TEST_TIME_MS: i64 = 1_700_000_060_000;

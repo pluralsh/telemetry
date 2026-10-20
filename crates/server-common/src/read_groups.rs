@@ -24,13 +24,16 @@ use futures::{
     FutureExt, StreamExt,
     stream::{self, BoxStream, FuturesUnordered},
 };
-use sharding::{ShardId, server::ReadGroupsConfig};
+use sharding::{
+    ShardId,
+    server::{Product, ReadGroupsConfig, ServerMode, ShardingConfig},
+};
 use tonic::{
     Code, Request, Status, Streaming,
     transport::{Channel, Endpoint},
 };
 
-use crate::internal_rpc;
+use crate::{auth::AuthConfig, internal_rpc};
 
 /// One replica of a remote shard's reader group.
 #[derive(Clone, Debug)]
@@ -65,6 +68,24 @@ impl ReadGroups {
             channels: Mutex::default(),
             next: AtomicUsize::new(0),
         }
+    }
+
+    /// The read groups of a reader-group member, which reads every shard
+    /// but its own through them, or `None` when this server is not one.
+    pub fn configured<P: Product>(
+        mode: ServerMode,
+        sharding: &ShardingConfig<P>,
+        auth: &AuthConfig,
+    ) -> anyhow::Result<Option<Self>> {
+        let (ServerMode::Reader, Some(config)) = (mode, &sharding.read_groups) else {
+            return Ok(None);
+        };
+        let local = config.local_shard().map_err(anyhow::Error::msg)?;
+        Ok(Some(Self::new(
+            config.clone(),
+            local,
+            auth.internal_token()?,
+        )))
     }
 
     /// The shard this reader serves in process.

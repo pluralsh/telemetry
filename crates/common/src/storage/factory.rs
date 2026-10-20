@@ -667,6 +667,18 @@ impl SharedDbCache {
         }
         Ok(())
     }
+
+    /// Passes `opened` through, closing this cache first when opening the
+    /// databases that share it failed, since nothing else will.
+    pub async fn close_if_failed<T, E: From<StorageError>>(
+        &self,
+        opened: Result<T, E>,
+    ) -> Result<T, E> {
+        if opened.is_err() {
+            self.close().await?;
+        }
+        opened
+    }
 }
 
 /// Builds the combined SlateDB cache from the serializable data- and

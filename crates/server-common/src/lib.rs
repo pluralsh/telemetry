@@ -10,6 +10,7 @@ pub mod internal_rpc;
 pub mod read_groups;
 pub mod reload;
 pub mod runtime;
+pub mod tasks;
 pub mod usage;
 pub mod warmer;
 

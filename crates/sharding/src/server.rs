@@ -1,13 +1,16 @@
 //! Sharding configuration and startup shared by the Metrics, Logs, and Traces
 //! servers. Products differ only in the defaults supplied by [`Product`].
 
-use std::{fmt, marker::PhantomData, net::SocketAddr};
+use std::{fmt, marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Assignment, AssignmentGeneration, AssignmentState, DEFAULT_IO_CONCURRENCY_LIMIT,
-    DEFAULT_SHARDS, ModelError, Owner, ShardId, ShardMap, ShardRange,
+    Assignment, AssignmentGeneration, AssignmentState, BoxError, DEFAULT_IO_CONCURRENCY_LIMIT,
+    DEFAULT_SHARDS, EpochPolicy, ModelError, Owner, ShardDatabase, ShardId, ShardMap, ShardRange,
+    ShardSet, WriteRouter,
 };
 
 /// Product-specific defaults for the Kubernetes sharding resources.
@@ -369,6 +372,116 @@ impl<P: Product> ShardingConfig<P> {
             }
             (ServerMode::Writer, _) => owned_shards(assignment, local_owner).collect(),
         }
+    }
+
+    /// Joins the cluster this config describes. `epoch_policy` aligns
+    /// Kubernetes scale-up cutovers to the product's time partitions.
+    pub async fn join(
+        &self,
+        grpc: SocketAddr,
+        epoch_policy: EpochPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<ClusterMembership, BoxError> {
+        #[cfg(feature = "kubernetes")]
+        if let ShardingBackend::Kubernetes(settings) = &self.kind {
+            let (runtime, assignment) =
+                KubernetesRuntime::bootstrap(settings, epoch_policy, cancellation.clone()).await?;
+            return Ok(ClusterMembership {
+                local_owner: runtime.identity().to_owned(),
+                assignment,
+                runtime: ClusterRuntime {
+                    kubernetes: Some(runtime),
+                },
+            });
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        if matches!(self.kind, ShardingBackend::Kubernetes(_)) {
+            let _ = (epoch_policy, cancellation);
+            return Err("Kubernetes sharding requires the kubernetes feature".into());
+        }
+        let (local_owner, assignment) = self.static_assignment(grpc)?;
+        Ok(ClusterMembership {
+            local_owner,
+            assignment,
+            runtime: ClusterRuntime::default(),
+        })
+    }
+}
+
+/// This process's place in the cluster at startup: its owner id, the
+/// assignment it routes by, and the runtime that keeps them current.
+pub struct ClusterMembership {
+    pub local_owner: String,
+    pub assignment: ShardMap,
+    pub runtime: ClusterRuntime,
+}
+
+/// What keeps a Kubernetes-sharded process's assignment and open shards
+/// current; nothing for the static backends, whose assignment never changes.
+#[derive(Default)]
+pub struct ClusterRuntime {
+    #[cfg(feature = "kubernetes")]
+    kubernetes: Option<KubernetesRuntime>,
+}
+
+impl ClusterRuntime {
+    /// Spawns the tasks that keep `router`'s assignment current and `shards`
+    /// in step with it: readers open every shard of each new assignment,
+    /// writers open and close the shards whose leases they hold.
+    pub fn spawn<D>(
+        self,
+        shards: &Arc<ShardSet<D>>,
+        router: &Arc<WriteRouter>,
+        cancellation: &CancellationToken,
+    ) -> Vec<JoinHandle<()>>
+    where
+        D: ShardDatabase,
+        D::Error: Into<BoxError>,
+    {
+        #[cfg(feature = "kubernetes")]
+        if let Some(runtime) = self.kubernetes {
+            let assignment = Arc::clone(router.assignment());
+            return match shards.role() {
+                crate::ShardRole::Reader => {
+                    vec![runtime.spawn_reader(Arc::clone(shards), assignment, cancellation)]
+                }
+                crate::ShardRole::Writer => {
+                    let lifecycle = Arc::new(crate::RoutedShardLifecycle::new(
+                        Arc::clone(shards),
+                        Arc::clone(router),
+                    ));
+                    runtime.spawn(lifecycle, assignment, cancellation).into()
+                }
+            };
+        }
+        let _ = (shards, router, cancellation);
+        Vec::new()
+    }
+}
+
+impl<D: ShardDatabase> ShardSet<D> {
+    /// Whether exactly the shards a `mode` process serves under `assignment`
+    /// are open: every shard (or a reader group member's own) for readers
+    /// and standalone servers, and the shards `local_owner` owns, of which
+    /// there must be some, for writers.
+    pub async fn serves(&self, mode: ServerMode, assignment: &ShardMap, local_owner: &str) -> bool {
+        let expected = match mode {
+            ServerMode::Standalone | ServerMode::Reader => {
+                let scope = self.reader_scope();
+                (0..assignment.shard_count)
+                    .map(ShardId::new)
+                    .filter(|shard| scope.is_none_or(|scope| scope == *shard))
+                    .collect::<Vec<_>>()
+            }
+            ServerMode::Writer => {
+                let owned = owned_shards(assignment, local_owner).collect::<Vec<_>>();
+                if owned.is_empty() {
+                    return false;
+                }
+                owned
+            }
+        };
+        self.ids().await == expected
     }
 }
 

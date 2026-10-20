@@ -5,7 +5,7 @@
 //! Merge operator for the records the writer updates without reading them.
 
 use bytes::Bytes;
-use common::storage::{MergeOperator, default_merge_batch};
+use common::storage::{MergeOperator, decode_merge_operands, default_merge_batch};
 use roaring::RoaringBitmap;
 
 use crate::codec::{MergeKind, decode_postings, encode_postings, merge_kind};
@@ -51,20 +51,11 @@ impl MergeOperator for LogsMergeOperator {
     }
 }
 
-/// Decodes every value, dropping and reporting those that are corrupt: a
-/// merge cannot fail, and panicking would take down SlateDB compaction.
 fn decoded<'a, T>(
     values: impl Iterator<Item = &'a Bytes>,
     decode: impl Fn(&[u8]) -> Result<T>,
 ) -> impl Iterator<Item = T> {
-    values.filter_map(move |value| match decode(value) {
-        Ok(decoded) => Some(decoded),
-        Err(error) => {
-            tracing::error!(%error, "dropping corrupt logs merge operand");
-            ::metrics::counter!("logs_corrupt_merge_operands_total").increment(1);
-            None
-        }
-    })
+    decode_merge_operands(values, decode, "logs_corrupt_merge_operands_total")
 }
 
 #[cfg(test)]

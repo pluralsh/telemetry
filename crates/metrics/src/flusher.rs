@@ -137,126 +137,22 @@ impl TsdbFlusher {
         let start = std::time::Instant::now();
         let ttl = bucket_ttl(frozen.bucket, self.retention);
 
-        // Phase 1: build storage ops. Track estimated key+value bytes by
-        // summing `Bytes::len()` on each produced op (cheap, no extra clone).
+        // Phase 1: build storage ops.
         let build_start = std::time::Instant::now();
-        let mut ops = Vec::new();
-        let mut estimated_bytes: u64 = 0;
-        let push_op = |ops: &mut Vec<RecordOp>, estimated: &mut u64, op: RecordOp| {
-            *estimated += op_estimated_bytes(&op) as u64;
-            ops.push(op);
-        };
-
-        for (fingerprint, series_id) in &frozen.series_dict_delta {
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                insert_series_id(
-                    &frozen.namespace,
-                    frozen.bucket,
-                    *fingerprint,
-                    *series_id,
-                    ttl,
-                )?,
-            );
-        }
-
-        for entry in frozen.forward_index.series.iter() {
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                insert_series_fingerprint(
-                    &frozen.namespace,
-                    frozen.bucket,
-                    *entry.key(),
-                    entry.value().labels.series_fingerprint(),
-                    ttl,
-                ),
-            );
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                insert_forward_index(
-                    &frozen.namespace,
-                    frozen.bucket,
-                    *entry.key(),
-                    entry.value().clone(),
-                    ttl,
-                )?,
-            );
-        }
-
-        for entry in frozen.inverted_index.postings.iter() {
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                merge_inverted_index(
-                    &frozen.namespace,
-                    frozen.bucket,
-                    entry.key().clone(),
-                    entry.value().clone(),
-                    ttl,
-                )?,
-            );
-        }
-
-        let mut catalog = CatalogBatch::default();
-        for entry in frozen.inverted_index.postings.iter() {
-            catalog.insert(
-                "",
-                entry.key().name.clone(),
-                DiscoveryValue::String(entry.key().value.clone()),
-            );
-        }
-        for metadata in frozen.metadata.values() {
-            catalog.insert_metadata(
-                metadata.metric_name.clone(),
-                crate::discovery::encode_metadata(metadata),
-            );
-        }
-        for op in catalog.into_ops(
-            &crate::discovery::partition_prefix(&frozen.namespace, frozen.bucket),
-            ttl,
-        ) {
-            push_op(&mut ops, &mut estimated_bytes, op);
-        }
-
-        for (series_id, series_samples) in frozen.samples {
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                merge_samples(
-                    &frozen.namespace,
-                    frozen.bucket,
-                    series_id,
-                    &series_samples.metric_name,
-                    series_samples.points,
-                    series_samples.histograms,
-                    ttl,
-                )?,
-            );
-        }
-        // Same batch as the samples: a reader never sees samples without the
-        // generation that announces them.
         let generation = next_generation(self.last_generation);
-        push_op(
-            &mut ops,
-            &mut estimated_bytes,
-            put_bucket_generation(&frozen.namespace, frozen.bucket, generation, ttl),
-        );
-        let ops_count = ops.len() as u64;
+        let batch = flush_ops(frozen, ttl, generation)?;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS)
             .record(build_start.elapsed().as_secs_f64());
-        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_OPS).record(ops_count as f64);
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_OPS).record(batch.ops.len() as f64);
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_ESTIMATED_BYTES)
-            .record(estimated_bytes as f64);
+            .record(batch.estimated_bytes as f64);
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_NEW_SERIES).record(new_series_count as f64);
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_SAMPLES).record(sample_count as f64);
 
         // Phase 2: SlateDB apply. Time spent here reflects SlateDB write
         // backpressure (memtable full, WAL stall, etc.).
         let apply_start = std::time::Instant::now();
-        let result = self.storage.apply(ops).await;
+        let result = self.storage.apply(batch.ops).await;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS)
             .record(apply_start.elapsed().as_secs_f64());
 
@@ -284,6 +180,105 @@ impl TsdbFlusher {
         }
         Ok(())
     }
+}
+
+/// The storage ops of one flush, with their estimated size.
+#[derive(Default)]
+struct OpBatch {
+    ops: Vec<RecordOp>,
+    /// Sum of each op's key and value lengths.
+    estimated_bytes: u64,
+}
+
+impl OpBatch {
+    fn push(&mut self, op: RecordOp) {
+        self.estimated_bytes += op_estimated_bytes(&op) as u64;
+        self.ops.push(op);
+    }
+}
+
+/// Every op that persists `frozen`, ending with the bucket's new
+/// `generation`. They must be applied as one batch so a reader never sees
+/// samples without the generation that announces them.
+fn flush_ops(frozen: FrozenTsdbDelta, ttl: Ttl, generation: u64) -> crate::Result<OpBatch> {
+    let namespace = &frozen.namespace;
+    let bucket = frozen.bucket;
+    let mut batch = OpBatch::default();
+
+    for (fingerprint, series_id) in &frozen.series_dict_delta {
+        batch.push(insert_series_id(
+            namespace,
+            bucket,
+            *fingerprint,
+            *series_id,
+            ttl,
+        )?);
+    }
+    for entry in frozen.forward_index.series.iter() {
+        let series_id = *entry.key();
+        batch.push(insert_series_fingerprint(
+            namespace,
+            bucket,
+            series_id,
+            entry.value().labels.series_fingerprint(),
+            ttl,
+        ));
+        batch.push(insert_forward_index(
+            namespace,
+            bucket,
+            series_id,
+            entry.value().clone(),
+            ttl,
+        )?);
+    }
+    for entry in frozen.inverted_index.postings.iter() {
+        batch.push(merge_inverted_index(
+            namespace,
+            bucket,
+            entry.key().clone(),
+            entry.value().clone(),
+            ttl,
+        )?);
+    }
+    for op in catalog_ops(&frozen, ttl) {
+        batch.push(op);
+    }
+    for (series_id, samples) in frozen.samples {
+        batch.push(merge_samples(
+            namespace,
+            bucket,
+            series_id,
+            &samples.metric_name,
+            samples.points,
+            samples.histograms,
+            ttl,
+        )?);
+    }
+    batch.push(put_bucket_generation(namespace, bucket, generation, ttl));
+    Ok(batch)
+}
+
+/// The discovery catalog entries for the label values and metric metadata
+/// `frozen` adds.
+fn catalog_ops(frozen: &FrozenTsdbDelta, ttl: Ttl) -> Vec<RecordOp> {
+    let mut catalog = CatalogBatch::default();
+    for entry in frozen.inverted_index.postings.iter() {
+        catalog.insert(
+            "",
+            entry.key().name.clone(),
+            DiscoveryValue::String(entry.key().value.clone()),
+        );
+    }
+    for metadata in frozen.metadata.values() {
+        catalog.insert_metadata(
+            metadata.metric_name.clone(),
+            crate::discovery::encode_metadata(metadata),
+        );
+    }
+    catalog.into_ops(
+        &crate::discovery::partition_prefix(&frozen.namespace, frozen.bucket),
+        ttl,
+    )
 }
 
 #[cfg(test)]

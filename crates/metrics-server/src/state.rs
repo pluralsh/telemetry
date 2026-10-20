@@ -13,23 +13,21 @@ use server_common::health::ErrorThrottle;
 use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::reload::{self, Live, LiveConfig};
+use server_common::tasks::spawn_periodic;
 use server_common::warmer::{WarmPass, readiness_waits, spawn_cache_warmer, warming_enabled};
 use sharding::{
-    AssignmentGeneration, ForwardError, Owner, RouterLimits, ShardId, ShardMap, WriteRouter,
-    server::owned_shards, shard_request_id,
+    AssignmentGeneration, EpochPolicy, ForwardError, Owner, RouterLimits, ShardId, WriteRouter,
+    server::ClusterMembership, shard_request_id,
 };
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
-
-#[cfg(feature = "kubernetes")]
-use sharding::{EpochPolicy, RoutedShardLifecycle, server::KubernetesRuntime};
+use tonic::transport::Channel;
 
 use server_common::auth::JwtAuthenticator;
 
 use crate::{
-    config::{Config, Durability, NamespaceConfig, ServerMode, ShardingBackend},
+    config::{Config, Durability, NamespaceConfig, ServerMode},
     http::ApiError,
     internal_writer::to_proto_request,
     shard_reader::GrpcMetricsShards,
@@ -64,67 +62,33 @@ impl AppState {
             None => None,
         };
         let cancellation = CancellationToken::new();
-        #[cfg(feature = "kubernetes")]
-        let mut kubernetes = None;
-        let (local_owner, assignment) = match &config.sharding.kind {
-            #[cfg(feature = "kubernetes")]
-            ShardingBackend::Kubernetes(settings) => {
-                let (runtime, assignment) =
-                    KubernetesRuntime::bootstrap(settings, epoch_policy(), cancellation.clone())
-                        .await
-                        .map_err(|error| anyhow::anyhow!(error))?;
-                let local = runtime.identity().to_owned();
-                kubernetes = Some(runtime);
-                (local, assignment)
-            }
-            #[cfg(not(feature = "kubernetes"))]
-            ShardingBackend::Kubernetes(_) => {
-                anyhow::bail!("Kubernetes sharding requires the kubernetes feature")
-            }
-            _ => assignment_for(&config)?,
-        };
-        let shard_count = assignment.shard_count;
-        let options = ShardingOptions::new(shard_count, config.sharding.io_concurrency_limit)?;
+        let ClusterMembership {
+            local_owner,
+            assignment,
+            runtime,
+        } = config
+            .sharding
+            .join(config.listeners.grpc, epoch_policy(), &cancellation)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let options =
+            ShardingOptions::new(assignment.shard_count, config.sharding.io_concurrency_limit)?;
         let metrics_config = metrics_config(&config);
-        let writer_shards = if config.mode == ServerMode::Standalone {
-            (0..shard_count).map(ShardId::new).collect::<Vec<_>>()
-        } else if matches!(config.sharding.kind, ShardingBackend::Kubernetes(_)) {
-            Vec::new()
-        } else {
-            owned_shards(&assignment, &local_owner).collect()
-        };
-        let writers = if config.mode != ServerMode::Reader {
-            Some(Arc::new(
-                ShardedMetrics::open_writers(metrics_config.clone(), options, writer_shards)
-                    .await?,
-            ))
-        } else {
-            None
-        };
-        let read_group = match (&config.mode, &config.sharding.read_groups) {
-            (ServerMode::Reader, Some(groups)) => Some((
-                groups.clone(),
-                groups
-                    .local_shard()
-                    .map_err(|error| anyhow::anyhow!(error))?,
-            )),
-            _ => None,
-        };
-        let reader_shards = match &read_group {
-            Some((_, local)) => vec![*local]
-                .into_iter()
-                .filter(|shard| shard.get() < shard_count)
-                .collect(),
-            None => (0..shard_count).map(ShardId::new).collect::<Vec<_>>(),
-        };
-        let readers = if config.mode == ServerMode::Standalone {
-            writers.clone()
-        } else if config.mode != ServerMode::Writer {
-            Some(Arc::new(
-                ShardedMetrics::open_readers(
+        let shards = config
+            .sharding
+            .startup_shards(config.mode, &assignment, &local_owner);
+        let (writers, readers) = match config.mode {
+            ServerMode::Standalone | ServerMode::Writer => {
+                let writers =
+                    Arc::new(ShardedMetrics::open_writers(metrics_config, options, shards).await?);
+                let readers = (config.mode == ServerMode::Standalone).then(|| Arc::clone(&writers));
+                (Some(writers), readers)
+            }
+            ServerMode::Reader => {
+                let readers = ShardedMetrics::open_readers(
                     metrics_config,
                     options,
-                    reader_shards,
+                    shards,
                     config
                         .reader_disk_cache
                         .apply(slatedb::config::DbReaderOptions {
@@ -133,22 +97,16 @@ impl AppState {
                         }),
                     config.reader_cache_capacity,
                 )
-                .await?,
-            ))
-        } else {
-            None
+                .await?;
+                (None, Some(Arc::new(readers)))
+            }
         };
-        if let (Some((groups, local)), Some(readers)) = (read_group, &readers) {
-            let token = config
-                .auth
-                .internal
-                .as_ref()
-                .map(|secret| secret.expose())
-                .transpose()?;
-            readers.shards().scope_readers_to(local);
-            readers.connect_remote_shards(Arc::new(GrpcMetricsShards::new(Arc::new(
-                ReadGroups::new(groups, local, token),
-            ))));
+        if let Some(readers) = &readers
+            && let Some(groups) =
+                ReadGroups::configured(config.mode, &config.sharding, &config.auth)?
+        {
+            readers.shards().scope_readers_to(groups.local_shard());
+            readers.connect_remote_shards(Arc::new(GrpcMetricsShards::new(Arc::new(groups))));
         }
         let cache_warmed =
             !readiness_waits(&config.cache_warmer, config.mode != ServerMode::Writer);
@@ -188,70 +146,48 @@ impl AppState {
             cache_warmed: Arc::new(AtomicBool::new(cache_warmed)),
             storage_health: StorageHealth::global().clone(),
         };
-        #[cfg(feature = "kubernetes")]
-        if let Some(runtime) = kubernetes {
-            if state.config.mode == ServerMode::Reader {
-                let task = runtime.spawn_reader(
-                    state
-                        .readers
-                        .as_ref()
-                        .expect("reader mode must open sharded metrics")
-                        .clone(),
-                    Arc::clone(state.router.assignment()),
-                    &state.cancellation,
-                );
-                state.background_tasks.lock().await.push(task);
-            } else {
-                let writers = state
-                    .writers
-                    .as_ref()
-                    .expect("writer mode must open sharded metrics");
-                let lifecycle = Arc::new(RoutedShardLifecycle::new(
-                    Arc::clone(writers.shards()),
-                    Arc::clone(&state.router),
-                ));
-                let tasks = runtime.spawn(
-                    lifecycle,
-                    Arc::clone(state.router.assignment()),
-                    &state.cancellation,
-                );
-                state.background_tasks.lock().await.extend(tasks);
-            }
-        }
+        // The writer set in writer and standalone mode, the reader set in reader mode.
+        let lifecycle_shards = state
+            .writers
+            .as_ref()
+            .or(state.readers.as_ref())
+            .expect("every server mode opens sharded metrics")
+            .shards();
+        let cluster_tasks = runtime.spawn(lifecycle_shards, &state.router, &state.cancellation);
+        state.background_tasks.lock().await.extend(cluster_tasks);
         state.start_cache_warmer(true).await;
-        if state.config.mode != ServerMode::Reader && state.config.write.flush_interval_seconds > 0
-        {
-            let flush_state = state.clone();
-            let flush_cancel = state.cancellation.clone();
-            let interval = Duration::from_secs(state.config.write.flush_interval_seconds);
-            let flush_task = tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut failures = ErrorThrottle::flush();
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        () = flush_cancel.cancelled() => return,
-                        _ = ticker.tick() => {
-                            match flush_state.flush_active_writers().await {
-                                Ok(_) => failures.reset(),
-                                Err(error) => {
-                                    if let Some(suppressed) = failures.admit() {
-                                        tracing::error!(
-                                            %error,
-                                            suppressed,
-                                            "periodic durable flush failed"
-                                        );
-                                    }
-                                }
+        state.start_durable_flush_task().await;
+        Ok(state)
+    }
+
+    async fn start_durable_flush_task(&self) {
+        let seconds = self.config.write.flush_interval_seconds;
+        if self.config.mode == ServerMode::Reader || seconds == 0 {
+            return;
+        }
+        let state = self.clone();
+        let failures = Arc::new(Mutex::new(ErrorThrottle::flush()));
+        let task = spawn_periodic(
+            Duration::from_secs(seconds),
+            self.cancellation.clone(),
+            move || {
+                let state = state.clone();
+                let failures = Arc::clone(&failures);
+                async move {
+                    let flushed = state.flush_active_writers().await;
+                    let mut failures = failures.lock().expect("flush throttle lock");
+                    match flushed {
+                        Ok(()) => failures.reset(),
+                        Err(error) => {
+                            if let Some(suppressed) = failures.admit() {
+                                tracing::error!(%error, suppressed, "periodic durable flush failed");
                             }
                         }
                     }
                 }
-            });
-            state.background_tasks.lock().await.push(flush_task);
-        }
-        Ok(state)
+            },
+        );
+        self.background_tasks.lock().await.push(task);
     }
 
     pub fn config(&self) -> &Config {
@@ -275,13 +211,7 @@ impl AppState {
         if self.config.mode != ServerMode::Reader || self.config.sharding.read_groups.is_none() {
             return Ok(None);
         }
-        let token = self
-            .config
-            .auth
-            .internal
-            .as_ref()
-            .map(|secret| secret.expose())
-            .transpose()?;
+        let token = self.config.auth.internal_token()?;
         Ok(Some(crate::shard_reader::shard_reader_service(
             Arc::clone(readers),
             token,
@@ -355,33 +285,19 @@ impl AppState {
         if !self.cache_warmed.load(Ordering::Acquire) {
             return false;
         }
-        match self.config.mode {
-            ServerMode::Standalone => self.readers.is_some(),
-            ServerMode::Reader => {
-                let shard_count = self.router.assignment().read().await.shard_count;
-                let scope = self
-                    .readers
-                    .as_ref()
-                    .and_then(|readers| readers.shards().reader_scope());
-                let expected = (0..shard_count)
-                    .map(ShardId::new)
-                    .filter(|shard| scope.is_none_or(|scope| scope == *shard))
-                    .collect::<Vec<_>>();
-                match &self.readers {
-                    Some(readers) => readers.shards().ids().await == expected,
-                    None => false,
-                }
-            }
-            ServerMode::Writer => {
-                let assignment = self.router.assignment().read().await;
-                let expected =
-                    owned_shards(&assignment, self.router.local_owner()).collect::<Vec<_>>();
-                let Some(writers) = &self.writers else {
-                    return false;
-                };
-                !expected.is_empty() && writers.shards().ids().await == expected
-            }
-        }
+        let database = match self.config.mode {
+            ServerMode::Standalone => return self.readers.is_some(),
+            ServerMode::Reader => &self.readers,
+            ServerMode::Writer => &self.writers,
+        };
+        let Some(database) = database else {
+            return false;
+        };
+        let assignment = self.router.assignment().read().await;
+        database
+            .shards()
+            .serves(self.config.mode, &assignment, self.router.local_owner())
+            .await
     }
 
     /// (Re)starts the warmer from the live config, replacing any running one.
@@ -512,10 +428,7 @@ impl AppState {
         let token = self
             .config
             .auth
-            .internal
-            .as_ref()
-            .map(|secret| secret.expose())
-            .transpose()
+            .internal_token()
             .map_err(ApiError::internal)?;
         let shard = target.shard;
         self.router
@@ -536,22 +449,17 @@ impl AppState {
                     let endpoint = owner_endpoint(&self.config, owner);
                     let token = token.as_deref();
                     async move {
-                        let unavailable = |status: &tonic::Status| ApiError::unavailable(status);
                         let endpoint = endpoint.map_err(ForwardError::Failed)?;
-                        let channel = self
-                            .channels
-                            .channel(&endpoint)
-                            .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
-                        let mut request = Request::new(request);
-                        internal_rpc::authorize(&mut request, token)
-                            .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
-                        InternalWriterClient::new(channel)
-                            .max_encoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
-                            .max_decoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
-                            .write(request)
-                            .await
-                            .map(drop)
-                            .map_err(|status| internal_rpc::forward_error(&status, unavailable))
+                        internal_rpc::forward_write(
+                            &self.channels,
+                            &endpoint,
+                            token,
+                            request,
+                            |channel, request| async move {
+                                internal_writer_client(channel).write(request).await
+                            },
+                        )
+                        .await
                     }
                 },
             )
@@ -599,7 +507,7 @@ pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {
     }
 }
 
-#[cfg(feature = "kubernetes")]
+/// Aligns scale-up cutovers to the hourly buckets metrics are stored in.
 fn epoch_policy() -> EpochPolicy {
     EpochPolicy {
         alignment: Duration::from_secs(3600),
@@ -607,8 +515,15 @@ fn epoch_policy() -> EpochPolicy {
     }
 }
 
-pub(crate) fn assignment_for(config: &Config) -> anyhow::Result<(String, ShardMap)> {
+#[cfg(test)]
+pub(crate) fn assignment_for(config: &Config) -> anyhow::Result<(String, sharding::ShardMap)> {
     Ok(config.sharding.static_assignment(config.listeners.grpc)?)
+}
+
+fn internal_writer_client(channel: Channel) -> InternalWriterClient<Channel> {
+    InternalWriterClient::new(channel)
+        .max_encoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
+        .max_decoding_message_size(internal_rpc::MAX_INTERNAL_MESSAGE_BYTES)
 }
 
 fn owner_endpoint(config: &Config, owner: &Owner) -> Result<String, ApiError> {

@@ -129,31 +129,8 @@ impl<'a> Plan<'a> {
         let mut identities: Option<Vec<u64>> = None;
         let mut selected = Vec::with_capacity(slice.len());
         for (index, log) in pipelines.logs.iter().enumerate() {
-            selected.clear();
-            selected.extend(
-                slice
-                    .rows
-                    .clone()
-                    .filter(|&row| pipelines.in_log_window(index, batch.timestamps[row]))
-                    .map(|row| row as u32),
-            );
-            if selected.is_empty() || !selector_matches(log, &batch.labels)? {
+            if !self.select_rows(index, log, slice, &mut selected)? {
                 continue;
-            }
-            let tests = &pipelines.line_tests[index];
-            if !tests.is_empty() {
-                let mut kept = 0;
-                for position in 0..selected.len() {
-                    let row = selected[position];
-                    if passes_line_tests(log, tests, batch.line(row as usize))? {
-                        selected[kept] = row;
-                        kept += 1;
-                    }
-                }
-                selected.truncate(kept);
-                if selected.is_empty() {
-                    continue;
-                }
             }
             let stored = stored.get_or_insert_with(|| Fields::stored(slice));
             let mut work = Work::new(slice, stored);
@@ -306,6 +283,44 @@ impl<'a> Plan<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Fills `selected` with the rows of `slice` that are inside expression
+    /// `index`'s log window, from a stream its selector matches, and pass its
+    /// line filters. Returns whether any rows were selected.
+    fn select_rows(
+        &self,
+        index: usize,
+        log: &LogExpr,
+        slice: &BatchSlice,
+        selected: &mut Vec<u32>,
+    ) -> Result<bool> {
+        let pipelines = &self.pipelines;
+        let batch = &*slice.batch;
+        selected.clear();
+        selected.extend(
+            slice
+                .rows
+                .clone()
+                .filter(|&row| pipelines.in_log_window(index, batch.timestamps[row]))
+                .map(|row| row as u32),
+        );
+        if selected.is_empty() || !selector_matches(log, &batch.labels)? {
+            return Ok(false);
+        }
+        let tests = &pipelines.line_tests[index];
+        if !tests.is_empty() {
+            let mut kept = 0;
+            for position in 0..selected.len() {
+                let row = selected[position];
+                if passes_line_tests(log, tests, batch.line(row as usize))? {
+                    selected[kept] = row;
+                    kept += 1;
+                }
+            }
+            selected.truncate(kept);
+        }
+        Ok(!selected.is_empty())
     }
 
     /// Runs the expression's stages over the selected rows, stage by stage,

@@ -1,17 +1,16 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport};
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
-    ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
-    shard_opener,
+    ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions, shard_opener,
+    sorted_union,
 };
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
-use futures::future::{try_join, try_join_all};
+use futures::future::try_join_all;
 use proto::logs::internal::v1 as pb;
 
 use crate::db::BlockCache;
@@ -54,14 +53,6 @@ impl QueryResults {
             segment_ns: i64::try_from(config.segment_duration.as_nanos()).unwrap_or(i64::MAX),
         }
     }
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-        })
 }
 
 fn shard_config(config: &Config, shard: ShardId) -> Config {
@@ -148,19 +139,14 @@ impl ShardedLogs {
         cache: SharedDbCache,
         results: QueryResults,
     ) -> Result<Self> {
-        match shards {
-            Ok(shards) => Ok(Self {
-                shards: Arc::new(shards),
-                cache,
-                remote: OnceLock::new(),
-                results: results.cache,
-                segment_ns: results.segment_ns,
-            }),
-            Err(error) => {
-                cache.close().await?;
-                Err(error)
-            }
-        }
+        let shards = cache.close_if_failed(shards).await?;
+        Ok(Self {
+            shards: Arc::new(shards),
+            cache,
+            remote: OnceLock::new(),
+            results: results.cache,
+            segment_ns: results.segment_ns,
+        })
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -193,8 +179,7 @@ impl ShardedLogs {
     /// Warms the SSTs of `window` across every open shard and namespace,
     /// newest segment first, into `budget_percent` of the metadata cache.
     /// SSTs `ledger` holds are skipped, and those compaction or a rollup
-    /// removed are evicted; see [`warm_planned`]. Without a metadata cache
-    /// only the payload window is warmed.
+    /// removed are evicted; see [`ShardSet::start_warm`].
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
@@ -204,36 +189,21 @@ impl ShardedLogs {
         ledger: &WarmLedger,
         budget_percent: u8,
     ) -> Result<WarmReport> {
-        let budget = WarmBudget::of(&self.cache, budget_percent);
-        let window = if budget.is_some() {
-            window
-        } else {
-            window.payloads_only()
-        };
-        if budget.is_none() && window.payloads.is_none() {
-            return Ok(WarmReport::default());
-        }
-        let Some((_permits, concurrency)) = self.shards.reserve_io(concurrency, cancel).await?
+        let Some(pass) = self
+            .shards
+            .start_warm(&self.cache, window, concurrency, cancel, budget_percent)
+            .await?
         else {
             return Ok(WarmReport::default());
         };
         let mut plan = WarmPlan::default();
-        for database in self.shards.databases().await {
+        for database in pass.databases() {
             if cancel.is_cancelled() {
                 return Ok(WarmReport::default());
             }
-            database.plan_warm(namespaces, window, &mut plan);
+            database.plan_warm(namespaces, pass.window, &mut plan);
         }
-        Ok(warm_planned(
-            "logs",
-            plan,
-            budget.unwrap_or(WarmBudget::UNBOUNDED),
-            window.payloads.is_some(),
-            concurrency,
-            cancel,
-            ledger,
-        )
-        .await)
+        Ok(pass.finish("logs", plan, cancel, ledger).await)
     }
 
     /// Writes to shards opened locally; every routed shard must be open.
@@ -360,7 +330,7 @@ impl ShardedLogs {
         };
         ResultCache::record(lookup.reused_steps, computed as usize);
         let merged = crate::result_cache::merge(head, tail);
-        let now = now_ns();
+        let now = common::time::now_ns();
         let through = if last <= now {
             last
         } else {
@@ -402,17 +372,14 @@ impl ShardedLogs {
         start_ns: i64,
         end_ns: i64,
     ) -> Result<Vec<String>> {
-        let remote = self.remote_shards();
-        let (mut names, remote) = try_join(
-            self.local_label_names(namespace, start_ns, end_ns),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.label_names(namespace, start_ns, end_ns)),
-            ),
-        )
-        .await?;
-        names.extend(remote);
+        let names = self
+            .shards
+            .fan_out_with_remote(
+                &self.remote_shards(),
+                |database| async move { database.label_names(namespace, start_ns, end_ns).await },
+                |shard| shard.label_names(namespace, start_ns, end_ns),
+            )
+            .await?;
         Ok(sorted_union(names))
     }
 
@@ -423,17 +390,18 @@ impl ShardedLogs {
         start_ns: i64,
         end_ns: i64,
     ) -> Result<Vec<String>> {
-        let remote = self.remote_shards();
-        let (mut values, remote) = try_join(
-            self.local_label_values(namespace, name, start_ns, end_ns),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.label_values(namespace, name, start_ns, end_ns)),
-            ),
-        )
-        .await?;
-        values.extend(remote);
+        let values = self
+            .shards
+            .fan_out_with_remote(
+                &self.remote_shards(),
+                |database| async move {
+                    database
+                        .label_values(namespace, name, start_ns, end_ns)
+                        .await
+                },
+                |shard| shard.label_values(namespace, name, start_ns, end_ns),
+            )
+            .await?;
         Ok(sorted_union(values))
     }
 
@@ -444,80 +412,26 @@ impl ShardedLogs {
         start_ns: i64,
         end_ns: i64,
     ) -> Result<Vec<Labels>> {
-        let remote = self.remote_shards();
-        let (mut series, remote) = try_join(
-            self.local_series(namespace, selectors, start_ns, end_ns),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.series(namespace, selectors, start_ns, end_ns)),
-            ),
-        )
-        .await?;
-        series.extend(remote);
-        Ok(sorted_union(series))
-    }
-
-    async fn local_label_names(
-        &self,
-        namespace: &Namespace,
-        start_ns: i64,
-        end_ns: i64,
-    ) -> Result<Vec<Vec<String>>> {
-        self.shards
-            .fan_out(
-                |database| async move { database.label_names(namespace, start_ns, end_ns).await },
+        let series = self
+            .shards
+            .fan_out_with_remote(
+                &self.remote_shards(),
+                |database| async move {
+                    database
+                        .series(namespace, selectors, start_ns, end_ns)
+                        .await
+                },
+                |shard| shard.series(namespace, selectors, start_ns, end_ns),
             )
-            .await
-    }
-
-    async fn local_label_values(
-        &self,
-        namespace: &Namespace,
-        name: &str,
-        start_ns: i64,
-        end_ns: i64,
-    ) -> Result<Vec<Vec<String>>> {
-        self.shards
-            .fan_out(|database| async move {
-                database
-                    .label_values(namespace, name, start_ns, end_ns)
-                    .await
-            })
-            .await
-    }
-
-    async fn local_series(
-        &self,
-        namespace: &Namespace,
-        selectors: &[String],
-        start_ns: i64,
-        end_ns: i64,
-    ) -> Result<Vec<Vec<Labels>>> {
-        self.shards
-            .fan_out(|database| async move {
-                database
-                    .series(namespace, selectors, start_ns, end_ns)
-                    .await
-            })
-            .await
+            .await?;
+        Ok(sorted_union(series))
     }
 
     /// The shard a reader coordinating a query asks this one to read, which
     /// must be the shard this reader serves.
     async fn served(&self, read: Option<&pb::ShardRead>) -> Result<(Arc<LogDb>, Namespace)> {
         let (shard, namespace) = namespace_from_wire(read)?;
-        if self
-            .shards
-            .reader_scope()
-            .is_some_and(|scope| scope != shard)
-        {
-            return Err(Error::Unavailable(format!(
-                "this reader does not serve shard {}",
-                shard.get()
-            )));
-        }
-        Ok((self.shards.require(shard).await?, namespace))
+        Ok((self.shards.require_served(shard).await?, namespace))
     }
 
     /// Runs a coordinator's query over the shard this reader serves.
@@ -618,25 +532,6 @@ impl ShardedLogs {
         let closed = self.shards.close_all().await;
         self.cache.close().await?;
         closed
-    }
-}
-
-fn sorted_union<T: Ord>(parts: Vec<Vec<T>>) -> Vec<T> {
-    parts
-        .into_iter()
-        .flatten()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-#[async_trait]
-impl ReaderShardLifecycle for ShardedLogs {
-    async fn reconcile_readers(
-        &self,
-        assignment: &ShardMap,
-    ) -> std::result::Result<(), sharding::BoxError> {
-        self.shards.reconcile(assignment).await.map_err(Into::into)
     }
 }
 
@@ -1059,7 +954,8 @@ mod tests {
         .unwrap();
 
         database
-            .reconcile_readers(&scaled(&assignment(1), 2, 1_000))
+            .shards()
+            .reconcile(&scaled(&assignment(1), 2, 1_000))
             .await
             .unwrap();
         assert_eq!(
@@ -1168,7 +1064,7 @@ mod tests {
             .await
             .unwrap();
         let namespace = Namespace::new("tenant").unwrap();
-        let h0 = (now_ns() / HOUR - 3) * HOUR;
+        let h0 = (common::time::now_ns() / HOUR - 3) * HOUR;
         let write = |offsets: &[i64]| {
             let entries = offsets
                 .iter()
@@ -1406,7 +1302,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Unavailable(_)));
+        assert!(matches!(
+            error,
+            Error::Shard(sharding::ShardSetError::NotServed(_))
+        ));
         for reader in [everything, coordinator] {
             reader.close().await.unwrap();
         }

@@ -2223,6 +2223,89 @@ fn push_sample(
     batches.push(labels, timestamp_ns, "", metadata, Some((rows, line_bytes)));
 }
 
+/// How a sample-only metric query reads each run of one segment.
+struct SamplePlan {
+    /// Runs no other run of their stream overlaps, by `(stream, object)`,
+    /// whose rows need no deduplication.
+    isolated: HashSet<(StreamId, u64)>,
+    /// The structured metadata fields read from each stream that reads any.
+    with_metadata: HashMap<StreamId, FieldSelection>,
+    /// Runs whose blocks are decoded, by `(stream, object, first block)`.
+    decoded: HashSet<(StreamId, u64, u32)>,
+}
+
+impl SamplePlan {
+    /// Plans the runs of `streams`, adding to `batches` those counted from
+    /// their index entries alone: isolated runs that read no metadata and
+    /// that no evaluation window splits.
+    fn new(streams: &[SegmentStream], read: &SampleRead, batches: &mut StreamBatches) -> Self {
+        let mut plan = Self {
+            isolated: HashSet::new(),
+            with_metadata: HashMap::new(),
+            decoded: HashSet::new(),
+        };
+        for stream in streams {
+            // `__error__` metadata fails the query, and an errored row keeps
+            // every error label, so a stream that may hold one reads all of
+            // its runs' metadata; deduplication compares rows across runs, so
+            // it must see the same fields of each.
+            let fields = if stream.may_fail() {
+                FieldSelection::All
+            } else {
+                read.metadata.fields(&stream.labels)
+            };
+            let metadata = !fields.is_none();
+            if metadata {
+                plan.with_metadata.insert(stream.stream_id, fields);
+            }
+            let alone = isolated_runs(&stream.runs);
+            for (&(object_id, run), alone) in stream.runs.iter().zip(alone) {
+                if alone && !metadata && !read.splits(run.min_timestamp_ns, run.max_timestamp_ns) {
+                    push_sample(
+                        batches,
+                        &stream.labels,
+                        run.min_timestamp_ns,
+                        (run.rows, run.line_bytes),
+                        &crate::Fields::default(),
+                    );
+                    continue;
+                }
+                if alone {
+                    plan.isolated.insert((stream.stream_id, object_id));
+                }
+                plan.decoded
+                    .insert((stream.stream_id, object_id, run.first_block));
+            }
+        }
+        plan
+    }
+
+    /// Read units of `streams` trimmed to the runs that are decoded.
+    ///
+    /// Planned over every run, as the query's page estimate is: dropping
+    /// counted runs first could split one unit into two and overrun it.
+    /// Sample-only metric queries skip line payloads, so one wider range per
+    /// object is cheaper than many sparse object-store reads.
+    fn units(&self, streams: &[SegmentStream]) -> Vec<ReadUnit> {
+        plan_reads(streams, false, u32::MAX)
+            .into_iter()
+            .filter_map(|mut unit| {
+                unit.runs.retain(|run| {
+                    self.decoded
+                        .contains(&(run.stream_id, run.object_id, run.run.first_block))
+                });
+                unit.first_block = unit.runs.iter().map(|run| run.run.first_block).min()?;
+                unit.end_block = unit
+                    .runs
+                    .iter()
+                    .map(|run| run.run.first_block + run.run.blocks)
+                    .max()?;
+                Some(unit)
+            })
+            .collect()
+    }
+}
+
 fn push_row_sample(batches: &mut StreamBatches, labels: &Arc<Labels>, sample: &RowSample) {
     let weight = (1, sample.line_len.into());
     push_sample(
@@ -2295,62 +2378,15 @@ impl LogDb {
         batches: &mut StreamBatches,
         consume: &mut impl FnMut(&mut StreamBatches) -> Result<()>,
     ) -> Result<()> {
-        let mut isolated = HashSet::new();
-        let mut with_metadata = HashMap::new();
-        let mut decoded = HashSet::new();
-        for stream in &streams {
-            // `__error__` metadata fails the query, and an errored row keeps
-            // every error label, so a stream that may hold one reads all of
-            // its runs' metadata; deduplication compares rows across runs, so
-            // it must see the same fields of each.
-            let fields = if stream.may_fail() {
-                FieldSelection::All
-            } else {
-                read.metadata.fields(&stream.labels)
-            };
-            let metadata = !fields.is_none();
-            if metadata {
-                with_metadata.insert(stream.stream_id, fields);
-            }
-            let alone = isolated_runs(&stream.runs);
-            for (&(object_id, run), alone) in stream.runs.iter().zip(alone) {
-                if alone && !metadata && !read.splits(run.min_timestamp_ns, run.max_timestamp_ns) {
-                    push_sample(
-                        batches,
-                        &stream.labels,
-                        run.min_timestamp_ns,
-                        (run.rows, run.line_bytes),
-                        &crate::Fields::default(),
-                    );
-                    continue;
-                }
-                if alone {
-                    isolated.insert((stream.stream_id, object_id));
-                }
-                decoded.insert((stream.stream_id, object_id, run.first_block));
-            }
-        }
+        let plan = SamplePlan::new(&streams, read, batches);
         consume(batches)?;
-        // Planned over every run, as the query's page estimate is: dropping
-        // counted runs first could split one unit into two and overrun it.
-        // Sample-only metric queries skip line payloads, so one wider range
-        // per object is cheaper than many sparse object-store reads.
-        let units = plan_reads(&streams, false, u32::MAX)
-            .into_iter()
-            .filter_map(|mut unit| {
-                unit.runs.retain(|run| {
-                    decoded.contains(&(run.stream_id, run.object_id, run.run.first_block))
-                });
-                unit.first_block = unit.runs.iter().map(|run| run.run.first_block).min()?;
-                unit.end_block = unit
-                    .runs
-                    .iter()
-                    .map(|run| run.run.first_block + run.run.blocks)
-                    .max()?;
-                Some(unit)
-            })
-            .collect::<Vec<_>>();
+        let units = plan.units(&streams);
         let shared_read = Arc::new(read.clone());
+        let SamplePlan {
+            isolated,
+            with_metadata,
+            ..
+        } = plan;
         let (isolated, with_metadata) = (&isolated, &with_metadata);
         let mut loaded = futures::stream::iter(units)
             .map(|unit| {

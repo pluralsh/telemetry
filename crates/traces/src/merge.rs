@@ -5,7 +5,7 @@
 //! Merge operator for trace heads, which the writer adds to without reading.
 
 use bytes::Bytes;
-use common::storage::{MergeOperator, default_merge_batch};
+use common::storage::{MergeOperator, decode_merge_operands, default_merge_batch};
 
 use crate::codec::{decode_head, encode_head, is_head_key, merge_heads};
 
@@ -16,20 +16,12 @@ impl MergeOperator for TracesMergeOperator {
         if !is_head_key(key) {
             return default_merge_batch(key, existing_value, operands, |_, _, value| value);
         }
-        // A merge cannot fail, and panicking would take down SlateDB
-        // compaction, so corrupt operands are dropped and reported.
-        let merged = existing_value
-            .iter()
-            .chain(operands)
-            .filter_map(|value| match decode_head(value) {
-                Ok(head) => Some(head),
-                Err(error) => {
-                    tracing::error!(%error, "dropping corrupt trace head operand");
-                    ::metrics::counter!("traces_corrupt_merge_operands_total").increment(1);
-                    None
-                }
-            })
-            .reduce(merge_heads);
+        let merged = decode_merge_operands(
+            existing_value.iter().chain(operands),
+            decode_head,
+            "traces_corrupt_merge_operands_total",
+        )
+        .reduce(merge_heads);
         match merged {
             Some(head) => encode_head(&head).expect("trace heads encode into memory"),
             None => operands

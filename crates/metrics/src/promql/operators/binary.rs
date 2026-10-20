@@ -525,28 +525,13 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
                         );
                     }
 
-                    // Prometheus counts every pair whose operation is defined
-                    // for its operand types, including comparisons that filter
-                    // the sample out; only incompatible or failed
-                    // float/histogram pairs skip the cardinality check.
-                    let matched = match (Operand::of(l_cell, l_h), Operand::of(r_cell, r_h)) {
-                        (Some(Operand::Float(_)), Some(Operand::Float(_))) => true,
-                        (Some(Operand::Histogram(_)), Some(Operand::Histogram(_)))
-                            if matches!(
-                                self.kind,
-                                BinaryOpKind::Eq { .. } | BinaryOpKind::Ne { .. }
-                            ) =>
-                        {
-                            true
-                        }
-                        _ => {
-                            out.validity.get(out_idx)
-                                || out_hist
-                                    .as_ref()
-                                    .is_some_and(|cells| cells[out_idx].is_some())
-                        }
+                    let wrote = || {
+                        out.validity.get(out_idx)
+                            || out_hist
+                                .as_ref()
+                                .is_some_and(|cells| cells[out_idx].is_some())
                     };
-                    if matched
+                    if self.pair_matches(Operand::of(l_cell, l_h), Operand::of(r_cell, r_h), wrote)
                         && let Some(&key) = shared.row_many.get(out_row)
                         && key != NO_SERIES
                     {
@@ -575,6 +560,26 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
             ),
             out_hist,
         ))
+    }
+
+    /// Whether a pair counts toward the many-to-one cardinality check.
+    /// Prometheus counts every pair whose operation is defined for its
+    /// operand types, including comparisons that filter the sample out; only
+    /// incompatible or failed float/histogram pairs, which `wrote` no output
+    /// cell, are skipped.
+    fn pair_matches(
+        &self,
+        lhs: Option<Operand<'_>>,
+        rhs: Option<Operand<'_>>,
+        wrote: impl FnOnce() -> bool,
+    ) -> bool {
+        match (lhs, rhs) {
+            (Some(Operand::Float(_)), Some(Operand::Float(_))) => true,
+            (Some(Operand::Histogram(_)), Some(Operand::Histogram(_))) => {
+                matches!(self.kind, BinaryOpKind::Eq { .. } | BinaryOpKind::Ne { .. }) || wrote()
+            }
+            _ => wrote(),
+        }
     }
 
     /// Set-operator loop, following Prometheus `VectorAnd` / `VectorOr` /

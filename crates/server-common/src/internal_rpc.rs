@@ -8,16 +8,19 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Mutex, PoisonError},
 };
 
 use sharding::{ForwardError, RouteError, ShardId, ShardMap};
 use subtle::ConstantTimeEq;
 use tonic::{
-    Code, Request, Status,
+    Code, Request, Response, Status,
     metadata::{MetadataMap, MetadataValue},
     transport::{Channel, Endpoint},
 };
+
+use crate::ApiError;
 
 const AUTHORIZATION: &str = "authorization";
 
@@ -129,6 +132,31 @@ pub fn forward_error<E>(status: &Status, error: impl FnOnce(&Status) -> E) -> Fo
     } else {
         ForwardError::Failed(error(status))
     }
+}
+
+/// Forwards `message` to the writer at `endpoint` with `send`, which calls
+/// the product's internal writer client on the pooled channel.
+pub async fn forward_write<M, R, F, Fut>(
+    channels: &ChannelPool,
+    endpoint: &str,
+    token: Option<&str>,
+    message: M,
+    send: F,
+) -> Result<(), ForwardError<ApiError>>
+where
+    F: FnOnce(Channel, Request<M>) -> Fut,
+    Fut: Future<Output = Result<Response<R>, Status>>,
+{
+    let unavailable = |status: &Status| ApiError::unavailable(status);
+    let channel = channels
+        .channel(endpoint)
+        .map_err(|status| ForwardError::Failed(unavailable(&status)))?;
+    let mut request = Request::new(message);
+    authorize(&mut request, token).map_err(|status| ForwardError::Failed(unavailable(&status)))?;
+    send(channel, request)
+        .await
+        .map(drop)
+        .map_err(|status| forward_error(&status, unavailable))
 }
 
 pub fn route_status(error: &RouteError) -> Status {

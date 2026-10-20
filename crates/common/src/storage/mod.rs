@@ -322,6 +322,24 @@ pub fn default_merge_batch(
     result.expect("merge_batch called with no existing value and no operands")
 }
 
+/// Decodes the values of a merge, dropping corrupt ones: a merge cannot fail,
+/// and panicking would take down SlateDB compaction. Each dropped value is
+/// logged and counted in `corrupt_counter`.
+pub fn decode_merge_operands<'a, T, E: std::fmt::Display>(
+    values: impl Iterator<Item = &'a Bytes>,
+    decode: impl Fn(&[u8]) -> Result<T, E>,
+    corrupt_counter: &'static str,
+) -> impl Iterator<Item = T> {
+    values.filter_map(move |value| match decode(value) {
+        Ok(decoded) => Some(decoded),
+        Err(error) => {
+            tracing::error!(%error, counter = corrupt_counter, "dropping corrupt merge operand");
+            metrics::counter!(corrupt_counter).increment(1);
+            None
+        }
+    })
+}
+
 /// Iterator over storage records.
 #[async_trait]
 pub trait StorageIterator {

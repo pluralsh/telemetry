@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     future::Future,
     sync::{
         Arc, OnceLock,
@@ -8,16 +8,24 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream};
+use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::{SharedDbCache, WarmWindow};
+use futures::{
+    StreamExt, TryStreamExt,
+    future::{BoxFuture, try_join, try_join_all},
+    stream,
+};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ShardId, ShardMap, ShardingOptions};
+use crate::{BoxError, ReaderShardLifecycle, ShardId, ShardMap, ShardingOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShardSetError {
     #[error("shard {0} is not open on this node")]
     NotOpen(ShardId),
+    #[error("this reader does not serve shard {0}")]
+    NotServed(ShardId),
     #[error("shard {0} database still has in-flight references")]
     InFlight(ShardId),
     #[error("reader reconciliation requires a reader facade")]
@@ -143,6 +151,15 @@ impl<D: ShardDatabase> ShardSet<D> {
 
     pub async fn require(&self, shard: ShardId) -> Result<Arc<D>, ShardSetError> {
         self.get(shard).await.ok_or(ShardSetError::NotOpen(shard))
+    }
+
+    /// The shard a coordinating reader asks this one to read, which must be
+    /// open and, for a reader group member, its own.
+    pub async fn require_served(&self, shard: ShardId) -> Result<Arc<D>, ShardSetError> {
+        if self.reader_scope().is_some_and(|scope| scope != shard) {
+            return Err(ShardSetError::NotServed(shard));
+        }
+        self.require(shard).await
     }
 
     pub async fn contains(&self, shard: ShardId) -> bool {
@@ -297,6 +314,31 @@ impl<D: ShardDatabase> ShardSet<D> {
         .await
     }
 
+    /// [`Self::fan_out`] alongside `read_remote` on every shard in `remotes`,
+    /// the shards other reader groups serve. Local results come first, in
+    /// shard order, then remote ones in `remotes` order.
+    pub async fn fan_out_with_remote<'r, R, T, E, F, Fut, G, RemoteFut>(
+        &self,
+        remotes: &'r [R],
+        read: F,
+        read_remote: G,
+    ) -> Result<Vec<T>, E>
+    where
+        E: From<ShardSetError>,
+        F: Fn(Arc<D>) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        G: Fn(&'r R) -> RemoteFut,
+        RemoteFut: Future<Output = Result<T, E>>,
+    {
+        let (mut results, remote) = try_join(
+            self.fan_out(read),
+            try_join_all(remotes.iter().map(read_remote)),
+        )
+        .await?;
+        results.extend(remote);
+        Ok(results)
+    }
+
     /// Reserves up to `concurrency` I/O permits (clamped to the process
     /// budget). Returns `None` when `cancel` fires first.
     pub async fn reserve_io(
@@ -314,30 +356,98 @@ impl<D: ShardDatabase> ShardSet<D> {
         }
     }
 
-    /// Warms every open shard sequentially under one reservation of up to
-    /// `concurrency` I/O permits.
-    pub async fn warm<E, F, Fut>(
+    /// Starts a pass warming `window` of every open shard into
+    /// `budget_percent` of `cache`'s metadata cache, holding up to
+    /// `concurrency` I/O permits until [`ShardWarmPass::finish`]. Without a
+    /// metadata cache only the payload window is warmed. Returns `None` when
+    /// there is nothing to warm or `cancel` fires first.
+    pub async fn start_warm(
         &self,
+        cache: &SharedDbCache,
+        window: WarmWindow,
         concurrency: usize,
         cancel: &CancellationToken,
-        warm: F,
-    ) -> Result<(), E>
-    where
-        E: From<ShardSetError>,
-        F: Fn(Arc<D>, usize) -> Fut,
-        Fut: Future<Output = Result<(), E>>,
-    {
-        let Some((_permits, concurrency)) = self.reserve_io(concurrency, cancel).await? else {
-            return Ok(());
+        budget_percent: u8,
+    ) -> Result<Option<ShardWarmPass<D>>, ShardSetError> {
+        let budget = WarmBudget::of(cache, budget_percent);
+        let window = if budget.is_some() {
+            window
+        } else {
+            window.payloads_only()
         };
-        for database in self.databases().await {
-            if cancel.is_cancelled() {
-                return Ok(());
-            }
-            warm(database, concurrency).await?;
+        if budget.is_none() && window.payloads.is_none() {
+            return Ok(None);
         }
-        Ok(())
+        let Some((permits, concurrency)) = self.reserve_io(concurrency, cancel).await? else {
+            return Ok(None);
+        };
+        Ok(Some(ShardWarmPass {
+            databases: self.databases().await,
+            window,
+            budget: budget.unwrap_or(WarmBudget::UNBOUNDED),
+            concurrency,
+            _permits: permits,
+        }))
     }
+}
+
+/// A warming pass over the shards open when it started; see
+/// [`ShardSet::start_warm`]. The caller plans each database's SSTs, then
+/// [`Self::finish`] warms the plan.
+pub struct ShardWarmPass<D> {
+    databases: Vec<Arc<D>>,
+    /// The window to plan, narrowed to payloads without a metadata cache.
+    pub window: WarmWindow,
+    budget: WarmBudget,
+    concurrency: usize,
+    _permits: OwnedSemaphorePermit,
+}
+
+impl<D> ShardWarmPass<D> {
+    pub fn databases(&self) -> &[Arc<D>] {
+        &self.databases
+    }
+
+    /// Warms `plan`; see [`warm_planned`].
+    pub async fn finish(
+        self,
+        product: &'static str,
+        plan: WarmPlan,
+        cancel: &CancellationToken,
+        ledger: &WarmLedger,
+    ) -> WarmReport {
+        warm_planned(
+            product,
+            plan,
+            self.budget,
+            self.window.payloads.is_some(),
+            self.concurrency,
+            cancel,
+            ledger,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl<D> ReaderShardLifecycle for ShardSet<D>
+where
+    D: ShardDatabase,
+    D::Error: Into<BoxError>,
+{
+    async fn reconcile_readers(&self, assignment: &ShardMap) -> Result<(), BoxError> {
+        self.reconcile(assignment).await.map_err(Into::into)
+    }
+}
+
+/// The sorted, deduplicated union of per-shard results.
+pub fn sorted_union<T: Ord>(parts: impl IntoIterator<Item = Vec<T>>) -> Vec<T> {
+    parts
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

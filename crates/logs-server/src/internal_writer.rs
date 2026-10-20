@@ -101,10 +101,7 @@ impl InternalWriter for AppState {
         let token = self
             .config
             .auth
-            .internal
-            .as_ref()
-            .map(|secret| secret.expose())
-            .transpose()
+            .internal_token()
             .map_err(|error| Status::internal(error.to_string()))?;
         internal_rpc::verify(request.metadata(), token.as_deref())?;
         let request = request.into_inner();

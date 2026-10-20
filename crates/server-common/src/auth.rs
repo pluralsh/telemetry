@@ -73,6 +73,13 @@ pub struct AuthConfig {
     pub internal: Option<Secret>,
 }
 
+impl AuthConfig {
+    /// The internal cluster credential, when one is configured.
+    pub fn internal_token(&self) -> Result<Option<String>, SecretError> {
+        self.internal.as_ref().map(Secret::expose).transpose()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JwtConfig {

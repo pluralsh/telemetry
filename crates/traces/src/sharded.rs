@@ -1,15 +1,15 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
 use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
-use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport};
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
-    ReaderShardLifecycle, ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions,
-    shard_opener,
+    ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions, shard_opener,
+    sorted_union,
 };
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +47,15 @@ fn shard_config(config: &Config, shard: ShardId) -> Config {
         .storage
         .with_path_suffix(&ShardingOptions::shard_suffix(shard));
     config
+}
+
+/// Where a scanned trace came from: the index of an open shard, which
+/// returns only IDs, or of a remote shard's trace, which arrives loaded.
+/// Among equal trace IDs, local sources sort first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ScanSource {
+    Local(usize),
+    Remote(usize),
 }
 
 /// A facade over independently opened storage-shard trace databases.
@@ -104,17 +113,12 @@ impl ShardedTraces {
     }
 
     async fn new(shards: Result<ShardSet<TraceDb>>, cache: SharedDbCache) -> Result<Self> {
-        match shards {
-            Ok(shards) => Ok(Self {
-                shards: Arc::new(shards),
-                cache,
-                remote: OnceLock::new(),
-            }),
-            Err(error) => {
-                cache.close().await?;
-                Err(error)
-            }
-        }
+        let shards = cache.close_if_failed(shards).await?;
+        Ok(Self {
+            shards: Arc::new(shards),
+            cache,
+            remote: OnceLock::new(),
+        })
     }
 
     /// The open storage shards, for ownership lifecycle management.
@@ -153,8 +157,7 @@ impl ShardedTraces {
     /// Warms the SSTs of `window` across every open shard and namespace,
     /// newest segment first, into `budget_percent` of the metadata cache.
     /// SSTs `ledger` holds are skipped, and those compaction removed are
-    /// evicted; see [`warm_planned`]. Without a metadata cache only the
-    /// payload window is warmed.
+    /// evicted; see [`ShardSet::start_warm`].
     pub async fn warm_recent(
         &self,
         namespaces: &[Namespace],
@@ -164,36 +167,23 @@ impl ShardedTraces {
         ledger: &WarmLedger,
         budget_percent: u8,
     ) -> Result<WarmReport> {
-        let budget = WarmBudget::of(&self.cache, budget_percent);
-        let window = if budget.is_some() {
-            window
-        } else {
-            window.payloads_only()
-        };
-        if budget.is_none() && window.payloads.is_none() {
-            return Ok(WarmReport::default());
-        }
-        let Some((_permits, concurrency)) = self.shards.reserve_io(concurrency, cancel).await?
+        let Some(pass) = self
+            .shards
+            .start_warm(&self.cache, window, concurrency, cancel, budget_percent)
+            .await?
         else {
             return Ok(WarmReport::default());
         };
         let mut plan = WarmPlan::default();
-        for database in self.shards.databases().await {
+        for database in pass.databases() {
             if cancel.is_cancelled() {
                 return Ok(WarmReport::default());
             }
-            database.plan_warm(namespaces, window, &mut plan).await?;
+            database
+                .plan_warm(namespaces, pass.window, &mut plan)
+                .await?;
         }
-        Ok(warm_planned(
-            "traces",
-            plan,
-            budget.unwrap_or(WarmBudget::UNBOUNDED),
-            window.payloads.is_some(),
-            concurrency,
-            cancel,
-            ledger,
-        )
-        .await)
+        Ok(pass.finish("traces", plan, cancel, ledger).await)
     }
 
     /// Writes to shards opened locally; every routed shard must be open.
@@ -258,19 +248,16 @@ impl ShardedTraces {
         end_ns: u64,
         matchers: &[AttributeMatcher],
     ) -> Result<Vec<Trace>> {
-        let remote = self.remote_shards();
-        let (mut per_shard, remote) = try_join(
-            self.shards.fan_out(|database| async move {
-                database.search(namespace, start_ns, end_ns, matchers).await
-            }),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.search(namespace, start_ns, end_ns, matchers)),
-            ),
-        )
-        .await?;
-        per_shard.extend(remote);
+        let per_shard =
+            self.shards
+                .fan_out_with_remote(
+                    &self.remote_shards(),
+                    |database| async move {
+                        database.search(namespace, start_ns, end_ns, matchers).await
+                    },
+                    |shard| shard.search(namespace, start_ns, end_ns, matchers),
+                )
+                .await?;
         let multiple_shards = per_shard.len() > 1;
         let mut results = per_shard.into_iter().flatten().collect::<Vec<_>>();
         if multiple_shards {
@@ -303,38 +290,40 @@ impl ShardedTraces {
         let mut selected = scanned
             .iter()
             .enumerate()
-            .flat_map(|(shard, (_, ids))| ids.iter().map(move |id| (id.trace_id, shard)))
+            .flat_map(|(shard, (_, ids))| {
+                ids.iter()
+                    .map(move |id| (id.trace_id, ScanSource::Local(shard)))
+            })
             .chain(
                 remote
                     .iter()
                     .enumerate()
-                    .map(|(index, trace)| (trace.trace_id, scanned.len() + index)),
+                    .map(|(index, trace)| (trace.trace_id, ScanSource::Remote(index))),
             )
             .collect::<Vec<_>>();
         selected.sort_unstable();
         selected.truncate(limit);
         let keep = selected.into_iter().collect::<HashSet<_>>();
         for (shard, (_, ids)) in scanned.iter_mut().enumerate() {
-            ids.retain(|id| keep.contains(&(id.trace_id, shard)));
+            ids.retain(|id| keep.contains(&(id.trace_id, ScanSource::Local(shard))));
         }
-        let local_count = scanned.len();
 
-        let loaded = futures::future::try_join_all(
-            scanned.into_iter().filter(|(_, ids)| !ids.is_empty()).map(
-                |(database, ids)| async move {
-                    self.shards
-                        .with_io(database.load_scanned(namespace, ids))
-                        .await
-                },
-            ),
-        )
+        let loaded = try_join_all(scanned.into_iter().filter(|(_, ids)| !ids.is_empty()).map(
+            |(database, ids)| async move {
+                self.shards
+                    .with_io(database.load_scanned(namespace, ids))
+                    .await
+            },
+        ))
         .await?;
         let mut results = loaded.into_iter().flatten().collect::<Vec<_>>();
         results.extend(
             remote
                 .into_iter()
                 .enumerate()
-                .filter(|(index, trace)| keep.contains(&(trace.trace_id, local_count + index)))
+                .filter(|(index, trace)| {
+                    keep.contains(&(trace.trace_id, ScanSource::Remote(*index)))
+                })
                 .map(|(_, trace)| trace),
         );
         results.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
@@ -348,21 +337,18 @@ impl ShardedTraces {
         end_ns: u64,
         scope: Option<AttributeScope>,
     ) -> Result<Vec<String>> {
-        let remote = self.remote_shards();
-        let (mut names, remote) = try_join(
-            self.shards.fan_out(|database| async move {
-                database
-                    .catalog_names(namespace, start_ns, end_ns, scope)
-                    .await
-            }),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.catalog_names(namespace, start_ns, end_ns, scope)),
-            ),
-        )
-        .await?;
-        names.extend(remote);
+        let names = self
+            .shards
+            .fan_out_with_remote(
+                &self.remote_shards(),
+                |database| async move {
+                    database
+                        .catalog_names(namespace, start_ns, end_ns, scope)
+                        .await
+                },
+                |shard| shard.catalog_names(namespace, start_ns, end_ns, scope),
+            )
+            .await?;
         Ok(sorted_union(names))
     }
 
@@ -374,21 +360,18 @@ impl ShardedTraces {
         scope: Option<AttributeScope>,
         name: &str,
     ) -> Result<Vec<DiscoveryValue>> {
-        let remote = self.remote_shards();
-        let (mut values, remote) = try_join(
-            self.shards.fan_out(|database| async move {
-                database
-                    .catalog_values(namespace, start_ns, end_ns, scope, name)
-                    .await
-            }),
-            try_join_all(
-                remote
-                    .iter()
-                    .map(|shard| shard.catalog_values(namespace, start_ns, end_ns, scope, name)),
-            ),
-        )
-        .await?;
-        values.extend(remote);
+        let values = self
+            .shards
+            .fan_out_with_remote(
+                &self.remote_shards(),
+                |database| async move {
+                    database
+                        .catalog_values(namespace, start_ns, end_ns, scope, name)
+                        .await
+                },
+                |shard| shard.catalog_values(namespace, start_ns, end_ns, scope, name),
+            )
+            .await?;
         Ok(sorted_union(values))
     }
 
@@ -498,17 +481,7 @@ impl ShardedTraces {
     /// must be the shard this reader serves.
     async fn served(&self, read: Option<&pb::ShardRead>) -> Result<(Arc<TraceDb>, Namespace)> {
         let (shard, namespace) = read_from_wire(read)?;
-        if self
-            .shards
-            .reader_scope()
-            .is_some_and(|scope| scope != shard)
-        {
-            return Err(Error::Unavailable(format!(
-                "this reader does not serve shard {}",
-                shard.get()
-            )));
-        }
-        Ok((self.shards.require(shard).await?, namespace))
+        Ok((self.shards.require_served(shard).await?, namespace))
     }
 
     pub async fn serve_get_trace(
@@ -660,25 +633,6 @@ impl ShardedTraces {
         let closed = self.shards.close_all().await;
         self.cache.close().await?;
         closed
-    }
-}
-
-fn sorted_union<T: Ord>(parts: Vec<Vec<T>>) -> Vec<T> {
-    parts
-        .into_iter()
-        .flatten()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-#[async_trait]
-impl ReaderShardLifecycle for ShardedTraces {
-    async fn reconcile_readers(
-        &self,
-        assignment: &ShardMap,
-    ) -> std::result::Result<(), sharding::BoxError> {
-        self.shards.reconcile(assignment).await.map_err(Into::into)
     }
 }
 
@@ -888,7 +842,8 @@ mod tests {
         .unwrap();
 
         database
-            .reconcile_readers(&scaled(&assignment(1), 2, 1_000))
+            .shards()
+            .reconcile(&scaled(&assignment(1), 2, 1_000))
             .await
             .unwrap();
         assert_eq!(
@@ -1225,7 +1180,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Unavailable(_)));
+        assert!(matches!(
+            error,
+            Error::Shard(sharding::ShardSetError::NotServed(_))
+        ));
         coordinator.close().await.unwrap();
         everything.close().await.unwrap();
     }

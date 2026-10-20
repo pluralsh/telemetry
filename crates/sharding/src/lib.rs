@@ -38,7 +38,10 @@ pub use router::{
     shard_request_id,
 };
 pub use runtime::{ManagerError, OwnershipManager, OwnershipManagerConfig, OwnershipState};
-pub use shard_set::{ShardDatabase, ShardOpener, ShardRole, ShardSet, ShardSetError, shard_opener};
+pub use shard_set::{
+    ShardDatabase, ShardOpener, ShardRole, ShardSet, ShardSetError, ShardWarmPass, shard_opener,
+    sorted_union,
+};
 pub use traits::{
     AssignmentStore, BoxError, LeaseBackend, OwnerResolver, ReaderShardLifecycle, ResolvedOwner,
     ShardLifecycle,

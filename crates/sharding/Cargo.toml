@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
+common = { path = "../common" }
 futures.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
