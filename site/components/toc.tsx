@@ -25,29 +25,27 @@ export function Toc() {
   }, [pathname]);
 
   if (headings.length < 2) return null;
+  const current = active || headings[0].id;
   return (
-    <div className="text-[12.5px] tracking-[-0.2px]">
-      <div className="mb-3 font-serif text-[13px] text-ink">On this page</div>
-      <ul className="flex flex-col gap-[3px]">
-        {headings.map((h) => (
-          <li key={h.id}>
-            <a
-              href={`#${h.id}`}
-              className={`flex items-baseline gap-2 py-[2px] transition-colors ${
-                active === h.id ? "text-accent-text" : "text-muted hover:text-ink"
-              } ${h.level === 3 ? "pl-4" : ""}`}
-            >
-              <span
-                aria-hidden
-                className={`inline-block size-[5px] shrink-0 -translate-y-px rotate-45 border ${
-                  active === h.id ? "border-accent-text bg-accent-text" : "border-line-strong"
-                }`}
-              />
-              {h.text}
-            </a>
-          </li>
-        ))}
+    <nav aria-label="On this page" className="pb-8">
+      <div className="label mb-3 mt-9 text-[12px]">On this page</div>
+      <ul className="border-l-2 border-line">
+        {headings.map((h) => {
+          const on = current === h.id;
+          return (
+            <li key={h.id}>
+              <a
+                href={`#${h.id}`}
+                className={`-ml-[2px] block border-l-2 py-1 pr-3 text-[14px] leading-[1.45] transition-colors ${
+                  on ? "border-accent text-accent-text" : "border-transparent text-muted hover:text-ink"
+                } ${h.level === 3 ? "pl-6" : "pl-3"}`}
+              >
+                {h.text}
+              </a>
+            </li>
+          );
+        })}
       </ul>
-    </div>
+    </nav>
   );
 }

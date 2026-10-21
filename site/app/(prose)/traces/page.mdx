@@ -1,13 +1,10 @@
 import { PageHeader } from "@/components/doc-page";
-import { SpaceIcon } from "@/components/icons";
 import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
 import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
 
 export const metadata = { title: "Traces architecture" };
 
 <PageHeader
-  icon={<SpaceIcon space="traces" size={28} />}
-  eyebrow="Traces"
   title="Architecture"
   lede="A Tempo-compatible trace database on SlateDB. It takes OTLP, Zipkin and Jaeger, answers TraceQL and trace-by-ID lookups, and runs as two StatefulSets and a bucket."
 />

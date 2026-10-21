@@ -1,26 +1,12 @@
 import type { Metadata } from "next";
-import localFont from "next/font/local";
 import { ThemeProvider } from "next-themes";
-import "@fontsource/ibm-plex-serif/300.css";
-import "@fontsource/ibm-plex-serif/300-italic.css";
-import "@fontsource/ibm-plex-serif/400.css";
-import "@fontsource/ibm-plex-serif/400-italic.css";
-import "@fontsource/lilex/400.css";
+import "@fontsource/newsreader/400.css";
+import "@fontsource/newsreader/400-italic.css";
 import "./globals.css";
 import { DocsShell } from "@/components/docs-shell";
 import { loadSpec } from "@/lib/openapi";
 import { PRODUCT_IDS } from "@/lib/nav";
 import type { ApiNav } from "@/components/sidebar";
-
-const writer = localFont({
-  src: [
-    { path: "./fonts/iAWriterQuattroS-Regular.woff2", weight: "400", style: "normal" },
-    { path: "./fonts/iAWriterQuattroS-Italic.woff2", weight: "400", style: "italic" },
-    { path: "./fonts/iAWriterQuattroS-Bold.woff2", weight: "700", style: "normal" },
-  ],
-  variable: "--font-writer",
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://telemetry.plural.sh"),
@@ -59,9 +45,9 @@ function buildApiNav(): ApiNav {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={writer.variable} suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <body>
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+        <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
           <DocsShell apiNav={buildApiNav()}>{children}</DocsShell>
         </ThemeProvider>
       </body>

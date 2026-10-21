@@ -1,40 +1,46 @@
+import { Breadcrumbs, PageFooter, PrevNext } from "./page-chrome";
 import { Toc } from "./toc";
 
-/** Prose page frame: article column plus an "On this page" rail behind a vertical rule. */
-export function DocPage({ children }: { children: React.ReactNode }) {
+/**
+ * Centered content column with breadcrumbs, prev/next and footer. `wide` is for
+ * reference pages (API, benchmarks) that need room for tables and charts.
+ */
+export function PageFrame({ children, wide = false }: { children: React.ReactNode; wide?: boolean }) {
   return (
-    <div className="flex min-h-[calc(100vh-57px)]">
-      <div className="min-w-0 flex-1">
-        <article className="prose-docs mx-auto max-w-[800px] px-6 pb-24 pt-12 sm:px-10 lg:pt-16">{children}</article>
+    <div
+      className={`flex min-h-[calc(100vh-60px)] w-full min-w-0 flex-col pb-6 pt-9 ${
+        wide ? "max-w-[1120px] min-[1588px]:max-w-[1280px]" : "max-w-[820px] min-[1588px]:max-w-[880px]"
+      }`}
+    >
+      <Breadcrumbs />
+      {children}
+      <div className="mb-6 mt-16 border-t border-line pt-6">
+        <PrevNext />
       </div>
-      <div className="hidden w-60 shrink-0 border-l border-line xl:block">
-        <div className="sticky top-[57px] px-6 py-12 lg:py-16">
-          <Toc />
-        </div>
-      </div>
+      <PageFooter />
     </div>
   );
 }
 
-export function PageHeader({
-  eyebrow,
-  title,
-  lede,
-  icon,
-}: {
-  eyebrow: string;
-  title: string;
-  lede?: React.ReactNode;
-  icon?: React.ReactNode;
-}) {
+/** Prose page: article column plus a sticky "On this page" rail on wide screens. */
+export function DocPage({ children }: { children: React.ReactNode }) {
   return (
-    <header className="not-prose mb-12">
-      <div className="mb-5 flex items-center gap-2.5">
-        {icon}
-        <span className="eyebrow">{eyebrow}</span>
-      </div>
-      <h1 className="font-serif text-[2.6rem] font-light leading-[1.12] tracking-[-0.02em] text-ink">{title}</h1>
-      {lede && <p className="mt-4 max-w-[620px] text-[16px] leading-[1.6] tracking-[-0.4px] text-fg">{lede}</p>}
+    <div className="flex items-start justify-center px-6 lg:px-8 min-[1588px]:px-16">
+      <PageFrame>
+        <article className="prose-docs">{children}</article>
+      </PageFrame>
+      <aside className="thin-scroll sticky top-[60px] ml-8 hidden max-h-[calc(100vh-60px)] w-[220px] shrink-0 overflow-y-auto xl:block">
+        <Toc />
+      </aside>
+    </div>
+  );
+}
+
+export function PageHeader({ title, lede }: { title: string; lede?: React.ReactNode }) {
+  return (
+    <header className="not-prose mb-8 flex flex-col gap-2.5 border-b border-line pb-[18px]">
+      <h1 className="font-serif text-[clamp(36px,4.4vw,52px)] font-normal leading-[1.05] tracking-[-0.02em] text-ink">{title}</h1>
+      {lede && <p className="text-[18px] leading-[1.5] text-muted">{lede}</p>}
     </header>
   );
 }

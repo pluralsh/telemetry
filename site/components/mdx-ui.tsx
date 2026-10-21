@@ -3,21 +3,51 @@ import { PRODUCTS, PRODUCT_IDS } from "@/lib/nav";
 import { ArrowRight, PluralMark, SpaceIcon } from "./icons";
 import { ProductScene } from "./scenes";
 
+const CALLOUT_TONES = {
+  note: {
+    color: "var(--violet)",
+    label: "Info",
+    icon: (
+      <>
+        <circle cx="8" cy="8" r="6.25" />
+        <path d="M8 7.25v4M8 4.75v.5" />
+      </>
+    ),
+  },
+  warn: {
+    color: "var(--warning)",
+    label: "Warning",
+    icon: (
+      <>
+        <path d="M8 2 14.5 13.5h-13L8 2Z" strokeLinejoin="round" />
+        <path d="M8 6.5v3.25M8 11.5v.5" />
+      </>
+    ),
+  },
+} as const;
+
+/** Tinted callout matching the main docs: colored label row, then title and body in ink. */
 export function Callout({ title, children, tone = "note" }: { title?: string; children: React.ReactNode; tone?: "note" | "warn" }) {
-  const color = tone === "warn" ? "var(--traces)" : "var(--accent-text)";
+  const { color, label, icon } = CALLOUT_TONES[tone];
   return (
-    <div className="not-prose card relative px-4 py-3.5 text-[14px] leading-relaxed">
-      <span aria-hidden className="absolute inset-y-3 left-0 w-px" style={{ background: color }} />
-      {title && (
-        <div className="mb-1 flex items-center gap-2 font-serif text-[14.5px] text-ink">
-          <span aria-hidden className="inline-block size-[6px] rotate-45" style={{ background: color }} />
-          {title}
-        </div>
-      )}
-      <div className="text-fg [&_a]:text-accent-text [&_a]:underline [&_a]:underline-offset-2 [&_code]:font-mono [&_code]:text-[12.5px] [&_code]:text-ink">
+    <aside
+      className="not-prose flex flex-col gap-2 rounded-[4px] px-5 py-4 text-[15px] leading-[1.65]"
+      style={{
+        backgroundColor: `color-mix(in srgb, ${color} var(--callout-tint), var(--panel))`,
+        border: `1px solid color-mix(in srgb, ${color} var(--callout-border), transparent)`,
+      }}
+    >
+      <div className="label flex items-center gap-2" style={{ color }}>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" aria-hidden>
+          {icon}
+        </svg>
+        {label}
+      </div>
+      {title && <div className="font-medium text-ink">{title}</div>}
+      <div className="text-ink [&_a]:text-accent-text [&_a]:underline [&_a]:decoration-[var(--accent-ring)] [&_a]:underline-offset-[3px] [&_code]:rounded-[4px] [&_code]:bg-code-inline [&_code]:px-[0.36em] [&_code]:py-[0.12em] [&_code]:font-mono [&_code]:text-[0.86em]">
         {children}
       </div>
-    </div>
+    </aside>
   );
 }
 
@@ -35,7 +65,7 @@ export function ProductCards() {
             <div className="flex flex-1 flex-col gap-2 p-4">
               <div className="flex items-center gap-2">
                 <SpaceIcon space={id} size={18} />
-                <span className="font-serif text-[18px] text-ink">{p.name}</span>
+                <span className="text-[17px] font-medium text-ink">{p.name}</span>
                 <span className="leader" />
                 <span className="eyebrow">{p.peer}</span>
               </div>
@@ -54,8 +84,8 @@ export function ProductCards() {
 export function Hero() {
   return (
     <header className="not-prose relative mb-10">
-      <h1 className="font-serif text-[2.9rem] font-light leading-[1.08] tracking-[-0.025em] text-ink sm:text-[3.4rem]">
-        Unbelievably <em className="font-light text-accent-text">Simple</em> Observability
+      <h1 className="font-serif text-[2.9rem] font-normal leading-[1.05] tracking-[-0.02em] text-ink sm:text-[3.4rem]">
+        Unbelievably <em className="text-accent-text">Simple</em> Observability
       </h1>
       <p className="mt-6 max-w-[600px] text-[16px] leading-[1.6] tracking-[-0.4px] text-fg">
         Plural Telemetry is a Rust reimplementation of Prometheus, Loki and Tempo, built with{" "}
@@ -91,7 +121,7 @@ export function Hero() {
 export function Stat({ value, label }: { value: string; label: string }) {
   return (
     <div className="px-5 py-5 [&+&]:border-l [&+&]:border-line max-md:[&:nth-child(3)]:border-l-0 max-md:[&:nth-child(n+3)]:border-t">
-      <div className="font-serif text-[30px] font-light leading-none tabular-nums text-ink">{value}</div>
+      <div className="font-serif text-[32px] leading-none tabular-nums text-ink">{value}</div>
       <div className="mt-2 text-[12.5px] leading-snug text-fg">{label}</div>
     </div>
   );

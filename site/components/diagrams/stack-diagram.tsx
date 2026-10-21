@@ -75,7 +75,7 @@ export function StackDiagram({ animated = true, showControls = true }: { animate
             <g transform={`translate(${c.x + 24} ${108})`}>
               <c.Icon size={28} />
             </g>
-            <text x={c.x + 74} y={119} className="fill-ink font-serif" fontSize={21}>
+            <text x={c.x + 74} y={119} className="fill-ink font-medium" fontSize={21}>
               {c.name}
             </text>
             <text x={c.x + 74} y={137} className="fill-muted" fontSize={11.5} fontStyle="italic">
@@ -96,7 +96,7 @@ export function StackDiagram({ animated = true, showControls = true }: { animate
 
         {/* SlateDB band */}
         <rect x={40} y={262} width={800} height={136} rx={3} fill="var(--panel)" stroke="var(--ink)" strokeOpacity={0.55} />
-        <text x={62} y={286} className="fill-ink font-serif" fontSize={22}>
+        <text x={62} y={286} className="fill-ink font-medium" fontSize={22}>
           SlateDB
         </text>
         <text x={152} y={286} className="fill-muted" fontSize={11.5} fontStyle="italic">
@@ -134,7 +134,7 @@ export function StackDiagram({ animated = true, showControls = true }: { animate
 
         {/* object storage */}
         <rect x={40} y={446} width={800} height={86} rx={3} fill="url(#stack-hatch)" stroke="var(--line-strong)" />
-        <text x={62} y={478} className="fill-ink font-serif" fontSize={20}>
+        <text x={62} y={478} className="fill-ink font-medium" fontSize={20}>
           Object storage
         </text>
         <text x={62} y={500} className="fill-fg" fontSize={12.5}>

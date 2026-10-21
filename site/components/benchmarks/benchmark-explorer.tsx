@@ -15,7 +15,7 @@ import { RunPicker, StatusDot } from "./run-picker";
 export function Stat({ label, value, sub, tone = "text-ink" }: { label: string; value: React.ReactNode; sub?: React.ReactNode; tone?: string }) {
   return (
     <div className="border-line px-4 py-3.5 [&:not(:first-child)]:border-l">
-      <div className={`whitespace-nowrap font-serif text-[20px] font-light tabular-nums ${tone}`}>{value}</div>
+      <div className={`whitespace-nowrap font-serif text-[22px] tabular-nums ${tone}`}>{value}</div>
       <div className="mt-0.5 text-[11.5px] leading-tight text-muted">{label}</div>
       {sub && <div className="mt-0.5 font-mono text-[10.5px] text-faint">{sub}</div>}
     </div>

@@ -180,7 +180,7 @@ export function NextSteps({ product, links }: { product: ProductId; links: Next[
           <Link key={k} href={`/${product}/${n.path}`} className="card group flex items-start gap-3 p-4 transition-colors hover:border-line-strong">
             <SpaceIcon space={product} size={18} />
             <span className="min-w-0 flex-1">
-              <span className="flex items-center gap-1.5 font-serif text-[16px] text-ink">
+              <span className="flex items-center gap-1.5 text-[15px] font-medium text-ink">
                 {n.title}
                 <span className="text-muted transition-transform group-hover:translate-x-0.5 group-hover:text-accent-text">
                   <ArrowRight />

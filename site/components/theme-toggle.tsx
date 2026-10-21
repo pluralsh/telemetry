@@ -14,7 +14,8 @@ export function ThemeToggle() {
       type="button"
       onClick={() => setTheme(dark ? "light" : "dark")}
       aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
-      className="btn btn-ghost btn-sm px-2"
+      title={dark ? "Switch to light theme" : "Switch to dark theme"}
+      className="btn btn-icon"
     >
       {dark ? (
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden>

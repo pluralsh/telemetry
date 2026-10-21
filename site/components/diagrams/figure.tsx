@@ -26,7 +26,7 @@ export function Figure({
       <span aria-hidden className="node" style={{ left: -4.5, bottom: -4.5 }} />
       <span aria-hidden className="node" style={{ right: -4.5, bottom: -4.5 }} />
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-2.5">
-        <span className="font-serif text-[14px] text-ink">{label}</span>
+        <span className="text-[14px] font-medium text-ink">{label}</span>
         {controls && <div className="flex flex-wrap items-center gap-2">{controls}</div>}
       </div>
       <div className={bodyClassName}>{children}</div>

@@ -1,13 +1,10 @@
 import { PageHeader } from "@/components/doc-page";
-import { SpaceIcon } from "@/components/icons";
 import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
 import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
 
 export const metadata = { title: "Metrics architecture" };
 
 <PageHeader
-  icon={<SpaceIcon space="metrics" size={28} />}
-  eyebrow="Metrics"
   title="Architecture"
   lede="A Prometheus-compatible time-series database on SlateDB. It takes remote write and OTLP, answers PromQL, and runs as two StatefulSets and a bucket."
 />

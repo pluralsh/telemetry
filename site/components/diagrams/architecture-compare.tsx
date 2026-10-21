@@ -62,7 +62,7 @@ function Panel({ side, mode, level, q, color, accent }: { side: ArchSide; mode: 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex items-baseline gap-2 px-4 pb-2.5 pt-4">
-        <div className="font-serif text-[17px] text-ink">{side.title}</div>
+        <div className="text-[16px] font-medium text-ink">{side.title}</div>
         <span className="leader" />
         <div className="eyebrow">{side.subtitle}</div>
       </div>
@@ -112,7 +112,7 @@ function Panel({ side, mode, level, q, color, accent }: { side: ArchSide; mode: 
       <dl className="grid grid-cols-4 border-b border-line">
         {side.stats(level, q).map((s, i) => (
           <div key={s.label} className={`px-3 py-3 ${i > 0 ? "border-l border-line" : ""}`}>
-            <dd className="whitespace-nowrap font-serif text-[20px] font-light leading-none tabular-nums text-ink">{s.value}</dd>
+            <dd className="whitespace-nowrap font-serif text-[22px] leading-none tabular-nums text-ink">{s.value}</dd>
             <dt className="mt-1.5 text-[11px] leading-tight text-muted">{s.label}</dt>
           </div>
         ))}

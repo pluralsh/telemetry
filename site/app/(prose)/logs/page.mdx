@@ -1,13 +1,10 @@
 import { PageHeader } from "@/components/doc-page";
-import { SpaceIcon } from "@/components/icons";
 import { ArchitectureCompare } from "@/components/diagrams/architecture-compare";
 import { KeyLayout, NextSteps } from "@/components/docs/product-blocks";
 
 export const metadata = { title: "Logs architecture" };
 
 <PageHeader
-  icon={<SpaceIcon space="logs" size={28} />}
-  eyebrow="Logs"
   title="Architecture"
   lede="A Loki-compatible log database on SlateDB. It speaks LogQL and Loki push, and also takes OTLP and Elasticsearch _bulk writes, from two StatefulSets and a bucket."
 />

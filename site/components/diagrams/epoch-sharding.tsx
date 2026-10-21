@@ -334,7 +334,7 @@ export function EpochSharding() {
 
         <div className="grid md:grid-cols-[1fr_240px]">
         <div className="flex min-h-[300px] flex-col border-b border-line p-4 md:border-b-0 md:border-r">
-          <div className="mb-3 font-serif text-[14px] text-ink">
+          <div className="mb-3 text-[14px] font-medium text-ink">
             {reading ? "Read flow" : "Write flow"} <span className="eyebrow">· {reading ? "range query on reader-0" : "traced record"}</span>
           </div>
           <AnimatePresence mode="wait">
@@ -382,7 +382,7 @@ export function EpochSharding() {
 
         </div>
         <div className="p-4">
-          <div className="mb-3 font-serif text-[14px] text-ink">{reading ? "Shards scanned" : "Shard ownership"}</div>
+          <div className="mb-3 text-[14px] font-medium text-ink">{reading ? "Shards scanned" : "Shard ownership"}</div>
           <div className="flex flex-col gap-1">
             {reading
               ? hits.map((n, k) => (

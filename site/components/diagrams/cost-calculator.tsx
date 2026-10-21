@@ -78,9 +78,9 @@ export function CostCalculator() {
             {results.map((r, i) => (
               <div key={r.name}>
                 <div className="mb-1.5 flex items-baseline gap-3">
-                  <span className="font-serif text-[16px] text-ink">{r.name}</span>
+                  <span className="text-[15px] font-medium text-ink">{r.name}</span>
                   <span className="leader" />
-                  <span className="font-serif text-[22px] font-light tabular-nums text-ink">
+                  <span className="font-serif text-[24px] tabular-nums text-ink">
                     {usd(r.total)}
                     <span className="ml-1 text-[12px] text-muted">/mo</span>
                   </span>
@@ -107,7 +107,7 @@ export function CostCalculator() {
           <div className="grid border-t border-line md:grid-cols-3">
             {results.map((r, i) => (
               <div key={r.name} className={i > 0 ? "border-t border-line md:border-l md:border-t-0" : ""}>
-                <div className="flex items-center gap-2 border-b border-line px-3 py-2 font-serif text-[13.5px] text-ink">
+                <div className="flex items-center gap-2 border-b border-line px-3 py-2 text-[13.5px] font-medium text-ink">
                   <span className="h-2 w-2" style={{ background: COLORS[i] }} />
                   {r.name}
                 </div>

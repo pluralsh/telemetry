@@ -31,7 +31,7 @@ export function SpaceSwitcher() {
       <div
         role="tablist"
         aria-label="Documentation space"
-        className="relative hidden h-[34px] items-stretch rounded-sm border border-line-strong bg-card p-[2px] md:flex"
+        className="relative hidden h-9 items-stretch rounded-[4px] border border-line-strong bg-panel p-[3px] md:flex"
       >
         {SPACES.map((s, i) => {
           const on = s.id === active;
@@ -42,14 +42,14 @@ export function SpaceSwitcher() {
                 role="tab"
                 aria-selected={on}
                 href={targetHref(pathname, active, s.id)}
-                className={`relative flex items-center gap-2 px-3 text-[13px] tracking-[-0.3px] transition-colors ${
-                  on ? "text-ink" : "text-muted hover:text-ink"
+                className={`relative flex items-center gap-2 px-3 text-[14px] transition-colors ${
+                  on ? "font-medium text-accent-text" : "text-muted hover:text-ink"
                 }`}
               >
                 {on && (
                   <motion.span
                     layoutId="space-tab"
-                    className="absolute inset-0 rounded-[2px] border border-line-strong bg-panel shadow-[inset_0_-2px_0_0_var(--edge)]"
+                    className="absolute inset-0 rounded-[2px] bg-accent-tint"
                     transition={{ type: "spring", stiffness: 520, damping: 40 }}
                   />
                 )}
@@ -75,16 +75,16 @@ export function SpaceSwitcher() {
           <Dropdown.Content
             align="start"
             sideOffset={6}
-            className="z-50 w-max min-w-72 max-w-[calc(100vw-1.5rem)] rounded-sm border border-line-strong bg-panel p-1 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.25)]"
+            className="z-50 w-max min-w-72 max-w-[calc(100vw-1.5rem)] rounded-[4px] border border-line-strong bg-panel p-1 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.25)]"
           >
             {SPACES.map((s) => (
               <Dropdown.Item
                 key={s.id}
                 onSelect={() => router.push(targetHref(pathname, active, s.id))}
-                className="flex cursor-pointer items-center gap-3 rounded-[2px] px-2 py-2 outline-none data-[highlighted]:bg-bg-subtle"
+                className="flex cursor-pointer items-center gap-3 rounded-[4px] px-2 py-2 outline-none data-[highlighted]:bg-bg-subtle"
               >
                 <SpaceIcon space={s.id} size={20} className="shrink-0" />
-                <span className="w-16 shrink-0 whitespace-nowrap text-[13px] text-ink">{s.label}</span>
+                <span className="w-16 shrink-0 whitespace-nowrap text-[14px] text-ink">{s.label}</span>
                 <span className="leader" />
                 <span className="eyebrow whitespace-nowrap">{s.blurb}</span>
               </Dropdown.Item>

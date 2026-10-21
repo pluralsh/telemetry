@@ -32,7 +32,7 @@ function statusTone(status: string) {
 function Subhead({ children, aside }: { children: React.ReactNode; aside?: React.ReactNode }) {
   return (
     <div className="mb-1 mt-9 flex items-baseline gap-3 border-b border-line-strong pb-2">
-      <h4 className="font-serif text-[15px] text-ink">{children}</h4>
+      <h4 className="text-[15px] font-medium text-ink">{children}</h4>
       {aside && <span className="ml-auto flex flex-wrap justify-end gap-1">{aside}</span>}
     </div>
   );
@@ -64,7 +64,7 @@ export async function Endpoint({ product, op }: { product: ProductId; op: Operat
     <section id={op.anchor} className="scroll-mt-[72px] border-t border-line py-14 first:border-t-0">
       <div className="grid gap-x-12 gap-y-8 xl:grid-cols-[minmax(0,1fr)_minmax(0,440px)]">
         <div className="min-w-0">
-          <h3 className="font-serif text-[1.6rem] font-light leading-tight tracking-[-0.01em] text-ink">
+          <h3 className="text-[20px] font-medium leading-[1.35] tracking-[-0.005em] text-ink">
             <a href={`#${op.anchor}`} className="hover:text-accent-text">
               {op.title}
             </a>

@@ -2,68 +2,97 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Brand palette shared with the main Plural docs (console/js/documentation/src/theme/palette.ts). */
 :root {
-  --bg: #f4f4f2;
-  --bg-subtle: #ececeb;
-  --panel: #fbfbfb;
-  --card: rgb(255 255 255 / 0.6);
-  --ink: #000000;
-  --fg: #383d48;
-  --muted: #5f6672;
-  --faint: #8b919c;
-  --line: #dadde2;
-  --line-strong: #cfd3da;
+  --bg: #fafafa;
+  --bg-subtle: #f2f3fb;
+  --sidebar: #f1f1f3;
+  --panel: #ffffff;
+  --card: #ffffff;
+  --ink: #0e1015;
+  --ink-light: rgb(14 16 21 / 0.86);
+  --fg: rgb(14 16 21 / 0.78);
+  --muted: #4f535c;
+  --faint: #8a8f99;
+  --line: rgb(14 16 21 / 0.1);
+  --line-strong: rgb(14 16 21 / 0.16);
   --node: #ffffff;
-  --accent: #0751cf;
-  --accent-hover: #0646b4;
-  --accent-edge: #053794;
-  --accent-ring: #93b4f5;
-  --accent-text: #0751cf;
+  --accent: #4a51f2;
+  --accent-hover: #3d44e6;
+  --accent-ring: rgb(74 81 242 / 0.3);
+  --accent-tint: rgb(74 81 242 / 0.08);
+  --accent-text: #4a51f2;
+  --accent-text-hover: #2f36c4;
+  --code-inline: #eeeef4;
+  --logo-mark: #4a51f2;
+  --violet: #6e3fd9;
+  --warning: #b54708;
+  --callout-tint: 7%;
+  --callout-border: 25%;
   --highlight: #ebe6da;
-  --plural: #6c3ce9;
-  --metrics: #6c3ce9;
-  --logs: #14958a;
-  --traces: #cf7a2c;
-  --code-bg: #fbfbfb;
-  --hatch: rgb(56 61 72 / 0.07);
-  --edge: rgb(111 123 144 / 0.12);
+  --plural: #6e3fd9;
+  --metrics: #6e3fd9;
+  --logs: #0b7c88;
+  --traces: #b54708;
+  --code-bg: #ffffff;
+  --hatch: rgb(14 16 21 / 0.07);
+  --edge: transparent;
+  --grain-opacity: 0.13;
+  --table-header: color-mix(in srgb, color-mix(in srgb, var(--accent) 35%, var(--ink)) 8%, transparent);
+  --table-stripe: color-mix(in srgb, var(--ink) 4%, transparent);
+  --table-line: color-mix(in srgb, color-mix(in srgb, var(--accent) 35%, var(--ink)) 16%, transparent);
   color-scheme: light;
 }
 
 .dark {
-  --bg: #111216;
-  --bg-subtle: #16181d;
-  --panel: #15171c;
-  --card: rgb(255 255 255 / 0.02);
-  --ink: #ffffff;
-  --fg: #a9afbb;
-  --muted: #8a909c;
-  --faint: #636975;
-  --line: #22252c;
-  --line-strong: #2c3038;
-  --node: #05080f;
-  --accent: #1f5fe0;
-  --accent-hover: #2d6cf0;
-  --accent-edge: #0a3a9e;
-  --accent-ring: #3a64b8;
-  --accent-text: #9fc3f5;
+  --bg: #12131b;
+  --bg-subtle: #232538;
+  --sidebar: #151620;
+  --panel: #191a25;
+  --card: #191a25;
+  --ink: #ecedf7;
+  --ink-light: rgb(236 237 247 / 0.88);
+  --fg: rgb(236 237 247 / 0.76);
+  --muted: #a3a6bd;
+  --faint: #6d7088;
+  --line: rgb(190 195 255 / 0.1);
+  --line-strong: rgb(190 195 255 / 0.18);
+  --node: #191a25;
+  --accent: #4a51f2;
+  --accent-hover: #5d63f4;
+  --accent-ring: rgb(158 163 255 / 0.32);
+  --accent-tint: rgb(74 81 242 / 0.16);
+  --accent-text: #9ea3ff;
+  --accent-text-hover: #c4c7ff;
+  --code-inline: #232538;
+  --logo-mark: #ecedf7;
+  --violet: #c9b6ff;
+  --warning: #f5c97a;
+  --callout-tint: 12%;
+  --callout-border: 40%;
   --highlight: #ebe6da;
-  --plural: #a385ff;
-  --metrics: #a385ff;
-  --logs: #5fd3c5;
-  --traces: #f2b47a;
-  --code-bg: #14161b;
-  --hatch: rgb(169 175 187 / 0.06);
-  --edge: rgb(0 0 0 / 0.35);
+  --plural: #c9b6ff;
+  --metrics: #c9b6ff;
+  --logs: #14d9d1;
+  --traces: #f5c97a;
+  --code-bg: #191a25;
+  --hatch: rgb(236 237 247 / 0.06);
+  --edge: transparent;
+  --grain-opacity: 0.1;
+  --table-header: color-mix(in srgb, var(--ink) 9%, transparent);
+  --table-stripe: color-mix(in srgb, var(--ink) 5%, transparent);
+  --table-line: color-mix(in srgb, var(--ink) 14%, transparent);
   color-scheme: dark;
 }
 
 @theme inline {
   --color-bg: var(--bg);
   --color-bg-subtle: var(--bg-subtle);
+  --color-sidebar: var(--sidebar);
   --color-panel: var(--panel);
   --color-card: var(--card);
   --color-ink: var(--ink);
+  --color-ink-light: var(--ink-light);
   --color-fg: var(--fg);
   --color-muted: var(--muted);
   --color-faint: var(--faint);
@@ -71,6 +100,7 @@
   --color-line-strong: var(--line-strong);
   --color-node: var(--node);
   --color-accent: var(--accent);
+  --color-accent-tint: var(--accent-tint);
   --color-accent-text: var(--accent-text);
   --color-highlight: var(--highlight);
   --color-plural: var(--plural);
@@ -78,34 +108,107 @@
   --color-logs: var(--logs);
   --color-traces: var(--traces);
   --color-code: var(--code-bg);
-  --font-sans: var(--font-writer), ui-sans-serif, system-ui, sans-serif;
-  --font-serif: "IBM Plex Serif", ui-serif, Georgia, serif;
-  --font-mono: "Lilex", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-code-inline: var(--code-inline);
+  --font-sans: "Articulat", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Newsreader", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
   --radius-xs: 2px;
   --radius-sm: 4px;
 }
 
+/* Articulat ships in 400 and 500 only; bold everywhere means 500. */
+@font-face {
+  font-family: Articulat;
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  src: url("./fonts/Articulat-Normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: Articulat;
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+  src: url("./fonts/Articulat-NormalOblique.woff2") format("woff2");
+}
+@font-face {
+  font-family: Articulat;
+  font-weight: 500 700;
+  font-style: normal;
+  font-display: swap;
+  src: url("./fonts/Articulat-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 500 700;
+  font-display: swap;
+  src: url("./fonts/JetBrainsMono-Medium.woff2") format("woff2");
+}
+
 html {
   background: var(--bg);
-  color: var(--fg);
+  color: var(--ink);
   -webkit-font-smoothing: antialiased;
   scroll-padding-top: 5rem;
 }
 
 body {
+  position: relative;
   font-family: var(--font-sans);
   font-size: 15px;
+  letter-spacing: 0.01em;
+  font-synthesis-weight: none;
+  transition:
+    background-color 0.2s ease-out,
+    color 0.2s ease-out;
+}
+
+/* Film grain shared with the main docs and plural.sh. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncG type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncB type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  opacity: var(--grain-opacity);
+}
+
+b,
+strong {
+  font-weight: 500;
 }
 
 ::selection {
-  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  background: var(--accent-tint);
+  color: var(--ink);
 }
 
 @layer components {
   .eyebrow {
-    font-family: var(--font-sans);
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
     font-size: 12px;
-    font-style: italic;
+    line-height: 1.4;
+    letter-spacing: 0;
+    color: var(--muted);
+  }
+
+  /* Uppercase mono label used for nav group headings and rail titles. */
+  .label {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    font-size: 11px;
+    line-height: 1.4;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
     color: var(--muted);
   }
 
@@ -139,51 +242,61 @@ body {
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
-    padding: 0 0.875rem;
+    padding: 0 0.75rem;
     border: 1px solid transparent;
     border-radius: 4px;
     font-size: 14px;
-    letter-spacing: -0.35px;
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: 0.01em;
     white-space: nowrap;
     user-select: none;
     transition:
-      background-color 120ms,
-      border-color 120ms,
-      color 120ms;
+      background-color 0.2s ease-out,
+      border-color 0.2s ease-out,
+      color 0.2s ease-out;
   }
-  .btn:active {
-    transform: translateY(1px) scale(0.99);
+  .btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .btn-sm {
-    height: 30px;
+    height: 32px;
     padding: 0 0.625rem;
     font-size: 13px;
   }
   .btn-primary {
     background: var(--accent);
     color: #fff;
-    border-color: var(--accent-edge);
-    box-shadow:
-      inset 0 -2px 0 0 var(--accent-edge),
-      0 1px 3px 0 color-mix(in srgb, var(--accent) 18%, transparent);
   }
   .btn-primary:hover {
     background: var(--accent-hover);
   }
   .btn-secondary {
-    background: var(--card);
+    background: var(--panel);
     color: var(--ink);
     border-color: var(--line-strong);
-    box-shadow: inset 0 -2px 0 0 var(--edge);
   }
   .btn-secondary:hover {
-    border-color: var(--accent-ring);
+    border-color: var(--faint);
   }
   .btn-ghost {
+    font-weight: 400;
     color: var(--ink);
   }
   .btn-ghost:hover {
-    background: color-mix(in srgb, var(--fg) 7%, transparent);
+    background: var(--bg-subtle);
+  }
+  /* Square 36px bordered icon button, as in the main docs header. */
+  .btn-icon {
+    width: 36px;
+    padding: 0;
+    background: var(--panel);
+    color: var(--ink);
+    border-color: var(--line-strong);
+  }
+  .btn-icon:hover {
+    border-color: var(--faint);
   }
 
   .kbd {
@@ -193,9 +306,9 @@ body {
     align-items: center;
     justify-content: center;
     padding: 0 0.375rem;
-    border: 1px solid color-mix(in srgb, var(--muted) 22%, transparent);
-    border-radius: 2px;
-    background: color-mix(in srgb, var(--panel) 55%, transparent);
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    background: var(--bg-subtle);
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--muted);
@@ -210,7 +323,7 @@ body {
     border: 1px solid var(--line-strong);
     border-radius: 4px;
     background: var(--card);
-    box-shadow: inset 0 -2px 0 0 var(--edge);
+    transition: border-color 0.2s ease-out;
   }
   a.card:hover,
   button.card:hover {
@@ -230,7 +343,6 @@ body {
     border: 1px solid var(--line-strong);
     border-radius: 2px;
     background: var(--panel);
-    box-shadow: inset 0 -2px 0 0 var(--edge);
   }
   .range::-moz-range-thumb {
     width: 12px;
@@ -238,7 +350,6 @@ body {
     border: 1px solid var(--line-strong);
     border-radius: 2px;
     background: var(--panel);
-    box-shadow: inset 0 -2px 0 0 var(--edge);
   }
   .range:hover::-webkit-slider-thumb {
     border-color: var(--accent-ring);
@@ -260,63 +371,77 @@ body {
 }
 
 /* ---------- prose ---------- */
+/* Mirrors the main docs' long-form styles: Articulat body, sans headings, serif page titles. */
 @layer components {
   .prose-docs {
     color: var(--fg);
-    font-size: 15px;
-    line-height: 1.75;
-    letter-spacing: -0.15px;
+    font-size: 16px;
+    line-height: 1.7;
+    letter-spacing: 0.01em;
   }
 
   .prose-docs > * + * {
-    margin-top: 1.1em;
+    margin-top: 1em;
   }
 
   .prose-docs :where(h1):not(:where(.not-prose, .not-prose *)) {
     font-family: var(--font-serif);
     font-weight: 400;
-    font-size: 2.5rem;
-    line-height: 1.15;
+    font-size: clamp(36px, 4.4vw, 52px);
+    line-height: 1.05;
     letter-spacing: -0.02em;
     color: var(--ink);
   }
 
   .prose-docs :where(h2):not(:where(.not-prose, .not-prose *)) {
     position: relative;
-    font-family: var(--font-serif);
-    font-weight: 400;
-    font-size: 1.6rem;
-    line-height: 1.25;
-    letter-spacing: -0.01em;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    font-size: 24px;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
     color: var(--ink);
-    margin-top: 2.4em;
+    margin-top: 2.2em;
   }
 
   .prose-docs :where(h3):not(:where(.not-prose, .not-prose *)) {
-    font-family: var(--font-serif);
-    font-weight: 400;
-    font-size: 1.15rem;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    font-size: 20px;
+    line-height: 1.35;
+    letter-spacing: -0.005em;
     color: var(--ink);
-    margin-top: 2em;
+    margin-top: 1.8em;
   }
 
-  .prose-docs :where(h2 + *, h3 + *):not(:where(.not-prose, .not-prose *)) {
+  .prose-docs :where(h4):not(:where(.not-prose, .not-prose *)) {
+    font-family: var(--font-sans);
+    font-weight: 500;
+    font-size: 17px;
+    line-height: 1.4;
+    color: var(--ink);
+    margin-top: 1.6em;
+  }
+
+  .prose-docs :where(h2 + *, h3 + *, h4 + *):not(:where(.not-prose, .not-prose *)) {
     margin-top: 0.6em;
   }
 
   .prose-docs :where(a):not(:where(.not-prose, .not-prose *)) {
     color: var(--accent-text);
     text-decoration: underline;
-    text-decoration-color: color-mix(in srgb, var(--accent-text) 35%, transparent);
+    text-decoration-thickness: 1px;
+    text-decoration-color: var(--accent-ring);
     text-underline-offset: 3px;
   }
 
   .prose-docs :where(a:hover):not(:where(.not-prose, .not-prose *)) {
-    text-decoration-color: var(--accent-text);
+    color: var(--accent-text-hover);
+    text-decoration-color: currentColor;
   }
 
   .prose-docs :where(strong):not(:where(.not-prose, .not-prose *)) {
-    font-weight: 700;
+    font-weight: 500;
     color: var(--ink);
   }
 
@@ -325,35 +450,25 @@ body {
   }
 
   .prose-docs :where(ul):not(:where(.not-prose, .not-prose *)) {
-    list-style: none;
-    padding-left: 0;
+    list-style: disc;
+    padding-left: 1.5em;
   }
 
-  .prose-docs :where(ul > li):not(:where(.not-prose, .not-prose *)) {
-    position: relative;
-    padding-left: 1.4em;
-  }
-
-  .prose-docs :where(ul > li):not(:where(.not-prose, .not-prose *))::before {
-    content: "";
-    position: absolute;
-    left: 0.25em;
-    top: 0.72em;
-    width: 5px;
-    height: 5px;
-    transform: rotate(45deg);
-    border: 1px solid var(--faint);
+  .prose-docs :where(ul > li):not(:where(.not-prose, .not-prose *))::marker {
+    color: var(--faint);
   }
 
   .prose-docs :where(ol):not(:where(.not-prose, .not-prose *)) {
-    list-style: decimal-leading-zero;
-    padding-left: 2em;
+    list-style: decimal;
+    padding-left: 1.5em;
   }
 
   .prose-docs :where(ol > li):not(:where(.not-prose, .not-prose *))::marker {
-    font-family: var(--font-mono);
-    font-size: 0.8em;
-    color: var(--faint);
+    color: var(--muted);
+  }
+
+  .prose-docs :where(li):not(:where(.not-prose, .not-prose *)) {
+    padding-left: 0.25em;
   }
 
   .prose-docs :where(li + li):not(:where(.not-prose, .not-prose *)) {
@@ -362,56 +477,67 @@ body {
 
   .prose-docs :where(:not(pre) > code):not(:where(.not-prose, .not-prose *)) {
     font-family: var(--font-mono);
+    font-variant-ligatures: none;
     font-size: 0.86em;
-    padding: 0.08em 0.32em;
-    border: 1px solid var(--line);
-    background: var(--card);
-    border-radius: 2px;
+    padding: 0.12em 0.36em;
+    background: var(--code-inline);
+    border-radius: 4px;
     color: var(--ink);
   }
 
   .prose-docs :where(blockquote):not(:where(.not-prose, .not-prose *)) {
-    border-left: 1px solid var(--accent-text);
+    border-left: 2px solid var(--line-strong);
     padding: 0.1em 0 0.1em 1.2em;
-    font-family: var(--font-serif);
-    font-size: 1.2rem;
-    font-style: italic;
-    font-weight: 300;
-    color: var(--ink);
+    font-size: 18px;
+    line-height: 1.6;
+    color: var(--muted);
+  }
+
+  .prose-docs :where(.table-wrap):not(:where(.not-prose, .not-prose *)) {
+    border: 1px solid var(--table-line);
+    border-radius: 6px;
+    overflow-x: auto;
   }
 
   .prose-docs :where(table):not(:where(.not-prose, .not-prose *)) {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13.5px;
-    display: block;
-    overflow-x: auto;
+    font-size: 14px;
+    line-height: 1.55;
   }
 
   .prose-docs :where(th):not(:where(.not-prose, .not-prose *)) {
     text-align: left;
-    font-family: var(--font-serif);
-    font-weight: 400;
-    font-size: 13.5px;
+    font-weight: 500;
     color: var(--ink);
-    border-bottom: 1px solid var(--line-strong);
-    padding: 0.55em 1em 0.55em 0;
+    background: var(--table-header);
+    border-bottom: 1px solid var(--table-line);
+    padding: 0.75em 1em;
     white-space: nowrap;
   }
 
   .prose-docs :where(td):not(:where(.not-prose, .not-prose *)) {
-    border-bottom: 1px solid var(--line);
-    padding: 0.6em 1em 0.6em 0;
+    border-top: 1px solid var(--table-line);
+    padding: 0.75em 1em;
     vertical-align: top;
+  }
+
+  .prose-docs :where(th + th, td + td):not(:where(.not-prose, .not-prose *)) {
+    border-left: 1px solid var(--table-line);
+  }
+
+  .prose-docs :where(tbody tr:first-child td):not(:where(.not-prose, .not-prose *)) {
+    border-top: none;
+  }
+
+  .prose-docs :where(tbody tr:nth-child(even) td):not(:where(.not-prose, .not-prose *)) {
+    background: var(--table-stripe);
   }
 
   .prose-docs :where(hr):not(:where(.not-prose, .not-prose *)) {
     border: none;
-    height: 12px;
     margin: 2.5em 0;
     border-top: 1px solid var(--line);
-    border-bottom: 1px solid var(--line);
-    background-image: repeating-linear-gradient(-45deg, var(--hatch) 0 1px, transparent 1px 6px);
   }
 }
 
@@ -426,7 +552,8 @@ body {
 }
 .code-block pre {
   font-family: var(--font-mono);
-  font-size: 12.75px;
+  font-variant-ligatures: none;
+  font-size: 13px;
   line-height: 1.7;
   overflow-x: auto;
   padding: 0.9rem 1rem;

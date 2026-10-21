@@ -14,6 +14,11 @@ function Pre({ children }: { children?: React.ReactNode }) {
 
 const components: MDXComponents = {
   pre: Pre,
+  table: (props) => (
+    <div className="table-wrap">
+      <table {...props} />
+    </div>
+  ),
   a: ({ href = "", children, ...rest }) =>
     href.startsWith("/") ? (
       <Link href={href} {...rest}>

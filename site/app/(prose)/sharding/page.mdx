@@ -1,13 +1,10 @@
 import { PageHeader } from "@/components/doc-page";
 import { Callout } from "@/components/mdx-ui";
-import { TelemetryIcon } from "@/components/icons";
 import { EpochSharding } from "@/components/diagrams/epoch-sharding";
 
 export const metadata = { title: "Epoch sharding" };
 
 <PageHeader
-  icon={<TelemetryIcon size={28} />}
-  eyebrow="Concepts"
   title="Epoch sharding"
   lede="SlateDB allows one writer per database. Plural Telemetry gets many writers by routing each record to a storage shard, using a hash of its identity and the routing epoch in effect at its timestamp."
 />
