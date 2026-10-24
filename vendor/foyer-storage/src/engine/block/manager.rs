@@ -1,0 +1,614 @@
+// Copyright 2026 foyer Project Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt::Debug,
+    ops::{Deref, DerefMut},
+    sync::{
+        Arc, RwLock, RwLockWriteGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+use asyncband::oneshot;
+use foyer_common::{
+    error::{ErrorKind, Result},
+    metrics::Metrics,
+    spawn::Spawner,
+};
+use futures_core::future::BoxFuture;
+use futures_util::{
+    FutureExt,
+    future::{Shared, ready},
+};
+use itertools::Itertools;
+use rand::seq::IteratorRandom;
+
+use crate::{
+    Device,
+    engine::block::{
+        eviction::{EvictionInfo, EvictionPicker},
+        reclaimer::ReclaimerTrait,
+    },
+    io::{
+        bytes::{IoB, IoBuf, IoBufMut},
+        device::Partition,
+        engine::IoEngine,
+    },
+};
+
+pub type BlockId = u32;
+
+/// Block statistics.
+#[derive(Debug, Default)]
+pub struct BlockStatistics {
+    /// Estimated invalid bytes in the block.
+    /// FIXME(MrCroxx): This value is way too coarse. Need fix.
+    pub invalid: AtomicUsize,
+    /// Access count of the block.
+    pub access: AtomicUsize,
+    /// Marked as `true` if the block is about to be evicted by some eviction picker.
+    pub probation: AtomicBool,
+}
+
+impl BlockStatistics {
+    pub(crate) fn reset(&self) {
+        self.invalid.store(0, Ordering::Relaxed);
+        self.access.store(0, Ordering::Relaxed);
+        self.probation.store(false, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct BlockInner {
+    id: BlockId,
+    partition: Arc<dyn Partition>,
+    io_engine: Arc<dyn IoEngine>,
+    statistics: Arc<BlockStatistics>,
+}
+
+/// A block is a logical partition of a device. It is used to manage the device's storage space.
+#[derive(Debug, Clone)]
+pub struct Block {
+    inner: Arc<BlockInner>,
+}
+
+impl Block {
+    /// Get block id.
+    pub fn id(&self) -> BlockId {
+        self.inner.id
+    }
+
+    /// Get block Statistics.
+    pub fn statistics(&self) -> &Arc<BlockStatistics> {
+        &self.inner.statistics
+    }
+
+    /// Get block size.
+    pub fn size(&self) -> usize {
+        self.inner.partition.size()
+    }
+
+    pub(crate) async fn write(&self, buf: Box<dyn IoBuf>, offset: u64) -> (Box<dyn IoB>, Result<()>) {
+        let (buf, res) = self
+            .inner
+            .io_engine
+            .write(buf, self.inner.partition.as_ref(), offset)
+            .await;
+        (buf, res)
+    }
+
+    pub(crate) async fn read(&self, buf: Box<dyn IoBufMut>, offset: u64) -> (Box<dyn IoB>, Result<()>) {
+        let (buf, res) = self
+            .inner
+            .io_engine
+            .read(buf, self.inner.partition.as_ref(), offset)
+            .await;
+        (buf, res)
+    }
+
+    pub(crate) fn partition(&self) -> &Arc<dyn Partition> {
+        &self.inner.partition
+    }
+}
+
+#[cfg(test)]
+impl Block {
+    pub(crate) fn new_for_test(id: BlockId, partition: Arc<dyn Partition>, io_engine: Arc<dyn IoEngine>) -> Self {
+        let inner = BlockInner {
+            id,
+            partition,
+            io_engine,
+            statistics: Arc::<BlockStatistics>::default(),
+        };
+        let inner = Arc::new(inner);
+        Self { inner }
+    }
+}
+
+pub type GetCleanBlockHandle = Shared<BoxFuture<'static, Block>>;
+
+#[derive(Debug)]
+struct State {
+    clean_blocks: VecDeque<BlockId>,
+    evictable_blocks: HashSet<BlockId>,
+    writing_blocks: HashSet<BlockId>,
+    reclaiming_blocks: HashSet<BlockId>,
+
+    clean_block_waiters: Vec<oneshot::Sender<Block>>,
+
+    eviction_pickers: Vec<Box<dyn EvictionPicker>>,
+
+    reclaim_waiters: Vec<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    blocks: Vec<Block>,
+    state: RwLock<State>,
+    reclaimer: Arc<dyn ReclaimerTrait>,
+    reclaim_concurrency: usize,
+    clean_block_threshold: usize,
+    metrics: Arc<Metrics>,
+    spawner: Spawner,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockManager {
+    inner: Arc<Inner>,
+}
+
+impl BlockManager {
+    #[expect(clippy::too_many_arguments)]
+    pub fn open(
+        device: Arc<dyn Device>,
+        io_engine: Arc<dyn IoEngine>,
+        block_size: usize,
+        mut eviction_pickers: Vec<Box<dyn EvictionPicker>>,
+        reclaimer: Arc<dyn ReclaimerTrait>,
+        reclaim_concurrency: usize,
+        clean_block_threshold: usize,
+        metrics: Arc<Metrics>,
+        spawner: Spawner,
+    ) -> Result<Self> {
+        let mut blocks = vec![];
+
+        while device.free() >= block_size {
+            let partition = match device.create_partition(block_size) {
+                Ok(partition) => partition,
+                Err(e) if e.kind() == ErrorKind::NoSpace => break,
+                Err(e) => return Err(e),
+            };
+            let id = blocks.len() as BlockId;
+            let block = Block {
+                inner: Arc::new(BlockInner {
+                    id,
+                    partition,
+                    io_engine: io_engine.clone(),
+                    statistics: Arc::<BlockStatistics>::default(),
+                }),
+            };
+            blocks.push(block);
+        }
+
+        let rs = blocks.iter().map(|r| r.id()).collect_vec();
+        for pickers in eviction_pickers.iter_mut() {
+            pickers.init(&rs, block_size);
+        }
+
+        metrics.storage_block_engine_block_size_bytes.absolute(block_size as _);
+
+        let state = State {
+            clean_blocks: VecDeque::new(),
+            evictable_blocks: HashSet::new(),
+            writing_blocks: HashSet::new(),
+            reclaiming_blocks: HashSet::new(),
+            clean_block_waiters: Vec::new(),
+            eviction_pickers,
+            reclaim_waiters: Vec::new(),
+        };
+        let inner = Inner {
+            blocks,
+            state: RwLock::new(state),
+            reclaimer,
+            reclaim_concurrency,
+            clean_block_threshold,
+            metrics,
+            spawner,
+        };
+        let inner = Arc::new(inner);
+        let this = Self { inner };
+        Ok(this)
+    }
+
+    pub fn init(&self, clean_blocks: &[BlockId]) {
+        let mut state = self.inner.state.write().unwrap();
+        let mut evictable_blocks: HashSet<BlockId> = self.inner.blocks.iter().map(|r| r.id()).collect();
+        state.clean_blocks = clean_blocks
+            .iter()
+            .inspect(|id| {
+                evictable_blocks.remove(id);
+            })
+            .copied()
+            .collect();
+
+        // Temporarily take pickers to make borrow checker happy.
+        let mut pickers = std::mem::take(&mut state.eviction_pickers);
+
+        // Notify pickers.
+        for block in evictable_blocks {
+            state.evictable_blocks.insert(block);
+            for picker in pickers.iter_mut() {
+                picker.on_block_evictable(
+                    EvictionInfo {
+                        blocks: &self.inner.blocks,
+                        evictable: &state.evictable_blocks,
+                        clean: state.clean_blocks.len(),
+                    },
+                    block,
+                );
+            }
+        }
+
+        // Restore taken pickers after operations.
+
+        std::mem::swap(&mut state.eviction_pickers, &mut pickers);
+        assert!(pickers.is_empty());
+
+        // Restore the clean-block reserve a recovered device may lack.
+        let reclaim = self.reclaim_if_needed(&mut state);
+
+        let metrics = &self.inner.metrics;
+        metrics
+            .storage_block_engine_block_clean
+            .absolute(state.clean_blocks.len() as _);
+        metrics
+            .storage_block_engine_block_evictable
+            .absolute(state.evictable_blocks.len() as _);
+        metrics
+            .storage_block_engine_block_writing
+            .absolute(state.writing_blocks.len() as _);
+        metrics
+            .storage_block_engine_block_reclaiming
+            .absolute(state.reclaiming_blocks.len() as _);
+
+        drop(state);
+        self.spawn_reclaim(reclaim);
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.inner.blocks.len()
+    }
+
+    pub fn block(&self, id: BlockId) -> &Block {
+        &self.inner.blocks[id as usize]
+    }
+
+    pub fn get_clean_block(&self) -> GetCleanBlockHandle {
+        let this = self.clone();
+        async move {
+            // Wrap state lock guard to make borrow checker happy.
+            let rx = {
+                let mut state = this.inner.state.write().unwrap();
+                if let Some(id) = state.clean_blocks.pop_front() {
+                    let block = this.inner.blocks[id as usize].clone();
+                    state.writing_blocks.insert(id);
+                    this.inner.metrics.storage_block_engine_block_clean.decrease(1);
+                    this.inner.metrics.storage_block_engine_block_writing.increase(1);
+                    let reclaim = this.reclaim_if_needed(&mut state);
+                    drop(state);
+                    this.spawn_reclaim(reclaim);
+                    return block;
+                } else {
+                    let (tx, rx) = oneshot::channel();
+                    state.clean_block_waiters.push(tx);
+                    // Nothing else triggers a reclaim while no block is being written, so a waiter
+                    // must start one or it can wait forever (e.g. after recovering with 0 clean blocks).
+                    let reclaim = this.reclaim_if_needed(&mut state);
+                    drop(state);
+                    this.spawn_reclaim(reclaim);
+                    rx
+                }
+            };
+            rx.await.unwrap()
+        }
+        .boxed()
+        .shared()
+    }
+
+    pub fn on_writing_finish(&self, block: Block) {
+        let mut state = self.inner.state.write().unwrap();
+        state.writing_blocks.remove(&block.id());
+        self.inner.metrics.storage_block_engine_block_writing.decrease(1);
+        let inserted = state.evictable_blocks.insert(block.id());
+        self.inner.metrics.storage_block_engine_block_evictable.increase(1);
+
+        assert!(inserted);
+
+        // Temporarily take pickers to make borrow checker happy.
+        let mut pickers = std::mem::take(&mut state.eviction_pickers);
+
+        // Notify pickers.
+        for picker in pickers.iter_mut() {
+            picker.on_block_evictable(
+                EvictionInfo {
+                    blocks: &self.inner.blocks,
+                    evictable: &state.evictable_blocks,
+                    clean: state.clean_blocks.len(),
+                },
+                block.id(),
+            );
+        }
+
+        // Restore taken pickers after operations.
+
+        std::mem::swap(&mut state.eviction_pickers, &mut pickers);
+        assert!(pickers.is_empty());
+
+        tracing::debug!(
+            id = block.id(),
+            "[block manager]: Block state transfers from writing to evictable."
+        );
+
+        let reclaim = self.reclaim_if_needed(&mut state);
+        drop(state);
+        self.spawn_reclaim(reclaim);
+    }
+
+    fn on_reclaim_finish(&self, block: Block) {
+        let mut state = self.inner.state.write().unwrap();
+        state.reclaiming_blocks.remove(&block.id());
+        self.inner.metrics.storage_block_engine_block_reclaiming.decrease(1);
+        if let Some(waiter) = state.clean_block_waiters.pop() {
+            self.inner.metrics.storage_block_engine_block_writing.increase(1);
+            let _ = waiter.send(block);
+        } else {
+            self.inner.metrics.storage_block_engine_block_clean.increase(1);
+            state.clean_blocks.push_back(block.id());
+        }
+        let reclaim = self.reclaim_if_needed(&mut state);
+        if state.reclaiming_blocks.is_empty() {
+            for tx in std::mem::take(&mut state.reclaim_waiters) {
+                let _ = tx.send(());
+            }
+        }
+        drop(state);
+        self.spawn_reclaim(reclaim);
+    }
+
+    /// Pick a block to reclaim if the clean blocks run low, and return the reclaim future.
+    ///
+    /// The returned future MUST be spawned with [`Self::spawn_reclaim`] after the state lock is released. A spawner may
+    /// drop a future immediately (e.g. when its runtime is shutting down). Dropping the [`ReclaimingBlock`] held by the
+    /// future calls [`Self::on_reclaim_finish`], which takes the state lock again and would deadlock if it is still
+    /// held by the caller.
+    #[must_use]
+    fn reclaim_if_needed(&self, state: &mut RwLockWriteGuard<'_, State>) -> Option<BoxFuture<'static, ()>> {
+        if state.clean_blocks.len() < self.inner.clean_block_threshold
+            && state.reclaiming_blocks.len() < self.inner.reclaim_concurrency
+            && let Some(block) = self.evict(state)
+        {
+            state.reclaiming_blocks.insert(block.id());
+            self.inner.metrics.storage_block_engine_block_reclaiming.increase(1);
+            let block = ReclaimingBlock {
+                block_manager: self.clone(),
+                block,
+            };
+            return Some(self.inner.reclaimer.reclaim(block));
+        }
+        None
+    }
+
+    /// Spawn the reclaim future returned by [`Self::reclaim_if_needed`]. The state lock must not be held.
+    fn spawn_reclaim(&self, reclaim: Option<BoxFuture<'static, ()>>) {
+        if let Some(future) = reclaim {
+            self.inner.spawner.spawn(future);
+        }
+    }
+
+    fn evict(&self, state: &mut RwLockWriteGuard<'_, State>) -> Option<Block> {
+        let mut picked = None;
+
+        if state.evictable_blocks.is_empty() {
+            return None;
+        }
+
+        // Temporarily take pickers to make borrow checker happy.
+        let mut pickers = std::mem::take(&mut state.eviction_pickers);
+
+        // Pick a block to evict with pickers.
+        for picker in pickers.iter_mut() {
+            if let Some(block) = picker.pick(EvictionInfo {
+                blocks: &self.inner.blocks,
+                evictable: &state.evictable_blocks,
+                clean: state.clean_blocks.len(),
+            }) {
+                picked = Some(block);
+                break;
+            }
+        }
+
+        // If no block is selected, just randomly pick one.
+        let picked = picked.unwrap_or_else(|| state.evictable_blocks.iter().choose(&mut rand::rng()).copied().unwrap());
+
+        // Update evictable map.
+        let removed = state.evictable_blocks.remove(&picked);
+        self.inner.metrics.storage_block_engine_block_evictable.decrease(1);
+        assert!(removed);
+
+        // Notify pickers.
+        for picker in pickers.iter_mut() {
+            picker.on_block_evict(
+                EvictionInfo {
+                    blocks: &self.inner.blocks,
+                    evictable: &state.evictable_blocks,
+                    clean: state.clean_blocks.len(),
+                },
+                picked,
+            );
+        }
+
+        // Restore taken pickers after operations.
+        std::mem::swap(&mut state.eviction_pickers, &mut pickers);
+        assert!(pickers.is_empty());
+
+        let block = self.inner.blocks[picked as usize].clone();
+        tracing::debug!("[block manager]: Block {picked} is evicted.");
+
+        Some(block)
+    }
+
+    pub fn wait_reclaim(&self) -> BoxFuture<'static, ()> {
+        let mut state = self.inner.state.write().unwrap();
+        if state.reclaiming_blocks.is_empty() {
+            return ready(()).boxed();
+        }
+        let (tx, rx) = oneshot::channel();
+        state.reclaim_waiters.push(tx);
+        async move {
+            let _ = rx.await;
+        }
+        .boxed()
+    }
+}
+
+pub struct ReclaimingBlock {
+    block_manager: BlockManager,
+    block: Block,
+}
+
+impl Deref for ReclaimingBlock {
+    type Target = Block;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
+impl DerefMut for ReclaimingBlock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.block
+    }
+}
+
+impl Drop for ReclaimingBlock {
+    fn drop(&mut self) {
+        self.block_manager.on_reclaim_finish(self.block.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use bytesize::ByteSize;
+
+    use super::*;
+    use crate::{
+        PsyncIoEngineConfig,
+        engine::block::eviction::FifoPicker,
+        io::{
+            device::{DeviceBuilder, fs::FsDeviceBuilder},
+            engine::{IoEngineBuildContext, IoEngineConfig},
+        },
+    };
+
+    /// A reclaimer that holds the reclaiming block until the future is dropped, then finishes the reclaim.
+    #[derive(Debug)]
+    struct DropReclaimer;
+
+    impl ReclaimerTrait for DropReclaimer {
+        fn reclaim(&self, block: ReclaimingBlock) -> BoxFuture<'static, ()> {
+            async move { drop(block) }.boxed()
+        }
+    }
+
+    /// 4 blocks of 16 KiB, the first one is clean and the rest are evictable.
+    ///
+    /// The reclaims are spawned onto a runtime that is already shut down, which drops them immediately on the thread
+    /// that spawns them, like a runtime shutting down with a reclaim in flight.
+    fn block_manager_for_test(dir: impl AsRef<std::path::Path>) -> BlockManager {
+        let device = FsDeviceBuilder::new(dir)
+            .with_capacity(ByteSize::kib(64).as_u64() as _)
+            .build()
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let io_engine = runtime
+            .block_on(PsyncIoEngineConfig::new().boxed().build(IoEngineBuildContext {
+                spawner: Spawner::Handle(runtime.handle().clone()),
+            }))
+            .unwrap();
+
+        let closed = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let spawner = Spawner::Handle(closed.handle().clone());
+        drop(closed);
+
+        let block_manager = BlockManager::open(
+            device,
+            io_engine,
+            16 * 1024,
+            vec![Box::<FifoPicker>::default()],
+            Arc::new(DropReclaimer),
+            1,
+            2,
+            Arc::new(Metrics::noop()),
+            spawner,
+        )
+        .unwrap();
+        block_manager.init(&[0]);
+        block_manager
+    }
+
+    /// Run `f` on another thread, so that a deadlock fails the test instead of hanging it.
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("block manager deadlocked: reclaim is spawned while holding the state lock")
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    fn test_reclaim_dropped_by_spawner_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let block_manager = block_manager_for_test(dir.path());
+
+        run_with_timeout(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+            // Taking the last clean block reclaims, and the spawner drops the reclaim at once.
+            let block = runtime.block_on(block_manager.get_clean_block());
+            assert_eq!(block.id(), 0);
+            {
+                let state = block_manager.inner.state.read().unwrap();
+                assert!(state.reclaiming_blocks.is_empty());
+                assert_eq!(state.clean_blocks.len(), 2);
+                assert_eq!(state.evictable_blocks.len(), 1);
+            }
+
+            // Finishing a write makes the block evictable and reclaims, and the spawner drops the reclaim at once.
+            block_manager.on_writing_finish(block);
+            {
+                let state = block_manager.inner.state.read().unwrap();
+                assert!(state.reclaiming_blocks.is_empty());
+                assert_eq!(state.clean_blocks.len(), 2);
+                assert_eq!(state.evictable_blocks.len(), 2);
+            }
+        });
+    }
+}

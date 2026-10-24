@@ -155,7 +155,7 @@ cache_warmer:
   timeout_seconds: 30 # Applies only with block_readiness.
   warm_range_seconds: 0 # 0 = all live data, bounded by metadata_budget_percent
   concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
-  include_payloads: false # true also warms hour buckets' sample blocks into block_cache.
+  include_payloads: false # true also warms buckets' sample blocks into block_cache.
   metadata_budget_percent: 75
   payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
   continuous: # Every interval, warms SSTs that appeared since the last pass.
@@ -346,7 +346,8 @@ hour" queries benefit first.
 ### Payload warming
 
 `continuous.include_payloads` (default `true`) also warms the sample blocks
-of new hour buckets inside the payload range into `block_cache`. They are
+of new buckets inside the payload range, rollups included, into
+`block_cache`. They are
 charged to their own budget, `payload_budget_percent` (default 50) of
 `block_cache`: of its disk tier with `FoyerHybrid`, otherwise of its memory.
 Since the operator sizes `block_cache` from the pod's memory limit and

@@ -27,3 +27,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## foyer
+
+`vendor/foyer-storage` is a modified copy of `foyer-storage` 0.22.6 from the
+foyer project, https://github.com/foyer-rs/foyer, licensed under the Apache
+License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). The changes
+are listed in `vendor/foyer-storage/PATCHES.md`.
+
+Copyright 2026 foyer Project Authors

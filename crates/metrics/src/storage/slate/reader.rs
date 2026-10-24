@@ -459,8 +459,8 @@ where
     ///
     /// Each timeseries bucket is its own SlateDB segment (RFC-0024). Each
     /// planned SST warms its filters and index, plus the bucket's data
-    /// blocks when `include_samples` is set and the bucket is an hour.
-    /// Metadata-only warming stays in SlateDB's metadata cache so index
+    /// blocks when `include_samples` is set, rollups included: the payload
+    /// budget, newest first, bounds how many fit. Metadata-only warming stays in SlateDB's metadata cache so index
     /// records cannot evict sample payloads from the data cache.
     pub(super) fn plan_warm(
         &self,
@@ -492,9 +492,6 @@ where
             {
                 continue;
             }
-            // A rollup bucket's samples dwarf the cache budget for the hours a
-            // warm is meant to keep hot.
-            let include_samples = include_samples && bucket.size == 1;
             let targets: Arc<[CacheTarget]> =
                 bucket_cache_targets(&namespace, &bucket, include_samples).into();
             planned.extend(views.into_iter().map(|view| {

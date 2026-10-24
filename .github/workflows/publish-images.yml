@@ -8,6 +8,7 @@ on:
       - Cargo.toml
       - config/**
       - crates/**
+      - vendor/**
       - go/operator/**
       - mise.toml
   push:
@@ -20,6 +21,7 @@ on:
       - Cargo.toml
       - config/**
       - crates/**
+      - vendor/**
       - go/operator/**
       - mise.toml
 

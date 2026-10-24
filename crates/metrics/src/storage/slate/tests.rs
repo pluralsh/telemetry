@@ -574,3 +574,60 @@ async fn should_warm_buckets_resolved_from_segments() {
 
     storage.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn should_warm_rollup_bucket_samples() {
+    use crate::storage::in_memory_storage;
+    use common::storage::slate::warm::{WarmBudget, WarmLedger, warm_planned};
+    use slatedb::config::{FlushOptions, FlushType};
+    use tokio_util::sync::CancellationToken;
+
+    // given: a record in a day rollup, flushed to an L0 SST
+    let storage = in_memory_storage().await;
+    let namespace = crate::Namespace::default();
+    let bucket = TimeBucket {
+        start: 1440,
+        size: 24,
+    };
+    let key = ForwardIndexKey {
+        namespace: namespace.clone(),
+        bucket,
+        series_id: 1,
+    }
+    .encode();
+    storage
+        .put(vec![Record::new(key, Bytes::from_static(b"v")).into()])
+        .await
+        .unwrap();
+    storage
+        .db
+        .flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+    // when
+    let mut plan = WarmPlan::default();
+    storage.plan_warm(&[(namespace, HashSet::from([bucket]))], true, &mut plan);
+    let ledger = WarmLedger::new(true);
+    let report = warm_planned(
+        "metrics",
+        plan,
+        WarmBudget::UNBOUNDED,
+        true,
+        2,
+        &CancellationToken::new(),
+        &ledger,
+    )
+    .await;
+
+    // then
+    assert!(report.warmed_ssts > 0);
+    assert!(
+        ledger.payload_bytes() > 0,
+        "the rollup's sample blocks are warmed"
+    );
+
+    storage.close().await.unwrap();
+}
