@@ -1,8 +1,8 @@
 apiVersion: v2
 name: pseudofs
 description: Standalone Helm chart for PseudoFS
-appVersion: 0.3.12
-version: 0.1.40
+appVersion: 0.3.13
+version: 0.1.41
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
