@@ -14,7 +14,9 @@ use server_common::ingest::{IngestPipeline, Signal};
 use server_common::internal_rpc::{self, ChannelPool};
 use server_common::reload::{self, Live, LiveConfig};
 use server_common::tasks::spawn_periodic;
-use server_common::warmer::{WarmPass, readiness_waits, spawn_cache_warmer, warming_enabled};
+use server_common::warmer::{
+    WarmPass, WarmState, readiness_waits, spawn_cache_warmer, warming_enabled,
+};
 use sharding::{
     AssignmentGeneration, EpochPolicy, ForwardError, Owner, RouterLimits, ShardId, WriteRouter,
     server::ClusterMembership, shard_request_id,
@@ -40,6 +42,7 @@ pub struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) live: Arc<Live<LiveConfig<NamespaceConfig>>>,
     pub(crate) warmer: Arc<Mutex<Option<CancellationToken>>>,
+    pub(crate) warm_state: Arc<WarmState>,
     pub(crate) jwt: Option<JwtAuthenticator>,
     pub(crate) writers: Option<Arc<ShardedMetrics>>,
     pub(crate) readers: Option<Arc<ShardedMetrics>>,
@@ -132,6 +135,7 @@ impl AppState {
         let state = Self {
             live: Arc::new(Live::new(live_config(&config))),
             warmer: Arc::default(),
+            warm_state: Arc::default(),
             config: Arc::new(config),
             jwt,
             writers,
@@ -327,6 +331,7 @@ impl AppState {
         let task = spawn_cache_warmer(
             "metrics",
             &config,
+            &self.warm_state,
             cancel,
             Arc::clone(&self.cache_warmed),
             move |pass: WarmPass| {
@@ -340,7 +345,7 @@ impl AppState {
                             pass.concurrency,
                             &pass.cancel,
                             &pass.ledger,
-                            pass.metadata_budget_percent,
+                            pass.shares,
                         )
                         .await
                         .map(drop)

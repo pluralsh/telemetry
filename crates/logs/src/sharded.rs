@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport};
+use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
     ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions, shard_opener,
@@ -177,7 +177,7 @@ impl ShardedLogs {
     }
 
     /// Warms the SSTs of `window` across every open shard and namespace,
-    /// newest segment first, into `budget_percent` of the metadata cache.
+    /// newest segment first, into `shares` of the caches.
     /// SSTs `ledger` holds are skipped, and those compaction or a rollup
     /// removed are evicted; see [`ShardSet::start_warm`].
     pub async fn warm_recent(
@@ -187,11 +187,11 @@ impl ShardedLogs {
         concurrency: usize,
         cancel: &CancellationToken,
         ledger: &WarmLedger,
-        budget_percent: u8,
+        shares: WarmShares,
     ) -> Result<WarmReport> {
         let Some(pass) = self
             .shards
-            .start_warm(&self.cache, window, concurrency, cancel, budget_percent)
+            .start_warm(&self.cache, window, concurrency, cancel, shares)
             .await?
         else {
             return Ok(WarmReport::default());
@@ -527,6 +527,16 @@ impl ShardedLogs {
         Ok(sealed)
     }
 
+    /// Summarizes settled segments in every shard opened for writing; see
+    /// [`LogDb::summarize`].
+    pub async fn summarize(&self) -> Result<usize> {
+        let mut summarized = 0;
+        for database in self.shards.databases().await {
+            summarized += database.summarize().await?;
+        }
+        Ok(summarized)
+    }
+
     /// Closes every shard, then the cache they share.
     pub async fn close(&self) -> Result<()> {
         let closed = self.shards.close_all().await;
@@ -850,7 +860,7 @@ mod tests {
                     2,
                     &CancellationToken::new(),
                     ledger,
-                    75,
+                    WarmShares::default(),
                 )
                 .await
         }

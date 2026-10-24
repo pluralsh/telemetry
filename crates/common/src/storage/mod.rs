@@ -5,6 +5,7 @@ pub mod config;
 pub mod counting;
 pub mod factory;
 pub mod health;
+pub mod hybrid_cache;
 pub mod in_memory;
 pub mod loader;
 pub mod metered_cache;

@@ -4,6 +4,7 @@
 use std::{
     collections::HashSet,
     env, fmt, fs,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,6 +21,12 @@ use tokio::sync::{Mutex, RwLock};
 #[error("cannot resolve secret: {0}")]
 pub struct SecretError(String);
 
+impl SecretError {
+    pub(crate) fn new(message: String) -> Self {
+        Self(message)
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum Secret {
@@ -35,20 +42,27 @@ impl fmt::Debug for Secret {
 }
 
 impl Secret {
+    /// The secret's value. File secrets are served from memory and re-read
+    /// when their directory changes.
     pub fn expose(&self) -> Result<String, SecretError> {
-        let value = match self {
-            Self::Literal { value } => value.clone(),
+        match self {
+            Self::Literal { value } => normalize_secret(value.clone()),
             Self::Env { name } => env::var(name)
-                .map_err(|_| SecretError(format!("environment variable {name} is unset")))?,
-            Self::File { path } => fs::read_to_string(path)
-                .map_err(|error| SecretError(format!("cannot read {path}: {error}")))?,
-        };
-        let value = value.trim_end_matches(['\r', '\n']).to_owned();
-        if value.is_empty() {
-            return Err(SecretError("secret cannot be empty".to_owned()));
+                .map_err(|_| SecretError(format!("environment variable {name} is unset")))
+                .and_then(normalize_secret),
+            Self::File { path } => crate::secret_files::read(Path::new(path)),
         }
-        Ok(value)
     }
+}
+
+/// Strips trailing line endings, which secret files and editors often add,
+/// and rejects an empty secret.
+pub(crate) fn normalize_secret(value: String) -> Result<String, SecretError> {
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        return Err(SecretError("secret cannot be empty".to_owned()));
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

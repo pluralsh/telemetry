@@ -79,6 +79,7 @@ fn state(mode: ServerMode) -> AppState {
             &config,
         ))),
         warmer: Arc::default(),
+        warm_state: Arc::default(),
         config: Arc::new(config),
         jwt: None,
         writers: None,

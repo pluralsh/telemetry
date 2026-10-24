@@ -19,6 +19,7 @@ http-body = "1.0.1"
 jsonwebtoken.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+notify = "8"
 prost.workspace = true
 proto = { path = "../proto" }
 regex.workspace = true

@@ -17,7 +17,8 @@
 use std::sync::atomic::AtomicU64;
 
 use common::WarmWindow;
-use common::storage::config::DEFAULT_PAYLOAD_WARM_RANGE_SECONDS;
+use common::storage::config::ALL_LIVE_DATA;
+use common::storage::slate::warm::WarmShares;
 use common::storage::slate::warm::{WarmLedger, WarmReport};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -211,7 +212,7 @@ async fn profile_warm_memory() {
     };
     let continuous = WarmWindow {
         metadata,
-        payloads: payloads.then(|| Duration::from_secs(DEFAULT_PAYLOAD_WARM_RANGE_SECONDS)),
+        payloads: payloads.then_some(ALL_LIVE_DATA),
     };
     let namespaces = [namespace()];
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -244,7 +245,17 @@ async fn profile_warm_memory() {
     let started = Instant::now();
     start_recording();
     let report = db
-        .warm_recent(&namespaces, startup, concurrency, &cancel, &ledger, percent)
+        .warm_recent(
+            &namespaces,
+            startup,
+            concurrency,
+            &cancel,
+            &ledger,
+            WarmShares {
+                metadata_percent: percent,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let gets = stop_recording();
@@ -260,7 +271,10 @@ async fn profile_warm_memory() {
                 concurrency,
                 &cancel,
                 &ledger,
-                percent,
+                WarmShares {
+                    metadata_percent: percent,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -306,7 +320,10 @@ async fn profile_warm_memory() {
                 concurrency,
                 &cancel,
                 &ledger,
-                percent,
+                WarmShares {
+                    metadata_percent: percent,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

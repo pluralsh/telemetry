@@ -72,11 +72,12 @@ cache_warmer:
   timeout_seconds: 30
   concurrency: 2
   include_payloads: false
+  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
   continuous:
     enabled: true
     interval_seconds: 10
     warm_range_seconds: 0
-    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
+    payload_warm_range_seconds: 0 # 0 = all live data unless warm_range_seconds is set, bounded by payload_budget_percent
     include_payloads: true
 
 auth:

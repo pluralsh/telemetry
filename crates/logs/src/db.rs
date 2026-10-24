@@ -34,10 +34,10 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use crate::Namespace;
 use crate::analyzer::DEFAULT_ANALYZER;
 use crate::codec::{
-    ObjectRef, StoredObject, decode_forward_key, decode_labels, decode_object_id, decode_postings,
-    decode_stream_id, dictionary_key, encode_labels, encode_object_id, encode_postings,
-    encode_stream_id, field_stats_key, forward_key, forward_prefix, next_object_id_key,
-    next_stream_id_key, posting_key, rollup_dictionary_key, rollup_forward_key,
+    ObjectRef, SegmentSummary, StoredObject, decode_forward_key, decode_labels, decode_object_id,
+    decode_postings, decode_stream_id, dictionary_key, encode_labels, encode_object_id,
+    encode_postings, encode_stream_id, field_stats_key, forward_key, forward_prefix,
+    next_object_id_key, next_stream_id_key, posting_key, rollup_dictionary_key, rollup_forward_key,
     rollup_forward_prefix, rollup_next_stream_id_key, rollup_posting_key, rollup_prefix,
     segment_for, segment_prefix,
 };
@@ -56,6 +56,7 @@ use crate::search::{
 mod block_cache;
 mod query;
 mod rollup;
+mod summary;
 mod unfiltered;
 mod write;
 
@@ -296,6 +297,18 @@ pub struct LogDb {
     /// Holds on the merges of segments a rollup copies into.
     merge_holds: MergeHolds,
     retention: Option<Duration>,
+    /// How long after a segment ends it is summarized: once compaction
+    /// finalizes it, when late writes are rare.
+    settle_after: Duration,
+    /// [`summary::SUMMARY_BUCKET`], overridable so tests fit buckets to
+    /// their short segments.
+    summary_bucket: Duration,
+    /// The current summary of each segment the last pass saw, so passes
+    /// read only a segment's next object ID to find it unchanged.
+    summarized: std::sync::Mutex<HashMap<(Namespace, SegmentId), SegmentSummary>>,
+    /// Likewise the current summary of each rollup period.
+    period_summaries:
+        std::sync::Mutex<HashMap<(Namespace, SegmentId), crate::codec::PeriodSummary>>,
 }
 
 /// Where discovery reads one slice of a time range from.
@@ -483,6 +496,10 @@ impl LogDb {
             rollup_lock: Mutex::new(()),
             merge_holds,
             retention: config.retention,
+            settle_after: config.compaction.finalize_after,
+            summary_bucket: summary::SUMMARY_BUCKET,
+            summarized: std::sync::Mutex::default(),
+            period_summaries: std::sync::Mutex::default(),
         })
     }
 
@@ -573,6 +590,10 @@ impl LogDb {
             rollup_lock: Mutex::new(()),
             merge_holds: MergeHolds::default(),
             retention: config.retention,
+            settle_after: config.compaction.finalize_after,
+            summary_bucket: summary::SUMMARY_BUCKET,
+            summarized: std::sync::Mutex::default(),
+            period_summaries: std::sync::Mutex::default(),
         })
     }
 

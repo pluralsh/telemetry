@@ -238,12 +238,13 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `enabled` _boolean_ | Enabled runs a startup pass over recent SSTs. Defaults to true for<br />readers, which warm filters and indexes in the background; Logs<br />readers that skip filters warm only indexes. |  |  |
 | `warmRangeSeconds` _integer_ | WarmRangeSeconds is the recent window whose metadata the startup pass<br />warms. Unset covers all live data, which retention bounds, and the<br />metadata budget bounds what is held. A set value bounds payloads too<br />unless PayloadWarmRangeSeconds is set. 7200, the default of earlier<br />CRDs that the API server stored in existing resources, is read as<br />unset. |  | Minimum: 1 <br /> |
-| `payloadWarmRangeSeconds` _integer_ | PayloadWarmRangeSeconds is the recent window whose payloads the<br />startup pass warms when IncludePayloads is set. Unset uses<br />WarmRangeSeconds when that is set, otherwise 7200. Servers older than<br />this field reject it, so set it only once every reader runs a server<br />that knows it. |  | Minimum: 1 <br /> |
+| `payloadWarmRangeSeconds` _integer_ | PayloadWarmRangeSeconds is the recent window whose payloads the<br />startup pass warms when IncludePayloads is set. Unset uses<br />WarmRangeSeconds when that is set, otherwise all live data, which<br />PayloadBudgetPercent bounds newest first. Servers older than this<br />field reject it, so set it only once every reader runs a server that<br />knows it. |  | Minimum: 1 <br /> |
 | `timeoutSeconds` _integer_ |  | 30 | Minimum: 1 <br /> |
 | `concurrency` _integer_ |  | 2 | Minimum: 1 <br /> |
 | `includePayloads` _boolean_ |  | false |  |
 | `blockReadiness` _boolean_ | BlockReadiness holds readiness until the startup pass ends. Unset<br />keeps the server default, false. |  |  |
 | `metadataBudgetPercent` _integer_ | MetadataBudgetPercent is the share of the metadata cache warming may<br />fill before it stops; the server default is 75. |  | Maximum: 100 <br />Minimum: 0 <br /> |
+| `payloadBudgetPercent` _integer_ | PayloadBudgetPercent is the share of the data block cache that<br />payload warming may fill, newest first: of its disk tier when it has<br />one, otherwise of its memory. Warmed payloads go to the disk tier<br />only, so warming never fills memory. The server default is 50.<br />Servers older than this field reject it, so set it only once every<br />reader runs a server that knows it. |  | Maximum: 100 <br />Minimum: 0 <br /> |
 | `continuous` _[ContinuousCacheWarmerSpec](#continuouscachewarmerspec)_ | Continuous warms SSTs that appear in reader manifests after startup. |  |  |
 
 

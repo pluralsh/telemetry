@@ -21,7 +21,9 @@ use server_common::internal_rpc::{self, ChannelPool};
 use server_common::read_groups::ReadGroups;
 use server_common::reload::{self, Live, LiveConfig};
 use server_common::tasks::spawn_periodic;
-use server_common::warmer::{WarmPass, readiness_waits, spawn_cache_warmer, warming_enabled};
+use server_common::warmer::{
+    WarmPass, WarmState, readiness_waits, spawn_cache_warmer, warming_enabled,
+};
 use sharding::{
     AssignmentGeneration, EpochPolicy, ForwardError, Owner, RouterLimits, ShardId, WriteRouter,
     server::ClusterMembership, shard_request_id,
@@ -37,6 +39,9 @@ use crate::{
     shard_reader::GrpcLogsShards,
 };
 
+/// How often writers look for settled segments to summarize.
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 pub struct AppState {
     /// The config the process started with; see `live` for reloaded settings.
@@ -45,6 +50,7 @@ pub struct AppState {
     pub(crate) jwt: Option<JwtAuthenticator>,
     pub(crate) live: Arc<Live<LiveConfig<NamespaceConfig>>>,
     warmer: Arc<Mutex<Option<CancellationToken>>>,
+    warm_state: Arc<WarmState>,
     pub(crate) router: Arc<WriteRouter>,
     pub(crate) completed_requests: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(crate) ingest: IngestPipeline,
@@ -128,6 +134,7 @@ impl AppState {
             bodies: BodyBudget::new(config.request.max_in_flight_body_bytes),
             live: Arc::new(Live::new(live_config(&config))),
             warmer: Arc::default(),
+            warm_state: Arc::default(),
             config: Arc::new(config),
             db,
             jwt,
@@ -147,6 +154,7 @@ impl AppState {
         state.start_cache_warmer(true).await;
         state.start_durable_flush_task().await;
         state.start_rollup_task().await;
+        state.start_summary_task().await;
         Ok(state)
     }
 
@@ -243,6 +251,7 @@ impl AppState {
         let task = spawn_cache_warmer(
             "logs",
             &config,
+            &self.warm_state,
             cancel,
             Arc::clone(&self.cache_warmed),
             move |pass: WarmPass| {
@@ -256,7 +265,7 @@ impl AppState {
                             pass.concurrency,
                             &pass.cancel,
                             &pass.ledger,
-                            pass.metadata_budget_percent,
+                            pass.shares,
                         )
                         .await
                         .map(drop)
@@ -406,8 +415,34 @@ impl AppState {
             async move {
                 tokio::select! {
                     () = state.cancellation.cancelled() => {}
-                    rolled = state.db.rollup(&rollup) => if let Err(error) = rolled {
-                        tracing::warn!(%error, "Logs segment rollup failed");
+                    rolled = state.db.rollup(&rollup) => {
+                        if let Err(error) = &rolled {
+                            tracing::warn!(%error, "Logs segment rollup failed");
+                        }
+                        common::storage::rollup::record_pass("logs", rolled.ok());
+                    },
+                }
+            }
+        });
+        self.tasks.lock().await.push(task);
+    }
+
+    /// Periodically summarizes settled segments for lineless metric queries.
+    async fn start_summary_task(&self) {
+        if self.config.mode == ServerMode::Reader {
+            return;
+        }
+        let state = self.clone();
+        let task = spawn_periodic(SUMMARY_INTERVAL, self.cancellation.clone(), move || {
+            let state = state.clone();
+            async move {
+                tokio::select! {
+                    () = state.cancellation.cancelled() => {}
+                    summarized = state.db.summarize() => {
+                        if let Err(error) = summarized {
+                            tracing::warn!(%error, "Logs segment summary failed");
+                            ::metrics::counter!("logs_summary_errors_total").increment(1);
+                        }
                     },
                 }
             }

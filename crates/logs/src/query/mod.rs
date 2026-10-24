@@ -257,7 +257,9 @@ impl<'a> ScanPlan<'a> {
             request,
             query,
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
-            streams: stream_filter(query)?.with_labels(labels),
+            streams: stream_filter(query)?
+                .with_labels(labels)
+                .with_summaries(lineless.as_ref()),
             indexed_terms: indexed_match_terms(query),
             lineless,
             limit: options.limit,

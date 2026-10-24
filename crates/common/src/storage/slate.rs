@@ -382,7 +382,14 @@ impl SlateReadHandle {
                 } else {
                     warm::index_estimate(&view.sst.info)
                 };
-                (view.sst.id, Arc::clone(&targets), recency, estimate)
+                let payload = warm::payload_estimate(&view.sst.info);
+                (
+                    view.sst.id,
+                    Arc::clone(&targets),
+                    recency,
+                    estimate,
+                    payload,
+                )
             }));
         }
         let db: warm::WarmDb = match &self.source {
@@ -390,8 +397,8 @@ impl SlateReadHandle {
             ManifestSource::Reader(reader) => Arc::clone(reader) as warm::WarmDb,
         };
         let db = plan.add_database(db, live);
-        for (id, targets, recency, estimate) in planned {
-            plan.push(db, id, targets, recency, estimate);
+        for (id, targets, recency, estimate, payload) in planned {
+            plan.push(db, id, targets, recency, estimate, payload);
         }
     }
 }

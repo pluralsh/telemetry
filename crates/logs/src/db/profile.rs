@@ -7,7 +7,9 @@ use common::storage::config::{
     BlockCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
     SlateDbStorageConfig, StorageConfig,
 };
-use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::storage::slate::warm::{
+    WarmBudget, WarmLedger, WarmPlan, WarmReport, WarmShares, warm_planned,
+};
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
@@ -515,6 +517,7 @@ fn classify_key(key: &[u8]) -> &'static str {
         Some(12) => "object_tombstone",
         Some(13) => "rollup",
         Some(14) => "object_directory",
+        Some(15) => "summary",
         Some(_) => "catalog",
     }
 }
@@ -806,7 +809,7 @@ async fn profile_fuzz_progressive() {
                 warm_planned(
                     "logs",
                     plan,
-                    WarmBudget::of(&cache, 75).unwrap_or(WarmBudget::UNBOUNDED),
+                    WarmBudget::of(&cache, WarmShares::default()).unwrap_or(WarmBudget::UNBOUNDED),
                     true,
                     2,
                     &cancel,
@@ -1471,6 +1474,10 @@ async fn cold_reader_cached(
         rollup_lock: Mutex::new(()),
         merge_holds: Default::default(),
         retention: config.retention,
+        settle_after: config.compaction.finalize_after,
+        summary_bucket: crate::db::summary::SUMMARY_BUCKET,
+        summarized: Default::default(),
+        period_summaries: Default::default(),
     };
     (db, cache)
 }
@@ -1770,6 +1777,26 @@ async fn profile_cluster_day() {
         if std::env::var("PROFILE_ROLLUP_ONLY").is_ok() {
             return;
         }
+    }
+
+    // `PROFILE_SUMMARIZE` summarizes the store's settled segments once.
+    if std::env::var("PROFILE_SUMMARIZE").is_ok() && !store.join("summarized").exists() {
+        let writer = LogDb::open(config.clone()).await.unwrap();
+        let started = Instant::now();
+        let mut summarized = 0;
+        loop {
+            let pass = writer.summarize().await.unwrap();
+            if pass == 0 {
+                break;
+            }
+            summarized += pass;
+        }
+        println!(
+            "summarized {summarized} segments in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        writer.close().await.unwrap();
+        std::fs::write(store.join("summarized"), b"").unwrap();
     }
 
     // `PROFILE_END=ingested` ends the day where the ingest did, so every run
@@ -2698,7 +2725,14 @@ async fn warm_pass(
     warm_planned(
         "logs",
         plan,
-        WarmBudget::of(cache, percent).unwrap(),
+        WarmBudget::of(
+            cache,
+            WarmShares {
+                metadata_percent: percent,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
         payloads,
         2,
         cancel,

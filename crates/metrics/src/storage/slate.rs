@@ -23,7 +23,7 @@ use bytes::Bytes;
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{SharedDbCache, sst_block_size};
 use common::storage::metrics_recorder::MetricsRsRecorder;
-use common::storage::slate::warm::{WarmDb, WarmPlan, metadata_estimate};
+use common::storage::slate::warm::{WarmDb, WarmPlan, metadata_estimate, payload_estimate};
 use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
 use common::storage::{
     CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,

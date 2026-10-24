@@ -17,6 +17,7 @@ use slatedb::{CacheTarget, DbCacheManagerOps};
 use tokio_util::sync::CancellationToken;
 
 use crate::storage::factory::SharedDbCache;
+pub use crate::storage::hybrid_cache::warming_payloads;
 use crate::storage::metered_cache::{ENTRY_OVERHEAD_BYTES, attributing};
 
 /// SSTs already handed to the block cache, so periodic passes warm only files
@@ -46,6 +47,11 @@ impl SstWarmTracker {
             state: Mutex::default(),
             armed: AtomicBool::new(armed),
         }
+    }
+
+    /// Makes the next pass warm everything it has not seen.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
     }
 
     /// Ends a completed pass: forgets SSTs it did not see and arms the tracker.
@@ -153,12 +159,52 @@ pub fn index_estimate(info: &SsTableInfo) -> u64 {
     metadata_estimate(&filtered)
 }
 
+/// What an SST's data blocks weigh in a data cache, from the encoded length
+/// of the data section, which ends where its filter, index or stats begin.
+/// Cached blocks are decompressed; the factor is a reservation only,
+/// replaced by the measured weight once warmed.
+pub fn payload_estimate(info: &SsTableInfo) -> u64 {
+    let data_end = [
+        Some(info.index_offset),
+        (info.filter_len > 0).then_some(info.filter_offset),
+        (info.stats_len > 0).then_some(info.stats_offset),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(0);
+    if info.compression_codec.is_some() {
+        data_end.saturating_mul(2)
+    } else {
+        data_end
+    }
+}
+
 struct PlannedSst {
     db: usize,
     id: SsTableId,
     targets: Arc<[CacheTarget]>,
     recency: i64,
     estimate: u64,
+    /// [`payload_estimate`] when `targets` warm data blocks, else 0.
+    payload: u64,
+}
+
+impl PlannedSst {
+    fn warms_payload(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| matches!(target, CacheTarget::Data(_)))
+    }
+
+    /// Its targets without data blocks.
+    fn metadata_targets(&self) -> Arc<[CacheTarget]> {
+        self.targets
+            .iter()
+            .filter(|target| !matches!(target, CacheTarget::Data(_)))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The SSTs one pass may warm, and every SST each database's manifest
@@ -185,6 +231,8 @@ impl WarmPlan {
 
     /// Plans warming `targets` of SST `id` of database `db`. `recency` (any
     /// unit, larger is newer, comparable across passes) orders the pass.
+    /// `estimate` is its metadata's [`metadata_estimate`], and `payload` its
+    /// data blocks' [`payload_estimate`] when `targets` warm them.
     pub fn push(
         &mut self,
         db: usize,
@@ -192,14 +240,20 @@ impl WarmPlan {
         targets: Arc<[CacheTarget]>,
         recency: i64,
         estimate: u64,
+        payload: u64,
     ) {
-        self.ssts.push(PlannedSst {
+        let mut sst = PlannedSst {
             db,
             id,
             targets,
             recency,
             estimate,
-        });
+            payload: 0,
+        };
+        if sst.warms_payload() {
+            sst.payload = payload;
+        }
+        self.ssts.push(sst);
     }
 
     pub fn len(&self) -> usize {
@@ -216,15 +270,20 @@ type LedgerKey = (usize, SsTableId);
 #[derive(Clone, Copy, Debug)]
 struct Warmed {
     bytes: u64,
+    /// Data-block bytes it warmed and still counts.
+    payload: u64,
     recency: i64,
 }
 
-/// The SSTs a budgeted warmer has warmed and the metadata bytes they hold.
+/// The SSTs a budgeted warmer has warmed, with the metadata and data-block
+/// bytes they hold.
 ///
 /// It holds only SST ids and byte counts, never cache entries, so it pins
 /// nothing: what it forgets stays evictable. A pass forgets SSTs their
 /// database no longer holds (and evicts them), SSTs of databases it no
-/// longer plans, and the oldest SSTs when a newer one needs their room.
+/// longer plans, and the oldest SSTs when a newer one needs their room;
+/// a newer SST's data blocks likewise take the payload room of the oldest,
+/// which keep their metadata.
 #[derive(Debug, Default)]
 pub struct WarmLedger {
     state: Mutex<LedgerState>,
@@ -238,6 +297,8 @@ struct LedgerState {
     ignored: HashSet<LedgerKey>,
     bytes: u64,
     reserved: u64,
+    payload_bytes: u64,
+    payload_reserved: u64,
 }
 
 impl LedgerState {
@@ -245,6 +306,7 @@ impl LedgerState {
         match self.warmed.remove(key) {
             Some(warmed) => {
                 self.bytes -= warmed.bytes;
+                self.payload_bytes -= warmed.payload;
                 true
             }
             None => false,
@@ -269,9 +331,19 @@ impl WarmLedger {
         }
     }
 
+    /// Makes the next pass warm everything it does not hold.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
     /// Metadata bytes held by the SSTs it warmed.
     pub fn bytes(&self) -> u64 {
         self.lock().bytes
+    }
+
+    /// Data-block bytes held by the SSTs it warmed.
+    pub fn payload_bytes(&self) -> u64 {
+        self.lock().payload_bytes
     }
 
     /// SSTs it warmed and still counts.
@@ -344,22 +416,68 @@ impl WarmLedger {
         Reservation::Displaced(displaced)
     }
 
-    /// Releases the reservations of SSTs a cancelled pass dropped.
-    fn release(&self, reserved: u64) {
-        self.lock().reserved -= reserved;
+    /// Reserves room for `sst`'s data blocks within `budget`, taking the
+    /// payload room of older warmed SSTs, oldest first, when it must.
+    /// Returns how many it took from, or `None` when even that leaves too
+    /// little: then `sst` warms only its metadata.
+    fn reserve_payload(&self, sst: &PlannedSst, budget: u64) -> Option<usize> {
+        let mut state = self.lock();
+        let fits = |state: &LedgerState| {
+            state.payload_bytes + state.payload_reserved + sst.payload <= budget
+        };
+        if fits(&state) {
+            state.payload_reserved += sst.payload;
+            return Some(0);
+        }
+        let mut older: Vec<(i64, LedgerKey)> = state
+            .warmed
+            .iter()
+            .filter(|(_, warmed)| warmed.payload > 0 && warmed.recency < sst.recency)
+            .map(|(key, warmed)| (warmed.recency, *key))
+            .collect();
+        older.sort_unstable_by_key(|(recency, _)| *recency);
+        let releasable: u64 = older.iter().map(|(_, key)| state.warmed[key].payload).sum();
+        if state.payload_bytes - releasable + state.payload_reserved + sst.payload > budget {
+            return None;
+        }
+        let mut displaced = 0;
+        for (_, key) in older {
+            if fits(&state) {
+                break;
+            }
+            let warmed = state.warmed.get_mut(&key).expect("listed above");
+            let payload = std::mem::take(&mut warmed.payload);
+            state.payload_bytes -= payload;
+            displaced += 1;
+        }
+        state.payload_reserved += sst.payload;
+        Some(displaced)
     }
 
-    fn complete(&self, sst: &PlannedSst, warmed_bytes: Option<u64>) {
+    /// Releases the reservations of SSTs a cancelled pass dropped.
+    fn release(&self, reserved: u64, payload_reserved: u64) {
+        let mut state = self.lock();
+        state.reserved -= reserved;
+        state.payload_reserved -= payload_reserved;
+    }
+
+    /// Records `sst` warmed, its payload with its data blocks when
+    /// `payload` holds their reservation, with the `(metadata, payload)`
+    /// bytes it holds, or releases its reservations when it failed.
+    fn complete(&self, sst: &PlannedSst, payload: Option<u64>, warmed: Option<(u64, u64)>) {
         let mut state = self.lock();
         state.reserved -= sst.estimate;
-        if let Some(bytes) = warmed_bytes {
+        state.payload_reserved -= payload.unwrap_or(0);
+        if let Some((bytes, payload)) = warmed {
             let key = (sst.db, sst.id);
             state.forget(&key);
             state.bytes += bytes;
+            state.payload_bytes += payload;
             state.warmed.insert(
                 key,
                 Warmed {
                     bytes,
+                    payload,
                     recency: sst.recency,
                 },
             );
@@ -384,6 +502,27 @@ pub struct WarmReport {
     pub displaced_ssts: usize,
     /// Warmed SSTs compaction removed, evicted from the cache.
     pub evicted_ssts: usize,
+    /// Data-block bytes warmed.
+    pub payload_bytes: u64,
+    /// SSTs whose data blocks were left unwarmed because the payload budget
+    /// was full; their metadata was warmed as usual.
+    pub payload_skipped_ssts: usize,
+    /// Older warmed SSTs whose data blocks stopped counting to make room
+    /// for newer ones.
+    pub payload_displaced_ssts: usize,
+}
+
+/// Shares of the caches a warmer may fill; see [`WarmBudget::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmShares {
+    pub metadata_percent: u8,
+    pub payload_percent: u8,
+}
+
+impl Default for WarmShares {
+    fn default() -> Self {
+        crate::storage::config::CacheWarmerConfig::default().shares()
+    }
 }
 
 /// How a budgeted pass charges what it warms.
@@ -394,6 +533,55 @@ pub struct WarmBudget {
     /// Whether the metadata cache measures warmed bytes (a metered
     /// in-memory cache); otherwise each SST is charged its estimate.
     pub measured: bool,
+    pub payload: PayloadBudget,
+}
+
+/// How a budgeted pass charges the data blocks it warms.
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadBudget {
+    /// Data-cache bytes the warmer may hold.
+    pub bytes: u64,
+    /// Data-block bytes being warmed at once, of SSTs in flight, beyond
+    /// which no other SST's data blocks start: SlateDB reads an SST's data
+    /// blocks in one go and holds them until they are all cached. One SST
+    /// always may.
+    pub in_flight_bytes: u64,
+    /// Whether the data cache measures warmed bytes (a hybrid cache, see
+    /// [`warming_payloads`]); otherwise each SST is charged its estimate.
+    pub measured: bool,
+}
+
+/// `percent` of `bytes`, at most all of them.
+fn share(bytes: u64, percent: u8) -> u64 {
+    (u128::from(bytes) * u128::from(percent.min(100)) / 100) as u64
+}
+
+/// Least [`PayloadBudget::in_flight_bytes`] derived from a data cache.
+const MIN_IN_FLIGHT_PAYLOAD_BYTES: u64 = 16 << 20;
+
+impl PayloadBudget {
+    pub const UNBOUNDED: Self = Self {
+        bytes: u64::MAX,
+        in_flight_bytes: u64::MAX,
+        measured: false,
+    };
+
+    /// `percent` of the tier of `cache`'s data cache that warming fills:
+    /// the disk of a hybrid cache, whose warming skips memory, or else
+    /// memory. Data blocks in flight are bounded by a quarter of its
+    /// memory. `None` when it has no data cache, which then caches no data
+    /// blocks.
+    pub fn of(cache: &SharedDbCache, percent: u8) -> Option<Self> {
+        let data = cache.data()?;
+        let filled = data
+            .disk_capacity_bytes
+            .unwrap_or(data.memory_capacity_bytes);
+        Some(Self {
+            bytes: share(filled, percent),
+            in_flight_bytes: (data.memory_capacity_bytes / 4).max(MIN_IN_FLIGHT_PAYLOAD_BYTES),
+            measured: data.disk_capacity_bytes.is_some(),
+        })
+    }
 }
 
 impl WarmBudget {
@@ -402,15 +590,19 @@ impl WarmBudget {
     pub const UNBOUNDED: Self = Self {
         bytes: u64::MAX,
         measured: false,
+        payload: PayloadBudget::UNBOUNDED,
     };
 
-    /// `percent` of `cache`'s in-memory metadata capacity, or `None` when it
-    /// has no metadata cache.
-    pub fn of(cache: &SharedDbCache, percent: u8) -> Option<Self> {
+    /// `shares` of `cache`'s in-memory metadata capacity and of its data
+    /// cache ([`PayloadBudget::of`]), or `None` when it has no metadata
+    /// cache.
+    pub fn of(cache: &SharedDbCache, shares: WarmShares) -> Option<Self> {
         let meta = cache.meta()?;
         Some(Self {
-            bytes: meta.capacity_bytes / 100 * u64::from(percent.min(100)),
+            bytes: share(meta.capacity_bytes, shares.metadata_percent),
             measured: meta.usage.is_some(),
+            payload: PayloadBudget::of(cache, shares.payload_percent)
+                .unwrap_or(PayloadBudget::UNBOUNDED),
         })
     }
 }
@@ -421,8 +613,14 @@ impl WarmBudget {
 /// counted, unless forgetting older warmed SSTs makes room. Warmed SSTs
 /// their database no longer holds are evicted first.
 ///
-/// Transient memory is bounded by `concurrency` SSTs' filters and indexes
-/// in flight. A cancelled pass keeps what it warmed.
+/// Data blocks are charged to [`WarmBudget::payload`] the same way, except
+/// that an SST whose data blocks do not fit still warms its metadata. They
+/// are warmed in a [`warming_payloads`] scope, which keeps them out of a
+/// hybrid cache's memory.
+///
+/// Transient memory is bounded by `concurrency` SSTs' filters and indexes,
+/// and by [`PayloadBudget::in_flight_bytes`] of data blocks, in flight. A
+/// cancelled pass keeps what it warmed.
 #[allow(clippy::too_many_arguments)]
 pub async fn warm_planned(
     product: &'static str,
@@ -459,12 +657,18 @@ pub async fn warm_planned(
     } else {
         "excluded"
     };
-    let mut ssts = ssts.into_iter();
+    let mut ssts = ssts.into_iter().peekable();
     let mut in_flight = FuturesUnordered::new();
-    let mut reserved = 0;
+    let (mut reserved, mut payload_reserved) = (0, 0);
     loop {
         while in_flight.len() < concurrency && !cancel.is_cancelled() {
-            let Some(sst) = ssts.next() else { break };
+            let Some(next) = ssts.peek() else { break };
+            if payload_reserved > 0
+                && payload_reserved + next.payload > budget.payload.in_flight_bytes
+            {
+                break;
+            }
+            let mut sst = ssts.next().expect("peeked");
             match ledger.reserve(&sst, budget.bytes) {
                 Reservation::Fits => {}
                 Reservation::Displaced(displaced) => report.displaced_ssts += displaced,
@@ -479,31 +683,59 @@ pub async fn warm_planned(
                 }
             }
             reserved += sst.estimate;
+            let payload = if sst.warms_payload() {
+                match ledger.reserve_payload(&sst, budget.payload.bytes) {
+                    Some(displaced) => {
+                        report.payload_displaced_ssts += displaced;
+                        Some(sst.payload)
+                    }
+                    None => {
+                        report.payload_skipped_ssts += 1;
+                        sst.targets = sst.metadata_targets();
+                        sst.payload = 0;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            payload_reserved += payload.unwrap_or(0);
             let db = Arc::clone(&plan.dbs[&sst.db].0);
             in_flight.push(async move {
                 let bytes = Arc::new(AtomicU64::new(0));
-                let result =
-                    attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets)).await;
-                let measured = if budget.measured {
+                let payload_bytes = Arc::new(AtomicU64::new(0));
+                let warm = attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets));
+                let result = match payload {
+                    Some(_) => warming_payloads(Arc::clone(&payload_bytes), warm).await,
+                    None => warm.await,
+                };
+                let metadata = if budget.measured {
                     bytes.load(Ordering::Relaxed)
                 } else {
                     sst.estimate
                 };
-                (sst, result.map(|()| measured))
+                let warmed_payload = match payload {
+                    Some(_) if budget.payload.measured => payload_bytes.load(Ordering::Relaxed),
+                    Some(estimate) => estimate,
+                    None => 0,
+                };
+                (sst, payload, result.map(|()| (metadata, warmed_payload)))
             });
         }
         if in_flight.is_empty() {
             break;
         }
-        let (sst, result) = tokio::select! {
+        let (sst, payload, result) = tokio::select! {
             () = cancel.cancelled() => break,
             Some(done) = in_flight.next() => done,
         };
         reserved -= sst.estimate;
+        payload_reserved -= payload.unwrap_or(0);
         let status = match &result {
-            Ok(bytes) => {
+            Ok((bytes, payload)) => {
                 report.warmed_ssts += 1;
                 report.warmed_bytes += bytes;
+                report.payload_bytes += payload;
                 "success"
             }
             Err(error) => {
@@ -512,7 +744,7 @@ pub async fn warm_planned(
                 "error"
             }
         };
-        ledger.complete(&sst, result.ok());
+        ledger.complete(&sst, payload, result.ok());
         metrics::counter!(
             "telemetry_cache_warmer_ssts_total",
             "product" => product,
@@ -522,7 +754,7 @@ pub async fn warm_planned(
         .increment(1);
     }
     drop(in_flight);
-    ledger.release(reserved);
+    ledger.release(reserved, payload_reserved);
     record(product, &report, ledger, budget, started);
     report
 }
@@ -576,6 +808,16 @@ fn record(
         .set(report.skipped_bytes as f64);
     metrics::counter!("telemetry_cache_warmer_displaced_ssts_total", "product" => product)
         .increment(report.displaced_ssts as u64);
+    if budget.payload.bytes != u64::MAX {
+        metrics::gauge!("telemetry_cache_warmer_payload_budget_bytes", "product" => product)
+            .set(budget.payload.bytes as f64);
+    }
+    metrics::gauge!("telemetry_cache_warmer_payload_warmed_bytes", "product" => product)
+        .set(ledger.payload_bytes() as f64);
+    metrics::gauge!("telemetry_cache_warmer_skipped_ssts", "product" => product, "reason" => "payload_budget")
+        .set(report.payload_skipped_ssts as f64);
+    metrics::counter!("telemetry_cache_warmer_payload_displaced_ssts_total", "product" => product)
+        .increment(report.payload_displaced_ssts as u64);
     let changed =
         report.warmed_ssts + report.failed_ssts + report.displaced_ssts + report.evicted_ssts;
     if changed == 0 {
@@ -593,8 +835,12 @@ fn record(
         failed_ssts = report.failed_ssts,
         ledger_bytes = ledger.bytes(),
         budget_bytes = budget.bytes,
+        payload_bytes = report.payload_bytes,
+        payload_skipped_ssts = report.payload_skipped_ssts,
+        payload_ledger_bytes = ledger.payload_bytes(),
+        payload_budget_bytes = budget.payload.bytes,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "metadata warm pass finished"
+        "warm pass finished"
     );
 }
 
@@ -654,15 +900,36 @@ mod tests {
     #[derive(Default)]
     struct FakeDb {
         warmed: Mutex<Vec<SsTableId>>,
+        /// SSTs warmed with their data blocks.
+        payloads: Mutex<Vec<SsTableId>>,
         evicted: Mutex<Vec<SsTableId>>,
         failing: Mutex<HashSet<SsTableId>>,
+        /// Data-block warms running at once, and the most there were.
+        active_payloads: std::sync::atomic::AtomicUsize,
+        peak_payloads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl DbCacheManagerOps for FakeDb {
-        async fn warm_sst(&self, id: SsTableId, _: &[CacheTarget]) -> Result<(), slatedb::Error> {
+        async fn warm_sst(
+            &self,
+            id: SsTableId,
+            targets: &[CacheTarget],
+        ) -> Result<(), slatedb::Error> {
             if self.failing.lock().unwrap().contains(&id) {
                 return Err(slatedb::Error::internal("injected".to_owned()));
+            }
+            if targets
+                .iter()
+                .any(|target| matches!(target, CacheTarget::Data(_)))
+            {
+                let active = self.active_payloads.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_payloads.fetch_max(active, Ordering::SeqCst);
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                self.active_payloads.fetch_sub(1, Ordering::SeqCst);
+                self.payloads.lock().unwrap().push(id);
             }
             self.warmed.lock().unwrap().push(id);
             Ok(())
@@ -683,7 +950,33 @@ mod tests {
         let key = plan.add_database(Arc::clone(db) as WarmDb, ids.clone().into_iter().map(id));
         let targets: Arc<[CacheTarget]> = vec![CacheTarget::Filters, CacheTarget::Index].into();
         for n in ids {
-            plan.push(key, id(n), Arc::clone(&targets), n as i64, ESTIMATE);
+            plan.push(key, id(n), Arc::clone(&targets), n as i64, ESTIMATE, 0);
+        }
+        plan
+    }
+
+    const PAYLOAD: u64 = 1_000;
+
+    /// [`plan`] warming data blocks too, each SST's estimated at
+    /// [`PAYLOAD`] bytes.
+    fn payload_plan(db: &Arc<FakeDb>, ids: std::ops::Range<u64>) -> WarmPlan {
+        let mut plan = WarmPlan::default();
+        let key = plan.add_database(Arc::clone(db) as WarmDb, ids.clone().map(id));
+        let targets: Arc<[CacheTarget]> = vec![
+            CacheTarget::Filters,
+            CacheTarget::Index,
+            CacheTarget::data::<&[u8], _>(..),
+        ]
+        .into();
+        for n in ids {
+            plan.push(
+                key,
+                id(n),
+                Arc::clone(&targets),
+                n as i64,
+                ESTIMATE,
+                PAYLOAD,
+            );
         }
         plan
     }
@@ -692,7 +985,90 @@ mod tests {
         WarmBudget {
             bytes,
             measured: false,
+            payload: PayloadBudget::UNBOUNDED,
         }
+    }
+
+    async fn payload_pass(
+        db: &Arc<FakeDb>,
+        ids: std::ops::Range<u64>,
+        payload: PayloadBudget,
+        ledger: &WarmLedger,
+    ) -> WarmReport {
+        warm_planned(
+            "test",
+            payload_plan(db, ids),
+            WarmBudget {
+                payload,
+                ..budget(u64::MAX)
+            },
+            true,
+            4,
+            &CancellationToken::new(),
+            ledger,
+        )
+        .await
+    }
+
+    fn payload_budget(bytes: u64, in_flight_bytes: u64) -> PayloadBudget {
+        PayloadBudget {
+            bytes,
+            in_flight_bytes,
+            measured: false,
+        }
+    }
+
+    fn ids(ssts: &Mutex<Vec<SsTableId>>) -> Vec<u64> {
+        let mut ids: Vec<u64> = ssts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(SsTableId::unwrap_wal_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn payloads_fill_their_budget_newest_first_and_older_ssts_keep_metadata() {
+        let db = Arc::new(FakeDb::default());
+        let ledger = WarmLedger::new(true);
+
+        let report = payload_pass(&db, 0..10, payload_budget(2_500, u64::MAX), &ledger).await;
+
+        assert_eq!(ids(&db.payloads), vec![8, 9]);
+        assert_eq!(report.warmed_ssts, 10, "every SST warms its metadata");
+        assert_eq!(report.payload_skipped_ssts, 8);
+        assert_eq!(report.payload_bytes, 2 * PAYLOAD);
+        assert_eq!(ledger.payload_bytes(), 2 * PAYLOAD);
+
+        let report = payload_pass(&db, 0..12, payload_budget(2_500, u64::MAX), &ledger).await;
+
+        assert_eq!(ids(&db.payloads), vec![8, 9, 10, 11]);
+        assert_eq!(report.payload_displaced_ssts, 2);
+        assert_eq!(ledger.payload_bytes(), 2 * PAYLOAD);
+        assert_eq!(ledger.lock().payload_reserved, 0);
+    }
+
+    #[tokio::test]
+    async fn payloads_in_flight_stay_under_their_cap() {
+        let db = Arc::new(FakeDb::default());
+        let ledger = WarmLedger::new(true);
+
+        let report = payload_pass(&db, 0..8, payload_budget(u64::MAX, 2_500), &ledger).await;
+
+        assert_eq!(report.warmed_ssts, 8);
+        assert_eq!(ids(&db.payloads), (0..8).collect::<Vec<_>>());
+        assert_eq!(db.peak_payloads.load(Ordering::SeqCst), 2);
+
+        let db = Arc::new(FakeDb::default());
+        payload_pass(&db, 0..4, payload_budget(u64::MAX, 1), &ledger).await;
+        assert_eq!(
+            db.peak_payloads.load(Ordering::SeqCst),
+            1,
+            "an SST over the cap still warms, alone"
+        );
+        assert_eq!(ids(&db.payloads), vec![0, 1, 2, 3]);
     }
 
     async fn pass(
@@ -714,15 +1090,7 @@ mod tests {
     }
 
     fn warmed(db: &FakeDb) -> Vec<u64> {
-        let mut ids: Vec<u64> = db
-            .warmed
-            .lock()
-            .unwrap()
-            .iter()
-            .map(SsTableId::unwrap_wal_id)
-            .collect();
-        ids.sort_unstable();
-        ids
+        ids(&db.warmed)
     }
 
     #[tokio::test]
@@ -858,28 +1226,43 @@ mod tests {
     }
 
     /// A reader over `ssts` flushed L0 SSTs of 2,000 keys each, sharing a
-    /// metered metadata cache of `meta_capacity` bytes.
+    /// metered metadata cache of `meta_capacity` bytes and a 4 MiB data
+    /// cache, in memory or with a 64 MiB disk tier when `hybrid`.
     async fn reader_over_flushed_ssts(
         ssts: usize,
         meta_capacity: u64,
+        hybrid: bool,
     ) -> (tempfile::TempDir, Arc<slatedb::DbReader>, SharedDbCache) {
         use crate::storage::config::{
-            BlockCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
-            SlateDbStorageConfig,
+            BlockCacheConfig, FoyerHybridCacheConfig, FoyerMemoryCacheConfig,
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
         };
         use slatedb::config::{FlushOptions, FlushType, Settings};
 
         let dir = tempfile::tempdir().unwrap();
+        let block_cache = if hybrid {
+            BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 4 << 20,
+                disk_capacity: 64 << 20,
+                disk_path: dir.path().join("cache").to_str().unwrap().to_owned(),
+                write_policy: Default::default(),
+                flushers: 1,
+                buffer_pool_size: None,
+                submit_queue_size_threshold: 1 << 20,
+            })
+        } else {
+            BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: 4 << 20,
+                shards: Some(1),
+            })
+        };
         let config = SlateDbStorageConfig {
             path: "db".to_owned(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                path: dir.path().to_str().unwrap().to_owned(),
+                path: dir.path().join("store").to_str().unwrap().to_owned(),
             }),
             settings_path: None,
-            block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-                capacity: 4 << 20,
-                shards: Some(1),
-            })),
+            block_cache: Some(block_cache),
             meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
                 capacity: meta_capacity,
                 shards: None,
@@ -920,7 +1303,11 @@ mod tests {
         (dir, Arc::new(reader), cache)
     }
 
-    fn plan_l0(reader: &Arc<slatedb::DbReader>, keep: impl Fn(usize) -> bool) -> WarmPlan {
+    fn plan_l0(
+        reader: &Arc<slatedb::DbReader>,
+        payloads: bool,
+        keep: impl Fn(usize) -> bool,
+    ) -> WarmPlan {
         let manifest = reader.status().current_manifest;
         let views: Vec<_> = manifest.l0().iter().rev().enumerate().collect();
         let mut plan = WarmPlan::default();
@@ -931,31 +1318,101 @@ mod tests {
                 .filter(|(n, _)| keep(*n))
                 .map(|(_, view)| view.sst.id),
         );
-        let targets: Arc<[CacheTarget]> = vec![CacheTarget::Filters, CacheTarget::Index].into();
+        let mut targets = vec![CacheTarget::Filters, CacheTarget::Index];
+        if payloads {
+            targets.push(CacheTarget::data::<&[u8], _>(..));
+        }
+        let targets: Arc<[CacheTarget]> = targets.into();
         for (n, view) in views.into_iter().filter(|(n, _)| keep(*n)) {
             let estimate = metadata_estimate(&view.sst.info);
-            plan.push(key, view.sst.id, Arc::clone(&targets), n as i64, estimate);
+            let payload = payload_estimate(&view.sst.info);
+            plan.push(
+                key,
+                view.sst.id,
+                Arc::clone(&targets),
+                n as i64,
+                estimate,
+                payload,
+            );
         }
         plan
+    }
+
+    #[tokio::test]
+    async fn real_payload_warming_fills_the_disk_tier_within_budget_and_not_memory() {
+        let (_dir, reader, cache) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reader_over_flushed_ssts(12, 1 << 20, true),
+        )
+        .await
+        .expect("writing the SSTs stalled");
+        let data = cache.data().unwrap().clone();
+        assert_eq!(data.disk_capacity_bytes, Some(64 << 20));
+        let shares = WarmShares {
+            metadata_percent: 100,
+            payload_percent: 50,
+        };
+        let mut budget = WarmBudget::of(&cache, shares).unwrap();
+        assert_eq!(budget.payload.bytes, 32 << 20, "half the disk tier");
+        assert!(budget.payload.measured);
+        let manifest = reader.status().current_manifest;
+        let sst_payload = payload_estimate(&manifest.l0()[0].sst.info);
+        assert!(sst_payload > 0);
+        budget.payload.bytes = sst_payload * 7 / 2;
+        let ledger = WarmLedger::new(true);
+
+        let report = warm_planned(
+            "test",
+            plan_l0(&reader, true, |_| true),
+            budget,
+            true,
+            4,
+            &CancellationToken::new(),
+            &ledger,
+        )
+        .await;
+
+        assert_eq!(report.warmed_ssts, 12, "{report:?}");
+        let with_payload = 12 - report.payload_skipped_ssts;
+        assert!((1..=3).contains(&with_payload), "{report:?}");
+        assert!(report.payload_bytes > 0);
+        assert_eq!(ledger.payload_bytes(), report.payload_bytes);
+        assert!(ledger.payload_bytes() <= budget.payload.bytes);
+        assert_eq!(
+            data.memory_usage_bytes(),
+            0,
+            "warmed data blocks skip the memory tier"
+        );
+
+        let newest = format!("{:04}-{:06}", 11, 1_234);
+        let value = reader.get(newest.as_bytes()).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"value"[..]));
     }
 
     #[tokio::test]
     async fn real_metadata_warming_stays_in_budget_and_releases_removed_ssts() {
         let (_dir, reader, cache) = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            reader_over_flushed_ssts(12, 64 << 10),
+            reader_over_flushed_ssts(12, 64 << 10, false),
         )
         .await
         .expect("writing the SSTs stalled");
         let usage = cache.meta().unwrap().usage.clone().unwrap();
-        let budget = WarmBudget::of(&cache, 50).unwrap();
+        let budget = WarmBudget::of(
+            &cache,
+            WarmShares {
+                metadata_percent: 50,
+                payload_percent: 50,
+            },
+        )
+        .unwrap();
         assert!(budget.measured);
         let ledger = WarmLedger::new(true);
         let cancel = CancellationToken::new();
 
         let report = warm_planned(
             "test",
-            plan_l0(&reader, |_| true),
+            plan_l0(&reader, false, |_| true),
             budget,
             false,
             4,
@@ -985,7 +1442,7 @@ mod tests {
         let warmed = report.warmed_ssts;
         let report = warm_planned(
             "test",
-            plan_l0(&reader, |_| false),
+            plan_l0(&reader, false, |_| false),
             budget,
             false,
             4,

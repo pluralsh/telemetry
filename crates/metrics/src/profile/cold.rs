@@ -763,7 +763,10 @@ async fn warm_metadata(db: &ShardedMetrics, end_ms: i64) {
         16,
         &tokio_util::sync::CancellationToken::new(),
         &common::storage::slate::warm::WarmLedger::new(true),
-        100,
+        common::storage::slate::warm::WarmShares {
+            metadata_percent: 100,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

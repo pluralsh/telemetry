@@ -327,6 +327,11 @@ func (in *CacheWarmerSpec) DeepCopyInto(out *CacheWarmerSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.PayloadBudgetPercent != nil {
+		in, out := &in.PayloadBudgetPercent, &out.PayloadBudgetPercent
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Continuous != nil {
 		in, out := &in.Continuous, &out.Continuous
 		*out = new(ContinuousCacheWarmerSpec)

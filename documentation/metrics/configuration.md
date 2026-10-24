@@ -157,11 +157,12 @@ cache_warmer:
   concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
   include_payloads: false # true also warms hour buckets' sample blocks into block_cache.
   metadata_budget_percent: 75
+  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
   continuous: # Every interval, warms SSTs that appeared since the last pass.
     enabled: true
     interval_seconds: 10
     warm_range_seconds: 0
-    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
+    payload_warm_range_seconds: 0 # 0 = all live data unless warm_range_seconds is set, bounded by payload_budget_percent
     include_payloads: true
 
 write:
@@ -306,10 +307,10 @@ A startup pass, and every continuous pass after it, works as follows:
 1. It lists the live SSTs of the buckets (Traces: segments, plus the trace
    locator) inside `warm_range_seconds`. The default, `0`, lists all live
    data, so metadata warming covers retention and the budget decides how
-   much of it is held. Payloads, when included, are warmed only for the
-   buckets inside the payload range (`payload_warm_range_seconds`, or
-   `warm_range_seconds` when set, or 7200 s): they share `block_cache` with
-   queries, so a long payload range would churn it.
+   much of it is held. Payloads, when included, are warmed for the buckets
+   inside the payload range (`payload_warm_range_seconds`, or
+   `warm_range_seconds` when set, or all live data), and the payload budget
+   decides how many of them are held; see [Payload warming](#payload-warming).
 2. It orders them newest first. Metrics uses the bucket's end; Traces uses
    the segment's end, and the locator's SST creation time.
 3. It warms each SST's index and filter, up to `concurrency` SSTs at a time,
@@ -342,10 +343,36 @@ also brings back `timeout_seconds`. Queries during the pass read whatever is
 warm by then; because the newest buckets warm first, the dashboards' "last
 hour" queries benefit first.
 
-`continuous.include_payloads` (default `true`) still warms the sample blocks
-of new hour buckets inside the payload range into `block_cache`. Those
-blocks are bounded by `block_cache` and are not counted against the
-metadata budget.
+### Payload warming
+
+`continuous.include_payloads` (default `true`) also warms the sample blocks
+of new hour buckets inside the payload range into `block_cache`. They are
+charged to their own budget, `payload_budget_percent` (default 50) of
+`block_cache`: of its disk tier with `FoyerHybrid`, otherwise of its memory.
+Since the operator sizes `block_cache` from the pod's memory limit and
+volume, the warmer sizes itself from them too.
+
+- Before an SST's data blocks start, their estimate (the encoded length of
+  the data section, ×2 when compressed) is reserved. With a hybrid cache
+  the ledger then records the bytes the warm actually found or inserted.
+- When the next SST's data blocks do not fit, a newer SST takes the payload
+  room of the oldest ones the ledger holds; their blocks stay cached until
+  the cache evicts them. When even that is not enough, the SST warms its
+  metadata only and is counted as skipped for `payload_budget`.
+
+Warming never fills memory with payloads:
+
+- With a hybrid cache, warmed blocks are written to the disk tier only, and
+  blocks warming finds on disk are not promoted into memory. The memory tier
+  keeps what queries read.
+- Warming waits for the disk tier to write what it queued once that reaches
+  half of `submit_queue_size_threshold`, instead of overflowing foyer's
+  submit queue, which drops entries. Warming therefore runs at the speed
+  the disk writes.
+- SlateDB reads all of an SST's data blocks before caching them, so a pass
+  starts no further SST's data blocks while those in flight exceed a quarter
+  of `block_cache`'s memory capacity (at least 16 MiB). One SST larger than
+  that still warms, alone.
 
 With the default range, `n` below is every live SST, so planning walks the
 whole live set each pass. That is in-memory bookkeeping, about 150 bytes per
@@ -376,7 +403,9 @@ traces, with about 10k live SSTs.
 | Ledger (SST id, bytes, recency per warmed SST) | ≈ 100 B × warmed SSTs ≤ 100 B × `n` | < 1 MiB | ≈ 1 MiB |
 | Plan per pass (SST id, estimate, live-set entry) | ≈ 150 B × `N`, freed after the pass | < 1 MiB | ≈ 1.5 MiB |
 | In-flight warm reads | `k` × (largest index × 4 + largest filter) | ≈ 10 MiB | ≈ 25 MiB |
-| Data blocks from continuous payload warming | ≤ `D`, shared with queries | ≤ 676 MiB | ≤ 2.7 GiB |
+| Data blocks from payload warming, hybrid `block_cache` | 0 in memory; ≤ `payload_budget_percent` of its disk | 0 | 0 |
+| Data blocks from payload warming, memory `block_cache` | ≤ `D × payload_budget_percent / 100` | ≤ 338 MiB | ≤ 1.35 GiB |
+| In-flight payload warm reads | ≤ max(`D` / 4, 16 MiB, largest SST's data) | ≤ 169 MiB | ≤ 691 MiB |
 
 Nothing in the table grows with retention or series count beyond the
 per-SST bookkeeping. More metadata than `B` means more SSTs are skipped and
@@ -462,6 +491,10 @@ Each metric is labeled with `product`.
 | `telemetry_cache_warmer_skipped_ssts{reason="budget"}` | gauge | What the last pass left cold because it did not fit |
 | `telemetry_cache_warmer_skipped_bytes{reason="budget"}` | gauge | The skipped SSTs' estimated bytes |
 | `telemetry_cache_warmer_displaced_ssts_total` | counter | Older SSTs forgotten to make room for newer ones |
+| `telemetry_cache_warmer_payload_budget_bytes` | gauge | The payload budget, when there is a data cache |
+| `telemetry_cache_warmer_payload_warmed_bytes` | gauge | Data-block bytes the ledger holds after the last pass |
+| `telemetry_cache_warmer_skipped_ssts{reason="payload_budget"}` | gauge | SSTs the last pass warmed without their data blocks |
+| `telemetry_cache_warmer_payload_displaced_ssts_total` | counter | Older SSTs whose data blocks stopped counting to make room for newer ones |
 | `telemetry_cache_warmer_evicted_ssts_total{status}` | counter | Removed SSTs evicted from `meta_cache` |
 | `telemetry_cache_warmer_ssts_total{status}` | counter | SST warms by outcome |
 | `telemetry_cache_warmer_runs_total{mode,status}` | counter | Passes by mode (`startup`, `continuous`) and outcome |
@@ -514,8 +547,11 @@ Each metric is labeled with `product`.
     servers read as before.
   - New operator, old servers (for example pods not yet rolled): the key is
     left out and old servers default to 7200, as before.
-  - New operator, new servers: metadata covers all live data, payloads the
-    last 7200 s.
+  - New operator, new servers: metadata and payloads cover all live data,
+    bounded by their budgets.
+- `payload_budget_percent` is new, and payloads now default to all live
+  data rather than the last 7200 s. Servers that predate the key reject
+  it, so the operator renders it only when `payloadBudgetPercent` is set.
 
 ## SlateDB defaults
 

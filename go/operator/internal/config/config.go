@@ -594,6 +594,7 @@ func renderCacheWarmerConfig(spec *telemetryv1alpha1.CacheWarmerSpec, enabledByD
 		IncludePayloads:         boolValue(spec.IncludePayloads, false),
 		BlockReadiness:          spec.BlockReadiness,
 		MetadataBudgetPercent:   spec.MetadataBudgetPercent,
+		PayloadBudgetPercent:    spec.PayloadBudgetPercent,
 		Continuous:              renderContinuousCacheWarmerConfig(spec.Continuous),
 	}
 }
@@ -1037,6 +1038,7 @@ type renderCacheWarmer struct {
 	IncludePayloads         bool                        `json:"include_payloads"`
 	BlockReadiness          *bool                       `json:"block_readiness,omitempty"`
 	MetadataBudgetPercent   *int32                      `json:"metadata_budget_percent,omitempty"`
+	PayloadBudgetPercent    *int32                      `json:"payload_budget_percent,omitempty"`
 	Continuous              renderContinuousCacheWarmer `json:"continuous"`
 }
 type renderContinuousCacheWarmer struct {

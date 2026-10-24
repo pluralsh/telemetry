@@ -503,12 +503,13 @@ where
                     Arc::clone(&targets),
                     bucket.end_ms(),
                     metadata_estimate(&view.sst.info),
+                    payload_estimate(&view.sst.info),
                 )
             }));
         }
         let db = plan.add_database(Arc::clone(&self.db) as WarmDb, live);
-        for (id, targets, recency, estimate) in planned {
-            plan.push(db, id, targets, recency, estimate);
+        for (id, targets, recency, estimate, payload) in planned {
+            plan.push(db, id, targets, recency, estimate, payload);
         }
     }
 }

@@ -49,6 +49,7 @@ backfill.
 | `0x0c` | Object tombstone | Replaced object awaiting deletion |
 | `0x0d` | Rollup | Discovery records of a whole rollup period |
 | `0x0e` | Object directory | Every run of one object, with its leaves |
+| `0x0f` | Summary | Per-stream row counts of a settled segment |
 
 ## Stream and label records
 
@@ -296,6 +297,85 @@ metadata, which fails the query like the full read does.
 Rows with equal timestamps are ordered by stream fingerprint, then object ID,
 then position in the run, so results are deterministic and preserve write
 order within a stream.
+
+### Segment summaries
+
+```text
+SegmentSummary (0x0f, 0x00)
+KEY   record prefix │ 0x00
+VALUE ┌─────────┬───────┬────────────────────┬────────────┬────────────────┐
+      │ version │ flags │ expiry ms          │ generation │ bucket width   │
+      │ u8 = 1  │ u8    │ var_u64 if flags&1 │ var_u64    │ var_u64, ns    │
+      └─────────┴───────┴────────────────────┴────────────┴────────────────┘
+
+StreamSummary (0x0f, 0x01)
+KEY   record prefix │ 0x01 │ stream_id: u32 BE
+VALUE version: u8 = 1 │ flags: u8 │ count: var_u32
+      │ (bucket Δ: var_u64 │ rows: var_u64 │ line bytes: var_u64) × count
+```
+
+A writer summarizes every segment reads use (base segments, and sealed
+rollups in place of those they cover) once `compaction.finalize_after` has
+passed after its end, every five minutes, newest first and at most 32
+segments a pass. A summary counts each stream's rows and line bytes per
+one-minute bucket, bucket `b` holding timestamps in `(b × 60 s, (b + 1) ×
+60 s]` as evaluation windows hold rows. It is counted by the lineless read
+above with a window boundary at every bucket end, so its rows are
+deduplicated exactly as a query's. Bucket numbers are delta-encoded, the
+first from the bucket of the segment's start. A stream with a row that may
+fail a query (`__error__` metadata or an error label) is written with flag
+bit 0 and no buckets: it is not summarized. A stream with no live rows has
+no record.
+
+The segment record is written after every stream record of the summary. Its
+`generation` is the segment's next object ID when counting began; every
+write advances that ID and merges keep it, so the summary counts what reads
+see while the two are equal. `expiry` is the earliest expiry of the runs
+counted. A segment written after its summary is summarized again on the
+next pass; one whose earliest run has expired is not, as retention removes
+it soon after.
+
+A lineless read uses a segment's summary when it is current and every
+window boundary is a whole multiple of the bucket width, so each window
+holds all of a bucket or none of it. Then each selected stream whose grouping
+needs none of its structured metadata and that has no error label is
+counted from its summary record, one sample per bucket at the bucket's last
+instant within the query range, and none of its runs are listed or read.
+Summary records are read like run records, by one scan over a dense span of
+stream IDs or a point read per stream. The other streams, and streams not
+summarized, are read as above.
+
+Each settled rollup period also gets a summary that sums those of its
+segments, under the period's rollup prefix and keyed by period stream ID:
+
+```text
+PeriodSummary (Rollup 0x05, 0x00)
+KEY   rollup prefix │ 0x05 │ 0x00
+VALUE version: u8 = 1 │ flags: u8 │ expiry ms: var_u64 if flags&1
+      │ bucket width: var_u64, ns │ count: var_u32
+      │ (segment start: i64 BE │ segment width: var_u64 │ generation: var_u64) × count
+
+PeriodStreamSummary (Rollup 0x05, 0x01)
+KEY   rollup prefix │ 0x05 │ 0x01 │ period stream_id: u32 BE
+VALUE as StreamSummary, bucket Δ first from the bucket of the period's start
+```
+
+On the same pass, once every segment of a period reads use is summarized
+at its current generation, the writer maps each segment stream to its
+period stream ID by fingerprint, through the segment and period
+dictionaries, and adds up their buckets; a stream that one segment did not
+summarize is not summarized for the period. The period record lists every
+segment read that holds data, with the generation its summary had, and the
+earliest expiry of those summaries. It is current while the segments reads
+use for the period, and their next object IDs, are exactly those listed.
+
+A lineless read across at least two segments of a settled period first
+tries its summary, alongside the segments of other periods. In one wave it
+reads the period record, every segment's next object ID, and the period's
+streams holding the exact matchers (postings and forward labels, as
+discovery reads them). When the record is current and aligned, and every
+selected stream is counted from it, the period is read as one target of
+counts only. Otherwise its segments are read as above.
 
 ### Compaction
 

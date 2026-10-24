@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::storage::slate::warm::WarmLedger;
+use common::storage::slate::warm::{WarmLedger, WarmShares};
 use common::{CacheWarmerConfig, SstWarmTracker, WarmWindow};
 use serde::Deserialize;
 use tokio::task::JoinHandle;
@@ -21,8 +21,8 @@ pub struct WarmPass {
     pub tracker: Option<Arc<SstWarmTracker>>,
     /// What every pass of this warmer has warmed, for budgeted warming.
     pub ledger: Arc<WarmLedger>,
-    /// See [`CacheWarmerConfig::metadata_budget_percent`].
-    pub metadata_budget_percent: u8,
+    /// See [`CacheWarmerConfig::shares`].
+    pub shares: WarmShares,
 }
 
 /// Whether a server in this role and configuration runs any warming at all.
@@ -75,14 +75,26 @@ fn merge(base: &mut serde_json::Value, over: serde_json::Value) {
     }
 }
 
+/// What a process's warmers have warmed. A warmer restarted by a config
+/// reload takes it over, so it keeps what is already warmed instead of
+/// starting unarmed and never warming the SSTs live at the restart.
+#[derive(Debug, Default)]
+pub struct WarmState {
+    tracker: Arc<SstWarmTracker>,
+    ledger: Arc<WarmLedger>,
+}
+
 /// Spawns the startup pass (when enabled) and then, when continuous warming
 /// is enabled, a pass every `continuous.interval_seconds` that warms only SSTs
 /// that appeared since the previous pass. `cache_warmed` is set once the
 /// startup pass ends, whatever its outcome; a startup pass that does not
-/// block readiness has no timeout.
+/// block readiness has no timeout. Until a startup pass or a first
+/// continuous pass has run on `state`, a continuous pass only records the
+/// live SSTs.
 pub fn spawn_cache_warmer<W, Fut, E>(
     product: &'static str,
     config: &CacheWarmerConfig,
+    state: &WarmState,
     cancellation: CancellationToken,
     cache_warmed: Arc<AtomicBool>,
     warm: W,
@@ -93,11 +105,15 @@ where
     E: Display,
 {
     let config = config.clone();
+    if config.enabled {
+        state.tracker.arm();
+        state.ledger.arm();
+    }
     let tracker = config
         .continuous
         .enabled
-        .then(|| Arc::new(SstWarmTracker::new(config.enabled)));
-    let ledger = Arc::new(WarmLedger::new(config.enabled));
+        .then(|| Arc::clone(&state.tracker));
+    let ledger = Arc::clone(&state.ledger);
     tokio::spawn(async move {
         if config.enabled {
             let timeout = config
@@ -110,7 +126,7 @@ where
                 cancel: cancellation.clone(),
                 tracker: tracker.clone(),
                 ledger: Arc::clone(&ledger),
-                metadata_budget_percent: config.metadata_budget_percent,
+                shares: config.shares(),
             };
             let status =
                 run_pass(product, "startup", timeout, tracker.as_deref(), warm(pass)).await;
@@ -136,7 +152,7 @@ where
                 cancel: cancellation.clone(),
                 tracker: Some(Arc::clone(&tracker)),
                 ledger: Arc::clone(&ledger),
-                metadata_budget_percent: config.metadata_budget_percent,
+                shares: config.shares(),
             };
             run_pass(product, "continuous", None, Some(&tracker), warm(pass)).await;
         }
@@ -213,6 +229,7 @@ mod tests {
         let task = spawn_cache_warmer(
             "test",
             &config,
+            &WarmState::default(),
             cancellation.clone(),
             Arc::clone(&cache_warmed),
             move |pass: WarmPass| {
@@ -260,6 +277,7 @@ mod tests {
         spawn_cache_warmer(
             "test",
             &config,
+            &WarmState::default(),
             CancellationToken::new(),
             Arc::clone(&cache_warmed),
             move |pass: WarmPass| {
@@ -273,6 +291,54 @@ mod tests {
 
         assert!(cache_warmed.load(Ordering::Acquire));
         assert_eq!(*passes.lock().unwrap(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_warmer_keeps_the_state_of_the_one_it_replaces() {
+        let mut config = CacheWarmerConfig {
+            enabled: true,
+            ..CacheWarmerConfig::default()
+        };
+        config.continuous.interval_seconds = 10;
+        let state = WarmState::default();
+        let ledgers = Arc::new(Mutex::new(Vec::new()));
+        let spawn = |config: &CacheWarmerConfig, cancellation: CancellationToken| {
+            let recorded = Arc::clone(&ledgers);
+            spawn_cache_warmer(
+                "test",
+                config,
+                &state,
+                cancellation,
+                Arc::new(AtomicBool::new(false)),
+                move |pass: WarmPass| {
+                    recorded.lock().unwrap().push(Arc::clone(&pass.ledger));
+                    async { Ok::<(), String>(()) }
+                },
+            )
+        };
+
+        let first = CancellationToken::new();
+        let task = spawn(&config, first.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        first.cancel();
+        task.await.unwrap();
+
+        // A reload restarts the warmer without its startup pass.
+        config.enabled = false;
+        let second = CancellationToken::new();
+        let task = spawn(&config, second.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        second.cancel();
+        task.await.unwrap();
+
+        let ledgers = ledgers.lock().unwrap();
+        assert!(ledgers.len() >= 2, "{}", ledgers.len());
+        assert!(
+            ledgers
+                .iter()
+                .all(|ledger| Arc::ptr_eq(ledger, &ledgers[0]))
+        );
+        assert!(Arc::ptr_eq(&ledgers[0], &state.ledger));
     }
 
     #[derive(Deserialize)]
@@ -332,14 +398,15 @@ mod tests {
         let cache_warmed = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&finished);
-        let percent = config.metadata_budget_percent;
+        let shares = config.shares();
         spawn_cache_warmer(
             "test",
             &config,
+            &WarmState::default(),
             CancellationToken::new(),
             Arc::clone(&cache_warmed),
             move |pass: WarmPass| {
-                assert_eq!(pass.metadata_budget_percent, percent);
+                assert_eq!(pass.shares, shares);
                 let done = Arc::clone(&done);
                 async move {
                     tokio::time::sleep(Duration::from_secs(60)).await;

@@ -21,7 +21,9 @@ pub struct CacheWarmerConfig {
     /// is set; see [`Self::window`].
     pub warm_range_seconds: u64,
     /// Recent wall-clock window whose payloads are warmed when
-    /// `include_payloads` is set; 0 derives it from `warm_range_seconds`.
+    /// `include_payloads` is set; 0 derives it from `warm_range_seconds`,
+    /// and when both are 0 payloads are bounded by
+    /// `payload_budget_percent` alone, newest first.
     pub payload_warm_range_seconds: u64,
     /// Maximum time startup warming may delay readiness, when it does.
     pub timeout_seconds: u64,
@@ -37,12 +39,19 @@ pub struct CacheWarmerConfig {
     /// keep the rest. Metrics and traces stop warming metadata there and
     /// count what did not fit; logs ignores it.
     pub metadata_budget_percent: u8,
+    /// Share of the data cache the warmer may fill with payloads, newest
+    /// first: of its disk tier when it has one, else of its memory. Warmed
+    /// payloads go to the disk tier only, so warming never fills memory.
+    pub payload_budget_percent: u8,
     /// Periodic warming of SSTs that appear after startup.
     pub continuous: ContinuousCacheWarmerConfig,
 }
 
 /// [`CacheWarmerConfig::metadata_budget_percent`] unless configured.
 pub const DEFAULT_METADATA_BUDGET_PERCENT: u8 = 75;
+
+/// [`CacheWarmerConfig::payload_budget_percent`] unless configured.
+pub const DEFAULT_PAYLOAD_BUDGET_PERCENT: u8 = 50;
 
 impl Default for CacheWarmerConfig {
     fn default() -> Self {
@@ -55,6 +64,7 @@ impl Default for CacheWarmerConfig {
             include_payloads: false,
             block_readiness: true,
             metadata_budget_percent: DEFAULT_METADATA_BUDGET_PERCENT,
+            payload_budget_percent: DEFAULT_PAYLOAD_BUDGET_PERCENT,
             continuous: ContinuousCacheWarmerConfig::default(),
         }
     }
@@ -65,6 +75,9 @@ impl CacheWarmerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.metadata_budget_percent > 100 {
             return Err("cache_warmer.metadata_budget_percent must be at most 100".to_owned());
+        }
+        if self.payload_budget_percent > 100 {
+            return Err("cache_warmer.payload_budget_percent must be at most 100".to_owned());
         }
         if self.enabled && self.timeout_seconds == 0 {
             return Err(
@@ -93,11 +106,19 @@ impl CacheWarmerConfig {
             self.include_payloads,
         )
     }
+
+    /// The cache shares every pass of this warmer may fill.
+    pub fn shares(&self) -> crate::storage::slate::warm::WarmShares {
+        crate::storage::slate::warm::WarmShares {
+            metadata_percent: self.metadata_budget_percent,
+            payload_percent: self.payload_budget_percent,
+        }
+    }
 }
 
-/// Payload range when neither range is configured. Payloads churn the data
-/// cache, so unlike metadata they stay limited to the most recent data.
-pub const DEFAULT_PAYLOAD_WARM_RANGE_SECONDS: u64 = 7_200;
+/// Payload range when neither range is configured: all live data, which
+/// [`CacheWarmerConfig::payload_budget_percent`] bounds newest first.
+pub const ALL_LIVE_DATA: std::time::Duration = std::time::Duration::MAX;
 
 /// What one warming pass plans, as ages back from now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,13 +135,13 @@ impl WarmWindow {
     /// before payloads had their own range.
     pub fn new(warm_range_seconds: u64, payload_warm_range_seconds: u64, payloads: bool) -> Self {
         let seconds = |seconds: u64| (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
-        let payload_seconds = [payload_warm_range_seconds, warm_range_seconds]
+        let payload_range = [payload_warm_range_seconds, warm_range_seconds]
             .into_iter()
-            .find(|seconds| *seconds > 0)
-            .unwrap_or(DEFAULT_PAYLOAD_WARM_RANGE_SECONDS);
+            .find_map(seconds)
+            .unwrap_or(ALL_LIVE_DATA);
         Self {
             metadata: seconds(warm_range_seconds),
-            payloads: payloads.then(|| std::time::Duration::from_secs(payload_seconds)),
+            payloads: payloads.then_some(payload_range),
         }
     }
 
@@ -548,6 +569,7 @@ mod tests {
                 include_payloads: false,
                 block_readiness: true,
                 metadata_budget_percent: 75,
+                payload_budget_percent: 50,
                 continuous: ContinuousCacheWarmerConfig {
                     enabled: true,
                     interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,
@@ -560,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_covers_all_live_data_and_payloads_stay_recent_by_default() {
+    fn metadata_and_payloads_cover_all_live_data_by_default() {
         let hours = |hours: u64| Some(std::time::Duration::from_secs(hours * 3_600));
         let config = CacheWarmerConfig::default();
         assert_eq!(
@@ -574,7 +596,7 @@ mod tests {
             config.continuous.window(),
             WarmWindow {
                 metadata: None,
-                payloads: hours(2)
+                payloads: Some(ALL_LIVE_DATA)
             }
         );
         assert_eq!(
@@ -598,7 +620,7 @@ mod tests {
         );
         assert_eq!(
             WarmWindow::new(0, 0, true).payloads_only().metadata,
-            hours(2)
+            Some(ALL_LIVE_DATA)
         );
     }
 
@@ -612,6 +634,10 @@ mod tests {
             Some(10_000_000_000_000 - 3_600_000_000_000)
         );
         assert_eq!(WarmWindow::new(1, 0, false).payloads_since(5, 1), None);
+        assert_eq!(
+            WarmWindow::new(0, 0, true).payloads_since(10_000, 1_000_000_000),
+            Some(i64::MIN)
+        );
         assert_eq!(
             WarmWindow::new(u64::MAX, 0, false).metadata_since(0, 1_000_000_000),
             i64::MIN

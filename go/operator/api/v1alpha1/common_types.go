@@ -180,9 +180,10 @@ type CacheWarmerSpec struct {
 	WarmRangeSeconds *int64 `json:"warmRangeSeconds,omitempty"`
 	// PayloadWarmRangeSeconds is the recent window whose payloads the
 	// startup pass warms when IncludePayloads is set. Unset uses
-	// WarmRangeSeconds when that is set, otherwise 7200. Servers older than
-	// this field reject it, so set it only once every reader runs a server
-	// that knows it.
+	// WarmRangeSeconds when that is set, otherwise all live data, which
+	// PayloadBudgetPercent bounds newest first. Servers older than this
+	// field reject it, so set it only once every reader runs a server that
+	// knows it.
 	// +kubebuilder:validation:Minimum=1
 	PayloadWarmRangeSeconds *int64 `json:"payloadWarmRangeSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
@@ -201,6 +202,15 @@ type CacheWarmerSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	MetadataBudgetPercent *int32 `json:"metadataBudgetPercent,omitempty"`
+	// PayloadBudgetPercent is the share of the data block cache that
+	// payload warming may fill, newest first: of its disk tier when it has
+	// one, otherwise of its memory. Warmed payloads go to the disk tier
+	// only, so warming never fills memory. The server default is 50.
+	// Servers older than this field reject it, so set it only once every
+	// reader runs a server that knows it.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	PayloadBudgetPercent *int32 `json:"payloadBudgetPercent,omitempty"`
 	// Continuous warms SSTs that appear in reader manifests after startup.
 	Continuous *ContinuousCacheWarmerSpec `json:"continuous,omitempty"`
 }

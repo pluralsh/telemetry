@@ -119,11 +119,12 @@ cache_warmer:
   concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
   include_payloads: false # true also warms segments' data blocks into block_cache.
   metadata_budget_percent: 75
+  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
   continuous: # Every interval, warms SSTs that appeared since the last pass.
     enabled: true
     interval_seconds: 10
     warm_range_seconds: 0
-    payload_warm_range_seconds: 0 # 0 = 7200 unless warm_range_seconds is set
+    payload_warm_range_seconds: 0 # 0 = all live data unless warm_range_seconds is set, bounded by payload_budget_percent
     include_payloads: true
 
 # Decoded read caches of each storage shard; 0 disables one. The defaults are

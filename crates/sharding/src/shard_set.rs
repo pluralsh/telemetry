@@ -8,7 +8,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use common::storage::slate::warm::{WarmBudget, WarmLedger, WarmPlan, WarmReport, warm_planned};
+use common::storage::slate::warm::{
+    PayloadBudget, WarmBudget, WarmLedger, WarmPlan, WarmReport, WarmShares, warm_planned,
+};
 use common::{SharedDbCache, WarmWindow};
 use futures::{
     StreamExt, TryStreamExt,
@@ -356,35 +358,41 @@ impl<D: ShardDatabase> ShardSet<D> {
         }
     }
 
-    /// Starts a pass warming `window` of every open shard into
-    /// `budget_percent` of `cache`'s metadata cache, holding up to
-    /// `concurrency` I/O permits until [`ShardWarmPass::finish`]. Without a
-    /// metadata cache only the payload window is warmed. Returns `None` when
-    /// there is nothing to warm or `cancel` fires first.
+    /// Starts a pass warming `window` of every open shard into `shares` of
+    /// `cache`, holding up to `concurrency` I/O permits until
+    /// [`ShardWarmPass::finish`]. Without a metadata cache only the payload
+    /// window is warmed, and without a data cache no payloads are. Returns
+    /// `None` when there is nothing to warm or `cancel` fires first.
     pub async fn start_warm(
         &self,
         cache: &SharedDbCache,
-        window: WarmWindow,
+        mut window: WarmWindow,
         concurrency: usize,
         cancel: &CancellationToken,
-        budget_percent: u8,
+        shares: WarmShares,
     ) -> Result<Option<ShardWarmPass<D>>, ShardSetError> {
-        let budget = WarmBudget::of(cache, budget_percent);
-        let window = if budget.is_some() {
-            window
-        } else {
-            window.payloads_only()
-        };
+        let payload = PayloadBudget::of(cache, shares.payload_percent);
+        if payload.is_none() {
+            window.payloads = None;
+        }
+        let budget = WarmBudget::of(cache, shares);
+        if budget.is_none() {
+            window = window.payloads_only();
+        }
         if budget.is_none() && window.payloads.is_none() {
             return Ok(None);
         }
+        let budget = budget.unwrap_or(WarmBudget {
+            payload: payload.unwrap_or(PayloadBudget::UNBOUNDED),
+            ..WarmBudget::UNBOUNDED
+        });
         let Some((permits, concurrency)) = self.reserve_io(concurrency, cancel).await? else {
             return Ok(None);
         };
         Ok(Some(ShardWarmPass {
             databases: self.databases().await,
             window,
-            budget: budget.unwrap_or(WarmBudget::UNBOUNDED),
+            budget,
             concurrency,
             _permits: permits,
         }))

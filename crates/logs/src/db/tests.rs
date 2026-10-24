@@ -2982,6 +2982,144 @@ async fn lineless_metric_reads_match_full_row_reads() {
     }
 }
 
+/// Lineless metric reads whose windows fall on whole summary buckets count
+/// summarized streams from segment summaries; they must agree with the
+/// full-row read before and after a late write makes the summaries stale,
+/// and after the next pass rebuilds them.
+#[tokio::test]
+async fn summarized_metric_reads_match_full_row_reads() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    const MS: i64 = 1_000_000;
+    let ops = ["count_over_time", "rate", "bytes_over_time", "bytes_rate"];
+    let wrappers = [
+        "{}",
+        "sum({})",
+        "sum by (service) ({})",
+        "sum by (pod) ({})",
+        "sum({}) + sum by (service) ({})",
+    ];
+    let selectors = [r#"{environment="prod"}"#, r#"{service="api"}"#];
+    let now_unix_ms = unix_time_ms().unwrap();
+    for seed in 1..=20u64 {
+        let errors = seed % 5 == 0;
+        let mut db = LogDb::open(Config {
+            retention: None,
+            page: PageConfig {
+                target_size_bytes: 4096,
+                max_rows: 12,
+                rows_per_block: 3,
+            },
+            ..test_config()
+        })
+        .await
+        .unwrap();
+        db.summary_bucket = Duration::from_secs(1);
+        let namespace = Namespace::default();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut previous = Vec::new();
+        for _ in 0..1 + rng.below(6) {
+            let batches = lineless_batches(&mut rng, &previous, errors);
+            db.write(&namespace, batches.clone()).await.unwrap();
+            previous = batches;
+        }
+        db.flush().await.unwrap();
+        db.flush_memtable().await.unwrap();
+        assert!(
+            db.summarize_at(now_unix_ms).await.unwrap() > 0,
+            "seed {seed}"
+        );
+        assert_eq!(
+            db.summarize_at(now_unix_ms).await.unwrap(),
+            0,
+            "seed {seed}"
+        );
+        if !errors {
+            let read = SampleRead {
+                metadata: MetadataNeeds::None,
+                boundaries: vec![Boundaries {
+                    first: 0,
+                    step: 1_000 * MS,
+                    count: 31,
+                }],
+            };
+            let targets = db
+                .scan_targets(
+                    &namespace,
+                    0,
+                    30_000 * MS,
+                    &StreamFilter::exact(Vec::new()).with_summaries(Some(&read)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(targets.estimate(true).pages, 0, "seed {seed}");
+            let periods = targets
+                .segment_ids()
+                .filter(|segment| segment.width_ns == 20_000 * MS)
+                .count();
+            assert_eq!(periods, 2, "seed {seed}");
+        }
+
+        for round in 0..3 {
+            if round == 1 {
+                let batches = lineless_batches(&mut rng, &previous, errors);
+                db.write(&namespace, batches).await.unwrap();
+                db.flush().await.unwrap();
+            }
+            if round == 2 {
+                db.flush_memtable().await.unwrap();
+                db.summarize_at(now_unix_ms).await.unwrap();
+            }
+            for _ in 0..30 {
+                let aligned = rng.below(4) > 0;
+                let unit = if aligned { 1_000 } else { 250 };
+                let op = ops[rng.below(ops.len() as u64) as usize];
+                let selector = selectors[rng.below(2) as usize];
+                let range = [1, 2, 5, 7][rng.below(4) as usize] * unit;
+                let offset = [0, 1, 3][rng.below(3) as usize] * unit;
+                let window = |filter: &str| {
+                    let offset = if offset == 0 {
+                        String::new()
+                    } else {
+                        format!(" offset {offset}ms")
+                    };
+                    format!("{op}({selector}{filter} [{range}ms]{offset})")
+                };
+                let wrapper = wrappers[rng.below(wrappers.len() as u64) as usize];
+                let (fast, slow) = (
+                    wrapper.replace("{}", &window("")),
+                    wrapper.replace("{}", &window(r#" |= """#)),
+                );
+                let start = rng.below(35) as i64 * unit * MS;
+                let (fast, slow) = if rng.below(4) == 0 {
+                    (
+                        QueryRequest::instant(fast, start),
+                        QueryRequest::instant(slow, start),
+                    )
+                } else {
+                    let end = start + rng.below(30) as i64 * unit * MS;
+                    let step = [1, 2, 5][rng.below(3) as usize] * unit * MS;
+                    (
+                        QueryRequest::range(fast, start, end, step),
+                        QueryRequest::range(slow, start, end, step),
+                    )
+                };
+                let result = async |request| {
+                    db.query(&namespace, request, QueryOptions::default())
+                        .await
+                        .map_err(|error| error.to_string())
+                };
+                assert_eq!(
+                    result(&fast).await,
+                    result(&slow).await,
+                    "seed {seed} round {round}: {fast:?}"
+                );
+            }
+        }
+        db.close().await.unwrap();
+    }
+}
+
 #[test]
 fn grouped_lineless_reads_select_the_metadata_their_labels_come_from() {
     use crate::object::FieldSelection;

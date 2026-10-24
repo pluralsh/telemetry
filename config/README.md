@@ -181,8 +181,21 @@ keep parsing and new keys need no migration).
   unless `payload_warm_range_seconds` is set, as it did before payloads had their own range.
 - `cache_warmer.payload_warm_range_seconds`: recent time range whose payloads are warmed when
   `include_payloads` is set. Default `0`, which uses `warm_range_seconds` when that is set and
-  `7200` otherwise. Payloads fill the data cache that queries share, so this range stays short.
-  Servers older than this key reject it.
+  otherwise all live data, bounded by `payload_budget_percent`. Servers older than this key
+  reject it.
+- `cache_warmer.payload_budget_percent`: the share of the data cache payload warming may fill,
+  `0` to `100`, newest first: of the disk tier of a `FoyerHybrid` `block_cache`, otherwise of its
+  memory. The warmer sizes itself from the cache capacities, which the operator derives from the
+  pod's memory and volume. Older SSTs' payloads stop counting when newer ones need the room, and
+  SSTs whose payloads do not fit still warm their metadata. Default `50`. Servers older than this
+  key reject it.
+
+  Payload warming never fills memory: with a hybrid cache, warmed blocks are written to the disk
+  tier only, disk hits during warming are not promoted into memory, and warming waits for the
+  disk tier to write what is queued rather than overflow foyer's submit queue (which drops
+  entries). SlateDB reads all of an SST's data blocks before caching them, so warming also holds
+  no more than a quarter of the data cache's memory capacity (at least 16 MiB) of data blocks in
+  flight; one SST larger than that still warms, alone.
 - `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false, with
   `block_readiness`. Default `30`; timeout is fail-open.
 - `cache_warmer.concurrency`: maximum concurrent SST warm operations and number of permits reserved

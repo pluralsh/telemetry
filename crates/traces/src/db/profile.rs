@@ -1413,7 +1413,14 @@ async fn profile_warm_memory() {
     .unwrap();
     let db = Arc::new(db);
     let ledger = WarmLedger::new(true);
-    let budget = WarmBudget::of(&cache, percent).unwrap();
+    let budget = WarmBudget::of(
+        &cache,
+        common::storage::slate::warm::WarmShares {
+            metadata_percent: percent,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let mut record = |phase: &str, report: WarmReport, gets: &[ColdGet], elapsed: Duration| {
         let meta = cache.meta().and_then(|meta| meta.usage.as_ref());
@@ -1453,9 +1460,7 @@ async fn profile_warm_memory() {
         let (db, ledger, cancel, namespaces) = (&db, &ledger, &cancel, &namespaces);
         let window = common::WarmWindow {
             metadata,
-            payloads: include_payloads.then(|| {
-                Duration::from_secs(common::storage::config::DEFAULT_PAYLOAD_WARM_RANGE_SECONDS)
-            }),
+            payloads: include_payloads.then_some(common::storage::config::ALL_LIVE_DATA),
         };
         async move {
             let mut plan = WarmPlan::default();

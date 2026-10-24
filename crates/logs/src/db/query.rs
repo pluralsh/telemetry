@@ -11,8 +11,11 @@ use common::storage::ReadHints;
 
 use super::*;
 use crate::codec::{
-    StoredRun, decode_object, decode_rollup_forward_key, decode_run, decode_run_key, directory_key,
-    posting_name_prefix, segment_run_prefix, stream_run_prefix,
+    SegmentSummary, StoredRun, StreamSummary, SummaryBucket, decode_object, decode_period_summary,
+    decode_rollup_forward_key, decode_run, decode_run_key, decode_segment_summary,
+    decode_stream_summary, decode_stream_summary_key, directory_key, period_stream_summary_key,
+    period_stream_summary_prefix, period_summary_key, posting_name_prefix, segment_run_prefix,
+    stream_run_prefix, stream_summary_key, stream_summary_prefix, summary_key,
 };
 use crate::object::{
     Block, FieldSelection, ReadNeeds, RowSample, block_header, decode_block_rows,
@@ -254,6 +257,22 @@ impl LogDb {
         period: SegmentId,
         exact: &[Label],
     ) -> Result<Vec<Arc<Labels>>> {
+        Ok(self
+            .rollup_streams(namespace, period, exact)
+            .await?
+            .into_iter()
+            .map(|(_, labels)| labels)
+            .collect())
+    }
+
+    /// The period-local ID and labels of every stream of `period` holding
+    /// every `exact` label, in ID order.
+    async fn rollup_streams(
+        &self,
+        namespace: &Namespace,
+        period: SegmentId,
+        exact: &[Label],
+    ) -> Result<Vec<(StreamId, Arc<Labels>)>> {
         let forward = rollup_forward_prefix(namespace, period);
         let prefix_len = forward.len();
         let scan = |range| {
@@ -262,8 +281,7 @@ impl LogDb {
             })
         };
         if exact.is_empty() {
-            let labelled = scan(BytesRange::unbounded()).await?;
-            return Ok(labelled.into_iter().map(|(_, labels)| labels).collect());
+            return scan(BytesRange::unbounded()).await;
         }
         let reads = self.reads();
         let records = futures::future::try_join_all(
@@ -290,15 +308,14 @@ impl LogDb {
                 .into_iter()
                 .flatten()
                 .filter(|(id, _)| ids.binary_search(id).is_ok())
-                .map(|(_, labels)| labels)
                 .collect());
         }
-        let labelled: Vec<Option<Arc<Labels>>> = futures::stream::iter(ids)
+        let labelled: Vec<Option<(StreamId, Arc<Labels>)>> = futures::stream::iter(ids)
             .map(|id| async move {
                 self.reads()
                     .get(rollup_forward_key(namespace, period, id))
                     .await?
-                    .map(|record| decode_labels(&record.value).map(Arc::new))
+                    .map(|record| decode_labels(&record.value).map(|labels| (id, Arc::new(labels))))
                     .transpose()
             })
             .buffered(STREAM_METADATA_CONCURRENCY)
@@ -394,20 +411,82 @@ impl LogDb {
         filter: &StreamFilter,
     ) -> Result<ScanTargets> {
         let now_unix_ms = unix_time_ms()?;
-        let segments = futures::stream::iter(self.visible_segment_ids(
-            namespace,
-            (start_ns, end_ns),
-            false,
-        )?)
-        .map(|segment| async move {
-            let streams = self
-                .segment_streams(namespace, segment, filter, (start_ns, end_ns), now_unix_ms)
-                .await?;
-            Ok::<_, Error>((segment, streams))
-        })
-        .buffered(self.tuning.list_concurrency)
-        .try_collect()
-        .await?;
+        let list = |segments: Vec<SegmentId>| {
+            futures::stream::iter(segments)
+                .map(|segment| async move {
+                    let streams = self
+                        .segment_streams(
+                            namespace,
+                            segment,
+                            filter,
+                            (start_ns, end_ns),
+                            now_unix_ms,
+                        )
+                        .await?;
+                    Ok::<_, Error>((segment, streams))
+                })
+                .buffered(self.tuning.list_concurrency)
+                .try_collect::<Vec<_>>()
+        };
+        let visible = self.visible_segment_ids(namespace, (start_ns, end_ns), false)?;
+        let (Some(read), Some(rollup_ns)) = (&filter.summaries, self.rollup_ns) else {
+            return Ok(ScanTargets {
+                range: (start_ns, end_ns),
+                segments: list(visible).await?,
+                line_terms: filter.line_terms.clone(),
+                first_ordinal: 0,
+            });
+        };
+        let period_of = |segment: &SegmentId| segment_for(segment.start_ns, rollup_ns);
+        let settled_before = i64::try_from(now_unix_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000)
+            .saturating_sub(duration_ns(self.settle_after)?);
+        let mut spanned = visible.iter().map(period_of).collect::<Vec<_>>();
+        spanned.dedup();
+        // Only settled periods are summarized, and a period summary lists
+        // every stream of the period, so it pays only for queries reading
+        // more than one of its segments.
+        spanned.retain(|period| {
+            period.start_ns.saturating_add(period.width_ns) <= settled_before
+                && visible
+                    .iter()
+                    .filter(|segment| period_of(segment) == *period)
+                    .nth(1)
+                    .is_some()
+        });
+        let (candidates, others): (Vec<_>, Vec<_>) = visible
+            .into_iter()
+            .partition(|segment| spanned.contains(&period_of(segment)));
+        let attempts = futures::stream::iter(spanned)
+            .map(|period| async move {
+                let streams = self
+                    .period_streams(namespace, period, filter, read, now_unix_ms)
+                    .await?;
+                Ok::<_, Error>((period, streams))
+            })
+            .buffered(self.tuning.list_concurrency)
+            .try_collect::<Vec<_>>();
+        let (attempts, mut segments) = futures::future::try_join(attempts, list(others)).await?;
+        let mut summarized = Vec::new();
+        let mut unsummarized = HashSet::new();
+        for (period, streams) in attempts {
+            match streams {
+                Some(streams) => summarized.push((period, streams)),
+                None => {
+                    unsummarized.insert(period);
+                }
+            }
+        }
+        let fallback = candidates
+            .into_iter()
+            .filter(|segment| unsummarized.contains(&period_of(segment)))
+            .collect::<Vec<_>>();
+        if !fallback.is_empty() {
+            segments.extend(list(fallback).await?);
+        }
+        segments.extend(summarized);
+        segments.sort_by_key(|(segment, _)| segment.start_ns);
         Ok(ScanTargets {
             range: (start_ns, end_ns),
             segments,
@@ -1479,13 +1558,15 @@ impl LogDb {
                 && run.min_timestamp_ns <= end_ns
         };
         let projection = filter.labels.as_ref().filter(|_| self.project_labels);
-        let ((selected, projected), runs) = match self
-            .select_streams(namespace, segment, &filter.exact, projection)
-            .await?
-        {
+        let (selection, summary) = futures::future::try_join(
+            self.select_streams(namespace, segment, &filter.exact, projection),
+            self.usable_summary(namespace, segment, filter, now_unix_ms),
+        )
+        .await?;
+        let ((selected, projected), runs) = match selection {
             Selection::Labelled(streams, projected) => ((streams, projected), None),
             Selection::Listed(stream_ids, version)
-                if self.tuning.overlap_runs && filter.selects_exact() =>
+                if summary.is_none() && self.tuning.overlap_runs && filter.selects_exact() =>
             {
                 let (selected, runs) = futures::future::try_join(
                     self.label_streams(
@@ -1520,15 +1601,15 @@ impl LogDb {
             .filter(|(_, labels)| filter.matches(labels))
             .map(|(stream_id, labels)| (*stream_id, Arc::clone(labels)))
             .collect::<Vec<_>>();
-        let runs = match runs {
-            Some(runs) => runs,
+        let (runs, counts) = match runs {
+            Some(runs) => (runs, Vec::new()),
             None => {
-                let stream_ids = labelled.iter().map(|(id, _)| *id).collect();
-                self.segment_runs(namespace, segment, stream_ids, live)
+                self.stream_contents(namespace, segment, &labelled, summary, live)
                     .await?
             }
         };
         debug_assert_eq!(labelled.len(), runs.len());
+        let mut counts = counts.into_iter();
         let mut streams = labelled
             .into_iter()
             .zip(runs)
@@ -1536,6 +1617,7 @@ impl LogDb {
                 stream_id,
                 labels,
                 runs,
+                counts: counts.next().flatten(),
             })
             .collect::<Vec<_>>();
         if projected {
@@ -1559,6 +1641,247 @@ impl LogDb {
             }
         }
         Ok(streams)
+    }
+
+    /// The summary of `segment`, when `filter` may count streams from one
+    /// and it still counts what reads see: written since its last write
+    /// and before any run it counts expired, in buckets no window boundary
+    /// falls inside.
+    async fn usable_summary(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        filter: &StreamFilter,
+        now_unix_ms: u64,
+    ) -> Result<Option<(SegmentSummary, Arc<SampleRead>)>> {
+        let Some(read) = &filter.summaries else {
+            return Ok(None);
+        };
+        let reads = self.reads();
+        let (summary, next) = futures::future::try_join(
+            reads.get(summary_key(namespace, segment)),
+            reads.get(next_object_id_key(namespace, segment)),
+        )
+        .await?;
+        let Some(summary) = summary
+            .map(|record| decode_segment_summary(&record.value))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let generation = next
+            .map(|record| decode_object_id(&record.value))
+            .transpose()?;
+        Ok(
+            (summary.is_current(generation, now_unix_ms) && read.aligned_to(summary.bucket_ns))
+                .then(|| (summary, Arc::clone(read))),
+        )
+    }
+
+    /// The streams of every segment of `period` that `filter` selects, all
+    /// counted from the period's summary, when it is current and holds
+    /// every one of them: summed from the summary of each segment reads
+    /// use, at that segment's current generation.
+    async fn period_streams(
+        &self,
+        namespace: &Namespace,
+        period: SegmentId,
+        filter: &StreamFilter,
+        read: &SampleRead,
+        now_unix_ms: u64,
+    ) -> Result<Option<Vec<SegmentStream>>> {
+        let Some(covered) = self.period_segments(&self.rollups(namespace), period) else {
+            return Ok(None);
+        };
+        let (summary, generations, labelled) = futures::future::try_join3(
+            async {
+                Ok::<_, Error>(
+                    self.reads()
+                        .get(period_summary_key(namespace, period))
+                        .await?,
+                )
+            },
+            self.generations_of(namespace, covered),
+            self.rollup_streams(namespace, period, &filter.exact),
+        )
+        .await?;
+        let Some(summary) = summary
+            .map(|record| decode_period_summary(&record.value))
+            .transpose()?
+            .filter(|summary| {
+                read.aligned_to(summary.bucket_ns) && summary.is_current(&generations, now_unix_ms)
+            })
+        else {
+            return Ok(None);
+        };
+        let labelled = labelled
+            .into_iter()
+            .filter(|(_, labels)| filter.matches(labels))
+            .collect::<Vec<_>>();
+        let countable = labelled.iter().all(|(_, labels)| {
+            read.metadata.fields(labels).is_none()
+                && !labels.iter().any(|label| is_error_label(&label.name))
+        });
+        if !countable {
+            return Ok(None);
+        }
+        let found = self
+            .summaries_under(
+                period_stream_summary_prefix(namespace, period),
+                |stream_id| period_stream_summary_key(namespace, period, stream_id),
+                summary.bucket(period.start_ns),
+                labelled.iter().map(|(stream_id, _)| *stream_id).collect(),
+            )
+            .await?;
+        let mut streams = Vec::with_capacity(labelled.len());
+        for ((stream_id, labels), found) in labelled.into_iter().zip(found) {
+            match found {
+                Some(None) => return Ok(None),
+                Some(Some(buckets)) => streams.push(SegmentStream {
+                    stream_id,
+                    labels,
+                    runs: Vec::new(),
+                    counts: Some(StreamCounts {
+                        bucket_ns: summary.bucket_ns,
+                        buckets,
+                    }),
+                }),
+                None => {}
+            }
+        }
+        Ok(Some(streams))
+    }
+
+    /// Runs of each of `labelled` (ascending) passing `keep`, and counts of
+    /// those `summary` counts instead: streams it summarized, of which the
+    /// read needs no structured metadata and no row can fail. Their runs
+    /// are left empty, as are those of streams it holds no rows of.
+    async fn stream_contents(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        labelled: &[(StreamId, Arc<Labels>)],
+        summary: Option<(SegmentSummary, Arc<SampleRead>)>,
+        keep: impl Fn(&StoredRun) -> bool + Copy + Send + Sync + 'static,
+    ) -> Result<(Vec<Vec<(u64, StoredRun)>>, Vec<Option<StreamCounts>>)> {
+        let mut counts = labelled.iter().map(|_| None).collect::<Vec<_>>();
+        let mut listed = vec![true; labelled.len()];
+        if let Some((summary, read)) = summary {
+            let counted = labelled
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, labels))| {
+                    read.metadata.fields(labels).is_none()
+                        && !labels.iter().any(|label| is_error_label(&label.name))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let stream_ids = counted.iter().map(|&index| labelled[index].0).collect();
+            let found = self
+                .stream_summaries(namespace, segment, &summary, stream_ids)
+                .await?;
+            for (index, found) in counted.into_iter().zip(found) {
+                match found {
+                    Some(None) => continue,
+                    Some(Some(buckets)) => {
+                        counts[index] = Some(StreamCounts {
+                            bucket_ns: summary.bucket_ns,
+                            buckets,
+                        });
+                    }
+                    None => {}
+                }
+                listed[index] = false;
+            }
+        }
+        let stream_ids = labelled
+            .iter()
+            .zip(&listed)
+            .filter(|(_, listed)| **listed)
+            .map(|((stream_id, _), _)| *stream_id)
+            .collect();
+        let mut runs = self
+            .segment_runs(namespace, segment, stream_ids, keep)
+            .await?
+            .into_iter();
+        let runs = listed
+            .iter()
+            .map(|listed| {
+                if *listed {
+                    runs.next().unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        Ok((runs, counts))
+    }
+
+    /// Summaries of `stream_ids` (ascending) in `segment`, in input order;
+    /// `None` for a stream the summary holds no rows of.
+    async fn stream_summaries(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        summary: &SegmentSummary,
+        stream_ids: Vec<StreamId>,
+    ) -> Result<Vec<Option<StreamSummary>>> {
+        self.summaries_under(
+            stream_summary_prefix(namespace, segment),
+            |stream_id| stream_summary_key(namespace, segment, stream_id),
+            summary.bucket(segment.start_ns),
+            stream_ids,
+        )
+        .await
+    }
+
+    /// Summaries of `stream_ids` (ascending) under `prefix`, each keyed by
+    /// `key`, in input order; `None` for a stream with no record.
+    async fn summaries_under(
+        &self,
+        prefix: Bytes,
+        key: impl Fn(StreamId) -> Bytes + Copy + Send + Sync,
+        first: i64,
+        stream_ids: Vec<StreamId>,
+    ) -> Result<Vec<Option<StreamSummary>>> {
+        if let Some(spans) = self.span_scans(&stream_ids) {
+            let prefix_len = prefix.len();
+            let selected = &stream_ids;
+            let scans = spans.into_iter().map(|span| {
+                let prefix = prefix.clone();
+                async move {
+                    let mut records = self.reads().scan_prefix_iter(prefix, span, None).await?;
+                    let mut found = Vec::new();
+                    while let Some(record) = records.next().await? {
+                        let stream_id = decode_stream_summary_key(&record.key, prefix_len)?;
+                        if selected.binary_search(&stream_id).is_ok() {
+                            found.push((stream_id, decode_stream_summary(&record.value, first)?));
+                        }
+                    }
+                    Ok::<_, Error>(found)
+                }
+            });
+            let mut found = futures::future::try_join_all(scans)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect::<HashMap<_, _>>();
+            return Ok(stream_ids
+                .iter()
+                .map(|stream_id| found.remove(stream_id))
+                .collect());
+        }
+        futures::stream::iter(stream_ids)
+            .map(|stream_id| async move {
+                self.reads()
+                    .get(key(stream_id))
+                    .await?
+                    .map(|record| decode_stream_summary(&record.value, first))
+                    .transpose()
+            })
+            .buffered(STREAM_METADATA_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Runs of `stream_ids` (ascending) passing `keep`, in input order.
@@ -1919,6 +2242,48 @@ struct SegmentStream {
     labels: Arc<Labels>,
     /// Live overlapping runs with their object IDs.
     runs: Vec<(u64, StoredRun)>,
+    /// The stream's rows from the segment's summary, read instead of its
+    /// runs, which are then left empty.
+    counts: Option<StreamCounts>,
+}
+
+/// One stream's [`SummaryBucket`]s, buckets `bucket_ns` wide.
+struct StreamCounts {
+    bucket_ns: i64,
+    buckets: Vec<SummaryBucket>,
+}
+
+impl StreamCounts {
+    /// Adds a sample of each bucket overlapping `[start, end]`, at its last
+    /// instant within it. Summaries are read only when no window boundary
+    /// falls inside a bucket, so every window holds all of a bucket's rows
+    /// or none of them.
+    fn samples(
+        &self,
+        stream_id: StreamId,
+        labels: &Arc<Labels>,
+        (start, end): (i64, i64),
+        sink: &mut impl SampleSink,
+    ) {
+        let none = crate::Fields::default();
+        for bucket in &self.buckets {
+            let first = bucket
+                .bucket
+                .saturating_mul(self.bucket_ns)
+                .saturating_add(1);
+            let last = first.saturating_add(self.bucket_ns - 1);
+            if last < start || first > end {
+                continue;
+            }
+            let (mut rows, mut line_bytes) = (bucket.rows, bucket.line_bytes);
+            while rows > 0 {
+                let part = u32::try_from(rows).unwrap_or(u32::MAX);
+                sink.sample(stream_id, labels, last.min(end), (part, line_bytes), &none);
+                rows -= u64::from(part);
+                line_bytes = 0;
+            }
+        }
+    }
 }
 
 impl SegmentStream {
@@ -2205,22 +2570,102 @@ impl SampleRead {
                 k < i128::from(boundaries.count) && first + k * step < max
             })
     }
+
+    /// Whether every window boundary is a multiple of `width`, so no window
+    /// holds part of a `width`-wide summary bucket.
+    pub(crate) fn aligned_to(&self, width: i64) -> bool {
+        width > 0
+            && self.boundaries.iter().all(|boundaries| {
+                boundaries.count == 0
+                    || (boundaries.first.rem_euclid(width) == 0
+                        && (boundaries.count == 1 || boundaries.step.rem_euclid(width) == 0))
+            })
+    }
 }
 
-/// Adds to `batches` rows of one stream that every evaluation window holds
-/// all or none of: `rows` stored rows from `timestamp_ns` on, with
-/// `line_bytes` of lines between them.
-fn push_sample(
-    batches: &mut StreamBatches,
-    labels: &Arc<Labels>,
-    timestamp_ns: i64,
-    (rows, line_bytes): (u32, u64),
-    metadata: &crate::Fields,
-) {
-    let metadata = metadata
-        .iter()
-        .map(|field| (field.name.as_str(), field.value.as_str()));
-    batches.push(labels, timestamp_ns, "", metadata, Some((rows, line_bytes)));
+/// Where [`LogDb::read_samples`] puts what it reads.
+trait SampleSink {
+    /// Rows of stream `stream_id` that every evaluation window holds all or
+    /// none of: `rows` stored rows from `timestamp_ns` on, with `line_bytes`
+    /// of lines between them.
+    fn sample(
+        &mut self,
+        stream_id: StreamId,
+        labels: &Arc<Labels>,
+        timestamp_ns: i64,
+        weight: (u32, u64),
+        metadata: &crate::Fields,
+    );
+}
+
+impl SampleSink for StreamBatches {
+    fn sample(
+        &mut self,
+        _: StreamId,
+        labels: &Arc<Labels>,
+        timestamp_ns: i64,
+        (rows, line_bytes): (u32, u64),
+        metadata: &crate::Fields,
+    ) {
+        let metadata = metadata
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str()));
+        self.push(labels, timestamp_ns, "", metadata, Some((rows, line_bytes)));
+    }
+}
+
+/// Streams [`LogDb::count_segment`] counts per read.
+const COUNT_STREAMS: usize = 256;
+
+/// What [`LogDb::count_segment`] found.
+#[derive(Default)]
+pub(super) struct SegmentCounts {
+    /// Every stream with live rows, in ID order.
+    pub(super) streams: Vec<(StreamId, StreamSummary)>,
+    /// Earliest expiry of the runs counted.
+    pub(super) earliest: Option<u64>,
+    /// Latest expiry of the runs counted, `None` inside when one never
+    /// expires.
+    pub(super) latest: Option<Option<u64>>,
+}
+
+impl SegmentCounts {
+    fn expiry(&mut self, expires_at_unix_ms: Option<u64>) {
+        if let Some(at) = expires_at_unix_ms {
+            self.earliest = Some(self.earliest.map_or(at, |earliest| earliest.min(at)));
+        }
+        self.latest = Some(match (self.latest, expires_at_unix_ms) {
+            (None, at) => at,
+            (Some(Some(latest)), Some(at)) => Some(latest.max(at)),
+            _ => None,
+        });
+    }
+}
+
+/// Deduplicated rows and line bytes per summary bucket of each stream.
+struct SummarySink {
+    summary: SegmentSummary,
+    streams: HashMap<StreamId, BTreeMap<i64, (u64, u64)>>,
+}
+
+impl SampleSink for SummarySink {
+    fn sample(
+        &mut self,
+        stream_id: StreamId,
+        _: &Arc<Labels>,
+        timestamp_ns: i64,
+        (rows, line_bytes): (u32, u64),
+        _: &crate::Fields,
+    ) {
+        let bucket = self
+            .streams
+            .entry(stream_id)
+            .or_default()
+            .entry(self.summary.bucket(timestamp_ns))
+            .or_default();
+        bucket.0 += u64::from(rows);
+        bucket.1 += line_bytes;
+    }
 }
 
 /// How a sample-only metric query reads each run of one segment.
@@ -2238,7 +2683,7 @@ impl SamplePlan {
     /// Plans the runs of `streams`, adding to `batches` those counted from
     /// their index entries alone: isolated runs that read no metadata and
     /// that no evaluation window splits.
-    fn new(streams: &[SegmentStream], read: &SampleRead, batches: &mut StreamBatches) -> Self {
+    fn new(streams: &[SegmentStream], read: &SampleRead, batches: &mut impl SampleSink) -> Self {
         let mut plan = Self {
             isolated: HashSet::new(),
             with_metadata: HashMap::new(),
@@ -2261,8 +2706,8 @@ impl SamplePlan {
             let alone = isolated_runs(&stream.runs);
             for (&(object_id, run), alone) in stream.runs.iter().zip(alone) {
                 if alone && !metadata && !read.splits(run.min_timestamp_ns, run.max_timestamp_ns) {
-                    push_sample(
-                        batches,
+                    batches.sample(
+                        stream.stream_id,
                         &stream.labels,
                         run.min_timestamp_ns,
                         (run.rows, run.line_bytes),
@@ -2306,10 +2751,15 @@ impl SamplePlan {
     }
 }
 
-fn push_row_sample(batches: &mut StreamBatches, labels: &Arc<Labels>, sample: &RowSample) {
+fn push_row_sample(
+    batches: &mut impl SampleSink,
+    stream_id: StreamId,
+    labels: &Arc<Labels>,
+    sample: &RowSample,
+) {
     let weight = (1, sample.line_len.into());
-    push_sample(
-        batches,
+    batches.sample(
+        stream_id,
         labels,
         sample.timestamp_ns,
         weight,
@@ -2367,7 +2817,7 @@ impl LogDb {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn read_segment_samples(
+    async fn read_segment_samples<S: SampleSink>(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
@@ -2375,9 +2825,14 @@ impl LogDb {
         range: (i64, i64),
         budget: &PageBudget,
         read: &SampleRead,
-        batches: &mut StreamBatches,
-        consume: &mut impl FnMut(&mut StreamBatches) -> Result<()>,
+        batches: &mut S,
+        consume: &mut impl FnMut(&mut S) -> Result<()>,
     ) -> Result<()> {
+        for stream in &streams {
+            if let Some(counts) = &stream.counts {
+                counts.samples(stream.stream_id, &stream.labels, range, batches);
+            }
+        }
         let plan = SamplePlan::new(&streams, read, batches);
         consume(batches)?;
         let units = plan.units(&streams);
@@ -2450,8 +2905,8 @@ impl LogDb {
                 match samples {
                     RunSamples::Isolated(samples) => {
                         for sample in samples {
-                            push_sample(
-                                batches,
+                            batches.sample(
+                                run.stream_id,
                                 &run.labels,
                                 sample.timestamp_ns,
                                 sample.weight,
@@ -2479,6 +2934,83 @@ impl LogDb {
         Ok(())
     }
 
+    /// Every stream of `segment` with live rows, counted in the buckets of
+    /// `summary` and deduplicated as lineless reads count them, by a read
+    /// with a window boundary at the end of every bucket; `None` for a
+    /// stream with a row that may fail a query, which queries read in full.
+    pub(super) async fn count_segment(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        summary: &SegmentSummary,
+    ) -> Result<SegmentCounts> {
+        let range = (
+            segment.start_ns,
+            segment
+                .start_ns
+                .saturating_add(segment.width_ns)
+                .saturating_sub(1),
+        );
+        let (first, last) = (summary.bucket(range.0), summary.bucket(range.1));
+        let read = SampleRead {
+            metadata: MetadataNeeds::None,
+            boundaries: vec![Boundaries {
+                first: first.saturating_add(1).saturating_mul(summary.bucket_ns),
+                step: summary.bucket_ns,
+                count: u64::try_from(last - first).unwrap_or(0),
+            }],
+        };
+        let budget = PageBudget::new(usize::MAX);
+        let mut counts = SegmentCounts::default();
+        for targets in self
+            .segment_reads(namespace, segment, COUNT_STREAMS)
+            .await?
+        {
+            for (_, streams) in targets.segments {
+                let (failing, counted): (Vec<_>, Vec<_>) =
+                    streams.into_iter().partition(SegmentStream::may_fail);
+                counts
+                    .streams
+                    .extend(failing.iter().map(|stream| (stream.stream_id, None)));
+                for (_, run) in counted.iter().flat_map(|stream| &stream.runs) {
+                    counts.expiry(run.expires_at_unix_ms);
+                }
+                let mut sink = SummarySink {
+                    summary: *summary,
+                    streams: HashMap::new(),
+                };
+                self.read_segment_samples(
+                    namespace,
+                    segment,
+                    counted,
+                    range,
+                    &budget,
+                    &read,
+                    &mut sink,
+                    &mut |_| Ok(()),
+                )
+                .await?;
+                counts
+                    .streams
+                    .extend(sink.streams.into_iter().map(|(stream_id, buckets)| {
+                        let buckets = buckets
+                            .into_iter()
+                            .map(|(bucket, (rows, line_bytes))| SummaryBucket {
+                                bucket,
+                                rows,
+                                line_bytes,
+                            })
+                            .collect();
+                        (stream_id, Some(buckets))
+                    }));
+            }
+        }
+        counts
+            .streams
+            .sort_unstable_by_key(|(stream_id, _)| *stream_id);
+        Ok(counts)
+    }
+
     /// Adds samples of one stream's runs that may hold duplicates to
     /// `batches`, deduplicated by their full structured metadata, whose
     /// `fields` the samples hold.
@@ -2489,9 +3021,12 @@ impl LogDb {
         runs: Vec<(UnitRun, Vec<RowSample>)>,
         range: (i64, i64),
         fields: &FieldSelection,
-        batches: &mut StreamBatches,
+        batches: &mut impl SampleSink,
     ) -> Result<()> {
-        let Some(labels) = runs.first().map(|(run, _)| Arc::clone(&run.labels)) else {
+        let Some((stream_id, labels)) = runs
+            .first()
+            .map(|(run, _)| (run.stream_id, Arc::clone(&run.labels)))
+        else {
             return Ok(());
         };
         let mut keys = runs
@@ -2512,7 +3047,7 @@ impl LogDb {
         });
         if keys.windows(2).all(|pair| pair[0] != pair[1]) {
             for sample in runs.iter().flat_map(|(_, samples)| samples) {
-                push_row_sample(batches, &labels, sample);
+                push_row_sample(batches, stream_id, &labels, sample);
             }
             return Ok(());
         }
@@ -2543,8 +3078,8 @@ impl LogDb {
         });
         entries.dedup();
         for entry in &entries {
-            push_sample(
-                batches,
+            batches.sample(
+                stream_id,
                 &labels,
                 entry.timestamp_ns,
                 (1, entry.line.len() as u64),
@@ -2643,7 +3178,8 @@ fn isolated_samples(
     Ok(samples)
 }
 
-/// `weight` stored rows from `timestamp_ns` on, as [`push_sample`] takes them.
+/// `weight` stored rows from `timestamp_ns` on, as [`SampleSink::sample`]
+/// takes them.
 struct WeightedSample {
     timestamp_ns: i64,
     weight: (u32, u64),
@@ -2692,6 +3228,12 @@ pub(crate) struct ScanTargets {
 }
 
 impl ScanTargets {
+    /// The segments read, or rollup periods read from their summaries.
+    #[cfg(test)]
+    pub(super) fn segment_ids(&self) -> impl Iterator<Item = SegmentId> + '_ {
+        self.segments.iter().map(|(segment, _)| *segment)
+    }
+
     pub(super) fn streams(&self) -> impl Iterator<Item = (StreamId, &Labels)> {
         self.segments.iter().flat_map(|(_, streams)| {
             streams
@@ -3051,6 +3593,9 @@ pub(crate) struct StreamFilter {
     /// label the selectors match on among them. Selected streams may then
     /// carry just these labels.
     labels: Option<Arc<[String]>>,
+    /// The lineless read of a query that may count streams from segment
+    /// summaries; see [`LogDb::segment_streams`].
+    summaries: Option<Arc<SampleRead>>,
 }
 
 impl StreamFilter {
@@ -3060,6 +3605,14 @@ impl StreamFilter {
             selectors: Vec::new(),
             line_terms: None,
             labels: None,
+            summaries: None,
+        }
+    }
+
+    pub(crate) fn with_summaries(self, read: Option<&SampleRead>) -> Self {
+        Self {
+            summaries: read.cloned().map(Arc::new),
+            ..self
         }
     }
 
@@ -3086,6 +3639,7 @@ impl StreamFilter {
                 .collect::<Result<_>>()?,
             line_terms: None,
             labels: None,
+            summaries: None,
         })
     }
 

@@ -42,7 +42,23 @@ pub(crate) enum RecordType {
     /// Discovery records of a whole rollup period; see [`rollup_prefix`].
     Rollup = 13,
     ObjectDirectory = 14,
+    /// Per-stream row counts of a settled segment; see [`summary_key`].
+    Summary = 15,
 }
+
+/// Records under the [`RecordType::Summary`] prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum SummaryRecord {
+    Segment = 0,
+    Stream = 1,
+}
+
+/// Leading byte of summary values.
+const SUMMARY_FORMAT: u8 = 1;
+/// Stream summary flag: the stream's rows were not summarized, so reads
+/// list its runs.
+const UNSUMMARIZED: u8 = 1;
 
 /// Records under [`rollup_prefix`]. The period's discovery catalog shares
 /// the prefix and starts with `CATALOG_RECORD_TYPE`, which none of these use.
@@ -53,6 +69,8 @@ enum RollupRecord {
     StreamDictionary = 2,
     ForwardLabels = 3,
     LabelPostings = 4,
+    /// [`PeriodSummary`] and stream summaries keyed by period stream ID.
+    Summary = 5,
 }
 
 /// One stored object: the blocks written together by a flush or a merge.
@@ -649,6 +667,286 @@ pub(crate) fn decode_run(bytes: &[u8]) -> Result<StoredRun> {
     })
 }
 
+/// What a segment's summary was built from: the segment's next object ID
+/// then, which any later write advances, the earliest expiry of the runs it
+/// counts, and the width of its buckets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentSummary {
+    pub generation: u64,
+    pub expires_at_unix_ms: Option<u64>,
+    pub bucket_ns: i64,
+}
+
+impl SegmentSummary {
+    /// Whether it still counts what reads of the segment see, whose next
+    /// object ID is `generation`.
+    pub(crate) fn is_current(&self, generation: Option<u64>, unix_ms: u64) -> bool {
+        generation == Some(self.generation) && !is_expired(self.expires_at_unix_ms, unix_ms)
+    }
+
+    /// The bucket holding `timestamp_ns`: bucket `b` holds `(b * width,
+    /// (b + 1) * width]`, as evaluation windows hold rows.
+    pub(crate) fn bucket(&self, timestamp_ns: i64) -> i64 {
+        timestamp_ns.saturating_sub(1).div_euclid(self.bucket_ns)
+    }
+}
+
+/// Deduplicated rows and line bytes of one stream in one summary bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SummaryBucket {
+    pub bucket: i64,
+    pub rows: u64,
+    pub line_bytes: u64,
+}
+
+/// One stream's summary: its buckets in order, or `None` when its rows
+/// were not summarized.
+pub(crate) type StreamSummary = Option<Vec<SummaryBucket>>;
+
+fn summary_prefix(namespace: &Namespace, segment: SegmentId, record: SummaryRecord) -> BytesMut {
+    let mut bytes = record_prefix(namespace, segment, RecordType::Summary);
+    bytes.put_u8(record as u8);
+    bytes
+}
+
+/// The [`SegmentSummary`] of `segment`, written after its stream summaries.
+pub(crate) fn summary_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    summary_prefix(namespace, segment, SummaryRecord::Segment).freeze()
+}
+
+pub(crate) fn stream_summary_key(
+    namespace: &Namespace,
+    segment: SegmentId,
+    stream_id: StreamId,
+) -> Bytes {
+    let mut bytes = summary_prefix(namespace, segment, SummaryRecord::Stream);
+    bytes.put_u32(stream_id);
+    bytes.freeze()
+}
+
+/// Every stream summary of `segment`, followed by its stream ID.
+pub(crate) fn stream_summary_prefix(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    summary_prefix(namespace, segment, SummaryRecord::Stream).freeze()
+}
+
+/// Stream ID of a key under [`stream_summary_prefix`] of length `prefix_len`.
+pub(crate) fn decode_stream_summary_key(bytes: &[u8], prefix_len: usize) -> Result<StreamId> {
+    bytes
+        .get(prefix_len..)
+        .and_then(|suffix| <[u8; 4]>::try_from(suffix).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| Error::Corrupt("invalid stream summary key".to_owned()))
+}
+
+pub(crate) fn encode_segment_summary(summary: &SegmentSummary) -> Result<Bytes> {
+    let bucket_ns = u64::try_from(summary.bucket_ns)
+        .ok()
+        .filter(|bucket_ns| *bucket_ns > 0)
+        .ok_or_else(|| Error::Invalid("summary buckets must have a width".to_owned()))?;
+    let mut bytes = BytesMut::with_capacity(24);
+    bytes.put_u8(SUMMARY_FORMAT);
+    put_expiry(summary.expires_at_unix_ms, &mut bytes);
+    var_u64::serialize(summary.generation, &mut bytes);
+    var_u64::serialize(bucket_ns, &mut bytes);
+    Ok(bytes.freeze())
+}
+
+pub(crate) fn decode_segment_summary(bytes: &[u8]) -> Result<SegmentSummary> {
+    let mut buf = summary_body(bytes, "segment summary")?;
+    let expires_at_unix_ms = read_expiry(&mut buf)?;
+    let generation = var_u64::deserialize(&mut buf)?;
+    let bucket_ns = i64::try_from(var_u64::deserialize(&mut buf)?)
+        .ok()
+        .filter(|bucket_ns| *bucket_ns > 0)
+        .ok_or_else(|| Error::Corrupt("segment summary has no bucket width".to_owned()))?;
+    ensure_consumed(buf, "segment summary")?;
+    Ok(SegmentSummary {
+        generation,
+        expires_at_unix_ms,
+        bucket_ns,
+    })
+}
+
+/// Buckets are delta-encoded from `first`, the bucket of the segment's
+/// first timestamp, and must be in strictly increasing order.
+pub(crate) fn encode_stream_summary(summary: &StreamSummary, first: i64) -> Result<Bytes> {
+    let Some(buckets) = summary else {
+        return Ok(Bytes::from_static(&[SUMMARY_FORMAT, UNSUMMARIZED]));
+    };
+    let mut bytes = BytesMut::with_capacity(8 + buckets.len() * 6);
+    bytes.put_u8(SUMMARY_FORMAT);
+    bytes.put_u8(0);
+    var_u32::serialize(value_len(buckets.len())?, &mut bytes);
+    let mut previous = first;
+    for (index, bucket) in buckets.iter().enumerate() {
+        let delta = bucket
+            .bucket
+            .checked_sub(previous)
+            .and_then(|delta| u64::try_from(delta).ok())
+            .filter(|delta| index == 0 || *delta > 0)
+            .ok_or_else(|| Error::Invalid("summary buckets must be ordered".to_owned()))?;
+        previous = bucket.bucket;
+        var_u64::serialize(delta, &mut bytes);
+        var_u64::serialize(bucket.rows, &mut bytes);
+        var_u64::serialize(bucket.line_bytes, &mut bytes);
+    }
+    Ok(bytes.freeze())
+}
+
+pub(crate) fn decode_stream_summary(bytes: &[u8], first: i64) -> Result<StreamSummary> {
+    let mut buf = summary_body(bytes, "stream summary")?;
+    match read_u8(&mut buf)? {
+        0 => {}
+        UNSUMMARIZED => {
+            ensure_consumed(buf, "stream summary")?;
+            return Ok(None);
+        }
+        flags => {
+            return Err(Error::Corrupt(format!(
+                "stream summary has unknown flags {flags:#x}"
+            )));
+        }
+    }
+    let count = var_u32::deserialize(&mut buf)? as usize;
+    let mut buckets = Vec::with_capacity(count.min(buf.len()));
+    let mut bucket = first;
+    for index in 0..count {
+        let delta = i64::try_from(var_u64::deserialize(&mut buf)?)
+            .ok()
+            .filter(|delta| index == 0 || *delta > 0)
+            .ok_or_else(|| Error::Corrupt("stream summary buckets are not ordered".to_owned()))?;
+        bucket = bucket
+            .checked_add(delta)
+            .ok_or_else(|| Error::Corrupt("stream summary bucket overflows".to_owned()))?;
+        buckets.push(SummaryBucket {
+            bucket,
+            rows: var_u64::deserialize(&mut buf)?,
+            line_bytes: var_u64::deserialize(&mut buf)?,
+        });
+    }
+    ensure_consumed(buf, "stream summary")?;
+    Ok(Some(buckets))
+}
+
+/// What a rollup period's summary was summed from: every segment of the
+/// period reads use that holds data, each with the generation its summary
+/// had, the earliest expiry of their summaries, and their bucket width.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PeriodSummary {
+    pub segments: Vec<(SegmentId, u64)>,
+    pub expires_at_unix_ms: Option<u64>,
+    pub bucket_ns: i64,
+}
+
+impl PeriodSummary {
+    /// Whether it still counts what reads of the period see, whose
+    /// segments (all of them, ascending) have next object IDs
+    /// `generations`.
+    pub(crate) fn is_current(
+        &self,
+        generations: &[(SegmentId, Option<u64>)],
+        unix_ms: u64,
+    ) -> bool {
+        let written = generations.iter().filter_map(|(segment, generation)| {
+            generation.map(|generation| (*segment, generation))
+        });
+        written.eq(self.segments.iter().copied()) && !is_expired(self.expires_at_unix_ms, unix_ms)
+    }
+
+    /// See [`SegmentSummary::bucket`].
+    pub(crate) fn bucket(&self, timestamp_ns: i64) -> i64 {
+        timestamp_ns.saturating_sub(1).div_euclid(self.bucket_ns)
+    }
+}
+
+fn period_summary_prefix(
+    namespace: &Namespace,
+    period: SegmentId,
+    record: SummaryRecord,
+) -> BytesMut {
+    let mut bytes = rollup_record_prefix(namespace, period, RollupRecord::Summary);
+    bytes.put_u8(record as u8);
+    bytes
+}
+
+/// The [`PeriodSummary`] of `period`, written after its stream summaries.
+pub(crate) fn period_summary_key(namespace: &Namespace, period: SegmentId) -> Bytes {
+    period_summary_prefix(namespace, period, SummaryRecord::Segment).freeze()
+}
+
+/// The summary of the stream with period-local ID `stream_id`.
+pub(crate) fn period_stream_summary_key(
+    namespace: &Namespace,
+    period: SegmentId,
+    stream_id: StreamId,
+) -> Bytes {
+    let mut bytes = period_summary_prefix(namespace, period, SummaryRecord::Stream);
+    bytes.put_u32(stream_id);
+    bytes.freeze()
+}
+
+/// Every stream summary of `period`, followed by its period stream ID.
+pub(crate) fn period_stream_summary_prefix(namespace: &Namespace, period: SegmentId) -> Bytes {
+    period_summary_prefix(namespace, period, SummaryRecord::Stream).freeze()
+}
+
+pub(crate) fn encode_period_summary(summary: &PeriodSummary) -> Result<Bytes> {
+    let bucket_ns = u64::try_from(summary.bucket_ns)
+        .ok()
+        .filter(|bucket_ns| *bucket_ns > 0)
+        .ok_or_else(|| Error::Invalid("summary buckets must have a width".to_owned()))?;
+    let mut bytes = BytesMut::with_capacity(16 + summary.segments.len() * 20);
+    bytes.put_u8(SUMMARY_FORMAT);
+    put_expiry(summary.expires_at_unix_ms, &mut bytes);
+    var_u64::serialize(bucket_ns, &mut bytes);
+    var_u32::serialize(value_len(summary.segments.len())?, &mut bytes);
+    for (segment, generation) in &summary.segments {
+        let width = u64::try_from(segment.width_ns)
+            .map_err(|_| Error::Invalid("segment width must be positive".to_owned()))?;
+        bytes.put_i64(segment.start_ns);
+        var_u64::serialize(width, &mut bytes);
+        var_u64::serialize(*generation, &mut bytes);
+    }
+    Ok(bytes.freeze())
+}
+
+pub(crate) fn decode_period_summary(bytes: &[u8]) -> Result<PeriodSummary> {
+    let mut buf = summary_body(bytes, "period summary")?;
+    let expires_at_unix_ms = read_expiry(&mut buf)?;
+    let bucket_ns = i64::try_from(var_u64::deserialize(&mut buf)?)
+        .ok()
+        .filter(|bucket_ns| *bucket_ns > 0)
+        .ok_or_else(|| Error::Corrupt("period summary has no bucket width".to_owned()))?;
+    let count = var_u32::deserialize(&mut buf)? as usize;
+    let mut segments = Vec::with_capacity(count.min(buf.len()));
+    for _ in 0..count {
+        let start = buf
+            .get(..8)
+            .and_then(|start| <[u8; 8]>::try_from(start).ok())
+            .map(i64::from_be_bytes)
+            .ok_or_else(|| Error::Corrupt("truncated period summary".to_owned()))?;
+        buf = &buf[8..];
+        let width = i64::try_from(var_u64::deserialize(&mut buf)?)
+            .map_err(|_| Error::Corrupt("period summary segment is too wide".to_owned()))?;
+        let generation = var_u64::deserialize(&mut buf)?;
+        segments.push((SegmentId::new(start, width), generation));
+    }
+    ensure_consumed(buf, "period summary")?;
+    Ok(PeriodSummary {
+        segments,
+        expires_at_unix_ms,
+        bucket_ns,
+    })
+}
+
+fn summary_body<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
+    match bytes.split_first() {
+        Some((&SUMMARY_FORMAT, body)) => Ok(body),
+        Some((format, _)) => Err(Error::Corrupt(format!("unknown {what} format {format}"))),
+        None => Err(Error::Corrupt(format!("empty {what}"))),
+    }
+}
+
 /// Runs must be ordered by strictly increasing stream ID; IDs are
 /// delta-encoded.
 pub(crate) fn encode_object(object: &StoredObject) -> Result<Bytes> {
@@ -928,6 +1226,7 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         12 => RecordType::ObjectTombstone,
         13 => RecordType::Rollup,
         14 => RecordType::ObjectDirectory,
+        15 => RecordType::Summary,
         value => return Err(Error::Corrupt(format!("unknown record type {value}"))),
     };
     Ok((namespace, segment, record_type, scope_len + 1))
@@ -948,6 +1247,51 @@ mod tests {
     #[test]
     fn segment_extractor_name_is_stable() {
         assert_eq!(SEGMENT_EXTRACTOR.name(), "logs-log/v6");
+    }
+
+    #[test]
+    fn summaries_round_trip() {
+        let segment = SegmentSummary {
+            generation: 42,
+            expires_at_unix_ms: Some(7),
+            bucket_ns: 60_000_000_000,
+        };
+        let encoded = encode_segment_summary(&segment).unwrap();
+        assert_eq!(decode_segment_summary(&encoded).unwrap(), segment);
+        assert_eq!(segment.bucket(0), -1);
+        assert_eq!(segment.bucket(1), 0);
+        assert_eq!(segment.bucket(60_000_000_000), 0);
+        assert_eq!(segment.bucket(60_000_000_001), 1);
+
+        let first = segment.bucket(HOUR_NS);
+        let buckets = vec![
+            SummaryBucket {
+                bucket: first,
+                rows: 3,
+                line_bytes: 90,
+            },
+            SummaryBucket {
+                bucket: first + 59,
+                rows: u64::from(u32::MAX) + 1,
+                line_bytes: 0,
+            },
+        ];
+        let summary = Some(buckets.clone());
+        let encoded = encode_stream_summary(&summary, first).unwrap();
+        assert_eq!(decode_stream_summary(&encoded, first).unwrap(), summary);
+        let unsummarized = encode_stream_summary(&None, first).unwrap();
+        assert_eq!(decode_stream_summary(&unsummarized, first).unwrap(), None);
+
+        let unordered = Some(vec![buckets[1], buckets[0]]);
+        assert!(encode_stream_summary(&unordered, first).is_err());
+
+        let namespace = Namespace::new("tenant").unwrap();
+        let prefix = stream_summary_prefix(&namespace, hour(HOUR_NS));
+        let key = stream_summary_key(&namespace, hour(HOUR_NS), 9);
+        assert!(key.starts_with(&prefix));
+        assert_eq!(decode_stream_summary_key(&key, prefix.len()).unwrap(), 9);
+        assert!(!summary_key(&namespace, hour(HOUR_NS)).starts_with(&prefix));
+        assert_eq!(parse_record_prefix(&key).unwrap().2, RecordType::Summary);
     }
 
     #[test]

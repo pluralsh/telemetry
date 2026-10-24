@@ -479,7 +479,7 @@ func TestRenderCacheWarmerDefaultsPerProduct(t *testing.T) {
 		if warmer["enabled"] != product.enabled {
 			t.Errorf("%s cache_warmer.enabled = %v, want %v", product.key, warmer["enabled"], product.enabled)
 		}
-		for _, absent := range []string{"block_readiness", "metadata_budget_percent"} {
+		for _, absent := range []string{"block_readiness", "metadata_budget_percent", "payload_budget_percent"} {
 			if _, ok := warmer[absent]; ok {
 				t.Errorf("%s cache_warmer renders %s without a spec value", product.key, absent)
 			}
@@ -506,6 +506,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 	continuousInterval, continuousRange := int64(20), int64(5400)
 	continuousPayloads := false
 	blockReadiness, budgetPercent := true, int32(50)
+	payloadBudgetPercent := int32(40)
 	payloadRange, continuousPayloadRange := int64(1800), int64(900)
 	cacheWarmer := &telemetryv1alpha1.CacheWarmerSpec{
 		Enabled:                 &enabled,
@@ -516,6 +517,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 		IncludePayloads:         &includePayloads,
 		BlockReadiness:          &blockReadiness,
 		MetadataBudgetPercent:   &budgetPercent,
+		PayloadBudgetPercent:    &payloadBudgetPercent,
 		Continuous: &telemetryv1alpha1.ContinuousCacheWarmerSpec{
 			Enabled:                 &enabled,
 			IntervalSeconds:         &continuousInterval,
@@ -577,6 +579,7 @@ func TestRenderCacheWarmerOverrides(t *testing.T) {
 				"include_payloads: false",
 				"block_readiness: true",
 				"metadata_budget_percent: 50",
+				"payload_budget_percent: 40",
 				"payload_warm_range_seconds: 1800",
 				"payload_warm_range_seconds: 900",
 			} {

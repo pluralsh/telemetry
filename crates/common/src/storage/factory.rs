@@ -10,6 +10,7 @@ use super::compaction::SegmentCompaction;
 use super::config::{
     BlockCacheConfig, DiskPerformance, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
 };
+use super::hybrid_cache::WarmingHybridCache;
 use super::in_memory::InMemoryStorage;
 use super::metered_cache::{CacheUsage, MeteredCache};
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
@@ -612,7 +613,40 @@ pub async fn create_storage_read(
 pub struct SharedDbCache {
     cache: Option<Arc<dyn DbCache>>,
     meta: Option<MetaCacheInfo>,
-    data: Option<CacheUsage>,
+    data: Option<DataCacheInfo>,
+}
+
+/// The tiers of a [`SharedDbCache`]'s data-block cache.
+#[derive(Clone)]
+pub struct DataCacheInfo {
+    pub memory_capacity_bytes: u64,
+    /// The disk tier of a hybrid cache, which block warming fills instead
+    /// of memory; see [`super::hybrid_cache`].
+    pub disk_capacity_bytes: Option<u64>,
+    /// Present when the cache is in memory only.
+    pub usage: Option<CacheUsage>,
+    hybrid: Option<foyer::HybridCache<CachedKey, CachedEntry>>,
+}
+
+impl DataCacheInfo {
+    /// Bytes its memory tier holds.
+    pub fn memory_usage_bytes(&self) -> u64 {
+        match (&self.hybrid, &self.usage) {
+            (Some(hybrid), _) => hybrid.memory().usage() as u64,
+            (None, Some(usage)) => usage.usage_bytes(),
+            (None, None) => 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for DataCacheInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataCacheInfo")
+            .field("memory_capacity_bytes", &self.memory_capacity_bytes)
+            .field("disk_capacity_bytes", &self.disk_capacity_bytes)
+            .field("memory_usage_bytes", &self.memory_usage_bytes())
+            .finish()
+    }
 }
 
 /// The memory side of a [`SharedDbCache`]'s metadata cache.
@@ -658,6 +692,11 @@ impl SharedDbCache {
 
     /// Usage of the data-block cache, when it is in memory only.
     pub fn data_usage(&self) -> Option<&CacheUsage> {
+        self.data.as_ref().and_then(|data| data.usage.as_ref())
+    }
+
+    /// The data-block cache, when one is configured.
+    pub fn data(&self) -> Option<&DataCacheInfo> {
         self.data.as_ref()
     }
 
@@ -707,8 +746,17 @@ pub async fn build_split_cache(
 type SplitCacheParts = (
     Option<Arc<dyn DbCache>>,
     Option<MetaCacheInfo>,
-    Option<CacheUsage>,
+    Option<DataCacheInfo>,
 );
+
+/// One cache [`build_cache`] built.
+#[derive(Default)]
+struct BuiltCache {
+    cache: Option<Arc<dyn DbCache>>,
+    /// Present when it is in memory only.
+    usage: Option<CacheUsage>,
+    hybrid: Option<foyer::HybridCache<CachedKey, CachedEntry>>,
+}
 
 async fn build_split_cache_parts(
     data: &Option<BlockCacheConfig>,
@@ -726,23 +774,37 @@ async fn build_split_cache_parts(
             data.disk_path
         )));
     }
-    let (data_cache, data_usage) = build_cache(data, "data").await?;
-    let (meta_cache, meta_usage) = build_cache(meta, "meta").await?;
+    let data_built = build_cache(data, "data").await?;
+    let meta_built = build_cache(meta, "meta").await?;
     let meta_info = meta.as_ref().map(|config| MetaCacheInfo {
         capacity_bytes: match config {
             BlockCacheConfig::FoyerHybrid(hybrid) => hybrid.memory_capacity,
             BlockCacheConfig::FoyerMemory(memory) => memory.capacity,
         },
-        usage: meta_usage,
+        usage: meta_built.usage,
+    });
+    let data_info = data.as_ref().map(|config| {
+        let (memory_capacity_bytes, disk_capacity_bytes) = match config {
+            BlockCacheConfig::FoyerHybrid(hybrid) => {
+                (hybrid.memory_capacity, Some(hybrid.disk_capacity))
+            }
+            BlockCacheConfig::FoyerMemory(memory) => (memory.capacity, None),
+        };
+        DataCacheInfo {
+            memory_capacity_bytes,
+            disk_capacity_bytes,
+            usage: data_built.usage,
+            hybrid: data_built.hybrid,
+        }
     });
     let split = SplitCache::new()
-        .with_block_cache(data_cache)
-        .with_meta_cache(meta_cache)
+        .with_block_cache(data_built.cache)
+        .with_meta_cache(meta_built.cache)
         .build();
     Ok((
         Some(Arc::new(split) as Arc<dyn DbCache>),
         meta_info,
-        data_usage,
+        data_info,
     ))
 }
 
@@ -751,12 +813,9 @@ async fn build_split_cache_parts(
 ///
 /// `label` distinguishes the data vs metadata cache in logs and in the foyer
 /// cache name.
-async fn build_cache(
-    config: &Option<BlockCacheConfig>,
-    label: &str,
-) -> StorageResult<(Option<Arc<dyn DbCache>>, Option<CacheUsage>)> {
+async fn build_cache(config: &Option<BlockCacheConfig>, label: &str) -> StorageResult<BuiltCache> {
     let Some(config) = config else {
-        return Ok((None, None));
+        return Ok(BuiltCache::default());
     };
     match config {
         BlockCacheConfig::FoyerHybrid(foyer_config) => {
@@ -848,10 +907,22 @@ async fn build_cache(
                 "hybrid cache enabled"
             );
 
-            Ok((
-                Some(Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>),
-                None,
-            ))
+            // Only data blocks are warmed to disk: warmed metadata is meant
+            // to stay in memory.
+            let built: Arc<dyn DbCache> = if label == "data" {
+                Arc::new(WarmingHybridCache::new(
+                    cache.clone(),
+                    foyer_config.submit_queue_size_threshold,
+                    policy,
+                ))
+            } else {
+                Arc::new(FoyerHybridCache::new_with_cache(cache.clone()))
+            };
+            Ok(BuiltCache {
+                cache: Some(built),
+                usage: None,
+                hybrid: Some(cache),
+            })
         }
         BlockCacheConfig::FoyerMemory(mem_config) => {
             let capacity = mem_config.capacity;
@@ -866,7 +937,11 @@ async fn build_cache(
             );
             let cache = MeteredCache::new(label, capacity, shards);
             let usage = cache.usage();
-            Ok((Some(Arc::new(cache) as Arc<dyn DbCache>), Some(usage)))
+            Ok(BuiltCache {
+                cache: Some(Arc::new(cache) as Arc<dyn DbCache>),
+                usage: Some(usage),
+                hybrid: None,
+            })
         }
     }
 }
@@ -1290,7 +1365,7 @@ mod tests {
         let result = build_split_cache(&None, &None).await.unwrap();
         assert!(result.is_none());
         // And the single-cache builder returns None for an absent config.
-        assert!(build_cache(&None, "data").await.unwrap().0.is_none());
+        assert!(build_cache(&None, "data").await.unwrap().cache.is_none());
     }
 
     /// A writer whose memtable flushed 2,000 keys into one L0 SST keeps that

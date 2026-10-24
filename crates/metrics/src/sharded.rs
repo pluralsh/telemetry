@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport};
+use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
 use futures::{FutureExt, Stream, StreamExt, stream};
 use roaring::RoaringBitmap;
@@ -301,7 +301,7 @@ impl ShardedMetrics {
     }
 
     /// Warms the SSTs of `window` across every open shard and namespace,
-    /// newest bucket first, into `budget_percent` of the metadata cache.
+    /// newest bucket first, into `shares` of the caches.
     /// SSTs `ledger` holds are skipped, and those compaction removed are
     /// evicted; see [`ShardSet::start_warm`].
     pub async fn warm_recent(
@@ -311,17 +311,11 @@ impl ShardedMetrics {
         concurrency: usize,
         cancel: &CancellationToken,
         ledger: &WarmLedger,
-        budget_percent: u8,
+        shares: WarmShares,
     ) -> Result<WarmReport> {
         let Some(pass) = self
             .shards
-            .start_warm(
-                &self.block_cache,
-                window,
-                concurrency,
-                cancel,
-                budget_percent,
-            )
+            .start_warm(&self.block_cache, window, concurrency, cancel, shares)
             .await?
         else {
             return Ok(WarmReport::default());
