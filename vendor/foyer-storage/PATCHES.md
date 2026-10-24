@@ -1,9 +1,9 @@
 # foyer-storage 0.22.6, patched
 
 Unmodified `foyer-storage` 0.22.6 from crates.io (Apache-2.0,
-https://github.com/foyer-rs/foyer) except for two open upstream fixes, both
-to `src/engine/block/manager.rs`. Drop this directory and the
-`[patch.crates-io]` entry once a release carries both.
+https://github.com/foyer-rs/foyer) except for three open upstream fixes to
+the block engine. Drop this directory and the `[patch.crates-io]` entry once
+a release carries all of them.
 
 ## No writes after recovering with 0 clean blocks
 
@@ -29,3 +29,17 @@ the lock. Test: `test_reclaim_dropped_by_spawner_does_not_deadlock` in
 
 #1374's two new reclaims are applied in #1380's form, spawned after the lock
 is released.
+
+## Entries that miss the flush buffer's tail are dropped
+
+foyer-rs/foyer#1334, fixed by #1335 (unreviewed). While a flush is in
+flight the flusher kept filling its current buffer, and every entry that no
+longer fit was dropped and counted as `buffer_overflow`. Seen on a logs
+reader dropping about 56% of disk-cache inserts while its disk was nearly
+idle.
+
+`Buffer::push` tells "no room left" from "can never fit", and the flusher
+retries entries of the first kind in order after the buffer rotates. They
+stay counted in the submit queue until written, so the queue's threshold,
+and our warmer's throttle on it, push back instead of losing them. Tests: the
+`flusher.rs` tests module, which needs `mixtrics` in dev-dependencies.

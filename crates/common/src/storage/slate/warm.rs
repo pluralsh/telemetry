@@ -1390,6 +1390,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_payload_warming_writes_every_warmed_block_to_disk() {
+        let (_dir, reader, cache) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reader_over_flushed_ssts(12, 1 << 20, true),
+        )
+        .await
+        .expect("writing the SSTs stalled");
+        let data = cache.data().unwrap().clone();
+        let shares = WarmShares {
+            metadata_percent: 100,
+            payload_percent: 100,
+        };
+        let ledger = WarmLedger::new(true);
+
+        let report = warm_planned(
+            "test",
+            plan_l0(&reader, true, |_| true),
+            WarmBudget::of(&cache, shares).unwrap(),
+            true,
+            4,
+            &CancellationToken::new(),
+            &ledger,
+        )
+        .await;
+
+        assert_eq!(report.payload_skipped_ssts, 0, "{report:?}");
+        assert!(ledger.payload_bytes() > 0);
+        let written = data.disk_write_bytes().await;
+        assert!(
+            written >= ledger.payload_bytes(),
+            "the disk tier wrote {written} of {} warmed bytes",
+            ledger.payload_bytes()
+        );
+    }
+
+    #[tokio::test]
     async fn real_metadata_warming_stays_in_budget_and_releases_removed_ssts() {
         let (_dir, reader, cache) = tokio::time::timeout(
             std::time::Duration::from_secs(60),

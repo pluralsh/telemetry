@@ -148,6 +148,10 @@ class ColdConfig:
     # quiescent, and Loki's compactor, which otherwise waits a 10-minute
     # interval no cold process lives for.
     compaction: bool = True
+    # Let Logs summarize every settled segment while settling, as a
+    # long-running writer does every 5 minutes, no cold process living that
+    # long, so lineless metric queries count from summaries.
+    summaries: bool = True
     # Measure the implementation once per start, each on a fresh process:
     # `off` with startup cache warming disabled, `ready` sending the query as
     # soon as it is ready, `warm` after its startup warm pass ended, `idle`
@@ -175,6 +179,7 @@ class ColdConfig:
             timeline=_flag("FUZZ_COLD_TIMELINE", False),
             rollups=_flag("FUZZ_COLD_ROLLUPS", True),
             compaction=_flag("FUZZ_COLD_COMPACTION", True),
+            summaries=_flag("FUZZ_COLD_SUMMARIES", True),
             impl_starts=tuple(
                 item.strip()
                 for item in _env("FUZZ_COLD_IMPL_STARTS", "").split(",")
@@ -203,6 +208,7 @@ class ColdConfig:
             "family_filter": list(self.families),
             "rollups": self.rollups,
             "compaction": self.compaction,
+            "summaries": self.summaries,
             "impl_starts": list(self.impl_starts),
         }
 

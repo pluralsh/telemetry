@@ -1645,15 +1645,16 @@ impl LogDb {
 
     /// The summary of `segment`, when `filter` may count streams from one
     /// and it still counts what reads see: written since its last write
-    /// and before any run it counts expired, in buckets no window boundary
-    /// falls inside.
+    /// and before any run it counts expired, with at most
+    /// [`MAX_SPLIT_BUCKETS`] buckets a window boundary falls inside, which
+    /// are returned too.
     async fn usable_summary(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         filter: &StreamFilter,
         now_unix_ms: u64,
-    ) -> Result<Option<(SegmentSummary, Arc<SampleRead>)>> {
+    ) -> Result<Option<(SegmentSummary, Arc<SampleRead>, Arc<[i64]>)>> {
         let Some(read) = &filter.summaries else {
             return Ok(None);
         };
@@ -1672,10 +1673,12 @@ impl LogDb {
         let generation = next
             .map(|record| decode_object_id(&record.value))
             .transpose()?;
-        Ok(
-            (summary.is_current(generation, now_unix_ms) && read.aligned_to(summary.bucket_ns))
-                .then(|| (summary, Arc::clone(read))),
-        )
+        if !summary.is_current(generation, now_unix_ms) {
+            return Ok(None);
+        }
+        Ok(read
+            .split_buckets(summary.bucket_ns)
+            .map(|split| (summary, Arc::clone(read), split)))
     }
 
     /// The streams of every segment of `period` that `filter` selects, all
@@ -1744,6 +1747,7 @@ impl LogDb {
                     counts: Some(StreamCounts {
                         bucket_ns: summary.bucket_ns,
                         buckets,
+                        split: Arc::new([]),
                     }),
                 }),
                 None => {}
@@ -1755,18 +1759,21 @@ impl LogDb {
     /// Runs of each of `labelled` (ascending) passing `keep`, and counts of
     /// those `summary` counts instead: streams it summarized, of which the
     /// read needs no structured metadata and no row can fail. Their runs
-    /// are left empty, as are those of streams it holds no rows of.
+    /// are left empty, as are those of streams it holds no rows of, but for
+    /// runs overlapping a bucket a window boundary splits, whose rows there
+    /// are read instead of counted.
     async fn stream_contents(
         &self,
         namespace: &Namespace,
         segment: SegmentId,
         labelled: &[(StreamId, Arc<Labels>)],
-        summary: Option<(SegmentSummary, Arc<SampleRead>)>,
+        summary: Option<(SegmentSummary, Arc<SampleRead>, Arc<[i64]>)>,
         keep: impl Fn(&StoredRun) -> bool + Copy + Send + Sync + 'static,
     ) -> Result<(Vec<Vec<(u64, StoredRun)>>, Vec<Option<StreamCounts>>)> {
         let mut counts = labelled.iter().map(|_| None).collect::<Vec<_>>();
         let mut listed = vec![true; labelled.len()];
-        if let Some((summary, read)) = summary {
+        let mut partial = vec![false; labelled.len()];
+        if let Some((summary, read, split)) = summary {
             let counted = labelled
                 .iter()
                 .enumerate()
@@ -1784,10 +1791,17 @@ impl LogDb {
                 match found {
                     Some(None) => continue,
                     Some(Some(buckets)) => {
+                        let (read, whole): (Vec<_>, Vec<_>) = buckets
+                            .into_iter()
+                            .partition(|bucket| split.binary_search(&bucket.bucket).is_ok());
+                        partial[index] = !read.is_empty();
+                        listed[index] = partial[index];
                         counts[index] = Some(StreamCounts {
                             bucket_ns: summary.bucket_ns,
-                            buckets,
+                            buckets: whole,
+                            split: Arc::clone(&split),
                         });
+                        continue;
                     }
                     None => {}
                 }
@@ -1806,12 +1820,17 @@ impl LogDb {
             .into_iter();
         let runs = listed
             .iter()
-            .map(|listed| {
-                if *listed {
-                    runs.next().unwrap_or_default()
-                } else {
-                    Vec::new()
+            .zip(&partial)
+            .zip(&counts)
+            .map(|((listed, partial), counts)| {
+                if !*listed {
+                    return Vec::new();
                 }
+                let mut runs = runs.next().unwrap_or_default();
+                if let (true, Some(counts)) = (*partial, counts) {
+                    runs.retain(|(_, run)| counts.overlaps_split(run));
+                }
+                runs
             })
             .collect();
         Ok((runs, counts))
@@ -2240,24 +2259,36 @@ fn catalog_prefix(namespace: &Namespace, partition: Partition) -> Bytes {
 struct SegmentStream {
     stream_id: StreamId,
     labels: Arc<Labels>,
-    /// Live overlapping runs with their object IDs.
+    /// Live overlapping runs with their object IDs; with `counts`, only
+    /// those overlapping one of its split buckets.
     runs: Vec<(u64, StoredRun)>,
     /// The stream's rows from the segment's summary, read instead of its
-    /// runs, which are then left empty.
+    /// runs but in buckets a window boundary splits.
     counts: Option<StreamCounts>,
 }
 
-/// One stream's [`SummaryBucket`]s, buckets `bucket_ns` wide.
+/// One stream's [`SummaryBucket`]s, buckets `bucket_ns` wide, but for those
+/// in `split`.
 struct StreamCounts {
     bucket_ns: i64,
     buckets: Vec<SummaryBucket>,
+    /// Buckets a window boundary falls inside, ascending, whose rows are
+    /// read from runs instead.
+    split: Arc<[i64]>,
 }
 
 impl StreamCounts {
+    /// Whether `run` holds rows in a split bucket's time range.
+    fn overlaps_split(&self, run: &StoredRun) -> bool {
+        let bucket = |timestamp_ns: i64| timestamp_ns.saturating_sub(1).div_euclid(self.bucket_ns);
+        let (first, last) = (bucket(run.min_timestamp_ns), bucket(run.max_timestamp_ns));
+        let from = self.split.partition_point(|&split| split < first);
+        self.split.get(from).is_some_and(|&split| split <= last)
+    }
+
     /// Adds a sample of each bucket overlapping `[start, end]`, at its last
-    /// instant within it. Summaries are read only when no window boundary
-    /// falls inside a bucket, so every window holds all of a bucket's rows
-    /// or none of them.
+    /// instant within it. No window boundary falls inside a bucket not
+    /// split, so every window holds all of its rows or none of them.
     fn samples(
         &self,
         stream_id: StreamId,
@@ -2571,6 +2602,40 @@ impl SampleRead {
             })
     }
 
+    /// The `width`-wide summary buckets a window boundary falls inside, so
+    /// that some window holds part of one, ascending; `None` for more than
+    /// [`MAX_SPLIT_BUCKETS`].
+    pub(crate) fn split_buckets(&self, width: i64) -> Option<Arc<[i64]>> {
+        if width <= 0 {
+            return None;
+        }
+        let mut split = BTreeSet::new();
+        for boundaries in &self.boundaries {
+            let count = if boundaries.step.rem_euclid(width) == 0 {
+                // Every boundary falls as far into its bucket as the first.
+                if boundaries.first.rem_euclid(width) == 0 {
+                    continue;
+                }
+                boundaries.count.min(MAX_SPLIT_BUCKETS as u64 + 1)
+            } else {
+                boundaries.count
+            };
+            for k in 0..count {
+                let at = i128::from(boundaries.first) + i128::from(k) * i128::from(boundaries.step);
+                let Ok(at) = i64::try_from(at) else {
+                    break;
+                };
+                if at.rem_euclid(width) != 0 {
+                    split.insert(at.div_euclid(width));
+                    if split.len() > MAX_SPLIT_BUCKETS {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(split.into_iter().collect())
+    }
+
     /// Whether every window boundary is a multiple of `width`, so no window
     /// holds part of a `width`-wide summary bucket.
     pub(crate) fn aligned_to(&self, width: i64) -> bool {
@@ -2582,6 +2647,11 @@ impl SampleRead {
             })
     }
 }
+
+/// Most summary buckets window boundaries may split for a read to count a
+/// segment from its summary: their rows are read from runs instead, and
+/// their edges join every boundary check of the read.
+const MAX_SPLIT_BUCKETS: usize = 64;
 
 /// Where [`LogDb::read_samples`] puts what it reads.
 trait SampleSink {
@@ -2665,6 +2735,35 @@ impl SampleSink for SummarySink {
             .or_default();
         bucket.0 += u64::from(rows);
         bucket.1 += line_bytes;
+    }
+}
+
+/// Passes on run samples of a stream counted from a summary only in its
+/// split buckets, the summary counting the rest. Every sample lies within
+/// one bucket, a read's boundaries including the split buckets' edges.
+struct ClippedSink<'a, S> {
+    inner: &'a mut S,
+    /// Bucket width and split buckets of each counted stream.
+    clipped: HashMap<StreamId, (i64, Arc<[i64]>)>,
+}
+
+impl<S: SampleSink> SampleSink for ClippedSink<'_, S> {
+    fn sample(
+        &mut self,
+        stream_id: StreamId,
+        labels: &Arc<Labels>,
+        timestamp_ns: i64,
+        weight: (u32, u64),
+        metadata: &crate::Fields,
+    ) {
+        if let Some((bucket_ns, split)) = self.clipped.get(&stream_id) {
+            let bucket = timestamp_ns.saturating_sub(1).div_euclid(*bucket_ns);
+            if split.binary_search(&bucket).is_err() {
+                return;
+            }
+        }
+        self.inner
+            .sample(stream_id, labels, timestamp_ns, weight, metadata);
     }
 }
 
@@ -2828,11 +2927,69 @@ impl LogDb {
         batches: &mut S,
         consume: &mut impl FnMut(&mut S) -> Result<()>,
     ) -> Result<()> {
+        let mut clipped = HashMap::new();
         for stream in &streams {
             if let Some(counts) = &stream.counts {
                 counts.samples(stream.stream_id, &stream.labels, range, batches);
+                if !counts.split.is_empty() {
+                    clipped.insert(
+                        stream.stream_id,
+                        (counts.bucket_ns, Arc::clone(&counts.split)),
+                    );
+                }
             }
         }
+        if clipped.is_empty() {
+            return self
+                .read_segment_runs(
+                    namespace, segment, streams, range, budget, read, batches, consume,
+                )
+                .await;
+        }
+        // Run rows of a counted stream are kept only in its split buckets, so
+        // their edges bound every sample too.
+        let mut edges = read.clone();
+        let buckets = clipped
+            .values()
+            .flat_map(|(bucket_ns, split)| split.iter().map(|&bucket| (*bucket_ns, bucket)))
+            .collect::<BTreeSet<_>>();
+        edges
+            .boundaries
+            .extend(buckets.into_iter().map(|(bucket_ns, bucket)| Boundaries {
+                first: bucket.saturating_mul(bucket_ns),
+                step: bucket_ns,
+                count: 2,
+            }));
+        let mut sink = ClippedSink {
+            inner: batches,
+            clipped,
+        };
+        self.read_segment_runs(
+            namespace,
+            segment,
+            streams,
+            range,
+            budget,
+            &edges,
+            &mut sink,
+            &mut |sink: &mut ClippedSink<'_, S>| consume(&mut *sink.inner),
+        )
+        .await
+    }
+
+    /// [`Self::read_segment_samples`] of `streams`' runs.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_segment_runs<S: SampleSink>(
+        &self,
+        namespace: &Namespace,
+        segment: SegmentId,
+        streams: Vec<SegmentStream>,
+        range: (i64, i64),
+        budget: &PageBudget,
+        read: &SampleRead,
+        batches: &mut S,
+        consume: &mut impl FnMut(&mut S) -> Result<()>,
+    ) -> Result<()> {
         let plan = SamplePlan::new(&streams, read, batches);
         consume(batches)?;
         let units = plan.units(&streams);

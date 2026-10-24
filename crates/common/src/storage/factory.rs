@@ -637,6 +637,16 @@ impl DataCacheInfo {
             (None, None) => 0,
         }
     }
+
+    /// Bytes its disk tier has written, once queued writes land.
+    #[cfg(test)]
+    pub(crate) async fn disk_write_bytes(&self) -> u64 {
+        let Some(hybrid) = &self.hybrid else {
+            return 0;
+        };
+        hybrid.storage().wait().await;
+        hybrid.statistics().disk_write_bytes() as u64
+    }
 }
 
 impl std::fmt::Debug for DataCacheInfo {

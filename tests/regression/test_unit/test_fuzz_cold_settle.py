@@ -282,6 +282,29 @@ def test_loki_compactor_config_runs_the_compactor_sooner(tmp_path: Path) -> None
         logs.loki_compactor_config(configured)
 
 
+def test_summary_settle_waits_for_an_idle_pass_and_fails_on_errors(
+    tmp_path: Path,
+) -> None:
+    for directory in logs.IMPL_CONFIG_DIRS.values():
+        config = PRODUCTS / "logs" / directory / "logs-s3.yaml"
+        settle = logs.summary_settle_config(config)
+        assert settle.startswith(config.read_text().rstrip())
+        assert settle.endswith("\nsummary_interval_seconds: 10\n")
+    configured = tmp_path / "logs-s3.yaml"
+    configured.write_text("summary_interval_seconds: 60\n")
+    with pytest.raises(ValueError):
+        logs.summary_settle_config(configured)
+    scrape = (
+        "# TYPE logs_summary_passes_total counter\n"
+        'logs_summary_passes_total{outcome="ok"} 3\n'
+        'logs_summary_passes_total{outcome="idle"} 1\n'
+        "logs_summary_passes_total_other 9\n"
+    )
+    assert logs.summary_passes(scrape, "ok") == 3
+    assert logs.summary_passes(scrape, "idle") == 1
+    assert logs.summary_passes(scrape, "error") == 0
+
+
 def test_logs_compose_mounts_the_settle_configs() -> None:
     compose = (PRODUCTS / "logs" / "docker-compose.yml").read_text()
     assert "${LOGS_S3_CONFIG:-./${LOGS_CONFIG_DIR:-.}/logs-s3.yaml}" in compose
@@ -313,6 +336,12 @@ class _FlushStack:
         return {"fuzz/compacted": {"objects": 2, "bytes": 3 << 20, "largest": 2 << 20}}
 
     def settle_on(self, service: ColdService, **kwargs: Any) -> float:
+        if kwargs["env"] == "LOGS_S3_CONFIG":
+            self.calls.append(("settle_summaries", service.service))
+            assert kwargs["config"].parent.name == "production"
+            assert kwargs["text"].endswith("\nsummary_interval_seconds: 10\n")
+            assert not kwargs.get("wipe")
+            return 12.0
         self.calls.append(("settle_on", service.service))
         assert kwargs["env"] == "LOKI_FUZZ_CONFIG_PATH" and kwargs["wipe"]
         assert "compaction_interval: 10s" in kwargs["text"]
@@ -337,10 +366,27 @@ class _FlushStack:
 @pytest.mark.parametrize(
     ("env", "settles"),
     [
-        ({}, ["settle_on", "settle_rollups", "settle_compaction"]),
-        ({"FUZZ_COLD_COMPACTION": "0"}, ["start", "settle_rollups"]),
-        ({"FUZZ_COLD_ROLLUPS": "0"}, ["settle_on", "settle_compaction"]),
-        ({"FUZZ_COLD_ROLLUPS": "0", "FUZZ_COLD_COMPACTION": "0"}, ["start"]),
+        ({}, ["settle_on", "settle_rollups", "settle_compaction", "settle_summaries"]),
+        (
+            {"FUZZ_COLD_COMPACTION": "0"},
+            ["start", "settle_rollups", "settle_summaries"],
+        ),
+        (
+            {"FUZZ_COLD_ROLLUPS": "0"},
+            ["settle_on", "settle_compaction", "settle_summaries"],
+        ),
+        (
+            {"FUZZ_COLD_SUMMARIES": "0"},
+            ["settle_on", "settle_rollups", "settle_compaction"],
+        ),
+        (
+            {
+                "FUZZ_COLD_ROLLUPS": "0",
+                "FUZZ_COLD_COMPACTION": "0",
+                "FUZZ_COLD_SUMMARIES": "0",
+            },
+            ["start"],
+        ),
     ],
 )
 def test_logs_cold_flush_settles_both_sides(
@@ -367,6 +413,7 @@ def test_logs_cold_flush_settles_both_sides(
         "settle_on": "loki_compactor",
         "settle_rollups": "rollups",
         "settle_compaction": "impl_compaction",
+        "settle_summaries": "summaries",
     }
     assert set(report["settle_s"]) == {expected[s] for s in settles if s in expected}
     assert ("after" in report) == bool(report["settle_s"])

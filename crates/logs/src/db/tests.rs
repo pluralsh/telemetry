@@ -2807,6 +2807,37 @@ fn window_boundaries_split_only_the_spans_they_fall_inside() {
 }
 
 #[test]
+fn window_boundaries_split_the_summary_buckets_they_fall_inside() {
+    let read = |boundaries: Vec<Boundaries>| SampleRead {
+        metadata: MetadataNeeds::None,
+        boundaries,
+    };
+    let at = |first, step, count| Boundaries { first, step, count };
+    let split = |read: &SampleRead| read.split_buckets(10).map(|split| split.to_vec());
+    // Windows (5, 10], (15, 20], (25, 30] split buckets (0, 10], (10, 20] and (20, 30].
+    let windows = read(vec![at(10, 10, 3), at(5, 10, 3)]);
+    assert_eq!(split(&windows), Some(vec![0, 1, 2]));
+    assert_eq!(
+        split(&read(vec![at(10, 10, 3), at(0, 10, 3)])),
+        Some(vec![])
+    );
+    // An instant query at 37 over 30 splits only the buckets of 7 and 37.
+    assert_eq!(split(&read(vec![at(7, 30, 2)])), Some(vec![0, 3]));
+    assert_eq!(split(&read(vec![at(-3, 10, 1)])), Some(vec![-1]));
+    assert_eq!(split(&read(vec![at(5, 10, 65)])), None);
+    assert_eq!(
+        split(&read(vec![at(5, 10, 64)])).map(|split| split.len()),
+        Some(64)
+    );
+    assert_eq!(split(&read(vec![at(1, 3, 1_000_000)])), None);
+    assert_eq!(
+        split(&read(vec![at(i64::MAX - 1, i64::MAX, 3)])),
+        Some(vec![i64::MAX / 10])
+    );
+    assert_eq!(windows.split_buckets(0), None);
+}
+
+#[test]
 fn rows_repeat_only_where_runs_meet_or_may_hold_duplicates() {
     let run = |min, max, duplicate_free| StoredRun {
         level: 0,
@@ -3001,6 +3032,7 @@ async fn summarized_metric_reads_match_full_row_reads() {
     ];
     let selectors = [r#"{environment="prod"}"#, r#"{service="api"}"#];
     let now_unix_ms = unix_time_ms().unwrap();
+    let mut unaligned_pages = (0, 0);
     for seed in 1..=20u64 {
         let errors = seed % 5 == 0;
         let mut db = LogDb::open(Config {
@@ -3058,6 +3090,30 @@ async fn summarized_metric_reads_match_full_row_reads() {
                 .filter(|segment| segment.width_ns == 20_000 * MS)
                 .count();
             assert_eq!(periods, 2, "seed {seed}");
+
+            // An instant read whose window starts and ends mid-bucket still
+            // counts the buckets between from segment summaries.
+            let unaligned = SampleRead {
+                metadata: MetadataNeeds::None,
+                boundaries: vec![Boundaries {
+                    first: 250 * MS,
+                    step: 29_500 * MS,
+                    count: 2,
+                }],
+            };
+            let pages = async |filter: &StreamFilter| {
+                db.scan_targets(&namespace, 250 * MS, 29_750 * MS, filter)
+                    .await
+                    .unwrap()
+                    .estimate(true)
+                    .pages
+            };
+            let full = pages(&StreamFilter::exact(Vec::new())).await;
+            let summarized =
+                pages(&StreamFilter::exact(Vec::new()).with_summaries(Some(&unaligned))).await;
+            assert!(summarized <= full, "seed {seed}: {summarized} > {full}");
+            unaligned_pages.0 += summarized;
+            unaligned_pages.1 += full;
         }
 
         for round in 0..3 {
@@ -3118,6 +3174,105 @@ async fn summarized_metric_reads_match_full_row_reads() {
         }
         db.close().await.unwrap();
     }
+    assert!(
+        unaligned_pages.0 < unaligned_pages.1,
+        "unaligned reads read {} of {} pages",
+        unaligned_pages.0,
+        unaligned_pages.1
+    );
+}
+
+/// Reads whose windows split a few summary buckets count the rest from
+/// segment summaries and read rows only in those: blocks and runs counted
+/// whole must not carry rows across a split bucket's edge.
+#[tokio::test]
+async fn reads_splitting_summary_buckets_count_the_rest_from_summaries() {
+    use crate::query::{QueryOptions, QueryRequest};
+
+    const MS: i64 = 1_000_000;
+    let mut db = LogDb::open(Config {
+        retention: None,
+        page: PageConfig {
+            target_size_bytes: 1 << 20,
+            max_rows: 48,
+            rows_per_block: 12,
+        },
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    db.summary_bucket = Duration::from_secs(1);
+    let namespace = Namespace::default();
+    let entries = (0..120)
+        .map(|row| LogEntry::new(row * 250 * MS + 100 * MS, format!("row {row}")))
+        .collect();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(labels("api", "prod"), entries)],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    db.flush_memtable().await.unwrap();
+    assert!(db.summarize_at(unix_time_ms().unwrap()).await.unwrap() > 0);
+
+    let result = async |request: &QueryRequest| {
+        db.query(&namespace, request, QueryOptions::default())
+            .await
+            .unwrap()
+    };
+    // Blocks hold 12 rows 250ms apart from 100ms on, so block `b` spans
+    // `[3b + 0.1, 3b + 2.85]` seconds: windows starting just before one's
+    // first row, or ending just after its last, split only its first or
+    // last bucket.
+    let windows = [
+        (7_250, 5_000),
+        (29_900, 27_300),
+        (13_400, 3_000),
+        (20_600, 9_700),
+        (7_250, 4_200),
+        (20_600, 11_550),
+        (14_900, 10_000),
+        (23_900, 5_000),
+    ];
+    for (at, range) in windows {
+        let query = |filter: &str| {
+            format!(r#"sum by (service) (count_over_time({{service="api"}}{filter} [{range}ms]))"#)
+        };
+        let instant = |filter| QueryRequest::instant(query(filter), at * MS);
+        assert_eq!(
+            result(&instant("")).await,
+            result(&instant(r#" |= """#)).await,
+            "at {at}ms over {range}ms"
+        );
+        let ranged =
+            |filter| QueryRequest::range(query(filter), at * MS, (at + 4_500) * MS, 1_500 * MS);
+        assert_eq!(
+            result(&ranged("")).await,
+            result(&ranged(r#" |= """#)).await,
+            "from {at}ms over {range}ms"
+        );
+    }
+
+    let read = SampleRead {
+        metadata: MetadataNeeds::None,
+        boundaries: vec![Boundaries {
+            first: 2_600 * MS,
+            step: 27_300 * MS,
+            count: 2,
+        }],
+    };
+    let pages = async |filter: &StreamFilter| {
+        db.scan_targets(&namespace, 2_600 * MS, 29_900 * MS, filter)
+            .await
+            .unwrap()
+            .estimate(true)
+            .pages
+    };
+    let full = pages(&StreamFilter::exact(Vec::new())).await;
+    let summarized = pages(&StreamFilter::exact(Vec::new()).with_summaries(Some(&read))).await;
+    assert!(summarized < full, "{summarized} of {full} pages");
+    db.close().await.unwrap();
 }
 
 #[test]

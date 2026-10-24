@@ -39,9 +39,6 @@ use crate::{
     shard_reader::GrpcLogsShards,
 };
 
-/// How often writers look for settled segments to summarize.
-const SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
-
 #[derive(Clone)]
 pub struct AppState {
     /// The config the process started with; see `live` for reloaded settings.
@@ -429,20 +426,30 @@ impl AppState {
 
     /// Periodically summarizes settled segments for lineless metric queries.
     async fn start_summary_task(&self) {
-        if self.config.mode == ServerMode::Reader {
+        let seconds = self.config.summary_interval_seconds;
+        if self.config.mode == ServerMode::Reader || seconds == 0 {
             return;
         }
         let state = self.clone();
-        let task = spawn_periodic(SUMMARY_INTERVAL, self.cancellation.clone(), move || {
+        let interval = Duration::from_secs(seconds);
+        let task = spawn_periodic(interval, self.cancellation.clone(), move || {
             let state = state.clone();
             async move {
                 tokio::select! {
                     () = state.cancellation.cancelled() => {}
                     summarized = state.db.summarize() => {
-                        if let Err(error) = summarized {
-                            tracing::warn!(%error, "Logs segment summary failed");
-                            ::metrics::counter!("logs_summary_errors_total").increment(1);
-                        }
+                        // `idle` passes found nothing left to summarize.
+                        let outcome = match summarized {
+                            Ok(0) => "idle",
+                            Ok(_) => "ok",
+                            Err(error) => {
+                                tracing::warn!(%error, "Logs segment summary failed");
+                                ::metrics::counter!("logs_summary_errors_total").increment(1);
+                                "error"
+                            }
+                        };
+                        ::metrics::counter!("logs_summary_passes_total", "outcome" => outcome)
+                            .increment(1);
                     },
                 }
             }

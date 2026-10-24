@@ -190,6 +190,9 @@ pub struct Config {
     pub compaction: CompactionConfig,
     /// Rollup of closed days of segments into wider segments.
     pub rollup: SegmentRollupConfig,
+    /// How often writers summarize settled segments for metric queries
+    /// that read no lines; `0` disables it.
+    pub summary_interval_seconds: u64,
     /// Byte budget of the process's cache of object blocks with their
     /// decompressed bodies, shared by every shard; `0` disables it.
     pub reader_cache_capacity: u64,
@@ -228,6 +231,7 @@ impl Default for Config {
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             rollup: SegmentRollupConfig::default(),
+            summary_interval_seconds: 300,
             reader_cache_capacity: core.block_cache_capacity_bytes,
             result_cache_capacity: core.result_cache_capacity_bytes,
             write: WriteConfig::default(),

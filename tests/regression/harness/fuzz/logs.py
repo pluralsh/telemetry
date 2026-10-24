@@ -94,6 +94,11 @@ ROLLUP_FAILED = "Logs segment rollup failed"
 LOKI_COMPACTION_INTERVAL = "10s"
 LOKI_COMPACTIONS = "loki_boltdb_shipper_compact_tables_operation_total"
 LOKI_COMPACTION_TIMEOUT_S = 600.0
+# Logs summarizes settled segments every 5 minutes; settling restarts it
+# summarizing this often and waits for a pass that finds nothing left.
+SUMMARY_SETTLE_INTERVAL_S = 10
+SUMMARY_SETTLE_TIMEOUT_S = 600.0
+SUMMARY_PASSES = "logs_summary_passes_total"
 
 APPS = ("checkout", "cart", "search", "auth", "billing", "gateway", "worker", "cron")
 ENVS = ("prod", "staging", "dev")
@@ -353,6 +358,23 @@ def loki_compactions(scrape: str) -> float:
         for line in scrape.splitlines()
         if line.startswith(LOKI_COMPACTIONS + "{") and 'status="success"' in line
     )
+
+
+def summary_passes(scrape: str, outcome: str) -> float:
+    """Logs summary passes with `outcome` in a Prometheus scrape."""
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in scrape.splitlines()
+        if line.startswith(SUMMARY_PASSES + "{") and f'outcome="{outcome}"' in line
+    )
+
+
+def summary_settle_config(config: Path) -> str:
+    """Logs' `config` summarizing every `SUMMARY_SETTLE_INTERVAL_S`."""
+    text = config.read_text()
+    if re.search(r"^summary_interval_seconds:", text, re.MULTILINE):
+        raise ValueError(f"{config} already configures summaries")
+    return f"{text.rstrip()}\nsummary_interval_seconds: {SUMMARY_SETTLE_INTERVAL_S}\n"
 
 
 def loki_compactor_config(config: Path) -> str:
@@ -621,6 +643,8 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             timings["impl_compaction"], report["impl_compaction"] = (
                 stack.settle_compaction(impl, metrics_url=impl.metrics_url)
             )
+        if settings.summaries:
+            timings["summaries"] = self._settle_summaries(stack, impl, ready_timeout_s)
         report["settle_s"] = {name: round(value, 1) for name, value in timings.items()}
         if timings:
             report["after"] = self._cold_layout(stack, impl)
@@ -631,6 +655,35 @@ class LogsFuzz(FuzzProduct, ColdProduct):
                 print(f"cold logs: layout {when} settling: {summary}", flush=True)
         path = self.config.output_dir / "cold_settle.json"
         path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    def _settle_summaries(
+        self, stack: ColdStack, impl: ColdService, ready_timeout_s: float
+    ) -> float:
+        """Restarts Logs summarizing every `SUMMARY_SETTLE_INTERVAL_S` once
+        the layout is final, and waits for a pass that finds nothing left."""
+        assert impl.metrics_url is not None
+        metrics_url = impl.metrics_url
+        config = PRODUCT_DIR / IMPL_CONFIG_DIRS[self.impl_config] / "logs-s3.yaml"
+
+        def summarized() -> bool:
+            passes = scrape(metrics_url)
+            if failed := summary_passes(passes, "error"):
+                raise RuntimeError(
+                    f"{failed:g} Logs summary passes failed while settling"
+                )
+            return summary_passes(passes, "idle") >= 1
+
+        return stack.settle_on(
+            impl,
+            config=config,
+            text=summary_settle_config(config),
+            env="LOGS_S3_CONFIG",
+            settled=summarized,
+            ready_timeout_s=ready_timeout_s,
+            timeout_s=SUMMARY_SETTLE_TIMEOUT_S,
+            poll_s=SUMMARY_SETTLE_INTERVAL_S / 2,
+            what="its summaries",
+        )
 
     def _cold_layout(self, stack: ColdStack, impl: ColdService) -> dict[str, Any]:
         """Both sides' objects in MinIO, the implementation's SlateDB layout
@@ -743,6 +796,21 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             + ' |= "level=error" [{range}]))'
         )
         by_app = "sum by (app) (rate(" + namespace + " [{range}]))"
+
+        def facet(family: str, at: int) -> Case:
+            # Console's log facet counts: one instant window over the range.
+            query = (
+                f"topk(100, sum by (namespace) (count_over_time({everything} [24h])))"
+            )
+            return Case(
+                f"{family}.24h",
+                query,
+                Request(
+                    "GET", "/loki/api/v1/query", (("query", query), ("time", str(at)))
+                ),
+                _metric_comparator(query),
+            )
+
         return [
             logs("log.needle", needle, 1),
             logs("log.needle", needle, 24),
@@ -750,6 +818,10 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             *(metric("metric.count_by_level", by_level, hours) for hours in (6, 24)),
             metric("metric.errors_by_namespace", by_namespace, 24),
             *(metric("metric.rate_by_app", by_app, hours) for hours in (1, 6)),
+            # `end` is a whole minute; 37s before it, the window starts and
+            # ends inside summary buckets.
+            facet("metric.facet_by_namespace", end - 60 * SECOND),
+            facet("metric.facet_by_namespace_unaligned", end - 37 * SECOND),
             Case(
                 "series.namespace.24h",
                 namespace,

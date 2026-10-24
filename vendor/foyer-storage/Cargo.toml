@@ -173,6 +173,9 @@ version = "0.22.6"
 features = ["test_utils"]
 default-features = false
 
+[dev-dependencies.mixtrics]
+version = "0.2"
+
 [dev-dependencies.tempfile]
 version = "3"
 
