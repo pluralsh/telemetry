@@ -1447,28 +1447,57 @@ async fn profile_remote_cold_dashboard() {
         panic!("PROFILE_S3 is region:bucket:base_path");
     };
     let cluster = std::env::var("PROFILE_CLUSTER").unwrap_or("mgmt".to_string());
-    let namespace = Namespace::new(
-        std::env::var("PROFILE_NAMESPACE").unwrap_or("default".to_string()),
-    )
-    .unwrap();
+    let namespace =
+        Namespace::new(std::env::var("PROFILE_NAMESPACE").unwrap_or("default".to_string()))
+            .unwrap();
     let queries = [
-        ("cpu", format!(r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m]))"#)),
-        ("mem", format!(r#"sum(container_memory_working_set_bytes{{image!="",cluster="{cluster}",container!=""}})"#)),
-        ("ns_cpu", format!(r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m])) by (namespace)"#)),
-        ("pod_mem", format!(r#"sum(container_memory_working_set_bytes{{cluster="{cluster}",image!="",container!=""}}) by (pod)"#)),
-        ("node_cpu", format!(r#"(1 - avg(irate(node_cpu_seconds_total{{mode="idle",cluster="{cluster}"}}[5m])))"#)),
-        ("pods", format!(r#"count(kube_pod_info{{cluster="{cluster}"}})"#)),
+        (
+            "cpu",
+            format!(
+                r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m]))"#
+            ),
+        ),
+        (
+            "mem",
+            format!(
+                r#"sum(container_memory_working_set_bytes{{image!="",cluster="{cluster}",container!=""}})"#
+            ),
+        ),
+        (
+            "ns_cpu",
+            format!(
+                r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m])) by (namespace)"#
+            ),
+        ),
+        (
+            "pod_mem",
+            format!(
+                r#"sum(container_memory_working_set_bytes{{cluster="{cluster}",image!="",container!=""}}) by (pod)"#
+            ),
+        ),
+        (
+            "node_cpu",
+            format!(
+                r#"(1 - avg(irate(node_cpu_seconds_total{{mode="idle",cluster="{cluster}"}}[5m])))"#
+            ),
+        ),
+        (
+            "pods",
+            format!(r#"count(kube_pod_info{{cluster="{cluster}"}})"#),
+        ),
     ];
     let open = || async {
         let mut config = Config {
             storage: SlateDbStorageConfig {
-                object_store: ObjectStoreConfig::Aws(common::storage::config::AwsObjectStoreConfig {
-                    region: region.to_string(),
-                    bucket: bucket.to_string(),
-                    endpoint: None,
-                    allow_http: false,
-                    virtual_hosted_style: false,
-                }),
+                object_store: ObjectStoreConfig::Aws(
+                    common::storage::config::AwsObjectStoreConfig {
+                        region: region.to_string(),
+                        bucket: bucket.to_string(),
+                        endpoint: None,
+                        allow_http: false,
+                        virtual_hosted_style: false,
+                    },
+                ),
                 ..storage_config(Path::new("/nonexistent"), base.to_string())
             },
             ..Default::default()
@@ -1504,7 +1533,13 @@ async fn profile_remote_cold_dashboard() {
             .map(|phases| {
                 phases
                     .iter()
-                    .map(|phase| format!("{} {:.0}", phase["name"].as_str().unwrap(), phase["elapsedMs"].as_f64().unwrap()))
+                    .map(|phase| {
+                        format!(
+                            "{} {:.0}",
+                            phase["name"].as_str().unwrap(),
+                            phase["elapsedMs"].as_f64().unwrap()
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1570,7 +1605,7 @@ async fn profile_remote_cold_dashboard() {
             let started = Instant::now();
             let ledger = common::storage::slate::warm::WarmLedger::new(true);
             db.warm_recent(
-                &[namespace.clone()],
+                std::slice::from_ref(&namespace),
                 common::WarmWindow {
                     metadata: Some(Duration::from_secs(hours * 3600)),
                     payloads: None,
