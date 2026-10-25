@@ -193,6 +193,9 @@ pub struct Config {
     /// How often writers summarize settled segments for metric queries
     /// that read no lines; `0` disables it.
     pub summary_interval_seconds: u64,
+    /// Whether writes give every entry a `detected_level` structured
+    /// metadata field, as Loki does, unless it already has one.
+    pub discover_log_levels: bool,
     /// Byte budget of the process's cache of object blocks with their
     /// decompressed bodies, shared by every shard; `0` disables it.
     pub reader_cache_capacity: u64,
@@ -232,6 +235,7 @@ impl Default for Config {
             compaction: CompactionConfig::default(),
             rollup: SegmentRollupConfig::default(),
             summary_interval_seconds: 300,
+            discover_log_levels: true,
             reader_cache_capacity: core.block_cache_capacity_bytes,
             result_cache_capacity: core.result_cache_capacity_bytes,
             write: WriteConfig::default(),

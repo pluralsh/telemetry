@@ -19,9 +19,9 @@ use crate::analyzer::DEFAULT_ANALYZER;
 use crate::db::{Boundaries, MetadataNeeds, PageBudget, SampleRead, ScanTargets, StreamFilter};
 use crate::logql::{
     self, BinaryModifier, BinaryOp, ComparisonOp, Conversion, Expr, FilterValue, FormatAssignment,
-    FormatValue, Grouping, IpPattern, LabelFilterExpr, LineFilter, LineFilterOp, LineFilterTerm,
-    LogExpr, MatchOp, ParserExpression, ParserStage, PipelineStage, Query, RangeOp, Unwrap,
-    VectorMatching, VectorOp,
+    FormatValue, Grouping, IpPattern, LabelFilterExpr, LabelPredicate, LineFilter, LineFilterOp,
+    LineFilterTerm, LogExpr, MatchOp, ParserExpression, ParserStage, PipelineStage, Query, RangeOp,
+    Unwrap, VectorMatching, VectorOp,
 };
 use crate::search::{SCORE_METADATA_FIELD, interior_terms, query_terms, source_matches};
 use crate::{Error, Label, Labels, LogDb, LogEntry, Namespace, Result};
@@ -1207,30 +1207,75 @@ fn evaluation_steps(request: &QueryRequest) -> (i64, i64, u64) {
     }
 }
 
+/// The labels a stage of a lineless read filters on: a stage that compares
+/// labels with strings, which sees only stream labels and structured
+/// metadata and cannot fail. `None` for any other stage.
+fn lineless_filter_labels(stage: &PipelineStage) -> Option<Vec<&str>> {
+    fn collect<'a>(filter: &'a LabelFilterExpr, labels: &mut Vec<&'a str>) -> bool {
+        match filter {
+            LabelFilterExpr::And(lhs, rhs) | LabelFilterExpr::Or(lhs, rhs) => {
+                collect(&lhs.value, labels) && collect(&rhs.value, labels)
+            }
+            LabelFilterExpr::Predicate(LabelPredicate {
+                label,
+                op:
+                    ComparisonOp::Equal
+                    | ComparisonOp::NotEqual
+                    | ComparisonOp::Regex
+                    | ComparisonOp::NotRegex,
+                value: FilterValue::String(_),
+            }) if !is_error_label(label) => {
+                labels.push(label);
+                true
+            }
+            LabelFilterExpr::Predicate(_) => false,
+        }
+    }
+    let PipelineStage::LabelFilter(filter) = stage else {
+        return None;
+    };
+    let mut labels = Vec::new();
+    collect(&filter.value, &mut labels).then_some(labels)
+}
+
+/// Every label the stages of `logs` filter on, when all are lineless.
+fn lineless_filters<'a>(logs: &[&'a LogExpr]) -> Option<Vec<&'a str>> {
+    let mut labels = Vec::new();
+    for log in logs {
+        for stage in &log.stages {
+            labels.extend(lineless_filter_labels(&stage.value)?);
+        }
+    }
+    Some(labels)
+}
+
 /// The read of a metric query no stage of which sees a line: every log
 /// expression is the input of a `count_over_time`, `rate`, `bytes_over_time`
-/// or `bytes_rate` with no pipeline stages, so each row contributes only its
-/// timestamp, line length and labels. Structured metadata, which becomes
-/// labels, is read as [`lineless_metadata`] needs it.
+/// or `bytes_rate` whose only stages filter labels with strings (such as
+/// `| detected_level="error"`), so each row contributes only its timestamp,
+/// line length and labels. Structured metadata, which becomes labels, is
+/// read as [`lineless_metadata`] needs it.
 fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleRead>> {
     let mut logs = Vec::new();
     collect_log_exprs(query, &mut logs);
     let mut aggregations = Vec::new();
     collect_range_aggregations(query, &mut aggregations);
+    let Some(filtered) = lineless_filters(&logs) else {
+        return Ok(None);
+    };
     let qualifies = |log: &LogExpr| {
-        log.stages.is_empty()
-            && aggregations.iter().any(|(op, aggregated, _)| {
-                std::ptr::eq(*aggregated, log)
-                    && matches!(
-                        op,
-                        RangeOp::Count | RangeOp::Rate | RangeOp::Bytes | RangeOp::BytesRate
-                    )
-            })
+        aggregations.iter().any(|(op, aggregated, _)| {
+            std::ptr::eq(*aggregated, log)
+                && matches!(
+                    op,
+                    RangeOp::Count | RangeOp::Rate | RangeOp::Bytes | RangeOp::BytesRate
+                )
+        })
     };
     if logs.is_empty() || !logs.iter().all(|log| qualifies(log)) {
         return Ok(None);
     }
-    let metadata = lineless_metadata(&aggregations);
+    let metadata = lineless_metadata(&aggregations, &filtered);
     let (first, step, count) = evaluation_steps(request);
     let mut boundaries = Vec::with_capacity(logs.len() * 2);
     for log in logs {
@@ -1260,9 +1305,16 @@ fn lineless_read(query: &Query, request: &QueryRequest) -> Result<Option<SampleR
 /// only those series. So `by (labels)` needs the metadata that can become
 /// those labels, and any aggregation without grouping, or `without`, needs
 /// all of it, as its series' identity depends on every label: a `max` over
-/// them would see fewer, larger series were any metadata dropped.
-fn lineless_metadata(aggregations: &[(RangeOp, &LogExpr, Option<&Grouping>)]) -> MetadataNeeds {
-    let mut names = Vec::new();
+/// them would see fewer, larger series were any metadata dropped. Labels
+/// stages filter on, `filtered`, are needed too.
+fn lineless_metadata(
+    aggregations: &[(RangeOp, &LogExpr, Option<&Grouping>)],
+    filtered: &[&str],
+) -> MetadataNeeds {
+    let mut names = filtered
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
     for (_, _, grouping) in aggregations {
         match grouping {
             Some(grouping) if !grouping.without => names.extend(grouping.labels.iter().cloned()),
@@ -1282,31 +1334,37 @@ fn lineless_metadata(aggregations: &[(RangeOp, &LogExpr, Option<&Grouping>)]) ->
 /// suffixes stripped, since whether a stream has label `n` decides whether
 /// metadata `n` is promoted to `n` or `n_extracted`; the error labels, which
 /// errored series keep and failures read; and every label a stream selector
-/// matches on. A stream labelled with only these yields the same series,
-/// metadata reads and selection as with all of its labels. `None` when an
-/// aggregation keeps every label.
+/// matches on, or a stage filters on. A stream labelled with only these
+/// yields the same series, metadata reads and selection as with all of its
+/// labels. `None` when an aggregation keeps every label.
 fn lineless_labels(query: &Query) -> Option<Vec<String>> {
     let mut aggregations = Vec::new();
     collect_range_aggregations(query, &mut aggregations);
+    let mut logs = Vec::new();
+    collect_log_exprs(query, &mut logs);
     let mut names = [ERROR_LABEL, ERROR_DETAILS_LABEL, PRESERVE_ERROR_LABEL]
         .map(str::to_owned)
         .to_vec();
+    let mut add = |label: &str| {
+        let mut name = label;
+        names.push(name.to_owned());
+        while let Some(shorter) = name
+            .strip_suffix("_extracted")
+            .filter(|shorter| !shorter.is_empty())
+        {
+            names.push(shorter.to_owned());
+            name = shorter;
+        }
+    };
     for (_, _, grouping) in &aggregations {
         let grouping = grouping.filter(|grouping| !grouping.without)?;
         for label in &grouping.labels {
-            let mut name = label.as_str();
-            names.push(name.to_owned());
-            while let Some(shorter) = name
-                .strip_suffix("_extracted")
-                .filter(|shorter| !shorter.is_empty())
-            {
-                names.push(shorter.to_owned());
-                name = shorter;
-            }
+            add(label);
         }
     }
-    let mut logs = Vec::new();
-    collect_log_exprs(query, &mut logs);
+    for label in lineless_filters(&logs).unwrap_or_default() {
+        add(label);
+    }
     names.extend(
         logs.iter()
             .flat_map(|log| &log.selector.value.matchers)

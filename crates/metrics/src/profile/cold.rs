@@ -1432,3 +1432,225 @@ async fn profile_cold_discovery() {
         }
     }
 }
+
+/// Console's 1d cluster dashboard over the SlateDB store `PROFILE_S3`
+/// (`region:bucket:base_path`), read only, each query on a fresh reader with
+/// empty caches and the real object store's latency. `PROFILE_CLUSTER` picks
+/// the cluster, `PROFILE_NAMESPACE` the metrics namespace (default
+/// `default`) and `PROFILE_CONCURRENT` runs the dashboard's queries at once
+/// on one fresh reader, as the browser sends them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual profiling"]
+async fn profile_remote_cold_dashboard() {
+    let target = std::env::var("PROFILE_S3").unwrap();
+    let [region, bucket, base] = target.splitn(3, ':').collect::<Vec<_>>()[..] else {
+        panic!("PROFILE_S3 is region:bucket:base_path");
+    };
+    let cluster = std::env::var("PROFILE_CLUSTER").unwrap_or("mgmt".to_string());
+    let namespace = Namespace::new(
+        std::env::var("PROFILE_NAMESPACE").unwrap_or("default".to_string()),
+    )
+    .unwrap();
+    let queries = [
+        ("cpu", format!(r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m]))"#)),
+        ("mem", format!(r#"sum(container_memory_working_set_bytes{{image!="",cluster="{cluster}",container!=""}})"#)),
+        ("ns_cpu", format!(r#"sum(rate(container_cpu_usage_seconds_total{{container!="",cluster="{cluster}"}}[5m])) by (namespace)"#)),
+        ("pod_mem", format!(r#"sum(container_memory_working_set_bytes{{cluster="{cluster}",image!="",container!=""}}) by (pod)"#)),
+        ("node_cpu", format!(r#"(1 - avg(irate(node_cpu_seconds_total{{mode="idle",cluster="{cluster}"}}[5m])))"#)),
+        ("pods", format!(r#"count(kube_pod_info{{cluster="{cluster}"}})"#)),
+    ];
+    let open = || async {
+        let mut config = Config {
+            storage: SlateDbStorageConfig {
+                object_store: ObjectStoreConfig::Aws(common::storage::config::AwsObjectStoreConfig {
+                    region: region.to_string(),
+                    bucket: bucket.to_string(),
+                    endpoint: None,
+                    allow_http: false,
+                    virtual_hosted_style: false,
+                }),
+                ..storage_config(Path::new("/nonexistent"), base.to_string())
+            },
+            ..Default::default()
+        };
+        config.query_cache.result_cache_enabled = false;
+        let inner = common::create_object_store(&config.storage.object_store).unwrap();
+        let slow: Arc<dyn ObjectStore> = Arc::new(SlowStore {
+            inner,
+            latency: Duration::ZERO,
+        });
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            common::storage::coalescing::CoalescingObjectStore::new(slow, "s3:remote-profile"),
+        );
+        let started = Instant::now();
+        let db = ShardedMetrics::open_readers_over(
+            config,
+            ShardingOptions::new(1, sharding::DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
+            [ShardId::new(0)],
+            slatedb::config::DbReaderOptions::default(),
+            READER_CACHE_CAPACITY,
+            Some(store),
+        )
+        .await
+        .unwrap();
+        eprintln!("opened reader in {:.0} ms", ms(started.elapsed()));
+        db
+    };
+    let now = common::time::now_ms();
+    let end_ms = now - now.rem_euclid(STEP.as_millis() as i64);
+    let report = |name: &str, total: Duration, trace: &serde_json::Value, gets: &[Get]| {
+        let phases: Vec<String> = trace["phases"]
+            .as_array()
+            .map(|phases| {
+                phases
+                    .iter()
+                    .map(|phase| format!("{} {:.0}", phase["name"].as_str().unwrap(), phase["elapsedMs"].as_f64().unwrap()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let buckets: Vec<String> = trace["buckets"]
+            .as_array()
+            .map(|buckets| {
+                buckets
+                    .iter()
+                    .map(|bucket| {
+                        format!(
+                            "{}h:{}s/{:.0}+{:.0}ms",
+                            bucket["sizeHours"],
+                            bucket["series"],
+                            bucket["resolveMs"].as_f64().unwrap(),
+                            bucket["sampleMs"].as_f64().unwrap()
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "{name:>9} {:>7.0} ms gets {:>5} {:>7.1} MiB waves {:>3} peak {:>3} | {} | {}",
+            ms(total),
+            gets.len(),
+            gets.iter().map(|get| get.bytes).sum::<u64>() as f64 / f64::from(1 << 20),
+            waves(gets),
+            peak(gets),
+            phases.join(" "),
+            buckets.join(" "),
+        );
+    };
+    if std::env::var("PROFILE_CONCURRENT").is_ok() {
+        let db = open().await;
+        start_recording();
+        let started = Instant::now();
+        let results = futures::future::join_all(queries.iter().map(|(name, text)| {
+            let db = &db;
+            let namespace = &namespace;
+            async move {
+                let began = Instant::now();
+                let (_, trace) = db
+                    .query_range_with_trace(namespace, text, day_range(end_ms), STEP, true)
+                    .await
+                    .unwrap();
+                (*name, began.elapsed(), trace.unwrap())
+            }
+        }))
+        .await;
+        let total = started.elapsed();
+        let gets = stop_recording();
+        for (name, took, trace) in &results {
+            report(name, *took, trace, &[]);
+        }
+        report("dashboard", total, &serde_json::Value::Null, &gets);
+        db.close().await.unwrap();
+        return;
+    }
+    for (name, text) in &queries {
+        let db = open().await;
+        // `PROFILE_META_WARM_HOURS` warms that many hours of SST metadata
+        // first, as a startup warmer would.
+        if let Some(hours) = env::<u64>("PROFILE_META_WARM_HOURS") {
+            let started = Instant::now();
+            let ledger = common::storage::slate::warm::WarmLedger::new(true);
+            db.warm_recent(
+                &[namespace.clone()],
+                common::WarmWindow {
+                    metadata: Some(Duration::from_secs(hours * 3600)),
+                    payloads: None,
+                },
+                16,
+                &tokio_util::sync::CancellationToken::new(),
+                &ledger,
+                common::storage::slate::warm::WarmShares {
+                    metadata_percent: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            eprintln!(
+                "warmed {hours}h of metadata in {:.0} ms, {:.1} MiB",
+                ms(started.elapsed()),
+                ledger.bytes() as f64 / f64::from(1 << 20)
+            );
+        }
+        start_recording();
+        let started = Instant::now();
+        let (_, trace) = db
+            .query_range_with_trace(&namespace, text, day_range(end_ms), STEP, true)
+            .await
+            .unwrap();
+        let total = started.elapsed();
+        let gets = stop_recording();
+        let trace = trace.unwrap();
+        report(name, total, &trace, &gets);
+        if std::env::var("PROFILE_DETAIL").is_ok() {
+            for key in ["subphases", "io"] {
+                for item in trace[key].as_array().into_iter().flatten() {
+                    eprintln!("    {key} {item}");
+                }
+            }
+            if let Some(object) = trace.as_object() {
+                eprintln!("    keys {:?}", object.keys().collect::<Vec<_>>());
+            }
+            print_waves(&gets);
+        }
+        db.close().await.unwrap();
+        if std::env::var("PROFILE_DETAIL").is_ok() {
+            return;
+        }
+    }
+}
+
+/// Each GET of the longest dependent chain: when it started, how long it
+/// took, its bytes and object.
+fn print_waves(gets: &[Get]) {
+    let mut by_end: Vec<&Get> = gets.iter().collect();
+    by_end.sort_by_key(|get| get.end);
+    let mut chain: Vec<(usize, Option<usize>)> = Vec::with_capacity(by_end.len());
+    for (index, get) in by_end.iter().enumerate() {
+        let prior = by_end[..index]
+            .iter()
+            .enumerate()
+            .zip(&chain)
+            .filter(|((_, earlier), _)| earlier.end <= get.start)
+            .max_by_key(|(_, (length, _))| *length)
+            .map(|((at, _), (length, _))| (*length, at));
+        chain.push(prior.map_or((1, None), |(length, at)| (length + 1, Some(at))));
+    }
+    let Some(mut at) = (0..chain.len()).max_by_key(|index| chain[*index].0) else {
+        return;
+    };
+    let mut path = vec![at];
+    while let Some(previous) = chain[at].1 {
+        path.push(previous);
+        at = previous;
+    }
+    for index in path.into_iter().rev() {
+        let get = by_end[index];
+        eprintln!(
+            "    wave start {:>6.0} took {:>4.0} ms {:>8} B {}",
+            ms(get.start),
+            ms(get.end - get.start),
+            get.bytes,
+            get.path
+        );
+    }
+}

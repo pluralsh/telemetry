@@ -3182,6 +3182,53 @@ async fn summarized_metric_reads_match_full_row_reads() {
     );
 }
 
+/// A segment that fails to summarize does not keep older ones, which a pass
+/// reaches after it, from being summarized.
+#[tokio::test]
+async fn summary_passes_skip_segments_that_fail() {
+    const SECOND: i64 = 1_000_000_000;
+    let db = LogDb::open(Config {
+        retention: None,
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    let namespace = Namespace::default();
+    let entries = [SECOND, 11 * SECOND]
+        .into_iter()
+        .map(|timestamp_ns| LogEntry::new(timestamp_ns, "row"))
+        .collect();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(labels("api", "prod"), entries)],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    let (older, newer) = (
+        SegmentId::new(0, 10 * SECOND),
+        SegmentId::new(10 * SECOND, 10 * SECOND),
+    );
+    db.writer()
+        .unwrap()
+        .apply(vec![RecordOp::put_with_ttl(
+            crate::codec::summary_key(&namespace, newer),
+            Bytes::from_static(b"corrupt"),
+            Ttl::NoExpiry,
+        )])
+        .await
+        .unwrap();
+    db.flush_memtable().await.unwrap();
+
+    assert_eq!(db.summarize_at(unix_time_ms().unwrap()).await.unwrap(), 1);
+    let stored = db
+        .storage
+        .get(crate::codec::summary_key(&namespace, older))
+        .await
+        .unwrap();
+    assert!(stored.is_some());
+}
+
 /// Reads whose windows split a few summary buckets count the rest from
 /// segment summaries and read rows only in those: blocks and runs counted
 /// whole must not carry rows across a split bucket's edge.
@@ -3272,6 +3319,111 @@ async fn reads_splitting_summary_buckets_count_the_rest_from_summaries() {
     let full = pages(&StreamFilter::exact(Vec::new())).await;
     let summarized = pages(&StreamFilter::exact(Vec::new()).with_summaries(Some(&read))).await;
     assert!(summarized < full, "{summarized} of {full} pages");
+    db.close().await.unwrap();
+}
+
+/// Level counts and level filters are counted from summaries, which split
+/// buckets by `detected_level`, and match reading every row.
+#[tokio::test]
+async fn level_reads_count_from_summaries() {
+    use crate::level::DETECTED_LEVEL;
+    use crate::query::{QueryOptions, QueryRequest};
+
+    const MS: i64 = 1_000_000;
+    let mut db = LogDb::open(Config {
+        retention: None,
+        page: PageConfig {
+            target_size_bytes: 1 << 20,
+            max_rows: 48,
+            rows_per_block: 12,
+        },
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    db.summary_bucket = Duration::from_secs(1);
+    let namespace = Namespace::default();
+    let levels = ["info", "error", "warn", "info", ""];
+    let entries = (0..120)
+        .map(|row| {
+            let timestamp = row * 250 * MS + 100 * MS;
+            match levels[row as usize % levels.len()] {
+                "" => LogEntry::new(timestamp, format!("row {row}")),
+                level => LogEntry::with_structured_metadata(
+                    timestamp,
+                    format!("row {row}"),
+                    crate::Fields::new(vec![crate::Field::new(DETECTED_LEVEL, level)]).unwrap(),
+                ),
+            }
+        })
+        .collect();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(labels("api", "prod"), entries)],
+    )
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+    db.flush_memtable().await.unwrap();
+    assert!(db.summarize_at(unix_time_ms().unwrap()).await.unwrap() > 0);
+
+    let result = async |query: String, ranged: bool| {
+        let request = if ranged {
+            QueryRequest::range(query, 10_000 * MS, 30_000 * MS, 2_000 * MS)
+        } else {
+            QueryRequest::instant(query, 30_000 * MS)
+        };
+        db.query(&namespace, &request, QueryOptions::default())
+            .await
+            .unwrap()
+    };
+    let queries = [
+        r#"sum by (detected_level) (count_over_time({service="api"}LINE [10s]))"#,
+        r#"sum(count_over_time({service="api"}LINE | detected_level="error" [10s]))"#,
+        r#"sum by (detected_level) (rate({service="api"}LINE | detected_level=~"error|warn" [10s]))"#,
+        r#"sum(bytes_over_time({service="api"}LINE | detected_level!="info" [10s]))"#,
+    ];
+    for query in queries {
+        let counted = query.replace("LINE", "");
+        let scanned = query.replace("LINE", r#" |= """#);
+        let plan_request = QueryRequest::instant(counted.clone(), 30_000 * MS);
+        let parsed = crate::logql::parse(&counted).unwrap();
+        let plan =
+            crate::query::ScanPlan::new(&plan_request, &parsed, &QueryOptions::default()).unwrap();
+        assert!(plan.is_lineless(), "{counted}");
+        let empty = r#"sum(count_over_time({service="none"} [10s]))"#.to_owned();
+        assert_ne!(
+            format!("{:?}", result(counted.clone(), false).await),
+            format!("{:?}", result(empty, false).await),
+            "{counted}"
+        );
+        for ranged in [false, true] {
+            assert_eq!(
+                result(counted.clone(), ranged).await,
+                result(scanned.clone(), ranged).await,
+                "{counted} ranged {ranged}"
+            );
+        }
+    }
+
+    let read = SampleRead {
+        metadata: MetadataNeeds::Names(vec![DETECTED_LEVEL.to_owned()]),
+        boundaries: vec![Boundaries {
+            first: 10_000 * MS,
+            step: 10_000 * MS,
+            count: 3,
+        }],
+    };
+    let pages = async |filter: &StreamFilter| {
+        db.scan_targets(&namespace, 0, 30_000 * MS, filter)
+            .await
+            .unwrap()
+            .estimate(true)
+            .pages
+    };
+    let full = pages(&StreamFilter::exact(Vec::new())).await;
+    let summarized = pages(&StreamFilter::exact(Vec::new()).with_summaries(Some(&read))).await;
+    assert_eq!(summarized, 0, "{summarized} of {full} pages");
     db.close().await.unwrap();
 }
 

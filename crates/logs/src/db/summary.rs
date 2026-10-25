@@ -30,6 +30,11 @@ const SUMMARIES_PER_PASS: usize = 32;
 /// Stream summaries per storage write.
 const SUMMARY_WRITE_BATCH: usize = 1024;
 
+fn summary_failed(namespace: &Namespace, segment: SegmentId, error: &Error) {
+    tracing::warn!(%namespace, %segment, %error, "Logs segment summary failed");
+    ::metrics::counter!("logs_summary_errors_total").increment(1);
+}
+
 impl LogDb {
     /// Summarizes the settled segments reads use that have no current
     /// summary. Returns the segments summarized.
@@ -94,16 +99,20 @@ impl LogDb {
                 .expect("summary cache poisoned")
                 .retain(|key, _| live.contains(key));
         }
+        // A segment that fails to summarize is skipped, so that it cannot
+        // keep every older one from being summarized: passes go newest first.
         let mut summarized = 0;
         for (namespace, segment) in segments {
             if summarized == SUMMARIES_PER_PASS {
                 break;
             }
-            if self
+            match self
                 .summarize_segment(writer.as_ref(), &namespace, segment, now_unix_ms)
-                .await?
+                .await
             {
-                summarized += 1;
+                Ok(true) => summarized += 1,
+                Ok(false) => {}
+                Err(error) => summary_failed(&namespace, segment, &error),
             }
         }
         let mut periods_summarized = 0;
@@ -111,11 +120,13 @@ impl LogDb {
             if periods_summarized == SUMMARIES_PER_PASS {
                 break;
             }
-            if self
+            match self
                 .summarize_period(writer.as_ref(), &namespace, period)
-                .await?
+                .await
             {
-                periods_summarized += 1;
+                Ok(true) => periods_summarized += 1,
+                Ok(false) => {}
+                Err(error) => summary_failed(&namespace, period, &error),
             }
         }
         Ok(summarized + periods_summarized)
@@ -188,7 +199,9 @@ impl LogDb {
                 };
                 match summarized.get(&(namespace.clone(), *segment)) {
                     Some(summary)
-                        if summary.generation == generation && summary.bucket_ns == bucket_ns =>
+                        if summary.generation == generation
+                            && summary.bucket_ns == bucket_ns
+                            && summary.levels =>
                     {
                         listed.push((*segment, generation));
                         if let Some(expiry) = summary.expires_at_unix_ms {
@@ -208,6 +221,7 @@ impl LogDb {
             segments: listed,
             expires_at_unix_ms,
             bucket_ns,
+            levels: true,
         };
         let key = (namespace.clone(), period);
         let cached = self
@@ -238,9 +252,9 @@ impl LogDb {
             .await?
             .into_iter()
             .collect::<HashMap<_, _>>();
-        /// Rows and line bytes by bucket, `None` once a segment did not
-        /// summarize the stream.
-        type Summed = Option<BTreeMap<i64, (u64, u64)>>;
+        /// Rows and line bytes by bucket and level, `None` once a segment
+        /// did not summarize the stream.
+        type Summed = Option<BTreeMap<(i64, u8), (u64, u64)>>;
         let mut streams: BTreeMap<StreamId, Summed> = BTreeMap::new();
         for (segment, _) in &summary.segments {
             let fingerprints = self
@@ -272,7 +286,7 @@ impl LogDb {
                 match (decode_stream_summary(&record.value, first)?, entry) {
                     (Some(buckets), Some(summed)) => {
                         for bucket in buckets {
-                            let summed = summed.entry(bucket.bucket).or_default();
+                            let summed = summed.entry((bucket.bucket, bucket.level)).or_default();
                             summed.0 += bucket.rows;
                             summed.1 += bucket.line_bytes;
                         }
@@ -297,8 +311,9 @@ impl LogDb {
             let buckets = buckets.map(|buckets| {
                 buckets
                     .into_iter()
-                    .map(|(bucket, (rows, line_bytes))| SummaryBucket {
+                    .map(|((bucket, level), (rows, line_bytes))| SummaryBucket {
                         bucket,
+                        level,
                         rows,
                         line_bytes,
                     })
@@ -371,7 +386,7 @@ impl LogDb {
         // Once its earliest run expires, reads ignore a summary, but it is
         // not rebuilt: that runs out with the segment's retention anyway.
         let current = |summary: &SegmentSummary| {
-            summary.bucket_ns == bucket_ns && summary.generation == generation
+            summary.bucket_ns == bucket_ns && summary.generation == generation && summary.levels
         };
         let cached = self
             .summarized
@@ -400,6 +415,7 @@ impl LogDb {
             generation,
             expires_at_unix_ms: None,
             bucket_ns,
+            levels: true,
         };
         let counts = self.count_segment(namespace, segment, &summary).await?;
         let summary = SegmentSummary {

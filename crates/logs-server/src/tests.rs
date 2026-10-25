@@ -44,6 +44,9 @@ async fn state_with_flush_interval(
     config.write.flush_interval_seconds = flush_interval_seconds;
     config.auth.unauthenticated = true;
     config.cache_warmer.enabled = false;
+    // Responses below are Loki's shapes without `detected_level`, which
+    // `pushes_detect_levels` covers.
+    config.discover_log_levels = false;
     AppState::open(config).await.unwrap()
 }
 
@@ -771,6 +774,88 @@ fn otlp_request(line: &str, timestamp_ns: u64) -> ExportLogsServiceRequest {
             schema_url: String::new(),
         }],
     }
+}
+
+#[tokio::test]
+async fn pushes_detect_levels() {
+    let mut config = Config {
+        storage: StorageConfig::InMemory,
+        namespaces: vec![namespace("tenant")],
+        ..Config::default()
+    };
+    config.write.flush_interval_seconds = 3600;
+    config.auth.unauthenticated = true;
+    config.cache_warmer.enabled = false;
+    let state = AppState::open(config).await.unwrap();
+    assert_eq!(
+        push(
+            &state,
+            "tenant",
+            json!({"streams":[{
+                "stream":{"app":"api"},
+                "values":[
+                    ["1000000000","level=error msg=boom"],
+                    ["2000000000","{\"level\":\"warning\"}"],
+                    ["3000000000","GET /healthz",{"detected_level":"debug"}]
+                ]
+            }]})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    state.db.flush().await.unwrap();
+
+    let body = response_json(
+        query(
+            &state,
+            "/read/ns/tenant/loki/api/v1/query_range?query=%7Bapp%3D%22api%22%7D&start=0&end=4&direction=forward",
+        )
+        .await,
+    )
+    .await;
+    let streams = body["data"]["result"].as_array().unwrap();
+    let levels = streams
+        .iter()
+        .map(|stream| {
+            stream["stream"]["detected_level"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(levels, ["debug", "error", "warn"]);
+
+    let body = response_json(
+        query(
+            &state,
+            "/read/ns/tenant/loki/api/v1/query?query=sum%20by%20(detected_level)%20(count_over_time(%7Bapp%3D%22api%22%7D%20%7C%20detected_level%3D~%22error%7Cwarn%22%20%5B10s%5D))&time=4",
+        )
+        .await,
+    )
+    .await;
+    let mut counted = body["data"]["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|sample| {
+            (
+                sample["metric"]["detected_level"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                sample["value"][1].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    counted.sort();
+    assert_eq!(
+        counted,
+        [
+            ("error".to_owned(), "1".to_owned()),
+            ("warn".to_owned(), "1".to_owned())
+        ]
+    );
+    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]

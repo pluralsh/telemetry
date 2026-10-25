@@ -1721,13 +1721,13 @@ impl LogDb {
             .into_iter()
             .filter(|(_, labels)| filter.matches(labels))
             .collect::<Vec<_>>();
-        let countable = labelled.iter().all(|(_, labels)| {
-            read.metadata.fields(labels).is_none()
-                && !labels.iter().any(|label| is_error_label(&label.name))
-        });
-        if !countable {
+        let Some(levels) = labelled
+            .iter()
+            .map(|(_, labels)| summary_countable(read, labels))
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(None);
-        }
+        };
         let found = self
             .summaries_under(
                 period_stream_summary_prefix(namespace, period),
@@ -1737,9 +1737,10 @@ impl LogDb {
             )
             .await?;
         let mut streams = Vec::with_capacity(labelled.len());
-        for ((stream_id, labels), found) in labelled.into_iter().zip(found) {
+        for (((stream_id, labels), found), levels) in labelled.into_iter().zip(found).zip(levels) {
             match found {
                 Some(None) => return Ok(None),
+                Some(Some(buckets)) if levels && !levels_counted(&buckets) => return Ok(None),
                 Some(Some(buckets)) => streams.push(SegmentStream {
                     stream_id,
                     labels,
@@ -1748,6 +1749,7 @@ impl LogDb {
                         bucket_ns: summary.bucket_ns,
                         buckets,
                         split: Arc::new([]),
+                        levels,
                     }),
                 }),
                 None => {}
@@ -1777,19 +1779,21 @@ impl LogDb {
             let counted = labelled
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, labels))| {
-                    read.metadata.fields(labels).is_none()
-                        && !labels.iter().any(|label| is_error_label(&label.name))
+                .filter_map(|(index, (_, labels))| {
+                    summary_countable(&read, labels).map(|levels| (index, levels))
                 })
-                .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            let stream_ids = counted.iter().map(|&index| labelled[index].0).collect();
+            let stream_ids = counted
+                .iter()
+                .map(|&(index, _)| labelled[index].0)
+                .collect();
             let found = self
                 .stream_summaries(namespace, segment, &summary, stream_ids)
                 .await?;
-            for (index, found) in counted.into_iter().zip(found) {
+            for ((index, levels), found) in counted.into_iter().zip(found) {
                 match found {
                     Some(None) => continue,
+                    Some(Some(buckets)) if levels && !levels_counted(&buckets) => continue,
                     Some(Some(buckets)) => {
                         let (read, whole): (Vec<_>, Vec<_>) = buckets
                             .into_iter()
@@ -1800,6 +1804,7 @@ impl LogDb {
                             bucket_ns: summary.bucket_ns,
                             buckets: whole,
                             split: Arc::clone(&split),
+                            levels,
                         });
                         continue;
                     }
@@ -2275,6 +2280,36 @@ struct StreamCounts {
     /// Buckets a window boundary falls inside, ascending, whose rows are
     /// read from runs instead.
     split: Arc<[i64]>,
+    /// Whether samples carry their bucket's `detected_level`, as the read
+    /// needs it.
+    levels: bool,
+}
+
+/// Whether `read` can count a stream labelled `labels` from a summary:
+/// `Some(levels)` when it needs none of the stream's structured metadata
+/// but, with `levels`, its `detected_level`, by which summaries split
+/// buckets. A stream with an error label can fail, so is read in full.
+fn summary_countable(read: &SampleRead, labels: &Labels) -> Option<bool> {
+    if labels.iter().any(|label| is_error_label(&label.name)) {
+        return None;
+    }
+    match read.metadata.fields(labels) {
+        FieldSelection::None => Some(false),
+        FieldSelection::Only(fields)
+            if fields.len() == 1 && fields[0] == crate::level::DETECTED_LEVEL =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Whether every bucket of a summary counts its level, as a read that
+/// needs levels requires.
+fn levels_counted(buckets: &[SummaryBucket]) -> bool {
+    buckets
+        .iter()
+        .all(|bucket| bucket.level != crate::codec::UNCOUNTED_LEVEL)
 }
 
 impl StreamCounts {
@@ -2297,6 +2332,20 @@ impl StreamCounts {
         sink: &mut impl SampleSink,
     ) {
         let none = crate::Fields::default();
+        let levels = if self.levels {
+            crate::level::LEVELS
+                .iter()
+                .map(|level| {
+                    crate::Fields::new(vec![crate::Field::new(
+                        crate::level::DETECTED_LEVEL,
+                        *level,
+                    )])
+                    .expect("one field is canonical")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for bucket in &self.buckets {
             let first = bucket
                 .bucket
@@ -2306,10 +2355,22 @@ impl StreamCounts {
             if last < start || first > end {
                 continue;
             }
+            let metadata = match bucket.level {
+                code if self.levels && code != crate::codec::NO_LEVEL => {
+                    levels.get(usize::from(code) - 1).unwrap_or(&none)
+                }
+                _ => &none,
+            };
             let (mut rows, mut line_bytes) = (bucket.rows, bucket.line_bytes);
             while rows > 0 {
                 let part = u32::try_from(rows).unwrap_or(u32::MAX);
-                sink.sample(stream_id, labels, last.min(end), (part, line_bytes), &none);
+                sink.sample(
+                    stream_id,
+                    labels,
+                    last.min(end),
+                    (part, line_bytes),
+                    metadata,
+                );
                 rows -= u64::from(part);
                 line_bytes = 0;
             }
@@ -2712,10 +2773,14 @@ impl SegmentCounts {
     }
 }
 
-/// Deduplicated rows and line bytes per summary bucket of each stream.
+/// Rows and line bytes by summary bucket and level code.
+type LevelBuckets = BTreeMap<(i64, u8), (u64, u64)>;
+
+/// Deduplicated rows and line bytes per summary bucket and level of each
+/// stream; `None` for a stream with a level no code stands for.
 struct SummarySink {
     summary: SegmentSummary,
-    streams: HashMap<StreamId, BTreeMap<i64, (u64, u64)>>,
+    streams: HashMap<StreamId, Option<LevelBuckets>>,
 }
 
 impl SampleSink for SummarySink {
@@ -2725,13 +2790,25 @@ impl SampleSink for SummarySink {
         _: &Arc<Labels>,
         timestamp_ns: i64,
         (rows, line_bytes): (u32, u64),
-        _: &crate::Fields,
+        metadata: &crate::Fields,
     ) {
-        let bucket = self
+        let level = match metadata
+            .iter()
+            .find(|field| field.name == crate::level::DETECTED_LEVEL)
+        {
+            Some(field) => crate::level::code(&field.value),
+            None => Some(crate::codec::NO_LEVEL),
+        };
+        let stream = self
             .streams
             .entry(stream_id)
-            .or_default()
-            .entry(self.summary.bucket(timestamp_ns))
+            .or_insert_with(|| Some(BTreeMap::new()));
+        let (Some(level), Some(buckets)) = (level, stream.as_mut()) else {
+            *stream = None;
+            return;
+        };
+        let bucket = buckets
+            .entry((self.summary.bucket(timestamp_ns), level))
             .or_default();
         bucket.0 += u64::from(rows);
         bucket.1 += line_bytes;
@@ -3110,7 +3187,7 @@ impl LogDb {
         );
         let (first, last) = (summary.bucket(range.0), summary.bucket(range.1));
         let read = SampleRead {
-            metadata: MetadataNeeds::None,
+            metadata: MetadataNeeds::Names(vec![crate::level::DETECTED_LEVEL.to_owned()]),
             boundaries: vec![Boundaries {
                 first: first.saturating_add(1).saturating_mul(summary.bucket_ns),
                 step: summary.bucket_ns,
@@ -3150,15 +3227,18 @@ impl LogDb {
                 counts
                     .streams
                     .extend(sink.streams.into_iter().map(|(stream_id, buckets)| {
-                        let buckets = buckets
-                            .into_iter()
-                            .map(|(bucket, (rows, line_bytes))| SummaryBucket {
-                                bucket,
-                                rows,
-                                line_bytes,
-                            })
-                            .collect();
-                        (stream_id, Some(buckets))
+                        let buckets = buckets.map(|buckets| {
+                            buckets
+                                .into_iter()
+                                .map(|((bucket, level), (rows, line_bytes))| SummaryBucket {
+                                    bucket,
+                                    level,
+                                    rows,
+                                    line_bytes,
+                                })
+                                .collect()
+                        });
+                        (stream_id, buckets)
                     }));
             }
         }

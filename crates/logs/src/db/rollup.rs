@@ -24,6 +24,9 @@ const COPY_STREAMS: usize = 1;
 /// Rows per deterministic copy checkpoint. This is independent of physical
 /// objects and read coalescing, so source compaction cannot renumber a retry.
 const COPY_ROWS: usize = 1024;
+/// Checkpoint ordinal recording that every batch of a stream is copied, so a
+/// retry skips reading it again.
+const STREAM_COPIED: u64 = u64::MAX;
 const COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const COPY_PROGRESS_VERSION: u8 = 1;
 
@@ -219,6 +222,10 @@ impl LogDb {
                     "rollup copy step did not contain exactly one stream".to_owned(),
                 ));
             };
+            let copied = copy_progress_key(namespace, wide, segment, fingerprint, STREAM_COPIED);
+            if copy.copied.contains(&copied) {
+                continue;
+            }
             let budget = PageBudget::new(usize::MAX);
             let (sender, mut rows) = tokio::sync::mpsc::channel(1);
             let read = self.read_bounded_chunks(namespace, read, &budget, sender);
@@ -267,6 +274,20 @@ impl LogDb {
                 Ok::<_, Error>(())
             };
             tokio::try_join!(read, write)?;
+            // Applied after the stream's batches, so storage never holds it
+            // without them.
+            self.apply_groups_with_ops(
+                namespace,
+                StreamGroups::default(),
+                vec![RecordOp::put_with_ttl(
+                    copied.clone(),
+                    Bytes::new(),
+                    copy.ttl,
+                )],
+                Some(COPY_WRITE_TIMEOUT),
+            )
+            .await?;
+            copy.copied.insert(copied);
         }
         Ok(())
     }
@@ -900,6 +921,20 @@ mod tests {
         }
         db.flush_memtable().await.unwrap();
         assert_eq!(rows(&db).await, before);
+        // Each stream of each copied hour is stored as copied, so the retry
+        // skips reading it.
+        let stored = db.copy_progress(&namespace(), day()).await.unwrap();
+        for hour in 0..5 {
+            for service in ["api", "worker"] {
+                assert!(stored.contains(&copy_progress_key(
+                    &namespace(),
+                    day(),
+                    SegmentId::new(DAY + hour * HOUR, HOUR),
+                    &stream(service).fingerprint(),
+                    STREAM_COPIED,
+                )));
+            }
+        }
 
         assert_eq!(
             db.rollup_at(&RollupConfig::default(), after_delay())

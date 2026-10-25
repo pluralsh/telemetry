@@ -135,9 +135,16 @@ rollup:
   interval_seconds: 300 # How often closed windows and days are looked for.
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
 
-# How often writers summarize settled segments into per-minute row counts, which
-# metric queries that read no lines count from; 0 disables it.
+# How often writers summarize settled segments into per-minute row counts, split
+# by detected_level, which metric queries that read no lines, or filter only on
+# labels such as `| detected_level="error"`, count from; 0 disables it.
 summary_interval_seconds: 300
+
+# Give every pushed entry a detected_level structured metadata field (trace,
+# debug, info, warn, error, critical, fatal or unknown) unless it has one, as
+# Loki does: read from a level, lvl or severity label, field, JSON key or logfmt
+# pair, a klog header, or else the first level word in the line.
+discover_log_levels: true
 
 # Bytes of object blocks kept in memory across queries, with their bodies
 # decompressed once a query needs them; one budget shared by every storage

@@ -56,9 +56,14 @@ enum SummaryRecord {
 
 /// Leading byte of summary values.
 const SUMMARY_FORMAT: u8 = 1;
+/// Segment and period summaries whose stream summaries count rows per
+/// `detected_level`.
+const LEVELS_SUMMARY_FORMAT: u8 = 2;
 /// Stream summary flag: the stream's rows were not summarized, so reads
 /// list its runs.
 const UNSUMMARIZED: u8 = 1;
+/// Stream summary flag: each bucket is split by `detected_level`.
+const LEVEL_BUCKETS: u8 = 2;
 
 /// Records under [`rollup_prefix`]. The period's discovery catalog shares
 /// the prefix and starts with `CATALOG_RECORD_TYPE`, which none of these use.
@@ -675,6 +680,8 @@ pub(crate) struct SegmentSummary {
     pub generation: u64,
     pub expires_at_unix_ms: Option<u64>,
     pub bucket_ns: i64,
+    /// Whether its stream summaries split buckets by `detected_level`.
+    pub levels: bool,
 }
 
 impl SegmentSummary {
@@ -691,16 +698,25 @@ impl SegmentSummary {
     }
 }
 
-/// Deduplicated rows and line bytes of one stream in one summary bucket.
+/// Deduplicated rows and line bytes of one stream in one summary bucket,
+/// of one `detected_level` when the summary splits buckets by level.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SummaryBucket {
     pub bucket: i64,
+    /// [`crate::level::code`] of the rows' level, [`NO_LEVEL`] for rows
+    /// without one, or [`UNCOUNTED_LEVEL`] when levels were not counted.
+    pub level: u8,
     pub rows: u64,
     pub line_bytes: u64,
 }
 
-/// One stream's summary: its buckets in order, or `None` when its rows
-/// were not summarized.
+/// [`SummaryBucket::level`] of rows without a `detected_level`.
+pub(crate) const NO_LEVEL: u8 = 0;
+/// [`SummaryBucket::level`] of a summary that does not split by level.
+pub(crate) const UNCOUNTED_LEVEL: u8 = u8::MAX;
+
+/// One stream's summary: its buckets ordered by bucket and level, or
+/// `None` when its rows were not summarized.
 pub(crate) type StreamSummary = Option<Vec<SummaryBucket>>;
 
 fn summary_prefix(namespace: &Namespace, segment: SegmentId, record: SummaryRecord) -> BytesMut {
@@ -744,7 +760,7 @@ pub(crate) fn encode_segment_summary(summary: &SegmentSummary) -> Result<Bytes> 
         .filter(|bucket_ns| *bucket_ns > 0)
         .ok_or_else(|| Error::Invalid("summary buckets must have a width".to_owned()))?;
     let mut bytes = BytesMut::with_capacity(24);
-    bytes.put_u8(SUMMARY_FORMAT);
+    bytes.put_u8(summary_format(summary.levels));
     put_expiry(summary.expires_at_unix_ms, &mut bytes);
     var_u64::serialize(summary.generation, &mut bytes);
     var_u64::serialize(bucket_ns, &mut bytes);
@@ -752,7 +768,7 @@ pub(crate) fn encode_segment_summary(summary: &SegmentSummary) -> Result<Bytes> 
 }
 
 pub(crate) fn decode_segment_summary(bytes: &[u8]) -> Result<SegmentSummary> {
-    let mut buf = summary_body(bytes, "segment summary")?;
+    let (levels, mut buf) = versioned_summary_body(bytes, "segment summary")?;
     let expires_at_unix_ms = read_expiry(&mut buf)?;
     let generation = var_u64::deserialize(&mut buf)?;
     let bucket_ns = i64::try_from(var_u64::deserialize(&mut buf)?)
@@ -764,29 +780,40 @@ pub(crate) fn decode_segment_summary(bytes: &[u8]) -> Result<SegmentSummary> {
         generation,
         expires_at_unix_ms,
         bucket_ns,
+        levels,
     })
 }
 
 /// Buckets are delta-encoded from `first`, the bucket of the segment's
-/// first timestamp, and must be in strictly increasing order.
+/// first timestamp, and must be in strictly increasing order of bucket and
+/// level. Either every bucket has a counted level or none does.
 pub(crate) fn encode_stream_summary(summary: &StreamSummary, first: i64) -> Result<Bytes> {
     let Some(buckets) = summary else {
         return Ok(Bytes::from_static(&[SUMMARY_FORMAT, UNSUMMARIZED]));
     };
-    let mut bytes = BytesMut::with_capacity(8 + buckets.len() * 6);
+    let levels = buckets.iter().any(|bucket| bucket.level != UNCOUNTED_LEVEL);
+    if levels && buckets.iter().any(|bucket| bucket.level == UNCOUNTED_LEVEL) {
+        return Err(Error::Invalid(
+            "summary buckets must all count levels or none".to_owned(),
+        ));
+    }
+    let mut bytes = BytesMut::with_capacity(8 + buckets.len() * 7);
     bytes.put_u8(SUMMARY_FORMAT);
-    bytes.put_u8(0);
+    bytes.put_u8(if levels { LEVEL_BUCKETS } else { 0 });
     var_u32::serialize(value_len(buckets.len())?, &mut bytes);
-    let mut previous = first;
+    let mut previous = (first, 0);
     for (index, bucket) in buckets.iter().enumerate() {
         let delta = bucket
             .bucket
-            .checked_sub(previous)
+            .checked_sub(previous.0)
             .and_then(|delta| u64::try_from(delta).ok())
-            .filter(|delta| index == 0 || *delta > 0)
+            .filter(|delta| index == 0 || *delta > 0 || (levels && bucket.level > previous.1))
             .ok_or_else(|| Error::Invalid("summary buckets must be ordered".to_owned()))?;
-        previous = bucket.bucket;
+        previous = (bucket.bucket, bucket.level);
         var_u64::serialize(delta, &mut bytes);
+        if levels {
+            bytes.put_u8(bucket.level);
+        }
         var_u64::serialize(bucket.rows, &mut bytes);
         var_u64::serialize(bucket.line_bytes, &mut bytes);
     }
@@ -795,8 +822,9 @@ pub(crate) fn encode_stream_summary(summary: &StreamSummary, first: i64) -> Resu
 
 pub(crate) fn decode_stream_summary(bytes: &[u8], first: i64) -> Result<StreamSummary> {
     let mut buf = summary_body(bytes, "stream summary")?;
-    match read_u8(&mut buf)? {
-        0 => {}
+    let levels = match read_u8(&mut buf)? {
+        0 => false,
+        LEVEL_BUCKETS => true,
         UNSUMMARIZED => {
             ensure_consumed(buf, "stream summary")?;
             return Ok(None);
@@ -806,20 +834,27 @@ pub(crate) fn decode_stream_summary(bytes: &[u8], first: i64) -> Result<StreamSu
                 "stream summary has unknown flags {flags:#x}"
             )));
         }
-    }
+    };
     let count = var_u32::deserialize(&mut buf)? as usize;
     let mut buckets = Vec::with_capacity(count.min(buf.len()));
-    let mut bucket = first;
+    let (mut bucket, mut previous_level) = (first, 0);
     for index in 0..count {
-        let delta = i64::try_from(var_u64::deserialize(&mut buf)?)
-            .ok()
-            .filter(|delta| index == 0 || *delta > 0)
+        let delta = i64::try_from(var_u64::deserialize(&mut buf)?).ok();
+        let level = if levels {
+            read_u8(&mut buf)?
+        } else {
+            UNCOUNTED_LEVEL
+        };
+        let delta = delta
+            .filter(|delta| index == 0 || *delta > 0 || (levels && level > previous_level))
             .ok_or_else(|| Error::Corrupt("stream summary buckets are not ordered".to_owned()))?;
+        previous_level = level;
         bucket = bucket
             .checked_add(delta)
             .ok_or_else(|| Error::Corrupt("stream summary bucket overflows".to_owned()))?;
         buckets.push(SummaryBucket {
             bucket,
+            level,
             rows: var_u64::deserialize(&mut buf)?,
             line_bytes: var_u64::deserialize(&mut buf)?,
         });
@@ -836,6 +871,8 @@ pub(crate) struct PeriodSummary {
     pub segments: Vec<(SegmentId, u64)>,
     pub expires_at_unix_ms: Option<u64>,
     pub bucket_ns: i64,
+    /// As [`SegmentSummary::levels`], which every segment summed has.
+    pub levels: bool,
 }
 
 impl PeriodSummary {
@@ -896,7 +933,7 @@ pub(crate) fn encode_period_summary(summary: &PeriodSummary) -> Result<Bytes> {
         .filter(|bucket_ns| *bucket_ns > 0)
         .ok_or_else(|| Error::Invalid("summary buckets must have a width".to_owned()))?;
     let mut bytes = BytesMut::with_capacity(16 + summary.segments.len() * 20);
-    bytes.put_u8(SUMMARY_FORMAT);
+    bytes.put_u8(summary_format(summary.levels));
     put_expiry(summary.expires_at_unix_ms, &mut bytes);
     var_u64::serialize(bucket_ns, &mut bytes);
     var_u32::serialize(value_len(summary.segments.len())?, &mut bytes);
@@ -911,7 +948,7 @@ pub(crate) fn encode_period_summary(summary: &PeriodSummary) -> Result<Bytes> {
 }
 
 pub(crate) fn decode_period_summary(bytes: &[u8]) -> Result<PeriodSummary> {
-    let mut buf = summary_body(bytes, "period summary")?;
+    let (levels, mut buf) = versioned_summary_body(bytes, "period summary")?;
     let expires_at_unix_ms = read_expiry(&mut buf)?;
     let bucket_ns = i64::try_from(var_u64::deserialize(&mut buf)?)
         .ok()
@@ -936,14 +973,34 @@ pub(crate) fn decode_period_summary(bytes: &[u8]) -> Result<PeriodSummary> {
         segments,
         expires_at_unix_ms,
         bucket_ns,
+        levels,
     })
 }
 
 fn summary_body<'a>(bytes: &'a [u8], what: &str) -> Result<&'a [u8]> {
+    match versioned_summary_body(bytes, what)? {
+        (false, body) => Ok(body),
+        (true, _) => Err(Error::Corrupt(format!(
+            "unknown {what} format {LEVELS_SUMMARY_FORMAT}"
+        ))),
+    }
+}
+
+/// The body of a segment or period summary, and whether it counts levels.
+fn versioned_summary_body<'a>(bytes: &'a [u8], what: &str) -> Result<(bool, &'a [u8])> {
     match bytes.split_first() {
-        Some((&SUMMARY_FORMAT, body)) => Ok(body),
+        Some((&SUMMARY_FORMAT, body)) => Ok((false, body)),
+        Some((&LEVELS_SUMMARY_FORMAT, body)) => Ok((true, body)),
         Some((format, _)) => Err(Error::Corrupt(format!("unknown {what} format {format}"))),
         None => Err(Error::Corrupt(format!("empty {what}"))),
+    }
+}
+
+fn summary_format(levels: bool) -> u8 {
+    if levels {
+        LEVELS_SUMMARY_FORMAT
+    } else {
+        SUMMARY_FORMAT
     }
 }
 
@@ -1255,9 +1312,16 @@ mod tests {
             generation: 42,
             expires_at_unix_ms: Some(7),
             bucket_ns: 60_000_000_000,
+            levels: false,
         };
         let encoded = encode_segment_summary(&segment).unwrap();
         assert_eq!(decode_segment_summary(&encoded).unwrap(), segment);
+        let with_levels = SegmentSummary {
+            levels: true,
+            ..segment
+        };
+        let encoded = encode_segment_summary(&with_levels).unwrap();
+        assert_eq!(decode_segment_summary(&encoded).unwrap(), with_levels);
         assert_eq!(segment.bucket(0), -1);
         assert_eq!(segment.bucket(1), 0);
         assert_eq!(segment.bucket(60_000_000_000), 0);
@@ -1267,11 +1331,13 @@ mod tests {
         let buckets = vec![
             SummaryBucket {
                 bucket: first,
+                level: UNCOUNTED_LEVEL,
                 rows: 3,
                 line_bytes: 90,
             },
             SummaryBucket {
                 bucket: first + 59,
+                level: UNCOUNTED_LEVEL,
                 rows: u64::from(u32::MAX) + 1,
                 line_bytes: 0,
             },
@@ -1284,6 +1350,28 @@ mod tests {
 
         let unordered = Some(vec![buckets[1], buckets[0]]);
         assert!(encode_stream_summary(&unordered, first).is_err());
+
+        let level = |bucket, level, rows| SummaryBucket {
+            bucket,
+            level,
+            rows,
+            line_bytes: rows * 10,
+        };
+        let by_level = Some(vec![
+            level(first, NO_LEVEL, 1),
+            level(first, 3, 2),
+            level(first, 5, 4),
+            level(first + 2, 3, 8),
+        ]);
+        let encoded = encode_stream_summary(&by_level, first).unwrap();
+        assert_eq!(decode_stream_summary(&encoded, first).unwrap(), by_level);
+        let repeated = Some(vec![level(first, 3, 1), level(first, 3, 2)]);
+        assert!(encode_stream_summary(&repeated, first).is_err());
+        let mixed = Some(vec![
+            level(first, 3, 1),
+            level(first + 1, UNCOUNTED_LEVEL, 2),
+        ]);
+        assert!(encode_stream_summary(&mixed, first).is_err());
 
         let namespace = Namespace::new("tenant").unwrap();
         let prefix = stream_summary_prefix(&namespace, hour(HOUR_NS));

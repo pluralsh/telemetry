@@ -640,9 +640,12 @@ impl Serialize for StructuredMetadata<'_> {
 async fn write_batches(
     state: &AppState,
     namespace: String,
-    batches: Vec<LogBatch>,
+    mut batches: Vec<LogBatch>,
 ) -> Result<(), ApiError> {
     let namespace = Namespace::new(namespace).map_err(ApiError::bad_request)?;
+    if state.config.discover_log_levels {
+        plural_logs::level::add_detected_levels(&mut batches);
+    }
     state
         .route_write(&namespace, batches, ulid::Ulid::new().to_string())
         .await?;

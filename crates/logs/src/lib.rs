@@ -13,6 +13,7 @@ mod compaction;
 mod config;
 mod db;
 mod error;
+pub mod level;
 pub mod logql;
 mod memory;
 mod merge;
