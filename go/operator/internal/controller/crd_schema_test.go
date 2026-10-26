@@ -49,7 +49,7 @@ var _ = Describe("CRD schema", func() {
 		readBack func(client.Object) (writer, reader *corev1.PodTemplateSpec)
 	}{
 		{
-			kind: "Metrics",
+			kind: dataStoreMetrics,
 			object: func(name string) client.Object {
 				return &telemetryv1alpha1.Metrics{
 					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
@@ -63,7 +63,7 @@ var _ = Describe("CRD schema", func() {
 			},
 		},
 		{
-			kind: "Logs",
+			kind: dataStoreLogs,
 			object: func(name string) client.Object {
 				return &telemetryv1alpha1.Logs{
 					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
@@ -77,7 +77,7 @@ var _ = Describe("CRD schema", func() {
 			},
 		},
 		{
-			kind: "Traces",
+			kind: dataStoreTraces,
 			object: func(name string) client.Object {
 				return &telemetryv1alpha1.Traces{
 					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
