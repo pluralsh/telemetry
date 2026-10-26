@@ -104,6 +104,7 @@ rules:
 - apiGroups:
   - telemetry.plural.sh
   resources:
+  - bucketcleaners
   - logs
   - metrics
   - namespaceauthentications
@@ -120,6 +121,7 @@ rules:
 - apiGroups:
   - telemetry.plural.sh
   resources:
+  - bucketcleaners/finalizers
   - logs/finalizers
   - metrics/finalizers
   - namespaceauthentications/finalizers
@@ -130,6 +132,7 @@ rules:
 - apiGroups:
   - telemetry.plural.sh
   resources:
+  - bucketcleaners/status
   - logs/status
   - metrics/status
   - namespaceauthentications/status

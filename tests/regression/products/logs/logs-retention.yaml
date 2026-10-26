@@ -10,6 +10,7 @@ page:
   target_size_bytes: 4096
   max_rows: 32
   rows_per_block: 16
+discover_log_levels: false
 write: { flush_interval_seconds: 1 }
 auth: { unauthenticated: true }
 namespaces:

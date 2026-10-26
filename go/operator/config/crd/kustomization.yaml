@@ -8,6 +8,7 @@ resources:
 - bases/telemetry.plural.sh_pseudofs.yaml
 - bases/telemetry.plural.sh_namespaceauthentications.yaml
 - bases/telemetry.plural.sh_shardmaps.yaml
+- bases/telemetry.plural.sh_bucketcleaners.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

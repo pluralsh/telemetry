@@ -9,6 +9,7 @@
 Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API group.
 
 ### Resource Types
+- [BucketCleaner](#bucketcleaner)
 - [Logs](#logs)
 - [Metrics](#metrics)
 - [NamespaceAuthentication](#namespaceauthentication)
@@ -177,6 +178,45 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `username` _string_ |  |  | MinLength: 1 <br /> |
 | `passwordSecretKeyRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
+
+
+#### BucketCleaner
+
+
+
+BucketCleaner verifies the operator can reach an object-store prefix and
+deletes every object under it when the BucketCleaner is deleted.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `BucketCleaner` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[BucketCleanerSpec](#bucketcleanerspec)_ |  |  |  |
+
+
+#### BucketCleanerSpec
+
+
+
+BucketCleanerSpec defines the desired state of BucketCleaner.
+
+
+
+_Appears in:_
+- [BucketCleaner](#bucketcleaner)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `objectStore` _[ObjectStoreSpec](#objectstorespec)_ | ObjectStore is the bucket holding the tracked data, in the same form as<br />a datastore's spec.config.storage.objectStore. Credential Secrets are<br />read from the BucketCleaner's namespace by the operator itself; when<br />they are omitted the operator's own cloud identity is used. |  |  |
+| `subPath` _string_ | SubPath is the key prefix within the bucket, typically a datastore's<br />spec.config.storage.path. It is treated as a directory: "logs" covers<br />"logs/..." but not "logs-archive/...". Every object under it is deleted<br />when the BucketCleaner is deleted. |  | MinLength: 1 <br />Pattern: `[^/]` <br /> |
+| `checkIntervalSeconds` _integer_ | CheckIntervalSeconds is how often bucket access is re-verified. | 300 | Minimum: 10 <br /> |
+
+
 
 
 #### CacheSpec
@@ -795,6 +835,7 @@ _Appears in:_
 
 
 _Appears in:_
+- [BucketCleanerSpec](#bucketcleanerspec)
 - [StorageSpec](#storagespec)
 
 | Field | Description | Default | Validation |

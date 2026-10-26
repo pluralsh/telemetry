@@ -37,4 +37,7 @@ resources:
 - pseudofs_admin_role.yaml
 - pseudofs_editor_role.yaml
 - pseudofs_viewer_role.yaml
+- bucketcleaner_admin_role.yaml
+- bucketcleaner_editor_role.yaml
+- bucketcleaner_viewer_role.yaml
 

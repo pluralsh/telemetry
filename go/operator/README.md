@@ -121,6 +121,39 @@ directly, so the Ingress must not strip or rewrite it. Health, readiness, and
 metrics endpoints remain unprefixed and are not exposed by these routes.
 Disabling ingress deletes the operator-owned Ingress.
 
+A `BucketCleaner` ties an object-store prefix to a Kubernetes resource. It
+takes the same `objectStore` block as a datastore's `spec.config.storage`
+(`Aws`, `Azure`, or `Gcp`, including custom endpoints) and a `subPath`,
+usually that datastore's `spec.config.storage.path`:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: BucketCleaner
+metadata:
+  name: logs-data
+spec:
+  objectStore:
+    type: Aws
+    aws:
+      region: us-east-1
+      bucket: telemetry
+  subPath: logs
+```
+
+While it exists, the operator lists the prefix every `checkIntervalSeconds`
+(default 300) and reports the result in the `Ready` condition
+(`BucketAccessible` or `BucketInaccessible`). Deleting it deletes every object
+under `subPath/` before its finalizer is released; progress is reported as
+`Deleting` with `status.deletedObjects`, and errors as `DeletionFailed`.
+`subPath` is immutable. The operator itself talks to the bucket, so
+credential Secrets must live in the BucketCleaner's namespace, and when they
+are omitted the operator's own ServiceAccount identity (IRSA, workload
+identity, ADC) needs list and delete access to the bucket. Azure
+`workloadIdentity.tokenFile` must exist in the operator pod. If the
+credentials are gone for good, remove the
+`telemetry.plural.sh/bucket-cleaner` finalizer by hand to release the
+resource without deleting data.
+
 This module is part of the repository's `go/` workspace. The supported
 installation method is the published OCI Helm chart. The generated
 [CRD API reference](docs/api.md) documents the supported resources.

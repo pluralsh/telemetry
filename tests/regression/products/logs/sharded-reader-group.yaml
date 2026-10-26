@@ -18,6 +18,7 @@ page:
   max_rows: 128
   rows_per_block: 32
 compaction: { min_age_seconds: 1, finalize_after_seconds: 5, delete_delay_seconds: 30 }
+discover_log_levels: false
 write: { durability: durable, flush_interval_seconds: 1, remote_concurrency: 8, remote_retries: 3 }
 sharding:
   shards: 2

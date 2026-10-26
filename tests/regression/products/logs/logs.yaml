@@ -13,6 +13,8 @@ page:
   max_rows: 128
   rows_per_block: 32
 compaction: { min_age_seconds: 1, finalize_after_seconds: 5, delete_delay_seconds: 30 }
+# Loki runs with discover_log_levels off, so responses match only without it.
+discover_log_levels: false
 write: { flush_interval_seconds: 1 }
 auth: { unauthenticated: true }
 namespaces:

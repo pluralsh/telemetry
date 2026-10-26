@@ -20,6 +20,8 @@ storage:
 segment_duration_seconds: 3600
 retention_seconds: 86400
 page: { target_size_bytes: 1048576, max_rows: 8192, rows_per_block: 256 }
+# The production default is on; the Loki oracle runs with it off.
+discover_log_levels: false
 write:
   durability: applied
   flush_interval_seconds: 10
