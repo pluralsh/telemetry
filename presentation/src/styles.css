@@ -1,0 +1,289 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Palette mirrors site/app/globals.css (telemetry.plural.sh). */
+:root {
+  --bg: #fafafa;
+  --bg-subtle: #f2f3fb;
+  --panel: #ffffff;
+  --ink: #0e1015;
+  --fg: rgb(14 16 21 / 0.78);
+  --muted: #4f535c;
+  --faint: #8a8f99;
+  --line: rgb(14 16 21 / 0.1);
+  --line-strong: rgb(14 16 21 / 0.16);
+  --node: #ffffff;
+  --accent: #4a51f2;
+  --accent-hover: #3d44e6;
+  --accent-ring: rgb(74 81 242 / 0.3);
+  --accent-tint: rgb(74 81 242 / 0.08);
+  --accent-text: #4a51f2;
+  --code-inline: #eeeef4;
+  --logo-mark: #4a51f2;
+  --violet: #6e3fd9;
+  --warning: #b54708;
+  --danger: #c4320a;
+  --ok: #0b7c56;
+  --metrics: #6e3fd9;
+  --logs: #0b7c88;
+  --traces: #b54708;
+  --hatch: rgb(14 16 21 / 0.07);
+  --grain-opacity: 0.13;
+  --letterbox: #e9e9ec;
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #12131b;
+  --bg-subtle: #232538;
+  --panel: #191a25;
+  --ink: #ecedf7;
+  --fg: rgb(236 237 247 / 0.76);
+  --muted: #a3a6bd;
+  --faint: #6d7088;
+  --line: rgb(190 195 255 / 0.1);
+  --line-strong: rgb(190 195 255 / 0.18);
+  --node: #191a25;
+  --accent: #4a51f2;
+  --accent-hover: #5d63f4;
+  --accent-ring: rgb(158 163 255 / 0.32);
+  --accent-tint: rgb(74 81 242 / 0.16);
+  --accent-text: #9ea3ff;
+  --code-inline: #232538;
+  --logo-mark: #ecedf7;
+  --violet: #c9b6ff;
+  --warning: #f5c97a;
+  --danger: #ff8a65;
+  --ok: #5ee0b0;
+  --metrics: #c9b6ff;
+  --logs: #14d9d1;
+  --traces: #f5c97a;
+  --hatch: rgb(236 237 247 / 0.06);
+  --grain-opacity: 0.1;
+  --letterbox: #0b0c11;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-subtle: var(--bg-subtle);
+  --color-panel: var(--panel);
+  --color-ink: var(--ink);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-tint: var(--accent-tint);
+  --color-accent-text: var(--accent-text);
+  --color-metrics: var(--metrics);
+  --color-logs: var(--logs);
+  --color-traces: var(--traces);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+  --font-sans: "Articulat", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Newsreader", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+@font-face {
+  font-family: Articulat;
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  src: url("./fonts/Articulat-Normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: Articulat;
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+  src: url("./fonts/Articulat-NormalOblique.woff2") format("woff2");
+}
+@font-face {
+  font-family: Articulat;
+  font-weight: 500 700;
+  font-style: normal;
+  font-display: swap;
+  src: url("./fonts/Articulat-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 500 700;
+  font-display: swap;
+  src: url("./fonts/JetBrainsMono-Medium.woff2") format("woff2");
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+html {
+  background: var(--letterbox);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--font-sans);
+  letter-spacing: 0.01em;
+  font-synthesis-weight: none;
+  overflow: hidden;
+}
+
+b,
+strong {
+  font-weight: 500;
+}
+
+::selection {
+  background: var(--accent-tint);
+}
+
+.stage {
+  font-size: 28px;
+  line-height: 1.45;
+}
+
+/* Film grain shared with the docs and plural.sh. */
+.grain::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncG type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncB type='linear' slope='2.4' intercept='-0.7'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  opacity: var(--grain-opacity);
+}
+
+@layer components {
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    letter-spacing: 0;
+    color: var(--muted);
+  }
+
+  .label {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .hatch {
+    background-image: repeating-linear-gradient(-45deg, var(--hatch) 0 1px, transparent 1px 8px);
+  }
+
+  .node {
+    position: absolute;
+    z-index: 5;
+    width: 8px;
+    height: 8px;
+    transform: rotate(45deg);
+    border: 1px solid var(--line-strong);
+    background: var(--node);
+    pointer-events: none;
+  }
+
+  .btn {
+    display: inline-flex;
+    height: 36px;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0 0.75rem;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    user-select: none;
+  }
+  .btn-sm {
+    height: 30px;
+    font-size: 13px;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-secondary {
+    background: var(--panel);
+    color: var(--ink);
+    border-color: var(--line-strong);
+  }
+
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.05em 0.4em;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    background: var(--bg-subtle);
+    font-family: var(--font-mono);
+    font-size: 0.8em;
+    color: var(--muted);
+  }
+
+  .card {
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    background: var(--panel);
+  }
+
+  .leader {
+    flex: 1;
+    min-width: 1.5rem;
+    align-self: center;
+    height: 0;
+    border-bottom: 1px dotted color-mix(in srgb, var(--muted) 45%, transparent);
+    transform: translateY(3px);
+  }
+
+  .code {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+  }
+}
+
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+@keyframes dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+.flow-dash {
+  stroke-dasharray: 4 8;
+  animation: dash 1.2s linear infinite;
+}
+.static .flow-dash {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-dash {
+    animation: none;
+  }
+}
