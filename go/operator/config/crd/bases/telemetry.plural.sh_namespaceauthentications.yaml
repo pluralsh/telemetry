@@ -66,6 +66,7 @@ spec:
                     - Metrics
                     - Logs
                     - Traces
+                    - Vector
                     type: string
                   name:
                     minLength: 1
@@ -112,6 +113,7 @@ spec:
                   Ingested bytes for the namespace are buffered and periodically reported
                   to it. When several NamespaceAuthentications for the same datastore and
                   namespace set different endpoints, the lexicographically smallest wins.
+                  Vector doesn't report usage.
                 maxLength: 253
                 pattern: ^(http://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$
                 type: string
@@ -125,6 +127,9 @@ spec:
             - secretKeyRef
             - username
             type: object
+            x-kubernetes-validations:
+            - message: usageReportingEndpoint is not supported for Vector
+              rule: self.dataStoreRef.kind != 'Vector' || !has(self.usageReportingEndpoint)
           status:
             description: NamespaceAuthenticationStatus defines the observed state
               of NamespaceAuthentication.

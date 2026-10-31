@@ -1,0 +1,55 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Sharded Vector" };
+
+<PageHeader
+  title="Sharded"
+  lede="Several writers, each owning one shard of the namespace space, and a reader group per shard."
+/>
+
+## How it works
+
+Each writer owns exactly one active shard, a range of namespace ids, and serves it only while it holds the shard's Lease. Each writer added later takes half of an existing shard, through a SlateDB clone that copies no data. Readers run one group per shard. [Sharding and scaling](/vector/sharding/) animates how shards split over time.
+
+## Deploy
+
+Same as the [split](/vector/installation/read-write/), with more writers:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Vector
+metadata:
+  name: vector
+  namespace: telemetry
+spec:
+  mode: Sharded
+  config:
+    storage:
+      objectStore:
+        type: Aws
+        aws:
+          region: us-east-1
+          bucket: my-vector-bucket
+          accessKeyIDSecretRef: { name: vector-object-store, key: access-key-id }
+          secretAccessKeySecretRef: { name: vector-object-store, key: secret-access-key }
+  writer:
+    replicas: 3   # one shard per writer
+  reader:
+    replicas: 2   # replicas per reader group
+```
+
+Then add [credentials](/vector/installation/#access) and send requests to the `vector` Service.
+
+## What the operator runs
+
+| Resource | Name |
+| --- | --- |
+| Writers | the `vector-writer` StatefulSet |
+| Shard Leases | `vector-vector-shard-{id}`, plus the `vector-vector-coordinator` Lease that elects the writer managing the topology |
+| Readers | `vector-reader-{shard}` StatefulSets behind `vector-reader-{shard}-headless`; with `reader.readGroups.enabled: false`, one group serves every shard |
+| Entry point | the `vector` Service, over every writer and reader |
+
+## Scaling
+
+- **Writers:** raise `writer.replicas` at any time. Each new writer splits the widest shard. Lowering it is rejected: the StatefulSet keeps its replicas, and `Ready` reports `WriterScaleDownRejected`.
+- **Readers:** `reader.replicas` sets the replicas per group, or set `reader.autoscaling`. When a shard splits, the operator starts a group for each child and removes the parent's once they're ready.

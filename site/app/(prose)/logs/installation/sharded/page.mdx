@@ -1,0 +1,33 @@
+import { PageHeader } from "@/components/doc-page";
+import { InstallSpec, NextSteps, VerifyInstall } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Sharded Logs" };
+
+<PageHeader
+  title="Sharded"
+  lede="Several writers, each owning one storage shard, and a reader group per shard. Ingest scales with writers, queries with readers."
+/>
+
+## How it works
+
+Each writer holds the Lease on one storage shard. A entry routes to a shard by a hash of its namespace and stream labels, under the [routing epoch](/sharding/) in effect at its timestamp, and any writer accepts any entry and forwards it to the shard's owner. Each shard gets its own reader group, and a query fans out to every group and merges the results. Adding writers schedules a new epoch: new shards take data from the next aligned hour, and old data never moves.
+
+## Deploy
+
+A shared bucket is required: [grant S3 access](/logs/installation/#grant-s3-access) first. Hover a field to see what it does:
+
+<InstallSpec product="logs" mode="sharded" />
+
+Apply it with `kubectl apply -f logs.yaml`, then add [credentials](/logs/installation/#access) and [connect your tools](/logs/installation/#connect-your-tools). The operator rolls the pods whenever the spec changes.
+
+<VerifyInstall product="logs" />
+
+An empty `data` array is expected until the collector has sent something.
+
+## Scaling
+
+- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take writes from the next aligned hour. Existing data stays where it is, so scale-down is blocked until it expires.
+- **Readers:** `spec.reader.replicas` sets the replicas per reader group. Change it at any time, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
+- **Heavy queries:** raise `request.queryConcurrency` and `request.maxInFlightQueryBytes` together with reader memory.
+
+<NextSteps product="logs" links={["architecture", "api", "benchmarks"]} />

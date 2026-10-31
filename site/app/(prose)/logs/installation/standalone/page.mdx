@@ -1,0 +1,33 @@
+import { PageHeader } from "@/components/doc-page";
+import { InstallSpec, NextSteps, ToolEndpoints, VerifyInstall } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Standalone Logs" };
+
+<PageHeader
+  title="Standalone"
+  lede="One pod that ingests and queries, with its data on a persistent volume. Enough for development and small clusters."
+/>
+
+## Deploy
+
+`Standalone` is the default mode. With no object store configured, data lives on the pod's data volume. Hover a field to see what it does:
+
+<InstallSpec product="logs" mode="standalone" />
+
+Apply it with `kubectl apply -f logs.yaml`, then add [credentials](/logs/installation/#access). To keep the data in a bucket instead of on the volume, add `spec.config.storage.objectStore` as in the [split guide](/logs/installation/read-write/) and [grant S3 access](/logs/installation/#grant-s3-access).
+
+## Connect and verify
+
+Ingest and queries go to the one `logs` Service:
+
+<ToolEndpoints product="logs" standalone />
+
+<VerifyInstall product="logs" standalone />
+
+An empty `data` array is expected until the collector has sent something.
+
+## Limits
+
+The pod is a single point of failure: ingest and queries stop while it restarts. Its volume caps how much it can keep, and it can't add readers. When queries need more capacity, or the database must survive a pod restart, move to the [reader/writer split](/logs/installation/read-write/).
+
+<NextSteps product="logs" links={["read-write", "sharded"]} />

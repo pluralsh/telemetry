@@ -4,18 +4,20 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import { motion } from "motion/react";
-import { PRODUCTS, PRODUCT_IDS, spaceFromPath, type SpaceId } from "@/lib/nav";
+import { PRODUCTS, PRODUCT_IDS, VECTOR, spaceFromPath, type SpaceId } from "@/lib/nav";
 import { SpaceIcon } from "./icons";
 
 const SPACES: { id: SpaceId; label: string; blurb: string }[] = [
   { id: "overview", label: "Overview", blurb: "Project, install and concepts" },
   ...PRODUCT_IDS.map((id) => ({ id, label: PRODUCTS[id].name, blurb: `${PRODUCTS[id].peerLong}-compatible` })),
+  { id: "vector", label: VECTOR.name, blurb: "Vector and full-text search" },
 ];
 
 /** Keep the reader on the equivalent page when hopping between databases. */
 function targetHref(current: string, from: SpaceId, to: SpaceId) {
   if (to === "overview") return "/";
-  if (from === "overview") return `/${to}/`;
+  // The vector docs have a different page set from the telemetry databases.
+  if (from === "overview" || from === "vector" || to === "vector") return `/${to}/`;
   const rest = current.split("/").filter(Boolean).slice(1).join("/");
   return `/${to}/${rest ? rest + "/" : ""}`;
 }

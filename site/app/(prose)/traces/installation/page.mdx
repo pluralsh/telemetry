@@ -3,44 +3,38 @@ import { Callout } from "@/components/mdx-ui";
 import {
   AccessSpec,
   ClientConfigs,
-  InstallSpec,
   NextSteps,
   PasswordSecrets,
   PodIdentitySetup,
   ToolEndpoints,
-  VerifyInstall,
 } from "@/components/docs/product-blocks";
 
 export const metadata = { title: "Traces installation" };
 
 <PageHeader
   title="Installation"
-  lede="Run a Traces database on Kubernetes: grant it a bucket, declare it as a custom resource, and give each tenant namespace credentials."
+  lede="Run a Traces database on Kubernetes: pick a deployment mode, declare it as a custom resource, and give each tenant namespace credentials."
 />
 
 This guide assumes the operator is already installed; see [Installation](/installation/). Examples use the `telemetry` Kubernetes namespace and an S3 bucket named `acme-telemetry`.
 
+## Choose a mode
+
+| Mode | Pods | Storage | Use it for |
+| --- | --- | --- | --- |
+| [Standalone](/traces/installation/standalone/) | One pod that ingests and queries | A volume, or a bucket | Development and small clusters |
+| [Reader/writer split](/traces/installation/read-write/) | One writer, autoscaled readers | A shared bucket | Heavy query load on modest ingest |
+| [Sharded](/traces/installation/sharded/) | Several writers, a reader group per shard | A shared bucket | Ingest beyond one writer |
+
+The split and sharded modes are the same `Sharded` resource with one writer or several, so a split deployment grows into a sharded one by raising `spec.writer.replicas`.
+
 ## Grant S3 access
 
-Traces authenticates to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). The operator creates a ServiceAccount named after the database, `traces`, so associate an IAM role with it:
+Skip this for a standalone database on a volume. Otherwise Traces authenticates to S3 with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html). The operator creates a ServiceAccount named after the database, `traces`, so associate an IAM role with it:
 
 <PodIdentitySetup product="traces" />
 
 The role's trust policy must allow `pods.eks.amazonaws.com` to call `sts:AssumeRole` and `sts:TagSession`. No keys go in the spec.
-
-## Quick start
-
-A `Standalone` database is a single pod that ingests and queries, which is enough for development and small clusters. Every field not shown takes its default:
-
-<InstallSpec product="traces" variant="quickstart" />
-
-## Production
-
-A `Sharded` database runs writers and readers as separate StatefulSets. Hover a field, or its note, to see what it does:
-
-<InstallSpec product="traces" variant="production" />
-
-Apply it with `kubectl apply -f traces.yaml`. The operator renders the server config, then creates the ServiceAccount, StatefulSets, Services and Ingress. It rolls the pods whenever the spec changes.
 
 ## Access
 
@@ -56,11 +50,11 @@ Clients send these as HTTP basic auth.
 
 ## Connect your tools
 
-Writers serve ingest routes and readers serve queries. Inside the cluster:
+Writers serve ingest routes and readers serve queries. In the split and sharded modes, inside the cluster:
 
 <ToolEndpoints product="traces" />
 
-Any writer accepts any span and forwards each trace to its shard's owner, so the plain `traces-writer` ClusterIP Service is all a client needs. For an OTel Collector and Grafana:
+A standalone database serves both from the one `traces` Service. Any writer accepts any span and forwards each trace to its shard's owner, so the plain `traces-writer` Service is all a client needs. For an OTel Collector and Grafana:
 
 <ClientConfigs product="traces" />
 
@@ -68,14 +62,4 @@ Any writer accepts any span and forwards each trace to its shard's owner, so the
   Writer pods also listen for OTLP/gRPC on `4317` and Jaeger gRPC on `14250`, but the operator's Service exposes only HTTP and internal gRPC. Expose those ports with your own Service, and pass the tenant namespace in `x-scope-orgid` metadata alongside basic auth.
 </Callout>
 
-## Verify
-
-<VerifyInstall product="traces" />
-
-## Scaling
-
-- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take traces from the next aligned hour, by each trace's earliest span. Scale-down is blocked. See [epoch sharding](/sharding/).
-- **Readers:** each storage shard has its own reader group, and `spec.reader.replicas` sets the replicas per group. Change it at any time, since readers hold no state beyond their cache, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
-- **Large traces:** raise `request.maxSpansPerTrace` and reader memory together.
-
-<NextSteps product="traces" links={["architecture", "api", "benchmarks"]} />
+<NextSteps product="traces" links={["standalone", "read-write", "sharded"]} />

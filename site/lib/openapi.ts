@@ -1,8 +1,9 @@
 import "server-only";
 import fs from "node:fs";
 import path from "node:path";
-import type { ProductId } from "./nav";
+import type { ApiProduct } from "./nav";
 import { API_COPY, PARAM_COPY, TAG_COPY } from "./api-copy";
+import { VECTOR_API_COPY, VECTOR_PARAM_COPY, VECTOR_TAG_COPY } from "./vector-api";
 
 const DOCS_DIR = path.join(process.cwd(), "..", "documentation");
 
@@ -16,6 +17,7 @@ export type Schema = {
   additionalProperties?: Schema | boolean;
   oneOf?: Schema[];
   anyOf?: Schema[];
+  discriminator?: { propertyName: string; mapping?: Record<string, string> };
   enum?: unknown[];
   minimum?: number;
   $ref?: string;
@@ -46,8 +48,8 @@ export type Operation = {
   responses: { status: string; description: string; media: Media[] }[];
 };
 
-export type ApiSpec = {
-  product: ProductId;
+export type ApiSpec<P extends ApiProduct = ApiProduct> = {
+  product: P;
   title: string;
   description: string;
   version: string;
@@ -83,6 +85,12 @@ function resolve(schema: Schema | undefined, raw: RawSpec, depth = 0): Schema | 
   return out;
 }
 
+function copyFor(product: ApiProduct) {
+  return product === "vector"
+    ? { ops: VECTOR_API_COPY, params: VECTOR_PARAM_COPY, tags: VECTOR_TAG_COPY }
+    : { ops: API_COPY[product], params: PARAM_COPY[product], tags: TAG_COPY[product] };
+}
+
 function baseId(operationId: string) {
   return operationId.replace(/_(get|post)$/, "");
 }
@@ -96,19 +104,20 @@ function media(content: Record<string, { schema?: Schema }> | undefined, raw: Ra
   return Object.entries(content ?? {}).map(([type, m]) => ({ type, schema: resolve(m.schema, raw) }));
 }
 
-export function loadSpec(product: ProductId): ApiSpec {
+export function loadSpec<P extends ApiProduct>(product: P): ApiSpec<P> {
   const raw: RawSpec = JSON.parse(fs.readFileSync(path.join(DOCS_DIR, "openapi", `${product}.json`), "utf8"));
   const ops: Operation[] = [];
+  const copies = copyFor(product);
 
   for (const [p, methods] of Object.entries(raw.paths)) {
     for (const [method, op] of Object.entries(methods)) {
       if (typeof op !== "object" || !op.operationId) continue;
-      const copy = API_COPY[product]?.[baseId(op.operationId)];
+      const copy = copies.ops?.[baseId(op.operationId)];
       const params: Param[] = (op.parameters ?? []).map((x: any) => ({
         name: x.name,
         in: x.in,
         required: !!x.required || x.in === "path",
-        description: x.description ?? PARAM_COPY[product]?.[x.name],
+        description: x.description ?? copies.params?.[x.name],
         schema: resolve(x.schema, raw) ?? {},
       }));
       const methodUp = method.toUpperCase();
@@ -155,7 +164,7 @@ export function loadSpec(product: ProductId): ApiSpec {
   const tags = tagOrder
     .map((name) => ({
       name,
-      description: TAG_COPY[product]?.[name] ?? "",
+      description: copies.tags?.[name] ?? "",
       ops: ops.filter((o) => o.tag === name),
     }))
     .filter((t) => t.ops.length);

@@ -1,0 +1,1200 @@
+//! Serialization/deserialization for vector database storage.
+//!
+//! This module implements the key/value encoding scheme defined in RFC 0001.
+
+pub mod centroid_info;
+pub mod centroid_stats;
+pub mod centroids;
+pub mod collection_meta;
+pub(crate) mod deletions;
+pub(crate) mod field_stats;
+pub mod id_dictionary;
+pub mod key;
+pub mod metadata_index;
+pub mod posting_list;
+pub(crate) mod term_postings;
+pub(crate) mod term_stats;
+pub mod vector_bitmap;
+pub mod vector_data;
+pub(crate) mod vector_field_stats;
+pub(crate) mod vector_id;
+pub mod vector_index_data;
+
+use bytes::{BufMut, Bytes, BytesMut};
+
+// Re-export encoding utilities from common
+pub use common::serde::encoding::{
+    EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
+};
+use common::serde::record_tag::RecordTag;
+
+/// Length of the fixed key prefix `[subsystem | segment | version | tag]` that
+/// precedes the subsystem-defined suffix of every vector key.
+///
+/// RFC-0006 inserts the 1-byte segment id between the subsystem and version
+/// bytes (see [`Segment`]), growing the prefix from 3 to 4 bytes.
+pub const PREFIX_AND_TAG_LEN: usize = 4;
+
+/// Byte offsets within the fixed key prefix `[subsystem | segment | version | tag]`.
+const SUBSYSTEM_OFFSET: usize = 0;
+const SEGMENT_OFFSET: usize = 1;
+const VERSION_OFFSET: usize = 2;
+const TAG_OFFSET: usize = 3;
+
+/// Key format version (currently 0x01)
+pub const KEY_VERSION: u8 = 0x01;
+
+/// Subsystem byte for vector storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::VECTOR;
+
+/// Record type enumeration for vector database records.
+///
+/// Tag `0x0c` is reserved for `Deletions` and tags `0x0d`-`0x0f` are reserved
+/// for FTS records per RFC-0006. `VectorIndexData` and `CentroidSeqBlock` were
+/// moved out of that range to make room (storage compatibility is pre-1.0).
+///
+/// `FtsTerm` (`0x0d`) covers both `TermPostings` and `TermStats`; the two are
+/// disambiguated by the trailing discriminator byte in the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordType {
+    CollectionMeta = 0x01,
+    CentroidSeqBlock = 0x02,
+    VectorIndexData = 0x03,
+    PostingList = 0x04,
+    IdDictionary = 0x05,
+    VectorData = 0x06,
+    MetadataIndex = 0x07,
+    SeqBlock = 0x08,
+    CentroidStats = 0x09,
+    Centroids = 0x0A,
+    CentroidInfo = 0x0B,
+    /// FTS deletions bitmap — singleton RoaringTreemap of deleted vector ids.
+    Deletions = 0x0C,
+    /// FTS term postings or term stats (discriminated by trailing key byte).
+    FtsTerm = 0x0D,
+    /// FTS per-vector field length stats.
+    FtsVectorFieldStats = 0x0E,
+    /// FTS per-field corpus stats.
+    FtsFieldStats = 0x0F,
+}
+
+impl RecordType {
+    /// Returns the ID of this record type.
+    pub fn id(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Converts a u8 id back to a RecordType.
+    pub fn from_id(id: u8) -> Result<Self, EncodingError> {
+        match id {
+            0x01 => Ok(RecordType::CollectionMeta),
+            0x02 => Ok(RecordType::CentroidSeqBlock),
+            0x03 => Ok(RecordType::VectorIndexData),
+            0x04 => Ok(RecordType::PostingList),
+            0x05 => Ok(RecordType::IdDictionary),
+            0x06 => Ok(RecordType::VectorData),
+            0x07 => Ok(RecordType::MetadataIndex),
+            0x08 => Ok(RecordType::SeqBlock),
+            0x09 => Ok(RecordType::CentroidStats),
+            0x0A => Ok(RecordType::Centroids),
+            0x0B => Ok(RecordType::CentroidInfo),
+            0x0C => Ok(RecordType::Deletions),
+            0x0D => Ok(RecordType::FtsTerm),
+            0x0E => Ok(RecordType::FtsVectorFieldStats),
+            0x0F => Ok(RecordType::FtsFieldStats),
+            _ => Err(EncodingError {
+                message: format!("Invalid record type: 0x{:02x}", id),
+            }),
+        }
+    }
+
+    /// Decodes the record type from the tag byte that follows the
+    /// `[subsystem | segment | version]` prefix bytes in a vector key.
+    pub fn from_tag_byte(byte: u8) -> Result<Self, EncodingError> {
+        let tag = RecordTag::from_byte(byte)?;
+        RecordType::from_id(tag.record_type())
+    }
+
+    /// Creates a RecordTag for this record type (reserved bits = 0).
+    pub fn tag(&self) -> RecordTag {
+        RecordTag::new(self.id(), 0)
+    }
+
+    /// Returns the storage [`Segment`] this record type lives in (RFC-0006).
+    ///
+    /// The segment is encoded as the second byte of every vector key so the
+    /// SlateDB segment extractor can route each segment's records into a
+    /// dedicated SlateDB segment.
+    pub fn segment(&self) -> Segment {
+        match self {
+            RecordType::CollectionMeta
+            | RecordType::VectorIndexData
+            | RecordType::IdDictionary
+            | RecordType::VectorData
+            | RecordType::MetadataIndex
+            | RecordType::SeqBlock => Segment::Default,
+            RecordType::CentroidSeqBlock
+            | RecordType::PostingList
+            | RecordType::CentroidStats
+            | RecordType::Centroids
+            | RecordType::CentroidInfo => Segment::Ann,
+            RecordType::Deletions
+            | RecordType::FtsTerm
+            | RecordType::FtsVectorFieldStats
+            | RecordType::FtsFieldStats => Segment::Fts,
+        }
+    }
+
+    /// Writes the 4-byte vector record prefix `[subsystem | segment | version | tag]`.
+    ///
+    /// RFC-0006 places the 1-byte segment id between the subsystem and version
+    /// bytes so all record types within a segment share a common routing prefix.
+    pub fn write_prefix(&self, buf: &mut BytesMut) {
+        buf.put_u8(SUBSYSTEM);
+        buf.put_u8(self.segment().as_byte());
+        buf.put_u8(KEY_VERSION);
+        buf.put_u8(self.tag().as_byte());
+    }
+
+    /// Encodes the 4-byte vector record prefix into a fresh `Bytes`.
+    pub fn encode_prefix(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
+        self.write_prefix(&mut buf);
+        buf.freeze()
+    }
+}
+
+/// Reads the record tag byte from a vector key, validating the subsystem,
+/// version, and segment bytes that precede it.
+///
+/// The key layout is `[subsystem | segment | version | tag | ...]` (RFC-0006).
+/// The segment id is redundant with the record type, but we validate that the
+/// two agree to catch mis-routed or corrupt keys early.
+pub fn parse_record_tag(buf: &[u8]) -> Result<RecordTag, EncodingError> {
+    if buf.len() < PREFIX_AND_TAG_LEN {
+        return Err(EncodingError {
+            message: "Buffer too short for record tag".to_string(),
+        });
+    }
+    if buf[SUBSYSTEM_OFFSET] != SUBSYSTEM {
+        return Err(EncodingError {
+            message: format!(
+                "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                SUBSYSTEM, buf[SUBSYSTEM_OFFSET]
+            ),
+        });
+    }
+    if buf[VERSION_OFFSET] != KEY_VERSION {
+        return Err(EncodingError {
+            message: format!(
+                "invalid key version: expected 0x{:02x}, got 0x{:02x}",
+                KEY_VERSION, buf[VERSION_OFFSET]
+            ),
+        });
+    }
+    let tag = RecordTag::from_byte(buf[TAG_OFFSET])?;
+    let record_type = RecordType::from_id(tag.record_type())?;
+    let segment = Segment::from_byte(buf[SEGMENT_OFFSET])?;
+    if segment != record_type.segment() {
+        return Err(EncodingError {
+            message: format!(
+                "segment mismatch for {:?}: key has {:?}, expected {:?}",
+                record_type,
+                segment,
+                record_type.segment()
+            ),
+        });
+    }
+    Ok(tag)
+}
+
+/// Logical storage segment for a vector record (RFC-0006 segmentation).
+///
+/// The segment id is encoded as the second byte of every vector key
+/// (`[subsystem | segment | version | tag | ...]`). The SlateDB segment
+/// extractor routes each segment's records into its own SlateDB segment, which
+/// lets the FTS segment be compacted aggressively (to apply accumulated
+/// deletes) without rewriting the ANN or default-segment data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Segment {
+    /// Singletons, the forward index, and the metadata (inverted) index.
+    Default = 0x00,
+    /// ANN posting lists and the centroid tree.
+    Ann = 0x01,
+    /// Full-text-search postings, statistics, and the deletions bitmap.
+    Fts = 0x02,
+}
+
+impl Segment {
+    /// Returns the on-disk segment id byte.
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Decodes a segment id byte.
+    pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
+        match byte {
+            0x00 => Ok(Segment::Default),
+            0x01 => Ok(Segment::Ann),
+            0x02 => Ok(Segment::Fts),
+            _ => Err(EncodingError {
+                message: format!("Invalid segment id: 0x{:02x}", byte),
+            }),
+        }
+    }
+}
+
+/// Trait for record keys that have a record type.
+pub trait RecordKey {
+    const RECORD_TYPE: RecordType;
+}
+
+/// Type discriminant for metadata field values.
+///
+/// Used in:
+/// - `CollectionMeta`: Defines the schema type for each metadata field
+/// - `FieldValue`: Tags the variant in serialized form
+/// - `MetadataIndexKey`: Identifies the value type in index keys
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum FieldType {
+    String = 0,
+    Int64 = 1,
+    Float64 = 2,
+    Bool = 3,
+    /// Full-text-searchable string. Stored as `AttributeValue::String`, always
+    /// indexed for BM25 regardless of `indexed` flag (RFC-0006).
+    Text = 4,
+    /// Array of strings. Each element is indexed separately in the metadata
+    /// index, so `Eq`/`In`/`Contains` filters match on any element.
+    StringArray = 5,
+    /// Array of 64-bit integers, indexed per element like `StringArray`.
+    Int64Array = 6,
+    /// Vector type (tag 255) - used internally to store vectors as a special field.
+    /// Not valid in collection metadata schemas.
+    Vector = 255,
+}
+
+impl FieldType {
+    pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
+        match byte {
+            0 => Ok(FieldType::String),
+            1 => Ok(FieldType::Int64),
+            2 => Ok(FieldType::Float64),
+            3 => Ok(FieldType::Bool),
+            4 => Ok(FieldType::Text),
+            5 => Ok(FieldType::StringArray),
+            6 => Ok(FieldType::Int64Array),
+            255 => Ok(FieldType::Vector),
+            _ => Err(EncodingError {
+                message: format!("Invalid field type: {}", byte),
+            }),
+        }
+    }
+}
+
+/// A metadata field value (tagged union).
+///
+/// Used in:
+/// - `VectorData`: Stores actual metadata values for each vector
+/// - `MetadataIndexKey`: Encodes values in index keys for filtering
+///
+/// ## Encoding
+///
+/// This type has two encoding modes:
+/// - **Value encoding** (via `Encode`/`Decode` traits): Little-endian, used in `VectorData`
+/// - **Sortable encoding** (via `encode_sortable`/`decode_sortable`): Big-endian with
+///   sign-bit transformations, used in `MetadataIndexKey` for correct lexicographic ordering
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    String(String),
+    Int64(i64),
+    Float64(f64),
+    Bool(bool),
+    /// Array of strings - Not valid in metadata index keys (elements are
+    /// indexed individually).
+    StringArray(Vec<String>),
+    /// Array of integers - Not valid in metadata index keys (elements are
+    /// indexed individually).
+    Int64Array(Vec<i64>),
+    /// Vector value - Not valid in metadata index keys.
+    Vector(Vec<f32>),
+}
+
+impl FieldValue {
+    /// Returns the type discriminant for this value.
+    pub fn field_type(&self) -> FieldType {
+        match self {
+            FieldValue::String(_) => FieldType::String,
+            FieldValue::Int64(_) => FieldType::Int64,
+            FieldValue::Float64(_) => FieldType::Float64,
+            FieldValue::Bool(_) => FieldType::Bool,
+            FieldValue::StringArray(_) => FieldType::StringArray,
+            FieldValue::Int64Array(_) => FieldType::Int64Array,
+            FieldValue::Vector(_) => FieldType::Vector,
+        }
+    }
+
+    /// The scalar values this value contributes to the metadata index: the
+    /// value itself for scalars, each element for arrays, nothing for vectors.
+    pub fn index_terms(&self) -> Vec<FieldValue> {
+        match self {
+            FieldValue::String(_)
+            | FieldValue::Int64(_)
+            | FieldValue::Float64(_)
+            | FieldValue::Bool(_) => vec![self.clone()],
+            FieldValue::StringArray(values) => {
+                let mut values = values.clone();
+                values.sort();
+                values.dedup();
+                values.into_iter().map(FieldValue::String).collect()
+            }
+            FieldValue::Int64Array(values) => {
+                let mut values = values.clone();
+                values.sort_unstable();
+                values.dedup();
+                values.into_iter().map(FieldValue::Int64).collect()
+            }
+            FieldValue::Vector(_) => Vec::new(),
+        }
+    }
+
+    /// Encode the field value for use in keys (sortable encoding).
+    ///
+    /// Uses big-endian sortable encodings for numeric types:
+    /// - Int64: XOR with sign bit to make negative numbers sort before positive
+    /// - Float64: IEEE 754 sortable encoding
+    ///
+    /// This encoding preserves lexicographic ordering in keys:
+    /// - Strings: Natural byte ordering via TerminatedBytes
+    /// - Integers: -100 < 0 < 100
+    /// - Floats: -1.0 < 0.0 < 1.0
+    /// - Bools: false < true
+    ///
+    /// # Panics
+    /// Panics if called on a `Vector` variant since vectors should not appear in index keys.
+    pub fn encode_sortable(&self, buf: &mut BytesMut) {
+        use bytes::BufMut;
+        use common::serde::sortable::{encode_f64_sortable, encode_i64_sortable};
+        use common::serde::terminated_bytes;
+
+        match self {
+            FieldValue::String(s) => {
+                buf.put_u8(FieldType::String as u8);
+                terminated_bytes::serialize(s.as_bytes(), buf);
+            }
+            FieldValue::Int64(v) => {
+                buf.put_u8(FieldType::Int64 as u8);
+                buf.put_u64(encode_i64_sortable(*v));
+            }
+            FieldValue::Float64(v) => {
+                buf.put_u8(FieldType::Float64 as u8);
+                buf.put_u64(encode_f64_sortable(*v));
+            }
+            FieldValue::Bool(v) => {
+                buf.put_u8(FieldType::Bool as u8);
+                buf.put_u8(if *v { 1 } else { 0 });
+            }
+            FieldValue::StringArray(_) | FieldValue::Int64Array(_) => {
+                panic!("Array values cannot be used in sortable key encoding")
+            }
+            FieldValue::Vector(_) => {
+                panic!("Vector values cannot be used in sortable key encoding")
+            }
+        }
+    }
+
+    /// Decode a field value from sortable key encoding.
+    ///
+    /// # Errors
+    /// Returns an error if the buffer is too short or contains invalid data.
+    /// Also returns an error for `Vector` type since vectors should not appear in index keys.
+    pub fn decode_sortable(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        use common::serde::sortable::{decode_f64_sortable, decode_i64_sortable};
+        use common::serde::terminated_bytes;
+
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: "Buffer too short for FieldValue type".to_string(),
+            });
+        }
+
+        let field_type = FieldType::from_byte(buf[0])?;
+        *buf = &buf[1..];
+
+        match field_type {
+            FieldType::String => {
+                let bytes = terminated_bytes::deserialize(buf).map_err(|e| EncodingError {
+                    message: format!("Failed to decode string value: {}", e),
+                })?;
+                let s = String::from_utf8(bytes.to_vec()).map_err(|e| EncodingError {
+                    message: format!("Invalid UTF-8 in string value: {}", e),
+                })?;
+                Ok(FieldValue::String(s))
+            }
+            FieldType::Int64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Int64 value".to_string(),
+                    });
+                }
+                let sortable = u64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Int64(decode_i64_sortable(sortable)))
+            }
+            FieldType::Float64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Float64 value".to_string(),
+                    });
+                }
+                let sortable = u64::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Float64(decode_f64_sortable(sortable)))
+            }
+            FieldType::Bool => {
+                if buf.is_empty() {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Bool value".to_string(),
+                    });
+                }
+                let value = buf[0] != 0;
+                *buf = &buf[1..];
+                Ok(FieldValue::Bool(value))
+            }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
+            FieldType::StringArray | FieldType::Int64Array => Err(EncodingError {
+                message: "Array values cannot be used in sortable key encoding".to_string(),
+            }),
+            FieldType::Vector => Err(EncodingError {
+                message: "Vector values cannot be used in sortable key encoding".to_string(),
+            }),
+        }
+    }
+}
+
+fn encode_string_array(values: &[String], buf: &mut BytesMut) {
+    if values.len() > u16::MAX as usize {
+        panic!("Array too long: {} items", values.len());
+    }
+    buf.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    for value in values {
+        encode_utf8(value, buf);
+    }
+}
+
+fn encode_int64_array(values: &[i64], buf: &mut BytesMut) {
+    if values.len() > u16::MAX as usize {
+        panic!("Array too long: {} items", values.len());
+    }
+    buf.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    for value in values {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn decode_array_len(buf: &mut &[u8]) -> Result<usize, EncodingError> {
+    if buf.len() < 2 {
+        return Err(EncodingError {
+            message: "Buffer too short for array count".to_string(),
+        });
+    }
+    let count = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    *buf = &buf[2..];
+    Ok(count)
+}
+
+fn decode_string_array(buf: &mut &[u8]) -> Result<Vec<String>, EncodingError> {
+    let count = decode_array_len(buf)?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(decode_utf8(buf)?);
+    }
+    Ok(values)
+}
+
+fn decode_int64_array(buf: &mut &[u8]) -> Result<Vec<i64>, EncodingError> {
+    let count = decode_array_len(buf)?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(i64::decode(buf)?);
+    }
+    Ok(values)
+}
+
+/// Trait for types that can be encoded to bytes.
+pub trait Encode {
+    fn encode(&self, buf: &mut BytesMut);
+}
+
+/// Trait for types that can be decoded from bytes.
+pub trait Decode: Sized {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError>;
+}
+
+/// Encode an array of encodable items.
+///
+/// Format: `count: u16` (little-endian) + `count` serialized elements
+pub fn encode_array<T: Encode>(items: &[T], buf: &mut BytesMut) {
+    let count = items.len();
+    if count > u16::MAX as usize {
+        panic!("Array too long: {} items", count);
+    }
+    buf.extend_from_slice(&(count as u16).to_le_bytes());
+    for item in items {
+        item.encode(buf);
+    }
+}
+
+/// Decode an array of decodable items.
+///
+/// Format: `count: u16` (little-endian) + `count` serialized elements
+pub fn decode_array<T: Decode>(buf: &mut &[u8]) -> Result<Vec<T>, EncodingError> {
+    if buf.len() < 2 {
+        return Err(EncodingError {
+            message: "Buffer too short for array count".to_string(),
+        });
+    }
+    let count = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    *buf = &buf[2..];
+
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(T::decode(buf)?);
+    }
+    Ok(items)
+}
+
+/// Encode a fixed-element array (no count prefix).
+///
+/// Format: Serialized elements back-to-back with no additional padding
+pub fn encode_fixed_element_array<T: Encode>(items: &[T], buf: &mut BytesMut) {
+    for item in items {
+        item.encode(buf);
+    }
+}
+
+/// Decode a fixed-element array (no count prefix).
+///
+/// The number of elements is computed by dividing the buffer length by the element size.
+/// This function validates that the buffer length is divisible by the element size.
+pub fn decode_fixed_element_array<T: Decode>(
+    buf: &mut &[u8],
+    element_size: usize,
+) -> Result<Vec<T>, EncodingError> {
+    if !buf.len().is_multiple_of(element_size) {
+        return Err(EncodingError {
+            message: format!(
+                "Buffer length {} is not divisible by element size {}",
+                buf.len(),
+                element_size
+            ),
+        });
+    }
+
+    let count = buf.len() / element_size;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(T::decode(buf)?);
+    }
+    Ok(items)
+}
+
+/// Append `values` as little-endian `f32`s (no count prefix).
+///
+/// Byte-identical to [`encode_fixed_element_array`] over `f32`, but a single
+/// copy on little-endian hosts instead of one bounds-checked push per element.
+pub fn encode_f32_array(values: &[f32], buf: &mut BytesMut) {
+    #[cfg(target_endian = "little")]
+    buf.extend_from_slice(bytemuck::cast_slice(values));
+    #[cfg(not(target_endian = "little"))]
+    {
+        buf.reserve(values.len() * 4);
+        for value in values {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+/// Decode a buffer of little-endian `f32`s (no count prefix), preserving
+/// every bit pattern including NaN payloads.
+pub fn decode_f32_array(bytes: &[u8]) -> Result<Vec<f32>, EncodingError> {
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(EncodingError {
+            message: format!(
+                "Buffer length {} is not divisible by element size 4",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+// Implement Encode/Decode for primitive types
+
+impl Encode for f32 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for f32 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for f32".to_string(),
+            });
+        }
+        let value = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        *buf = &buf[4..];
+        Ok(value)
+    }
+}
+
+impl Encode for u8 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&[*self]);
+    }
+}
+
+impl Decode for u8 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: "Buffer too short for u8".to_string(),
+            });
+        }
+        let value = buf[0];
+        *buf = &buf[1..];
+        Ok(value)
+    }
+}
+
+impl Encode for u16 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for u16 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 2 {
+            return Err(EncodingError {
+                message: "Buffer too short for u16".to_string(),
+            });
+        }
+        let value = u16::from_le_bytes([buf[0], buf[1]]);
+        *buf = &buf[2..];
+        Ok(value)
+    }
+}
+
+impl Encode for u32 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for u32 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 4 {
+            return Err(EncodingError {
+                message: "Buffer too short for u32".to_string(),
+            });
+        }
+        let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        *buf = &buf[4..];
+        Ok(value)
+    }
+}
+
+impl Encode for u64 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for u64 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 8 {
+            return Err(EncodingError {
+                message: "Buffer too short for u64".to_string(),
+            });
+        }
+        let value = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        *buf = &buf[8..];
+        Ok(value)
+    }
+}
+
+impl Encode for i64 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for i64 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 8 {
+            return Err(EncodingError {
+                message: "Buffer too short for i64".to_string(),
+            });
+        }
+        let value = i64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        *buf = &buf[8..];
+        Ok(value)
+    }
+}
+
+impl Encode for f64 {
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for f64 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < 8 {
+            return Err(EncodingError {
+                message: "Buffer too short for f64".to_string(),
+            });
+        }
+        let value = f64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        *buf = &buf[8..];
+        Ok(value)
+    }
+}
+
+/// Encode implementation for FieldValue (value encoding, little-endian).
+///
+/// This is used in `VectorData` for storing metadata and vector values.
+impl Encode for FieldValue {
+    fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            FieldValue::String(s) => {
+                buf.extend_from_slice(&[FieldType::String as u8]);
+                encode_utf8(s, buf);
+            }
+            FieldValue::Int64(v) => {
+                buf.extend_from_slice(&[FieldType::Int64 as u8]);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            FieldValue::Float64(v) => {
+                buf.extend_from_slice(&[FieldType::Float64 as u8]);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            FieldValue::Bool(v) => {
+                buf.extend_from_slice(&[FieldType::Bool as u8]);
+                buf.extend_from_slice(&[if *v { 1 } else { 0 }]);
+            }
+            FieldValue::StringArray(v) => {
+                buf.extend_from_slice(&[FieldType::StringArray as u8]);
+                encode_string_array(v, buf);
+            }
+            FieldValue::Int64Array(v) => {
+                buf.extend_from_slice(&[FieldType::Int64Array as u8]);
+                encode_int64_array(v, buf);
+            }
+            FieldValue::Vector(v) => {
+                buf.extend_from_slice(&[FieldType::Vector as u8]);
+                encode_f32_array(v, buf);
+            }
+        }
+    }
+}
+
+/// Decode implementation for FieldValue (value encoding, little-endian).
+///
+/// Note: For `Vector` type, this implementation requires the dimensions to be known.
+/// Use `FieldValue::decode_with_dimensions` when decoding from VectorData records.
+impl Decode for FieldValue {
+    fn decode(buf: &mut &[u8]) -> Result<Self, EncodingError> {
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: "Buffer too short for FieldValue type".to_string(),
+            });
+        }
+
+        let field_type = FieldType::from_byte(buf[0])?;
+        *buf = &buf[1..];
+
+        match field_type {
+            FieldType::String => {
+                let s = decode_utf8(buf)?;
+                Ok(FieldValue::String(s))
+            }
+            FieldType::Int64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Int64 value".to_string(),
+                    });
+                }
+                let v = i64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Int64(v))
+            }
+            FieldType::Float64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Float64 value".to_string(),
+                    });
+                }
+                let v = f64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Float64(v))
+            }
+            FieldType::Bool => {
+                if buf.is_empty() {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Bool value".to_string(),
+                    });
+                }
+                let v = buf[0] != 0;
+                *buf = &buf[1..];
+                Ok(FieldValue::Bool(v))
+            }
+            FieldType::StringArray => Ok(FieldValue::StringArray(decode_string_array(buf)?)),
+            FieldType::Int64Array => Ok(FieldValue::Int64Array(decode_int64_array(buf)?)),
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
+            FieldType::Vector => Err(EncodingError {
+                message: "Vector type requires dimensions context; use decode_with_dimensions"
+                    .to_string(),
+            }),
+        }
+    }
+}
+
+impl From<crate::model::AttributeValue> for FieldValue {
+    fn from(attr: crate::model::AttributeValue) -> Self {
+        match attr {
+            crate::model::AttributeValue::String(s) => FieldValue::String(s),
+            crate::model::AttributeValue::Int64(v) => FieldValue::Int64(v),
+            crate::model::AttributeValue::Float64(v) => FieldValue::Float64(v),
+            crate::model::AttributeValue::Bool(v) => FieldValue::Bool(v),
+            crate::model::AttributeValue::StringArray(v) => FieldValue::StringArray(v),
+            crate::model::AttributeValue::Int64Array(v) => FieldValue::Int64Array(v),
+            crate::model::AttributeValue::Vector(v) => FieldValue::Vector(v),
+        }
+    }
+}
+
+impl FieldValue {
+    /// Decode a FieldValue that may be a Vector, using the provided dimensions.
+    ///
+    /// This is used when decoding VectorData records where vectors are stored as fields.
+    pub fn decode_with_dimensions(
+        buf: &mut &[u8],
+        dimensions: usize,
+    ) -> Result<Self, EncodingError> {
+        if buf.is_empty() {
+            return Err(EncodingError {
+                message: "Buffer too short for FieldValue type".to_string(),
+            });
+        }
+
+        let field_type = FieldType::from_byte(buf[0])?;
+        *buf = &buf[1..];
+
+        match field_type {
+            FieldType::String => {
+                let s = decode_utf8(buf)?;
+                Ok(FieldValue::String(s))
+            }
+            FieldType::Int64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Int64 value".to_string(),
+                    });
+                }
+                let v = i64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Int64(v))
+            }
+            FieldType::Float64 => {
+                if buf.len() < 8 {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Float64 value".to_string(),
+                    });
+                }
+                let v = f64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                *buf = &buf[8..];
+                Ok(FieldValue::Float64(v))
+            }
+            FieldType::Bool => {
+                if buf.is_empty() {
+                    return Err(EncodingError {
+                        message: "Buffer too short for Bool value".to_string(),
+                    });
+                }
+                let v = buf[0] != 0;
+                *buf = &buf[1..];
+                Ok(FieldValue::Bool(v))
+            }
+            FieldType::StringArray => Ok(FieldValue::StringArray(decode_string_array(buf)?)),
+            FieldType::Int64Array => Ok(FieldValue::Int64Array(decode_int64_array(buf)?)),
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
+            FieldType::Vector => {
+                let expected_bytes = dimensions * 4;
+                if buf.len() < expected_bytes {
+                    return Err(EncodingError {
+                        message: format!(
+                            "Buffer too short for Vector value: expected {} bytes, got {}",
+                            expected_bytes,
+                            buf.len()
+                        ),
+                    });
+                }
+                // Only decode exactly dimensions elements (not the entire buffer)
+                let vector = decode_f32_array(&buf[..expected_bytes])?;
+                *buf = &buf[expected_bytes..];
+                Ok(FieldValue::Vector(vector))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_encode_and_decode_record_tag() {
+        // given
+        let record_tag = RecordType::CollectionMeta.tag();
+
+        // when
+        let encoded = record_tag.as_byte();
+        let decoded = RecordTag::from_byte(encoded).unwrap();
+
+        // then
+        assert_eq!(decoded.as_byte(), record_tag.as_byte());
+        assert_eq!(
+            RecordType::from_id(decoded.record_type()).unwrap(),
+            RecordType::CollectionMeta
+        );
+    }
+
+    #[test]
+    fn should_write_segment_byte_in_prefix() {
+        // given - record types in each of the three segments
+        let cases = [
+            (RecordType::CollectionMeta, Segment::Default),
+            (RecordType::PostingList, Segment::Ann),
+            (RecordType::CentroidInfo, Segment::Ann),
+            (RecordType::Deletions, Segment::Fts),
+            (RecordType::FtsTerm, Segment::Fts),
+            (RecordType::FtsFieldStats, Segment::Fts),
+        ];
+
+        for (record_type, expected_segment) in cases {
+            // when
+            let prefix = record_type.encode_prefix();
+
+            // then - layout is [subsystem | segment | version | tag]
+            assert_eq!(prefix.len(), PREFIX_AND_TAG_LEN);
+            assert_eq!(prefix[SUBSYSTEM_OFFSET], SUBSYSTEM);
+            assert_eq!(prefix[SEGMENT_OFFSET], expected_segment.as_byte());
+            assert_eq!(prefix[VERSION_OFFSET], KEY_VERSION);
+            assert_eq!(
+                RecordType::from_id(
+                    RecordTag::from_byte(prefix[TAG_OFFSET])
+                        .unwrap()
+                        .record_type()
+                )
+                .unwrap(),
+                record_type
+            );
+            // and the central tag parser accepts the well-formed prefix
+            assert!(parse_record_tag(&prefix).is_ok());
+        }
+    }
+
+    #[test]
+    fn should_reject_key_with_mismatched_segment() {
+        // given - a CollectionMeta prefix (Default segment) with the segment
+        // byte corrupted to the FTS segment
+        let mut prefix = RecordType::CollectionMeta.encode_prefix().to_vec();
+        prefix[SEGMENT_OFFSET] = Segment::Fts.as_byte();
+
+        // when
+        let result = parse_record_tag(&prefix);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("segment mismatch"));
+    }
+
+    #[test]
+    fn should_round_trip_segment_id_byte() {
+        for segment in [Segment::Default, Segment::Ann, Segment::Fts] {
+            assert_eq!(Segment::from_byte(segment.as_byte()).unwrap(), segment);
+        }
+        assert!(Segment::from_byte(0x99).is_err());
+    }
+
+    #[test]
+    fn should_convert_all_record_types() {
+        // given
+        let types = [
+            RecordType::CollectionMeta,
+            RecordType::CentroidSeqBlock,
+            RecordType::VectorIndexData,
+            RecordType::PostingList,
+            RecordType::IdDictionary,
+            RecordType::VectorData,
+            RecordType::MetadataIndex,
+            RecordType::SeqBlock,
+            RecordType::CentroidStats,
+            RecordType::Centroids,
+            RecordType::CentroidInfo,
+            RecordType::Deletions,
+            RecordType::FtsTerm,
+            RecordType::FtsVectorFieldStats,
+            RecordType::FtsFieldStats,
+        ];
+
+        for record_type in types {
+            // when
+            let id = record_type.id();
+            let recovered = RecordType::from_id(id).unwrap();
+
+            // then
+            assert_eq!(recovered, record_type);
+        }
+    }
+
+    #[test]
+    fn should_encode_and_decode_f32() {
+        // given
+        let value = 1.23456f32;
+        let mut buf = BytesMut::new();
+
+        // when
+        value.encode(&mut buf);
+        let mut slice = buf.as_ref();
+        let decoded = f32::decode(&mut slice).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_encode_and_decode_u64() {
+        // given
+        let value = 0xDEADBEEF_CAFEBABE_u64;
+        let mut buf = BytesMut::new();
+
+        // when
+        value.encode(&mut buf);
+        let mut slice = buf.as_ref();
+        let decoded = u64::decode(&mut slice).unwrap();
+
+        // then
+        assert_eq!(decoded, value);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_encode_and_decode_fixed_element_array() {
+        // given
+        let values = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut buf = BytesMut::new();
+
+        // when
+        encode_fixed_element_array(&values, &mut buf);
+        let mut slice = buf.as_ref();
+        let decoded: Vec<f32> = decode_fixed_element_array(&mut slice, 4).unwrap();
+
+        // then
+        assert_eq!(decoded, values);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn should_reject_f32_array_with_partial_element() {
+        // given
+        let bytes = [0u8; 7];
+
+        // when
+        let result = decode_f32_array(&bytes);
+
+        // then
+        assert!(result.is_err());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn should_encode_f32_array_identically_to_per_element_encoding(
+            bits in proptest::collection::vec(proptest::num::u32::ANY, 0..600)
+        ) {
+            // given - arbitrary bit patterns, including NaN payloads and subnormals
+            let values: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+            let mut bulk = BytesMut::new();
+            let mut per_element = BytesMut::new();
+
+            // when
+            encode_f32_array(&values, &mut bulk);
+            encode_fixed_element_array(&values, &mut per_element);
+
+            // then
+            proptest::prop_assert_eq!(&bulk[..], &per_element[..]);
+        }
+
+        #[test]
+        fn should_round_trip_f32_array_bit_for_bit(
+            bits in proptest::collection::vec(proptest::num::u32::ANY, 0..600)
+        ) {
+            // given
+            let values: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+            let mut buf = BytesMut::new();
+            encode_f32_array(&values, &mut buf);
+
+            // when
+            let decoded = decode_f32_array(&buf).unwrap();
+            let mut slice = buf.as_ref();
+            let reference: Vec<f32> = decode_fixed_element_array(&mut slice, 4).unwrap();
+
+            // then
+            let decoded_bits: Vec<u32> = decoded.iter().map(|v| v.to_bits()).collect();
+            let reference_bits: Vec<u32> = reference.iter().map(|v| v.to_bits()).collect();
+            proptest::prop_assert_eq!(&decoded_bits, &bits);
+            proptest::prop_assert_eq!(&reference_bits, &bits);
+        }
+    }
+}

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: telemetry-stack
-description: Plural Telemetry metrics, logs, traces, and namespace authentication resources
+description: Plural Telemetry metrics, logs, traces, vector, bucket cleaner, and namespace authentication resources
 appVersion: 0.3.17
 version: 0.1.31
 sources:

@@ -13,3 +13,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
+
+{{/* A product's storage: its spec.config.storage merged over global.storage. */}}
+{{- define "telemetry-stack.storage" -}}
+{{- $config := default dict (get (default dict .product.spec) "config") }}
+{{- toYaml (mergeOverwrite (deepCopy .root.Values.global.storage) (deepCopy (default dict (get $config "storage")))) }}
+{{- end }}

@@ -22,13 +22,14 @@ import (
 )
 
 type DataStoreReference struct {
-	// +kubebuilder:validation:Enum=Metrics;Logs;Traces
+	// +kubebuilder:validation:Enum=Metrics;Logs;Traces;Vector
 	Kind string `json:"kind"`
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 }
 
 // NamespaceAuthenticationSpec defines the desired state of NamespaceAuthentication.
+// +kubebuilder:validation:XValidation:rule="self.dataStoreRef.kind != 'Vector' || !has(self.usageReportingEndpoint)",message="usageReportingEndpoint is not supported for Vector"
 type NamespaceAuthenticationSpec struct {
 	DataStoreRef DataStoreReference `json:"dataStoreRef"`
 	// +kubebuilder:validation:MinLength=1
@@ -43,6 +44,7 @@ type NamespaceAuthenticationSpec struct {
 	// Ingested bytes for the namespace are buffered and periodically reported
 	// to it. When several NamespaceAuthentications for the same datastore and
 	// namespace set different endpoints, the lexicographically smallest wins.
+	// Vector doesn't report usage.
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^(http://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$`

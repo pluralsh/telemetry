@@ -64,12 +64,15 @@ type Input struct {
 	Logs              *telemetryv1alpha1.Logs
 	Traces            *telemetryv1alpha1.Traces
 	PseudoFS          *telemetryv1alpha1.PseudoFS
+	Vector            *telemetryv1alpha1.Vector
 	Global            Access
 	Namespaces        []NamespaceAccess
 	JWT               *JWT
 	InternalTokenPath string
 	InternalToken     []byte
 	SecretsPath       string
+	// EmbeddingAPIKey is the resolved Vector embedding provider key.
+	EmbeddingAPIKey []byte
 }
 
 type Result struct {
@@ -78,6 +81,9 @@ type Result struct {
 }
 
 func Render(input Input) (Result, error) {
+	if input.Vector != nil {
+		return renderVector(input)
+	}
 	if input.PseudoFS != nil {
 		return renderPseudoFS(input.PseudoFS)
 	}

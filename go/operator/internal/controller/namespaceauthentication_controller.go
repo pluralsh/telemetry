@@ -46,6 +46,8 @@ type NamespaceAuthenticationReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications/finalizers,verbs=update
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=metrics,verbs=get;list;watch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=logs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=traces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=vectors,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *NamespaceAuthenticationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -76,13 +78,15 @@ func (r *NamespaceAuthenticationReconciler) SetupWithManager(mgr ctrl.Manager) e
 		Watches(&telemetryv1alpha1.Metrics{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForMetrics)).
 		Watches(&telemetryv1alpha1.Logs{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForLogs)).
 		Watches(&telemetryv1alpha1.Traces{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForTraces)).
+		Watches(&telemetryv1alpha1.Vector{}, handler.EnqueueRequestsFromMapFunc(r.authenticationsForVector)).
 		Named("namespaceauthentication").
 		Complete(r)
 }
 
 func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *telemetryv1alpha1.NamespaceAuthentication) error {
-	if auth.Spec.DataStoreRef.Kind != dataStoreMetrics && auth.Spec.DataStoreRef.Kind != dataStoreLogs && auth.Spec.DataStoreRef.Kind != dataStoreTraces {
-		return fmt.Errorf("dataStoreRef.kind must be Metrics, Logs, or Traces")
+	kind := auth.Spec.DataStoreRef.Kind
+	if kind != dataStoreMetrics && kind != dataStoreLogs && kind != dataStoreTraces && kind != dataStoreVector {
+		return fmt.Errorf("dataStoreRef.kind must be Metrics, Logs, Traces, or Vector")
 	}
 	if auth.Spec.DataStoreRef.Name == "" || auth.Spec.Namespace == "" || auth.Spec.Username == "" {
 		return fmt.Errorf("dataStoreRef.name, namespace, and username are required")
@@ -93,17 +97,15 @@ func (r *NamespaceAuthenticationReconciler) validate(ctx context.Context, auth *
 	if auth.Spec.SecretKeyRef.Name == "" || auth.Spec.SecretKeyRef.Key == "" {
 		return fmt.Errorf("secretKeyRef.name and secretKeyRef.key are required")
 	}
-	key := types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.DataStoreRef.Name}
-	if auth.Spec.DataStoreRef.Kind == dataStoreMetrics {
-		if err := r.Get(ctx, key, &telemetryv1alpha1.Metrics{}); err != nil {
-			return fmt.Errorf("referenced Metrics is unavailable: %w", err)
-		}
-	} else if auth.Spec.DataStoreRef.Kind == dataStoreLogs {
-		if err := r.Get(ctx, key, &telemetryv1alpha1.Logs{}); err != nil {
-			return fmt.Errorf("referenced Logs is unavailable: %w", err)
-		}
-	} else if err := r.Get(ctx, key, &telemetryv1alpha1.Traces{}); err != nil {
-		return fmt.Errorf("referenced Traces is unavailable: %w", err)
+	if kind == dataStoreVector && auth.Spec.UsageReportingEndpoint != "" {
+		return fmt.Errorf("usageReportingEndpoint is not supported for Vector")
+	}
+	store, err := dataStoreObject(auth.Namespace, telemetryv1alpha1.BucketCleanerDataStoreReference{Kind: kind, Name: auth.Spec.DataStoreRef.Name})
+	if err != nil {
+		return err
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(store), store); err != nil {
+		return fmt.Errorf("referenced %s is unavailable: %w", kind, err)
 	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: auth.Namespace, Name: auth.Spec.SecretKeyRef.Name}, secret); err != nil {
@@ -137,6 +139,10 @@ func (r *NamespaceAuthenticationReconciler) authenticationsForLogs(ctx context.C
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForTraces(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.authenticationsForDataStore(ctx, obj, dataStoreTraces)
+}
+
+func (r *NamespaceAuthenticationReconciler) authenticationsForVector(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.authenticationsForDataStore(ctx, obj, dataStoreVector)
 }
 
 func (r *NamespaceAuthenticationReconciler) authenticationsForDataStore(ctx context.Context, obj client.Object, kind string) []reconcile.Request {

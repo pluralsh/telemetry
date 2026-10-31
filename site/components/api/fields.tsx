@@ -7,7 +7,7 @@ function nonNull(s: Schema): { schema: Schema; nullable: boolean } {
     return { schema: { ...s, type: types.length === 1 ? types[0] : types }, nullable: types.length < s.type.length };
   }
   const variants = s.oneOf ?? s.anyOf;
-  if (variants) {
+  if (variants && !s.discriminator) {
     const rest = variants.filter((v) => v.type !== "null");
     if (rest.length === 1) return { schema: { ...rest[0], description: s.description ?? rest[0].description }, nullable: rest.length < variants.length };
   }
@@ -19,7 +19,8 @@ export function typeLabel(input: Schema | undefined): { label: string; nullable:
   const { schema: s, nullable } = nonNull(input);
   const t = Array.isArray(s.type) ? s.type.join(" | ") : s.type;
   let label: string;
-  if (s.oneOf || s.anyOf) label = (s.oneOf ?? s.anyOf)!.map((v) => typeLabel(v).label).join(" | ");
+  if (s.discriminator && s.refName) label = s.refName;
+  else if (s.oneOf || s.anyOf) label = (s.oneOf ?? s.anyOf)!.map((v) => typeLabel(v).label).join(" | ");
   else if (t === "array") label = `array of ${s.items ? typeLabel(s.items).label : "any"}`;
   else if (s.refName && (t === "object" || s.properties)) label = s.refName;
   else if (t === "object" && s.additionalProperties && typeof s.additionalProperties === "object")
@@ -30,10 +31,23 @@ export function typeLabel(input: Schema | undefined): { label: string; nullable:
   return { label, nullable };
 }
 
-/** Object-like schema whose fields are worth listing, unwrapping arrays and nullable unions. */
+/** The tag value of one variant of a discriminated union. */
+function tagOf(variant: Schema, property: string): string {
+  const value = variant.properties?.[property]?.enum?.[0];
+  return value === undefined ? (variant.refName ?? "variant") : String(value);
+}
+
+/**
+ * Object-like schema whose fields are worth listing, unwrapping arrays and nullable unions.
+ * A discriminated union lists its variants, by tag.
+ */
 export function fieldsOf(input: Schema | undefined): { props: Record<string, Schema>; required: string[] } | null {
   if (!input) return null;
   const { schema: s } = nonNull(input);
+  if (s.discriminator && s.oneOf) {
+    const property = s.discriminator.propertyName;
+    return { props: Object.fromEntries(s.oneOf.map((v) => [`${property}: ${tagOf(v, property)}`, v])), required: [] };
+  }
   if (s.properties && Object.keys(s.properties).length) return { props: s.properties, required: s.required ?? [] };
   if (s.items) return fieldsOf(s.items);
   return null;

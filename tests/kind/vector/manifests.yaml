@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Namespace
+metadata: { name: vector-e2e }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: vector-object-store, namespace: vector-e2e }
+stringData:
+  access-key-id: vector
+  secret-access-key: vector-e2e-secret
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio, namespace: vector-e2e }
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: minio, namespace: vector-e2e }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      containers:
+        - name: minio
+          image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+          args: [server, /data]
+          env:
+            - { name: MINIO_ROOT_USER, value: vector }
+            - { name: MINIO_ROOT_PASSWORD, value: vector-e2e-secret }
+          ports:
+            - { name: s3, containerPort: 9000 }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: minio-init, namespace: vector-e2e }
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
+          env:
+            - { name: MC_HOST_local, value: "http://vector:vector-e2e-secret@minio:9000" }
+          args: [mb, --ignore-existing, local/vector-e2e]

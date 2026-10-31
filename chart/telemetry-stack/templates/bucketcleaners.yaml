@@ -1,0 +1,54 @@
+{{- $root := . -}}
+{{- if .Values.bucketCleaners.enabled }}
+{{- $cleaners := list }}
+{{- range $kind, $product := .Values.products }}
+{{- if $product.enabled }}
+{{- $storage := include "telemetry-stack.storage" (dict "root" $root "product" $product) | fromYaml }}
+{{- $type := dig "objectStore" "type" "Local" $storage }}
+{{- if not (has $type (list "Aws" "Azure" "Gcp")) }}
+{{- fail (printf "products.%s: bucket cleanup needs an Aws, Azure or Gcp objectStore, not %v" $kind $type) }}
+{{- end }}
+{{- $cleaners = append $cleaners (dict
+  "name" (printf "%s-data" $product.name)
+  "dataStoreRef" (dict "kind" (title $kind) "name" $product.name)
+  "source" (printf "products.%s" $kind)) }}
+{{- end }}
+{{- end }}
+{{- range $i, $cleaner := .Values.bucketCleaners.additional }}
+{{- $cleaner = merge (dict "source" (printf "bucketCleaners.additional[%d]" $i)) (deepCopy $cleaner) }}
+{{- if not $cleaner.dataStoreRef }}
+{{- $_ := set $cleaner "objectStore" (default $root.Values.global.storage.objectStore $cleaner.objectStore) }}
+{{- $_ := required (printf "%s: subPath is required without a dataStoreRef" $cleaner.source) $cleaner.subPath }}
+{{- end }}
+{{- $cleaners = append $cleaners $cleaner }}
+{{- end }}
+{{- range $cleaner := $cleaners }}
+{{- with $cleaner.objectStore }}
+{{- if not (has .type (list "Aws" "Azure" "Gcp")) }}
+{{- fail (printf "%s: a BucketCleaner needs an Aws, Azure or Gcp objectStore, not %v" $cleaner.source .type) }}
+{{- end }}
+{{- end }}
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: BucketCleaner
+metadata:
+  name: {{ required (printf "%s: name is required" $cleaner.source) $cleaner.name }}
+  labels:
+    {{- include "telemetry-stack.labels" $root | nindent 4 }}
+spec:
+  {{- with $cleaner.objectStore }}
+  objectStore:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $cleaner.subPath }}
+  subPath: {{ . | quote }}
+  {{- end }}
+  {{- with $cleaner.dataStoreRef }}
+  dataStoreRef:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with (default $root.Values.bucketCleaners.checkIntervalSeconds $cleaner.checkIntervalSeconds) }}
+  checkIntervalSeconds: {{ . }}
+  {{- end }}
+{{- end }}
+{{- end }}

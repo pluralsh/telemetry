@@ -27,7 +27,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-export async function ApiReference({ spec }: { spec: ApiSpec }) {
+export async function ApiReference({ spec }: { spec: ApiSpec<ProductId> }) {
   const product = PRODUCTS[spec.product];
   const allOps = spec.tags.flatMap((t) => t.ops);
 

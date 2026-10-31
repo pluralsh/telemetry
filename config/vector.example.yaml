@@ -1,0 +1,34 @@
+# A standalone vector cluster: one process serving its one shard.
+#   plural-vector --port 8080 cluster --config config/vector.example.yaml
+#
+# On Kubernetes the operator renders this file with `role: writer` or
+# `role: reader` and a `kubernetes` section; see the vector docs.
+storage:
+  type: SlateDb
+  path: vector
+  object_store:
+    type: Local
+    path: /var/lib/vector/data
+flush_interval: 1
+# Process-wide bounds on what queries, unflushed writes and compactions hold.
+# Writes past `write_bytes` get 429 once a flush doesn't make room within
+# their timeout. The operator sizes these from each pod's memory limit.
+memory:
+  query_bytes: 536870912
+  write_bytes: 134217728
+  compaction_bytes: 1073741824
+# Serves the API under a path, e.g. /vector/api/v1/..., to share a hostname
+# with other services. Health routes stay at the root.
+# path_prefix: /vector
+#
+# Embeds `embed` attributes and query texts. Providers: openai (or any
+# OpenAI-compatible `endpoint`), cohere, gemini, bedrock (Titan Text v2, via
+# the AWS credential chain; set `region` to pick the runtime endpoint).
+# embedding:
+#   provider: openai
+#   model: text-embedding-3-small
+#   api_key:
+#     source: env
+#     name: OPENAI_API_KEY
+#   cache:
+#     capacity: 67108864

@@ -15,10 +15,10 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.objectStore.type
+    - jsonPath: .status.objectStore.type
       name: Type
       type: string
-    - jsonPath: .spec.subPath
+    - jsonPath: .status.subPath
       name: SubPath
       type: string
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
@@ -63,12 +63,35 @@ spec:
                 format: int64
                 minimum: 10
                 type: integer
+              dataStoreRef:
+                description: |-
+                  DataStoreRef is the datastore, in the BucketCleaner's namespace, that
+                  writes under subPath. Omitted objectStore and subPath settings are
+                  taken from its storage while it exists. Deletion waits until the
+                  datastore and its pods are gone, so no replica writes objects after the
+                  prefix is emptied, and data is never deleted while the datastore exists.
+                properties:
+                  kind:
+                    enum:
+                    - Metrics
+                    - Logs
+                    - Traces
+                    - Vector
+                    type: string
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
               objectStore:
                 description: |-
                   ObjectStore is the bucket holding the tracked data, in the same form as
                   a datastore's spec.config.storage.objectStore. Credential Secrets are
                   read from the BucketCleaner's namespace by the operator itself; when
-                  they are omitted the operator's own cloud identity is used.
+                  they are omitted the operator's own cloud identity is used. Defaults to
+                  the dataStoreRef's spec.config.storage.objectStore.
                 properties:
                   aws:
                     description: AWSObjectStoreSpec configures an Amazon S3 or S3-compatible
@@ -405,23 +428,27 @@ spec:
                   SubPath is the key prefix within the bucket, typically a datastore's
                   spec.config.storage.path. It is treated as a directory: "logs" covers
                   "logs/..." but not "logs-archive/...". Every object under it is deleted
-                  when the BucketCleaner is deleted.
+                  when the BucketCleaner is deleted. Defaults to the dataStoreRef's
+                  spec.config.storage.path, or the product name when that is unset.
                 minLength: 1
                 pattern: '[^/]'
                 type: string
                 x-kubernetes-validations:
                 - message: subPath is immutable
                   rule: self == oldSelf
-            required:
-            - objectStore
-            - subPath
             type: object
             x-kubernetes-validations:
+            - message: objectStore and subPath are required unless dataStoreRef is
+                set
+              rule: has(self.dataStoreRef) || (has(self.objectStore) && has(self.subPath))
             - message: objectStore.type must be Aws, Azure, or Gcp
-              rule: self.objectStore.type in ['Aws', 'Azure', 'Gcp']
+              rule: '!has(self.objectStore) || self.objectStore.type in [''Aws'',
+                ''Azure'', ''Gcp'']'
             - message: objectStore.path is not supported; use subPath
-              rule: '!has(self.objectStore.path) || self.objectStore.path.size() ==
-                0'
+              rule: '!has(self.objectStore) || !has(self.objectStore.path) || self.objectStore.path.size()
+                == 0'
+            - message: subPath is immutable
+              rule: '!has(oldSelf.subPath) || has(self.subPath)'
           status:
             description: BucketCleanerStatus defines the observed state of BucketCleaner.
             properties:
@@ -491,9 +518,348 @@ spec:
                   successfully.
                 format: date-time
                 type: string
+              objectStore:
+                description: |-
+                  ObjectStore is the bucket last resolved from the spec and dataStoreRef.
+                  Deletion uses it once the datastore is gone.
+                properties:
+                  aws:
+                    description: AWSObjectStoreSpec configures an Amazon S3 or S3-compatible
+                      object store.
+                    properties:
+                      accessKeyIDSecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      allowHTTP:
+                        type: boolean
+                      bucket:
+                        minLength: 1
+                        type: string
+                      endpoint:
+                        type: string
+                      region:
+                        minLength: 1
+                        type: string
+                      secretAccessKeySecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      sessionTokenSecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      virtualHostedStyle:
+                        type: boolean
+                    required:
+                    - bucket
+                    - region
+                    type: object
+                    x-kubernetes-validations:
+                    - message: accessKeyIDSecretRef and secretAccessKeySecretRef must
+                        be configured together
+                      rule: has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)
+                  azure:
+                    properties:
+                      accessKeySecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      account:
+                        minLength: 1
+                        type: string
+                      allowHTTP:
+                        type: boolean
+                      bearerTokenSecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      clientSecret:
+                        properties:
+                          clientID:
+                            minLength: 1
+                            type: string
+                          clientSecretKeyRef:
+                            description: SecretKeySelector selects a key of a Secret.
+                            properties:
+                              key:
+                                description: The key of the secret to select from.  Must
+                                  be a valid secret key.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description: Specify whether the Secret or its key
+                                  must be defined
+                                type: boolean
+                            required:
+                            - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          tenantID:
+                            minLength: 1
+                            type: string
+                        required:
+                        - clientID
+                        - clientSecretKeyRef
+                        - tenantID
+                        type: object
+                      container:
+                        minLength: 1
+                        type: string
+                      endpoint:
+                        type: string
+                      sasTokenSecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      workloadIdentity:
+                        properties:
+                          clientID:
+                            minLength: 1
+                            type: string
+                          tenantID:
+                            minLength: 1
+                            type: string
+                          tokenFile:
+                            minLength: 1
+                            type: string
+                        required:
+                        - clientID
+                        - tenantID
+                        - tokenFile
+                        type: object
+                    required:
+                    - account
+                    - container
+                    type: object
+                    x-kubernetes-validations:
+                    - message: at most one Azure authentication method may be configured
+                      rule: '[has(self.accessKeySecretRef), has(self.sasTokenSecretRef),
+                        has(self.bearerTokenSecretRef), has(self.clientSecret), has(self.workloadIdentity)].filter(x,
+                        x).size() <= 1'
+                  gcp:
+                    properties:
+                      baseURL:
+                        type: string
+                      bearerTokenSecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      bucket:
+                        minLength: 1
+                        type: string
+                      serviceAccountKeySecretRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - bucket
+                    type: object
+                    x-kubernetes-validations:
+                    - message: serviceAccountKeySecretRef and bearerTokenSecretRef
+                        are mutually exclusive
+                      rule: '![has(self.serviceAccountKeySecretRef), has(self.bearerTokenSecretRef)].all(x,
+                        x)'
+                  path:
+                    type: string
+                  type:
+                    default: Local
+                    enum:
+                    - InMemory
+                    - Local
+                    - Aws
+                    - Azure
+                    - Gcp
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: Aws object stores require aws configuration
+                  rule: self.type != 'Aws' || has(self.aws)
+                - message: aws configuration is only valid for Aws object stores
+                  rule: self.type == 'Aws' || !has(self.aws)
+                - message: Azure object stores require azure configuration
+                  rule: self.type != 'Azure' || has(self.azure)
+                - message: azure configuration is only valid for Azure object stores
+                  rule: self.type == 'Azure' || !has(self.azure)
+                - message: Gcp object stores require gcp configuration
+                  rule: self.type != 'Gcp' || has(self.gcp)
+                - message: gcp configuration is only valid for Gcp object stores
+                  rule: self.type == 'Gcp' || !has(self.gcp)
               observedGeneration:
                 format: int64
                 type: integer
+              subPath:
+                description: SubPath is the prefix last resolved from the spec and
+                  dataStoreRef.
+                type: string
             type: object
         type: object
     served: true

@@ -19,6 +19,7 @@ const (
 	dataStoreMetrics = "Metrics"
 	dataStoreLogs    = "Logs"
 	dataStoreTraces  = "Traces"
+	dataStoreVector  = "Vector"
 
 	namespaceAuthMetricsIndex = "telemetry.plural.sh/namespace-auth-metrics"
 	metricsSecretIndex        = "telemetry.plural.sh/metrics-secret"
@@ -32,7 +33,10 @@ const (
 	reasonStorageResizing      = "StorageResizing"
 	reasonStorageResizeBlocked = "StorageResizeBlocked"
 	reasonMemoryLimitTooLow    = "MemoryLimitTooLow"
-	messageWorkloadsReady      = "all workloads are ready"
+	// reasonWriterScaleDownRejected: a Vector's writers each own a shard,
+	// and shards don't merge.
+	reasonWriterScaleDownRejected = "WriterScaleDownRejected"
+	messageWorkloadsReady         = "all workloads are ready"
 
 	suffixConfig        = "config"
 	suffixHeadless      = "headless"

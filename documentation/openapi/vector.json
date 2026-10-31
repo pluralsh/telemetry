@@ -1,0 +1,2390 @@
+{
+  "components": {
+    "schemas": {
+      "Aggregate": {
+        "description": "An aggregate over the rows matching `filters`, tagged by `op`.",
+        "discriminator": {
+          "mapping": {
+            "Count": "#/components/schemas/AggregateCount"
+          },
+          "propertyName": "op"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AggregateCount"
+          }
+        ]
+      },
+      "AggregateCount": {
+        "properties": {
+          "op": {
+            "enum": [
+              "Count"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      "AttributeSchema": {
+        "description": "Type and indexing of one attribute.",
+        "properties": {
+          "embed": {
+            "description": "Embed a `string` attribute into the vector of rows written without\none, with the server's embedding model. One attribute per\nnamespace. Default `false`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "full_text_search": {
+            "description": "Index a `string` attribute for `BM25` ranking. Applies to rows\nwritten after it is enabled. Default `false`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/AttributeType",
+            "description": "Attribute type. Fixed once set."
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      "AttributeType": {
+        "enum": [
+          "string",
+          "int",
+          "float",
+          "bool",
+          "[]string",
+          "[]int"
+        ],
+        "type": "string"
+      },
+      "Consistency": {
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/ConsistencyLevel"
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "type": "object"
+      },
+      "ConsistencyLevel": {
+        "enum": [
+          "strong",
+          "eventual"
+        ],
+        "type": "string"
+      },
+      "CreateNamespace": {
+        "properties": {
+          "dimensions": {
+            "description": "Vector length, 1 to 65535. Every row's vector must have it.\nOptional when an attribute embeds: the embedding model's length.",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "distance_metric": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DistanceMetric",
+                "description": "Default `cosine_distance`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeSchema"
+            },
+            "description": "Attributes to declare up front. Undeclared attributes are typed from\nthe first value written.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "Direction": {
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "type": "string"
+      },
+      "DistanceMetric": {
+        "description": "How vector distance is measured. Fixed when the namespace is created.",
+        "enum": [
+          "cosine_distance",
+          "euclidean_squared",
+          "dot_product"
+        ],
+        "type": "string"
+      },
+      "Document": {
+        "description": "A document stored as one row per passage.",
+        "properties": {
+          "attributes": {
+            "description": "Attributes copied onto every passage row.",
+            "type": "object"
+          },
+          "id": {
+            "description": "Document id: a string or non-negative integer. Passage `i` is\nstored as row `\"{id}#{i}\"`."
+          },
+          "passages": {
+            "description": "Passages in order, each `{\"vector\": [..], attribute: value, ..}`.\nPassage attributes override document attributes.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "attributes",
+          "passages"
+        ],
+        "type": "object"
+      },
+      "ErrorEnvelope": {
+        "description": "Error body of every 4xx and 5xx response.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "description": "Always `error`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Filter": {
+        "description": "A boolean filter over row attributes, tagged by `op`. On array\nattributes, operators match when any element does; negated operators\nalso match rows without the attribute. See\n[filters](/vector/queries/#filters).",
+        "discriminator": {
+          "mapping": {
+            "And": "#/components/schemas/FilterAnd",
+            "Contains": "#/components/schemas/FilterContains",
+            "ContainsAny": "#/components/schemas/FilterContainsAny",
+            "Eq": "#/components/schemas/FilterEq",
+            "Exists": "#/components/schemas/FilterExists",
+            "Glob": "#/components/schemas/FilterGlob",
+            "Gt": "#/components/schemas/FilterGt",
+            "Gte": "#/components/schemas/FilterGte",
+            "IGlob": "#/components/schemas/FilterIGlob",
+            "In": "#/components/schemas/FilterIn",
+            "Lt": "#/components/schemas/FilterLt",
+            "Lte": "#/components/schemas/FilterLte",
+            "Not": "#/components/schemas/FilterNot",
+            "NotContains": "#/components/schemas/FilterNotContains",
+            "NotContainsAny": "#/components/schemas/FilterNotContainsAny",
+            "NotEq": "#/components/schemas/FilterNotEq",
+            "NotExists": "#/components/schemas/FilterNotExists",
+            "NotGlob": "#/components/schemas/FilterNotGlob",
+            "NotIGlob": "#/components/schemas/FilterNotIGlob",
+            "NotIn": "#/components/schemas/FilterNotIn",
+            "Or": "#/components/schemas/FilterOr"
+          },
+          "propertyName": "op"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FilterAnd"
+          },
+          {
+            "$ref": "#/components/schemas/FilterOr"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNot"
+          },
+          {
+            "$ref": "#/components/schemas/FilterExists"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotExists"
+          },
+          {
+            "$ref": "#/components/schemas/FilterEq"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotEq"
+          },
+          {
+            "$ref": "#/components/schemas/FilterLt"
+          },
+          {
+            "$ref": "#/components/schemas/FilterLte"
+          },
+          {
+            "$ref": "#/components/schemas/FilterGt"
+          },
+          {
+            "$ref": "#/components/schemas/FilterGte"
+          },
+          {
+            "$ref": "#/components/schemas/FilterContains"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotContains"
+          },
+          {
+            "$ref": "#/components/schemas/FilterIn"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotIn"
+          },
+          {
+            "$ref": "#/components/schemas/FilterContainsAny"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotContainsAny"
+          },
+          {
+            "$ref": "#/components/schemas/FilterGlob"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotGlob"
+          },
+          {
+            "$ref": "#/components/schemas/FilterIGlob"
+          },
+          {
+            "$ref": "#/components/schemas/FilterNotIGlob"
+          }
+        ]
+      },
+      "FilterAnd": {
+        "description": "Every filter matches.",
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/Filter"
+            },
+            "type": "array"
+          },
+          "op": {
+            "enum": [
+              "And"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "filters"
+        ],
+        "type": "object"
+      },
+      "FilterContains": {
+        "description": "An array attribute has the value as an element.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Contains"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterContainsAny": {
+        "description": "An array attribute has any of the values as an element.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "ContainsAny"
+            ],
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/FilterValue"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "values"
+        ],
+        "type": "object"
+      },
+      "FilterEq": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Eq"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterExists": {
+        "description": "The row has the attribute.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Exists"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute"
+        ],
+        "type": "object"
+      },
+      "FilterGlob": {
+        "description": "Matches the pattern, case-sensitively.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Glob"
+            ],
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "FilterGt": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Gt"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterGte": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Gte"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterIGlob": {
+        "description": "Matches the pattern, ignoring case.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "IGlob"
+            ],
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "FilterIn": {
+        "description": "Equals one of the values.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "In"
+            ],
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/FilterValue"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "values"
+        ],
+        "type": "object"
+      },
+      "FilterLt": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Lt"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterLte": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "Lte"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterNot": {
+        "description": "The filter doesn't match.",
+        "properties": {
+          "filter": {
+            "$ref": "#/components/schemas/Filter"
+          },
+          "op": {
+            "enum": [
+              "Not"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "filter"
+        ],
+        "type": "object"
+      },
+      "FilterNotContains": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotContains"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterNotContainsAny": {
+        "description": "An attribute compared with a set of values.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotContainsAny"
+            ],
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/FilterValue"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "values"
+        ],
+        "type": "object"
+      },
+      "FilterNotEq": {
+        "description": "An attribute compared with one value.",
+        "properties": {
+          "attribute": {
+            "description": "Any attribute but `id` and `vector`.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotEq"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FilterValue"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FilterNotExists": {
+        "description": "The row doesn't have the attribute.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotExists"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute"
+        ],
+        "type": "object"
+      },
+      "FilterNotGlob": {
+        "description": "A `string` attribute matched against a glob pattern: `*`, `?`,\nclasses like `[a-z]` and `[!0-9]`, and `\\` to escape.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotGlob"
+            ],
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "FilterNotIGlob": {
+        "description": "A `string` attribute matched against a glob pattern: `*`, `?`,\nclasses like `[a-z]` and `[!0-9]`, and `\\` to escape.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotIGlob"
+            ],
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "FilterNotIn": {
+        "description": "An attribute compared with a set of values.",
+        "properties": {
+          "attribute": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "NotIn"
+            ],
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/FilterValue"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "values"
+        ],
+        "type": "object"
+      },
+      "FilterOr": {
+        "description": "Any filter matches.",
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/Filter"
+            },
+            "type": "array"
+          },
+          "op": {
+            "enum": [
+              "Or"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "filters"
+        ],
+        "type": "object"
+      },
+      "FilterValue": {
+        "description": "A filter operand: one value of the attribute's type, or of its element\ntype for array attributes.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "format": "int64",
+            "type": "integer"
+          },
+          {
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          }
+        ]
+      },
+      "LimitSpec": {
+        "properties": {
+          "per": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PerLimit"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total": {
+            "description": "Rows to return, 1 to 10000.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "type": "object"
+      },
+      "Namespace": {
+        "description": "A namespace's metadata.",
+        "properties": {
+          "created_at_ms": {
+            "description": "Creation time, in Unix milliseconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dimensions": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "distance_metric": {
+            "$ref": "#/components/schemas/DistanceMetric"
+          },
+          "embedding_model": {
+            "description": "The model embedding the namespace, e.g.\n`openai:text-embedding-3-small`, fixed when an attribute first\nembeds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Hex key prefix of the namespace inside its shard.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeSchema"
+            },
+            "description": "Every known attribute, declared or inferred.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "shard": {
+            "description": "Shard holding the namespace.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "id",
+          "shard",
+          "dimensions",
+          "distance_metric",
+          "schema",
+          "created_at_ms"
+        ],
+        "type": "object"
+      },
+      "NamespaceList": {
+        "properties": {
+          "namespaces": {
+            "items": {
+              "$ref": "#/components/schemas/Namespace"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "namespaces"
+        ],
+        "type": "object"
+      },
+      "NamespaceRange": {
+        "description": "Namespace ids `[start, end)`, as 16 hex digits.",
+        "properties": {
+          "end": {
+            "description": "Absent when the range extends to the end of the id space.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "start"
+        ],
+        "type": "object"
+      },
+      "PerLimit": {
+        "description": "At most `limit` rows per distinct combination of `attributes`.",
+        "properties": {
+          "attributes": {
+            "description": "Attributes to group by, e.g. `[\"$doc_id\"]`. `id` is allowed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attributes",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "Performance": {
+        "properties": {
+          "query_execution_ms": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query_execution_ms"
+        ],
+        "type": "object"
+      },
+      "Query": {
+        "description": "A query, or a batch of queries when `queries` is set.",
+        "properties": {
+          "aggregate_by": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Aggregate"
+            },
+            "description": "Named aggregates over every row matching `filters`, e.g.\n`{\"total\": {\"op\": \"Count\"}}`. Without `rank_by`, the response\nhas no rows.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "consistency": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Consistency"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exclude_attributes": {
+            "description": "Attributes to leave out.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "filters": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter",
+                "description": "Rows must match this filter."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "include_attributes": {
+            "description": "`true` (every attribute except `vector`, the default), `false`\n(only `id` and the score), or a list of names; list `vector`\nto return it."
+          },
+          "limit": {
+            "description": "A row count (default `10`), or `{\"total\": n, \"per\": {..}}` to\ncap rows per group, e.g. passages per document."
+          },
+          "nprobe": {
+            "description": "ANN centroids to probe. Default `limit` clamped to 10–100;\nfiltered queries that come up short are retried with more.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "queries": {
+            "description": "Multi-query: run these queries against one snapshot. Only\n`consistency` and `rrf` may accompany it.",
+            "items": {
+              "$ref": "#/components/schemas/SubQuery"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "rank_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RankBy",
+                "description": "How to order rows. Default: ascending `id`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rrf": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Rrf",
+                "description": "Multi-query: fuse the results into one ranking by reciprocal rank\nfusion. Without it, each query's result is returned in `results`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "top_k": {
+            "description": "Alias of a numeric `limit`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "QueryResult": {
+        "properties": {
+          "aggregations": {
+            "description": "Aggregate values by name.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "performance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Performance",
+                "description": "Absent for multi-query without `rrf`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "results": {
+            "description": "Multi-query without `rrf`: one result per query, in order.",
+            "items": {
+              "$ref": "#/components/schemas/SubQueryResult"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "rows": {
+            "description": "Matching rows, best first: `id`, then `$dist` (vector ranking) or\n`$score` (BM25 and RRF), then the selected attributes. Absent for\naggregation-only queries.",
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RankBy": {
+        "description": "How to order rows, tagged by `op`. See\n[ranking](/vector/queries/#ranking).",
+        "discriminator": {
+          "mapping": {
+            "ANN": "#/components/schemas/RankByANN",
+            "BM25": "#/components/schemas/RankByBM25",
+            "Order": "#/components/schemas/RankByOrder",
+            "kNN": "#/components/schemas/RankByKNN"
+          },
+          "propertyName": "op"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RankByANN"
+          },
+          {
+            "$ref": "#/components/schemas/RankByKNN"
+          },
+          {
+            "$ref": "#/components/schemas/RankByBM25"
+          },
+          {
+            "$ref": "#/components/schemas/RankByOrder"
+          }
+        ]
+      },
+      "RankByANN": {
+        "description": "Approximate nearest neighbours, closest first. Adds `$dist`.",
+        "properties": {
+          "op": {
+            "enum": [
+              "ANN"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "Text to embed into the query vector, in a namespace with an\n`embed` attribute.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vector": {
+            "description": "The query vector, with the namespace's dimensions. Exactly one of\n`vector` and `text`.",
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      "RankByBM25": {
+        "description": "BM25 relevance, best first. Adds `$score`.",
+        "properties": {
+          "attribute": {
+            "description": "A `full_text_search` attribute.",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "BM25"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute",
+          "query"
+        ],
+        "type": "object"
+      },
+      "RankByKNN": {
+        "description": "Exact nearest neighbours of the rows matching the filter. Adds\n`$dist`.",
+        "properties": {
+          "op": {
+            "enum": [
+              "kNN"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "Text to embed into the query vector, in a namespace with an\n`embed` attribute.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vector": {
+            "description": "The query vector, with the namespace's dimensions. Exactly one of\n`vector` and `text`.",
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      "RankByOrder": {
+        "description": "Attribute order.",
+        "properties": {
+          "attribute": {
+            "description": "An attribute, or `id` (ascending only). Rows without the attribute\ncome last.",
+            "type": "string"
+          },
+          "direction": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Direction",
+                "description": "Default `asc`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "op": {
+            "enum": [
+              "Order"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "attribute"
+        ],
+        "type": "object"
+      },
+      "Row": {
+        "description": "A row with every attribute, including `vector`.",
+        "properties": {
+          "attributes": {
+            "description": "Further attributes, by name.",
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "vector": {
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "vector",
+          "attributes"
+        ],
+        "type": "object"
+      },
+      "Rrf": {
+        "properties": {
+          "k": {
+            "description": "Rank offset: a row at rank `r` (from 1) adds `1 / (k + r)` to its\nfused score. Default `60`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Fused rows to return. Defaults to the largest sub-query limit.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SchemaUpdate": {
+        "additionalProperties": {
+          "$ref": "#/components/schemas/AttributeSchema"
+        },
+        "description": "Schema entries to add or update, by attribute name.",
+        "propertyNames": {
+          "type": "string"
+        },
+        "type": "object"
+      },
+      "Shard": {
+        "properties": {
+          "children": {
+            "description": "Shards this one was split into.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "created_at_ms": {
+            "description": "Creation time, in Unix milliseconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "namespaces": {
+            "description": "Namespaces the shard holds.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "owner": {
+            "description": "Writer replica that owns the shard: each writer owns one active\nshard.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "description": "Shard this one was split from.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "range": {
+            "$ref": "#/components/schemas/NamespaceRange",
+            "description": "Namespace ids the shard holds; every id belongs to exactly one\nactive shard."
+          },
+          "split_to": {
+            "description": "A writer that joined without a shard: the owner is splitting this\nshard and hands it the upper half.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ShardState"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "range",
+          "created_at_ms",
+          "namespaces"
+        ],
+        "type": "object"
+      },
+      "ShardList": {
+        "properties": {
+          "shards": {
+            "items": {
+              "$ref": "#/components/schemas/Shard"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "shards"
+        ],
+        "type": "object"
+      },
+      "ShardState": {
+        "enum": [
+          "active",
+          "retired"
+        ],
+        "type": "string"
+      },
+      "StatusOk": {
+        "properties": {
+          "status": {
+            "description": "Always `ok`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "SubQuery": {
+        "description": "One query of a multi-query batch.",
+        "properties": {
+          "aggregate_by": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Aggregate"
+            },
+            "description": "Named aggregates over every row matching `filters`, e.g.\n`{\"total\": {\"op\": \"Count\"}}`. Without `rank_by`, the response\nhas no rows.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "consistency": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Consistency"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exclude_attributes": {
+            "description": "Attributes to leave out.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "filters": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter",
+                "description": "Rows must match this filter."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "include_attributes": {
+            "description": "`true` (every attribute except `vector`, the default), `false`\n(only `id` and the score), or a list of names; list `vector`\nto return it."
+          },
+          "limit": {
+            "description": "A row count (default `10`), or `{\"total\": n, \"per\": {..}}` to\ncap rows per group, e.g. passages per document."
+          },
+          "nprobe": {
+            "description": "ANN centroids to probe. Default `limit` clamped to 10–100;\nfiltered queries that come up short are retried with more.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rank_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RankBy",
+                "description": "How to order rows. Default: ascending `id`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "top_k": {
+            "description": "Alias of a numeric `limit`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SubQueryResult": {
+        "description": "The result of one query of a batch.",
+        "properties": {
+          "aggregations": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "performance": {
+            "$ref": "#/components/schemas/Performance"
+          },
+          "rows": {
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "performance"
+        ],
+        "type": "object"
+      },
+      "Write": {
+        "description": "Changes to one namespace. Writing to a missing namespace creates it,\ntaking its dimensions from the first vector in the request, or from the\nembedding model when `schema` declares an `embed` attribute. Rows of a\nnamespace with an `embed` attribute may omit `vector`.\n\nOperations apply in the order `delete_by_filter`, `delete_documents`,\n`upsert_documents`, `upsert_rows`, `patch_rows`, `deletes`. The request\nis validated before anything is applied; each operation is atomic, the\nrequest as a whole is not.",
+        "properties": {
+          "delete_by_filter": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter",
+                "description": "Deletes every row matching this filter."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "delete_documents": {
+            "description": "Ids of documents whose passages to delete.",
+            "items": {},
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "deletes": {
+            "description": "Ids of rows to delete.",
+            "items": {},
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "distance_metric": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DistanceMetric",
+                "description": "Metric of a namespace this write creates. Must match an existing\nnamespace's metric."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "patch_rows": {
+            "description": "Partial rows merged into existing rows by `id`. `null` removes an\nattribute; rows that don't exist are skipped.",
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "schema": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeSchema"
+            },
+            "description": "Schema entries applied before the write, as in `PATCH .../schema`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "upsert_documents": {
+            "description": "Documents to insert or replace. A document's previous passages are\nreplaced, including any beyond the new passage count.",
+            "items": {
+              "$ref": "#/components/schemas/Document"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "upsert_rows": {
+            "description": "Rows to insert or replace: `{\"id\": .., \"vector\": [..], attribute:\nvalue, ..}`. `null` attributes are omitted.",
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WriteResult": {
+        "properties": {
+          "documents_deleted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "documents_upserted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rows_deleted": {
+            "description": "Rows removed by `deletes`, `delete_by_filter`, `delete_documents`,\nand stale passages of upserted documents.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rows_patched": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rows_upserted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows_upserted",
+          "rows_patched",
+          "rows_deleted",
+          "documents_upserted",
+          "documents_deleted"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "basic": {
+        "scheme": "basic",
+        "type": "http"
+      },
+      "bearer": {
+        "bearerFormat": "JWT",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Namespaced vector search with attribute filters, full-text ranking, multi-passage documents, and shard inspection.\n\nWhen authentication is configured, requests carry Basic credentials or a JWT bearer token. Namespace credentials grant read (queries, rows, metadata) or write (also creating, configuring, deleting and writing to the namespace) access to one namespace; global credentials cover every namespace and the shard listing. Namespaces must be declared, for example by a NamespaceAuthentication resource, and others answer 404. Listings show only the namespaces the caller can read.",
+    "license": {
+      "identifier": "AGPL-3.0-only",
+      "name": "AGPL-3.0-only"
+    },
+    "title": "Vector HTTP API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/-/healthy": {
+      "get": {
+        "operationId": "healthy",
+        "responses": {
+          "200": {
+            "description": "Process is running"
+          }
+        },
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/-/ready": {
+      "get": {
+        "operationId": "ready",
+        "responses": {
+          "200": {
+            "description": "Server is ready"
+          }
+        },
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/api/v1/namespaces": {
+      "get": {
+        "operationId": "list_namespaces",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespaceList"
+                }
+              }
+            },
+            "description": "Every namespace, by name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}": {
+      "delete": {
+        "operationId": "delete_namespace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusOk"
+                }
+              }
+            },
+            "description": "Namespace and all its rows deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      },
+      "get": {
+        "operationId": "get_namespace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Namespace"
+                }
+              }
+            },
+            "description": "Namespace metadata"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      },
+      "put": {
+        "operationId": "create_namespace",
+        "parameters": [
+          {
+            "description": "1–128 characters of `A-Z a-z 0-9 - _ .`",
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNamespace"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Namespace"
+                }
+              }
+            },
+            "description": "Namespace created on the shard whose range holds its id"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid name, dimensions, or schema, or an embed attribute without a matching embedding model"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The namespace exists"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The embedding provider failed while learning its dimensions"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/query": {
+      "post": {
+        "operationId": "query",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Query"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryResult"
+                }
+              }
+            },
+            "description": "Matching rows and aggregates"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid ranking, filter, or limit, or a strong query to a sharded cluster"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The embedding provider failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The replica serving the namespace is unavailable, for example while its shard splits for a new writer; retry"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "rows"
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/rows/{id}": {
+      "get": {
+        "operationId": "get_row",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Row id; passage rows are `{document}#{index}`",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Row"
+                }
+              }
+            },
+            "description": "The row"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace or row"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "rows"
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/schema": {
+      "get": {
+        "operationId": "get_schema",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaUpdate"
+                }
+              }
+            },
+            "description": "Attribute schemas by name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      },
+      "patch": {
+        "operationId": "update_schema",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SchemaUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaUpdate"
+                }
+              }
+            },
+            "description": "The updated schema"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A type change, or full-text search on a non-string"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "namespaces"
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/write": {
+      "post": {
+        "operationId": "write",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Write"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteResult"
+                }
+              }
+            },
+            "description": "Applied; visible to row reads and strong queries at once, and to eventual queries after the next flush"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid rows, types, or filter; nothing applied"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such namespace and no vector to create it from"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The embedding provider failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The replica serving the namespace is unavailable, for example while its shard splits for a new writer; retry"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "rows"
+        ]
+      }
+    },
+    "/api/v1/shards": {
+      "get": {
+        "operationId": "list_shards",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardList"
+                }
+              }
+            },
+            "description": "Every shard, active and retired"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or insufficient credentials, when authentication is configured"
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "shards"
+        ]
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {}
+            },
+            "description": "Prometheus exposition of server metrics"
+          }
+        },
+        "tags": [
+          "operations"
+        ]
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "Create, inspect, and delete namespaces",
+      "name": "namespaces"
+    },
+    {
+      "description": "Write and query rows and documents",
+      "name": "rows"
+    },
+    {
+      "description": "Inspect shards: one per writer, split as writers join",
+      "name": "shards"
+    },
+    {
+      "description": "Probes and metrics",
+      "name": "operations"
+    }
+  ]
+}

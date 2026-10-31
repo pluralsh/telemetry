@@ -1,0 +1,194 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Writing and querying vectors" };
+
+<PageHeader
+  title="Writing and querying"
+  lede="Writes upsert, patch, and delete rows and documents. Queries rank rows by vector distance, BM25, or an attribute, keep those matching a boolean filter, and can fuse several rankings into one."
+/>
+
+Examples use a namespace `articles` with 3-dimensional vectors and a server on `localhost:8080`. Every route is listed in the [API reference](/vector/api/).
+
+## Writes
+
+`POST /api/v1/namespaces/{namespace}/write` takes any combination of operations:
+
+| Field | Effect |
+| --- | --- |
+| `upsert_rows` | Insert or replace rows: `{"id": …, "vector": […], attribute: value, …}`. A replaced row loses attributes it no longer carries. In a namespace with an [`embed` attribute](/vector/embeddings/), `vector` may be omitted. |
+| `patch_rows` | Merge attributes into existing rows. `null` removes an attribute. Ids that don't exist are skipped. |
+| `deletes` | Delete rows by id. |
+| `delete_by_filter` | Delete every row matching a [filter](#filters). |
+| `upsert_documents` | Insert or replace [documents](#documents-and-passages). |
+| `delete_documents` | Delete documents, with all their passages, by id. |
+| `schema` | Declare attributes before writing, e.g. to enable `full_text_search` or `embed`. See [schemas](/vector/schema/). |
+| `distance_metric` | Metric of the namespace if this write creates it. |
+
+They apply in the order `delete_by_filter`, `delete_documents`, `upsert_documents`, `upsert_rows`, `patch_rows`, `deletes`. The whole request is parsed and type-checked first, so a malformed row or filter rejects it with `400` and changes nothing. The response counts what each operation did:
+
+```json
+{ "rows_upserted": 2, "rows_patched": 0, "rows_deleted": 1, "documents_upserted": 0, "documents_deleted": 0 }
+```
+
+### Attribute types
+
+An attribute's type is inferred from the first value written and then fixed for the namespace: `string`, `int`, `float`, `bool`, `[]string`, or `[]int`. A later value of a different type is rejected, though integers are accepted for `float` attributes. `GET /api/v1/namespaces/{namespace}/schema` shows the current schema; [schemas](/vector/schema/) covers declaring and changing it.
+
+Attribute names `id` and `vector` are reserved, as is any name starting with `$`.
+
+## Documents and passages
+
+A long text is best embedded as several passages. `upsert_documents` stores each passage as its own row, so each has its own vector and is ranked on its own:
+
+```bash
+curl -X POST localhost:8080/api/v1/namespaces/articles/write \
+  -H 'Content-Type: application/json' -d '{
+  "upsert_documents": [{
+    "id": "kb-42",
+    "attributes": { "title": "Rotating database credentials", "tags": ["security"] },
+    "passages": [
+      { "vector": [0.12, 0.88, 0.05], "body": "Credentials rotate every 30 days." },
+      { "vector": [0.31, 0.72, 0.11], "body": "Rotation restarts pods that mount the secret." }
+    ]
+  }]
+}'
+```
+
+Passage `i` of document `d` becomes row `d#i`, carrying the document's `attributes`, the passage's own attributes, and two system attributes, `$doc_id` and `$passage`. Upserting a document again replaces all its passages, including removing any beyond the new count.
+
+To return documents rather than passages, collapse by `$doc_id`. This returns the five best documents, each represented by its closest passage:
+
+```json
+{
+  "rank_by": { "op": "ANN", "vector": [0.1, 0.9, 0.0] },
+  "limit": { "total": 5, "per": { "attributes": ["$doc_id"], "limit": 1 } }
+}
+```
+
+`$doc_id` and `$passage` can be filtered on like any attribute, e.g. `{"op": "Eq", "attribute": "$doc_id", "value": "kb-42"}`.
+
+## Filters
+
+A filter is a JSON object whose `op` field names the operation. The other fields depend on the `op`: a condition on one attribute, or a combination of other filters:
+
+```json
+{
+  "op": "And",
+  "filters": [
+    { "op": "ContainsAny", "attribute": "tags", "values": ["security", "ops"] },
+    { "op": "Gte", "attribute": "year", "value": 2025 },
+    { "op": "Not", "filter": { "op": "IGlob", "attribute": "title", "pattern": "*draft*" } }
+  ]
+}
+```
+
+| `op` | Fields | Matches rows where the attribute |
+| --- | --- | --- |
+| `Eq`, `NotEq` | `attribute`, `value` | equals, or doesn't equal, the value |
+| `Lt`, `Lte`, `Gt`, `Gte` | `attribute`, `value` | compares less or greater than the value |
+| `Contains`, `NotContains` | `attribute`, `value` | (an array) has, or doesn't have, the value as an element |
+| `In`, `NotIn` | `attribute`, `values` | equals one, or none, of the values |
+| `ContainsAny`, `NotContainsAny` | `attribute`, `values` | (an array) has any, or none, of the values |
+| `Glob`, `NotGlob` | `attribute`, `pattern` | (a string) matches a glob pattern, case-sensitively |
+| `IGlob`, `NotIGlob` | `attribute`, `pattern` | (a string) matches a glob pattern, ignoring case |
+| `Exists`, `NotExists` | `attribute` | is set, or isn't |
+
+Combine filters with `{"op": "And", "filters": [...]}`, `{"op": "Or", "filters": [...]}`, and `{"op": "Not", "filter": {...}}`.
+
+- On array attributes, `Eq`, `In`, and the range operators match when **any** element does. The negated operators match when no element does.
+- Negated operators also match rows that don't have the attribute.
+- Glob patterns support `*`, `?`, character classes like `[a-z]` and `[!0-9]`, and `\` to escape. `Glob` patterns that start with a literal prefix (`"kb-*"`) only scan values with that prefix; `IGlob` scans every value of the attribute.
+- A `value` is one string, number, or boolean, and `values` a list of them. They must match the attribute's type, so `{"op": "Gt", "attribute": "year", "value": "2025"}` is a `400`. `null` is rejected too; use `Exists` or `NotExists` instead. Filtering on `id` or `vector` isn't supported.
+
+Each `op` is its own type in the [OpenAPI document](/vector/api/), such as `FilterEq` or `FilterAnd`, and `Filter` is their union, discriminated by `op`. Client generators turn that into a tagged union, or a sealed class with one subclass per operation. `rank_by` (`RankBy`) and `aggregate_by` (`Aggregate`) follow the same pattern.
+
+Every attribute is indexed, so filters are resolved from postings before any row is read.
+
+## Ranking
+
+`rank_by` sets the order of results. Without it, rows come back in ascending id order.
+
+| `rank_by` | Order |
+| --- | --- |
+| `{"op": "ANN", "vector": [...]}` | Approximate nearest neighbours, closest first |
+| `{"op": "kNN", "vector": [...]}` | Exact nearest neighbours of the rows matching the filter |
+| `{"op": "ANN", "text": "rotate credentials"}` | Either vector ranking, with the query vector [embedded](/vector/embeddings/#querying-by-text) from `text` |
+| `{"op": "BM25", "attribute": "body", "query": "rotate credentials"}` | BM25 relevance on a `full_text_search` attribute, best first |
+| `{"op": "Order", "attribute": "year", "direction": "desc"}` | Attribute value; `direction` is `asc` (the default) or `desc`. Rows without the attribute come last. |
+| `{"op": "Order", "attribute": "id"}` | Row id, ascending only |
+
+Vector rankings add `$dist` to each row, the distance under the namespace's metric (lower is closer). BM25 adds `$score`.
+
+ANN probes the nearest centroids of the index; `nprobe` overrides how many (by default the limit, clamped to 10–100). With a filter that matches 2,048 rows or fewer, ANN switches to exact kNN over those rows, so selective filters return exact results. When a less selective filter leaves fewer than `limit` results, ANN retries with more probes.
+
+Full-text search needs the attribute declared with `full_text_search` before rows are written:
+
+```json
+{ "schema": { "body": { "type": "string", "full_text_search": true } } }
+```
+
+Rows written before then aren't in the BM25 index; see [enabling full-text search](/vector/schema/#full-text-search).
+
+## Limits and projection
+
+`limit` is a row count (default 10, at most 10,000), or `{"total": n, "per": {"attributes": [...], "limit": m}}` to keep at most `m` rows per distinct combination of `attributes`, as in [collapsing passages](#documents-and-passages). `top_k` is accepted as an alias for a plain count.
+
+Rows include `id` and every attribute except `vector` by default:
+
+- `"include_attributes": ["title", "$doc_id"]` returns just those, plus `id`. Include `"vector"` to get vectors back.
+- `"include_attributes": false` returns only `id` (and `$dist` or `$score`).
+- `"exclude_attributes": ["body"]` drops attributes from the default set.
+
+## Aggregations
+
+`aggregate_by` counts the rows matching `filters`:
+
+```json
+{
+  "filters": { "op": "Contains", "attribute": "tags", "value": "security" },
+  "aggregate_by": { "matching": { "op": "Count" } }
+}
+```
+
+```json
+{ "aggregations": { "matching": 412 }, "performance": { "query_execution_ms": 0.8 } }
+```
+
+Without `rank_by`, the response has aggregations only. With it, both rows and aggregations are returned. `Count` is the only aggregate so far.
+
+## Multi-query and hybrid search
+
+Send `queries` instead of a single query to run several against one snapshot of the namespace. Each gets its own result:
+
+```json
+{
+  "queries": [
+    { "rank_by": { "op": "ANN", "vector": [0.1, 0.9, 0.0] } },
+    { "aggregate_by": { "n": { "op": "Count" } } }
+  ]
+}
+```
+
+```json
+{ "results": [ { "rows": [ … ], "performance": { … } }, { "aggregations": { "n": 1840 }, "performance": { … } } ] }
+```
+
+Add `rrf` to fuse the rankings with reciprocal rank fusion. A row ranked `r` (from 1) in a query contributes `1 / (k + r)` to its score, and rows are returned by total score, with `$score` set to it. This is the usual way to combine vector and keyword search:
+
+```json
+{
+  "queries": [
+    { "rank_by": { "op": "ANN", "vector": [0.1, 0.9, 0.0] }, "limit": 20 },
+    { "rank_by": { "op": "BM25", "attribute": "body", "query": "rotate credentials" }, "limit": 20 }
+  ],
+  "rrf": { "k": 60, "limit": 10 }
+}
+```
+
+`k` defaults to 60 and `limit` to the largest sub-query limit. Every sub-query must return rows.
+
+## Consistency
+
+A query is either `"consistency": {"level": "strong"}` or `{"level": "eventual"}`. A strong query first publishes every acknowledged write, so it sees every write that returned before it. An eventual query skips that step and reads the last published snapshot, at most one flush interval old. Multi-queries take `consistency` at the top level.
+
+Strong queries are only available in standalone deployments, where they are the default. On a [sharded Kubernetes cluster](/vector/installation/sharded/), queries are eventually consistent: the shard's reader group serves them, trailing the writer by up to the reader refresh interval as well (1 second by default), and a strong query is rejected with 400. That keeps read traffic on the readers, where it scales out. Row reads (`GET /api/v1/namespaces/{namespace}/rows/{id}`) still go to the owning writer and see writes at once.

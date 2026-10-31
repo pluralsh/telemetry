@@ -1,0 +1,55 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Vector reader/writer split" };
+
+<PageHeader
+  title="Reader/writer split"
+  lede="One writer owns the only shard, and a pool of readers serves queries from the same bucket."
+/>
+
+## How it works
+
+The writer serves the shard while it holds the shard's Kubernetes Lease. Readers open the shard read-only and follow the writer's commits every `readerRefreshIntervalSeconds`, so queries trail writes by the flush interval plus the refresh interval, about two seconds by default. Strong queries are rejected with `400`; use [Standalone](/vector/installation/standalone/) when queries must read their own writes.
+
+## Deploy
+
+It is a `Sharded` resource with one writer. Every replica opens the same shard, so it needs an `Aws`, `Azure`, or `Gcp` object store:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Vector
+metadata:
+  name: vector
+  namespace: telemetry
+spec:
+  mode: Sharded
+  config:
+    storage:
+      objectStore:
+        type: Aws
+        aws:
+          region: us-east-1
+          bucket: my-vector-bucket
+          accessKeyIDSecretRef: { name: vector-object-store, key: access-key-id }
+          secretAccessKeySecretRef: { name: vector-object-store, key: secret-access-key }
+  writer:
+    replicas: 1
+  reader:
+    replicas: 2
+    autoscaling:
+      enabled: true
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+```
+
+Then add [credentials](/vector/installation/#access).
+
+## Routing
+
+Send requests to the `vector` Service, which spreads them over the writer and readers. Any replica accepts any request and forwards it to the one that can serve it. Clients should retry `503` responses, returned while the writer restarts.
+
+## Operating it
+
+- **Queries:** readers scale on CPU between `replicas` and `maxReplicas`, and can be added or removed at any time.
+- **Writer restarts:** writes to the shard fail until the restarted pod takes its Lease back, after it expires (`leaseDurationSeconds`, 15 by default). Readers keep serving queries.
+- **Outgrowing one writer:** raise `spec.writer.replicas` to become a [sharded](/vector/installation/sharded/) deployment.

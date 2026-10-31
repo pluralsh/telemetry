@@ -61,6 +61,10 @@ jobs:
             image: ghcr.io/pluralsh/pseudofs
             context: .
             file: crates/pseudofs-server/Dockerfile
+          - name: vector
+            image: ghcr.io/pluralsh/vector
+            context: .
+            file: crates/vector/Dockerfile
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
             context: go/operator
@@ -127,6 +131,8 @@ jobs:
             image: ghcr.io/pluralsh/traces
           - name: pseudofs
             image: ghcr.io/pluralsh/pseudofs
+          - name: vector
+            image: ghcr.io/pluralsh/vector
           - name: telemetry-operator
             image: ghcr.io/pluralsh/telemetry-operator
     steps:

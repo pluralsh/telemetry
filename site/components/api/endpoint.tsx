@@ -1,4 +1,4 @@
-import type { ProductId } from "@/lib/nav";
+import type { ApiProduct } from "@/lib/nav";
 import type { Operation } from "@/lib/openapi";
 import { curlFor, responseExampleFor } from "@/lib/api-examples";
 import { CodeBlock } from "../code-block";
@@ -52,7 +52,7 @@ function MediaChips({ types }: { types: string[] }) {
 
 const IN_LABEL: Record<string, string> = { path: "Path parameters", query: "Query parameters", header: "Headers" };
 
-export async function Endpoint({ product, op }: { product: ProductId; op: Operation }) {
+export async function Endpoint({ product, op }: { product: ApiProduct; op: Operation }) {
   const groups = (["path", "query", "header"] as const)
     .map((where) => ({ where, params: op.params.filter((p) => p.in === where) }))
     .filter((g) => g.params.length);

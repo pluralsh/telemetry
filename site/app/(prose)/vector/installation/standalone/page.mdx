@@ -1,0 +1,69 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Standalone Vector" };
+
+<PageHeader
+  title="Standalone"
+  lede="One process that writes and queries a single shard. The only mode where queries can read their own writes."
+/>
+
+## On Kubernetes
+
+`Standalone` is the default mode. With no object store configured, data lives on the pod's data volume at `/var/lib/vector`, which the operator retains when the resource is deleted:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Vector
+metadata:
+  name: vector
+  namespace: telemetry
+spec:
+  writer:
+    dataVolume:
+      persistentVolumeClaim:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 50Gi } }
+```
+
+To keep the data in a bucket instead, add `spec.config.storage.objectStore` as in the [split guide](/vector/installation/read-write/). Send requests to `http://vector.telemetry:8080`, then add [credentials](/vector/installation/#access).
+
+## As a process
+
+The `cluster` subcommand runs one standalone server from a config file:
+
+```yaml
+# cluster.yaml
+storage:
+  type: SlateDb
+  path: vector
+  object_store:
+    type: Aws
+    region: us-east-1
+    bucket: my-vector-bucket
+flush_interval: 1        # seconds between flushes of buffered writes
+index:
+  split_threshold_vectors: 150   # split a centroid's posting list above this
+  merge_threshold_vectors: 50    # merge it into a neighbour below this
+# Optional; without it every request is allowed.
+auth:
+  global:
+    write:
+      - { type: basic, username: admin, password: { source: env, name: VECTOR_ADMIN_PASSWORD } }
+namespaces:
+  - name: search
+    auth:
+      read:
+        - { type: basic, username: search, password: { source: file, path: /etc/vector/secrets/search } }
+```
+
+```bash
+plural-vector --port 8080 cluster --config cluster.yaml
+```
+
+`object_store.type` is one of `Aws`, `Gcp`, `Azure`, `Local`, or `InMemory`. `storage.type: InMemory` keeps everything in memory, for tests. One standalone process owns a storage root at a time.
+
+The binary keeps two older single-collection modes, `vector` and `reader`, which serve the original `/api/v1/vector/*` routes. New deployments should use `cluster`.
+
+## Limits
+
+One process serves every write and query, so it is a single point of failure, and query load competes with ingest. When queries need their own capacity, move to the [reader/writer split](/vector/installation/read-write/); its queries are eventually consistent.

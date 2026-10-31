@@ -1,0 +1,38 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Vector
+metadata:
+  name: vector-sample
+spec:
+  mode: Sharded
+  version: 0.1.0
+  image:
+    repository: ghcr.io/pluralsh/vector
+    pullPolicy: IfNotPresent
+  config:
+    storage:
+      path: vector
+      objectStore:
+        type: Aws
+        aws:
+          bucket: vector
+          region: us-east-1
+          accessKeyIDSecretRef:
+            name: vector-object-store
+            key: access-key-id
+          secretAccessKeySecretRef:
+            name: vector-object-store
+            key: secret-access-key
+    # Lets namespaces embed a text attribute and query by text.
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      apiKeySecretRef:
+        name: vector-embedding
+        key: api-key
+  writer:
+    # Each writer owns one shard. Adding writers splits shards for them;
+    # writers can't be removed.
+    replicas: 2
+  reader:
+    # Each active shard gets its own reader group of this many replicas.
+    replicas: 2

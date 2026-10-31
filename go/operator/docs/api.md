@@ -16,6 +16,8 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 - [PseudoFS](#pseudofs)
 - [ShardMap](#shardmap)
 - [Traces](#traces)
+- [Vector](#vector)
+- [VectorTopology](#vectortopology)
 
 
 
@@ -71,6 +73,7 @@ _Appears in:_
 - [LogsConfigSpec](#logsconfigspec)
 - [MetricsConfigSpec](#metricsconfigspec)
 - [TracesConfigSpec](#tracesconfigspec)
+- [VectorConfigSpec](#vectorconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -199,6 +202,23 @@ deletes every object under it when the BucketCleaner is deleted.
 | `spec` _[BucketCleanerSpec](#bucketcleanerspec)_ |  |  |  |
 
 
+#### BucketCleanerDataStoreReference
+
+
+
+
+
+
+
+_Appears in:_
+- [BucketCleanerSpec](#bucketcleanerspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `kind` _string_ |  |  | Enum: [Metrics Logs Traces Vector] <br /> |
+| `name` _string_ |  |  | MinLength: 1 <br /> |
+
+
 #### BucketCleanerSpec
 
 
@@ -212,9 +232,10 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `objectStore` _[ObjectStoreSpec](#objectstorespec)_ | ObjectStore is the bucket holding the tracked data, in the same form as<br />a datastore's spec.config.storage.objectStore. Credential Secrets are<br />read from the BucketCleaner's namespace by the operator itself; when<br />they are omitted the operator's own cloud identity is used. |  |  |
-| `subPath` _string_ | SubPath is the key prefix within the bucket, typically a datastore's<br />spec.config.storage.path. It is treated as a directory: "logs" covers<br />"logs/..." but not "logs-archive/...". Every object under it is deleted<br />when the BucketCleaner is deleted. |  | MinLength: 1 <br />Pattern: `[^/]` <br /> |
+| `objectStore` _[ObjectStoreSpec](#objectstorespec)_ | ObjectStore is the bucket holding the tracked data, in the same form as<br />a datastore's spec.config.storage.objectStore. Credential Secrets are<br />read from the BucketCleaner's namespace by the operator itself; when<br />they are omitted the operator's own cloud identity is used. Defaults to<br />the dataStoreRef's spec.config.storage.objectStore. |  |  |
+| `subPath` _string_ | SubPath is the key prefix within the bucket, typically a datastore's<br />spec.config.storage.path. It is treated as a directory: "logs" covers<br />"logs/..." but not "logs-archive/...". Every object under it is deleted<br />when the BucketCleaner is deleted. Defaults to the dataStoreRef's<br />spec.config.storage.path, or the product name when that is unset. |  | MinLength: 1 <br />Pattern: `[^/]` <br /> |
 | `checkIntervalSeconds` _integer_ | CheckIntervalSeconds is how often bucket access is re-verified. | 300 | Minimum: 10 <br /> |
+| `dataStoreRef` _[BucketCleanerDataStoreReference](#bucketcleanerdatastorereference)_ | DataStoreRef is the datastore, in the BucketCleaner's namespace, that<br />writes under subPath. Omitted objectStore and subPath settings are<br />taken from its storage while it exists. Deletion waits until the<br />datastore and its pods are gone, so no replica writes objects after the<br />prefix is emptied, and data is never deleted while the datastore exists. |  |  |
 
 
 
@@ -321,7 +342,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `kind` _string_ |  |  | Enum: [Metrics Logs Traces] <br /> |
+| `kind` _string_ |  |  | Enum: [Metrics Logs Traces Vector] <br /> |
 | `name` _string_ |  |  | MinLength: 1 <br /> |
 
 
@@ -443,6 +464,7 @@ _Appears in:_
 - [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
 - [TracesSpec](#tracesspec)
+- [VectorSpec](#vectorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -480,6 +502,7 @@ _Appears in:_
 - [LogsSpec](#logsspec)
 - [MetricsSpec](#metricsspec)
 - [TracesSpec](#tracesspec)
+- [VectorSpec](#vectorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -821,7 +844,7 @@ _Appears in:_
 | `username` _string_ |  |  | MinLength: 1 <br /> |
 | `permission` _string_ |  |  | Enum: [read write] <br /> |
 | `secretKeyRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
-| `usageReportingEndpoint` _string_ | UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or<br />http://host:port) implementing Plural Console's PluralServer.MeterMetrics.<br />Ingested bytes for the namespace are buffered and periodically reported<br />to it. When several NamespaceAuthentications for the same datastore and<br />namespace set different endpoints, the lexicographically smallest wins. |  | MaxLength: 253 <br />Pattern: `^(http://)?[A-Za-z0-9.-]+(:[0-9]\{1,5\})?$` <br /> |
+| `usageReportingEndpoint` _string_ | UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or<br />http://host:port) implementing Plural Console's PluralServer.MeterMetrics.<br />Ingested bytes for the namespace are buffered and periodically reported<br />to it. When several NamespaceAuthentications for the same datastore and<br />namespace set different endpoints, the lexicographically smallest wins.<br />Vector doesn't report usage. |  | MaxLength: 253 <br />Pattern: `^(http://)?[A-Za-z0-9.-]+(:[0-9]\{1,5\})?$` <br /> |
 
 
 
@@ -836,6 +859,7 @@ _Appears in:_
 
 _Appears in:_
 - [BucketCleanerSpec](#bucketcleanerspec)
+- [BucketCleanerStatus](#bucketcleanerstatus)
 - [StorageSpec](#storagespec)
 
 | Field | Description | Default | Validation |
@@ -901,6 +925,21 @@ _Appears in:_
 | `Delete` |  |
 
 
+#### ProductMode
+
+_Underlying type:_ _string_
+
+
+
+
+
+_Appears in:_
+- [VectorSpec](#vectorspec)
+
+| Field | Description |
+| --- | --- |
+| `Standalone` |  |
+| `Sharded` |  |
 
 
 #### PseudoFS
@@ -1088,6 +1127,7 @@ _Appears in:_
 - [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
 - [TracesSpec](#tracesspec)
+- [VectorSpec](#vectorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1106,6 +1146,7 @@ _Appears in:_
 - [LogsSpec](#logsspec)
 - [MetricsSpec](#metricsspec)
 - [TracesSpec](#tracesspec)
+- [VectorSpec](#vectorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1239,6 +1280,7 @@ _Appears in:_
 - [MetricsConfigSpec](#metricsconfigspec)
 - [PseudoFSConfigSpec](#pseudofsconfigspec)
 - [TracesConfigSpec](#tracesconfigspec)
+- [VectorConfigSpec](#vectorconfigspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -1362,6 +1404,203 @@ _Appears in:_
 
 
 
+#### Vector
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `Vector` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[VectorSpec](#vectorspec)_ |  |  |  |
+
+
+#### VectorConfigSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [VectorSpec](#vectorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `storage` _[StorageSpec](#storagespec)_ |  | \{ path:vector \} |  |
+| `flushIntervalSeconds` _integer_ | FlushIntervalSeconds is how often namespaces flush buffered writes. | 1 | Minimum: 1 <br /> |
+| `readerRefreshIntervalSeconds` _integer_ | ReaderRefreshIntervalSeconds is how often readers pick up their<br />writer's changes, which bounds the staleness of eventual reads. | 1 | Minimum: 1 <br /> |
+| `leaseDurationSeconds` _integer_ | LeaseDurationSeconds is the lifetime of shard and coordinator leases:<br />how long a shard stays unserved after its writer dies. | 15 | Minimum: 3 <br /> |
+| `index` _[VectorIndexSpec](#vectorindexspec)_ |  |  |  |
+| `auth` _[AuthSpec](#authspec)_ | Auth configures credentials, as for the other datastores. Unless<br />unauthenticated is set, only declared namespaces exist: those of<br />namespaces and of NamespaceAuthentications referencing this Vector.<br />Namespace read access covers queries, rows and metadata; write access<br />also covers creating, configuring, deleting and writing to the<br />namespace. Shard listing needs global credentials.<br />Credential changes apply without restarting pods. |  |  |
+| `namespaces` _string array_ | Namespaces are declared without namespace credentials, for global<br />credentials or JWTs to use. |  |  |
+| `embedding` _[VectorEmbeddingSpec](#vectorembeddingspec)_ | Embedding configures the model that embeds namespaces' embed<br />attributes and query texts. Changing it restarts the pods; namespaces<br />keep the model they first embedded with. |  |  |
+
+
+#### VectorEmbeddingSpec
+
+
+
+VectorEmbeddingSpec is an embedding model served by a provider API.
+
+
+
+_Appears in:_
+- [VectorConfigSpec](#vectorconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `provider` _string_ | Provider is the API: openai (or an OpenAI-compatible endpoint, such<br />as Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon<br />Bedrock's Titan Text Embeddings v2). |  | Enum: [openai cohere gemini bedrock] <br /> |
+| `model` _string_ | Model is the provider's model name, e.g. text-embedding-3-small or<br />amazon.titan-embed-text-v2:0. |  | MinLength: 1 <br /> |
+| `apiKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ | APIKeySecretRef holds the provider API key. Rotating the Secret<br />applies without restarting pods. Bedrock instead uses the pods' AWS<br />credentials: an IAM role through the service account, or a Bedrock<br />API key in AWS_BEARER_TOKEN_BEDROCK. |  |  |
+| `endpoint` _string_ | Endpoint replaces the provider's API root, e.g.<br />http://ollama.ai.svc:11434/v1. |  |  |
+| `region` _string_ | Region is the AWS region of the Bedrock runtime. Without it, the<br />region of the pods' AWS config (AWS_REGION). |  | MinLength: 1 <br /> |
+| `dimensions` _integer_ | Dimensions asks models that can shorten their vectors for this many<br />dimensions: OpenAI's text-embedding-3 models, Gemini, and Titan v2<br />(256, 512 or 1024). |  | Maximum: 65535 <br />Minimum: 1 <br /> |
+| `batchSize` _integer_ | BatchSize is the most texts sent in one provider request. The server<br />default is 96. |  | Minimum: 1 <br /> |
+| `timeoutSeconds` _integer_ | TimeoutSeconds bounds each provider request. The server default is<br />30. |  | Minimum: 1 <br /> |
+| `cacheSize` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#quantity-resource-api)_ | CacheSize is the memory each replica spends caching embeddings, so<br />repeated texts and queries skip the provider. 0 disables the cache.<br />Without it, 4% of what each component's memory limit leaves after<br />headroom and reservations, and at least 16Mi. |  |  |
+
+
+#### VectorIndexSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [VectorConfigSpec](#vectorconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `splitThresholdVectors` _integer_ | SplitThresholdVectors is the posting-list size at which a centroid<br />splits. The server default is 150. |  | Minimum: 2 <br /> |
+| `mergeThresholdVectors` _integer_ | MergeThresholdVectors is the posting-list size below which a centroid<br />merges into its neighbours. The server default is 50. |  | Minimum: 1 <br /> |
+
+
+#### VectorNamespaceRange
+
+
+
+VectorNamespaceRange is the namespace ids [start, end) a shard holds, as
+16 hex digits. An absent end extends to the end of the id space.
+
+
+
+_Appears in:_
+- [VectorShard](#vectorshard)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `start` _string_ |  |  | Pattern: `^[0-9a-f]\{16\}$` <br /> |
+| `end` _string_ |  |  | Pattern: `^[0-9a-f]\{16\}$` <br /> |
+
+
+#### VectorShard
+
+
+
+
+
+
+
+_Appears in:_
+- [VectorTopologySpec](#vectortopologyspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `id` _integer_ |  |  | Minimum: 0 <br /> |
+| `state` _string_ |  |  | Enum: [active retired] <br /> |
+| `range` _[VectorNamespaceRange](#vectornamespacerange)_ |  |  |  |
+| `owner` _string_ | Owner is the writer pod that owns the shard. Each writer owns one<br />active shard. |  |  |
+| `split_to` _string_ | SplitTo is a writer pod without a shard that the owner is splitting<br />this shard for: the writer takes the upper half of the range. |  |  |
+| `parent` _integer_ | Parent is the shard this one was split from. |  |  |
+| `children` _integer array_ | Children are the shards this one was split into. |  |  |
+| `created_at_ms` _integer_ |  |  |  |
+
+
+#### VectorSpec
+
+
+
+VectorSpec defines the desired state of Vector.
+
+In Sharded mode each writer replica owns one shard, held with a Lease, and
+reader groups serve eventually consistent queries, one group per active
+shard by default. Adding writers splits shards for them: the elected
+writer picks the widest shard for each new writer once its pod is ready,
+and the shard's owner splits it with SlateDB clones, handing half its
+namespaces to the new writer without copying data. Writers can't be
+removed, since shards don't merge; the operator keeps the writer
+StatefulSet at one replica per shard. Any replica accepts any request and
+forwards it to the replica that can serve it.
+
+
+
+_Appears in:_
+- [Vector](#vector)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[ProductMode](#productmode)_ |  | Standalone | Enum: [Standalone Sharded] <br /> |
+| `version` _string_ | Version is the Vector container image tag. |  | Pattern: `^(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)\.(0\|[1-9][0-9]*)(-((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0\|[1-9][0-9]*)\|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$` <br /> |
+| `image` _[ImageSpec](#imagespec)_ |  | \{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/vector \} |  |
+| `config` _[VectorConfigSpec](#vectorconfigspec)_ |  |  |  |
+| `writer` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `reader` _[WorkloadSpec](#workloadspec)_ |  |  |  |
+| `service` _[ServiceSpec](#servicespec)_ |  | \{ httpPort:8080 type:ClusterIP \} |  |
+| `ingress` _[IngressSpec](#ingressspec)_ | Ingress exposes the API, which any replica serves, at<br />\{pathPrefix\}/api on the hostname. With a pathPrefix the servers serve<br />the API under it too, so the Ingress needs no rewrite and the<br />hostname can be shared with other services. Changing pathPrefix<br />restarts the pods. |  |  |
+| `serviceAccount` _[ServiceAccountSpec](#serviceaccountspec)_ |  |  |  |
+
+
+
+
+#### VectorTopology
+
+
+
+VectorTopology is the Schema for a Vector cluster's shard topology.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `VectorTopology` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[VectorTopologySpec](#vectortopologyspec)_ |  |  |  |
+
+
+#### VectorTopologySpec
+
+
+
+VectorTopologySpec is the authoritative shard layout of a Vector cluster.
+The elected writer and the writer splitting a shard change it with
+resourceVersion-based compare-and-swap; every replica follows it by watch.
+
+
+
+_Appears in:_
+- [VectorTopology](#vectortopology)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `generation` _integer_ |  |  | Minimum: 1 <br /> |
+| `next_shard_id` _integer_ |  |  | Minimum: 1 <br /> |
+| `shards` _[VectorShard](#vectorshard) array_ |  |  |  |
+
+
 #### VolumeSpec
 
 
@@ -1392,6 +1631,7 @@ _Appears in:_
 - [MetricsSpec](#metricsspec)
 - [PseudoFSSpec](#pseudofsspec)
 - [TracesSpec](#tracesspec)
+- [VectorSpec](#vectorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |

@@ -33,7 +33,7 @@ export const metadata: Metadata = {
 
 function buildApiNav(): ApiNav {
   return Object.fromEntries(
-    PRODUCT_IDS.map((id) => [
+    [...PRODUCT_IDS, "vector" as const].map((id) => [
       id,
       loadSpec(id).tags.map((t) => ({
         tag: t.name,

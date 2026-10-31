@@ -1,0 +1,31 @@
+import { PageHeader } from "@/components/doc-page";
+import { VectorShardSplits } from "@/components/diagrams/vector-shard-splits";
+
+export const metadata = { title: "Vector sharding and scaling" };
+
+<PageHeader
+  title="Sharding and scaling"
+  lede="Each writer owns one shard: a SlateDB database holding a range of namespace ids. Adding a writer splits a shard without copying data; readers scale each shard's queries."
+/>
+
+<VectorShardSplits />
+
+## Writers
+
+- **Placement is by namespace.** A namespace's id is a hash of its name, and all of its rows, indexes and schema live on the one shard whose range holds that id. A single namespace is limited to what one writer can index, so split one that outgrows it, for example by tenant.
+- **Splits are instant.** The children are SlateDB clones of a checkpoint and share the parent's files, which compaction later rewrites. The split shard's namespaces pause for a few seconds; nothing else does. Until the topology commits, the parent stays with its owner.
+- **Shards never merge.** Lowering `writer.replicas` is rejected with `WriterScaleDownRejected`, so add writers for sustained write or indexing load, not bursts.
+
+## Readers
+
+Each active shard gets a reader group, `{name}-reader-{shard}`, which opens it read-only and follows its commits every `readerRefreshIntervalSeconds`. Queries trail writes by about two seconds by default. Readers hold only caches, so `reader.replicas` can change freely; with `reader.readGroups.enabled: false`, one group serves every shard.
+
+| To scale | Change |
+| --- | --- |
+| Writes and indexing | `writer.replicas` up, which splits shards and can't be undone |
+| Queries | `reader.replicas`, per reader group |
+| Read-your-writes queries | A [Standalone](/vector/installation/standalone/) deployment |
+
+## Routing
+
+Any replica accepts any request and forwards it, using the topology, to the shard's writer (writes, row reads, schema changes) or reader group (queries). Clients only need the `{name}` Service. While a writer restarts or its shard splits, forwarded requests retry for about two seconds and then return `503`, which clients should retry. `GET /api/v1/shards` lists every shard, active and retired, with its range and owner.

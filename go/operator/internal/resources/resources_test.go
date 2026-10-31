@@ -243,6 +243,23 @@ func TestIngressUsesStandaloneServiceAndTLSDefaults(t *testing.T) {
 	assertIngressPath(t, paths, "/metrics/read", testMetricsName)
 }
 
+func TestVectorIngressRoutesTheWholeAPIToTheEntryService(t *testing.T) {
+	for _, mode := range []telemetryv1alpha1.ProductMode{telemetryv1alpha1.ProductModeStandalone, telemetryv1alpha1.ProductModeSharded} {
+		vector := &telemetryv1alpha1.Vector{
+			ObjectMeta: metav1.ObjectMeta{Name: "vector", Namespace: testNamespace},
+			Spec: telemetryv1alpha1.VectorSpec{
+				Mode:    mode,
+				Ingress: telemetryv1alpha1.IngressSpec{Enabled: true, Hostname: "telemetry.example.com", PathPrefix: "/vector"},
+			},
+		}
+		paths := Ingress(vector).Spec.Rules[0].HTTP.Paths
+		if len(paths) != 1 {
+			t.Fatalf("%s vector ingress paths = %#v", mode, paths)
+		}
+		assertIngressPath(t, paths, "/vector/api", "vector")
+	}
+}
+
 func TestIngressRoutesShardedWritesAndReads(t *testing.T) {
 	metrics := &telemetryv1alpha1.Metrics{
 		ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testNamespace},

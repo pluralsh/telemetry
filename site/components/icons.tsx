@@ -5,6 +5,7 @@ export const SPACE_COLORS: Record<SpaceId, string> = {
   metrics: "var(--ink)",
   logs: "var(--ink)",
   traces: "var(--ink)",
+  vector: "var(--ink)",
 };
 
 type IconProps = { size?: number; className?: string };
@@ -43,6 +44,14 @@ export const GLYPHS: Record<SpaceId, React.ReactNode> = {
       <circle cx="10" cy="5.5" r="1.25" fill="currentColor" />
       <circle cx="13" cy="12" r="1.25" fill="currentColor" />
       <circle cx="16" cy="18.5" r="1.25" fill="currentColor" />
+    </>
+  ),
+  vector: (
+    <>
+      <path d="M4 20 18.5 5.5M13 5.5h5.5V11" {...stroke} />
+      <circle cx="4" cy="20" r="1.25" fill="currentColor" />
+      <circle cx="9" cy="8" r="1.25" fill="currentColor" />
+      <circle cx="16" cy="16" r="1.25" fill="currentColor" />
     </>
   ),
   overview: null,

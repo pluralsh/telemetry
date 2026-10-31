@@ -1,0 +1,33 @@
+import { PageHeader } from "@/components/doc-page";
+import { InstallSpec, NextSteps, VerifyInstall } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Logs reader/writer split" };
+
+<PageHeader
+  title="Reader/writer split"
+  lede="One writer ingests into a shared bucket, and a pool of readers serves queries from it. Queries scale without touching ingest."
+/>
+
+## How it works
+
+The writer owns the database's one shard, holds it with a Kubernetes Lease, and flushes to object storage every `flushIntervalSeconds`. Readers open the same shard read-only from the bucket and follow the writer's flushes, so queries trail ingest by about that interval. Readers keep no state beyond their cache, so they can be added, removed, or autoscaled at any time.
+
+## Deploy
+
+It is a `Sharded` resource with one writer, and needs a bucket every pod can reach: [grant S3 access](/logs/installation/#grant-s3-access) first. Hover a field to see what it does:
+
+<InstallSpec product="logs" mode="read-write" />
+
+Apply it with `kubectl apply -f logs.yaml`, then add [credentials](/logs/installation/#access) and [connect your tools](/logs/installation/#connect-your-tools) to the `logs-writer` and `logs-reader` Services.
+
+<VerifyInstall product="logs" />
+
+An empty `data` array is expected until the collector has sent something.
+
+## Operating it
+
+- **Queries:** readers scale on CPU between `replicas` and `maxReplicas`. Raise reader memory and cache for heavier queries.
+- **Writer restarts:** while the writer is down, ingest fails and readers keep serving what was flushed. The restarted pod takes its shard back once the Lease expires (`spec.config.sharding.leaseDurationSeconds`, 15 by default).
+- **Outgrowing one writer:** raise `spec.writer.replicas` to become a [sharded](/logs/installation/sharded/) deployment.
+
+<NextSteps product="logs" links={["sharded", "architecture"]} />

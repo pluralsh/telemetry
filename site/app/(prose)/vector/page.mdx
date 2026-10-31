@@ -1,0 +1,70 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Vector" };
+
+<PageHeader
+  title="Vector"
+  lede="A turbopuffer-style vector database on SlateDB. Namespaces hold rows of vectors and typed attributes, queried by approximate or exact nearest neighbours, BM25, and boolean filters, with all data on object storage."
+/>
+
+## Concepts
+
+- **Namespace.** An independent collection with its own dimensions, distance metric (`cosine_distance`, `euclidean_squared`, or `dot_product`), attribute schema, and vector index. Use one per tenant or corpus. Writing to a namespace that doesn't exist creates it.
+- **Row.** An `id` (a string or non-negative integer up to 256 bytes), a `vector`, and any number of attributes. Attributes are `string`, `int`, `float`, `bool`, `[]string`, or `[]int`; types are inferred from the first value written and then fixed.
+- **Document.** A row group for long texts: each passage is its own row with its own vector, sharing the document's attributes. Queries collapse passages back to documents with [`limit.per`](/vector/queries/#documents-and-passages).
+- **Shard.** One SlateDB database holding a contiguous range of namespace ids. Every namespace lives on exactly one shard, and each writer owns exactly one shard. A writer added to the cluster gets its shard by splitting an existing one in two.
+
+Namespaces are schemaless by default: every attribute is indexed for filtering, so any attribute can appear in [`filters`](/vector/queries/#filters) without declaring it first. A [schema](/vector/schema/) is declared only to index `string` attributes for BM25 with `full_text_search`, or to have the server [embed](/vector/embeddings/) one into each row's vector.
+
+## Architecture
+
+`plural-vector cluster` serves the [HTTP API](/vector/api/) for every namespace, either as one standalone process or as a set of [replicas on Kubernetes](#running-on-kubernetes). Its storage root on object storage holds one database per shard:
+
+```text
+{path}/catalog          the topology, for a standalone server
+{path}/shards/000000    shard 0
+{path}/shards/000001    shard 1
+…
+```
+
+The topology lists every shard with its state, namespace-id range, and owner. A namespace's id is a hash of its name, so the topology alone says which shard holds a namespace: the active shard whose range contains its id. Each shard database stores the metadata of its own namespaces next to their data. A standalone server keeps the topology in its catalog database; on Kubernetes it lives in a `VectorTopology` resource.
+
+### Write path
+
+1. A write is validated in full (ids, vector dimensions, attribute types, filters) before anything is applied.
+2. Its rows are applied to the namespace's in-memory buffer, assigned internal ids, and indexed: vectors into the SPANN-style centroid index, attributes into per-value postings, and `full_text_search` attributes into BM25 term postings.
+3. The response returns. Every flush interval (1 second by default), buffered writes are committed to the shard's SlateDB database in one atomic batch.
+
+### Read path
+
+1. A strongly consistent query first publishes acknowledged writes so it reads its own writes. That is the default for a standalone server; a sharded cluster serves only [eventually consistent](/vector/queries/#consistency) queries, which read the last published snapshot.
+2. The filter is resolved to a bitmap of matching rows from the attribute postings.
+3. ANN queries probe the nearest centroids and score their posting lists. When a filter matches 2,048 rows or fewer, exact kNN over those rows is cheaper and is used instead. Filtered ANN queries that come up short retry with four times the probes.
+4. Rows are loaded, collapsed per group if `limit.per` is set, and projected to the requested attributes.
+
+### Storage layout
+
+Within a shard, keys are grouped by segment (rows and attributes, the vector index, full-text postings), then by the namespace's 8-byte id, a hash of its name. A namespace's data is therefore one contiguous key range per segment:
+
+```text
+[subsystem | segment | version | namespace id (8 B) | record tag | record key…]
+```
+
+Deleting a namespace deletes every key in those ranges, and compaction reclaims the space. Splits cut along the same ranges.
+
+## Sharding
+
+Every writer owns exactly one active shard, and a standalone server is a single writer with a single shard. Adding writers splits existing shards onto them with SlateDB clones, so no data is copied; shards never merge, so writers can't be removed. Readers serve queries per shard and scale independently. [Sharding and scaling](/vector/sharding/) covers splits, reader groups, routing, and when to add each kind of replica.
+
+## Running it
+
+Vector runs as one standalone process, or on Kubernetes as a `Vector` resource the telemetry operator manages. [Installation](/vector/installation/) compares the three deployment modes: [standalone](/vector/installation/standalone/), a [reader/writer split](/vector/installation/read-write/) on a shared bucket, and [sharded](/vector/installation/sharded/). Queries are eventually consistent outside Standalone mode; see [consistency](/vector/queries/#consistency).
+
+## Next steps
+
+- [Installation](/vector/installation/): deployment modes, credentials, and the Helm chart.
+- [Writing and querying](/vector/queries/): writes, documents, the filter language, ranking, and multi-query fusion.
+- [Schemas](/vector/schema/): inferred types, declaring attributes, and what can change.
+- [Embeddings](/vector/embeddings/): embedding rows and query texts with a hosted model.
+- [Sharding and scaling](/vector/sharding/): shard splits, adding writers and readers, and routing.
+- [API reference](/vector/api/): every route with request and response schemas.

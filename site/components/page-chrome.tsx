@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { Fragment } from "react";
 import { usePathname } from "next/navigation";
-import { PRODUCTS, REPO_URL, navFor, spaceFromPath } from "@/lib/nav";
+import { PRODUCTS, REPO_URL, VECTOR, flatItems, navFor, spaceFromPath } from "@/lib/nav";
 
 function norm(p: string) {
   return p.endsWith("/") ? p : p + "/";
@@ -14,11 +14,17 @@ type Crumb = { label: string; href?: string };
 function crumbsFor(pathname: string): Crumb[] {
   const space = spaceFromPath(pathname);
   const crumbs: Crumb[] = [{ label: "Docs", href: "/" }];
-  if (space !== "overview") crumbs.push({ label: PRODUCTS[space].name, href: `/${space}/` });
+  if (space !== "overview") crumbs.push({ label: space === "vector" ? VECTOR.name : PRODUCTS[space].name, href: `/${space}/` });
   for (const g of navFor(space)) {
     const item = g.items.find((i) => norm(i.href) === pathname);
     if (item) {
       crumbs.push({ label: g.title }, { label: item.title });
+      break;
+    }
+    const parent = g.items.find((i) => i.children?.some((c) => norm(c.href) === pathname));
+    if (parent) {
+      const child = parent.children!.find((c) => norm(c.href) === pathname)!;
+      crumbs.push({ label: g.title }, { label: parent.title, href: parent.href }, { label: child.title });
       break;
     }
   }
@@ -63,7 +69,7 @@ export function Breadcrumbs() {
 /** Previous/next walk the sidebar in reading order within the current space. */
 export function PrevNext() {
   const pathname = norm(usePathname());
-  const flat = navFor(spaceFromPath(pathname)).flatMap((g) => g.items);
+  const flat = flatItems(navFor(spaceFromPath(pathname)));
   const idx = flat.findIndex((i) => norm(i.href) === pathname);
   if (idx < 0) return null;
   const prev = flat[idx - 1];

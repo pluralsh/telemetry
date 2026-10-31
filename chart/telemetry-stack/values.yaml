@@ -104,3 +104,54 @@ products:
     #   namespace: default
     #   username: plrl
     #   permission: write
+
+  # The Vector database, served at {pathPrefix}/api on the shared hostname
+  # and in-cluster through the `{name}` Service on port 8080. Only namespaces
+  # with an authentication entry (or listed in spec.config.namespaces) exist;
+  # write permission lets their credentials create and configure them.
+  vector:
+    enabled: false
+    name: vector
+    spec:
+      mode: Sharded
+      config:
+        storage:
+          path: vector
+      ingress:
+        pathPrefix: /vector
+      writer:
+        replicas: 1
+      reader:
+        # Replicas per reader group; there is one group per shard.
+        replicas: 1
+    authentications: []
+    # - name: vector-search
+    #   namespace: search
+    #   username: plrl
+    #   permission: write
+
+# BucketCleaners delete a datastore's objects from the bucket when the
+# release is uninstalled (or the product is disabled). When enabled, every
+# enabled product gets one, named `{name}-data`, for its storage path. It
+# waits for the datastore and its pods to be gone before deleting anything.
+# The telemetry-operator must still be running when the release is removed,
+# and the object store must be Aws, Azure or Gcp.
+bucketCleaners:
+  enabled: false
+  # How often bucket access is re-verified; the operator defaults to 300.
+  checkIntervalSeconds: null
+  # Further prefixes to clean up. With a dataStoreRef, omitted objectStore
+  # and subPath settings come from that datastore's storage; without one,
+  # subPath is required and objectStore defaults to global.storage.objectStore.
+  additional: []
+  # - name: logs-archive
+  #   subPath: logs-archive
+  #   objectStore:
+  #     type: Aws
+  #     aws:
+  #       region: us-east-2
+  #       bucket: plrl-telemetry-archive
+  # - name: legacy-metrics
+  #   dataStoreRef:
+  #     kind: Metrics
+  #     name: legacy

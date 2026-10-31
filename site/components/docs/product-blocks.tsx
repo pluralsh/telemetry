@@ -16,15 +16,14 @@ import {
   collectorConfig,
   grafanaDatasource,
   verifyCommands,
-  productionSpec,
-  quickstartSpec,
+  installSpec,
   specNotes,
+  type InstallMode,
   type KeyField,
 } from "@/lib/product-docs";
 
-export function InstallSpec({ product, variant }: { product: ProductId; variant: "quickstart" | "production" }) {
-  const code = variant === "quickstart" ? quickstartSpec(product) : productionSpec(product);
-  return <AnnotatedYaml code={code} notes={specNotes(product)} title={`${product}.yaml`} />;
+export function InstallSpec({ product, mode }: { product: ProductId; mode: InstallMode }) {
+  return <AnnotatedYaml code={installSpec(product, mode)} notes={specNotes(product)} title={`${product}.yaml`} />;
 }
 
 export function AccessSpec({ product }: { product: ProductId }) {
@@ -61,20 +60,20 @@ export function PasswordSecrets({ product }: { product: ProductId }) {
   return <CodeBlock lang="bash" className="my-6" code={`${cmd("writer")}\n${cmd("reader")}`} />;
 }
 
-export function ClientConfigs({ product }: { product: ProductId }) {
+export function ClientConfigs({ product, standalone = false }: { product: ProductId; standalone?: boolean }) {
   return (
     <>
-      <CodeBlock lang="yaml" title="otel-collector.yaml" className="my-6" code={collectorConfig(product, serviceUrl(product, "writer"))} />
-      <CodeBlock lang="yaml" title="grafana-datasource.yaml" className="my-6" code={grafanaDatasource(product, serviceUrl(product, "reader"))} />
+      <CodeBlock lang="yaml" title="otel-collector.yaml" className="my-6" code={collectorConfig(product, serviceUrl(product, "writer", standalone))} />
+      <CodeBlock lang="yaml" title="grafana-datasource.yaml" className="my-6" code={grafanaDatasource(product, serviceUrl(product, "reader", standalone))} />
     </>
   );
 }
 
-export function VerifyInstall({ product }: { product: ProductId }) {
-  return <CodeBlock lang="bash" className="my-6" code={verifyCommands(product)} />;
+export function VerifyInstall({ product, standalone = false }: { product: ProductId; standalone?: boolean }) {
+  return <CodeBlock lang="bash" className="my-6" code={verifyCommands(product, standalone)} />;
 }
 
-export function ToolEndpoints({ product }: { product: ProductId }) {
+export function ToolEndpoints({ product, standalone = false }: { product: ProductId; standalone?: boolean }) {
   return (
     <table>
       <thead>
@@ -95,7 +94,7 @@ export function ToolEndpoints({ product }: { product: ProductId }) {
               )}
             </td>
             <td>
-              <code className="break-all">{serviceUrl(product, i.role) + i.path}</code>
+              <code className="break-all">{serviceUrl(product, i.role, standalone) + i.path}</code>
             </td>
           </tr>
         ))}
@@ -162,11 +161,14 @@ export function KeyLayout({ product, caption }: { product: ProductId; caption?: 
   );
 }
 
-type Next = "architecture" | "installation" | "api" | "benchmarks";
+type Next = "architecture" | "installation" | "api" | "benchmarks" | InstallMode;
 
 const NEXT: Record<Next, { title: string; path: string; blurb: (p: ProductId) => string }> = {
   architecture: { title: "Architecture", path: "", blurb: (p) => `How ${PRODUCTS[p].name} compares with ${PRODUCTS[p].peer}.` },
   installation: { title: "Installation", path: "installation/", blurb: () => "Annotated custom resources, access and scaling." },
+  standalone: { title: "Standalone", path: "installation/standalone/", blurb: () => "One pod, data on a volume or in a bucket." },
+  "read-write": { title: "Reader/writer split", path: "installation/read-write/", blurb: () => "One writer, autoscaled readers on a shared bucket." },
+  sharded: { title: "Sharded", path: "installation/sharded/", blurb: () => "Several writers, one reader group per shard." },
   api: { title: "API reference", path: "api/", blurb: (p) => `Every ${PRODUCTS[p].query} and ingest route, with examples.` },
   benchmarks: { title: "Benchmarks", path: "benchmarks/", blurb: (p) => `Latency against ${PRODUCTS[p].peer}, run by run.` },
 };

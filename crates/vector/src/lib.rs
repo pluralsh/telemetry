@@ -1,0 +1,68 @@
+//! OpenData Vector Database
+//!
+//! A vector database built on SlateDB with SPANN-style indexing for efficient
+//! approximate nearest neighbor search.
+//!
+//! # Example
+//!
+//! ```
+//! # use vector::{VectorDb, Vector, Config, DistanceMetric};
+//! # use std::time::Duration;
+//! # #[tokio::main]
+//! # async fn main() -> vector::Result<()> {
+//! let config = Config {
+//!     dimensions: 384,
+//!     distance_metric: DistanceMetric::L2,
+//!     flush_interval: Duration::from_secs(60),
+//!     ..Default::default()
+//! };
+//! let db = VectorDb::open(config).await?;
+//!
+//! let vectors = vec![
+//!     Vector::builder("product-001", vec![0.1; 384])
+//!         .attribute("category", "electronics")
+//!         .attribute("price", 99i64)
+//!         .build(),
+//! ];
+//!
+//! db.write(vectors).await?;
+//! db.flush().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+extern crate core;
+
+pub mod admin;
+pub mod cluster;
+pub mod db;
+pub(crate) mod error;
+pub mod math;
+pub mod memory;
+pub mod metric_names;
+pub mod model;
+pub(crate) mod query_engine;
+pub mod reader;
+pub mod serde;
+#[cfg(feature = "http-server")]
+pub mod server;
+pub(crate) mod storage;
+pub(crate) mod text;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
+pub(crate) mod utils;
+pub(crate) mod write;
+
+// Public API exports
+pub use admin::VectorDbAdmin;
+pub use cluster::{ClusterConfig, VectorCluster};
+pub use db::{VectorDb, VectorDbRead};
+pub use error::{Error, Result};
+pub use memory::MemoryConfig;
+pub use model::{
+    Attribute, AttributeValue, Bm25Query, Bm25Scorer, Config, DistanceMetric, FieldSelection,
+    FieldType, Filter, MetadataFieldSpec, Query, ReaderConfig, ScoreBy, SearchOptions,
+    SearchResult, Vector, VectorBuilder,
+};
+pub use reader::VectorDbReader;

@@ -1,0 +1,96 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Vector installation" };
+
+<PageHeader
+  title="Installation"
+  lede="Run Vector as one process, or on Kubernetes as a Vector resource: pick a deployment mode, then give each namespace credentials."
+/>
+
+The Kubernetes guides assume the operator is already installed; see [Installation](/installation/). Examples use the `telemetry` Kubernetes namespace and an S3 bucket named `my-vector-bucket`.
+
+## Choose a mode
+
+| Mode | Pods | Storage | Use it for |
+| --- | --- | --- | --- |
+| [Standalone](/vector/installation/standalone/) | One process that writes and queries | A volume, or a bucket | Development, small corpora, and read-your-writes queries |
+| [Reader/writer split](/vector/installation/read-write/) | One writer, autoscaled readers | A shared bucket | Heavy query load on one shard |
+| [Sharded](/vector/installation/sharded/) | Several writers, a reader group per shard | A shared bucket | Write volume or namespace counts beyond one writer |
+
+The split and sharded modes are the same `Sharded` resource with one writer or several. Adding writers to a split deployment splits its shard onto them, so it can grow without a migration.
+
+## Access
+
+Vector authenticates requests like the other Telemetry datastores: with Basic credentials, or with a JWT whose `namespace` claim matches, configured under `spec.config.auth`. Namespaces are declared by `NamespaceAuthentication` resources and `spec.config.namespaces`, and requests for other namespaces get 404 unless `spec.config.auth.unauthenticated` is set:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceAuthentication
+metadata:
+  name: search-writer
+spec:
+  dataStoreRef:
+    kind: Vector
+    name: vector
+  namespace: search
+  username: search
+  permission: write
+  secretKeyRef: { name: search-credentials, key: password }
+```
+
+| Access | Allows |
+| --- | --- |
+| Namespace `read` | Queries, row reads, namespace metadata and schema |
+| Namespace `write` | All of the above, plus creating, configuring (`PATCH /schema`), deleting and writing to the namespace |
+| Global (`spec.config.auth.global`) | Every declared namespace, plus listing shards |
+
+The namespace listing shows only the namespaces the caller can read. The operator reloads credential and namespace changes into running pods without restarting them. Replicas authenticate the requests they forward to each other with an internal token, generated into the `{name}-internal-token` Secret unless `spec.config.auth.internalTokenSecretRef` names one.
+
+## Ingress and path prefix
+
+Every replica serves the whole API and forwards what it can't serve itself, so a single Ingress path is enough: `spec.ingress` routes `{pathPrefix}/api` to the `vector` Service. With a `pathPrefix`, the servers also serve the API under it (`/vector/api/v1/namespaces/...`), so the Ingress needs no rewrite and Vector can share a hostname with the metrics, logs and traces databases:
+
+```yaml
+spec:
+  ingress:
+    enabled: true
+    hostname: telemetry.acme.internal
+    ingressClass: nginx
+    pathPrefix: /vector
+    tls: { enabled: true }
+```
+
+`pathPrefix` must start with `/` and not end with one. The health checks `/-/healthy` and `/-/ready` stay at the root and aren't exposed. Changing the prefix restarts the pods. Outside Kubernetes, set `path_prefix` at the top of the server config instead.
+
+## Memory and cache sizing
+
+The operator sizes each component from its container's memory limit (which, when unset, the operator sets to its default or the memory request, whichever is larger), so there is nothing to tune by hand. It first holds back headroom (a quarter of the limit, between 768 MiB and half of it) and a reservation for SlateDB's memtables, request bodies and centroids (512 MiB for writers and standalone servers, 448 MiB for readers). It then splits the rest:
+
+| Bound | Writer and standalone | Reader |
+| --- | --- | --- |
+| SST block cache | 22% | 22% |
+| SST metadata cache | 6% | 6% |
+| Query budget (`memory.query_bytes`) | 24% | 40% |
+| Write budget (`memory.write_bytes`) | 12% | 16 MiB |
+| Compaction budget (`memory.compaction_bytes`) | 12% | 64 MiB |
+| Embedding cache | 4% | 4% |
+
+The disk cache takes 90% of the cache volume. Setting `spec.config.embedding.cacheSize` replaces the derived embedding cache size.
+
+The budgets are process-wide, shared by every namespace and shard a replica serves:
+
+- **Queries** hold the posting lists they score, so many concurrent queries wait for room instead of running out of memory.
+- **Writes** hold their estimated size until their namespace's buffer flushes, and each namespace flushes once it holds a quarter of the budget. A write that finds no room flushes its namespace and waits up to its timeout (10 seconds by default), then fails with `429 Too Many Requests`; retry it with backoff.
+- **Compactions** start only while the estimated read-ahead and upload buffers of every running compaction fit; one always runs when none is.
+
+`vector_memory_budget_capacity_bytes`, `vector_memory_budget_used_bytes`, `vector_memory_budget_waits_total` and `vector_memory_budget_rejections_total`, each labelled by `budget`, show how full each budget runs. Outside Kubernetes, set them under `memory` in the server config; the defaults are 512 MiB for queries, 128 MiB for writes and 1 GiB for compactions.
+
+## Helm
+
+The `telemetry-stack` Helm chart creates a `Vector` resource when `products.vector.enabled` is set, using the chart's shared `global.storage` and `global.ingress` (served under `/vector`), and a `NamespaceAuthentication` for each entry of `products.vector.authentications`. With `bucketCleaners.enabled`, the chart also adds a `BucketCleaner` that references the store and takes its bucket and storage path from it. The cleaner deletes the data once the store and its pods are gone, for example after `helm uninstall`.
+
+## Next steps
+
+- [Standalone](/vector/installation/standalone/): one process, data on a volume or in a bucket.
+- [Reader/writer split](/vector/installation/read-write/): one writer, autoscaled readers on a shared bucket.
+- [Sharded](/vector/installation/sharded/): several writers, each owning one shard.

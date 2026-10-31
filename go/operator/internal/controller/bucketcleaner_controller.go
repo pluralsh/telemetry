@@ -18,12 +18,15 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/samber/lo"
 	"gocloud.dev/blob"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,6 +42,7 @@ import (
 
 	telemetryv1alpha1 "github.com/pluralsh/telemetry/go/operator/api/v1alpha1"
 	"github.com/pluralsh/telemetry/go/operator/internal/objectstore"
+	"github.com/pluralsh/telemetry/go/operator/internal/resources"
 )
 
 const (
@@ -49,9 +53,11 @@ const (
 	reasonBucketInaccessible = "BucketInaccessible"
 	reasonDeleting           = "Deleting"
 	reasonDeletionFailed     = "DeletionFailed"
+	reasonLocationUnresolved = "LocationUnresolved"
 
 	defaultBucketCheckInterval = 5 * time.Minute
 	bucketCheckRetry           = 30 * time.Second
+	dataStoreGoneRetry         = 5 * time.Second
 	defaultDeleteBudget        = 2 * time.Minute
 	defaultDeleteConcurrency   = 32
 )
@@ -62,6 +68,9 @@ const (
 type BucketCleanerReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader lists a datastore's pods without caching every pod; it
+	// defaults to Client.
+	APIReader client.Reader
 	// OpenBucket defaults to objectstore.Open.
 	OpenBucket objectstore.Opener
 	// DeleteBudget bounds one deletion pass so a large prefix does not hold a
@@ -74,6 +83,7 @@ type BucketCleanerReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=bucketcleaners/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=bucketcleaners/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list
 
 func (r *BucketCleanerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	cleaner := &telemetryv1alpha1.BucketCleaner{}
@@ -88,24 +98,35 @@ func (r *BucketCleanerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 	}
-	prefix, err := objectstore.Prefix(cleaner.Spec.SubPath)
-	if err == nil {
-		err = r.checkAccess(ctx, cleaner, prefix)
-	}
+	retry := min(bucketCheckInterval(cleaner), bucketCheckRetry)
+	location, err := r.resolve(ctx, cleaner, false)
 	if err != nil {
-		retry := min(bucketCheckInterval(cleaner), bucketCheckRetry)
-		return ctrl.Result{RequeueAfter: retry}, r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonBucketInaccessible, err.Error(), nil)
+		return ctrl.Result{RequeueAfter: retry}, r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonLocationUnresolved, err.Error(), nil)
 	}
-	message := "operator can access " + objectstore.Location(cleaner.Spec.ObjectStore, prefix)
+	recordLocation := func(status *telemetryv1alpha1.BucketCleanerStatus) {
+		status.ObjectStore, status.SubPath = location.store.DeepCopy(), location.subPath
+	}
+	if err := r.checkAccess(ctx, cleaner.Namespace, location); err != nil {
+		return ctrl.Result{RequeueAfter: retry}, r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonBucketInaccessible, err.Error(), recordLocation)
+	}
+	message := "operator can access " + location.String()
 	now := metav1.Now()
 	return ctrl.Result{RequeueAfter: bucketCheckInterval(cleaner)}, r.setStatus(ctx, cleaner, metav1.ConditionTrue, reasonBucketAccessible, message, func(status *telemetryv1alpha1.BucketCleanerStatus) {
+		recordLocation(status)
 		status.LastCheckTime = &now
 	})
 }
 
 func (r *BucketCleanerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &telemetryv1alpha1.BucketCleaner{}, bucketCleanerSecretIndex, func(obj client.Object) []string {
-		return objectStoreSecretNames(obj.(*telemetryv1alpha1.BucketCleaner).Spec.ObjectStore)
+		cleaner := obj.(*telemetryv1alpha1.BucketCleaner)
+		names := []string{}
+		for _, store := range []*telemetryv1alpha1.ObjectStoreSpec{cleaner.Spec.ObjectStore, cleaner.Status.ObjectStore} {
+			if store != nil {
+				names = append(names, objectStoreSecretNames(*store)...)
+			}
+		}
+		return lo.Uniq(names)
 	}); err != nil {
 		return err
 	}
@@ -122,17 +143,32 @@ func (r *BucketCleanerReconciler) finalize(ctx context.Context, cleaner *telemet
 	if !controllerutil.ContainsFinalizer(cleaner, bucketCleanerFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	prefix, err := objectstore.Prefix(cleaner.Spec.SubPath)
+	if waiting, err := r.dataStoreRunning(ctx, cleaner); err != nil {
+		_ = r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonDeletionFailed, err.Error(), nil)
+		return ctrl.Result{}, err
+	} else if waiting != "" {
+		message := fmt.Sprintf("waiting for %s to be deleted before deleting its objects", waiting)
+		return ctrl.Result{RequeueAfter: dataStoreGoneRetry}, r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonDeleting, message, nil)
+	}
+	location, err := r.resolve(ctx, cleaner, true)
+	if errors.Is(err, errLocationUnknown) {
+		// The datastore was gone before its location was ever resolved, so
+		// there is nothing this cleaner is known to own.
+		ctrl.LoggerFrom(ctx).Info("releasing bucket cleaner without deleting objects", "reason", err.Error())
+		base := cleaner.DeepCopy()
+		controllerutil.RemoveFinalizer(cleaner, bucketCleanerFinalizer)
+		return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, cleaner, client.MergeFrom(base)))
+	}
 	if err != nil {
 		return ctrl.Result{}, r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonDeletionFailed, err.Error(), nil)
 	}
-	bucket, err := r.open(ctx, cleaner)
+	prefix := location.prefix
+	bucket, err := r.open(ctx, cleaner.Namespace, location)
 	if err != nil {
 		_ = r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonDeletionFailed, err.Error(), nil)
 		return ctrl.Result{}, err
 	}
 	defer func() { _ = bucket.Close() }()
-	location := objectstore.Location(cleaner.Spec.ObjectStore, prefix)
 	passCtx, cancel := context.WithTimeout(ctx, r.deleteBudget())
 	defer cancel()
 	deleted, err := objectstore.DeletePrefix(passCtx, bucket, prefix, r.deleteConcurrency())
@@ -147,29 +183,184 @@ func (r *BucketCleanerReconciler) finalize(ctx context.Context, cleaner *telemet
 		_ = r.setStatus(ctx, cleaner, metav1.ConditionFalse, reasonDeletionFailed, message, recordDeleted)
 		return ctrl.Result{}, err
 	}
-	ctrl.LoggerFrom(ctx).Info("deleted bucket prefix", "location", location, "objects", total)
+	ctrl.LoggerFrom(ctx).Info("deleted bucket prefix", "location", location.String(), "objects", total)
 	base := cleaner.DeepCopy()
 	controllerutil.RemoveFinalizer(cleaner, bucketCleanerFinalizer)
 	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, cleaner, client.MergeFrom(base)))
 }
 
-func (r *BucketCleanerReconciler) checkAccess(ctx context.Context, cleaner *telemetryv1alpha1.BucketCleaner, prefix string) error {
-	bucket, err := r.open(ctx, cleaner)
+// dataStoreRunning describes what of the cleaner's datastore still exists:
+// the resource itself, or pods that may still write to the prefix. It is
+// empty once both are gone, or when the cleaner names no datastore.
+func (r *BucketCleanerReconciler) dataStoreRunning(ctx context.Context, cleaner *telemetryv1alpha1.BucketCleaner) (string, error) {
+	ref := cleaner.Spec.DataStoreRef
+	if ref == nil {
+		return "", nil
+	}
+	store, err := dataStoreObject(cleaner.Namespace, *ref)
+	if err != nil {
+		return "", err
+	}
+	described := fmt.Sprintf("%s %s", ref.Kind, ref.Name)
+	labels := resources.SelectorLabels(store, componentNone)
+	err = r.Get(ctx, client.ObjectKeyFromObject(store), store)
+	if err == nil {
+		return described, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(cleaner.Namespace), client.MatchingLabels(labels)); err != nil {
+		return "", err
+	}
+	if len(pods.Items) > 0 {
+		return fmt.Sprintf("the %d pods of %s", len(pods.Items), described), nil
+	}
+	return "", nil
+}
+
+// errLocationUnknown means a cleaner relies on its datastore for settings it
+// omits, and neither the datastore nor a previously resolved location exists.
+var errLocationUnknown = errors.New("bucket location is unknown")
+
+// bucketLocation is the bucket and prefix a cleaner owns.
+type bucketLocation struct {
+	store   telemetryv1alpha1.ObjectStoreSpec
+	subPath string
+	prefix  string
+}
+
+func (l bucketLocation) String() string {
+	return objectstore.Location(l.store, l.prefix)
+}
+
+// resolve returns the cleaner's bucket and prefix: its own settings, with
+// omitted ones taken from its datastore's storage. When the datastore is
+// gone and deleting is set, the location last recorded in status is used.
+func (r *BucketCleanerReconciler) resolve(ctx context.Context, cleaner *telemetryv1alpha1.BucketCleaner, deleting bool) (bucketLocation, error) {
+	spec := cleaner.Spec
+	var store *telemetryv1alpha1.ObjectStoreSpec
+	if spec.ObjectStore != nil {
+		store = spec.ObjectStore.DeepCopy()
+	}
+	subPath := spec.SubPath
+	if (store == nil || subPath == "") && spec.DataStoreRef != nil {
+		storage, found, err := r.dataStoreStorage(ctx, cleaner.Namespace, *spec.DataStoreRef)
+		switch {
+		case err != nil:
+			return bucketLocation{}, err
+		case found:
+			if store == nil {
+				store = storage.ObjectStore.DeepCopy()
+			}
+			if subPath == "" {
+				subPath = lo.CoalesceOrEmpty(storage.Path, dataStoreDefaultPath(spec.DataStoreRef.Kind))
+			}
+		case deleting && cleaner.Status.ObjectStore != nil && cleaner.Status.SubPath != "":
+			if store == nil {
+				store = cleaner.Status.ObjectStore.DeepCopy()
+			}
+			if subPath == "" {
+				subPath = cleaner.Status.SubPath
+			}
+		case deleting:
+			return bucketLocation{}, fmt.Errorf("%w: %s %s is gone and its storage was never resolved", errLocationUnknown, spec.DataStoreRef.Kind, spec.DataStoreRef.Name)
+		default:
+			return bucketLocation{}, fmt.Errorf("%s %s not found; its storage settings are needed for the omitted objectStore or subPath", spec.DataStoreRef.Kind, spec.DataStoreRef.Name)
+		}
+	}
+	if store == nil || subPath == "" {
+		return bucketLocation{}, errors.New("objectStore and subPath are required unless dataStoreRef is set")
+	}
+	switch lo.CoalesceOrEmpty(store.Type, telemetryv1alpha1.ObjectStoreLocal) {
+	case telemetryv1alpha1.ObjectStoreAWS, telemetryv1alpha1.ObjectStoreAzure, telemetryv1alpha1.ObjectStoreGCP:
+	default:
+		return bucketLocation{}, fmt.Errorf("objectStore type %q is not supported; BucketCleaner cleans Aws, Azure, or Gcp buckets", lo.CoalesceOrEmpty(store.Type, telemetryv1alpha1.ObjectStoreLocal))
+	}
+	store.Path = ""
+	prefix, err := objectstore.Prefix(subPath)
+	if err != nil {
+		return bucketLocation{}, err
+	}
+	return bucketLocation{store: *store, subPath: subPath, prefix: prefix}, nil
+}
+
+// dataStoreStorage returns the storage settings of the datastore ref names,
+// and whether it exists.
+func (r *BucketCleanerReconciler) dataStoreStorage(ctx context.Context, namespace string, ref telemetryv1alpha1.BucketCleanerDataStoreReference) (telemetryv1alpha1.StorageSpec, bool, error) {
+	store, err := dataStoreObject(namespace, ref)
+	if err != nil {
+		return telemetryv1alpha1.StorageSpec{}, false, err
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(store), store); err != nil {
+		return telemetryv1alpha1.StorageSpec{}, false, client.IgnoreNotFound(err)
+	}
+	switch store := store.(type) {
+	case *telemetryv1alpha1.Metrics:
+		return store.Spec.Config.Storage, true, nil
+	case *telemetryv1alpha1.Logs:
+		return store.Spec.Config.Storage, true, nil
+	case *telemetryv1alpha1.Traces:
+		return store.Spec.Config.Storage, true, nil
+	case *telemetryv1alpha1.Vector:
+		return store.Spec.Config.Storage, true, nil
+	}
+	return telemetryv1alpha1.StorageSpec{}, false, fmt.Errorf("unsupported dataStoreRef kind %q", ref.Kind)
+}
+
+func dataStoreObject(namespace string, ref telemetryv1alpha1.BucketCleanerDataStoreReference) (client.Object, error) {
+	object := metav1.ObjectMeta{Name: ref.Name, Namespace: namespace}
+	switch ref.Kind {
+	case dataStoreMetrics:
+		return &telemetryv1alpha1.Metrics{ObjectMeta: object}, nil
+	case dataStoreLogs:
+		return &telemetryv1alpha1.Logs{ObjectMeta: object}, nil
+	case dataStoreTraces:
+		return &telemetryv1alpha1.Traces{ObjectMeta: object}, nil
+	case dataStoreVector:
+		return &telemetryv1alpha1.Vector{ObjectMeta: object}, nil
+	}
+	return nil, fmt.Errorf("unsupported dataStoreRef kind %q", ref.Kind)
+}
+
+// dataStoreDefaultPath is the storage path a datastore of kind uses when its
+// spec.config.storage.path is unset.
+func dataStoreDefaultPath(kind string) string {
+	switch kind {
+	case dataStoreMetrics:
+		return resources.MetricsDescriptor.Name
+	case dataStoreLogs:
+		return resources.LogsDescriptor.Name
+	case dataStoreTraces:
+		return resources.TracesDescriptor.Name
+	case dataStoreVector:
+		return resources.VectorDescriptor.Name
+	}
+	return ""
+}
+
+func (r *BucketCleanerReconciler) checkAccess(ctx context.Context, namespace string, location bucketLocation) error {
+	bucket, err := r.open(ctx, namespace, location)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = bucket.Close() }()
-	return objectstore.CheckAccess(ctx, bucket, prefix)
+	return objectstore.CheckAccess(ctx, bucket, location.prefix)
 }
 
-func (r *BucketCleanerReconciler) open(ctx context.Context, cleaner *telemetryv1alpha1.BucketCleaner) (*blob.Bucket, error) {
+func (r *BucketCleanerReconciler) open(ctx context.Context, namespace string, location bucketLocation) (*blob.Bucket, error) {
 	open := r.OpenBucket
 	if open == nil {
 		open = objectstore.Open
 	}
-	bucket, err := open(ctx, cleaner.Spec.ObjectStore, r.secretFunc(cleaner.Namespace))
+	bucket, err := open(ctx, location.store, r.secretFunc(namespace))
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", objectstore.Location(cleaner.Spec.ObjectStore, ""), err)
+		return nil, fmt.Errorf("open %s: %w", objectstore.Location(location.store, ""), err)
 	}
 	return bucket, nil
 }

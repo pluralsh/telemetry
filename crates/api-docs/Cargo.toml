@@ -15,3 +15,5 @@ anyhow.workspace = true
 plural-logs-server = { path = "../logs-server", default-features = false }
 plural-metrics-server = { path = "../metrics-server", default-features = false }
 plural-traces-server = { path = "../traces-server", default-features = false }
+plural-vector = { path = "../vector", features = ["http-server"] }
+serde_json.workspace = true

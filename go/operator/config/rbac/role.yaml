@@ -17,6 +17,14 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - secrets
   - serviceaccounts
   - services
@@ -110,6 +118,7 @@ rules:
   - namespaceauthentications
   - pseudofs
   - traces
+  - vectors
   verbs:
   - create
   - delete
@@ -127,6 +136,7 @@ rules:
   - namespaceauthentications/finalizers
   - pseudofs/finalizers
   - traces/finalizers
+  - vectors/finalizers
   verbs:
   - update
 - apiGroups:
@@ -138,6 +148,7 @@ rules:
   - namespaceauthentications/status
   - pseudofs/status
   - traces/status
+  - vectors/status
   verbs:
   - get
   - patch
@@ -146,6 +157,7 @@ rules:
   - telemetry.plural.sh
   resources:
   - shardmaps
+  - vectortopologies
   verbs:
   - create
   - get

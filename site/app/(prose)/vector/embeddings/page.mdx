@@ -1,0 +1,154 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Vector embeddings" };
+
+<PageHeader
+  title="Embeddings"
+  lede="Give the server an embedding model and a namespace can embed one text attribute itself: rows are written without vectors, and queries rank by text. Embeddings are cached, so repeated texts and queries skip the provider."
+/>
+
+Embedding is an opt-in convenience. Writes and queries always accept vectors you compute yourself: without an `embedding` section in the server config, or in namespaces without an `embed` attribute, vectors are sent as usual, and even in a namespace that embeds, any row may carry its own `vector` and any query may rank by `vector` instead of `text`.
+
+## Configuring a model
+
+The server talks to providers through [Rig](https://crates.io/crates/rig-core), so one config shape covers every provider:
+
+| `provider` | API | Example `model` |
+| --- | --- | --- |
+| `openai` | OpenAI, or any OpenAI-compatible `endpoint`: Azure OpenAI, vLLM, Ollama, LiteLLM | `text-embedding-3-small` |
+| `cohere` | Cohere `v1/embed` | `embed-v4.0` |
+| `gemini` | Google Gemini | `gemini-embedding-001` |
+| `bedrock` | Amazon Bedrock, Titan Text Embeddings v2 | `amazon.titan-embed-text-v2:0` |
+
+```yaml
+# cluster.yaml
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: { source: env, name: OPENAI_API_KEY }  # or source: file
+  dimensions: 512      # optional: shorter vectors
+  # endpoint: http://ollama:11434/v1   # optional API root
+  batch_size: 96       # texts per request
+  timeout: 30          # seconds
+  cache:
+    capacity: 67108864 # bytes; 0 disables
+```
+
+`api_key` is read on every request, so a rotated key file applies without a restart. Endpoints that need no key, such as a local Ollama, can leave it out. Without `dimensions`, the server learns the model's vector length by embedding one probe text the first time it needs it. `dimensions` shortens vectors for models that support it: OpenAI's `text-embedding-3-*`, Gemini, and Titan v2 (256, 512 or 1024). Cohere models embed at a fixed size, so `dimensions` is rejected for `cohere`.
+
+Cohere embeds documents and queries differently: rows are embedded as `search_document` and query texts as `search_query`. The other providers embed both the same way.
+
+### Amazon Bedrock
+
+Bedrock authenticates with the AWS credential chain rather than `api_key`: an IAM role (IRSA or EKS Pod Identity on Kubernetes), the usual `AWS_*` environment variables, or a Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK`. `region` picks the runtime endpoint, and defaults to the chain's region. `endpoint` doesn't apply.
+
+```yaml
+embedding:
+  provider: bedrock
+  model: amazon.titan-embed-text-v2:0
+  region: us-east-1
+  dimensions: 512      # optional: 256, 512 or 1024 (the default)
+```
+
+Bedrock embeds one text per request, so a batch is sent as consecutive requests. Only Titan Text Embeddings v2 is supported; for Cohere models, use the `cohere` provider.
+
+### On Kubernetes
+
+Set `spec.config.embedding` on the `Vector` resource. The operator copies the key from `apiKeySecretRef` into the config Secret and points the servers at it:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: Vector
+metadata:
+  name: vector
+spec:
+  config:
+    embedding:
+      provider: cohere
+      model: embed-v4.0
+      apiKeySecretRef: { name: cohere, key: api-key }
+      cacheSize: 128Mi    # per replica; 0 disables
+```
+
+For Bedrock, leave out `apiKeySecretRef` and give the pods AWS credentials instead, for example an IAM role allowed `bedrock:InvokeModel`, through the ServiceAccount:
+
+```yaml
+spec:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/vector
+  config:
+    embedding:
+      provider: bedrock
+      model: amazon.titan-embed-text-v2:0
+      region: us-east-1
+```
+
+Every writer and reader gets the same model: writers embed rows, and readers embed query texts. Rotating the key Secret reaches running pods when the kubelet refreshes their Secret volume, without a restart. Changing the model, endpoint, or any other field restarts them.
+
+## Embedding an attribute
+
+Mark one `string` attribute `embed` in a namespace's [schema](/vector/schema/). A namespace created this way can leave out `dimensions` and take the model's:
+
+```bash
+curl -X POST localhost:8080/api/v1/namespaces/articles/write \
+  -H 'content-type: application/json' \
+  -d '{
+    "schema": { "body": { "type": "string", "embed": true, "full_text_search": true } },
+    "upsert_rows": [
+      { "id": 1, "title": "Rotating credentials", "body": "Rotate keys every 90 days…" },
+      { "id": 2, "title": "Draft", "body": "…", "vector": [0.1, 0.2, …] }
+    ]
+  }'
+```
+
+Rows are embedded only when they are written without a `vector`:
+
+- **Upserts and documents.** A row or passage without a vector gets the embedding of its `embed` attribute. A row with neither is rejected with `400`. A passage can inherit the attribute from its document's `attributes`.
+- **Patches.** A patch that sets the `embed` attribute re-embeds the row, unless it sets `vector` too. Removing the attribute with `null` keeps the old vector.
+- **Explicit vectors.** A `vector` in the request is always used as given, for example to import vectors computed elsewhere with the same model.
+
+The texts of one request are embedded together, in batches of `batch_size`. With the cache enabled, that happens before the namespace's write lock is taken, so a slow provider doesn't hold up other writes to the namespace. A provider failure fails the write with `502`. Upserted rows and documents are embedded before any operation applies; patches are re-embedded as they apply, after the operations before them.
+
+An embedded attribute is stored like any other, so it can also be returned, filtered, and declared `full_text_search` for [hybrid search](/vector/queries/#multi-query-and-hybrid-search).
+
+## Querying by text
+
+`ANN` and `kNN` take a `text` in place of a `vector` in a namespace with an `embed` attribute:
+
+```json
+{
+  "rank_by": { "op": "ANN", "text": "how often should keys rotate?" },
+  "filters": { "op": "Gte", "attribute": "year", "value": 2025 },
+  "top_k": 5
+}
+```
+
+Exactly one of `vector` and `text` is allowed. In a [multi-query](/vector/queries/#multi-query-and-hybrid-search), the texts of every sub-query are embedded in one provider request, which makes hybrid search one round trip to the provider:
+
+```json
+{
+  "queries": [
+    { "rank_by": { "op": "ANN", "text": "rotate credentials" } },
+    { "rank_by": { "op": "BM25", "attribute": "body", "query": "rotate credentials" } }
+  ],
+  "rrf": {}
+}
+```
+
+## Models and namespaces
+
+Vectors from different models can't be compared, so a namespace never mixes them. When a namespace first gets an `embed` attribute, it pins the configured model as its `embedding_model`, for example `openai:text-embedding-3-small:512` (provider, model, and requested dimensions). The model's vector length must equal the namespace's `dimensions`.
+
+From then on, embedding in that namespace requires the server to be configured with the same model. After a model change, or with the `embedding` section removed, writes that need embedding and text queries in namespaces pinned to the old model fail with `400`, while writes with explicit vectors and vector queries still work. To move to a new model, create a new namespace, rewrite the rows into it (they are embedded with the new model), and switch clients over.
+
+## Caching
+
+Each replica caches embeddings in memory with [foyer](https://crates.io/crates/foyer), up to `cache.capacity` bytes (64 MiB by default, about 21,000 vectors of 768 dimensions). On Kubernetes, without `cacheSize`, the operator sizes it from each pod's memory limit; see [memory and cache sizing](/vector/installation/#memory-and-cache-sizing). Entries are keyed by a hash of the model, the input kind (document or query), and the exact text. A row upserted again with the same text, a patch that sets the text back, and a repeated query all skip the provider. Within one request, duplicate texts are sent once.
+
+| Metric | Meaning |
+| --- | --- |
+| `vector_embedding_cache_hits_total` | Texts served from the cache |
+| `vector_embedding_cache_misses_total` | Distinct texts sent to the provider |
+| `vector_embedding_request_duration_seconds` | Provider request latency |
+| `vector_embedding_request_errors_total` | Failed provider requests |

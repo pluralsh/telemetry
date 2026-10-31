@@ -34,6 +34,7 @@ const (
 	LogsNameAnnotation     = "telemetry.plural.sh/logs-name"
 	TracesNameAnnotation   = "telemetry.plural.sh/traces-name"
 	PseudoFSNameAnnotation = "telemetry.plural.sh/pseudofs-name"
+	VectorNameAnnotation   = "telemetry.plural.sh/vector-name"
 	TokenKey               = "internal-token"
 	// ShardLabel marks a reader group's workload with the storage shard it
 	// serves.
@@ -56,6 +57,7 @@ const (
 	verbWatch                 = "watch"
 	routeRead                 = "/read"
 	routeWrite                = "/write"
+	routeAPI                  = "/api"
 	productUserID       int64 = 10001
 
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
@@ -151,7 +153,7 @@ func (e *MemoryError) Error() string {
 // rollsUp reports whether component runs the background rollup, which only
 // writers and standalone servers of the time-segmented stores do.
 func rollsUp(descriptor Descriptor, component Component) bool {
-	return descriptor.Kind != PseudoFSDescriptor.Kind && component != ComponentReader
+	return descriptor.Kind != PseudoFSDescriptor.Kind && descriptor.Kind != VectorDescriptor.Kind && component != ComponentReader
 }
 
 // ValidateMemory rejects writer and standalone memory limits too small for
@@ -172,6 +174,7 @@ type StatefulSetInput struct {
 	Logs                    *telemetryv1alpha1.Logs
 	Traces                  *telemetryv1alpha1.Traces
 	PseudoFS                *telemetryv1alpha1.PseudoFS
+	Vector                  *telemetryv1alpha1.Vector
 	Component               Component
 	ConfigSecretName        string
 	InternalTokenSecretName string
@@ -188,6 +191,11 @@ type Descriptor struct {
 	NameAnnotation                                                                               string
 	SupportsPathPrefix                                                                           bool
 	GRPCOnly                                                                                     bool
+	// HTTPOnly servers serve everything, peer traffic included, on the HTTP
+	// port.
+	HTTPOnly bool
+	// Subcommand precedes the server's --config flag.
+	Subcommand string
 	// ReloadsConfig servers apply config file changes in place, so config
 	// changes don't roll their pods.
 	ReloadsConfig bool
@@ -219,6 +227,12 @@ var (
 		Kind: "PseudoFS", Name: "pseudofs", Image: "ghcr.io/pluralsh/pseudofs", ConfigKey: "pseudofs.yaml",
 		ConfigDir: "/etc/pseudofs/config", DataPath: "/var/lib/pseudofs", CachePath: "/var/cache/pseudofs",
 		GRPCPort: 9093, NameAnnotation: PseudoFSNameAnnotation, GRPCOnly: true,
+	}
+	VectorDescriptor = Descriptor{
+		Kind: "Vector", Name: "vector", Image: "ghcr.io/pluralsh/vector", ConfigKey: "vector.yaml",
+		ConfigDir: "/etc/vector/config", SecretsPath: "/etc/vector/secrets", DataPath: "/var/lib/vector", CachePath: "/var/cache/vector",
+		InternalTokenPath: "/var/run/secrets/vector/internal-token", HTTPPort: 8080,
+		NameAnnotation: VectorNameAnnotation, SupportsPathPrefix: true, HTTPOnly: true, Subcommand: "cluster",
 	}
 )
 
@@ -277,10 +291,21 @@ func ForPseudoFS(pseudofs *telemetryv1alpha1.PseudoFS) *Product {
 	}
 }
 
+func ForVector(vector *telemetryv1alpha1.Vector) *Product {
+	return &Product{
+		ObjectMeta: vector.ObjectMeta, Descriptor: VectorDescriptor, Mode: vector.Spec.Mode,
+		Version: vector.Spec.Version, Image: vector.Spec.Image, Storage: vector.Spec.Config.Storage, Writer: vector.Spec.Writer,
+		Reader: vector.Spec.Reader, Service: vector.Spec.Service, Ingress: vector.Spec.Ingress,
+		ServiceAccountSpec: vector.Spec.ServiceAccount, ConfigHash: vector.Status.ConfigHash,
+	}
+}
+
 func product(value any) *Product {
 	switch value := value.(type) {
 	case *Product:
 		return value
+	case *telemetryv1alpha1.Vector:
+		return ForVector(value)
 	case *telemetryv1alpha1.Metrics:
 		return ForMetrics(value)
 	case *telemetryv1alpha1.Logs:
@@ -458,8 +483,19 @@ func ReaderTargets(value any, groups int32) []ReaderTarget {
 			Selector: SelectorLabels(instance, ComponentReader),
 		}}
 	}
-	targets := make([]ReaderTarget, 0, groups)
-	for shard := range max(groups, 1) {
+	return ReaderTargetsForShards(instance, lo.Range(int(max(groups, 1))))
+}
+
+// ReaderTargetsForShards are the reader StatefulSets of a sharded product
+// whose reader groups serve exactly `shards`, when read groups are enabled.
+func ReaderTargetsForShards[T ~int | ~int32](value any, shards []T) []ReaderTarget {
+	instance := product(value)
+	if !ReadGroupsEnabled(instance) {
+		return ReaderTargets(instance, 0)
+	}
+	targets := make([]ReaderTarget, 0, len(shards))
+	for _, id := range shards {
+		shard := int32(id)
 		targets = append(targets, ReaderTarget{
 			Name:     ReaderGroupName(instance, shard),
 			Shard:    lo.ToPtr(shard),
@@ -523,13 +559,23 @@ func ServiceAccount(value any) *corev1.ServiceAccount {
 func Role(value any) *rbacv1.Role {
 	metrics := product(value)
 	name := Name(metrics.Name, "sharding")
+	routing := "shardmaps"
+	vector := metrics.Descriptor.Kind == VectorDescriptor.Kind
+	if vector {
+		routing = "vectortopologies"
+	}
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"telemetry.plural.sh"}, Resources: []string{routing}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch", "delete"}},
+		{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(metrics, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
+	}
+	if vector {
+		// The elected writer plans splits only for writers whose pods are ready.
+		rules = append(rules, rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{verbGet, verbList, verbWatch}})
+	}
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metrics.Namespace, Labels: Labels(metrics, ComponentNone)},
-		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{"telemetry.plural.sh"}, Resources: []string{"shardmaps"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch"}},
-			{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{verbGet, verbList, verbWatch, "create", "update", "patch", "delete"}},
-			{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: []string{ComponentName(metrics, ComponentWriter)}, Verbs: []string{verbGet, verbList, verbWatch}},
-		},
+		Rules:      rules,
 	}
 }
 
@@ -559,10 +605,15 @@ func Service(value any, component Component, headless bool) *corev1.Service {
 	if !metrics.Descriptor.GRPCOnly {
 		service.Spec.Ports = append([]corev1.ServicePort{{Name: portHTTP, Port: HTTPPort(metrics), TargetPort: intstr.FromString(portHTTP), Protocol: corev1.ProtocolTCP}}, service.Spec.Ports...)
 	}
+	if metrics.Descriptor.HTTPOnly {
+		service.Spec.Ports = service.Spec.Ports[:1]
+	}
 	if headless {
 		service.Spec.Type = corev1.ServiceTypeClusterIP
 		service.Spec.ClusterIP = corev1.ClusterIPNone
-		service.Spec.Ports = service.Spec.Ports[1:]
+		if !metrics.Descriptor.HTTPOnly {
+			service.Spec.Ports = service.Spec.Ports[1:]
+		}
 	} else {
 		service.Spec.Type = lo.Ternary(metrics.Service.Type == "", corev1.ServiceTypeClusterIP, metrics.Service.Type)
 		service.Annotations = copyMap(metrics.Service.Annotations)
@@ -605,6 +656,11 @@ func ingressPaths(metrics *Product) []networkingv1.HTTPIngressPath {
 	if !metrics.Descriptor.SupportsPathPrefix {
 		prefix = ""
 	}
+	// Without split routes, any replica serves the whole API through the
+	// product's Service.
+	if metrics.Descriptor.WriteRoute == "" {
+		return []networkingv1.HTTPIngressPath{ingressPath(prefix+routeAPI, networkingv1.PathTypePrefix, metrics.Name)}
+	}
 	writerService := ComponentName(metrics, ComponentWriter)
 	readerService := ComponentName(metrics, ComponentReader)
 	if Mode(metrics) == telemetryv1alpha1.ProductModeStandalone {
@@ -629,7 +685,9 @@ func ingressPath(path string, pathType networkingv1.PathType, serviceName string
 
 func StatefulSet(input StatefulSetInput) (*appsv1.StatefulSet, error) {
 	var metrics *Product
-	if input.PseudoFS != nil {
+	if input.Vector != nil {
+		metrics = ForVector(input.Vector)
+	} else if input.PseudoFS != nil {
 		metrics = ForPseudoFS(input.PseudoFS)
 	} else if input.Logs != nil {
 		metrics = ForLogs(input.Logs)
@@ -771,9 +829,15 @@ func podTemplate(metrics *Product, input StatefulSetInput, user corev1.PodTempla
 		metricsContainer.ImagePullPolicy = corev1.PullIfNotPresent
 	}
 	metricsContainer.Args = []string{"--config", filepath.Join(metrics.Descriptor.ConfigDir, ConfigKeyFor(metrics, component))}
+	if metrics.Descriptor.Subcommand != "" {
+		metricsContainer.Args = append([]string{"--port", fmt.Sprint(HTTPPort(metrics)), metrics.Descriptor.Subcommand}, metricsContainer.Args...)
+	}
 	requiredPorts := []corev1.ContainerPort{{Name: portGRPC, ContainerPort: GRPCPort(metrics), Protocol: corev1.ProtocolTCP}}
 	if !metrics.Descriptor.GRPCOnly {
 		requiredPorts = append([]corev1.ContainerPort{{Name: portHTTP, ContainerPort: HTTPPort(metrics), Protocol: corev1.ProtocolTCP}}, requiredPorts...)
+	}
+	if metrics.Descriptor.HTTPOnly {
+		requiredPorts = requiredPorts[:1]
 	}
 	metricsContainer.Ports = mergeNamed(metricsContainer.Ports, func(item corev1.ContainerPort) string { return item.Name }, requiredPorts...)
 	metricsContainer.Env = mergeNamed(metricsContainer.Env, func(item corev1.EnvVar) string { return item.Name },

@@ -1,5 +1,7 @@
 export type ProductId = "metrics" | "logs" | "traces";
-export type SpaceId = "overview" | ProductId;
+/** Databases with a generated HTTP API reference. */
+export type ApiProduct = ProductId | "vector";
+export type SpaceId = "overview" | ApiProduct;
 
 export type Product = {
   id: ProductId;
@@ -67,8 +69,27 @@ export function isProductId(v: string): v is ProductId {
   return (PRODUCT_IDS as string[]).includes(v);
 }
 
-export type NavItem = { title: string; href: string };
+export type NavItem = { title: string; href: string; children?: NavItem[] };
 export type NavGroup = { title: string; items: NavItem[] };
+
+/** Every item of `groups` in reading order, children after their parent. */
+export function flatItems(groups: NavGroup[]): NavItem[] {
+  return groups.flatMap((g) => g.items.flatMap((i) => [i, ...(i.children ?? [])]));
+}
+
+/** The deployment modes every database's installation guide covers. */
+export function installationItems(space: ApiProduct): NavItem {
+  const base = `/${space}/installation/`;
+  return {
+    title: "Installation",
+    href: base,
+    children: [
+      { title: "Standalone", href: `${base}standalone/` },
+      { title: "Reader/writer split", href: `${base}read-write/` },
+      { title: "Sharded", href: `${base}sharded/` },
+    ],
+  };
+}
 
 export const OVERVIEW_NAV: NavGroup[] = [
   {
@@ -96,7 +117,7 @@ export function productNav(id: ProductId): NavGroup[] {
       title: "Guides",
       items: [
         { title: "Architecture", href: `/${id}/` },
-        { title: "Installation", href: `/${id}/installation/` },
+        installationItems(id),
       ],
     },
     {
@@ -109,13 +130,42 @@ export function productNav(id: ProductId): NavGroup[] {
   ];
 }
 
+/** The vector database: not an observability store, so it has its own nav and no operator. */
+export const VECTOR = {
+  name: "Vector",
+  tagline: "Namespaced vector and full-text search with filters and multi-passage documents",
+  peer: "turbopuffer",
+  httpPort: 8080,
+};
+
+export const VECTOR_NAV: NavGroup[] = [
+  {
+    title: "Guides",
+    items: [
+      { title: "Overview", href: "/vector/" },
+      installationItems("vector"),
+      { title: "Writing and querying", href: "/vector/queries/" },
+      { title: "Schemas", href: "/vector/schema/" },
+      { title: "Embeddings", href: "/vector/embeddings/" },
+      { title: "Sharding and scaling", href: "/vector/sharding/" },
+    ],
+  },
+  {
+    title: "Reference",
+    items: [{ title: "API reference", href: "/vector/api/" }],
+  },
+];
+
 export function spaceFromPath(pathname: string): SpaceId {
   const seg = pathname.split("/").filter(Boolean)[0];
+  if (seg === "vector") return "vector";
   return seg && isProductId(seg) ? seg : "overview";
 }
 
 export function navFor(space: SpaceId): NavGroup[] {
-  return space === "overview" ? OVERVIEW_NAV : productNav(space);
+  if (space === "overview") return OVERVIEW_NAV;
+  if (space === "vector") return VECTOR_NAV;
+  return productNav(space);
 }
 
 export const REPO_URL = "https://github.com/pluralsh/telemetry";

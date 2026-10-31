@@ -1,0 +1,112 @@
+# telemetry-stack values for the kind e2e: only the Vector store, on MinIO,
+# with a BucketCleaner that empties its prefix on uninstall. Tenants share the
+# plrl credentials, `private` belongs to another user, and admin holds the
+# global credentials the shard listing needs.
+authSecret:
+  create: true
+  name: vector-e2e-auth
+  username: plrl
+  password: e2e-tenant-secret
+authSecrets:
+  - name: vector-e2e-other
+    username: other
+    password: e2e-other-secret
+  - name: vector-e2e-admin
+    username: admin
+    password: e2e-admin-secret
+
+global:
+  storage:
+    objectStore:
+      type: Aws
+      aws:
+        region: us-east-1
+        bucket: vector-e2e
+        # Fully qualified: the operator, which runs the BucketCleaner, lives
+        # in another namespace.
+        endpoint: http://minio.vector-e2e.svc:9000
+        allowHTTP: true
+        accessKeyIDSecretRef: { name: vector-object-store, key: access-key-id }
+        secretAccessKeySecretRef: { name: vector-object-store, key: secret-access-key }
+  ingress:
+    enabled: false
+
+products:
+  metrics: { enabled: false }
+  logs: { enabled: false }
+  traces: { enabled: false }
+  vector:
+    enabled: true
+    name: vector
+    spec:
+      mode: Sharded
+      version: 0.0.0-e2e
+      image: { repository: vector-e2e, pullPolicy: Never }
+      config:
+        leaseDurationSeconds: 6
+        auth:
+          global:
+            write:
+              - username: admin
+                passwordSecretKeyRef: { name: vector-e2e-admin, key: password }
+        storage:
+          path: e2e
+          blockCache: { type: FoyerMemory, capacity: 33554432 }
+          metaCache: { type: FoyerMemory, capacity: 8388608 }
+      writer:
+        # One writer, so one shard; the e2e adds writers to split it.
+        replicas: 1
+        resources:
+          requests: { cpu: 50m, memory: 256Mi }
+          limits: { memory: 768Mi }
+        dataVolume: { emptyDir: {} }
+        cacheVolume: { emptyDir: {} }
+      reader:
+        replicas: 1
+        resources:
+          requests: { cpu: 50m, memory: 256Mi }
+          limits: { memory: 768Mi }
+        dataVolume: { emptyDir: {} }
+        cacheVolume: { emptyDir: {} }
+    authentications:
+      - name: vector-tenant-0
+        namespace: tenant-0
+        username: plrl
+        permission: write
+      - name: vector-tenant-1
+        namespace: tenant-1
+        username: plrl
+        permission: write
+      - name: vector-tenant-2
+        namespace: tenant-2
+        username: plrl
+        permission: write
+      - name: vector-tenant-3
+        namespace: tenant-3
+        username: plrl
+        permission: write
+      - name: vector-tenant-4
+        namespace: tenant-4
+        username: plrl
+        permission: write
+      - name: vector-tenant-5
+        namespace: tenant-5
+        username: plrl
+        permission: write
+      - name: vector-tenant-6
+        namespace: tenant-6
+        username: plrl
+        permission: write
+      - name: vector-tenant-7
+        namespace: tenant-7
+        username: plrl
+        permission: write
+      - name: vector-private
+        namespace: private
+        username: other
+        permission: write
+        secretKeyRef: { name: vector-e2e-other, key: password }
+
+bucketCleaners:
+  enabled: true
+  checkIntervalSeconds: 10

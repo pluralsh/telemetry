@@ -2,9 +2,17 @@
 
 ## Description
 The Telemetry Operator manages `Metrics` metric stores, `Logs` log stores, `Traces`
-trace stores, and their `NamespaceAuthentication` credentials. It renders product configuration, creates
+trace stores, `Vector` vector databases, and their `NamespaceAuthentication` credentials. It renders product configuration, creates
 internal credentials, and reconciles the Services, StatefulSets, and
 namespace-scoped RBAC required by standalone or sharded deployments.
+
+A `NamespaceAuthentication` with `dataStoreRef.kind: Vector` declares a Vector
+namespace: without one (or an entry in `spec.config.namespaces`), requests for
+the namespace get 404 unless `spec.config.auth.unauthenticated` is set. Its
+`write` permission covers creating, configuring, deleting and writing to the
+namespace, and `read` covers queries, rows and metadata. Vector servers reload
+namespaces and credentials in place, so changing them doesn't restart pods.
+`usageReportingEndpoint` isn't supported for Vector.
 
 The canonical product image tag is `spec.version`. It accepts SemVer 2.0 values
 such as `1.2.3` or `1.2.3-rc.1+build.7`; a leading `v` is rejected to match the
@@ -145,7 +153,34 @@ While it exists, the operator lists the prefix every `checkIntervalSeconds`
 (`BucketAccessible` or `BucketInaccessible`). Deleting it deletes every object
 under `subPath/` before its finalizer is released; progress is reported as
 `Deleting` with `status.deletedObjects`, and errors as `DeletionFailed`.
-`subPath` is immutable. The operator itself talks to the bucket, so
+`subPath` is immutable.
+
+With `dataStoreRef` (`kind` of `Metrics`, `Logs`, `Traces`, or `Vector`, and
+`name`), `objectStore` and `subPath` may be omitted: the operator takes them
+from that datastore's `spec.config.storage` (`objectStore`, and `path` or
+the product name when unset), with explicit fields winning. The resolved
+location is recorded in `status.objectStore` and `status.subPath`, and
+problems resolving it are reported as `LocationUnresolved`:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: BucketCleaner
+metadata:
+  name: logs-data
+spec:
+  dataStoreRef:
+    kind: Logs
+    name: logs
+```
+
+Deletion then waits, reporting `Deleting`, until that datastore in the
+BucketCleaner's namespace and all of its pods are gone, and deletes the
+location recorded in status. A datastore and its cleaner can then be deleted
+together, as on `helm uninstall`, without a stopping replica writing after
+the cleanup. The data is also kept for as long as the datastore exists. A
+cleaner whose datastore never existed while it did has no recorded location
+and is released without deleting anything. The operator itself talks to the
+bucket, so
 credential Secrets must live in the BucketCleaner's namespace, and when they
 are omitted the operator's own ServiceAccount identity (IRSA, workload
 identity, ADC) needs list and delete access to the bucket. Azure

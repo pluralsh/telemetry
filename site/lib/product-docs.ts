@@ -37,14 +37,55 @@ const PRODUCT_CONFIG: Record<ProductId, string> = {
 
 const WRITERS: Record<ProductId, number> = { metrics: 2, logs: 3, traces: 3 };
 
-export function quickstartSpec(p: ProductId) {
+export type InstallMode = "standalone" | "read-write" | "sharded";
+
+export function installSpec(p: ProductId, mode: InstallMode) {
+  if (mode === "standalone") return standaloneSpec(p);
+  if (mode === "read-write") return readWriteSpec(p);
+  return shardedSpec(p);
+}
+
+function standaloneSpec(p: ProductId) {
   return `${header(p)}
   config:
-${objectStore.replace("PRODUCT", p)}
+    retention: ${PRODUCTS[p].retentionDefault}
+  writer:
+    dataVolume:
+      persistentVolumeClaim:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 50Gi } }
 `;
 }
 
-export function productionSpec(p: ProductId) {
+function readWriteSpec(p: ProductId) {
+  return `${header(p)}
+  mode: Sharded
+  config:
+    retention: ${PRODUCTS[p].retentionDefault}
+${objectStore.replace("PRODUCT", p)}
+    write:
+      flushIntervalSeconds: 10
+  writer:
+    replicas: 1
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { memory: 4Gi }
+    cacheVolume:
+      persistentVolumeClaim:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 20Gi } }
+  reader:
+    replicas: 2
+    cacheVolume:
+      emptyDir: { sizeLimit: 20Gi }
+    autoscaling:
+      enabled: true
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+`;
+}
+
+function shardedSpec(p: ProductId) {
   return `${header(p)}
   mode: Sharded
   config:
@@ -94,6 +135,8 @@ export function specNotes(p: ProductId): Record<string, string> {
     "spec.config.sharding.leaseDurationSeconds": "How long a shard Lease survives without renewal before another writer may take the shard over. Default `15`; `renewIntervalSeconds` (default `5`) must be lower.",
     "spec.writer.replicas": "Writer count, which is also the storage shard count. Raise it at any time; new shards take writes from the next aligned hour. It cannot be lowered.",
     "spec.writer.resources": "Defaults to 250m CPU and 512Mi memory requests with a 2Gi limit. Budget for the write buffer: 64 MiB per shard, plus up to two frozen buffers being flushed.",
+    "spec.writer.dataVolume": `In Standalone mode with the default \`Local\` object store, the data itself lives here, at \`/var/lib/${p}\`. Default 10Gi. The PVC is retained when the database is deleted.`,
+    "spec.reader.autoscaling": "Adds a HorizontalPodAutoscaler per reader group. `minReplicas` defaults to `replicas`; scale on `targetCPUUtilizationPercentage` or `targetMemoryUtilizationPercentage`.",
     "spec.writer.cacheVolume": `Mounted at \`${cachePath}\` as the disk tier of the block cache (512 MiB RAM and 10 GiB disk by default). A PVC keeps it warm across restarts. Set exactly one of \`emptyDir\` or \`persistentVolumeClaim\`.`,
     "spec.reader.replicas": "Replicas per reader group. Each storage shard gets its own group, which opens only that shard; any reader answers any query by asking the other groups over gRPC. Default `2` in Sharded mode. Scale freely, or set `autoscaling` to scale each group on CPU.",
     "spec.reader.cacheVolume": "An `emptyDir` is enough: a restarted reader refills its cache from the bucket.",
@@ -207,13 +250,14 @@ datasources:
 `;
 }
 
-export function verifyCommands(p: ProductId) {
+export function verifyCommands(p: ProductId, standalone = false) {
   const port = PRODUCTS[p].httpPort;
+  const mode = standalone ? "Standalone" : "Sharded";
   return `kubectl -n ${INSTALL_NAMESPACE} get ${p}
-# NAME   MODE      READY   AGE
-# ${p.padEnd(6)} Sharded   True    2m
+# NAME   MODE${" ".repeat(mode.length - 4)}   READY   AGE
+# ${p.padEnd(6)} ${mode}   True    2m
 
-kubectl -n ${INSTALL_NAMESPACE} port-forward svc/${p}-reader ${port} &
+kubectl -n ${INSTALL_NAMESPACE} port-forward svc/${standalone ? p : `${p}-reader`} ${port} &
 curl -u grafana:"$PASSWORD" http://localhost:${port}/read/ns/${TENANT}${LABELS_PATH[p]}
 `;
 }

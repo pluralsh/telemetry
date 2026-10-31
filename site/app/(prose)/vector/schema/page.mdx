@@ -1,0 +1,84 @@
+import { PageHeader } from "@/components/doc-page";
+
+export const metadata = { title: "Vector schemas" };
+
+<PageHeader
+  title="Schemas"
+  lede="Namespaces are schemaless by default: attributes are typed by the first value written. A schema is only declared to opt attributes into full-text search or embedding, or to fix types before data arrives."
+/>
+
+## One schema per namespace
+
+Every namespace has its own schema, a map from attribute name to type and indexing options. It is stored with the namespace's metadata on the namespace's shard, so two namespaces can give the same attribute name different types, and changing one namespace's schema never affects another. Deleting a namespace deletes its schema.
+
+```json
+{
+  "body":  { "type": "string", "full_text_search": true, "embed": true },
+  "year":  { "type": "int" },
+  "tags":  { "type": "[]string" }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `type` | `string`, `int`, `float`, `bool`, `[]string`, or `[]int`. Fixed once set. |
+| `full_text_search` | Index a `string` attribute for `BM25` ranking. Default `false`. |
+| `embed` | Embed a `string` attribute into the vector of rows written without one. At most one attribute per namespace. Default `false`. See [embeddings](/vector/embeddings/). |
+
+`GET /api/v1/namespaces/{namespace}/schema` returns the schema, and `GET /api/v1/namespaces/{namespace}` returns it with the rest of the namespace's metadata: dimensions, distance metric, and the pinned embedding model.
+
+## Inferred types
+
+A write that carries an attribute the schema doesn't know adds it, typed from its value:
+
+| JSON value | Inferred type |
+| --- | --- |
+| String | `string` |
+| Integer | `int` |
+| Other number | `float` |
+| `true` / `false` | `bool` |
+| Array of strings, or an empty array | `[]string` |
+| Non-empty array of integers | `[]int` |
+
+`null` means "absent" and infers nothing. Other values, such as objects or mixed arrays, are rejected. Declare `[]int` attributes whose first value may be empty. Types are inferred across the whole request before anything is written, so two rows that disagree on a new attribute's type fail the request together.
+
+From then on the type is enforced: a value of another type is rejected with `400`, except that integers are accepted for `float` attributes. Inferred attributes are indexed for [filtering](/vector/queries/#filters) like declared ones, so filters never need a schema.
+
+Attribute names are 1 to 128 bytes. `id` and `vector` are reserved, as is any name starting with `$`; documents set `$doc_id` and `$passage` on their passage rows.
+
+## Declaring attributes
+
+Declare an attribute when inference isn't enough: to enable full-text search or embedding, or to pin a type before the first value arrives (for example, so a `float` attribute isn't inferred as `int` from a first value of `3`). There are three places to do it:
+
+- **On create.** `POST /api/v1/namespaces/{namespace}` with `{"dimensions": 768, "schema": {...}}`.
+- **On write.** A write's `schema` field is applied before its rows. A write to a missing namespace creates it, if it carries a vector or declares an `embed` attribute.
+- **Any time.** `PATCH /api/v1/namespaces/{namespace}/schema` with the entries to add or change.
+
+```bash
+curl -X PATCH localhost:8080/api/v1/namespaces/articles/schema \
+  -H 'content-type: application/json' \
+  -d '{"body": {"type": "string", "full_text_search": true}}'
+```
+
+Entries merge into the schema: attributes not named are left alone, and a named attribute's entry is replaced whole. An entry of `{"type": "string"}` for a full-text attribute therefore turns full-text search off, so send every option you want to keep. Applying the same schema twice is a no-op, so clients can send their schema on every write.
+
+## Changing a schema
+
+| Change | Effect |
+| --- | --- |
+| Add an attribute | Applies at once. Existing rows simply don't have it. |
+| Change an attribute's `type` | Rejected with `400`. |
+| Enable `full_text_search` | Applies to rows written afterwards. |
+| Disable `full_text_search` | `BM25` queries on the attribute are rejected from then on. |
+| Enable `embed` | Rows written afterwards without a vector are embedded. The first time, the namespace pins the embedding model. |
+| Move `embed` to another attribute | Set `embed: false` on the old attribute and `embed: true` on the new one in the same update. Existing vectors are kept. |
+
+Types can't change because every row's attributes are encoded and indexed by type. To change one, write the values under a new attribute name, or create a new namespace with the schema you want and rewrite the rows into it.
+
+### Full-text search
+
+Full-text indexing happens as rows are written, so enabling `full_text_search` on an attribute that already has values doesn't index the existing rows. Declare it before the first write, or upsert the existing rows again after enabling it. Changing the set of full-text attributes closes and reopens the namespace on its writer. Schema changes are rare and quick, but requests on that writer wait while one applies.
+
+### Embedding
+
+`embed` changes which text new vectors come from, never existing vectors. When a namespace first gets an `embed` attribute, it pins the server's current embedding model, and the model's vector length must equal the namespace's dimensions. A namespace created with an `embed` attribute and no `dimensions` takes them from the model. See [embeddings](/vector/embeddings/#models-and-namespaces).

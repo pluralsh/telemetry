@@ -1,0 +1,31 @@
+import { PageHeader } from "@/components/doc-page";
+import { InstallSpec, NextSteps, VerifyInstall } from "@/components/docs/product-blocks";
+
+export const metadata = { title: "Sharded Traces" };
+
+<PageHeader
+  title="Sharded"
+  lede="Several writers, each owning one storage shard, and a reader group per shard. Ingest scales with writers, queries with readers."
+/>
+
+## How it works
+
+Each writer holds the Lease on one storage shard. A span routes to a shard by a hash of its namespace and trace ID, under the [routing epoch](/sharding/) in effect at the trace's earliest span, and any writer accepts any span and forwards each trace to the shard's owner. Each shard gets its own reader group, and a query fans out to every group and merges the results. Adding writers schedules a new epoch: new shards take data from the next aligned hour, and old data never moves.
+
+## Deploy
+
+A shared bucket is required: [grant S3 access](/traces/installation/#grant-s3-access) first. Hover a field to see what it does:
+
+<InstallSpec product="traces" mode="sharded" />
+
+Apply it with `kubectl apply -f traces.yaml`, then add [credentials](/traces/installation/#access) and [connect your tools](/traces/installation/#connect-your-tools). The operator rolls the pods whenever the spec changes.
+
+<VerifyInstall product="traces" />
+
+## Scaling
+
+- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take traces from the next aligned hour, by each trace's earliest span. Scale-down is blocked.
+- **Readers:** `spec.reader.replicas` sets the replicas per reader group. Change it at any time, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
+- **Large traces:** raise `request.maxSpansPerTrace` and reader memory together.
+
+<NextSteps product="traces" links={["architecture", "api", "benchmarks"]} />

@@ -1,0 +1,128 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: vectortopologies.telemetry.plural.sh
+spec:
+  group: telemetry.plural.sh
+  names:
+    kind: VectorTopology
+    listKind: VectorTopologyList
+    plural: vectortopologies
+    shortNames:
+    - vtop
+    singular: vectortopology
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.generation
+      name: Generation
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: VectorTopology is the Schema for a Vector cluster's shard topology.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              VectorTopologySpec is the authoritative shard layout of a Vector cluster.
+              The elected writer and the writer splitting a shard change it with
+              resourceVersion-based compare-and-swap; every replica follows it by watch.
+            properties:
+              generation:
+                format: int64
+                minimum: 1
+                type: integer
+              next_shard_id:
+                format: int32
+                minimum: 1
+                type: integer
+              shards:
+                items:
+                  properties:
+                    children:
+                      description: Children are the shards this one was split into.
+                      items:
+                        format: int32
+                        type: integer
+                      type: array
+                    created_at_ms:
+                      format: int64
+                      type: integer
+                    id:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    owner:
+                      description: |-
+                        Owner is the writer pod that owns the shard. Each writer owns one
+                        active shard.
+                      type: string
+                    parent:
+                      description: Parent is the shard this one was split from.
+                      format: int32
+                      type: integer
+                    range:
+                      description: |-
+                        VectorNamespaceRange is the namespace ids [start, end) a shard holds, as
+                        16 hex digits. An absent end extends to the end of the id space.
+                      properties:
+                        end:
+                          pattern: ^[0-9a-f]{16}$
+                          type: string
+                        start:
+                          pattern: ^[0-9a-f]{16}$
+                          type: string
+                      required:
+                      - start
+                      type: object
+                    split_to:
+                      description: |-
+                        SplitTo is a writer pod without a shard that the owner is splitting
+                        this shard for: the writer takes the upper half of the range.
+                      type: string
+                    state:
+                      enum:
+                      - active
+                      - retired
+                      type: string
+                  required:
+                  - created_at_ms
+                  - id
+                  - range
+                  - state
+                  type: object
+                type: array
+            required:
+            - generation
+            - next_shard_id
+            - shards
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

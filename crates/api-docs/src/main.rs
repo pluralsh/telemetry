@@ -28,6 +28,11 @@ fn main() -> Result<()> {
             repository.join("documentation/openapi/traces.json"),
             plural_traces_server::openapi::document().to_pretty_json()?,
         ),
+        (
+            "Vector",
+            repository.join("documentation/openapi/vector.json"),
+            serde_json::to_string_pretty(&vector::server::openapi::document())?,
+        ),
     ];
 
     let mut stale = Vec::new();

@@ -1,0 +1,102 @@
+[package]
+name = "plural-vector"
+description = "Namespace-aware vector, full-text and attribute search built on SlateDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude = ["tests/data/"]
+
+[lib]
+name = "vector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plural-vector"
+path = "src/bin/server.rs"
+required-features = ["http-server"]
+
+[[bin]]
+name = "embedded-reader"
+path = "src/bin/embedded_reader.rs"
+required-features = ["embedded-reader"]
+
+[features]
+default = []
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_with", "dep:metrics-exporter-prometheus", "dep:utoipa", "dep:reqwest", "dep:server-common"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls", "dep:sharding", "sharding/kubernetes"]
+embedded-reader = ["dep:reqwest"]
+bench-internals = []
+avx512 = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bitpacking = { version = "0.9", default-features = false, features = ["bitpacker8x"] }
+blake3.workspace = true
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+bytes.workspace = true
+common = { path = "../common" }
+dashmap.workspace = true
+fail.workspace = true
+figment = { version = "0.10", features = ["yaml"] }
+foyer.workspace = true
+futures.workspace = true
+icu_segmenter = "2"
+log = "0.4.29"
+metrics.workspace = true
+rand = "0.8"
+rayon = "1.11.0"
+rig-bedrock = "=0.46.0"
+rig-core = { version = "=0.46.0", default-features = false }
+rig-reqwest = "=0.46.0"
+roaring = "0.10"
+rstest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+slatedb.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+usearch = "2"
+uuid.workspace = true
+
+axum = { version = "0.8", optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+k8s-openapi = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+sharding = { path = "../sharding", optional = true }
+metrics-exporter-prometheus = { version = "0.16", optional = true }
+prost = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["json"] }
+serde_with = { workspace = true, optional = true }
+server-common = { path = "../server-common", optional = true }
+tower = { version = "0.5", optional = true }
+utoipa = { version = "6.0.0", optional = true }
+
+[dev-dependencies]
+base64 = "0.23.1"
+common = { path = "../common", features = ["test-utils"] }
+criterion.workspace = true
+proptest.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+tempfile.workspace = true
+
+[[bench]]
+name = "l2_distance"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "l2_score_and_rank"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "kernels"
+harness = false
+required-features = ["bench-internals"]

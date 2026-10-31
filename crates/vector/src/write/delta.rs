@@ -1,0 +1,447 @@
+use crate::AttributeValue;
+use crate::memory::BudgetPermit;
+use common::coordinator::Delta;
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
+use std::sync::Arc;
+use tracing::debug;
+
+#[derive(Clone, Debug)]
+pub(crate) enum VectorDbOp {
+    Write(Vec<VectorWrite>),
+    Delete(Vec<String>),
+}
+
+impl VectorDbOp {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            VectorDbOp::Write(v) => v.len(),
+            VectorDbOp::Delete(v) => v.len(),
+        }
+    }
+
+    /// Estimated bytes the op holds in memory.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            VectorDbOp::Write(writes) => writes.iter().map(VectorWrite::estimated_bytes).sum(),
+            VectorDbOp::Delete(ids) => ids.iter().map(|id| size_of::<String>() + id.len()).sum(),
+        }
+    }
+}
+
+/// An op with the write budget it holds until the delta it joins is flushed.
+pub(crate) struct VectorDbWrite {
+    pub(crate) op: VectorDbOp,
+    pub(crate) permit: Option<BudgetPermit>,
+}
+
+impl From<VectorDbOp> for VectorDbWrite {
+    fn from(op: VectorDbOp) -> Self {
+        Self { op, permit: None }
+    }
+}
+
+/// Summary of one `FieldType::Text` attribute computed at write time (RFC-0006).
+///
+/// Populated by `VectorDb::prepare_vector_write` using the shared tokenizer
+/// and consumed by the Indexer to update FTS postings and statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TextAttributeSummary {
+    /// Maps each unique term to its frequency (count of occurrences) in the field.
+    pub(crate) terms: BTreeMap<String, usize>,
+    /// Number of tokens emitted by the tokenizer (the field's document length).
+    pub(crate) length: usize,
+}
+
+/// A vector write ready for the coordinator.
+///
+/// The write path validates and enqueues this struct.
+/// The delta handles ID allocation, dictionary lookup, centroid assignment, and updates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorWrite {
+    /// User-provided external ID.
+    pub(crate) external_id: String,
+    /// Vector embedding values.
+    pub(crate) values: Vec<f32>,
+    /// All attributes including the vector field.
+    pub(crate) attributes: Vec<(String, AttributeValue)>,
+    /// Summaries for every `FieldType::Text` attribute on this write.
+    pub(crate) text_attribute_summaries: HashMap<String, TextAttributeSummary>,
+}
+
+impl VectorWrite {
+    /// Estimated bytes the write holds in memory: its own fields, every
+    /// attribute, and each text attribute's distinct terms.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let attributes: usize = self
+            .attributes
+            .iter()
+            .map(|(name, value)| {
+                size_of::<(String, AttributeValue)>() + name.len() + attribute_heap_bytes(value)
+            })
+            .sum();
+        let summaries: usize = self
+            .text_attribute_summaries
+            .iter()
+            .map(|(name, summary)| {
+                size_of::<(String, TextAttributeSummary)>()
+                    + name.len()
+                    + summary
+                        .terms
+                        .keys()
+                        .map(|term| size_of::<(String, usize)>() + term.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        size_of::<Self>()
+            + self.external_id.len()
+            + self.values.len() * size_of::<f32>()
+            + attributes
+            + summaries
+    }
+}
+
+fn attribute_heap_bytes(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::String(s) => s.len(),
+        AttributeValue::Int64(_) | AttributeValue::Float64(_) | AttributeValue::Bool(_) => 0,
+        AttributeValue::StringArray(values) => {
+            values.iter().map(|s| size_of::<String>() + s.len()).sum()
+        }
+        AttributeValue::Int64Array(values) => values.len() * size_of::<i64>(),
+        AttributeValue::Vector(values) => values.len() * size_of::<f32>(),
+    }
+}
+
+/// Mutable delta that accumulates writes as well as deletes and builds RecordOps.
+///
+/// Implements the `Delta` trait for use with WriteCoordinator.
+pub(crate) struct VectorDbOpDelta {
+    /// Shared view of the delta's current state, readable by concurrent readers.
+    view: Arc<std::sync::RwLock<VectorDbDeltaView>>,
+}
+
+impl Delta for VectorDbOpDelta {
+    type Context = ();
+    type Write = VectorDbWrite;
+    type Frozen = Arc<VectorDbDeltaView>;
+    type FrozenView = Arc<VectorDbDeltaView>;
+    type ApplyResult = Arc<dyn Any + Send + Sync + 'static>;
+    type DeltaView = Arc<std::sync::RwLock<VectorDbDeltaView>>;
+    type Snapshot = Arc<dyn common::storage::StorageSnapshot>;
+
+    fn init(_context: Self::Context) -> Self {
+        Self {
+            view: Arc::new(std::sync::RwLock::new(VectorDbDeltaView::new())),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        write: Self::Write,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        let mut view = self.view.write().expect("lock poisoned");
+        view.push(write);
+        drop(view);
+        Ok(Arc::new(()))
+    }
+
+    fn estimate_size(&self) -> usize {
+        self.view.read().expect("lock poisoned").bytes
+    }
+
+    fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
+        let frozen = Arc::new(VectorDbDeltaView::clone(
+            &self.view.read().expect("lock poisoned"),
+        ));
+        debug!("freezing delta view with {} ops", frozen.ops.len());
+        let frozen_view = frozen.clone();
+        (frozen, frozen_view, ())
+    }
+
+    fn reader(&self) -> Self::DeltaView {
+        self.view.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct VectorDbDeltaView {
+    pub(crate) ops: Vec<VectorDbOp>,
+    /// Estimated bytes of `ops`.
+    pub(crate) bytes: usize,
+    /// The write budget `ops` hold, shared by every copy of the view so the
+    /// flusher can return it once they are flushed: the coordinator keeps
+    /// the last flushed view until the next flush.
+    pub(crate) permits: Arc<std::sync::Mutex<Vec<BudgetPermit>>>,
+}
+
+impl VectorDbDeltaView {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, write: VectorDbWrite) {
+        self.bytes += write.op.estimated_bytes();
+        self.ops.push(write.op);
+        if let Some(permit) = write.permit {
+            self.permits.lock().expect("lock poisoned").push(permit);
+        }
+    }
+
+    /// Returns the write budget the view's ops hold.
+    pub(crate) fn release_budget(&self) {
+        drop(std::mem::take(
+            &mut *self.permits.lock().expect("lock poisoned"),
+        ));
+    }
+}
+
+#[cfg(test)]
+impl VectorDbOpDelta {
+    pub(crate) fn push_op(&mut self, op: VectorDbOp) -> Result<(), String> {
+        self.apply(op.into()).map(drop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AttributeValue;
+
+    fn make_write(id: &str, values: Vec<f32>) -> VectorWrite {
+        VectorWrite {
+            external_id: id.to_string(),
+            values: values.clone(),
+            attributes: vec![("vector".to_string(), AttributeValue::Vector(values))],
+            text_attribute_summaries: HashMap::new(),
+        }
+    }
+
+    fn assert_write(write: &VectorWrite, expected_id: &str, expected_values: &[f32]) {
+        assert_eq!(write.external_id, expected_id);
+        assert_eq!(write.values, expected_values);
+        // The vector attribute should match the values
+        let vector_attr = write
+            .attributes
+            .iter()
+            .find(|(name, _)| name == "vector")
+            .expect("missing vector attribute");
+        match &vector_attr.1 {
+            AttributeValue::Vector(v) => assert_eq!(v.as_slice(), expected_values),
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    /// Flatten the view's per-call ops into a list of every individual
+    /// `VectorWrite`, preserving order. Test-only helper.
+    fn flatten_writes(view: &VectorDbDeltaView) -> Vec<&VectorWrite> {
+        view.ops
+            .iter()
+            .flat_map(|op| match op {
+                VectorDbOp::Write(w) => w.iter().collect::<Vec<_>>(),
+                VectorDbOp::Delete(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Flatten the view's per-call ops into a list of every individual
+    /// delete external ID, preserving order. Test-only helper.
+    fn flatten_deletes(view: &VectorDbDeltaView) -> Vec<&str> {
+        view.ops
+            .iter()
+            .flat_map(|op| match op {
+                VectorDbOp::Delete(ids) => ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                VectorDbOp::Write(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reader_should_see_applied_writes() {
+        let mut delta = VectorDbOpDelta::init(());
+        let reader = delta.reader();
+
+        delta
+            .push_op(VectorDbOp::Write(vec![
+                make_write("v1", vec![1.0, 0.0, 0.0]),
+                make_write("v2", vec![0.0, 1.0, 0.0]),
+            ]))
+            .unwrap();
+        delta
+            .push_op(VectorDbOp::Write(vec![make_write(
+                "v3",
+                vec![0.0, 0.0, 1.0],
+            )]))
+            .unwrap();
+
+        let view = reader.read().expect("lock poisoned");
+
+        let writes = flatten_writes(&view);
+        let deletes = flatten_deletes(&view);
+        assert_eq!(writes.len(), 3);
+        assert_eq!(deletes.len(), 0);
+        assert_write(writes[0], "v1", &[1.0, 0.0, 0.0]);
+        assert_write(writes[1], "v2", &[0.0, 1.0, 0.0]);
+        assert_write(writes[2], "v3", &[0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn frozen_view_should_contain_applied_writes() {
+        let mut delta = VectorDbOpDelta::init(());
+
+        delta
+            .push_op(VectorDbOp::Write(vec![
+                make_write("v1", vec![1.0, 0.0, 0.0]),
+                make_write("v2", vec![0.0, 1.0, 0.0]),
+            ]))
+            .unwrap();
+
+        let (_frozen, frozen_view, _ctx) = delta.freeze();
+        let writes = flatten_writes(&frozen_view);
+        let deletes = flatten_deletes(&frozen_view);
+        assert_eq!(writes.len(), 2);
+        assert_eq!(deletes.len(), 0);
+        assert_write(writes[0], "v1", &[1.0, 0.0, 0.0]);
+        assert_write(writes[1], "v2", &[0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn estimate_size_should_sum_the_estimated_bytes_of_writes() {
+        let mut delta = VectorDbOpDelta::init(());
+        assert_eq!(delta.estimate_size(), 0);
+        let first = VectorDbOp::Write(vec![make_write("v1", vec![1.0, 0.0, 0.0])]);
+        let second = VectorDbOp::Write(vec![
+            make_write("v2", vec![0.0, 1.0, 0.0]),
+            make_write("v3", vec![0.0, 0.0, 1.0]),
+        ]);
+
+        delta.push_op(first.clone()).unwrap();
+        assert_eq!(delta.estimate_size(), first.estimated_bytes());
+
+        delta.push_op(second.clone()).unwrap();
+        assert_eq!(
+            delta.estimate_size(),
+            first.estimated_bytes() + second.estimated_bytes()
+        );
+    }
+
+    #[test]
+    fn estimated_bytes_should_grow_with_vectors_attributes_and_terms() {
+        let small = make_write("v1", vec![0.0; 4]);
+        let mut large = make_write("v1", vec![0.0; 1024]);
+        assert!(large.estimated_bytes() >= small.estimated_bytes() + 2 * 1020 * 4);
+
+        let before = large.estimated_bytes();
+        large
+            .attributes
+            .push(("title".into(), AttributeValue::String("x".repeat(500))));
+        large.text_attribute_summaries.insert(
+            "title".into(),
+            TextAttributeSummary {
+                terms: BTreeMap::from([("y".repeat(100), 1)]),
+                length: 1,
+            },
+        );
+        assert!(large.estimated_bytes() >= before + 600);
+    }
+
+    #[test]
+    fn release_budget_should_return_permits_held_by_every_copy_of_the_view() {
+        // given
+        let budget = crate::memory::MemoryBudget::new(&crate::memory::MemoryConfig {
+            query_bytes: 1 << 20,
+            write_bytes: 1 << 20,
+            compaction_bytes: 1 << 20,
+        });
+        let mut delta = VectorDbOpDelta::init(());
+        delta
+            .apply(VectorDbWrite {
+                op: VectorDbOp::Delete(vec!["v1".into()]),
+                permit: Some(budget.try_write(1 << 19).unwrap()),
+            })
+            .unwrap();
+        let (frozen, frozen_view, _ctx) = delta.freeze();
+        assert_eq!(budget.write_available(), 1 << 19);
+
+        // when
+        frozen.release_budget();
+
+        // then
+        assert_eq!(budget.write_available(), 1 << 20);
+        drop(frozen_view);
+    }
+
+    #[test]
+    fn delta_should_record_deletes_in_frozen_view() {
+        let mut delta = VectorDbOpDelta::init(());
+
+        delta
+            .push_op(VectorDbOp::Delete(vec!["v1".to_string(), "v2".to_string()]))
+            .unwrap();
+        delta
+            .push_op(VectorDbOp::Delete(vec!["v3".to_string()]))
+            .unwrap();
+
+        let (_frozen, frozen_view, _ctx) = delta.freeze();
+        assert!(flatten_writes(&frozen_view).is_empty());
+        assert_eq!(flatten_deletes(&frozen_view), vec!["v1", "v2", "v3"]);
+    }
+
+    #[test]
+    fn delta_should_record_writes_and_deletes_mixed() {
+        let mut delta = VectorDbOpDelta::init(());
+
+        // Interleave writes and deletes; the frozen view should preserve each
+        // collection's insertion order, regardless of how the calls are mixed.
+        delta
+            .push_op(VectorDbOp::Write(vec![
+                make_write("v1", vec![1.0, 0.0, 0.0]),
+                make_write("v2", vec![0.0, 1.0, 0.0]),
+            ]))
+            .unwrap();
+        delta
+            .push_op(VectorDbOp::Delete(vec!["d1".to_string()]))
+            .unwrap();
+        delta
+            .push_op(VectorDbOp::Write(vec![make_write(
+                "v3",
+                vec![0.0, 0.0, 1.0],
+            )]))
+            .unwrap();
+        delta
+            .push_op(VectorDbOp::Delete(vec!["d2".to_string(), "d3".to_string()]))
+            .unwrap();
+
+        let (_frozen, frozen_view, _ctx) = delta.freeze();
+        let writes = flatten_writes(&frozen_view);
+        assert_eq!(writes.len(), 3);
+        assert_write(writes[0], "v1", &[1.0, 0.0, 0.0]);
+        assert_write(writes[1], "v2", &[0.0, 1.0, 0.0]);
+        assert_write(writes[2], "v3", &[0.0, 0.0, 1.0]);
+        assert_eq!(flatten_deletes(&frozen_view), vec!["d1", "d2", "d3"]);
+
+        // verify order-preservation
+        assert_eq!(frozen_view.ops.len(), 4);
+        assert!(matches!(frozen_view.ops[0], VectorDbOp::Write(_)));
+        assert!(matches!(frozen_view.ops[1], VectorDbOp::Delete(_)));
+        assert!(matches!(frozen_view.ops[2], VectorDbOp::Write(_)));
+        assert!(matches!(frozen_view.ops[3], VectorDbOp::Delete(_)));
+    }
+
+    #[test]
+    fn delta_estimate_size_should_include_deletes() {
+        let mut delta = VectorDbOpDelta::init(());
+
+        delta
+            .push_op(VectorDbOp::Delete(vec!["d1".to_string()]))
+            .unwrap();
+        let one = delta.estimate_size();
+        delta
+            .push_op(VectorDbOp::Delete(vec!["d2".to_string(), "d3".to_string()]))
+            .unwrap();
+
+        assert_eq!(one, size_of::<String>() + 2);
+        assert_eq!(delta.estimate_size(), 3 * one);
+    }
+}

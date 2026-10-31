@@ -197,6 +197,24 @@ impl StorageBuilder {
         self
     }
 
+    /// Maps over the compactor built from the settings' `compactor_options`.
+    ///
+    /// Installing a compactor through [`Self::map_slatedb`] does not work:
+    /// [`Self::build`] attaches this compactor afterwards and replaces it.
+    /// A segment compaction policy from the semantics, if any, still replaces
+    /// the scheduler supplier set here.
+    ///
+    /// No-op for InMemory storage and when compaction is disabled.
+    pub fn map_compactor(
+        mut self,
+        f: impl FnOnce(CompactorBuilder<String>) -> CompactorBuilder<String>,
+    ) -> Self {
+        if let StorageBuilderInner::SlateDb { compactor, .. } = &mut self.inner {
+            *compactor = compactor.take().map(|c| Box::new(f(*c)));
+        }
+        self
+    }
+
     /// Builds the storage instance.
     ///
     /// Applies semantics (merge operator) to the `DbBuilder` and calls `.build()`.

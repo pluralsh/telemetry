@@ -31,6 +31,7 @@ const (
 	testMetricsProduct      = "metrics"
 	testLogsProduct         = "logs"
 	testTracesProduct       = "traces"
+	testVectorProduct       = "vector"
 	testPseudoFSName        = "files"
 )
 
@@ -884,6 +885,68 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 	}
 }
 
+func testEmbedding() *telemetryv1alpha1.VectorEmbeddingSpec {
+	return &telemetryv1alpha1.VectorEmbeddingSpec{Provider: "openai", Model: "text-embedding-3-small"}
+}
+
+func TestRenderSizesVectorMemoryAroundItsReservations(t *testing.T) {
+	limit := func(quantity string) telemetryv1alpha1.WorkloadSpec {
+		return telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+		}}
+	}
+	render := func(embedding *telemetryv1alpha1.VectorEmbeddingSpec) Result {
+		result, err := Render(Input{Vector: &telemetryv1alpha1.Vector{
+			ObjectMeta: metav1.ObjectMeta{Name: testVectorProduct, Namespace: testMetricsNamespace},
+			Spec: telemetryv1alpha1.VectorSpec{
+				Mode:   telemetryv1alpha1.ProductModeSharded,
+				Writer: limit("4Gi"),
+				Reader: limit("2Gi"),
+				Config: telemetryv1alpha1.VectorConfigSpec{Embedding: embedding},
+			},
+		}, InternalToken: []byte("token")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	// given an embedding model without a cache size
+	result := render(testEmbedding())
+
+	// then the writer gets (4Gi - 1Gi headroom - 512Mi reserved) / 100 per
+	// percent, and the reader (2Gi - 768Mi headroom - 448Mi reserved) / 100,
+	// with fixed write and compaction budgets as it does neither.
+	for key, expected := range map[string][]string{
+		VectorKey: {
+			"query_bytes: 644245080", "write_bytes: 322122540", "compaction_bytes: 322122540",
+			"capacity: 107374180",
+		},
+		ReaderKey: {
+			"query_bytes: 348966080", "write_bytes: 16777216", "compaction_bytes: 67108864",
+			"capacity: 34896608",
+		},
+	} {
+		rendered := string(result.Data[key])
+		for _, value := range expected {
+			if !strings.Contains(rendered, value) {
+				t.Errorf("%s missing %q:\n%s", key, value, rendered)
+			}
+		}
+	}
+
+	// when the cache size is set, then every component keeps it
+	cacheSize := resource.MustParse("1Mi")
+	embedding := testEmbedding()
+	embedding.CacheSize = &cacheSize
+	result = render(embedding)
+	for _, key := range []string{VectorKey, ReaderKey} {
+		if rendered := string(result.Data[key]); !strings.Contains(rendered, "capacity: 1048576") {
+			t.Errorf("%s missing the set cache size:\n%s", key, rendered)
+		}
+	}
+}
+
 func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 	storage := []string{"storage.block_cache.memory_capacity", "storage.meta_cache.capacity"}
 	products := []struct {
@@ -919,6 +982,22 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 				return Input{Logs: &telemetryv1alpha1.Logs{
 					ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
 					Spec:       telemetryv1alpha1.LogsSpec{Mode: mode, Writer: workload, Reader: workload},
+				}}
+			},
+		},
+		{
+			name:   testVectorProduct,
+			bounds: []string{"memory.query_bytes", "memory.write_bytes", "memory.compaction_bytes", "embedding.cache.capacity"},
+			reserved: func(key string) int64 {
+				return lo.Ternary(key == ReaderKey, vectorReaderReserved, vectorWriterReserved)
+			},
+			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
+				return Input{Vector: &telemetryv1alpha1.Vector{
+					ObjectMeta: metav1.ObjectMeta{Name: testVectorProduct, Namespace: testMetricsNamespace},
+					Spec: telemetryv1alpha1.VectorSpec{
+						Mode: mode, Writer: workload, Reader: workload,
+						Config: telemetryv1alpha1.VectorConfigSpec{Embedding: testEmbedding()},
+					},
 				}}
 			},
 		},

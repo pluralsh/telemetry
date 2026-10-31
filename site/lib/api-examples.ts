@@ -1,11 +1,13 @@
-import { PRODUCTS, type ProductId } from "./nav";
+import { PRODUCTS, type ApiProduct, type ProductId } from "./nav";
 import type { Operation, Schema } from "./openapi";
+import { vectorCurl, vectorResponse } from "./vector-api";
 
 export const INSTALL_NAMESPACE = "telemetry";
 
-/** In-cluster base URL of a database's writer or reader Service, as created by the operator. */
-export function serviceUrl(product: ProductId, role: "writer" | "reader") {
-  return `http://${product}-${role}.${INSTALL_NAMESPACE}:${PRODUCTS[product].httpPort}`;
+/** In-cluster base URL of a database's writer or reader Service, as created by the operator. A standalone database has one Service for both. */
+export function serviceUrl(product: ProductId, role: "writer" | "reader", standalone = false) {
+  const service = standalone ? product : `${product}-${role}`;
+  return `http://${service}.${INSTALL_NAMESPACE}:${PRODUCTS[product].httpPort}`;
 }
 
 const TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
@@ -210,7 +212,8 @@ function shellQuote(s: string) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-export function curlFor(product: ProductId, op: Operation): string {
+export function curlFor(product: ApiProduct, op: Operation): string {
+  if (product === "vector") return vectorCurl(op);
   const host = serviceUrl(product, op.path.startsWith("/write/") ? "writer" : "reader");
   let url = op.path.replace("{namespace}", "default");
   for (const p of op.params.filter((p) => p.in === "path" && p.name !== "namespace")) {
@@ -280,9 +283,10 @@ function fromSchema(s: Schema | undefined, depth = 0): unknown {
   return null;
 }
 
-export function responseExampleFor(product: ProductId, op: Operation): { status: string; body: string } | null {
+export function responseExampleFor(product: ApiProduct, op: Operation): { status: string; body: string } | null {
   const ok = op.responses.find((r) => r.status.startsWith("2"));
   if (!ok) return null;
+  if (product === "vector") return vectorResponse(op, ok.status);
   const override = RESPONSE_EXAMPLES[`${product}.${bid(op)}`] ??
     (bid(op) === "query_range" ? RESPONSE_EXAMPLES[`${product}.query`] : undefined) ??
     (bid(op) === "trace_v2" ? { trace: RESPONSE_EXAMPLES["traces.trace_v1"] } : undefined);

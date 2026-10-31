@@ -1,0 +1,1078 @@
+use crate::Error::Internal;
+use crate::Result;
+use crate::metric_names::{INDEXER_ANN_REASSIGNS_TOTAL, INDEXER_WRITES_TOTAL};
+use crate::model::AttributeValue;
+use crate::serde::FieldValue;
+use crate::serde::centroid_info::CentroidInfoValue;
+use crate::serde::vector_data::Field;
+#[cfg(test)]
+use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::VectorId;
+use crate::serde::vector_index_data::VectorIndexDataValue;
+use crate::write::delta::{VectorDbOp, VectorWrite};
+use crate::write::indexer::drivers::AsyncBatchDriver;
+use crate::write::indexer::tree::IndexerOpts;
+use crate::write::indexer::tree::centroids::{
+    LeveledCentroidIndex, TreeLevel, batch_search_centroids, batch_search_centroids_in_level,
+};
+use crate::write::indexer::tree::split::ReassignVector;
+use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
+use common::StorageRead;
+use futures::future::BoxFuture;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tracing::trace;
+
+/// An upsert or delete where we need to resolve the old vector data from storage.
+enum Resolved {
+    Upsert {
+        write: VectorWrite,
+        old: (VectorId, VectorIndexDataValue),
+    },
+    Delete {
+        external_id: String,
+        old: (VectorId, VectorIndexDataValue),
+    },
+}
+
+pub(crate) struct WriteVectors {
+    opts: Arc<IndexerOpts>,
+    snapshot: Arc<dyn StorageRead>,
+    snapshot_epoch: u64,
+    ops: Vec<VectorDbOp>,
+}
+
+impl WriteVectors {
+    pub(crate) fn new(
+        opts: &Arc<IndexerOpts>,
+        snapshot: &Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+        ops: Vec<VectorDbOp>,
+    ) -> Self {
+        Self {
+            opts: opts.clone(),
+            snapshot: snapshot.clone(),
+            snapshot_epoch,
+            ops,
+        }
+    }
+
+    /// Returns (inserts, updates, deletes) counts.
+    pub(crate) async fn execute(
+        self,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta,
+    ) -> Result<(usize, usize, usize)> {
+        let total_writes: usize = self.ops.iter().map(VectorDbOp::len).sum();
+        metrics::counter!(INDEXER_WRITES_TOTAL).increment(total_writes as u64);
+
+        let (writes, delete_ids) = Self::collapse_ops(self.ops);
+        if writes.is_empty() && delete_ids.is_empty() {
+            return Ok((0, 0, 0));
+        }
+        let (inserts, upserts, deletes, centroid_assignments) = {
+            let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
+
+            // Centroid assignment runs on the blocking pool in parallel with the
+            // storage reads below.
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
+            let assignment_inputs: Vec<_> = writes
+                .iter()
+                .map(|write| (write.external_id.clone(), write.values.as_slice()))
+                .collect();
+            let assignments_fut = Self::assign_centroids(assignment_inputs, &centroid_index);
+
+            // Partition writes into inserts (new external_id) vs upserts
+            // (existing external_id). Build a single resolution batch for both
+            // upserts and deletes — they all need to fetch existing
+            // VectorIndexData from storage.
+            let mut inserts = Vec::with_capacity(writes.len());
+            let mut resolve_futures: Vec<BoxFuture<'static, Result<Resolved>>> = Vec::new();
+
+            for w in writes.clone() {
+                let Some(old_vector_id) = view.vector_id(&w.external_id) else {
+                    inserts.push(w);
+                    continue;
+                };
+                let index_data_fut = view.vector_index_data(old_vector_id);
+                resolve_futures.push(Box::pin(async move {
+                    let old_data = index_data_fut.await?.ok_or_else(|| {
+                        Internal(format!(
+                            "missing vector index data for id {}",
+                            old_vector_id
+                        ))
+                    })?;
+                    Ok(Resolved::Upsert {
+                        write: w,
+                        old: (old_vector_id, old_data),
+                    })
+                }));
+            }
+
+            for external_id in delete_ids {
+                let Some(vector_id) = view.vector_id(&external_id) else {
+                    continue;
+                };
+                let index_data_fut = view.vector_index_data(vector_id);
+                resolve_futures.push(Box::pin(async move {
+                    let old_data = index_data_fut.await?.ok_or_else(|| {
+                        Internal(format!("missing vector index data for id {}", vector_id))
+                    })?;
+                    Ok(Resolved::Delete {
+                        external_id,
+                        old: (vector_id, old_data),
+                    })
+                }));
+            }
+
+            // Resolve upserts and deletes concurrently (bounded by
+            // AsyncBatchDriver) while the centroid assignments run on the
+            // blocking pool.
+            let (centroid_assignments, resolve_results) =
+                tokio::join!(assignments_fut, AsyncBatchDriver::execute(resolve_futures));
+            let centroid_assignments = centroid_assignments?;
+            let mut upserts = Vec::new();
+            let mut deletes = Vec::new();
+            for result in resolve_results {
+                match result? {
+                    Resolved::Upsert { write, old } => upserts.push((write, old)),
+                    Resolved::Delete { external_id, old } => deletes.push((external_id, old)),
+                }
+            }
+            (inserts, upserts, deletes, centroid_assignments)
+        };
+
+        let insert_count = inserts.len();
+        let update_count = upserts.len();
+        let delete_count = deletes.len();
+
+        // Apply inserts to delta (no old data to clean up)
+        for insert in inserts {
+            let centroid = *centroid_assignments
+                .get(&insert.external_id)
+                .ok_or_else(|| {
+                    Internal(format!(
+                        "missing centroid assignment for external_id={}",
+                        insert.external_id
+                    ))
+                })?;
+            let vector_id = delta
+                .forward_index
+                .add_vector(&insert.external_id, &insert.attributes);
+            delta
+                .search_index
+                .add_to_posting(centroid, vector_id, insert.values.clone());
+            let indexed_fields = Self::collect_indexed_fields(&self.opts, &insert.attributes);
+            for field in &indexed_fields {
+                delta.search_index.add_to_inverted_index(
+                    field.field_name.clone(),
+                    field.value.clone(),
+                    vector_id,
+                );
+            }
+            delta.forward_index.update_vector_index_data(
+                vector_id,
+                vec![centroid],
+                indexed_fields,
+                insert.text_attribute_summaries.keys().cloned().collect(),
+            );
+            // RFC-0006: index text fields into the FTS postings/statistics.
+            delta
+                .fts_index
+                .add_text_summaries(vector_id, &insert.text_attribute_summaries);
+        }
+
+        // Apply upserts to delta
+        for (write, (old_vector_id, old_vector_index_data)) in upserts {
+            let centroid = *centroid_assignments
+                .get(&write.external_id)
+                .ok_or_else(|| {
+                    Internal(format!(
+                        "missing centroid assignment for external_id={}",
+                        write.external_id
+                    ))
+                })?;
+            delta.forward_index.delete_vector(old_vector_id);
+            // RFC-0006: hide the replaced internal id on the FTS query path via
+            // the Deletions bitmap (postings/term-stats are left in place), and
+            // apply the per-field FieldStats delete deltas for the fields the
+            // replaced vector populated.
+            delta.fts_index.add_deleted_vector_id(old_vector_id);
+            delta
+                .fts_index
+                .record_field_deletes(&old_vector_index_data.fts_fields);
+            for old_centroid in old_vector_index_data.postings {
+                delta
+                    .search_index
+                    .remove_from_posting(old_centroid, old_vector_id);
+            }
+            for field in old_vector_index_data.indexed_fields {
+                delta.search_index.remove_from_inverted_index(
+                    field.field_name,
+                    field.value,
+                    old_vector_id,
+                );
+            }
+            let vector_id = delta
+                .forward_index
+                .add_vector(&write.external_id, &write.attributes);
+            delta
+                .search_index
+                .add_to_posting(centroid, vector_id, write.values.clone());
+            let indexed_fields = Self::collect_indexed_fields(&self.opts, &write.attributes);
+            for field in &indexed_fields {
+                delta.search_index.add_to_inverted_index(
+                    field.field_name.clone(),
+                    field.value.clone(),
+                    vector_id,
+                );
+            }
+            delta.forward_index.update_vector_index_data(
+                vector_id,
+                vec![centroid],
+                indexed_fields,
+                write.text_attribute_summaries.keys().cloned().collect(),
+            );
+            // RFC-0006: index text fields for the new vector under its fresh
+            // internal id. Milestone 0 does not retract FTS postings or stats
+            // for the old vector — the query path tolerates stale postings by
+            // checking the forward index when resolving candidates.
+            delta
+                .fts_index
+                .add_text_summaries(vector_id, &write.text_attribute_summaries);
+        }
+
+        // Apply deletes to delta
+        for (external_id, (vector_id, old_vector_index_data)) in deletes {
+            delta
+                .forward_index
+                .delete_external_id_and_vector(external_id, vector_id);
+            // RFC-0006: hide the deleted internal id on the FTS query path via
+            // the Deletions bitmap (postings/term-stats are left in place), and
+            // apply the per-field FieldStats delete deltas for the fields the
+            // deleted vector populated.
+            delta.fts_index.add_deleted_vector_id(vector_id);
+            delta
+                .fts_index
+                .record_field_deletes(&old_vector_index_data.fts_fields);
+            for old_centroid in old_vector_index_data.postings {
+                delta
+                    .search_index
+                    .remove_from_posting(old_centroid, vector_id);
+            }
+            for field in old_vector_index_data.indexed_fields {
+                delta.search_index.remove_from_inverted_index(
+                    field.field_name,
+                    field.value,
+                    vector_id,
+                );
+            }
+        }
+
+        Ok((insert_count, update_count, delete_count))
+    }
+
+    fn collect_indexed_fields(
+        opts: &IndexerOpts,
+        attributes: &[(String, AttributeValue)],
+    ) -> Vec<Field> {
+        attributes
+            .iter()
+            .filter(|(name, _)| opts.is_indexed(name))
+            .flat_map(|(name, value)| {
+                FieldValue::from(value.clone())
+                    .index_terms()
+                    .into_iter()
+                    .map(|term| Field::new(name.clone(), term))
+            })
+            .collect()
+    }
+
+    async fn assign_centroids(
+        writes: Vec<(String, &[f32])>,
+        centroid_index: &LeveledCentroidIndex<'_>,
+    ) -> Result<HashMap<String, VectorId>> {
+        if writes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let search_result = batch_search_centroids(centroid_index, 1, writes).await?;
+        let mut centroid_assignments = HashMap::with_capacity(search_result.len());
+        for (external_id, centroids) in search_result {
+            let Some(centroid) = centroids.first() else {
+                return Err(Internal("no centroids found".to_string()));
+            };
+            centroid_assignments.insert(external_id, centroid.id());
+        }
+        Ok(centroid_assignments)
+    }
+
+    /// Collapse a sequence of writes and deletes into disjoint `(writes,
+    /// deletes)` lists. Walks ops in order so the last action observed for
+    /// each `external_id` wins — both for last-write-wins among writes and for
+    /// cross-type Write-vs-Delete shadowing.
+    fn collapse_ops(ops: Vec<VectorDbOp>) -> (Vec<VectorWrite>, Vec<String>) {
+        enum FinalAction {
+            Write(VectorWrite),
+            Delete,
+        }
+        let mut last_action: HashMap<String, FinalAction> = HashMap::new();
+        for op in ops {
+            match op {
+                VectorDbOp::Write(writes) => {
+                    for w in writes {
+                        last_action.insert(w.external_id.clone(), FinalAction::Write(w));
+                    }
+                }
+                VectorDbOp::Delete(ids) => {
+                    for id in ids {
+                        last_action.insert(id, FinalAction::Delete);
+                    }
+                }
+            }
+        }
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        for (id, action) in last_action {
+            match action {
+                FinalAction::Write(w) => writes.push(w),
+                FinalAction::Delete => deletes.push(id),
+            }
+        }
+        (writes, deletes)
+    }
+}
+
+struct VerifiedVectorReassignment {
+    reassignment: ReassignVector,
+    new_centroid: VectorId,
+}
+
+struct ResolvedVectorReassignment {
+    reassignment: ReassignVector,
+    index_data: VectorIndexDataValue,
+    new_centroid: VectorId,
+}
+
+struct ResolvedCentroidReassignment {
+    reassignment: ReassignVector,
+    data: CentroidInfoValue,
+    new_centroid: VectorId,
+}
+
+pub(crate) struct ReassignVectors {
+    opts: Arc<IndexerOpts>,
+    snapshot: Arc<dyn StorageRead>,
+    snapshot_epoch: u64,
+    reassignments: Vec<ReassignVector>,
+    level: TreeLevel,
+}
+
+impl ReassignVectors {
+    pub(crate) fn new(
+        opts: &Arc<IndexerOpts>,
+        snapshot: &Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+        reassignments: Vec<ReassignVector>,
+        level: TreeLevel,
+    ) -> Self {
+        Self {
+            opts: opts.clone(),
+            snapshot: snapshot.clone(),
+            snapshot_epoch,
+            reassignments,
+            level,
+        }
+    }
+
+    /// Returns the number of vectors actually reassigned.
+    pub(crate) async fn execute(
+        mut self,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta,
+    ) -> Result<usize> {
+        if self.reassignments.is_empty() {
+            return Ok(0);
+        }
+        // sanity check we don't have any double reassignments
+        let ids = self
+            .reassignments
+            .iter()
+            .map(|r| r.vector_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), self.reassignments.len());
+        let reassignments = {
+            let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
+            let centroid_index =
+                view.centroid_index(self.opts.dimensions, self.opts.distance_metric);
+
+            // update current centroid in case centroid was moved as part of a split/merge
+            self.reassignments.iter_mut().for_each(|r| {
+                assert_eq!(r.vector_id.level() + 1, self.level.level());
+                assert_eq!(r.level, self.level);
+                if let Some(p) = view.last_written_posting(r.vector_id) {
+                    r.current_centroid = p;
+                }
+            });
+
+            let ann_search_batch: Vec<_> = self
+                .reassignments
+                .iter()
+                .map(|r| (r.vector_id, r.vector.as_slice()))
+                .collect();
+            let assignments =
+                batch_search_centroids_in_level(&centroid_index, 1, ann_search_batch, self.level)
+                    .await?;
+
+            // determine which vectors actually need a new assignment
+            let reassignments: Vec<_> = self
+                .reassignments
+                .into_iter()
+                .filter_map(|r| {
+                    let closest_centroid = assignments
+                        .get(&r.vector_id)
+                        .expect("no centroids")
+                        .first()
+                        .expect("no centroids")
+                        .id();
+                    if closest_centroid == r.current_centroid {
+                        None
+                    } else {
+                        Some(VerifiedVectorReassignment {
+                            reassignment: r,
+                            new_centroid: closest_centroid,
+                        })
+                    }
+                })
+                .collect();
+            reassignments
+        };
+
+        let level = self.level;
+        let reassigned = if level.is_leaf() {
+            Self::execute_vector_reassignments(
+                &self.opts,
+                &self.snapshot,
+                self.snapshot_epoch,
+                state,
+                delta,
+                reassignments,
+            )
+            .await?
+        } else {
+            Self::execute_centroid_reassignments(
+                &self.snapshot,
+                self.snapshot_epoch,
+                state,
+                delta,
+                reassignments,
+            )
+            .await?
+        };
+        metrics::counter!(
+            INDEXER_ANN_REASSIGNS_TOTAL,
+            "level" => level.level().to_string(),
+        )
+        .increment(reassigned as u64);
+        Ok(reassigned)
+    }
+
+    async fn execute_centroid_reassignments(
+        snapshot: &Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta,
+        reassignments: Vec<VerifiedVectorReassignment>,
+    ) -> Result<usize> {
+        let resolved = {
+            let view = VectorIndexView::new(delta, state, snapshot, snapshot_epoch);
+            reassignments
+                .into_iter()
+                .map(|r| ResolvedCentroidReassignment {
+                    data: view
+                        .centroid(r.reassignment.vector_id)
+                        .cloned()
+                        .expect("unexpected missing centroid"),
+                    reassignment: r.reassignment,
+                    new_centroid: r.new_centroid,
+                })
+                .collect::<Vec<_>>()
+        };
+        let nreassigned = resolved.len();
+        for mut r in resolved {
+            delta
+                .search_index
+                .remove_from_posting(r.reassignment.current_centroid, r.reassignment.vector_id);
+            delta.search_index.add_to_posting(
+                r.new_centroid,
+                r.reassignment.vector_id,
+                r.reassignment.vector,
+            );
+            r.data.parent_vector_id = r.new_centroid;
+            delta
+                .search_index
+                .update_centroid(r.reassignment.vector_id, r.data);
+        }
+        Ok(nreassigned)
+    }
+
+    async fn execute_vector_reassignments(
+        _opts: &IndexerOpts,
+        snapshot: &Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta,
+        reassignments: Vec<VerifiedVectorReassignment>,
+    ) -> Result<usize> {
+        let resolved = {
+            let view = VectorIndexView::new(delta, state, snapshot, snapshot_epoch);
+            // pull the current index data so we can persist the new centroid assignment
+            let mut to_resolve = Vec::with_capacity(reassignments.len());
+            for r in reassignments {
+                let index_data_fut = view.vector_index_data(r.reassignment.vector_id);
+                to_resolve.push(Box::pin(async move {
+                    Ok(ResolvedVectorReassignment {
+                        reassignment: r.reassignment,
+                        index_data: index_data_fut.await?.expect("missing vector index data"),
+                        new_centroid: r.new_centroid,
+                    })
+                })
+                    as BoxFuture<Result<ResolvedVectorReassignment>>);
+            }
+            let resolve_results = AsyncBatchDriver::execute(to_resolve).await;
+            let mut resolved = Vec::with_capacity(resolve_results.len());
+            for result in resolve_results {
+                resolved.push(result?);
+            }
+            resolved
+        };
+        let nreassigned = resolved.len();
+        for r in resolved {
+            trace!("old index data: {:?}", r.index_data);
+            assert_eq!(
+                r.index_data.postings.len(),
+                1,
+                "expected exactly one posting for reassigned vector {}",
+                r.reassignment.vector_id
+            );
+            let old_centroid = r.index_data.postings[0];
+            assert_eq!(
+                old_centroid, r.reassignment.current_centroid,
+                "reassignment current centroid disagrees with vector index data for {}",
+                r.reassignment.vector_id
+            );
+            delta
+                .search_index
+                .remove_from_posting(old_centroid, r.reassignment.vector_id);
+            delta.search_index.add_to_posting(
+                r.new_centroid,
+                r.reassignment.vector_id,
+                r.reassignment.vector,
+            );
+            delta.forward_index.update_vector_index_data(
+                r.reassignment.vector_id,
+                vec![r.new_centroid],
+                r.index_data.indexed_fields,
+                r.index_data.fts_fields,
+            );
+        }
+        Ok(nreassigned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AttributeValue, MetadataFieldSpec};
+    use crate::serde::FieldType;
+    use crate::serde::FieldValue;
+    use crate::serde::collection_meta::DistanceMetric;
+    use crate::serde::vector_data::Field;
+    use crate::serde::vector_id::ROOT_VECTOR_ID;
+    use crate::storage::VectorDbStorageReadExt;
+    use crate::write::indexer::tree::centroids::{TreeDepth, TreeLevel};
+    use crate::write::indexer::tree::posting_list::{Posting, PostingList};
+    use crate::write::indexer::tree::test_utils::{
+        IndexerOpTestHarness, IndexerOpTestHarnessBuilder,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    const DIMS: usize = 3;
+    const CENTROID_ID_NUM: u64 = 1;
+
+    fn centroid_id(id: u64) -> VectorId {
+        VectorId::centroid_id(1, id)
+    }
+
+    fn create_opts() -> Arc<IndexerOpts> {
+        Arc::new(IndexerOpts {
+            dimensions: DIMS,
+            distance_metric: DistanceMetric::L2,
+            root_threshold_vectors: usize::MAX,
+            merge_threshold_vectors: 0,
+            split_threshold_vectors: usize::MAX,
+            split_search_neighbourhood: 4,
+            indexed_fields: HashSet::from(["category".to_string()]),
+            text_fields: HashSet::new(),
+            index_all_fields: false,
+        })
+    }
+
+    fn make_write(id: &str, values: Vec<f32>, category: &str) -> VectorWrite {
+        VectorWrite {
+            external_id: id.to_string(),
+            values: values.clone(),
+            attributes: vec![
+                ("vector".to_string(), AttributeValue::Vector(values)),
+                (
+                    "category".to_string(),
+                    AttributeValue::String(category.to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    AttributeValue::String(format!("{id} description")),
+                ),
+            ],
+            text_attribute_summaries: HashMap::new(),
+        }
+    }
+
+    fn make_data(id: &str, values: Vec<f32>, category: &str) -> VectorDataValue {
+        let fields = vec![
+            Field::new("vector", FieldValue::Vector(values)),
+            Field::new("category", FieldValue::String(category.to_string())),
+            Field::new(
+                "description",
+                FieldValue::String(format!("{id} description")),
+            ),
+        ];
+        VectorDataValue::new(id, fields)
+    }
+
+    async fn make_single_centroid_harness() -> IndexerOpTestHarness {
+        IndexerOpTestHarnessBuilder::new(vec![
+            MetadataFieldSpec::new("category", FieldType::String, true),
+            MetadataFieldSpec::new("description", FieldType::String, false),
+        ])
+        .with_leaf_centroid(centroid_id(CENTROID_ID_NUM), vec![0.0; DIMS], vec![])
+        .build(DIMS)
+        .await
+    }
+
+    #[tokio::test]
+    async fn should_update_delta_correctly_from_write_vectors() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        let writes = vec![
+            make_write("a", vec![1.0, 0.0, 0.0], "shoes"),
+            make_write("b", vec![0.0, 1.0, 0.0], "shoes"),
+            make_write("c", vec![0.0, 0.0, 1.0], "boots"),
+        ];
+
+        // when
+        h.write_and_apply(&opts, writes).await;
+
+        // then
+        let expected = vec![
+            ("a", vec![1.0, 0.0, 0.0], "shoes"),
+            ("b", vec![0.0, 1.0, 0.0], "shoes"),
+            ("c", vec![0.0, 0.0, 1.0], "boots"),
+        ];
+        let mut expected_postings: HashMap<VectorId, Vec<f32>> = HashMap::new();
+        let mut internal_ids = HashMap::new();
+        for (ext_id, values, category) in &expected {
+            let internal_id = h
+                .storage
+                .lookup_internal_id(ext_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing dictionary entry for {ext_id}"));
+            internal_ids.insert(ext_id.to_string(), internal_id);
+            let data = h
+                .storage
+                .get_vector_data(internal_id, DIMS)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing vector data for {ext_id}"));
+            assert_eq!(data, make_data(ext_id, values.clone(), category));
+            expected_postings.insert(internal_id, values.clone());
+        }
+        let posting = PostingList::from_value(
+            h.storage
+                .get_posting_list(centroid_id(CENTROID_ID_NUM), DIMS)
+                .await
+                .unwrap(),
+            false,
+        );
+        assert_eq!(posting.len(), 3);
+        for p in posting.iter() {
+            let posting_id = p.id();
+            let expected_vec = expected_postings
+                .get(&posting_id)
+                .unwrap_or_else(|| panic!("unexpected vector id {} in posting list", posting_id));
+            assert_eq!(p.vector(), expected_vec.as_slice());
+        }
+        let shoes_bitmap = h
+            .storage
+            .get_metadata_index("category", FieldValue::String("shoes".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(shoes_bitmap.len(), 2);
+        assert!(shoes_bitmap.contains(internal_ids["a"].id()));
+        assert!(shoes_bitmap.contains(internal_ids["b"].id()));
+        let boots_bitmap = h
+            .storage
+            .get_metadata_index("category", FieldValue::String("boots".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(boots_bitmap.len(), 1);
+        assert!(boots_bitmap.contains(internal_ids["c"].id()));
+        for id in ["a", "b", "c"] {
+            let bitmap = h
+                .storage
+                .get_metadata_index(
+                    "description",
+                    FieldValue::String(format!("{id} description")),
+                )
+                .await
+                .unwrap();
+            assert!(bitmap.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn should_update_delta_correctly_from_write_vectors_on_update() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(
+            &opts,
+            vec![
+                make_write("a", vec![1.0, 0.0, 0.0], "shoes"),
+                make_write("b", vec![0.0, 1.0, 0.0], "shoes"),
+            ],
+        )
+        .await;
+        let old_id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let old_id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
+
+        // when
+        h.write_and_apply(
+            &opts,
+            vec![
+                make_write("a", vec![2.0, 0.0, 0.0], "shoes"),
+                make_write("b", vec![0.0, 2.0, 0.0], "shoes"),
+            ],
+        )
+        .await;
+
+        // then
+        assert!(
+            h.storage
+                .get_vector_data(old_id_a, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.storage
+                .get_vector_data(old_id_b, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let new_id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let new_id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
+        assert_ne!(old_id_a, new_id_a);
+        assert_ne!(old_id_b, new_id_b);
+        let data_a = h
+            .storage
+            .get_vector_data(new_id_a, DIMS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data_a, make_data("a", vec![2.0, 0.0, 0.0], "shoes"));
+        let data_b = h
+            .storage
+            .get_vector_data(new_id_b, DIMS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data_b, make_data("b", vec![0.0, 2.0, 0.0], "shoes"));
+    }
+
+    #[tokio::test]
+    async fn should_compact_duplicate_writes_from_write_vectors() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        let writes = vec![
+            make_write("x", vec![1.0, 0.0, 0.0], "shoes"),
+            make_write("x", vec![2.0, 0.0, 0.0], "clothes"),
+            make_write("x", vec![3.0, 0.0, 0.0], "furniture"),
+        ];
+
+        // when
+        h.write_and_apply(&opts, writes).await;
+
+        // then
+        let internal_id = h.storage.lookup_internal_id("x").await.unwrap().unwrap();
+        let data = h
+            .storage
+            .get_vector_data(internal_id, DIMS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, make_data("x", vec![3.0, 0.0, 0.0], "furniture"));
+        let posting = PostingList::from_value(
+            h.storage
+                .get_posting_list(centroid_id(CENTROID_ID_NUM), DIMS)
+                .await
+                .unwrap(),
+            false,
+        );
+        assert_eq!(posting.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_reassign_vectors_after_split() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        let writes = vec![
+            make_write("a", vec![0.9, 0.1, 0.0], "shoes"),
+            make_write("b", vec![0.1, 0.9, 0.0], "shoes"),
+            make_write("c", vec![0.2, 0.8, 0.0], "boots"),
+        ];
+        h.write_and_apply(&opts, writes).await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
+        let id_c = h.storage.lookup_internal_id("c").await.unwrap().unwrap();
+        let snapshot = h.snapshot().await;
+        let mut delta = VectorIndexDelta::new(&h.state, false);
+        let depth = TreeDepth::of(h.state.centroids_meta().depth);
+        let level = TreeLevel::leaf(depth);
+        let old_centroid = centroid_id(CENTROID_ID_NUM);
+        delta.search_index.delete_centroids(vec![old_centroid]);
+        delta.search_index.remove_from_root(old_centroid);
+        let (c_a, c_a_info) =
+            delta
+                .search_index
+                .add_centroid(level, vec![1.0, 0.0, 0.0], ROOT_VECTOR_ID);
+        delta.search_index.add_to_root(c_a, c_a_info.vector.clone());
+        let (c_b, c_b_info) =
+            delta
+                .search_index
+                .add_centroid(level, vec![0.0, 1.0, 0.0], ROOT_VECTOR_ID);
+        delta.search_index.add_to_root(c_b, c_b_info.vector.clone());
+
+        let reassignments = vec![
+            ReassignVector::new(id_a, vec![0.9, 0.1, 0.0], old_centroid, level),
+            ReassignVector::new(id_b, vec![0.1, 0.9, 0.0], old_centroid, level),
+            ReassignVector::new(id_c, vec![0.2, 0.8, 0.0], old_centroid, level),
+        ];
+
+        // when
+        let rv = ReassignVectors::new(&opts, &snapshot, 1, reassignments, level);
+        rv.execute(&h.state, &mut delta).await.unwrap();
+        h.apply_delta(delta).await;
+
+        // then
+        let posting_a =
+            PostingList::from_value(h.storage.get_posting_list(c_a, DIMS).await.unwrap(), false);
+        let ids_a: HashSet<VectorId> = posting_a.iter().map(|p: &Posting| p.id()).collect();
+        assert!(ids_a.contains(&id_a));
+        assert!(!ids_a.contains(&id_b));
+        assert!(!ids_a.contains(&id_c));
+        let posting_b =
+            PostingList::from_value(h.storage.get_posting_list(c_b, DIMS).await.unwrap(), false);
+        let ids_b: HashSet<VectorId> = posting_b.iter().map(|p: &Posting| p.id()).collect();
+        assert!(ids_b.contains(&id_b));
+        assert!(ids_b.contains(&id_c));
+        assert!(!ids_b.contains(&id_a));
+    }
+
+    #[tokio::test]
+    async fn should_skip_reassignment_when_already_at_closest_centroid() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![0.9, 0.1, 0.0], "shoes")])
+            .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let depth = TreeDepth::of(h.state.centroids_meta().depth);
+        let level = TreeLevel::leaf(depth);
+        let reassignments = vec![ReassignVector::new(
+            id_a,
+            vec![0.9, 0.1, 0.0],
+            centroid_id(CENTROID_ID_NUM),
+            level,
+        )];
+
+        // when
+        let snapshot = h.snapshot().await;
+        let mut delta = VectorIndexDelta::new(&h.state, false);
+        let rv = ReassignVectors::new(&opts, &snapshot, 1, reassignments, level);
+        rv.execute(&h.state, &mut delta).await.unwrap();
+        let ops = delta.freeze(1, &mut h.state);
+
+        // then
+        let posting_ops: Vec<_> = ops
+            .iter()
+            .filter(|op| matches!(op, common::storage::RecordOp::Merge(_)))
+            .collect();
+        assert!(posting_ops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_use_delta_posting_as_true_current_centroid() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![0.9, 0.1, 0.0], "shoes")])
+            .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let snapshot = h.snapshot().await;
+        let mut delta = VectorIndexDelta::new(&h.state, false);
+        let depth = TreeDepth::of(h.state.centroids_meta().depth);
+        let level = TreeLevel::leaf(depth);
+        let old_centroid = centroid_id(CENTROID_ID_NUM);
+        delta.search_index.delete_centroids(vec![old_centroid]);
+        delta.search_index.remove_from_root(old_centroid);
+        let (c0, c0_info) =
+            delta
+                .search_index
+                .add_centroid(level, vec![1.0, 0.0, 0.0], ROOT_VECTOR_ID);
+        delta.search_index.add_to_root(c0, c0_info.vector.clone());
+        let (c1, c1_info) =
+            delta
+                .search_index
+                .add_centroid(level, vec![0.0, 1.0, 0.0], ROOT_VECTOR_ID);
+        delta.search_index.add_to_root(c1, c1_info.vector.clone());
+        delta
+            .search_index
+            .add_to_posting(c0, id_a, vec![0.9, 0.1, 0.0]);
+
+        let reassignments = vec![ReassignVector::new(
+            id_a,
+            vec![0.9, 0.1, 0.0],
+            old_centroid,
+            level,
+        )];
+
+        // when
+        let rv = ReassignVectors::new(&opts, &snapshot, 1, reassignments, level);
+        rv.execute(&h.state, &mut delta).await.unwrap();
+        h.apply_delta(delta).await;
+
+        // then
+        let posting_c0 =
+            PostingList::from_value(h.storage.get_posting_list(c0, DIMS).await.unwrap(), false);
+        let ids_c0: HashSet<VectorId> = posting_c0.iter().map(|p: &Posting| p.id()).collect();
+        assert!(ids_c0.contains(&id_a));
+        let posting_c1 =
+            PostingList::from_value(h.storage.get_posting_list(c1, DIMS).await.unwrap(), false);
+        let ids_c1: HashSet<VectorId> = posting_c1.iter().map(|p: &Posting| p.id()).collect();
+        assert!(!ids_c1.contains(&id_a));
+    }
+
+    #[tokio::test]
+    async fn delete_known_external_id_should_remove_from_postings_and_inverted_index() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(
+            &opts,
+            vec![
+                make_write("a", vec![1.0, 0.0, 0.0], "shoes"),
+                make_write("b", vec![0.0, 1.0, 0.0], "shoes"),
+            ],
+        )
+        .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
+        let leaf = centroid_id(CENTROID_ID_NUM);
+
+        // when
+        let count = h.delete_and_apply(&opts, vec!["a".to_string()]).await;
+
+        // then
+        assert_eq!(count, 1);
+
+        // dictionary entry tombstoned
+        assert!(h.storage.lookup_internal_id("a").await.unwrap().is_none());
+        // VectorData and VectorIndexData tombstoned
+        assert!(
+            h.storage
+                .get_vector_data(id_a, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.storage
+                .get_vector_index_data(id_a)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let posting =
+            PostingList::from_value(h.storage.get_posting_list(leaf, DIMS).await.unwrap(), false);
+        let posting_ids: HashSet<VectorId> = posting.iter().map(|p: &Posting| p.id()).collect();
+        assert!(posting_ids.contains(&id_b));
+        assert!(!posting_ids.contains(&id_a));
+
+        let shoes = h
+            .storage
+            .get_metadata_index("category", FieldValue::String("shoes".to_string()))
+            .await
+            .unwrap();
+        assert!(shoes.excluded.contains(id_a.id()));
+        assert!(shoes.included.contains(id_b.id()));
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_external_id_should_be_noop() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![1.0, 0.0, 0.0], "shoes")])
+            .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+
+        // when
+        let count = h
+            .delete_and_apply(&opts, vec!["does-not-exist".to_string()])
+            .await;
+
+        // then
+        assert_eq!(count, 0);
+        assert!(
+            h.storage
+                .get_vector_data(id_a, DIMS)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_should_dedupe_duplicate_ids_within_batch() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![1.0, 0.0, 0.0], "shoes")])
+            .await;
+
+        // when
+        let count = h
+            .delete_and_apply(&opts, vec!["a".to_string(), "a".to_string()])
+            .await;
+
+        // then
+        assert_eq!(count, 1);
+        assert!(h.storage.lookup_internal_id("a").await.unwrap().is_none());
+    }
+}

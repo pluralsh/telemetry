@@ -238,6 +238,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "PseudoFS")
 		os.Exit(1)
 	}
+	if err := (&controller.VectorReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		DefaultProductVersion: defaultProductVersion,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Vector")
+		os.Exit(1)
+	}
 	if err := (&controller.NamespaceAuthenticationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -246,8 +254,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.BucketCleanerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BucketCleaner")
 		os.Exit(1)
