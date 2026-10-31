@@ -7,6 +7,9 @@ const nextConfig = {
   basePath: process.env.DOCS_BASE_PATH || "",
   images: { unoptimized: true },
   pageExtensions: ["ts", "tsx", "mdx"],
+  experimental: {
+    agentUpgrade: "security",
+  },
 };
 
 const withMDX = createMDX({
