@@ -112,8 +112,10 @@ async fn main() {
             );
             let running: serde_json::Value = serde_yaml::from_str(&raw)
                 .unwrap_or_else(|e| panic!("Failed to parse config file '{config}': {e}"));
-            guard.watch(config.into(), running);
             let (cluster, peers) = open_cluster(cluster_config, identity).await;
+            cluster.declare_schemas(access.schemas());
+            cluster.spawn_schema_applier();
+            guard.watch(config.into(), running, Arc::clone(&cluster));
             ClusterServer::new(cluster, server_config, metrics_state)
                 .with_peers(peers)
                 .with_guard(guard)

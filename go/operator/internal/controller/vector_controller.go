@@ -53,6 +53,7 @@ type VectorReconciler struct {
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=vectors/finalizers,verbs=update
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=vectortopologies,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceauthentications,verbs=get;list;watch
+// +kubebuilder:rbac:groups=telemetry.plural.sh,resources=namespaceschemas,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -114,6 +115,7 @@ func (r *VectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&telemetryv1alpha1.VectorTopology{}, handler.EnqueueRequestsFromMapFunc(vectorForTopology)).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(vectorForPVC)).
 		Watches(&telemetryv1alpha1.NamespaceAuthentication{}, handler.EnqueueRequestsFromMapFunc(vectorForNamespaceAuth)).
+		Watches(&telemetryv1alpha1.NamespaceSchema{}, handler.EnqueueRequestsFromMapFunc(vectorForNamespaceSchema)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.vectorForSecret)).
 		Named("vector").
 		Complete(r)

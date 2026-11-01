@@ -13,6 +13,7 @@ Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API 
 - [Logs](#logs)
 - [Metrics](#metrics)
 - [NamespaceAuthentication](#namespaceauthentication)
+- [NamespaceSchema](#namespaceschema)
 - [PseudoFS](#pseudofs)
 - [ShardMap](#shardmap)
 - [Traces](#traces)
@@ -59,6 +60,25 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `read` _[BasicCredentialSpec](#basiccredentialspec) array_ |  |  |  |
 | `write` _[BasicCredentialSpec](#basiccredentialspec) array_ |  |  |  |
+
+
+#### AttributeSchema
+
+
+
+AttributeSchema is the schema of one namespace attribute, as in the
+datastore's schema API.
+
+
+
+_Appears in:_
+- [NamespaceSchemaSpec](#namespaceschemaspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `type` _string_ | Type is fixed once the attribute exists. |  | Enum: [string int float bool []string []int] <br /> |
+| `full_text_search` _boolean_ | FullTextSearch indexes a string attribute for BM25 ranking. |  |  |
+| `embed` _boolean_ | Embed embeds a string attribute into the vector of rows written<br />without one. At most one attribute per namespace. |  |  |
 
 
 #### AuthSpec
@@ -339,6 +359,7 @@ _Appears in:_
 
 _Appears in:_
 - [NamespaceAuthenticationSpec](#namespaceauthenticationspec)
+- [NamespaceSchemaSpec](#namespaceschemaspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -845,6 +866,44 @@ _Appears in:_
 | `permission` _string_ |  |  | Enum: [read write] <br /> |
 | `secretKeyRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ |  |  |  |
 | `usageReportingEndpoint` _string_ | UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or<br />http://host:port) implementing Plural Console's PluralServer.MeterMetrics.<br />Ingested bytes for the namespace are buffered and periodically reported<br />to it. When several NamespaceAuthentications for the same datastore and<br />namespace set different endpoints, the lexicographically smallest wins.<br />Vector doesn't report usage. |  | MaxLength: 253 <br />Pattern: `^(http://)?[A-Za-z0-9.-]+(:[0-9]\{1,5\})?$` <br /> |
+
+
+
+
+#### NamespaceSchema
+
+
+
+NamespaceSchema declares the attribute schema of a datastore namespace.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `telemetry.plural.sh/v1alpha1` | | |
+| `kind` _string_ | `NamespaceSchema` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[NamespaceSchemaSpec](#namespaceschemaspec)_ |  |  |  |
+
+
+#### NamespaceSchemaSpec
+
+
+
+NamespaceSchemaSpec defines the desired state of NamespaceSchema.
+
+
+
+_Appears in:_
+- [NamespaceSchema](#namespaceschema)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `dataStoreRef` _[DataStoreReference](#datastorereference)_ |  |  |  |
+| `namespace` _string_ | Namespace is the datastore namespace the schema is for. Defaults to<br />the resource's name. |  | MinLength: 1 <br /> |
+| `schema` _object (keys:string, values:[AttributeSchema](#attributeschema))_ | Schema maps attribute names to their schemas. Servers merge it into<br />the namespace whenever it changes and when the namespace is created:<br />attributes it names are replaced whole, others are left alone, and an<br />attribute's type can't change once set. Attributes removed from it<br />stay in the namespace. |  | MinProperties: 1 <br /> |
 
 
 

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/samber/lo"
 	"sigs.k8s.io/yaml"
@@ -114,6 +115,7 @@ func renderVector(input Input) (Result, error) {
 		namespace.UsageReportingEndpoint = ""
 		return namespace
 	}), spec.Namespaces, secretsPath)
+	namespaces = withSchemas(namespaces, input.Schemas)
 	jwt, err := renderVectorJWT(data, input.JWT, secretsPath)
 	if err != nil {
 		return Result{}, err
@@ -201,6 +203,21 @@ func renderVector(input Input) (Result, error) {
 	_, _ = sum.Write(data[jwksKey])
 	_, _ = sum.Write(input.InternalToken)
 	return Result{Data: data, Hash: hex.EncodeToString(sum.Sum(nil))}, nil
+}
+
+// withSchemas attaches each namespace's schema, declaring the namespaces
+// that only have one.
+func withSchemas(namespaces []renderNamespace, schemas map[string]map[string]telemetryv1alpha1.AttributeSchema) []renderNamespace {
+	for name := range schemas {
+		if !slices.ContainsFunc(namespaces, func(namespace renderNamespace) bool { return namespace.Name == name }) {
+			namespaces = append(namespaces, renderNamespace{Name: name, Auth: emptyAccess()})
+		}
+	}
+	slices.SortFunc(namespaces, func(a, b renderNamespace) int { return strings.Compare(a.Name, b.Name) })
+	for i := range namespaces {
+		namespaces[i].Schema = schemas[namespaces[i].Name]
+	}
+	return namespaces
 }
 
 const embeddingAPIKeyKey = "embedding-api-key"

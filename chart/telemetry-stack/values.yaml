@@ -129,6 +129,13 @@ products:
     #   namespace: search
     #   username: plrl
     #   permission: write
+    # NamespaceSchemas, merged into their namespace by the servers. The
+    # namespace defaults to the entry's name.
+    schemas: []
+    # - name: search
+    #   schema:
+    #     body: { type: string, full_text_search: true, embed: true }
+    #     year: { type: int }
 
 # BucketCleaners delete a datastore's objects from the bucket when the
 # release is uninstalled (or the product is disabled). When enabled, every

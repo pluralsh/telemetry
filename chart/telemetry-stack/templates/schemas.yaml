@@ -1,0 +1,24 @@
+{{- $root := . -}}
+{{- with .Values.products.vector }}
+{{- if .enabled }}
+{{- $product := . }}
+{{- range $schema := .schemas }}
+---
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceSchema
+metadata:
+  name: {{ required "products.vector.schemas[].name is required" $schema.name }}
+  labels:
+    {{- include "telemetry-stack.labels" $root | nindent 4 }}
+spec:
+  dataStoreRef:
+    kind: Vector
+    name: {{ $product.name }}
+  {{- with $schema.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  schema:
+    {{- toYaml (required "products.vector.schemas[].schema is required" $schema.schema) | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

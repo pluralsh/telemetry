@@ -55,14 +55,14 @@ func (r *NamespaceAuthenticationReconciler) Reconcile(ctx context.Context, req c
 	if err := r.Get(ctx, req.NamespacedName, auth); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	status, reason, message := metav1.ConditionTrue, "Ready", "authentication reference is valid"
+	status, reason, message := metav1.ConditionTrue, reasonReady, "authentication reference is valid"
 	if err := r.validate(ctx, auth); err != nil {
 		status, reason, message = metav1.ConditionFalse, "Invalid", err.Error()
 	}
 	base := auth.DeepCopy()
 	auth.Status.ObservedGeneration = auth.Generation
 	meta.SetStatusCondition(&auth.Status.Conditions, metav1.Condition{
-		Type: "Ready", Status: status, Reason: reason, Message: message,
+		Type: conditionReady, Status: status, Reason: reason, Message: message,
 		ObservedGeneration: auth.Generation, LastTransitionTime: metav1.NewTime(time.Now()),
 	})
 	if equality.Semantic.DeepEqual(base.Status, auth.Status) {

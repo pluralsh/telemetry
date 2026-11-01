@@ -7,6 +7,7 @@ resources:
 - bases/telemetry.plural.sh_traces.yaml
 - bases/telemetry.plural.sh_pseudofs.yaml
 - bases/telemetry.plural.sh_namespaceauthentications.yaml
+- bases/telemetry.plural.sh_namespaceschemas.yaml
 - bases/telemetry.plural.sh_shardmaps.yaml
 - bases/telemetry.plural.sh_bucketcleaners.yaml
 - bases/telemetry.plural.sh_vectors.yaml

@@ -1,0 +1,13 @@
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceSchema
+metadata:
+  name: articles
+spec:
+  dataStoreRef:
+    kind: Vector
+    name: vector
+  schema:
+    body: { type: string, full_text_search: true, embed: true }
+    year: { type: int }
+    score: { type: float }
+    tags: { type: "[]string" }

@@ -87,7 +87,7 @@ The budgets are process-wide, shared by every namespace and shard a replica serv
 
 ## Helm
 
-The `telemetry-stack` Helm chart creates a `Vector` resource when `products.vector.enabled` is set, using the chart's shared `global.storage` and `global.ingress` (served under `/vector`), and a `NamespaceAuthentication` for each entry of `products.vector.authentications`. With `bucketCleaners.enabled`, the chart also adds a `BucketCleaner` that references the store and takes its bucket and storage path from it. The cleaner deletes the data once the store and its pods are gone, for example after `helm uninstall`.
+The `telemetry-stack` Helm chart creates a `Vector` resource when `products.vector.enabled` is set, using the chart's shared `global.storage` and `global.ingress` (served under `/vector`), a `NamespaceAuthentication` for each entry of `products.vector.authentications`, and a [`NamespaceSchema`](/vector/schema/#on-kubernetes) for each entry of `products.vector.schemas`. With `bucketCleaners.enabled`, the chart also adds a `BucketCleaner` that references the store and takes its bucket and storage path from it. The cleaner deletes the data once the store and its pods are gone, for example after `helm uninstall`.
 
 ## Next steps
 

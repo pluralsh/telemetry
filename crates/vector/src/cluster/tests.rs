@@ -684,6 +684,162 @@ async fn should_reject_embedding_without_a_model_or_text() {
     assert!(err.to_string().contains("doesn't embed"), "{err}");
 }
 
+fn declared(schemas: Value) -> DeclaredSchemas {
+    serde_json::from_value(schemas).unwrap()
+}
+
+#[tokio::test]
+async fn should_create_namespaces_with_their_declared_schema() {
+    // given
+    let cluster = cluster().await;
+    cluster.declare_schemas(declared(json!({
+        "docs": {"n": {"type": "float"}, "parity": {"type": "string", "full_text_search": true}},
+    })));
+
+    // when
+    for ns in ["docs", "plain"] {
+        cluster
+            .write(ns, write_request(json!({"upsert_rows": rows(3)})))
+            .await
+            .unwrap();
+    }
+
+    // then
+    let docs = cluster.namespace("docs").await.unwrap();
+    assert_eq!(docs.schema["n"].attribute_type, AttributeType::Float);
+    assert!(docs.schema["parity"].full_text_search);
+    let plain = cluster.namespace("plain").await.unwrap();
+    assert_eq!(plain.schema["n"].attribute_type, AttributeType::Int);
+    assert!(!plain.schema["parity"].full_text_search);
+}
+
+#[tokio::test]
+async fn should_merge_declared_schemas_into_existing_namespaces() {
+    // given
+    let cluster = cluster().await;
+    cluster
+        .write("docs", write_request(json!({"upsert_rows": rows(3)})))
+        .await
+        .unwrap();
+    cluster.declare_schemas(declared(json!({
+        "docs": {"parity": {"type": "string", "full_text_search": true}, "year": {"type": "int"}},
+        "missing": {"year": {"type": "int"}},
+    })));
+
+    // when
+    let failed = cluster.apply_declared_schemas().await;
+
+    // then
+    assert!(failed.is_empty(), "{failed:?}");
+    let docs = cluster.namespace("docs").await.unwrap();
+    assert!(docs.schema["parity"].full_text_search);
+    assert_eq!(docs.schema["year"].attribute_type, AttributeType::Int);
+    assert_eq!(docs.schema["n"].attribute_type, AttributeType::Int);
+    assert!(matches!(
+        cluster.namespace("missing").await,
+        Err(Error::NotFound(_))
+    ));
+    let ids = query_ids(
+        &cluster,
+        "docs",
+        json!({"rank_by": {"op": "BM25", "attribute": "parity", "query": "even"}}),
+    )
+    .await;
+    assert!(
+        ids.is_empty(),
+        "rows written before full-text search aren't indexed"
+    );
+}
+
+#[tokio::test]
+async fn should_apply_newly_declared_schemas_in_the_background() {
+    // given: an applier that would otherwise wait an hour between passes
+    let cluster = Arc::new(
+        VectorCluster::open(ClusterConfig {
+            reconcile_interval: Duration::from_secs(3600),
+            ..ClusterConfig::default()
+        })
+        .await
+        .unwrap(),
+    );
+    cluster
+        .write("docs", write_request(json!({"upsert_rows": rows(3)})))
+        .await
+        .unwrap();
+    let applier = cluster.spawn_schema_applier();
+
+    // when
+    cluster.declare_schemas(declared(json!({"docs": {"year": {"type": "int"}}})));
+
+    // then
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !cluster
+            .namespace("docs")
+            .await
+            .unwrap()
+            .schema
+            .contains_key("year")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the declared schema was not applied");
+    applier.abort();
+}
+
+#[tokio::test]
+async fn should_report_declared_schemas_a_namespace_cannot_take() {
+    // given
+    let cluster = cluster().await;
+    cluster
+        .write("docs", write_request(json!({"upsert_rows": rows(3)})))
+        .await
+        .unwrap();
+    let before = cluster.namespace("docs").await.unwrap();
+    cluster.declare_schemas(declared(json!({"docs": {"n": {"type": "string"}}})));
+
+    // when
+    let failed = cluster.apply_declared_schemas().await;
+
+    // then
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, "docs");
+    assert!(
+        failed[0].1.to_string().contains("cannot change"),
+        "{}",
+        failed[0].1
+    );
+    assert_eq!(cluster.namespace("docs").await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn should_create_a_namespace_from_text_when_its_declared_schema_embeds() {
+    // given
+    let cluster = cluster().await.with_embedder(Arc::new(Embedder::with_model(
+        embedding::tests::FakeModel::new(4),
+        0,
+        16,
+    )));
+    cluster.declare_schemas(declared(
+        json!({"docs": {"body": {"type": "string", "embed": true}}}),
+    ));
+
+    // when
+    cluster
+        .write(
+            "docs",
+            write_request(json!({"upsert_rows": [{"id": "a", "body": "hello"}]})),
+        )
+        .await
+        .unwrap();
+
+    // then
+    let docs = cluster.namespace("docs").await.unwrap();
+    assert_eq!(docs.dimensions, 4);
+    assert!(docs.schema["body"].embed);
+}
+
 async fn populate(cluster: &VectorCluster, count: usize) -> Vec<String> {
     let names: Vec<String> = (0..count).map(|i| format!("tenant-{i}")).collect();
     for name in &names {

@@ -73,6 +73,8 @@ type Input struct {
 	SecretsPath       string
 	// EmbeddingAPIKey is the resolved Vector embedding provider key.
 	EmbeddingAPIKey []byte
+	// Schemas are the attribute schemas of Vector namespaces, by namespace.
+	Schemas map[string]map[string]telemetryv1alpha1.AttributeSchema
 }
 
 type Result struct {
@@ -1159,9 +1161,10 @@ type renderAuth struct {
 	Internal        *renderFileSecret `json:"internal,omitempty"`
 }
 type renderNamespace struct {
-	Name                   string       `json:"name"`
-	Auth                   renderAccess `json:"auth"`
-	UsageReportingEndpoint string       `json:"usage_reporting_endpoint,omitempty"`
+	Name                   string                                       `json:"name"`
+	Auth                   renderAccess                                 `json:"auth"`
+	UsageReportingEndpoint string                                       `json:"usage_reporting_endpoint,omitempty"`
+	Schema                 map[string]telemetryv1alpha1.AttributeSchema `json:"schema,omitempty"`
 }
 
 // renderNamespaces merges NamespaceAuthentication-derived access with the

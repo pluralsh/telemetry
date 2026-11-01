@@ -62,6 +62,33 @@ curl -X PATCH localhost:8080/api/v1/namespaces/articles/schema \
 
 Entries merge into the schema: attributes not named are left alone, and a named attribute's entry is replaced whole. An entry of `{"type": "string"}` for a full-text attribute therefore turns full-text search off, so send every option you want to keep. Applying the same schema twice is a no-op, so clients can send their schema on every write.
 
+### On Kubernetes
+
+A `NamespaceSchema` declares a namespace's schema next to the `Vector` that serves it, in the same shape as the API's:
+
+```yaml
+apiVersion: telemetry.plural.sh/v1alpha1
+kind: NamespaceSchema
+metadata:
+  name: articles          # the namespace, unless spec.namespace is set
+spec:
+  dataStoreRef:
+    kind: Vector
+    name: vector
+  schema:
+    body: { type: string, full_text_search: true, embed: true }
+    year: { type: int }
+    tags: { type: "[]string" }
+```
+
+The operator adds the schema to the servers' config, which they reload without restarting, and declares the namespace if no `NamespaceAuthentication` does. The schema then merges into the namespace like a `PATCH`:
+
+- A namespace created afterwards, by its first write or explicitly, starts with the schema. Its types hold from the first row, and a declared `embed` attribute lets the first write carry only text.
+- An existing namespace takes the schema about a minute after each change, once the kubelet refreshes the mounted config. The namespace's writer applies it, and checks every few seconds that the namespace still holds it, reapplying it if, say, a `PATCH` turns a declared option off. The declared schema always wins.
+- Attributes removed from the resource stay in the namespace, as no schema change removes an attribute.
+
+The `Ready` condition reports a schema whose `Vector` is missing, or a second `NamespaceSchema` for a namespace that already has one (the one whose name sorts first applies). Changes the namespace can't take, such as a new type for an existing attribute, are rejected like the same `PATCH`: the server logs a warning and leaves the namespace's schema as it was.
+
 ## Changing a schema
 
 | Change | Effect |

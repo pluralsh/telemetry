@@ -377,7 +377,13 @@ pub struct VectorCluster {
     state: tokio::sync::Mutex<State>,
     cancel: CancellationToken,
     embedder: Option<Arc<Embedder>>,
+    declared: std::sync::RwLock<Arc<DeclaredSchemas>>,
+    declared_changed: Arc<tokio::sync::Notify>,
 }
+
+/// Attribute schemas declared for namespaces in the server config, by
+/// namespace name.
+pub type DeclaredSchemas = BTreeMap<String, BTreeMap<String, AttributeSchema>>;
 
 impl VectorCluster {
     /// Opens a standalone cluster, creating its shard on first open.
@@ -434,6 +440,8 @@ impl VectorCluster {
             lock: tokio::sync::RwLock::new(()),
             state: tokio::sync::Mutex::new(State::default()),
             cancel: CancellationToken::new(),
+            declared: std::sync::RwLock::new(Arc::default()),
+            declared_changed: Arc::default(),
         };
         cluster.reconcile().await?;
         Ok(cluster)
@@ -674,6 +682,91 @@ impl VectorCluster {
         })
     }
 
+    /// Replaces the declared schemas. Namespaces created from then on start
+    /// with theirs, and [`Self::apply_declared_schemas`] merges them into
+    /// existing namespaces.
+    pub fn declare_schemas(&self, schemas: DeclaredSchemas) {
+        let mut declared = self.declared.write().expect("lock poisoned");
+        if **declared != schemas {
+            *declared = Arc::new(schemas);
+            self.declared_changed.notify_one();
+        }
+    }
+
+    fn declared_schema(&self, name: &str) -> BTreeMap<String, AttributeSchema> {
+        let declared = self.declared.read().expect("lock poisoned");
+        declared.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Merges each declared schema into its namespace, if the namespace
+    /// exists and this process writes its shard, and returns the namespaces
+    /// whose schema can't take it. A namespace whose schema already holds
+    /// every declared entry is left alone.
+    pub async fn apply_declared_schemas(&self) -> Vec<(String, Error)> {
+        let declared = Arc::clone(&self.declared.read().expect("lock poisoned"));
+        let mut failed = Vec::new();
+        for (name, schema) in declared.iter() {
+            let Ok((shard, _)) = self.local_shard(name, true).await else {
+                continue;
+            };
+            let current = match Self::stored_meta(&shard, name).await {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(e) => {
+                    failed.push((name.clone(), e));
+                    continue;
+                }
+            };
+            let mut merged = current.clone();
+            if let Err(e) = merged.merge_schema(schema) {
+                failed.push((name.clone(), e));
+                continue;
+            }
+            if merged.schema == current.schema {
+                continue;
+            }
+            match self.update_schema(name, schema).await {
+                Ok(_) => tracing::info!(namespace = %name, "applied the declared schema"),
+                Err(e) => failed.push((name.clone(), e)),
+            }
+        }
+        failed
+    }
+
+    /// Runs [`Self::apply_declared_schemas`] whenever the declared schemas
+    /// change and every `reconcile_interval`, until the cluster closes.
+    /// Each failure is logged once until its error changes.
+    pub fn spawn_schema_applier(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let cluster = Arc::downgrade(self);
+        let changed = Arc::clone(&self.declared_changed);
+        let interval = self.config.reconcile_interval;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let mut logged: HashMap<String, String> = HashMap::new();
+            loop {
+                {
+                    let Some(cluster) = cluster.upgrade() else {
+                        return;
+                    };
+                    let failed = cluster.apply_declared_schemas().await;
+                    logged.retain(|name, _| failed.iter().any(|(n, _)| n == name));
+                    for (name, error) in failed {
+                        let error = error.to_string();
+                        if logged.get(&name) != Some(&error) {
+                            tracing::warn!(namespace = %name, %error, "the declared schema can't be applied");
+                            logged.insert(name, error);
+                        }
+                    }
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = changed.notified() => {}
+                    () = tokio::time::sleep(interval) => {}
+                }
+            }
+        })
+    }
+
     /// The open shard holding namespace `name`, and the namespace's id.
     async fn local_shard(&self, name: &str, writable: bool) -> Result<(Arc<Shard>, NamespaceId)> {
         let id = NamespaceId::for_name(name);
@@ -754,10 +847,16 @@ impl VectorCluster {
         request: CreateNamespaceRequest,
     ) -> Result<NamespaceMeta> {
         validate_namespace_name(name)?;
+        let declared = self.declared_schema(name);
+        let embeds = request
+            .schema
+            .values()
+            .chain(declared.values())
+            .any(|s| s.embed);
         let dimensions = match request.dimensions {
             Some(0) => return Err(Error::InvalidInput("dimensions must be positive".into())),
             Some(dimensions) => dimensions,
-            None => match (&self.embedder, request.schema.values().any(|s| s.embed)) {
+            None => match (&self.embedder, embeds) {
                 (Some(embedder), true) => embedder.dimensions().await?,
                 _ => {
                     return Err(Error::InvalidInput(
@@ -767,6 +866,7 @@ impl VectorCluster {
             },
         };
         self.probe_embedder(&request.schema).await?;
+        self.probe_embedder(&declared).await?;
         let _shared = self.lock.read().await;
         let (shard, id) = self.local_shard(name, true).await?;
         // Serializes creates with each other.
@@ -791,6 +891,7 @@ impl VectorCluster {
             embedding_model: None,
             created_at_ms: now_ms(),
         };
+        meta.merge_schema(&declared)?;
         meta.merge_schema(&request.schema)?;
         embedding::pin(&mut meta, self.embedder.as_deref()).await?;
         directory::put(shard.writable()?, &meta).await?;
@@ -868,7 +969,8 @@ impl VectorCluster {
         let schema = request.schema.take();
         let (shard, _) = self.local_shard(name, true).await?;
         if Self::stored_meta(&shard, name).await?.is_none() {
-            let embeds = schema.as_ref().is_some_and(|s| s.values().any(|a| a.embed));
+            let embeds = schema.as_ref().is_some_and(|s| s.values().any(|a| a.embed))
+                || self.declared_schema(name).values().any(|a| a.embed);
             let dimensions = match request.first_dimensions() {
                 Some(dimensions) => Some(u16::try_from(dimensions).map_err(|_| {
                     Error::InvalidInput(format!("{dimensions} dimensions is too many"))

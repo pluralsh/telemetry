@@ -7,4 +7,5 @@ resources:
 - telemetry_v1alpha1_namespaceauthentication.yaml
 - telemetry_v1alpha1_bucketcleaner.yaml
 - telemetry_v1alpha1_vector.yaml
+- telemetry_v1alpha1_namespaceschema.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

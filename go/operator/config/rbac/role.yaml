@@ -116,6 +116,7 @@ rules:
   - logs
   - metrics
   - namespaceauthentications
+  - namespaceschemas
   - pseudofs
   - traces
   - vectors
@@ -134,6 +135,7 @@ rules:
   - logs/finalizers
   - metrics/finalizers
   - namespaceauthentications/finalizers
+  - namespaceschemas/finalizers
   - pseudofs/finalizers
   - traces/finalizers
   - vectors/finalizers
@@ -146,6 +148,7 @@ rules:
   - logs/status
   - metrics/status
   - namespaceauthentications/status
+  - namespaceschemas/status
   - pseudofs/status
   - traces/status
   - vectors/status

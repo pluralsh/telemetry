@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -882,6 +883,53 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 				t.Errorf("%s missing %q:\n%s", key, value, rendered)
 			}
 		}
+	}
+}
+
+func TestRenderVectorDeclaresNamespaceSchemasOutsideTheHash(t *testing.T) {
+	const docsNamespace = "docs"
+	render := func(schemas map[string]map[string]telemetryv1alpha1.AttributeSchema) (Result, renderVectorConfig) {
+		result, err := Render(Input{
+			Vector:        &telemetryv1alpha1.Vector{ObjectMeta: metav1.ObjectMeta{Name: testVectorProduct, Namespace: testMetricsNamespace}},
+			Namespaces:    []NamespaceAccess{{Name: docsNamespace}},
+			Schemas:       schemas,
+			InternalToken: []byte("token"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rendered renderVectorConfig
+		if err := yaml.Unmarshal(result.Data[VectorKey], &rendered); err != nil {
+			t.Fatal(err)
+		}
+		return result, rendered
+	}
+
+	// given
+	unschematized, _ := render(nil)
+
+	// when
+	result, rendered := render(map[string]map[string]telemetryv1alpha1.AttributeSchema{
+		docsNamespace: {"body": {Type: "string", FullTextSearch: true}},
+		"articles":    {"year": {Type: "int"}},
+	})
+
+	// then
+	names := lo.Map(rendered.Namespaces, func(namespace renderNamespace, _ int) string { return namespace.Name })
+	if want := []string{"articles", defaultNamespace, docsNamespace}; !slices.Equal(names, want) {
+		t.Fatalf("namespaces %v, want %v", names, want)
+	}
+	if schema := rendered.Namespaces[2].Schema; !schema["body"].FullTextSearch {
+		t.Errorf("docs schema %v lacks full-text search on body", schema)
+	}
+	if schema := rendered.Namespaces[1].Schema; schema != nil {
+		t.Errorf("default namespace has a schema: %v", schema)
+	}
+	if !strings.Contains(string(result.Data[VectorKey]), "full_text_search: true") {
+		t.Errorf("schema not rendered in the server's field names:\n%s", result.Data[VectorKey])
+	}
+	if result.Hash != unschematized.Hash {
+		t.Error("declaring schemas changed the config hash, which rolls the pods")
 	}
 }
 

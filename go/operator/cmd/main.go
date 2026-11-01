@@ -253,6 +253,13 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "NamespaceAuthentication")
 		os.Exit(1)
 	}
+	if err := (&controller.NamespaceSchemaReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NamespaceSchema")
+		os.Exit(1)
+	}
 	if err := (&controller.BucketCleanerReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),

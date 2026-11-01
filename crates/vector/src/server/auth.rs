@@ -14,7 +14,7 @@
 //! splitting need global credentials. Both sections are reloaded from the
 //! config file while the server runs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 use super::cluster::FORWARDED_HEADER;
 use super::error::ApiError;
 use crate::Error;
+use crate::VectorCluster;
+use crate::cluster::{AttributeSchema, DeclaredSchemas};
 
 /// Carries the internal token on requests one replica forwards to another.
 pub const INTERNAL_TOKEN_HEADER: &str = "x-vector-internal-token";
@@ -40,17 +42,32 @@ pub struct AccessConfig {
     pub namespaces: Vec<NamespaceAccess>,
 }
 
-/// A declared namespace and the credentials that may use it.
+/// A declared namespace, the credentials that may use it, and the
+/// attribute schema it is kept merged with.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamespaceAccess {
     pub name: String,
     #[serde(default)]
     pub auth: Access,
+    #[serde(default)]
+    pub schema: BTreeMap<String, AttributeSchema>,
 }
 
 impl AccessConfig {
     pub fn from_yaml(raw: &str) -> Result<Self, String> {
         serde_yaml::from_str(raw).map_err(|e| format!("invalid access config: {e}"))
+    }
+
+    /// The schemas declared for namespaces, by namespace name.
+    pub fn schemas(&self) -> DeclaredSchemas {
+        let mut schemas = DeclaredSchemas::new();
+        for namespace in self.namespaces.iter().filter(|ns| !ns.schema.is_empty()) {
+            schemas
+                .entry(namespace.name.clone())
+                .or_default()
+                .extend(namespace.schema.clone());
+        }
+        schemas
     }
 }
 
@@ -119,10 +136,16 @@ impl Guard {
         self.internal.as_deref()
     }
 
-    /// Applies the namespaces and credentials of each new revision of the
-    /// config file at `path`. The JWT and internal token settings, like the
-    /// rest of the file, apply on the next restart.
-    pub fn watch(self: &Arc<Self>, path: PathBuf, running: serde_json::Value) {
+    /// Applies the namespaces, credentials and namespace schemas of each new
+    /// revision of the config file at `path`, the schemas to `cluster`. The
+    /// JWT and internal token settings, like the rest of the file, apply on
+    /// the next restart.
+    pub fn watch(
+        self: &Arc<Self>,
+        path: PathBuf,
+        running: serde_json::Value,
+        cluster: Arc<VectorCluster>,
+    ) {
         let guard = Arc::clone(self);
         reload::spawn_config_watcher(
             "vector",
@@ -131,6 +154,7 @@ impl Guard {
             CancellationToken::new(),
             move |raw| {
                 let guard = Arc::clone(&guard);
+                let cluster = Arc::clone(&cluster);
                 let running = running.clone();
                 async move {
                     let next: serde_json::Value =
@@ -140,6 +164,7 @@ impl Guard {
                         return Ok(vec!["auth".into()]);
                     }
                     guard.policy.store(Policy::new(&config));
+                    cluster.declare_schemas(config.schemas());
                     Ok(reload::restart_required(&running, &next))
                 }
             },
@@ -388,6 +413,32 @@ namespaces:
             200
         );
         assert_eq!(status(guard.admin(&none, Permission::Write).await), 200);
+    }
+
+    #[test]
+    fn should_collect_the_schemas_declared_for_namespaces() {
+        // given
+        let raw = r#"
+namespaces:
+  - name: docs
+    schema:
+      body: { type: string, full_text_search: true }
+  - name: docs
+    schema:
+      year: { type: int }
+  - name: open
+"#;
+
+        // when
+        let schemas = AccessConfig::from_yaml(raw).unwrap().schemas();
+
+        // then
+        assert_eq!(schemas.keys().collect::<Vec<_>>(), ["docs"]);
+        assert!(schemas["docs"]["body"].full_text_search);
+        assert_eq!(
+            schemas["docs"]["year"].attribute_type,
+            crate::cluster::AttributeType::Int
+        );
     }
 
     #[tokio::test]

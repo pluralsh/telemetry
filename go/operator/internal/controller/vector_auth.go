@@ -83,6 +83,16 @@ func (r *VectorReconciler) resolveConfigInput(ctx context.Context, vector *telem
 		}
 		input.Namespaces = append(input.Namespaces, productconfig.NamespaceAccess{Name: auth.Spec.Namespace, KeyPrefix: auth.Name, Access: access})
 	}
+	schemas := &telemetryv1alpha1.NamespaceSchemaList{}
+	if err := r.List(ctx, schemas, client.InNamespace(vector.Namespace)); err != nil {
+		return productconfig.Input{}, fmt.Errorf("list namespace schemas: %w", err)
+	}
+	for namespace, schema := range effectiveSchemas(schemas.Items, vector.Name) {
+		if input.Schemas == nil {
+			input.Schemas = map[string]map[string]telemetryv1alpha1.AttributeSchema{}
+		}
+		input.Schemas[namespace] = schema.Spec.Schema
+	}
 	if spec := vector.Spec.Config.Embedding; spec != nil && spec.APIKeySecretRef != nil {
 		if input.EmbeddingAPIKey, err = helper.secretValue(ctx, vector.Namespace, *spec.APIKeySecretRef); err != nil {
 			return productconfig.Input{}, fmt.Errorf("resolve embedding API key: %w", err)
@@ -121,6 +131,32 @@ func vectorSecretNames(vector *telemetryv1alpha1.Vector) []string {
 		}
 	}
 	return lo.Uniq(names)
+}
+
+// effectiveSchemas are the NamespaceSchemas of the Vector `vector` that
+// apply, by datastore namespace: where several declare one namespace, the
+// one named first.
+func effectiveSchemas(schemas []telemetryv1alpha1.NamespaceSchema, vector string) map[string]*telemetryv1alpha1.NamespaceSchema {
+	effective := map[string]*telemetryv1alpha1.NamespaceSchema{}
+	for i := range schemas {
+		schema := &schemas[i]
+		if schema.Spec.DataStoreRef.Kind != dataStoreVector || schema.Spec.DataStoreRef.Name != vector || !schema.DeletionTimestamp.IsZero() {
+			continue
+		}
+		target := schema.TargetNamespace()
+		if current, found := effective[target]; !found || schema.Name < current.Name {
+			effective[target] = schema
+		}
+	}
+	return effective
+}
+
+func vectorForNamespaceSchema(_ context.Context, obj client.Object) []reconcile.Request {
+	schema := obj.(*telemetryv1alpha1.NamespaceSchema)
+	if schema.Spec.DataStoreRef.Kind != dataStoreVector || schema.Spec.DataStoreRef.Name == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: schema.Namespace, Name: schema.Spec.DataStoreRef.Name}}}
 }
 
 func vectorForNamespaceAuth(_ context.Context, obj client.Object) []reconcile.Request {

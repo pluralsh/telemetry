@@ -52,7 +52,16 @@ products:
         namespace: search
         username: plrl
         permission: write
+    schemas:
+      - name: search   # the namespace, unless `namespace` is set
+        schema:
+          body: { type: string, full_text_search: true, embed: true }
+          year: { type: int }
 ```
+
+Each `schemas` entry creates a `NamespaceSchema`, which the servers merge
+into the namespace's attribute schema, so its types and full-text or
+embedding options hold from the first write.
 
 ## Bucket cleanup
 
