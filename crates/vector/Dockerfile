@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # usearch's numkong kernels need a newer GCC than bookworm's for arm64 targets.
-FROM rust:1.91-trixie AS chef
+FROM rust:1.98-trixie AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/* \

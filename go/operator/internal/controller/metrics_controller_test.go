@@ -52,6 +52,7 @@ const (
 	testServiceAccountAnnotation = "eks.amazonaws.com/role-arn"
 	testServiceAccountRole       = "arn:aws:iam::123456789012:role/metrics"
 	testIngressHostname          = "metrics.example.com"
+	testLogs                     = "logs"
 )
 
 var _ = Describe("Metrics Controller", func() {

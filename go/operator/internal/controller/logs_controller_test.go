@@ -71,7 +71,7 @@ var _ = Describe("Logs Controller", func() {
 				writerReplicas = 4
 			}
 			logs.Spec.Writer.Replicas = &writerReplicas
-			logs.Spec.Writer.NodeSelector = map[string]string{"node.example.com/pool": "logs"}
+			logs.Spec.Writer.NodeSelector = map[string]string{"node.example.com/pool": testLogs}
 			logs.Spec.Writer.Tolerations = []corev1.Toleration{{
 				Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "telemetry", Effect: corev1.TaintEffectNoSchedule,
 			}}
@@ -134,7 +134,7 @@ var _ = Describe("Logs Controller", func() {
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: component}, sts)).To(Succeed())
 				Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(2))
 				Expect(sts.Spec.Template.Spec.Containers[0]).To(SatisfyAll(
-					HaveField("Name", "logs"),
+					HaveField("Name", testLogs),
 					HaveField("Image", "registry.example.com/telemetry/logs:2.3.4"),
 					HaveField("ImagePullPolicy", corev1.PullAlways),
 					HaveField("Args", ConsistOf("--config", HavePrefix("/etc/logs/config/"))),
@@ -142,7 +142,7 @@ var _ = Describe("Logs Controller", func() {
 				if component == name || component == name+"-writer" {
 					Expect(sts.Spec.Replicas).NotTo(BeNil())
 					Expect(*sts.Spec.Replicas).To(Equal(writerReplicas))
-					Expect(sts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("node.example.com/pool", "logs"))
+					Expect(sts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("node.example.com/pool", testLogs))
 					Expect(sts.Spec.Template.Spec.Tolerations).To(ContainElement(HaveField("Key", "dedicated")))
 				} else {
 					Expect(sts.Spec.Replicas).NotTo(BeNil())

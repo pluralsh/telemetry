@@ -87,7 +87,7 @@ var _ = Describe("BucketCleaner Controller", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "cleaner-s3", Namespace: testNamespace},
 			Data:       map[string][]byte{"access-key-id": []byte("id"), "secret-access-key": []byte("key")},
 		}
-		cleaner := bucketCleaner("cleaner-logs", secret.Name, "logs")
+		cleaner := bucketCleaner("cleaner-logs", secret.Name, testLogs)
 		for _, object := range []client.Object{secret, cleaner} {
 			Expect(k8sClient.Create(ctx, object)).To(Succeed())
 			created = append(created, object)
@@ -125,7 +125,7 @@ var _ = Describe("BucketCleaner Controller", func() {
 		defer func() { _ = seed.Close() }()
 		Expect(seed.WriteAll(ctx, "logs/keep-until-credentials", []byte("x"), nil)).To(Succeed())
 
-		cleaner := bucketCleaner("cleaner-missing-secret", "cleaner-missing-s3", "logs")
+		cleaner := bucketCleaner("cleaner-missing-secret", "cleaner-missing-s3", testLogs)
 		Expect(k8sClient.Create(ctx, cleaner)).To(Succeed())
 		created = append(created, cleaner)
 		var resolved []string
@@ -168,7 +168,7 @@ var _ = Describe("BucketCleaner Controller", func() {
 		logs.Spec.Config.Storage.ObjectStore = *awsStore(secret.Name)
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "cleaner-ref-logs-0", Namespace: testNamespace, Labels: resources.SelectorLabels(logs, componentWriter)},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "logs", Image: "logs"}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testLogs, Image: testLogs}}},
 		}
 		cleaner := &telemetryv1alpha1.BucketCleaner{
 			ObjectMeta: metav1.ObjectMeta{Name: "cleaner-ref", Namespace: testNamespace},
@@ -188,7 +188,7 @@ var _ = Describe("BucketCleaner Controller", func() {
 		Expect(resolved).To(Equal([]string{"id", "key"}))
 		current := &telemetryv1alpha1.BucketCleaner{}
 		Expect(k8sClient.Get(ctx, request.NamespacedName, current)).To(Succeed())
-		Expect(current.Status.SubPath).To(Equal("logs"))
+		Expect(current.Status.SubPath).To(Equal(testLogs))
 		Expect(current.Status.ObjectStore).To(Equal(awsStore(secret.Name)))
 		Expect(meta.FindStatusCondition(current.Status.Conditions, conditionReady)).To(HaveField("Message", "operator can access s3://telemetry/logs/"))
 		Expect(k8sClient.Delete(ctx, cleaner)).To(Succeed())
@@ -280,24 +280,24 @@ var _ = Describe("BucketCleaner Controller", func() {
 	})
 
 	It("rejects local object stores, missing locations and subPath changes", func() {
-		missing := &telemetryv1alpha1.BucketCleaner{ObjectMeta: metav1.ObjectMeta{Name: "cleaner-missing", Namespace: testNamespace}, Spec: telemetryv1alpha1.BucketCleanerSpec{SubPath: "logs"}}
+		missing := &telemetryv1alpha1.BucketCleaner{ObjectMeta: metav1.ObjectMeta{Name: "cleaner-missing", Namespace: testNamespace}, Spec: telemetryv1alpha1.BucketCleanerSpec{SubPath: testLogs}}
 		Expect(k8sClient.Create(ctx, missing)).To(MatchError(ContainSubstring("objectStore and subPath are required unless dataStoreRef is set")))
 
-		local := bucketCleaner("cleaner-local", "unused", "logs")
+		local := bucketCleaner("cleaner-local", "unused", testLogs)
 		local.Spec.ObjectStore = &telemetryv1alpha1.ObjectStoreSpec{Type: telemetryv1alpha1.ObjectStoreLocal}
 		Expect(k8sClient.Create(ctx, local)).To(MatchError(ContainSubstring("objectStore.type must be Aws, Azure, or Gcp")))
 
 		root := bucketCleaner("cleaner-root", "unused", "/")
 		Expect(k8sClient.Create(ctx, root)).NotTo(Succeed())
 
-		cleaner := bucketCleaner("cleaner-immutable", "unused", "logs")
+		cleaner := bucketCleaner("cleaner-immutable", "unused", testLogs)
 		Expect(k8sClient.Create(ctx, cleaner)).To(Succeed())
 		created = append(created, cleaner)
 		cleaner.Spec.SubPath = "metrics"
 		Expect(k8sClient.Update(ctx, cleaner)).To(MatchError(ContainSubstring("subPath is immutable")))
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cleaner), cleaner)).To(Succeed())
 		cleaner.Spec.SubPath = ""
-		cleaner.Spec.DataStoreRef = &telemetryv1alpha1.BucketCleanerDataStoreReference{Kind: dataStoreLogs, Name: "logs"}
+		cleaner.Spec.DataStoreRef = &telemetryv1alpha1.BucketCleanerDataStoreReference{Kind: dataStoreLogs, Name: testLogs}
 		Expect(k8sClient.Update(ctx, cleaner)).To(MatchError(ContainSubstring("subPath is immutable")))
 	})
 })
