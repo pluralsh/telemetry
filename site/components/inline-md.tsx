@@ -21,6 +21,13 @@ export function InlineMd({ text, className }: { text?: string; className?: strin
         const link = p.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
         if (link) {
           const [, label, href] = link;
+          if (href.startsWith("#")) {
+            return (
+              <a key={i} href={href} className="text-accent-text underline decoration-line-strong underline-offset-2 hover:decoration-current">
+                {label}
+              </a>
+            );
+          }
           return href.startsWith("/") ? (
             <Link key={i} href={href} className="text-accent-text underline decoration-line-strong underline-offset-2 hover:decoration-current">
               {label}

@@ -66,7 +66,8 @@ type NamespaceAuthenticationStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// NamespaceAuthentication is the Schema for the namespaceauthentications API.
+// NamespaceAuthentication declares a datastore namespace and a credential
+// that may read or write it.
 type NamespaceAuthentication struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

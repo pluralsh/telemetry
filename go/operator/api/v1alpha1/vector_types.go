@@ -172,6 +172,9 @@ type VectorStatus struct {
 // +kubebuilder:printcolumn:name="Shards",type=string,JSONPath=`.status.activeShards`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// Vector runs a vector and full-text search database on object storage, with
+// its namespaces spread over shards that split as they grow.
 type Vector struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

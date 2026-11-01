@@ -35,8 +35,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: NamespaceAuthentication is the Schema for the namespaceauthentications
-          API.
+        description: |-
+          NamespaceAuthentication declares a datastore namespace and a credential
+          that may read or write it.
         properties:
           apiVersion:
             description: |-

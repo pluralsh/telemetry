@@ -30,6 +30,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: |-
+          Vector runs a vector and full-text search database on object storage, with
+          its namespaces spread over shards that split as they grow.
         properties:
           apiVersion:
             description: |-

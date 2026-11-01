@@ -95,7 +95,8 @@ func (s VectorTopologySpec) ActiveShards() []int32 {
 // +kubebuilder:printcolumn:name="Generation",type=integer,JSONPath=`.spec.generation`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// VectorTopology is the Schema for a Vector cluster's shard topology.
+// VectorTopology is the shard layout of a Vector database. The operator and
+// the database's writers maintain it, so it is not meant to be edited.
 type VectorTopology struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

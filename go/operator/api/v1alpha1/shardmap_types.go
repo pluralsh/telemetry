@@ -89,7 +89,9 @@ type ShardMapSpec struct {
 // +kubebuilder:printcolumn:name="Shards",type=integer,JSONPath=`.spec.shard_count`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ShardMap is the Schema for authoritative telemetry shard routing.
+// ShardMap is the shard routing and writer ownership of a Metrics, Logs or
+// Traces database. The operator and the database's writers maintain it, so
+// it is not meant to be edited.
 type ShardMap struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

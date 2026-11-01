@@ -1,0 +1,5132 @@
+{
+  "groupVersions": [
+    {
+      "doc": "Package v1alpha1 contains API Schema definitions for the telemetry v1alpha1 API group.\n",
+      "groupVersion": "telemetry.plural.sh/v1alpha1",
+      "kinds": [
+        "BucketCleaner",
+        "Logs",
+        "Metrics",
+        "NamespaceAuthentication",
+        "NamespaceSchema",
+        "PseudoFS",
+        "ShardMap",
+        "Traces",
+        "Vector",
+        "VectorTopology"
+      ],
+      "types": [
+        {
+          "appearsIn": [
+            "ObjectStoreSpec"
+          ],
+          "doc": "AWSObjectStoreSpec configures an Amazon S3 or S3-compatible object store.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "region",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "bucket",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "endpoint",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "allowHTTP",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "virtualHostedStyle",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "accessKeyIDSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "secretAccessKeySecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "sessionTokenSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AWSObjectStoreSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "accessKeyIDSecretRef and secretAccessKeySecretRef must be configured together",
+              "rule": "has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "AuthSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "read",
+              "rules": [],
+              "type": "[BasicCredentialSpec](#basiccredentialspec) array",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "write",
+              "rules": [],
+              "type": "[BasicCredentialSpec](#basiccredentialspec) array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AccessSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "NamespaceSchemaSpec"
+          ],
+          "doc": "AttributeSchema is the schema of one namespace attribute, as in the\ndatastore's schema API.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Type is fixed once the attribute exists.",
+              "name": "type",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [string int float bool []string []int]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "FullTextSearch indexes a string attribute for BM25 ranking.",
+              "name": "full_text_search",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Embed embeds a string attribute into the vector of rows written\nwithout one. At most one attribute per namespace.",
+              "name": "embed",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AttributeSchema",
+          "resource": {},
+          "rules": [
+            {
+              "message": "full_text_search and embed need type string",
+              "rule": "self.type == 'string' || !(has(self.full_text_search) \u0026\u0026 self.full_text_search) \u0026\u0026 !(has(self.embed) \u0026\u0026 self.embed)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec",
+            "MetricsConfigSpec",
+            "TracesConfigSpec",
+            "VectorConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "false",
+              "doc": "Unauthenticated permits anonymous access to namespace HTTP APIs.",
+              "name": "unauthenticated",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "global",
+              "rules": [],
+              "type": "[AccessSpec](#accessspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "jwt",
+              "rules": [],
+              "type": "[JWTSpec](#jwtspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "internalTokenSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AuthSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "WorkloadSpec"
+          ],
+          "doc": "AutoscalingSpec scales reader replicas on resource utilization. While\nenabled the HorizontalPodAutoscaler owns replica counts and the\nworkload's replicas field only seeds a new StatefulSet.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "MinReplicas defaults to the workload's replicas, or 2.",
+              "name": "minReplicas",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "maxReplicas",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "TargetCPUUtilizationPercentage is average CPU usage relative to the\ncontainer's CPU request. Defaults to 70 when no memory target is set.",
+              "name": "targetCPUUtilizationPercentage",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "TargetMemoryUtilizationPercentage is average memory usage relative to\nthe container's memory request.",
+              "name": "targetMemoryUtilizationPercentage",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Behavior is passed through to the HorizontalPodAutoscaler.",
+              "name": "behavior",
+              "rules": [],
+              "type": "[HorizontalPodAutoscalerBehavior](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#horizontalpodautoscalerbehavior-v2-autoscaling)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AutoscalingSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "minReplicas must not exceed maxReplicas",
+              "rule": "!has(self.minReplicas) || self.minReplicas \u003c= self.maxReplicas"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "AzureObjectStoreSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "clientID",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "tenantID",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "clientSecretKeyRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AzureClientSecretAuthSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ObjectStoreSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "account",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "container",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "endpoint",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "allowHTTP",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "accessKeySecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "sasTokenSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "bearerTokenSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "clientSecret",
+              "rules": [],
+              "type": "[AzureClientSecretAuthSpec](#azureclientsecretauthspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "workloadIdentity",
+              "rules": [],
+              "type": "[AzureWorkloadIdentityAuthSpec](#azureworkloadidentityauthspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "AzureObjectStoreSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "at most one Azure authentication method may be configured",
+              "rule": "[has(self.accessKeySecretRef), has(self.sasTokenSecretRef), has(self.bearerTokenSecretRef), has(self.clientSecret), has(self.workloadIdentity)].filter(x, x).size() \u003c= 1"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "AzureObjectStoreSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "clientID",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "tenantID",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "tokenFile",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "AzureWorkloadIdentityAuthSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "AccessSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "username",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "passwordSecretKeyRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "BasicCredentialSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "BucketCleaner verifies the operator can reach an object-store prefix and\ndeletes every object under it when the BucketCleaner is deleted.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "objectStore and subPath are required unless dataStoreRef is set",
+                  "rule": "has(self.dataStoreRef) || (has(self.objectStore) \u0026\u0026 has(self.subPath))"
+                },
+                {
+                  "message": "objectStore.type must be Aws, Azure, or Gcp",
+                  "rule": "!has(self.objectStore) || self.objectStore.type in ['Aws', 'Azure', 'Gcp']"
+                },
+                {
+                  "message": "objectStore.path is not supported; use subPath",
+                  "rule": "!has(self.objectStore) || !has(self.objectStore.path) || self.objectStore.path.size() == 0"
+                },
+                {
+                  "message": "subPath is immutable",
+                  "rule": "!has(oldSelf.subPath) || has(self.subPath)"
+                }
+              ],
+              "type": "[BucketCleanerSpec](#bucketcleanerspec)",
+              "validation": []
+            }
+          ],
+          "kind": "BucketCleaner",
+          "name": "BucketCleaner",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "BucketCleanerSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "kind",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [Metrics Logs Traces Vector]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "name",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "BucketCleanerDataStoreReference",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "BucketCleaner"
+          ],
+          "doc": "BucketCleanerSpec defines the desired state of BucketCleaner.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "ObjectStore is the bucket holding the tracked data, in the same form as\na datastore's spec.config.storage.objectStore. Credential Secrets are\nread from the BucketCleaner's namespace by the operator itself; when\nthey are omitted the operator's own cloud identity is used. Defaults to\nthe dataStoreRef's spec.config.storage.objectStore.",
+              "name": "objectStore",
+              "rules": [
+                {
+                  "message": "Aws object stores require aws configuration",
+                  "rule": "self.type != 'Aws' || has(self.aws)"
+                },
+                {
+                  "message": "aws configuration is only valid for Aws object stores",
+                  "rule": "self.type == 'Aws' || !has(self.aws)"
+                },
+                {
+                  "message": "Azure object stores require azure configuration",
+                  "rule": "self.type != 'Azure' || has(self.azure)"
+                },
+                {
+                  "message": "azure configuration is only valid for Azure object stores",
+                  "rule": "self.type == 'Azure' || !has(self.azure)"
+                },
+                {
+                  "message": "Gcp object stores require gcp configuration",
+                  "rule": "self.type != 'Gcp' || has(self.gcp)"
+                },
+                {
+                  "message": "gcp configuration is only valid for Gcp object stores",
+                  "rule": "self.type == 'Gcp' || !has(self.gcp)"
+                }
+              ],
+              "type": "[ObjectStoreSpec](#objectstorespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "SubPath is the key prefix within the bucket, typically a datastore's\nspec.config.storage.path. It is treated as a directory: \"logs\" covers\n\"logs/...\" but not \"logs-archive/...\". Every object under it is deleted\nwhen the BucketCleaner is deleted. Defaults to the dataStoreRef's\nspec.config.storage.path, or the product name when that is unset.",
+              "name": "subPath",
+              "rules": [
+                {
+                  "message": "subPath is immutable",
+                  "rule": "self == oldSelf"
+                }
+              ],
+              "type": "string",
+              "validation": [
+                "MinLength: 1",
+                "Pattern: `[^/]`"
+              ]
+            },
+            {
+              "default": "300",
+              "doc": "CheckIntervalSeconds is how often bucket access is re-verified.",
+              "name": "checkIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 10"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "DataStoreRef is the datastore, in the BucketCleaner's namespace, that\nwrites under subPath. Omitted objectStore and subPath settings are\ntaken from its storage while it exists. Deletion waits until the\ndatastore and its pods are gone, so no replica writes objects after the\nprefix is emptied, and data is never deleted while the datastore exists.",
+              "name": "dataStoreRef",
+              "rules": [],
+              "type": "[BucketCleanerDataStoreReference](#bucketcleanerdatastorereference)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "BucketCleanerSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "objectStore and subPath are required unless dataStoreRef is set",
+              "rule": "has(self.dataStoreRef) || (has(self.objectStore) \u0026\u0026 has(self.subPath))"
+            },
+            {
+              "message": "objectStore.type must be Aws, Azure, or Gcp",
+              "rule": "!has(self.objectStore) || self.objectStore.type in ['Aws', 'Azure', 'Gcp']"
+            },
+            {
+              "message": "objectStore.path is not supported; use subPath",
+              "rule": "!has(self.objectStore) || !has(self.objectStore.path) || self.objectStore.path.size() == 0"
+            },
+            {
+              "message": "subPath is immutable",
+              "rule": "!has(oldSelf.subPath) || has(self.subPath)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "StorageSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "type",
+              "rules": [],
+              "type": "[CacheType](#cachetype)",
+              "validation": [
+                "Enum: [FoyerHybrid FoyerMemory]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "memoryCapacity",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "diskCapacity",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "diskPath",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "capacity",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "shards",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "writePolicy",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "flushers",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "bufferPoolSize",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "submitQueueSizeThreshold",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "CacheSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "CacheSpec"
+          ],
+          "doc": "",
+          "enumValues": [
+            {
+              "doc": "",
+              "name": "FoyerHybrid"
+            },
+            {
+              "doc": "",
+              "name": "FoyerMemory"
+            }
+          ],
+          "fields": [],
+          "kind": "",
+          "name": "CacheType",
+          "resource": {},
+          "rules": [],
+          "underlying": "string",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec",
+            "MetricsConfigSpec",
+            "TracesConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Enabled runs a startup pass over recent SSTs. Defaults to true for\nreaders, which warm filters and indexes in the background; Logs\nreaders that skip filters warm only indexes.",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "WarmRangeSeconds is the recent window whose metadata the startup pass\nwarms. Unset covers all live data, which retention bounds, and the\nmetadata budget bounds what is held. A set value bounds payloads too\nunless PayloadWarmRangeSeconds is set. 7200, the default of earlier\nCRDs that the API server stored in existing resources, is read as\nunset.",
+              "name": "warmRangeSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "PayloadWarmRangeSeconds is the recent window whose payloads the\nstartup pass warms when IncludePayloads is set. Unset uses\nWarmRangeSeconds when that is set, otherwise all live data, which\nPayloadBudgetPercent bounds newest first. Servers older than this\nfield reject it, so set it only once every reader runs a server that\nknows it.",
+              "name": "payloadWarmRangeSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "30",
+              "doc": "",
+              "name": "timeoutSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "2",
+              "doc": "",
+              "name": "concurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "false",
+              "doc": "",
+              "name": "includePayloads",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "BlockReadiness holds readiness until the startup pass ends. Unset\nkeeps the server default, false.",
+              "name": "blockReadiness",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "MetadataBudgetPercent is the share of the metadata cache warming may\nfill before it stops; the server default is 75.",
+              "name": "metadataBudgetPercent",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Maximum: 100",
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "PayloadBudgetPercent is the share of the data block cache that\npayload warming may fill, newest first: of its disk tier when it has\none, otherwise of its memory. Warmed payloads go to the disk tier\nonly, so warming never fills memory. The server default is 50.\nServers older than this field reject it, so set it only once every\nreader runs a server that knows it.",
+              "name": "payloadBudgetPercent",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Maximum: 100",
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Continuous warms SSTs that appear in reader manifests after startup.",
+              "name": "continuous",
+              "rules": [],
+              "type": "[ContinuousCacheWarmerSpec](#continuouscachewarmerspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "CacheWarmerSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "CacheWarmerSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "true",
+              "doc": "",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "10",
+              "doc": "",
+              "name": "intervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "WarmRangeSeconds is CacheWarmerSpec.WarmRangeSeconds for new SSTs.",
+              "name": "warmRangeSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "PayloadWarmRangeSeconds is CacheWarmerSpec.PayloadWarmRangeSeconds\nfor new SSTs.",
+              "name": "payloadWarmRangeSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "true",
+              "doc": "",
+              "name": "includePayloads",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "ContinuousCacheWarmerSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "NamespaceAuthenticationSpec",
+            "NamespaceSchemaSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "kind",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [Metrics Logs Traces Vector]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "name",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "DataStoreReference",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "StorageSpec"
+          ],
+          "doc": "DiskSpec is a disk's provisioned performance, as its provider advertises it.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "125",
+              "doc": "",
+              "name": "throughputMiBps",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "3000",
+              "doc": "",
+              "name": "iops",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "DiskSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "WriteSpec"
+          ],
+          "doc": "",
+          "enumValues": [
+            {
+              "doc": "",
+              "name": "applied"
+            },
+            {
+              "doc": "",
+              "name": "written"
+            },
+            {
+              "doc": "",
+              "name": "durable"
+            }
+          ],
+          "fields": [],
+          "kind": "",
+          "name": "Durability",
+          "resource": {},
+          "rules": [],
+          "underlying": "string",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ObjectStoreSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "bucket",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "baseURL",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccountKeySecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "bearerTokenSecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "GCPObjectStoreSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "serviceAccountKeySecretRef and bearerTokenSecretRef are mutually exclusive",
+              "rule": "![has(self.serviceAccountKeySecretRef), has(self.bearerTokenSecretRef)].all(x, x)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "HashRangeAssignment"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "start",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^[0-9a-f]{32}$`"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "end",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^[0-9a-f]{32}$`"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "HashRange",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "HashRangeMap"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "shard",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "range",
+              "rules": [],
+              "type": "[HashRange](#hashrange)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "HashRangeAssignment",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "RoutingEpoch"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "generation",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "assignments",
+              "rules": [],
+              "type": "[HashRangeAssignment](#hashrangeassignment) array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "HashRangeMap",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec",
+            "MetricsSpec",
+            "PseudoFSSpec",
+            "TracesSpec",
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Repository is the container image repository. It defaults to the product's\nofficial GHCR repository.",
+              "name": "repository",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Tag is a deprecated alias for the enclosing resource's spec.version.\nWhen both are set they must match, and spec.version takes precedence.\nDeprecated: use spec.version.",
+              "name": "tag",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "IfNotPresent",
+              "doc": "PullPolicy is the Kubernetes image pull policy.",
+              "name": "pullPolicy",
+              "rules": [],
+              "type": "[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#pullpolicy-v1-core)",
+              "validation": [
+                "Enum: [Always IfNotPresent Never]"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ImageSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "IngressSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "annotations",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "labels",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "IngressMetadataSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec",
+            "MetricsSpec",
+            "TracesSpec",
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "hostname",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "ingressClass",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "pathPrefix",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[IngressMetadataSpec](#ingressmetadataspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "tls",
+              "rules": [],
+              "type": "[IngressTLSSpec](#ingresstlsspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "IngressSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "hostname is required when ingress is enabled",
+              "rule": "!has(self.enabled) || !self.enabled || (has(self.hostname) \u0026\u0026 self.hostname.size() \u003e 0)"
+            },
+            {
+              "message": "pathPrefix must be empty or start with '/' and must not end with '/'",
+              "rule": "!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() \u003e 1 \u0026\u0026 self.pathPrefix.startsWith('/') \u0026\u0026 !self.pathPrefix.endsWith('/'))"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "IngressSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "secretName",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "IngressTLSSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "JWTSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "url",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "secretKeyRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "JWKSSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "exactly one of url or secretKeyRef is required",
+              "rule": "(has(self.url) \u0026\u0026 self.url.size() \u003e 0) != has(self.secretKeyRef)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "AuthSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "jwks",
+              "rules": [
+                {
+                  "message": "exactly one of url or secretKeyRef is required",
+                  "rule": "(has(self.url) \u0026\u0026 self.url.size() \u003e 0) != has(self.secretKeyRef)"
+                }
+              ],
+              "type": "[JWKSSpec](#jwksspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "issuer",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "audience",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "300",
+              "doc": "",
+              "name": "refreshIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "5",
+              "doc": "",
+              "name": "requestTimeoutSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "JWTSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "Logs runs a Loki-compatible log database on object storage: a writer\nStatefulSet and, in Sharded mode, a reader group per storage shard.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "reader replicas must be zero in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+                },
+                {
+                  "message": "writer replicas must be one in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+                },
+                {
+                  "message": "spec.version and deprecated spec.image.tag must match when both are set",
+                  "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+                }
+              ],
+              "type": "[LogsSpec](#logsspec)",
+              "validation": []
+            }
+          ],
+          "kind": "Logs",
+          "name": "Logs",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": []
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "{ path:logs }",
+              "doc": "",
+              "name": "storage",
+              "rules": [],
+              "type": "[StorageSpec](#storagespec)",
+              "validation": []
+            },
+            {
+              "default": "3600",
+              "doc": "",
+              "name": "segmentDurationSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.\nWhen unset, the server default of 14 days applies.",
+              "name": "retention",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "RetentionSeconds is deprecated in favor of retention.",
+              "name": "retentionSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "page",
+              "rules": [],
+              "type": "[LogsPageSpec](#logspagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "write",
+              "rules": [],
+              "type": "[WriteSpec](#writespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "sharding",
+              "rules": [
+                {
+                  "message": "renewIntervalSeconds must be less than leaseDurationSeconds",
+                  "rule": "!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds \u003c self.leaseDurationSeconds"
+                }
+              ],
+              "type": "[ShardingSpec](#shardingspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "request",
+              "rules": [
+                {
+                  "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+                  "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+                }
+              ],
+              "type": "[LogsRequestSpec](#logsrequestspec)",
+              "validation": []
+            },
+            {
+              "default": "{  }",
+              "doc": "",
+              "name": "elasticsearch",
+              "rules": [],
+              "type": "[LogsElasticsearchSpec](#logselasticsearchspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "cacheWarmer",
+              "rules": [],
+              "type": "[CacheWarmerSpec](#cachewarmerspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "auth",
+              "rules": [],
+              "type": "[AuthSpec](#authspec)",
+              "validation": []
+            },
+            {
+              "default": "[default]",
+              "doc": "",
+              "name": "namespaces",
+              "rules": [],
+              "type": "string array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "LogsConfigSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "set retention or the deprecated retentionSeconds, not both",
+              "rule": "!has(self.retention) || !has(self.retentionSeconds)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec"
+          ],
+          "doc": "LogsElasticsearchSpec maps Elasticsearch _bulk documents to log entries.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "[message log msg]",
+              "doc": "MessageFields are tried in order; the first present becomes the log line.",
+              "name": "messageFields",
+              "rules": [],
+              "type": "string array",
+              "validation": [
+                "items:MinLength: 1"
+              ]
+            },
+            {
+              "default": "@timestamp",
+              "doc": "TimeField holds the entry timestamp as RFC3339 or epoch milliseconds.",
+              "name": "timeField",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "StreamFields are document fields promoted to stream labels. Keep them\nlow-cardinality; all other fields become structured metadata.",
+              "name": "streamFields",
+              "rules": [],
+              "type": "string array",
+              "validation": [
+                "items:MinLength: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "LogsElasticsearchSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "1048576",
+              "doc": "",
+              "name": "targetSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "8192",
+              "doc": "",
+              "name": "maxRows",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "256",
+              "doc": "",
+              "name": "rowsPerBlock",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "LogsPageSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "33554432",
+              "doc": "MaxRequestBytes caps a request body as received, before content decoding.",
+              "name": "maxRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "134217728",
+              "doc": "MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.\nMust be at least maxRequestBytes.",
+              "name": "maxDecodedRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "5000",
+              "doc": "",
+              "name": "maxQueryEntries",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "10000",
+              "doc": "",
+              "name": "maxQueryPages",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "128",
+              "doc": "",
+              "name": "maxStructuredMetadataFields",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "16",
+              "doc": "",
+              "name": "queryConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MaxInFlightQueryBytes bounds the decoded bytes all running queries hold\nat once. When omitted, the operator sizes it from the memory limit.",
+              "name": "maxInFlightQueryBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "LogsRequestSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+              "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "Logs"
+          ],
+          "doc": "LogsSpec defines the desired state of Logs.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "Standalone",
+              "doc": "",
+              "name": "mode",
+              "rules": [],
+              "type": "[LogsMode](#logsmode)",
+              "validation": [
+                "Enum: [Standalone Sharded]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Version is the canonical Logs container image tag. It must be SemVer\nwithout a leading \"v\". When omitted, deprecated image.tag is used, then\nthe operator's default version.",
+              "name": "version",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/logs }",
+              "doc": "",
+              "name": "image",
+              "rules": [],
+              "type": "[ImageSpec](#imagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "config",
+              "rules": [
+                {
+                  "message": "set retention or the deprecated retentionSeconds, not both",
+                  "rule": "!has(self.retention) || !has(self.retentionSeconds)"
+                }
+              ],
+              "type": "[LogsConfigSpec](#logsconfigspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "writer",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "reader",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "{ grpcPort:9091 httpPort:3100 type:ClusterIP }",
+              "doc": "",
+              "name": "service",
+              "rules": [],
+              "type": "[ServiceSpec](#servicespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "ingress",
+              "rules": [
+                {
+                  "message": "hostname is required when ingress is enabled",
+                  "rule": "!has(self.enabled) || !self.enabled || (has(self.hostname) \u0026\u0026 self.hostname.size() \u003e 0)"
+                },
+                {
+                  "message": "pathPrefix must be empty or start with '/' and must not end with '/'",
+                  "rule": "!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() \u003e 1 \u0026\u0026 self.pathPrefix.startsWith('/') \u0026\u0026 !self.pathPrefix.endsWith('/'))"
+                }
+              ],
+              "type": "[IngressSpec](#ingressspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccount",
+              "rules": [],
+              "type": "[ServiceAccountSpec](#serviceaccountspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "LogsSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "reader replicas must be zero in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+            },
+            {
+              "message": "writer replicas must be one in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+            },
+            {
+              "message": "spec.version and deprecated spec.image.tag must match when both are set",
+              "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "Metrics runs a Prometheus-compatible metrics database on object storage: a\nwriter StatefulSet and, in Sharded mode, a reader group per storage shard.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "reader replicas must be zero in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+                },
+                {
+                  "message": "writer replicas must be one in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+                },
+                {
+                  "message": "spec.version and deprecated spec.image.tag must match when both are set",
+                  "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+                }
+              ],
+              "type": "[MetricsSpec](#metricsspec)",
+              "validation": []
+            }
+          ],
+          "kind": "Metrics",
+          "name": "Metrics",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": []
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "MetricsSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "{ path:metrics }",
+              "doc": "",
+              "name": "storage",
+              "rules": [],
+              "type": "[StorageSpec](#storagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Retention is how long samples are kept, counted from their timestamp, e.g. 14d or 2w.\nWhen unset, the server default of 60 days applies.",
+              "name": "retention",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "ReaderCacheCapacity sizes each shard's query cache: half of it, in\nbytes, holds decoded series chunks. When omitted, the operator sizes it\nfrom the container memory limit.",
+              "name": "readerCacheCapacity",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved\nselectors. When omitted, the operator sizes it from the container\nmemory limit.",
+              "name": "forwardIndexCacheCapacityBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Query limits PromQL evaluation across the whole process.",
+              "name": "query",
+              "rules": [],
+              "type": "[MetricsQuerySpec](#metricsqueryspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "cacheWarmer",
+              "rules": [],
+              "type": "[CacheWarmerSpec](#cachewarmerspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "write",
+              "rules": [],
+              "type": "[WriteSpec](#writespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "request",
+              "rules": [
+                {
+                  "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+                  "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+                }
+              ],
+              "type": "[MetricsRequestSpec](#metricsrequestspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "sharding",
+              "rules": [
+                {
+                  "message": "renewIntervalSeconds must be less than leaseDurationSeconds",
+                  "rule": "!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds \u003c self.leaseDurationSeconds"
+                }
+              ],
+              "type": "[ShardingSpec](#shardingspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "auth",
+              "rules": [],
+              "type": "[AuthSpec](#authspec)",
+              "validation": []
+            },
+            {
+              "default": "[default]",
+              "doc": "",
+              "name": "namespaces",
+              "rules": [],
+              "type": "string array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "MetricsConfigSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "MetricsConfigSpec"
+          ],
+          "doc": "MetricsQuerySpec limits the queries one Metrics process evaluates at once.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "MaxConcurrent is how many queries evaluate at once; the rest wait.\nDefaults to 32.",
+              "name": "maxConcurrent",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "QueueTimeoutSeconds is how long a query waits to start before failing\nwith 503. Defaults to 30.",
+              "name": "queueTimeoutSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MaxMemoryBytes is the engine memory one query may reserve. Defaults to\nhalf the memory budget, capped at 1 GiB, so one query cannot take all\nof it.",
+              "name": "maxMemoryBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MemoryBudgetBytes is the engine memory all running queries together may\nreserve. When omitted, the operator sizes it from the container memory\nlimit.",
+              "name": "memoryBudgetBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MaxConcurrentShardReads is how many shard reads a reader serves to other\nreader groups at once. Defaults to 16.",
+              "name": "maxConcurrentShardReads",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "MetricsQuerySpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "MetricsConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "33554432",
+              "doc": "MaxRequestBytes caps a request body as received, before content decoding.",
+              "name": "maxRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "134217728",
+              "doc": "MaxDecodedRequestBytes caps a write body after gzip or snappy decoding.\nMust be at least maxRequestBytes.",
+              "name": "maxDecodedRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "MetricsRequestSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+              "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "Metrics"
+          ],
+          "doc": "MetricsSpec defines the desired state of Metrics.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "Standalone",
+              "doc": "",
+              "name": "mode",
+              "rules": [],
+              "type": "[MetricsMode](#metricsmode)",
+              "validation": [
+                "Enum: [Standalone Sharded]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Version is the canonical Metrics container image tag. It must be SemVer\nwithout a leading \"v\". When omitted, deprecated image.tag is used, then\nthe operator's default version.",
+              "name": "version",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/metrics }",
+              "doc": "",
+              "name": "image",
+              "rules": [],
+              "type": "[ImageSpec](#imagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "config",
+              "rules": [],
+              "type": "[MetricsConfigSpec](#metricsconfigspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "writer",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "reader",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "{ grpcPort:9090 httpPort:8080 type:ClusterIP }",
+              "doc": "",
+              "name": "service",
+              "rules": [],
+              "type": "[ServiceSpec](#servicespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "ingress",
+              "rules": [
+                {
+                  "message": "hostname is required when ingress is enabled",
+                  "rule": "!has(self.enabled) || !self.enabled || (has(self.hostname) \u0026\u0026 self.hostname.size() \u003e 0)"
+                },
+                {
+                  "message": "pathPrefix must be empty or start with '/' and must not end with '/'",
+                  "rule": "!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() \u003e 1 \u0026\u0026 self.pathPrefix.startsWith('/') \u0026\u0026 !self.pathPrefix.endsWith('/'))"
+                }
+              ],
+              "type": "[IngressSpec](#ingressspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccount",
+              "rules": [],
+              "type": "[ServiceAccountSpec](#serviceaccountspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "MetricsSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "reader replicas must be zero in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+            },
+            {
+              "message": "writer replicas must be one in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+            },
+            {
+              "message": "spec.version and deprecated spec.image.tag must match when both are set",
+              "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "NamespaceAuthentication declares a datastore namespace and a credential\nthat may read or write it.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "usageReportingEndpoint is not supported for Vector",
+                  "rule": "self.dataStoreRef.kind != 'Vector' || !has(self.usageReportingEndpoint)"
+                }
+              ],
+              "type": "[NamespaceAuthenticationSpec](#namespaceauthenticationspec)",
+              "validation": []
+            }
+          ],
+          "kind": "NamespaceAuthentication",
+          "name": "NamespaceAuthentication",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": [
+              "nsauth"
+            ]
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "NamespaceAuthentication"
+          ],
+          "doc": "NamespaceAuthenticationSpec defines the desired state of NamespaceAuthentication.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "dataStoreRef",
+              "rules": [],
+              "type": "[DataStoreReference](#datastorereference)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "namespace",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "username",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "permission",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [read write]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "secretKeyRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "UsageReportingEndpoint is a plaintext gRPC endpoint (host:port or\nhttp://host:port) implementing Plural Console's PluralServer.MeterMetrics.\nIngested bytes for the namespace are buffered and periodically reported\nto it. When several NamespaceAuthentications for the same datastore and\nnamespace set different endpoints, the lexicographically smallest wins.\nVector doesn't report usage.",
+              "name": "usageReportingEndpoint",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MaxLength: 253",
+                "Pattern: `^(http://)?[A-Za-z0-9.-]+(:[0-9]{1,5})?$`"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "NamespaceAuthenticationSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "usageReportingEndpoint is not supported for Vector",
+              "rule": "self.dataStoreRef.kind != 'Vector' || !has(self.usageReportingEndpoint)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "NamespaceSchema declares the attribute schema of a datastore namespace.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "only Vector namespaces have schemas",
+                  "rule": "self.dataStoreRef.kind == 'Vector'"
+                }
+              ],
+              "type": "[NamespaceSchemaSpec](#namespaceschemaspec)",
+              "validation": []
+            }
+          ],
+          "kind": "NamespaceSchema",
+          "name": "NamespaceSchema",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": [
+              "nsschema"
+            ]
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "NamespaceSchema"
+          ],
+          "doc": "NamespaceSchemaSpec defines the desired state of NamespaceSchema.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "dataStoreRef",
+              "rules": [],
+              "type": "[DataStoreReference](#datastorereference)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Namespace is the datastore namespace the schema is for. Defaults to\nthe resource's name.",
+              "name": "namespace",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Schema maps attribute names to their schemas. Servers merge it into\nthe namespace whenever it changes and when the namespace is created:\nattributes it names are replaced whole, others are left alone, and an\nattribute's type can't change once set. Attributes removed from it\nstay in the namespace.",
+              "name": "schema",
+              "rules": [
+                {
+                  "message": "attribute names are at most 128 bytes and can't be id, vector, or start with $",
+                  "rule": "self.all(name, size(name) \u003c= 128 \u0026\u0026 name != 'id' \u0026\u0026 name != 'vector' \u0026\u0026 !name.startsWith('$'))"
+                },
+                {
+                  "message": "at most one attribute can embed",
+                  "rule": "self.filter(name, has(self[name].embed) \u0026\u0026 self[name].embed).size() \u003c= 1"
+                }
+              ],
+              "type": "object (keys:string, values:[AttributeSchema](#attributeschema))",
+              "validation": [
+                "MinProperties: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "NamespaceSchemaSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "only Vector namespaces have schemas",
+              "rule": "self.dataStoreRef.kind == 'Vector'"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "BucketCleanerSpec",
+            "BucketCleanerStatus",
+            "StorageSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "Local",
+              "doc": "",
+              "name": "type",
+              "rules": [],
+              "type": "[ObjectStoreType](#objectstoretype)",
+              "validation": [
+                "Enum: [InMemory Local Aws Azure Gcp]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "path",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "aws",
+              "rules": [
+                {
+                  "message": "accessKeyIDSecretRef and secretAccessKeySecretRef must be configured together",
+                  "rule": "has(self.accessKeyIDSecretRef) == has(self.secretAccessKeySecretRef)"
+                }
+              ],
+              "type": "[AWSObjectStoreSpec](#awsobjectstorespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "azure",
+              "rules": [
+                {
+                  "message": "at most one Azure authentication method may be configured",
+                  "rule": "[has(self.accessKeySecretRef), has(self.sasTokenSecretRef), has(self.bearerTokenSecretRef), has(self.clientSecret), has(self.workloadIdentity)].filter(x, x).size() \u003c= 1"
+                }
+              ],
+              "type": "[AzureObjectStoreSpec](#azureobjectstorespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "gcp",
+              "rules": [
+                {
+                  "message": "serviceAccountKeySecretRef and bearerTokenSecretRef are mutually exclusive",
+                  "rule": "![has(self.serviceAccountKeySecretRef), has(self.bearerTokenSecretRef)].all(x, x)"
+                }
+              ],
+              "type": "[GCPObjectStoreSpec](#gcpobjectstorespec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "ObjectStoreSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "Aws object stores require aws configuration",
+              "rule": "self.type != 'Aws' || has(self.aws)"
+            },
+            {
+              "message": "aws configuration is only valid for Aws object stores",
+              "rule": "self.type == 'Aws' || !has(self.aws)"
+            },
+            {
+              "message": "Azure object stores require azure configuration",
+              "rule": "self.type != 'Azure' || has(self.azure)"
+            },
+            {
+              "message": "azure configuration is only valid for Azure object stores",
+              "rule": "self.type == 'Azure' || !has(self.azure)"
+            },
+            {
+              "message": "Gcp object stores require gcp configuration",
+              "rule": "self.type != 'Gcp' || has(self.gcp)"
+            },
+            {
+              "message": "gcp configuration is only valid for Gcp object stores",
+              "rule": "self.type == 'Gcp' || !has(self.gcp)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ObjectStoreSpec"
+          ],
+          "doc": "",
+          "enumValues": [
+            {
+              "doc": "",
+              "name": "InMemory"
+            },
+            {
+              "doc": "",
+              "name": "Local"
+            },
+            {
+              "doc": "",
+              "name": "Aws"
+            },
+            {
+              "doc": "",
+              "name": "Azure"
+            },
+            {
+              "doc": "",
+              "name": "Gcp"
+            }
+          ],
+          "fields": [],
+          "kind": "",
+          "name": "ObjectStoreType",
+          "resource": {},
+          "rules": [],
+          "underlying": "string",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "WorkloadSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "WhenDeleted controls PVC retention when the StatefulSet is deleted.\nWhen omitted, the object-store-dependent workload default is used.",
+              "name": "whenDeleted",
+              "rules": [],
+              "type": "[PersistentVolumeClaimRetentionPolicyType](#persistentvolumeclaimretentionpolicytype)",
+              "validation": [
+                "Enum: [Retain Delete]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "WhenScaled controls PVC retention when StatefulSet replicas are reduced.\nWhen omitted, the object-store-dependent workload default is used.",
+              "name": "whenScaled",
+              "rules": [],
+              "type": "[PersistentVolumeClaimRetentionPolicyType](#persistentvolumeclaimretentionpolicytype)",
+              "validation": [
+                "Enum: [Retain Delete]"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "PersistentVolumeClaimRetentionPolicySpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PersistentVolumeClaimRetentionPolicySpec"
+          ],
+          "doc": "",
+          "enumValues": [
+            {
+              "doc": "",
+              "name": "Retain"
+            },
+            {
+              "doc": "",
+              "name": "Delete"
+            }
+          ],
+          "fields": [],
+          "kind": "",
+          "name": "PersistentVolumeClaimRetentionPolicyType",
+          "resource": {},
+          "rules": [],
+          "underlying": "string",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [
+            {
+              "doc": "",
+              "name": "Standalone"
+            },
+            {
+              "doc": "",
+              "name": "Sharded"
+            }
+          ],
+          "fields": [],
+          "kind": "",
+          "name": "ProductMode",
+          "resource": {},
+          "rules": [],
+          "underlying": "string",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "PseudoFS runs a persistent virtual filesystem for sandboxed and embedded\nruntimes, served over gRPC and stored in object storage.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "spec.version and deprecated spec.image.tag must match when both are set",
+                  "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+                },
+                {
+                  "message": "PseudoFS always runs exactly one replica",
+                  "rule": "!has(self.workload.replicas) || self.workload.replicas == 1"
+                },
+                {
+                  "message": "chunkSizeBytes must not exceed maxFileSizeBytes",
+                  "rule": "!has(self.config.chunkSizeBytes) || !has(self.config.maxFileSizeBytes) || self.config.chunkSizeBytes \u003c= self.config.maxFileSizeBytes"
+                },
+                {
+                  "message": "maxUnaryFileSizeBytes must not exceed maxFileSizeBytes",
+                  "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxFileSizeBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxFileSizeBytes"
+                },
+                {
+                  "message": "maxUnaryFileSizeBytes must not exceed maxDecodingMessageBytes",
+                  "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxDecodingMessageBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxDecodingMessageBytes"
+                },
+                {
+                  "message": "maxUnaryFileSizeBytes must not exceed maxEncodingMessageBytes",
+                  "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxEncodingMessageBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxEncodingMessageBytes"
+                }
+              ],
+              "type": "[PseudoFSSpec](#pseudofsspec)",
+              "validation": []
+            }
+          ],
+          "kind": "PseudoFS",
+          "name": "PseudoFS",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": [
+              "pseudofs"
+            ]
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PseudoFSConfigSpec"
+          ],
+          "doc": "PseudoFSBlobsSpec configures file content stored outside the metastore.\nBlobs are kept on the data volume until uploaded and then cached there, and\nare uploaded to the storage object store with the same credentials, under\n\"\u003cstorage.path\u003e/blobs\".",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "4294967296",
+              "doc": "CacheCapacityBytes bounds blob usage of the data volume, including\nblobs awaiting upload. Keep it well below the volume size.",
+              "name": "cacheCapacityBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "4",
+              "doc": "",
+              "name": "uploadConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "300",
+              "doc": "GCGraceSeconds is how long unreferenced blobs are kept so in-flight\nreads of replaced files can finish.",
+              "name": "gcGraceSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "PseudoFSBlobsSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PseudoFSSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "{ path:pseudofs }",
+              "doc": "Storage.Path is the filesystem's root prefix in the object store: the\nmetastore is kept under \"\u003cpath\u003e/metastore\" and blobs under\n\"\u003cpath\u003e/blobs\".",
+              "name": "storage",
+              "rules": [],
+              "type": "[StorageSpec](#storagespec)",
+              "validation": []
+            },
+            {
+              "default": "1048576",
+              "doc": "",
+              "name": "chunkSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1073741824",
+              "doc": "",
+              "name": "maxFileSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "64",
+              "doc": "",
+              "name": "maxAppendGenerations",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 2"
+              ]
+            },
+            {
+              "default": "8388608",
+              "doc": "",
+              "name": "maxUnaryFileSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "16777216",
+              "doc": "",
+              "name": "maxDecodingMessageBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "16777216",
+              "doc": "",
+              "name": "maxEncodingMessageBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "16384",
+              "doc": "InlineThresholdBytes is the largest write stored in the metastore\nrather than as a blob. Inline bytes pass through the metastore's WAL and\ncompactions, so raising this trades metastore write load for fewer blobs.",
+              "name": "inlineThresholdBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Maximum: 1.6777216e+07",
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "{  }",
+              "doc": "",
+              "name": "blobs",
+              "rules": [],
+              "type": "[PseudoFSBlobsSpec](#pseudofsblobsspec)",
+              "validation": []
+            },
+            {
+              "default": "{  }",
+              "doc": "",
+              "name": "search",
+              "rules": [
+                {
+                  "message": "defaultGlobResults must not exceed maxGlobResults",
+                  "rule": "!has(self.defaultGlobResults) || !has(self.maxGlobResults) || self.defaultGlobResults \u003c= self.maxGlobResults"
+                },
+                {
+                  "message": "defaultGrepMatches must not exceed maxGrepMatches",
+                  "rule": "!has(self.defaultGrepMatches) || !has(self.maxGrepMatches) || self.defaultGrepMatches \u003c= self.maxGrepMatches"
+                },
+                {
+                  "message": "defaultGrepFileSizeBytes must not exceed maxGrepFileSizeBytes",
+                  "rule": "!has(self.defaultGrepFileSizeBytes) || !has(self.maxGrepFileSizeBytes) || self.defaultGrepFileSizeBytes \u003c= self.maxGrepFileSizeBytes"
+                }
+              ],
+              "type": "[PseudoFSSearchSpec](#pseudofssearchspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "PseudoFSConfigSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "storage.path must be an object-store prefix without leading, trailing, or repeated '/'",
+              "rule": "!has(self.storage) || !has(self.storage.path) || self.storage.path.matches('^[^/]+(/[^/]+)*$')"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PseudoFSConfigSpec"
+          ],
+          "doc": "PseudoFSSearchSpec bounds Glob and Grep requests. Requests that leave a\nlimit unset use its default; larger requested values are capped.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "1000",
+              "doc": "",
+              "name": "defaultGlobResults",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "10000",
+              "doc": "",
+              "name": "maxGlobResults",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "100",
+              "doc": "",
+              "name": "defaultGrepMatches",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1000",
+              "doc": "",
+              "name": "maxGrepMatches",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "100",
+              "doc": "",
+              "name": "maxGrepContextLines",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "16777216",
+              "doc": "",
+              "name": "defaultGrepFileSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "67108864",
+              "doc": "",
+              "name": "maxGrepFileSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "8",
+              "doc": "GrepConcurrency is how many files one Grep request searches at once.",
+              "name": "grepConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1000000",
+              "doc": "MaxScannedEntries is how many directory entries one Glob or Grep walk\nmay read before failing with RESOURCE_EXHAUSTED.",
+              "name": "maxScannedEntries",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "30",
+              "doc": "MaxGrepSeconds is how long one Grep request may search before failing\nwith RESOURCE_EXHAUSTED after the matches already sent.",
+              "name": "maxGrepSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "PseudoFSSearchSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "defaultGlobResults must not exceed maxGlobResults",
+              "rule": "!has(self.defaultGlobResults) || !has(self.maxGlobResults) || self.defaultGlobResults \u003c= self.maxGlobResults"
+            },
+            {
+              "message": "defaultGrepMatches must not exceed maxGrepMatches",
+              "rule": "!has(self.defaultGrepMatches) || !has(self.maxGrepMatches) || self.defaultGrepMatches \u003c= self.maxGrepMatches"
+            },
+            {
+              "message": "defaultGrepFileSizeBytes must not exceed maxGrepFileSizeBytes",
+              "rule": "!has(self.defaultGrepFileSizeBytes) || !has(self.maxGrepFileSizeBytes) || self.defaultGrepFileSizeBytes \u003c= self.maxGrepFileSizeBytes"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PseudoFSSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "9093",
+              "doc": "",
+              "name": "grpcPort",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Maximum: 65535",
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "ClusterIP",
+              "doc": "",
+              "name": "type",
+              "rules": [],
+              "type": "[ServiceType](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#servicetype-v1-core)",
+              "validation": [
+                "Enum: [ClusterIP NodePort LoadBalancer]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "annotations",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "PseudoFSServiceSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "PseudoFS"
+          ],
+          "doc": "PseudoFSSpec defines the desired state of PseudoFS.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Version is the canonical PseudoFS container image tag.",
+              "name": "version",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/pseudofs }",
+              "doc": "",
+              "name": "image",
+              "rules": [],
+              "type": "[ImageSpec](#imagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "config",
+              "rules": [
+                {
+                  "message": "storage.path must be an object-store prefix without leading, trailing, or repeated '/'",
+                  "rule": "!has(self.storage) || !has(self.storage.path) || self.storage.path.matches('^[^/]+(/[^/]+)*$')"
+                }
+              ],
+              "type": "[PseudoFSConfigSpec](#pseudofsconfigspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "workload",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "service",
+              "rules": [],
+              "type": "[PseudoFSServiceSpec](#pseudofsservicespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccount",
+              "rules": [],
+              "type": "[ServiceAccountSpec](#serviceaccountspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "PseudoFSSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "spec.version and deprecated spec.image.tag must match when both are set",
+              "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+            },
+            {
+              "message": "PseudoFS always runs exactly one replica",
+              "rule": "!has(self.workload.replicas) || self.workload.replicas == 1"
+            },
+            {
+              "message": "chunkSizeBytes must not exceed maxFileSizeBytes",
+              "rule": "!has(self.config.chunkSizeBytes) || !has(self.config.maxFileSizeBytes) || self.config.chunkSizeBytes \u003c= self.config.maxFileSizeBytes"
+            },
+            {
+              "message": "maxUnaryFileSizeBytes must not exceed maxFileSizeBytes",
+              "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxFileSizeBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxFileSizeBytes"
+            },
+            {
+              "message": "maxUnaryFileSizeBytes must not exceed maxDecodingMessageBytes",
+              "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxDecodingMessageBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxDecodingMessageBytes"
+            },
+            {
+              "message": "maxUnaryFileSizeBytes must not exceed maxEncodingMessageBytes",
+              "rule": "!has(self.config.maxUnaryFileSizeBytes) || !has(self.config.maxEncodingMessageBytes) || self.config.maxUnaryFileSizeBytes \u003c= self.config.maxEncodingMessageBytes"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "WorkloadSpec"
+          ],
+          "doc": "ReadGroupsSpec splits sharded readers into one group per storage shard.\nEach group is a StatefulSet that opens only its own shard; a query sent\nto any reader reads its own shard in process and every other shard from\nthat shard's group over gRPC. Replicas, resources, and autoscaling apply\nto each group.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "true",
+              "doc": "Enabled defaults to true. When false, every reader opens every shard.",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "250",
+              "doc": "HedgeAfterMilliseconds starts a second copy of a unary shard read on\nanother replica of its group when the first has not answered in time.\nStreaming reads are never hedged. Zero disables hedging.",
+              "name": "hedgeAfterMilliseconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "120",
+              "doc": "RequestTimeoutSeconds bounds one shard read.",
+              "name": "requestTimeoutSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ReadGroupsSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ShardMapSpec"
+          ],
+          "doc": "RoutingEpoch is the hash routing for records timestamped at or after\nEffectiveFromNs, until the next epoch begins. The first epoch starts at the\nminimum int64 so every timestamp resolves to exactly one epoch.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "effective_from_ns",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "routing",
+              "rules": [],
+              "type": "[HashRangeMap](#hashrangemap)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "RoutingEpoch",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec",
+            "MetricsSpec",
+            "PseudoFSSpec",
+            "TracesSpec",
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "annotations",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "ServiceAccountSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec",
+            "MetricsSpec",
+            "TracesSpec",
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "httpPort",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "grpcPort",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "ClusterIP",
+              "doc": "",
+              "name": "type",
+              "rules": [],
+              "type": "[ServiceType](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#servicetype-v1-core)",
+              "validation": [
+                "Enum: [ClusterIP NodePort LoadBalancer]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "annotations",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "ServiceSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ShardMapSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "owner",
+              "rules": [],
+              "type": "[ShardOwner](#shardowner)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "range",
+              "rules": [],
+              "type": "[ShardRange](#shardrange)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "state",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [pending active draining released]"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ShardAssignment",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "ShardMap is the shard routing and writer ownership of a Metrics, Logs or\nTraces database. The operator and the database's writers maintain it, so\nit is not meant to be edited.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [],
+              "type": "[ShardMapSpec](#shardmapspec)",
+              "validation": []
+            }
+          ],
+          "kind": "ShardMap",
+          "name": "ShardMap",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": [
+              "sm"
+            ]
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ShardMap"
+          ],
+          "doc": "ShardMapSpec is the authoritative routing and writer-ownership snapshot.\nThe elected Rust shard coordinator writes it with resourceVersion-based\ncompare-and-swap updates; all writer and reader replicas consume it by watch.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "generation",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "ShardCount is the number of physical SlateDB storage shards, equal to\nthe latest epoch's shard count. Desired count comes from writer\nStatefulSet replicas; it only grows because shards are never merged.",
+              "name": "shard_count",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Epochs are ordered by EffectiveFromNs with non-decreasing shard counts.\nScale-up appends an epoch at a future aligned cutover.",
+              "name": "epochs",
+              "rules": [],
+              "type": "[RoutingEpoch](#routingepoch) array",
+              "validation": [
+                "MinItems: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "assignments",
+              "rules": [],
+              "type": "[ShardAssignment](#shardassignment) array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "ShardMapSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ShardAssignment"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "id",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "ordinal",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ShardOwner",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "ShardAssignment"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "start",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "end",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ShardRange",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec",
+            "MetricsConfigSpec",
+            "TracesConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "IOConcurrencyLimit bounds concurrent storage I/O operations per pod. When\nomitted, the operator infers it from the component's memory request at 96\npermits per GiB, with a minimum of 128.",
+              "name": "ioConcurrencyLimit",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "15",
+              "doc": "",
+              "name": "leaseDurationSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "5",
+              "doc": "",
+              "name": "renewIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ShardingSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "renewIntervalSeconds must be less than leaseDurationSeconds",
+              "rule": "!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds \u003c self.leaseDurationSeconds"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec",
+            "MetricsConfigSpec",
+            "PseudoFSConfigSpec",
+            "TracesConfigSpec",
+            "VectorConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "path",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "settingsPath",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "objectStore",
+              "rules": [
+                {
+                  "message": "Aws object stores require aws configuration",
+                  "rule": "self.type != 'Aws' || has(self.aws)"
+                },
+                {
+                  "message": "aws configuration is only valid for Aws object stores",
+                  "rule": "self.type == 'Aws' || !has(self.aws)"
+                },
+                {
+                  "message": "Azure object stores require azure configuration",
+                  "rule": "self.type != 'Azure' || has(self.azure)"
+                },
+                {
+                  "message": "azure configuration is only valid for Azure object stores",
+                  "rule": "self.type == 'Azure' || !has(self.azure)"
+                },
+                {
+                  "message": "Gcp object stores require gcp configuration",
+                  "rule": "self.type != 'Gcp' || has(self.gcp)"
+                },
+                {
+                  "message": "gcp configuration is only valid for Gcp object stores",
+                  "rule": "self.type == 'Gcp' || !has(self.gcp)"
+                }
+              ],
+              "type": "[ObjectStoreSpec](#objectstorespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "blockCache",
+              "rules": [],
+              "type": "[CacheSpec](#cachespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "metaCache",
+              "rules": [],
+              "type": "[CacheSpec](#cachespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Disk describes the performance specs of the disks used for block and meta caches. This is used to\noptimize caches and defaults to common block store specs as a reasonable baseline.",
+              "name": "disk",
+              "rules": [],
+              "type": "[DiskSpec](#diskspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "StorageSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "Traces runs a Tempo-compatible trace database on object storage: a writer\nStatefulSet and, in Sharded mode, a reader group per storage shard.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "reader replicas must be zero in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+                },
+                {
+                  "message": "writer replicas must be one in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+                },
+                {
+                  "message": "spec.version and deprecated spec.image.tag must match when both are set",
+                  "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+                }
+              ],
+              "type": "[TracesSpec](#tracesspec)",
+              "validation": []
+            }
+          ],
+          "kind": "Traces",
+          "name": "Traces",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": []
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "TracesSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "{ path:traces }",
+              "doc": "",
+              "name": "storage",
+              "rules": [],
+              "type": "[StorageSpec](#storagespec)",
+              "validation": []
+            },
+            {
+              "default": "3600",
+              "doc": "",
+              "name": "segmentDurationSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Retention is how long data is kept, counted from ingestion, e.g. 14d or 2w.\nWhen unset, the server default of 14 days applies.",
+              "name": "retention",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^([0-9]+[wdhms])*0*[1-9][0-9]*[wdhms]([0-9]+[wdhms])*$`"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "RetentionSeconds is deprecated in favor of retention.",
+              "name": "retentionSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "page",
+              "rules": [],
+              "type": "[TracesPageSpec](#tracespagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "write",
+              "rules": [],
+              "type": "[WriteSpec](#writespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "sharding",
+              "rules": [
+                {
+                  "message": "renewIntervalSeconds must be less than leaseDurationSeconds",
+                  "rule": "!has(self.renewIntervalSeconds) || !has(self.leaseDurationSeconds) || self.renewIntervalSeconds \u003c self.leaseDurationSeconds"
+                }
+              ],
+              "type": "[ShardingSpec](#shardingspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "request",
+              "rules": [
+                {
+                  "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+                  "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+                }
+              ],
+              "type": "[TracesRequestSpec](#tracesrequestspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "cacheWarmer",
+              "rules": [],
+              "type": "[CacheWarmerSpec](#cachewarmerspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "auth",
+              "rules": [],
+              "type": "[AuthSpec](#authspec)",
+              "validation": []
+            },
+            {
+              "default": "[default]",
+              "doc": "",
+              "name": "namespaces",
+              "rules": [],
+              "type": "string array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "TracesConfigSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "set retention or the deprecated retentionSeconds, not both",
+              "rule": "!has(self.retention) || !has(self.retentionSeconds)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "TracesConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "1048576",
+              "doc": "",
+              "name": "targetSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "4194304",
+              "doc": "",
+              "name": "maxSizeBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1024",
+              "doc": "",
+              "name": "maxTraces",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "TracesPageSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "TracesConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "33554432",
+              "doc": "MaxRequestBytes caps a request body as received, before content decoding.",
+              "name": "maxRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "134217728",
+              "doc": "MaxDecodedRequestBytes caps a write body after gzip decoding and a\ndecoded OTLP or Jaeger gRPC message. Must be at least maxRequestBytes.",
+              "name": "maxDecodedRequestBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "64",
+              "doc": "",
+              "name": "requestConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "10000",
+              "doc": "",
+              "name": "maxCandidates",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "100000",
+              "doc": "",
+              "name": "maxSpansPerTrace",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "8",
+              "doc": "",
+              "name": "queryConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1000",
+              "doc": "",
+              "name": "maxQueryLimit",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "TracesRequestSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "maxDecodedRequestBytes must be at least maxRequestBytes",
+              "rule": "!has(self.maxRequestBytes) || !has(self.maxDecodedRequestBytes) || self.maxDecodedRequestBytes \u003e= self.maxRequestBytes"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "Traces"
+          ],
+          "doc": "TracesSpec defines the desired state of Traces.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "Standalone",
+              "doc": "",
+              "name": "mode",
+              "rules": [],
+              "type": "[TracesMode](#tracesmode)",
+              "validation": [
+                "Enum: [Standalone Sharded]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Version is the canonical Traces container image tag. It must be SemVer\nwithout a leading \"v\". When omitted, deprecated image.tag is used, then\nthe operator's default version.",
+              "name": "version",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/traces }",
+              "doc": "",
+              "name": "image",
+              "rules": [],
+              "type": "[ImageSpec](#imagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "config",
+              "rules": [
+                {
+                  "message": "set retention or the deprecated retentionSeconds, not both",
+                  "rule": "!has(self.retention) || !has(self.retentionSeconds)"
+                }
+              ],
+              "type": "[TracesConfigSpec](#tracesconfigspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "writer",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "reader",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "{ grpcPort:9092 httpPort:3200 type:ClusterIP }",
+              "doc": "",
+              "name": "service",
+              "rules": [],
+              "type": "[ServiceSpec](#servicespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "ingress",
+              "rules": [
+                {
+                  "message": "hostname is required when ingress is enabled",
+                  "rule": "!has(self.enabled) || !self.enabled || (has(self.hostname) \u0026\u0026 self.hostname.size() \u003e 0)"
+                },
+                {
+                  "message": "pathPrefix must be empty or start with '/' and must not end with '/'",
+                  "rule": "!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() \u003e 1 \u0026\u0026 self.pathPrefix.startsWith('/') \u0026\u0026 !self.pathPrefix.endsWith('/'))"
+                }
+              ],
+              "type": "[IngressSpec](#ingressspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccount",
+              "rules": [],
+              "type": "[ServiceAccountSpec](#serviceaccountspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "TracesSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "reader replicas must be zero in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+            },
+            {
+              "message": "writer replicas must be one in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+            },
+            {
+              "message": "spec.version and deprecated spec.image.tag must match when both are set",
+              "rule": "!has(self.version) || !has(self.image) || !has(self.image.tag) || self.version == self.image.tag"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "Vector runs a vector and full-text search database on object storage, with\nits namespaces spread over shards that split as they grow.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [
+                {
+                  "message": "reader replicas must be zero in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+                },
+                {
+                  "message": "writer replicas must be one in Standalone mode",
+                  "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+                },
+                {
+                  "message": "Sharded mode needs an Aws, Azure or Gcp object store that every replica shares",
+                  "rule": "self.mode != 'Sharded' || (has(self.config) \u0026\u0026 has(self.config.storage) \u0026\u0026 has(self.config.storage.objectStore) \u0026\u0026 self.config.storage.objectStore.type in ['Aws', 'Azure', 'Gcp'])"
+                }
+              ],
+              "type": "[VectorSpec](#vectorspec)",
+              "validation": []
+            }
+          ],
+          "kind": "Vector",
+          "name": "Vector",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": []
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "{ path:vector }",
+              "doc": "",
+              "name": "storage",
+              "rules": [],
+              "type": "[StorageSpec](#storagespec)",
+              "validation": []
+            },
+            {
+              "default": "1",
+              "doc": "FlushIntervalSeconds is how often namespaces flush buffered writes.",
+              "name": "flushIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "1",
+              "doc": "ReaderRefreshIntervalSeconds is how often readers pick up their\nwriter's changes, which bounds the staleness of eventual reads.",
+              "name": "readerRefreshIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "15",
+              "doc": "LeaseDurationSeconds is the lifetime of shard and coordinator leases:\nhow long a shard stays unserved after its writer dies.",
+              "name": "leaseDurationSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 3"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "index",
+              "rules": [],
+              "type": "[VectorIndexSpec](#vectorindexspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Auth configures credentials, as for the other datastores. Unless\nunauthenticated is set, only declared namespaces exist: those of\nnamespaces and of NamespaceAuthentications referencing this Vector.\nNamespace read access covers queries, rows and metadata; write access\nalso covers creating, configuring, deleting and writing to the\nnamespace. Shard listing needs global credentials.\nCredential changes apply without restarting pods.",
+              "name": "auth",
+              "rules": [],
+              "type": "[AuthSpec](#authspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Namespaces are declared without namespace credentials, for global\ncredentials or JWTs to use.",
+              "name": "namespaces",
+              "rules": [],
+              "type": "string array",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Embedding configures the model that embeds namespaces' embed\nattributes and query texts. Changing it restarts the pods; namespaces\nkeep the model they first embedded with.",
+              "name": "embedding",
+              "rules": [
+                {
+                  "message": "bedrock authenticates with the AWS credential chain; apiKeySecretRef and endpoint don't apply",
+                  "rule": "self.provider != 'bedrock' || (!has(self.apiKeySecretRef) \u0026\u0026 !has(self.endpoint))"
+                },
+                {
+                  "message": "region only applies to the bedrock provider",
+                  "rule": "self.provider == 'bedrock' || !has(self.region)"
+                },
+                {
+                  "message": "cohere models embed at a fixed size; dimensions doesn't apply",
+                  "rule": "self.provider != 'cohere' || !has(self.dimensions)"
+                }
+              ],
+              "type": "[VectorEmbeddingSpec](#vectorembeddingspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VectorConfigSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorConfigSpec"
+          ],
+          "doc": "VectorEmbeddingSpec is an embedding model served by a provider API.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Provider is the API: openai (or an OpenAI-compatible endpoint, such\nas Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon\nBedrock's Titan Text Embeddings v2).",
+              "name": "provider",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [openai cohere gemini bedrock]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Model is the provider's model name, e.g. text-embedding-3-small or\namazon.titan-embed-text-v2:0.",
+              "name": "model",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "APIKeySecretRef holds the provider API key. Rotating the Secret\napplies without restarting pods. Bedrock instead uses the pods' AWS\ncredentials: an IAM role through the service account, or a Bedrock\nAPI key in AWS_BEARER_TOKEN_BEDROCK.",
+              "name": "apiKeySecretRef",
+              "rules": [],
+              "type": "[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Endpoint replaces the provider's API root, e.g.\nhttp://ollama.ai.svc:11434/v1.",
+              "name": "endpoint",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Region is the AWS region of the Bedrock runtime. Without it, the\nregion of the pods' AWS config (AWS_REGION).",
+              "name": "region",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "MinLength: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Dimensions asks models that can shorten their vectors for this many\ndimensions: OpenAI's text-embedding-3 models, Gemini, and Titan v2\n(256, 512 or 1024).",
+              "name": "dimensions",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Maximum: 65535",
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "BatchSize is the most texts sent in one provider request. The server\ndefault is 96.",
+              "name": "batchSize",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "TimeoutSeconds bounds each provider request. The server default is\n30.",
+              "name": "timeoutSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "CacheSize is the memory each replica spends caching embeddings, so\nrepeated texts and queries skip the provider. 0 disables the cache.\nWithout it, 4% of what each component's memory limit leaves after\nheadroom and reservations, and at least 16Mi.",
+              "name": "cacheSize",
+              "rules": [],
+              "type": "[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#quantity-resource-api)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VectorEmbeddingSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "bedrock authenticates with the AWS credential chain; apiKeySecretRef and endpoint don't apply",
+              "rule": "self.provider != 'bedrock' || (!has(self.apiKeySecretRef) \u0026\u0026 !has(self.endpoint))"
+            },
+            {
+              "message": "region only applies to the bedrock provider",
+              "rule": "self.provider == 'bedrock' || !has(self.region)"
+            },
+            {
+              "message": "cohere models embed at a fixed size; dimensions doesn't apply",
+              "rule": "self.provider != 'cohere' || !has(self.dimensions)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "SplitThresholdVectors is the posting-list size at which a centroid\nsplits. The server default is 150.",
+              "name": "splitThresholdVectors",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 2"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MergeThresholdVectors is the posting-list size below which a centroid\nmerges into its neighbours. The server default is 50.",
+              "name": "mergeThresholdVectors",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "VectorIndexSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorShard"
+          ],
+          "doc": "VectorNamespaceRange is the namespace ids [start, end) a shard holds, as\n16 hex digits. An absent end extends to the end of the id space.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "start",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^[0-9a-f]{16}$`"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "end",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^[0-9a-f]{16}$`"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "VectorNamespaceRange",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorTopologySpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "id",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "state",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Enum: [active retired]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "range",
+              "rules": [],
+              "type": "[VectorNamespaceRange](#vectornamespacerange)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Owner is the writer pod that owns the shard. Each writer owns one\nactive shard.",
+              "name": "owner",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "SplitTo is a writer pod without a shard that the owner is splitting\nthis shard for: the writer takes the upper half of the range.",
+              "name": "split_to",
+              "rules": [],
+              "type": "string",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Parent is the shard this one was split from.",
+              "name": "parent",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Children are the shards this one was split into.",
+              "name": "children",
+              "rules": [],
+              "type": "integer array",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "created_at_ms",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VectorShard",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "Vector"
+          ],
+          "doc": "VectorSpec defines the desired state of Vector.\n\nIn Sharded mode each writer replica owns one shard, held with a Lease, and\nreader groups serve eventually consistent queries, one group per active\nshard by default. Adding writers splits shards for them: the elected\nwriter picks the widest shard for each new writer once its pod is ready,\nand the shard's owner splits it with SlateDB clones, handing half its\nnamespaces to the new writer without copying data. Writers can't be\nremoved, since shards don't merge; the operator keeps the writer\nStatefulSet at one replica per shard. Any replica accepts any request and\nforwards it to the replica that can serve it.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "Standalone",
+              "doc": "",
+              "name": "mode",
+              "rules": [],
+              "type": "[ProductMode](#productmode)",
+              "validation": [
+                "Enum: [Standalone Sharded]"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Version is the Vector container image tag.",
+              "name": "version",
+              "rules": [],
+              "type": "string",
+              "validation": [
+                "Pattern: `^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$`"
+              ]
+            },
+            {
+              "default": "{ pullPolicy:IfNotPresent repository:ghcr.io/pluralsh/vector }",
+              "doc": "",
+              "name": "image",
+              "rules": [],
+              "type": "[ImageSpec](#imagespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "config",
+              "rules": [],
+              "type": "[VectorConfigSpec](#vectorconfigspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "writer",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "reader",
+              "rules": [],
+              "type": "[WorkloadSpec](#workloadspec)",
+              "validation": []
+            },
+            {
+              "default": "{ httpPort:8080 type:ClusterIP }",
+              "doc": "",
+              "name": "service",
+              "rules": [],
+              "type": "[ServiceSpec](#servicespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Ingress exposes the API, which any replica serves, at\n{pathPrefix}/api on the hostname. With a pathPrefix the servers serve\nthe API under it too, so the Ingress needs no rewrite and the\nhostname can be shared with other services. Changing pathPrefix\nrestarts the pods.",
+              "name": "ingress",
+              "rules": [
+                {
+                  "message": "hostname is required when ingress is enabled",
+                  "rule": "!has(self.enabled) || !self.enabled || (has(self.hostname) \u0026\u0026 self.hostname.size() \u003e 0)"
+                },
+                {
+                  "message": "pathPrefix must be empty or start with '/' and must not end with '/'",
+                  "rule": "!has(self.pathPrefix) || self.pathPrefix.size() == 0 || (self.pathPrefix.size() \u003e 1 \u0026\u0026 self.pathPrefix.startsWith('/') \u0026\u0026 !self.pathPrefix.endsWith('/'))"
+                }
+              ],
+              "type": "[IngressSpec](#ingressspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "serviceAccount",
+              "rules": [],
+              "type": "[ServiceAccountSpec](#serviceaccountspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VectorSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "reader replicas must be zero in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.reader) || !has(self.reader.replicas) || self.reader.replicas == 0"
+            },
+            {
+              "message": "writer replicas must be one in Standalone mode",
+              "rule": "self.mode != 'Standalone' || !has(self.writer) || !has(self.writer.replicas) || self.writer.replicas == 1"
+            },
+            {
+              "message": "Sharded mode needs an Aws, Azure or Gcp object store that every replica shares",
+              "rule": "self.mode != 'Sharded' || (has(self.config) \u0026\u0026 has(self.config.storage) \u0026\u0026 has(self.config.storage.objectStore) \u0026\u0026 self.config.storage.objectStore.type in ['Aws', 'Azure', 'Gcp'])"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [],
+          "doc": "VectorTopology is the shard layout of a Vector database. The operator and\nthe database's writers maintain it, so it is not meant to be edited.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "metadata",
+              "rules": [],
+              "type": "[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectmeta-v1-meta)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "spec",
+              "rules": [],
+              "type": "[VectorTopologySpec](#vectortopologyspec)",
+              "validation": []
+            }
+          ],
+          "kind": "VectorTopology",
+          "name": "VectorTopology",
+          "resource": {
+            "scope": "Namespaced",
+            "shortNames": [
+              "vtop"
+            ]
+          },
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorTopology"
+          ],
+          "doc": "VectorTopologySpec is the authoritative shard layout of a Vector cluster.\nThe elected writer and the writer splitting a shard change it with\nresourceVersion-based compare-and-swap; every replica follows it by watch.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "generation",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "next_shard_id",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "shards",
+              "rules": [],
+              "type": "[VectorShard](#vectorshard) array",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VectorTopologySpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "WorkloadSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "emptyDir",
+              "rules": [],
+              "type": "[EmptyDirVolumeSource](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#emptydirvolumesource-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "persistentVolumeClaim",
+              "rules": [],
+              "type": "[PersistentVolumeClaimSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#persistentvolumeclaimspec-v1-core)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "VolumeSpec",
+          "resource": {},
+          "rules": [
+            {
+              "message": "exactly one of emptyDir or persistentVolumeClaim is required",
+              "rule": "has(self.emptyDir) != has(self.persistentVolumeClaim)"
+            }
+          ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsSpec",
+            "MetricsSpec",
+            "PseudoFSSpec",
+            "TracesSpec",
+            "VectorSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "Replicas defaults to one for sharded writers and two for sharded\nreaders. Standalone mode uses exactly one writer and no reader.",
+              "name": "replicas",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "NodeSelector is merged with podTemplate.spec.nodeSelector. Values here\ntake precedence when the same key is configured in both places.",
+              "name": "nodeSelector",
+              "rules": [],
+              "type": "object (keys:string, values:string)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Tolerations are merged with podTemplate.spec.tolerations. A first-class\ntoleration replaces a podTemplate toleration with the same key, operator,\nand effect; otherwise it is appended.",
+              "name": "tolerations",
+              "rules": [],
+              "type": "[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Resources configures requests and limits for the datastore container.\nValues here take precedence over podTemplate container resources. Missing\nvalues default to a 250m CPU request and a 2Gi memory limit (8Gi for\nMetrics, Logs and Traces writers and standalone servers, which roll up\nclosed days), with memory requested at its limit unless a request is\nset. Those writers need at least a 6Gi limit and are not rolled out with\nless. The operator holds back a quarter of the memory limit (at least\n768Mi, at most half) as headroom and sizes the caches and query memory\nbudgets from the rest.",
+              "name": "resources",
+              "rules": [],
+              "type": "[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "PodTemplate is the full Kubernetes pod template escape hatch. Operator\nrequired fields and the first-class scheduling fields are merged into it.",
+              "name": "podTemplate",
+              "rules": [],
+              "type": "[PodTemplateSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podtemplatespec-v1-core)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "dataVolume",
+              "rules": [
+                {
+                  "message": "exactly one of emptyDir or persistentVolumeClaim is required",
+                  "rule": "has(self.emptyDir) != has(self.persistentVolumeClaim)"
+                }
+              ],
+              "type": "[VolumeSpec](#volumespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "cacheVolume",
+              "rules": [
+                {
+                  "message": "exactly one of emptyDir or persistentVolumeClaim is required",
+                  "rule": "has(self.emptyDir) != has(self.persistentVolumeClaim)"
+                }
+              ],
+              "type": "[VolumeSpec](#volumespec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "PersistentVolumeClaimRetentionPolicy controls whether StatefulSet PVCs\nare retained or deleted when the workload is deleted or scaled down.\nWhen omitted, remote and in-memory object stores default to Delete while\nLocal object stores default to Retain because the data PVC is authoritative.",
+              "name": "persistentVolumeClaimRetentionPolicy",
+              "rules": [],
+              "type": "[PersistentVolumeClaimRetentionPolicySpec](#persistentvolumeclaimretentionpolicyspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "ReadGroups configures per-shard reader groups. Readers only; ignored\nfor writers and in standalone mode.",
+              "name": "readGroups",
+              "rules": [],
+              "type": "[ReadGroupsSpec](#readgroupsspec)",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "Autoscaling adds a HorizontalPodAutoscaler per reader StatefulSet, one\nper reader group. Readers only; ignored for writers and in standalone\nmode.",
+              "name": "autoscaling",
+              "rules": [
+                {
+                  "message": "minReplicas must not exceed maxReplicas",
+                  "rule": "!has(self.minReplicas) || self.minReplicas \u003c= self.maxReplicas"
+                }
+              ],
+              "type": "[AutoscalingSpec](#autoscalingspec)",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "WorkloadSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsConfigSpec",
+            "MetricsConfigSpec",
+            "TracesConfigSpec"
+          ],
+          "doc": "",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "applied",
+              "doc": "",
+              "name": "durability",
+              "rules": [],
+              "type": "[Durability](#durability)",
+              "validation": [
+                "Enum: [applied written durable]"
+              ]
+            },
+            {
+              "default": "10",
+              "doc": "",
+              "name": "flushIntervalSeconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            },
+            {
+              "default": "10000",
+              "doc": "",
+              "name": "bufferQueueCapacity",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "30000",
+              "doc": "",
+              "name": "bufferFlushIntervalMilliseconds",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "67108864",
+              "doc": "",
+              "name": "bufferSizeThresholdBytes",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "16",
+              "doc": "",
+              "name": "remoteConcurrency",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "2",
+              "doc": "",
+              "name": "remoteRetries",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "WriteSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "LogsStatus",
+            "MetricsStatus",
+            "TracesStatus"
+          ],
+          "doc": "WriterScalingStatus reports the operator-observed writer membership and the\nauthoritative Rust-managed ShardMap state. Nil shard fields mean the\nShardMap was absent or could not be trusted.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "",
+              "name": "effectiveWriterReplicas",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "readyWriterReplicas",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "shardCount",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "shardGeneration",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            },
+            {
+              "default": "",
+              "doc": "",
+              "name": "routingEpochs",
+              "rules": [],
+              "type": "integer",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "WriterScalingStatus",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        }
+      ]
+    }
+  ]
+}

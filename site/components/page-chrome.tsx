@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { Fragment } from "react";
 import { usePathname } from "next/navigation";
-import { PRODUCTS, REPO_URL, VECTOR, flatItems, navFor, spaceFromPath } from "@/lib/nav";
+import { PRODUCTS, REPO_URL, VECTOR, flatItems, spaceFromPath, trailTo, type NavGroup } from "@/lib/nav";
+import { useNav } from "./nav-context";
 
 function norm(p: string) {
   return p.endsWith("/") ? p : p + "/";
@@ -11,20 +12,15 @@ function norm(p: string) {
 
 type Crumb = { label: string; href?: string };
 
-function crumbsFor(pathname: string): Crumb[] {
+function crumbsFor(pathname: string, groups: NavGroup[]): Crumb[] {
   const space = spaceFromPath(pathname);
   const crumbs: Crumb[] = [{ label: "Docs", href: "/" }];
   if (space !== "overview") crumbs.push({ label: space === "vector" ? VECTOR.name : PRODUCTS[space].name, href: `/${space}/` });
-  for (const g of navFor(space)) {
-    const item = g.items.find((i) => norm(i.href) === pathname);
-    if (item) {
-      crumbs.push({ label: g.title }, { label: item.title });
-      break;
-    }
-    const parent = g.items.find((i) => i.children?.some((c) => norm(c.href) === pathname));
-    if (parent) {
-      const child = parent.children!.find((c) => norm(c.href) === pathname)!;
-      crumbs.push({ label: g.title }, { label: parent.title, href: parent.href }, { label: child.title });
+  for (const g of groups) {
+    const trail = trailTo(g.items, pathname);
+    if (trail) {
+      const item = trail.pop()!;
+      crumbs.push({ label: g.title }, ...trail.map((i) => ({ label: i.title, href: i.href })), { label: item.title });
       break;
     }
   }
@@ -32,7 +28,8 @@ function crumbsFor(pathname: string): Crumb[] {
 }
 
 export function Breadcrumbs() {
-  const crumbs = crumbsFor(norm(usePathname()));
+  const pathname = norm(usePathname());
+  const crumbs = crumbsFor(pathname, useNav(spaceFromPath(pathname)));
   if (crumbs.length <= 1) return null;
 
   return (
@@ -69,7 +66,7 @@ export function Breadcrumbs() {
 /** Previous/next walk the sidebar in reading order within the current space. */
 export function PrevNext() {
   const pathname = norm(usePathname());
-  const flat = flatItems(navFor(spaceFromPath(pathname)));
+  const flat = flatItems(useNav(spaceFromPath(pathname)));
   const idx = flat.findIndex((i) => norm(i.href) === pathname);
   if (idx < 0) return null;
   const prev = flat[idx - 1];

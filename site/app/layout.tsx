@@ -5,6 +5,7 @@ import "@fontsource/newsreader/400-italic.css";
 import "./globals.css";
 import { DocsShell } from "@/components/docs-shell";
 import { loadSpec } from "@/lib/openapi";
+import { loadOperatorApi } from "@/lib/operator-api";
 import { PRODUCT_IDS } from "@/lib/nav";
 import type { ApiNav } from "@/components/sidebar";
 
@@ -48,7 +49,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" suppressHydrationWarning>
       <body>
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
-          <DocsShell apiNav={buildApiNav()}>{children}</DocsShell>
+          <DocsShell apiNav={buildApiNav()} operatorKinds={loadOperatorApi().kinds.map((k) => k.kind)}>{children}</DocsShell>
         </ThemeProvider>
       </body>
     </html>

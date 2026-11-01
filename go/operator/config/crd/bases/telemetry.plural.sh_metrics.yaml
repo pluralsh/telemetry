@@ -27,7 +27,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Metrics is the Schema for the metrics API.
+        description: |-
+          Metrics runs a Prometheus-compatible metrics database on object storage: a
+          writer StatefulSet and, in Sharded mode, a reader group per storage shard.
         properties:
           apiVersion:
             description: |-

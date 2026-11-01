@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { AnimatePresence, motion } from "motion/react";
-import { navFor, spaceFromPath, PRODUCTS, VECTOR, type ApiProduct, type NavItem, type ProductId } from "@/lib/nav";
+import { spaceFromPath, trailTo, PRODUCTS, VECTOR, type ApiProduct, type NavItem, type ProductId } from "@/lib/nav";
+import { useNav } from "./nav-context";
 import { SpaceIcon } from "./icons";
 import { MethodBadge } from "./method-badge";
 
@@ -23,7 +24,7 @@ const ACTIVE = "bg-accent-tint font-medium text-accent-text";
 
 function NavSection({ item, pathname, onNavigate }: { item: NavItem; pathname: string; onNavigate?: () => void }) {
   const children = item.children ?? [];
-  const within = norm(item.href) === pathname || children.some((c) => norm(c.href) === pathname);
+  const within = trailTo([item], pathname) !== undefined;
   const [open, setOpen] = useState(within);
   useEffect(() => {
     if (within) setOpen(true);
@@ -60,9 +61,13 @@ function NavSection({ item, pathname, onNavigate }: { item: NavItem; pathname: s
             <ul className="ml-3 mt-px flex flex-col gap-px border-l border-line pl-[7.5px]">
               {children.map((child) => (
                 <li key={child.href}>
-                  <Link href={child.href} onClick={onNavigate} className={`${ITEM} ${norm(child.href) === pathname ? ACTIVE : IDLE}`}>
-                    {child.title}
-                  </Link>
+                  {child.children ? (
+                    <NavSection item={child} pathname={pathname} onNavigate={onNavigate} />
+                  ) : (
+                    <Link href={child.href} onClick={onNavigate} className={`${ITEM} ${norm(child.href) === pathname ? ACTIVE : IDLE}`}>
+                      {child.title}
+                    </Link>
+                  )}
                 </li>
               ))}
             </ul>
@@ -76,7 +81,7 @@ function NavSection({ item, pathname, onNavigate }: { item: NavItem; pathname: s
 export function Sidebar({ apiNav, onNavigate }: { apiNav: ApiNav; onNavigate?: () => void }) {
   const pathname = norm(usePathname());
   const space = spaceFromPath(pathname);
-  const groups = navFor(space);
+  const groups = useNav(space);
 
   return (
     <nav className="pb-12 pl-4 pr-3 pt-5 text-[14px] leading-[1.45]">

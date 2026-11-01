@@ -50,9 +50,10 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 .PHONY: crd-docs
-crd-docs: crd-ref-docs ## Generate Markdown API documentation from the CRD types.
-	@mkdir -p docs
+crd-docs: crd-ref-docs ## Generate the API reference from the CRD types: Markdown, and JSON for the docs site.
+	@mkdir -p docs ../../documentation/operator
 	$(CRD_REF_DOCS) --source-path=./api --renderer=markdown --output-path=./docs/api.md --config=./crd-ref-docs.yaml
+	$(CRD_REF_DOCS) --source-path=./api --renderer=markdown --templates-dir=./hack/crd-docs-json --output-path=../../documentation/operator/api.json --config=./crd-ref-docs.yaml
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.

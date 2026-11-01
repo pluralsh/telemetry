@@ -43,3 +43,15 @@ cargo run -p api-docs -- --check
 
 OpenAPI covers HTTP APIs. Internal writer, OTLP, and Jaeger gRPC services remain
 described in the product API pages and their protobuf definitions.
+
+## Generated operator reference
+
+[`operator/api.json`](operator/api.json) describes the operator's custom
+resources for the docs site's operator reference. It is generated from the Go
+API types by crd-ref-docs, along with the Markdown
+[operator API reference](../go/operator/docs/api.md). Regenerate both after
+changing a type in `go/operator/api`:
+
+```sh
+make -C go/operator crd-docs
+```

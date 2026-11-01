@@ -156,6 +156,9 @@ type PseudoFSStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.grpcEndpoint`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// PseudoFS runs a persistent virtual filesystem for sandboxed and embedded
+// runtimes, served over gRPC and stored in object storage.
 type PseudoFS struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

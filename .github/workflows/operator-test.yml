@@ -36,7 +36,7 @@ jobs:
         run: cp config/crd/bases/*.yaml ../../chart/telemetry-operator/crds/
       - name: Verify generated files are current
         working-directory: .
-        run: git diff --exit-code -- go/operator chart/telemetry-operator/crds
+        run: git diff --exit-code -- go/operator chart/telemetry-operator/crds documentation/operator
       - uses: azure/setup-helm@v4
       - name: Lint operator chart
         working-directory: .

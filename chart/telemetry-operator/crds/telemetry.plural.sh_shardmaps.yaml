@@ -29,7 +29,10 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ShardMap is the Schema for authoritative telemetry shard routing.
+        description: |-
+          ShardMap is the shard routing and writer ownership of a Metrics, Logs or
+          Traces database. The operator and the database's writers maintain it, so
+          it is not meant to be edited.
         properties:
           apiVersion:
             description: |-

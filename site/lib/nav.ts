@@ -74,7 +74,28 @@ export type NavGroup = { title: string; items: NavItem[] };
 
 /** Every item of `groups` in reading order, children after their parent. */
 export function flatItems(groups: NavGroup[]): NavItem[] {
-  return groups.flatMap((g) => g.items.flatMap((i) => [i, ...(i.children ?? [])]));
+  const flat = (items: NavItem[]): NavItem[] => items.flatMap((i) => [i, ...flat(i.children ?? [])]);
+  return groups.flatMap((g) => flat(g.items));
+}
+
+/** The path from a top-level item of `items` down to the item at `href`, if any. */
+export function trailTo(items: NavItem[], href: string): NavItem[] | undefined {
+  for (const item of items) {
+    if (item.href === href) return [item];
+    const rest = trailTo(item.children ?? [], href);
+    if (rest) return [item, ...rest];
+  }
+  return undefined;
+}
+
+export const OPERATOR_REFERENCE = "/installation/operator/";
+
+export function kindSlug(kind: string): string {
+  return kind.toLowerCase();
+}
+
+export function operatorKindHref(kind: string): string {
+  return `${OPERATOR_REFERENCE}${kindSlug(kind)}/`;
 }
 
 /** The deployment modes every database's installation guide covers. */
@@ -91,15 +112,32 @@ export function installationItems(space: ApiProduct): NavItem {
   };
 }
 
-export const OVERVIEW_NAV: NavGroup[] = [
-  {
-    title: "Get started",
-    items: [
-      { title: "Introduction", href: "/" },
-      { title: "Manifesto", href: "/manifesto/" },
-      { title: "Installation", href: "/installation/" },
-    ],
-  },
+/** `operatorKinds` are the operator's resource kinds, from the generated API reference. */
+export function overviewNav(operatorKinds: string[]): NavGroup[] {
+  return [
+    {
+      title: "Get started",
+      items: [
+        { title: "Introduction", href: "/" },
+        { title: "Manifesto", href: "/manifesto/" },
+        {
+          title: "Installation",
+          href: "/installation/",
+          children: [
+            {
+              title: "Operator reference",
+              href: OPERATOR_REFERENCE,
+              children: operatorKinds.map((kind) => ({ title: kind, href: operatorKindHref(kind) })),
+            },
+          ],
+        },
+      ],
+    },
+    ...CONCEPTS_NAV,
+  ];
+}
+
+const CONCEPTS_NAV: NavGroup[] = [
   {
     title: "Concepts",
     items: [
@@ -162,8 +200,8 @@ export function spaceFromPath(pathname: string): SpaceId {
   return seg && isProductId(seg) ? seg : "overview";
 }
 
-export function navFor(space: SpaceId): NavGroup[] {
-  if (space === "overview") return OVERVIEW_NAV;
+export function navFor(space: SpaceId, operatorKinds: string[]): NavGroup[] {
+  if (space === "overview") return overviewNav(operatorKinds);
   if (space === "vector") return VECTOR_NAV;
   return productNav(space);
 }

@@ -593,7 +593,8 @@ _Appears in:_
 
 
 
-
+Logs runs a Loki-compatible log database on object storage: a writer
+StatefulSet and, in Sharded mode, a reader group per storage shard.
 
 
 
@@ -724,7 +725,8 @@ _Appears in:_
 
 
 
-Metrics is the Schema for the metrics API.
+Metrics runs a Prometheus-compatible metrics database on object storage: a
+writer StatefulSet and, in Sharded mode, a reader group per storage shard.
 
 
 
@@ -833,7 +835,8 @@ _Appears in:_
 
 
 
-NamespaceAuthentication is the Schema for the namespaceauthentications API.
+NamespaceAuthentication declares a datastore namespace and a credential
+that may read or write it.
 
 
 
@@ -1005,7 +1008,8 @@ _Appears in:_
 
 
 
-
+PseudoFS runs a persistent virtual filesystem for sandboxed and embedded
+runtimes, served over gRPC and stored in object storage.
 
 
 
@@ -1237,7 +1241,9 @@ _Appears in:_
 
 
 
-ShardMap is the Schema for authoritative telemetry shard routing.
+ShardMap is the shard routing and writer ownership of a Metrics, Logs or
+Traces database. The operator and the database's writers maintain it, so
+it is not meant to be edited.
 
 
 
@@ -1355,7 +1361,8 @@ _Appears in:_
 
 
 
-
+Traces runs a Tempo-compatible trace database on object storage: a writer
+StatefulSet and, in Sharded mode, a reader group per storage shard.
 
 
 
@@ -1467,7 +1474,8 @@ _Appears in:_
 
 
 
-
+Vector runs a vector and full-text search database on object storage, with
+its namespaces spread over shards that split as they grow.
 
 
 
@@ -1626,7 +1634,8 @@ _Appears in:_
 
 
 
-VectorTopology is the Schema for a Vector cluster's shard topology.
+VectorTopology is the shard layout of a Vector database. The operator and
+the database's writers maintain it, so it is not meant to be edited.
 
 
 

@@ -135,7 +135,8 @@ type MetricsStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// Metrics is the Schema for the metrics API.
+// Metrics runs a Prometheus-compatible metrics database on object storage: a
+// writer StatefulSet and, in Sharded mode, a reader group per storage shard.
 type Metrics struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

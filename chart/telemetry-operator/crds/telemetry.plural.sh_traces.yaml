@@ -27,6 +27,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: |-
+          Traces runs a Tempo-compatible trace database on object storage: a writer
+          StatefulSet and, in Sharded mode, a reader group per storage shard.
         properties:
           apiVersion:
             description: |-
