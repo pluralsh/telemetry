@@ -1,8 +1,8 @@
 apiVersion: v2
 name: metrics
 description: Production-oriented Helm chart for Metrics
-appVersion: 0.3.20
-version: 0.1.49
+appVersion: 0.3.21
+version: 0.1.50
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
