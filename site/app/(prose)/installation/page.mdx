@@ -19,6 +19,8 @@ The **telemetry-operator** watches these custom resources in the `telemetry.plur
 | `Traces` | A Tempo-compatible trace database |
 | `NamespaceAuthentication` | A read or write credential for one tenant namespace of one database |
 
+Every field of these and the operator's other resources is listed in the [operator reference](/installation/operator/).
+
 For each database the operator renders configuration, then creates a ServiceAccount, a writer StatefulSet, one reader StatefulSet per storage shard, Services, PodDisruptionBudgets, optional reader HorizontalPodAutoscalers, an optional Ingress, and PVCs for cache volumes. It also handles rolling restarts on config changes and PVC resizing.
 
 Every database runs in one of two modes:

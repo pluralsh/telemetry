@@ -150,7 +150,7 @@
             "description": "Document id: a string or non-negative integer. Passage `i` is\nstored as row `\"{id}#{i}\"`."
           },
           "passages": {
-            "description": "Passages in order, each `{\"vector\": [..], attribute: value, ..}`.\nPassage attributes override document attributes.",
+            "description": "Passages in order, each `{\"vector\": [..], attribute: value, ..}`.\nPassage attributes override document attributes. Without passages,\nin a namespace with an `embed` attribute, the server splits that\nattribute's text into passages sized for the embedding model.",
             "items": {
               "type": "object"
             },
@@ -158,9 +158,7 @@
           }
         },
         "required": [
-          "id",
-          "attributes",
-          "passages"
+          "id"
         ],
         "type": "object"
       },

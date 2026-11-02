@@ -18,7 +18,7 @@ The server talks to providers through [Rig](https://crates.io/crates/rig-core), 
 | `openai` | OpenAI, or any OpenAI-compatible `endpoint`: Azure OpenAI, vLLM, Ollama, LiteLLM | `text-embedding-3-small` |
 | `cohere` | Cohere `v1/embed` | `embed-v4.0` |
 | `gemini` | Google Gemini | `gemini-embedding-001` |
-| `bedrock` | Amazon Bedrock, Titan Text Embeddings v2 | `amazon.titan-embed-text-v2:0` |
+| `bedrock` | Amazon Bedrock: Titan Text Embeddings v2, Cohere Embed v3 and v4 | `amazon.titan-embed-text-v2:0`, `cohere.embed-v4:0` |
 
 ```yaml
 # cluster.yaml
@@ -32,11 +32,15 @@ embedding:
   timeout: 30          # seconds
   cache:
     capacity: 67108864 # bytes; 0 disables
+  max_input_chars: 24573 # optional: longest text sent to the model
+  split:               # passages of documents written without any
+    max_chars: 8000    # optional
+    overlap_chars: 0
 ```
 
-`api_key` is read on every request, so a rotated key file applies without a restart. Endpoints that need no key, such as a local Ollama, can leave it out. Without `dimensions`, the server learns the model's vector length by embedding one probe text the first time it needs it. `dimensions` shortens vectors for models that support it: OpenAI's `text-embedding-3-*`, Gemini, and Titan v2 (256, 512 or 1024). Cohere models embed at a fixed size, so `dimensions` is rejected for `cohere`.
+`api_key` is read on every request, so a rotated key file applies without a restart. Endpoints that need no key, such as a local Ollama, can leave it out. Without `dimensions`, the server learns the model's vector length by embedding one probe text the first time it needs it. `dimensions` shortens vectors for models that support it: OpenAI's `text-embedding-3-*`, Gemini, Titan v2 (256, 512 or 1024), and Cohere Embed v4 on Bedrock (256, 512, 1024 or 1536). Cohere's own API embeds at a fixed size, so `dimensions` is rejected for `cohere`.
 
-Cohere embeds documents and queries differently: rows are embedded as `search_document` and query texts as `search_query`. The other providers embed both the same way.
+Cohere models, on Cohere's API or Bedrock, embed documents and queries differently: rows are embedded as `search_document` and query texts as `search_query`. The other models embed both the same way.
 
 ### Amazon Bedrock
 
@@ -50,7 +54,15 @@ embedding:
   dimensions: 512      # optional: 256, 512 or 1024 (the default)
 ```
 
-Bedrock embeds one text per request, so a batch is sent as consecutive requests. Only Titan Text Embeddings v2 is supported; for Cohere models, use the `cohere` provider.
+```yaml
+embedding:
+  provider: bedrock
+  model: cohere.embed-v4:0  # or cohere.embed-english-v3, cohere.embed-multilingual-v3
+  region: us-east-2
+  dimensions: 1024          # optional, v4 only: 256, 512, 1024 or 1536 (the default)
+```
+
+The supported models are Titan Text Embeddings v2 and Cohere Embed v3 (English or multilingual) and v4; `model` can also be an inference profile id or ARN for one of them, such as `us.cohere.embed-v4:0`. Titan embeds one text per request, so a batch is sent as consecutive requests. Cohere models take up to 96 texts per request, so `batch_size` can't exceed 96 for them. Cohere Embed v3 embeds at a fixed 1024 dimensions, and Bedrock rejects v3 texts over 2,048 characters, which the server's [input limit](#input-limits-and-splitting) keeps them under.
 
 ### On Kubernetes
 
@@ -68,6 +80,7 @@ spec:
       model: embed-v4.0
       apiKeySecretRef: { name: cohere, key: api-key }
       cacheSize: 128Mi    # per replica; 0 disables
+      split: { maxChars: 4000, overlapChars: 200 }   # optional; also maxInputChars
 ```
 
 For Bedrock, leave out `apiKeySecretRef` and give the pods AWS credentials instead, for example an IAM role allowed `bedrock:InvokeModel`, through the ServiceAccount:
@@ -80,7 +93,7 @@ spec:
   config:
     embedding:
       provider: bedrock
-      model: amazon.titan-embed-text-v2:0
+      model: cohere.embed-v4:0
       region: us-east-1
 ```
 
@@ -104,13 +117,45 @@ curl -X POST localhost:8080/api/v1/namespaces/articles/write \
 
 Rows are embedded only when they are written without a `vector`:
 
-- **Upserts and documents.** A row or passage without a vector gets the embedding of its `embed` attribute. A row with neither is rejected with `400`. A passage can inherit the attribute from its document's `attributes`.
+- **Upserts and documents.** A row or passage without a vector gets the embedding of its `embed` attribute. A row with neither is rejected with `400`. A passage can inherit the attribute from its document's `attributes`, and a document without passages is [split](#input-limits-and-splitting) into them.
 - **Patches.** A patch that sets the `embed` attribute re-embeds the row, unless it sets `vector` too. Removing the attribute with `null` keeps the old vector.
 - **Explicit vectors.** A `vector` in the request is always used as given, for example to import vectors computed elsewhere with the same model.
 
 The texts of one request are embedded together, in batches of `batch_size`. With the cache enabled, that happens before the namespace's write lock is taken, so a slow provider doesn't hold up other writes to the namespace. A provider failure fails the write with `502`. Upserted rows and documents are embedded before any operation applies; patches are re-embedded as they apply, after the operations before them.
 
 An embedded attribute is stored like any other, so it can also be returned, filtered, and declared `full_text_search` for [hybrid search](/vector/queries/#multi-query-and-hybrid-search).
+
+## Input limits and splitting
+
+The server sizes text for the model, so clients don't need to know its context window.
+
+**Every text is cut to the model's input limit** before it's embedded: rows, passages, patches, and query texts alike. The attribute is still stored whole; only the text sent to the model is cut. The limit is `max_input_chars`, or without it the model's own:
+
+| Model | Default limit, in characters |
+| --- | --- |
+| OpenAI and OpenAI-compatible endpoints | 24,573 (8,191 tokens) |
+| Cohere v3 models, on Cohere's API | 1,536 (512 tokens) |
+| Cohere v3 models, on Bedrock | 2,048, Bedrock's cap |
+| Cohere Embed v4, on either API | 384,000 (128k tokens) |
+| Gemini | 6,144 (2,048 tokens) |
+| Titan Text Embeddings v2 | 24,576 (8,192 tokens) |
+
+Limits given in tokens are converted at 3 characters per token, which leaves room for code and JSON, as they tokenize more densely than prose. Models served by OpenAI-compatible endpoints such as vLLM or Ollama are assumed to take as much as OpenAI's; set `max_input_chars` for ones that take less.
+
+**Documents written without `passages` are split by the server.** The document's `embed` attribute is split into passages of at most `split.max_chars` characters (8,000 by default, or the input limit if that's smaller), and each passage row holds its part of the text in that attribute alongside the document's other attributes. Splits fall at the coarsest boundary that fits: paragraphs, then lines, sentences, words, and as a last resort mid-word. With `split.overlap_chars`, each passage starts with up to that much of the previous one's end, so text near a boundary can be found from either side.
+
+```bash
+curl -X POST localhost:8080/api/v1/namespaces/articles/write \
+  -H 'content-type: application/json' \
+  -d '{
+    "upsert_documents": [{
+      "id": "kb-42",
+      "attributes": { "title": "Rotating credentials", "body": "A long article…" }
+    }]
+  }'
+```
+
+The document is stored as rows `kb-42#0`, `kb-42#1`, …, which queries collapse back to documents with [`limit.per`](/vector/queries/#documents-and-passages). Sending `passages` instead keeps the split up to the client, as before. Upserting the document again re-splits it and drops passages beyond the new count. Changing the split settings applies to documents written afterwards.
 
 ## Querying by text
 

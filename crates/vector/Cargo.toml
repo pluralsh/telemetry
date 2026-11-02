@@ -33,6 +33,7 @@ avx512 = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+aws-sdk-bedrockruntime = { version = "1.124", default-features = false, features = ["rt-tokio", "default-https-client"] }
 bitpacking = { version = "0.9", default-features = false, features = ["bitpacker8x"] }
 blake3.workspace = true
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }

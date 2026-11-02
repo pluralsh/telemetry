@@ -1525,15 +1525,35 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `provider` _string_ | Provider is the API: openai (or an OpenAI-compatible endpoint, such<br />as Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon<br />Bedrock's Titan Text Embeddings v2). |  | Enum: [openai cohere gemini bedrock] <br /> |
-| `model` _string_ | Model is the provider's model name, e.g. text-embedding-3-small or<br />amazon.titan-embed-text-v2:0. |  | MinLength: 1 <br /> |
+| `provider` _string_ | Provider is the API: openai (or an OpenAI-compatible endpoint, such<br />as Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon<br />Bedrock's Titan Text Embeddings v2, Cohere Embed v3 or Cohere Embed<br />v4). |  | Enum: [openai cohere gemini bedrock] <br /> |
+| `model` _string_ | Model is the provider's model name, e.g. text-embedding-3-small,<br />amazon.titan-embed-text-v2:0 or cohere.embed-v4:0. |  | MinLength: 1 <br /> |
 | `apiKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ | APIKeySecretRef holds the provider API key. Rotating the Secret<br />applies without restarting pods. Bedrock instead uses the pods' AWS<br />credentials: an IAM role through the service account, or a Bedrock<br />API key in AWS_BEARER_TOKEN_BEDROCK. |  |  |
 | `endpoint` _string_ | Endpoint replaces the provider's API root, e.g.<br />http://ollama.ai.svc:11434/v1. |  |  |
 | `region` _string_ | Region is the AWS region of the Bedrock runtime. Without it, the<br />region of the pods' AWS config (AWS_REGION). |  | MinLength: 1 <br /> |
-| `dimensions` _integer_ | Dimensions asks models that can shorten their vectors for this many<br />dimensions: OpenAI's text-embedding-3 models, Gemini, and Titan v2<br />(256, 512 or 1024). |  | Maximum: 65535 <br />Minimum: 1 <br /> |
+| `dimensions` _integer_ | Dimensions asks models that can shorten their vectors for this many<br />dimensions: OpenAI's text-embedding-3 models, Gemini, Titan v2 (256,<br />512 or 1024) and Cohere Embed v4 on Bedrock (256, 512, 1024 or 1536). |  | Maximum: 65535 <br />Minimum: 1 <br /> |
 | `batchSize` _integer_ | BatchSize is the most texts sent in one provider request. The server<br />default is 96. |  | Minimum: 1 <br /> |
 | `timeoutSeconds` _integer_ | TimeoutSeconds bounds each provider request. The server default is<br />30. |  | Minimum: 1 <br /> |
 | `cacheSize` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#quantity-resource-api)_ | CacheSize is the memory each replica spends caching embeddings, so<br />repeated texts and queries skip the provider. 0 disables the cache.<br />Without it, 4% of what each component's memory limit leaves after<br />headroom and reservations, and at least 16Mi. |  |  |
+| `maxInputChars` _integer_ | MaxInputChars is the most characters of one text sent to the model;<br />longer texts are cut. Without it, the model's input limit, with<br />limits in tokens taken at 3 characters per token. Set it for models<br />of OpenAI-compatible endpoints, which are assumed to take 8191<br />tokens. |  | Minimum: 1 <br /> |
+| `split` _[VectorEmbeddingSplitSpec](#vectorembeddingsplitspec)_ | Split sizes the passages of documents written without any, which the<br />servers split from the namespace's embed attribute. |  |  |
+
+
+#### VectorEmbeddingSplitSpec
+
+
+
+VectorEmbeddingSplitSpec sizes the passages a document's text is split
+into, at paragraph, line, sentence and word boundaries.
+
+
+
+_Appears in:_
+- [VectorEmbeddingSpec](#vectorembeddingspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxChars` _integer_ | MaxChars is the most characters of one passage. Without it, 8000, or<br />the model's input limit if smaller. |  | Minimum: 1 <br /> |
+| `overlapChars` _integer_ | OverlapChars is how much of a passage's end is repeated at the start<br />of the next, so text near a boundary is found from either side. |  | Minimum: 0 <br /> |
 
 
 #### VectorIndexSpec

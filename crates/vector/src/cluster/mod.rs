@@ -44,6 +44,7 @@ mod directory;
 mod leases;
 mod namespace;
 mod shard;
+mod split;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

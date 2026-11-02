@@ -4,12 +4,15 @@
 //! `d` is row `"{d}#{i}"` carrying the document's attributes, the
 //! passage's own attributes, `$doc_id = d`, and `$passage = i`. Upserting a
 //! document replaces all of its passages; queries collapse passages back
-//! to documents with `limit.per`.
+//! to documents with `limit.per`. A document written without passages in a
+//! namespace that embeds has its embed attribute split into passages sized
+//! for the namespace's model, each passage row holding its part of the text.
 //!
 //! The operations of one request apply in the order `delete_by_filter`,
 //! `delete_documents`, `upsert_documents`, `upsert_rows`, `patch_rows`,
 //! `deletes`. Each is atomic on its own; a request as a whole is not.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -69,8 +72,51 @@ pub struct DocumentInput {
     /// Attributes copied to every passage row.
     #[serde(default)]
     pub attributes: Map<String, Value>,
-    /// Passages: `{"vector": [..], attr: value}`.
+    /// Passages: `{"vector": [..], attr: value}`. Without any, the server
+    /// splits the embed attribute in `attributes` into passages.
+    #[serde(default)]
     pub passages: Vec<Map<String, Value>>,
+}
+
+type Attributes = Map<String, Value>;
+
+/// `document`'s attributes and passages: its own, or, without passages,
+/// its embed attribute split into passages for the namespace's model.
+fn passages<'a>(
+    document: &'a DocumentInput,
+    meta: &NamespaceMeta,
+    embedder: Option<&Embedder>,
+) -> Result<(Cow<'a, Attributes>, Cow<'a, [Attributes]>)> {
+    if !document.passages.is_empty() {
+        return Ok((
+            Cow::Borrowed(&document.attributes),
+            Cow::Borrowed(&document.passages),
+        ));
+    }
+    let id = parse_id(&document.id)?;
+    let Some(attribute) = meta.embed_attribute() else {
+        return Err(Error::InvalidInput(format!(
+            "document '{id}' has no passages; use delete_documents to remove it"
+        )));
+    };
+    let Some(text) = document.attributes.get(attribute).and_then(Value::as_str) else {
+        return Err(Error::InvalidInput(format!(
+            "document '{id}' needs passages, or a string '{attribute}' to split into passages"
+        )));
+    };
+    let passages: Vec<Attributes> = embedding::for_namespace(meta, embedder)?
+        .split(text)
+        .into_iter()
+        .map(|part| Attributes::from_iter([(attribute.to_string(), Value::String(part))]))
+        .collect();
+    if passages.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "document '{id}' has no text in '{attribute}' to split into passages"
+        )));
+    }
+    let mut attributes = document.attributes.clone();
+    attributes.remove(attribute);
+    Ok((Cow::Owned(attributes), Cow::Owned(passages)))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -124,7 +170,7 @@ pub(crate) async fn write(
         .collect::<Result<Vec<_>>>()?;
     let mut documents = Vec::new();
     for document in request.upsert_documents.iter().flatten() {
-        documents.push(parse_document(document, &meta, &mut inferred)?);
+        documents.push(parse_document(document, &meta, embedder, &mut inferred)?);
     }
     let mut upserts = request
         .upsert_rows
@@ -265,11 +311,18 @@ pub(crate) async fn prefetch_embeddings(
     let Some(embedder) = embedder.filter(|e| e.caches()) else {
         return Ok(());
     };
-    let documents = request.upsert_documents.iter().flatten().flat_map(|d| {
-        d.passages
+    // Documents that fail to split are left for the write to reject.
+    let documents: Vec<_> = request
+        .upsert_documents
+        .iter()
+        .flatten()
+        .filter_map(|d| passages(d, meta, Some(embedder)).ok())
+        .collect();
+    let passage_texts = documents.iter().flat_map(|(attributes, passages)| {
+        passages
             .iter()
             .filter(|p| !p.contains_key(VECTOR_FIELD_NAME))
-            .filter_map(|p| p.get(attribute).or_else(|| d.attributes.get(attribute)))
+            .filter_map(|p| p.get(attribute).or_else(|| attributes.get(attribute)))
     });
     let rows = request
         .upsert_rows
@@ -278,7 +331,10 @@ pub(crate) async fn prefetch_embeddings(
         .chain(request.patch_rows.iter().flatten())
         .filter(|row| !row.contains_key(VECTOR_FIELD_NAME))
         .filter_map(|row| row.get(attribute));
-    let texts: Vec<&str> = documents.chain(rows).filter_map(Value::as_str).collect();
+    let texts: Vec<&str> = passage_texts
+        .chain(rows)
+        .filter_map(Value::as_str)
+        .collect();
     if texts.is_empty() {
         return Ok(());
     }
@@ -302,14 +358,10 @@ fn to_vector(row: ParsedRow) -> Vector {
 fn parse_document(
     document: &DocumentInput,
     meta: &NamespaceMeta,
+    embedder: Option<&Embedder>,
     inferred: &mut BTreeMap<String, AttributeSchema>,
 ) -> Result<(String, Vec<ParsedRow>)> {
     let id = parse_id(&document.id)?;
-    if document.passages.is_empty() {
-        return Err(Error::InvalidInput(format!(
-            "document '{id}' has no passages; use delete_documents to remove it"
-        )));
-    }
     for reserved in [
         ID_KEY,
         VECTOR_FIELD_NAME,
@@ -322,8 +374,9 @@ fn parse_document(
             )));
         }
     }
-    let mut rows = Vec::with_capacity(document.passages.len());
-    for (i, passage) in document.passages.iter().enumerate() {
+    let (attributes, passages) = passages(document, meta, embedder)?;
+    let mut rows = Vec::with_capacity(passages.len());
+    for (i, passage) in passages.iter().enumerate() {
         for reserved in [ID_KEY, DOC_ID_ATTRIBUTE, PASSAGE_ATTRIBUTE] {
             if passage.contains_key(reserved) {
                 return Err(Error::InvalidInput(format!(
@@ -331,7 +384,7 @@ fn parse_document(
                 )));
             }
         }
-        let mut row = document.attributes.clone();
+        let mut row = attributes.as_ref().clone();
         row.extend(passage.iter().map(|(k, v)| (k.clone(), v.clone())));
         row.insert(ID_KEY.into(), Value::String(format!("{id}#{i}")));
         row.insert(DOC_ID_ATTRIBUTE.into(), Value::String(id.clone()));

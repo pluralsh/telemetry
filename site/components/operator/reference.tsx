@@ -134,9 +134,7 @@ export function TypeSection({
   const doc = type.kind ? type.doc.split(/\n\s*\n/).slice(1).join("\n\n") : type.doc;
   return (
     <section className="[contain-intrinsic-size:auto_480px] [content-visibility:auto]">
-      <h2 id={typeAnchor(type.name)} className="scroll-mt-[84px]">
-        {type.name}
-      </h2>
+      <h2 id={typeAnchor(type.name)}>{type.name}</h2>
       <div className="not-prose flex flex-col gap-2">
         <AppearsIn names={type.appearsIn} onPage={onPage} />
         {doc && <GoDoc text={doc} />}

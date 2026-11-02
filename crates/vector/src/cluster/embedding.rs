@@ -9,8 +9,14 @@
 //!
 //! Providers are reached through [Rig](rig_core): OpenAI (and any
 //! OpenAI-compatible endpoint, e.g. Azure, vLLM or Ollama), Cohere, Gemini,
-//! and Amazon Bedrock's Titan text models through [`rig_bedrock`]. Cohere
-//! embeds documents and queries as such (its `input_type`).
+//! and Amazon Bedrock's Titan text models through [`rig_bedrock`]. Bedrock's
+//! Cohere models take Cohere's request body, which rig-bedrock doesn't send,
+//! so they're invoked directly with its runtime client. Cohere, on either
+//! API, embeds documents and queries as such (its `input_type`).
+//!
+//! Every text is cut to the model's input limit before it's embedded, and
+//! documents written without passages are split into passages that fit it
+//! (see [`super::split`]), so clients needn't know the model's context.
 //!
 //! Embeddings are cached in memory with foyer, keyed by model, input kind
 //! and text: a re-upserted row or a repeated query reuses its vector.
@@ -21,6 +27,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use aws_sdk_bedrockruntime::error::DisplayErrorContext;
+use aws_sdk_bedrockruntime::primitives::Blob;
 use foyer::{Cache, CacheBuilder};
 use rig_bedrock::client::BedrockRuntime;
 use rig_core::DynModel;
@@ -70,6 +78,52 @@ pub struct EmbeddingConfig {
     pub timeout: Duration,
     #[serde(default)]
     pub cache: EmbeddingCacheConfig,
+    /// Most characters of one text sent to the model; longer texts are cut.
+    /// Without it, the model's input limit (see [`default_max_input_chars`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_chars: Option<usize>,
+    #[serde(default)]
+    pub split: SplitConfig,
+}
+
+/// How the server splits the text of documents written without passages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SplitConfig {
+    /// Most characters of one passage. Without it, [`DEFAULT_PASSAGE_CHARS`]
+    /// or the model's input limit, whichever is smaller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    /// Characters of a passage's end repeated at the start of the next, so
+    /// text near a boundary is found from either side.
+    pub overlap_chars: usize,
+}
+
+/// Passage size when `split.max_chars` isn't set: long enough to keep a
+/// topic together, short enough to rank on one.
+pub const DEFAULT_PASSAGE_CHARS: usize = 8_000;
+
+/// Characters per token assumed for limits given in tokens: low, since
+/// code and JSON tokenize more densely than prose.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// The longest text `config`'s model takes, in characters. Limits given in
+/// tokens are converted at [`CHARS_PER_TOKEN`]; models of OpenAI-compatible
+/// endpoints are assumed to take as much as OpenAI's.
+fn default_max_input_chars(config: &EmbeddingConfig) -> usize {
+    let tokens = |n: usize| n * CHARS_PER_TOKEN;
+    match config.provider {
+        EmbeddingProvider::OpenAi => tokens(8_191),
+        EmbeddingProvider::Cohere if config.model.contains("v4") => tokens(128_000),
+        EmbeddingProvider::Cohere => tokens(512),
+        EmbeddingProvider::Gemini => tokens(2_048),
+        EmbeddingProvider::Bedrock => match BedrockFamily::of(&config.model) {
+            Some(BedrockFamily::TitanV2) | None => tokens(8_192),
+            // Bedrock rejects longer texts, whatever `truncate` says.
+            Some(BedrockFamily::CohereV3) => 2_048,
+            Some(BedrockFamily::CohereV4) => tokens(128_000),
+        },
+    }
 }
 
 fn default_batch_size() -> usize {
@@ -89,7 +143,7 @@ pub enum EmbeddingProvider {
     OpenAi,
     Cohere,
     Gemini,
-    /// Amazon Bedrock's Titan Text Embeddings v2.
+    /// Amazon Bedrock: Titan Text Embeddings v2, or Cohere Embed v3 and v4.
     Bedrock,
 }
 
@@ -104,10 +158,120 @@ impl EmbeddingProvider {
     }
 }
 
-/// The Bedrock model family rig-bedrock's request body fits.
-const BEDROCK_TITAN_V2: &str = "amazon.titan-embed-text-v2";
+/// The Bedrock embedding models the server can call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BedrockFamily {
+    /// Titan Text Embeddings v2, the request body rig-bedrock sends.
+    TitanV2,
+    /// Cohere Embed v3, English or multilingual, at a fixed 1024 dimensions.
+    CohereV3,
+    /// Cohere Embed v4, 1536 dimensions unless asked for fewer.
+    CohereV4,
+}
+
+/// Bedrock model ids the server can embed with, by family. A model is
+/// matched by substring, so inference profile ids and ARNs work too.
+const BEDROCK_MODELS: [(&str, BedrockFamily); 4] = [
+    ("amazon.titan-embed-text-v2", BedrockFamily::TitanV2),
+    ("cohere.embed-english-v3", BedrockFamily::CohereV3),
+    ("cohere.embed-multilingual-v3", BedrockFamily::CohereV3),
+    ("cohere.embed-v4", BedrockFamily::CohereV4),
+];
+
 /// Titan v2's output sizes; it embeds at the largest unless asked.
 const TITAN_V2_DIMENSIONS: [u16; 3] = [256, 512, 1024];
+const COHERE_V4_DIMENSIONS: [u16; 4] = [256, 512, 1024, 1536];
+/// The most texts one Bedrock Cohere request may carry.
+const BEDROCK_COHERE_MAX_TEXTS: usize = 96;
+
+impl BedrockFamily {
+    fn of(model: &str) -> Option<Self> {
+        BEDROCK_MODELS
+            .iter()
+            .find(|(id, _)| model.contains(id))
+            .map(|(_, family)| *family)
+    }
+
+    /// The output sizes the model can be asked for; empty for a fixed size.
+    fn dimensions(self) -> &'static [u16] {
+        match self {
+            BedrockFamily::TitanV2 => &TITAN_V2_DIMENSIONS,
+            BedrockFamily::CohereV3 => &[],
+            BedrockFamily::CohereV4 => &COHERE_V4_DIMENSIONS,
+        }
+    }
+
+    fn is_cohere(self) -> bool {
+        self != BedrockFamily::TitanV2
+    }
+}
+
+/// Cohere's `input_type` for `kind`.
+fn cohere_input_type(kind: InputKind) -> &'static str {
+    match kind {
+        InputKind::Document => "search_document",
+        InputKind::Query => "search_query",
+    }
+}
+
+/// The `InvokeModel` body of Bedrock's Cohere embedding models.
+#[derive(Serialize)]
+struct BedrockCohereRequest<'a> {
+    texts: &'a [String],
+    input_type: &'static str,
+    embedding_types: [&'static str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<u16>,
+    /// v3 rejects texts longer than its context unless told to truncate;
+    /// v4's context is 128k tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncate: Option<&'static str>,
+}
+
+impl<'a> BedrockCohereRequest<'a> {
+    fn new(
+        family: BedrockFamily,
+        texts: &'a [String],
+        kind: InputKind,
+        dimensions: Option<u16>,
+    ) -> Self {
+        Self {
+            texts,
+            input_type: cohere_input_type(kind),
+            embedding_types: ["float"],
+            output_dimension: dimensions.filter(|_| family == BedrockFamily::CohereV4),
+            truncate: (family == BedrockFamily::CohereV3).then_some("END"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BedrockCohereResponse {
+    embeddings: BedrockCohereEmbeddings,
+}
+
+/// Keyed by type when the request names `embedding_types`, as ours does;
+/// a bare list otherwise.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BedrockCohereEmbeddings {
+    ByType { float: Vec<Vec<f32>> },
+    Float(Vec<Vec<f32>>),
+}
+
+/// The vectors of a Bedrock Cohere reply to `count` texts, in order.
+fn bedrock_cohere_vectors(body: &[u8], count: usize) -> std::result::Result<Vec<Vec<f32>>, String> {
+    let response: BedrockCohereResponse =
+        serde_json::from_slice(body).map_err(|e| format!("unexpected reply: {e}"))?;
+    let vectors = match response.embeddings {
+        BedrockCohereEmbeddings::ByType { float } => float,
+        BedrockCohereEmbeddings::Float(float) => float,
+    };
+    if vectors.len() != count {
+        return Err(format!("{} vectors for {count} texts", vectors.len()));
+    }
+    Ok(vectors)
+}
 
 /// Where the API key comes from. File keys are re-read on each request, so
 /// a rotated Secret takes effect without a restart.
@@ -189,7 +353,7 @@ struct ProviderModel {
     endpoint: Option<String>,
     dimensions: Option<u16>,
     timeout: Duration,
-    bedrock: Option<BedrockRuntime>,
+    bedrock: Option<(BedrockRuntime, BedrockFamily)>,
 }
 
 /// The id pinned in namespaces: provider, model and requested dimensions.
@@ -205,7 +369,11 @@ fn model_id(config: &EmbeddingConfig) -> String {
 /// v2's default, which its request body always names.
 fn requested_dimensions(config: &EmbeddingConfig) -> Option<u16> {
     match config.provider {
-        EmbeddingProvider::Bedrock => Some(config.dimensions.unwrap_or(TITAN_V2_DIMENSIONS[2])),
+        EmbeddingProvider::Bedrock
+            if BedrockFamily::of(&config.model) == Some(BedrockFamily::TitanV2) =>
+        {
+            Some(config.dimensions.unwrap_or(TITAN_V2_DIMENSIONS[2]))
+        }
         _ => config.dimensions,
     }
 }
@@ -217,6 +385,7 @@ fn provider_model(config: &EmbeddingConfig) -> Result<Arc<dyn EmbeddingModel>> {
         return invalid("embedding.model is empty".into());
     }
     let provider = config.provider.name();
+    let mut bedrock_family = None;
     match config.provider {
         EmbeddingProvider::Bedrock => {
             if config.api_key.is_some() || config.endpoint.is_some() {
@@ -226,19 +395,39 @@ fn provider_model(config: &EmbeddingConfig) -> Result<Arc<dyn EmbeddingModel>> {
                         .into(),
                 );
             }
-            if !config.model.contains(BEDROCK_TITAN_V2) {
+            let Some(family) = BedrockFamily::of(&config.model) else {
+                let models: Vec<&str> = BEDROCK_MODELS.iter().map(|(id, _)| *id).collect();
                 return invalid(format!(
-                    "bedrock embeds with {BEDROCK_TITAN_V2} models, not '{}'",
+                    "bedrock embeds with {} models, not '{}'",
+                    models.join(", "),
                     config.model
                 ));
+            };
+            if let Some(dimensions) = config.dimensions {
+                match family.dimensions() {
+                    [] => {
+                        return invalid(format!(
+                            "{} embeds at a fixed size; embedding.dimensions doesn't apply",
+                            config.model
+                        ));
+                    }
+                    sizes if !sizes.contains(&dimensions) => {
+                        return invalid(format!(
+                            "{} embeds at {sizes:?} dimensions, not {dimensions}",
+                            config.model
+                        ));
+                    }
+                    _ => {}
+                }
             }
-            if let Some(dimensions) = config.dimensions
-                && !TITAN_V2_DIMENSIONS.contains(&dimensions)
-            {
+            if family.is_cohere() && config.batch_size > BEDROCK_COHERE_MAX_TEXTS {
                 return invalid(format!(
-                    "{BEDROCK_TITAN_V2} embeds at {TITAN_V2_DIMENSIONS:?} dimensions, not {dimensions}"
+                    "{} embeds at most {BEDROCK_COHERE_MAX_TEXTS} texts per request, not \
+                     embedding.batch_size {}",
+                    config.model, config.batch_size
                 ));
             }
+            bedrock_family = Some(family);
         }
         _ if config.region.is_some() => {
             return invalid("embedding.region only applies to the bedrock provider".into());
@@ -250,12 +439,12 @@ fn provider_model(config: &EmbeddingConfig) -> Result<Arc<dyn EmbeddingModel>> {
         }
         _ => {}
     }
-    let bedrock = (config.provider == EmbeddingProvider::Bedrock).then(|| {
+    let bedrock = bedrock_family.map(|family| {
         let mut builder = BedrockRuntime::builder();
         if let Some(region) = &config.region {
             builder = builder.region(region);
         }
-        builder.build()
+        (builder.build(), family)
     });
     Ok(Arc::new(ProviderModel {
         id: model_id(config),
@@ -297,15 +486,11 @@ impl ProviderModel {
                 if let Some(endpoint) = &self.endpoint {
                     config = config.with_base_url(endpoint);
                 }
-                let input_type = match kind {
-                    InputKind::Document => "search_document",
-                    InputKind::Query => "search_query",
-                };
                 let wire = cohere::embeddings::Embeddings {
                     provider: config,
                     model: self.model.clone(),
                     ndims: 0,
-                    input_type: input_type.into(),
+                    input_type: cohere_input_type(kind).into(),
                 };
                 Model::new(wire, http).erase()
             }
@@ -320,32 +505,54 @@ impl ProviderModel {
                 )
                 .erase()
             }
-            EmbeddingProvider::Bedrock => self
-                .bedrock
-                .as_ref()
-                .expect("a bedrock model has a runtime")
-                .embedding(self.model.clone(), dimensions)
-                .erase(),
+            EmbeddingProvider::Bedrock => {
+                let (runtime, _) = self
+                    .bedrock
+                    .as_ref()
+                    .expect("a bedrock model has a runtime");
+                runtime.embedding(self.model.clone(), dimensions).erase()
+            }
         })
     }
-}
 
-#[async_trait]
-impl EmbeddingModel for ProviderModel {
-    fn id(&self) -> &str {
-        &self.id
+    /// Embeds with one of Bedrock's Cohere models, all texts in one request.
+    async fn embed_bedrock_cohere(
+        &self,
+        runtime: &BedrockRuntime,
+        family: BedrockFamily,
+        texts: Vec<String>,
+        kind: InputKind,
+    ) -> Result<Vec<Vec<f32>>> {
+        let upstream =
+            |message: String| Error::Upstream(format!("embedding with {}: {message}", self.id));
+        let request = BedrockCohereRequest::new(family, &texts, kind, self.dimensions);
+        let body = serde_json::to_vec(&request).map_err(|e| upstream(e.to_string()))?;
+        let reply = runtime
+            .inner()
+            .await
+            .invoke_model()
+            .model_id(self.model.as_str())
+            .content_type("application/json")
+            .accept("application/json")
+            .body(Blob::new(body))
+            .send()
+            .await
+            .map_err(|e| upstream(DisplayErrorContext(&e).to_string()))?;
+        bedrock_cohere_vectors(reply.body.as_ref(), texts.len()).map_err(upstream)
     }
 
-    async fn embed(&self, texts: Vec<String>, kind: InputKind) -> Result<Vec<Vec<f32>>> {
+    async fn call(&self, texts: Vec<String>, kind: InputKind) -> Result<Vec<Vec<f32>>> {
+        if let Some((runtime, family)) = &self.bedrock
+            && family.is_cohere()
+        {
+            return self
+                .embed_bedrock_cohere(runtime, *family, texts, kind)
+                .await;
+        }
         let model = self.connect(kind)?;
-        let response = tokio::time::timeout(self.timeout, model.call(texts))
+        let response = model
+            .call(texts)
             .await
-            .map_err(|_| {
-                Error::Upstream(format!(
-                    "embedding with {}: no reply in {:?}",
-                    self.id, self.timeout
-                ))
-            })?
             .map_err(|e| Error::Upstream(format!("embedding with {}: {e}", self.id)))?;
         let mut vectors: Vec<Vec<f32>> = response
             .embeddings
@@ -360,6 +567,24 @@ impl EmbeddingModel for ProviderModel {
             vectors = sorted;
         }
         Ok(vectors)
+    }
+}
+
+#[async_trait]
+impl EmbeddingModel for ProviderModel {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn embed(&self, texts: Vec<String>, kind: InputKind) -> Result<Vec<Vec<f32>>> {
+        tokio::time::timeout(self.timeout, self.call(texts, kind))
+            .await
+            .map_err(|_| {
+                Error::Upstream(format!(
+                    "embedding with {}: no reply in {:?}",
+                    self.id, self.timeout
+                ))
+            })?
     }
 }
 
@@ -445,6 +670,9 @@ pub struct Embedder {
     cache: Option<Cache<CacheKey, Arc<[f32]>>>,
     batch_size: usize,
     dimensions: OnceCell<u16>,
+    max_input_chars: usize,
+    passage_chars: usize,
+    overlap_chars: usize,
 }
 
 impl fmt::Debug for Embedder {
@@ -457,11 +685,31 @@ impl fmt::Debug for Embedder {
 
 impl Embedder {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+        let max_input_chars = config
+            .max_input_chars
+            .unwrap_or_else(|| default_max_input_chars(config));
+        let passage_chars = config
+            .split
+            .max_chars
+            .unwrap_or(DEFAULT_PASSAGE_CHARS)
+            .min(max_input_chars);
+        if max_input_chars == 0 || passage_chars == 0 {
+            return Err(Error::InvalidInput(
+                "embedding.max_input_chars and embedding.split.max_chars must be positive".into(),
+            ));
+        }
+        if config.split.overlap_chars >= passage_chars {
+            return Err(Error::InvalidInput(format!(
+                "embedding.split.overlap_chars ({}) must be less than the passage size ({passage_chars})",
+                config.split.overlap_chars
+            )));
+        }
         let embedder = Self::with_model(
             provider_model(config)?,
             config.cache.capacity,
             config.batch_size,
-        );
+        )
+        .with_limits(max_input_chars, passage_chars, config.split.overlap_chars);
         if let Some(dimensions) = requested_dimensions(config) {
             embedder
                 .dimensions
@@ -490,6 +738,37 @@ impl Embedder {
             cache,
             batch_size: batch_size.max(1),
             dimensions: OnceCell::new(),
+            max_input_chars: usize::MAX,
+            passage_chars: DEFAULT_PASSAGE_CHARS,
+            overlap_chars: 0,
+        }
+    }
+
+    /// Cuts texts sent to the model at `max_input_chars`, and splits
+    /// documents into passages of `passage_chars` overlapping by
+    /// `overlap_chars`.
+    pub fn with_limits(
+        mut self,
+        max_input_chars: usize,
+        passage_chars: usize,
+        overlap_chars: usize,
+    ) -> Self {
+        self.max_input_chars = max_input_chars.max(1);
+        self.passage_chars = passage_chars.clamp(1, self.max_input_chars);
+        self.overlap_chars = overlap_chars.min(self.passage_chars - 1);
+        self
+    }
+
+    /// The passages a document's text is split into.
+    pub fn split(&self, text: &str) -> Vec<String> {
+        super::split::split(text, self.passage_chars, self.overlap_chars)
+    }
+
+    /// `text` cut to the most the model takes.
+    fn fit<'a>(&self, text: &'a str) -> &'a str {
+        match text.char_indices().nth(self.max_input_chars) {
+            Some((end, _)) => &text[..end],
+            None => text,
         }
     }
 
@@ -521,9 +800,11 @@ impl Embedder {
             .copied()
     }
 
-    /// One vector per text, in order. Cached texts aren't sent; the rest
-    /// are sent once each, in batches.
+    /// One vector per text, in order, each embedding at most the model's
+    /// input limit of its text. Cached texts aren't sent; the rest are sent
+    /// once each, in batches.
     pub async fn embed(&self, texts: &[&str], kind: InputKind) -> Result<Vec<Arc<[f32]>>> {
+        let texts: Vec<&str> = texts.iter().map(|t| self.fit(t)).collect();
         let keys: Vec<CacheKey> = texts.iter().map(|t| self.key(t, kind)).collect();
         let mut out: Vec<Option<Arc<[f32]>>> = keys
             .iter()
@@ -869,7 +1150,10 @@ pub(crate) mod tests {
         let rejected = [
             "provider: openai\nmodel: m\nregion: us-east-1\n",
             "provider: cohere\nmodel: embed-v4.0\ndimensions: 512\n",
-            "provider: bedrock\nmodel: cohere.embed-english-v3\n",
+            "provider: bedrock\nmodel: amazon.titan-embed-text-v1\n",
+            "provider: bedrock\nmodel: cohere.embed-english-v3\ndimensions: 512\n",
+            "provider: bedrock\nmodel: cohere.embed-v4:0\ndimensions: 768\n",
+            "provider: bedrock\nmodel: cohere.embed-v4:0\nbatch_size: 128\n",
             "provider: bedrock\nmodel: amazon.titan-embed-text-v2:0\ndimensions: 300\n",
             "provider: bedrock\nmodel: amazon.titan-embed-text-v2:0\nendpoint: http://x\n",
         ];
@@ -888,5 +1172,108 @@ pub(crate) mod tests {
         let embedder = Embedder::new(&config).unwrap();
         assert_eq!(embedder.model_id(), "bedrock:amazon.titan-embed-text-v2:0");
         assert_eq!(embedder.dimensions().await.unwrap(), 1024);
+    }
+
+    #[tokio::test]
+    async fn should_size_inputs_and_passages_for_the_model() {
+        let embedder = |yaml: &str| {
+            Embedder::new(&serde_yaml::from_str::<EmbeddingConfig>(yaml).unwrap()).unwrap()
+        };
+        let v3 = embedder("provider: bedrock\nmodel: cohere.embed-english-v3\n");
+        assert_eq!((v3.max_input_chars, v3.passage_chars), (2_048, 2_048));
+        let v4 = embedder("provider: bedrock\nmodel: cohere.embed-v4:0\n");
+        assert_eq!(
+            (v4.max_input_chars, v4.passage_chars),
+            (384_000, DEFAULT_PASSAGE_CHARS)
+        );
+        let tuned = embedder(
+            "provider: openai\nmodel: m\nmax_input_chars: 1000\nsplit: { max_chars: 5000, overlap_chars: 100 }\n",
+        );
+        assert_eq!(
+            (
+                tuned.max_input_chars,
+                tuned.passage_chars,
+                tuned.overlap_chars
+            ),
+            (1_000, 1_000, 100),
+            "passages never exceed the input limit"
+        );
+        assert_eq!(tuned.fit(&"é".repeat(1_500)).chars().count(), 1_000);
+        for yaml in [
+            "provider: openai\nmodel: m\nmax_input_chars: 0\n",
+            "provider: openai\nmodel: m\nsplit: { max_chars: 100, overlap_chars: 100 }\n",
+        ] {
+            let config: EmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(Embedder::new(&config).is_err(), "{yaml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_accept_cohere_models_on_bedrock() {
+        for (yaml, id, dimensions) in [
+            (
+                "provider: bedrock\nmodel: cohere.embed-v4:0\nregion: us-east-2\ndimensions: 1024\n",
+                "bedrock:cohere.embed-v4:0:1024",
+                Some(1024),
+            ),
+            (
+                "provider: bedrock\nmodel: us.cohere.embed-v4:0\n",
+                "bedrock:us.cohere.embed-v4:0",
+                None,
+            ),
+            (
+                "provider: bedrock\nmodel: cohere.embed-multilingual-v3\n",
+                "bedrock:cohere.embed-multilingual-v3",
+                None,
+            ),
+        ] {
+            let config: EmbeddingConfig = serde_yaml::from_str(yaml).unwrap();
+            let embedder = Embedder::new(&config).unwrap();
+            assert_eq!(embedder.model_id(), id);
+            assert_eq!(embedder.dimensions.get().copied(), dimensions, "{yaml}");
+        }
+    }
+
+    #[test]
+    fn should_encode_cohere_requests_for_bedrock() {
+        let texts = vec!["a".to_string(), "b".to_string()];
+        let v4 =
+            BedrockCohereRequest::new(BedrockFamily::CohereV4, &texts, InputKind::Query, Some(512));
+        assert_eq!(
+            serde_json::to_value(&v4).unwrap(),
+            serde_json::json!({
+                "texts": ["a", "b"],
+                "input_type": "search_query",
+                "embedding_types": ["float"],
+                "output_dimension": 512,
+            })
+        );
+        let v3 =
+            BedrockCohereRequest::new(BedrockFamily::CohereV3, &texts, InputKind::Document, None);
+        assert_eq!(
+            serde_json::to_value(&v3).unwrap(),
+            serde_json::json!({
+                "texts": ["a", "b"],
+                "input_type": "search_document",
+                "embedding_types": ["float"],
+                "truncate": "END",
+            })
+        );
+    }
+
+    #[test]
+    fn should_decode_cohere_replies_from_bedrock() {
+        let by_type = br#"{"id":"1","response_type":"embeddings_by_type","embeddings":{"float":[[1.0,2.0],[3.0,4.0]]},"texts":["a","b"]}"#;
+        assert_eq!(
+            bedrock_cohere_vectors(by_type, 2).unwrap(),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
+        );
+        let bare = br#"{"id":"1","embeddings":[[1.0,2.0]]}"#;
+        assert_eq!(
+            bedrock_cohere_vectors(bare, 1).unwrap(),
+            vec![vec![1.0, 2.0]]
+        );
+        assert!(bedrock_cohere_vectors(bare, 2).is_err());
+        assert!(bedrock_cohere_vectors(br#"{"message":"denied"}"#, 1).is_err());
     }
 }

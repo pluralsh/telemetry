@@ -589,6 +589,70 @@ async fn should_embed_rows_and_query_texts_with_the_namespace_model() {
 }
 
 #[tokio::test]
+async fn should_split_documents_without_passages_for_the_model() {
+    // given: a model taking 12 characters, so passages of at most 12
+    let model = embedding::tests::FakeModel::new(4);
+    let embedder = Embedder::with_model(model.clone(), 0, 16).with_limits(12, 12, 0);
+    let cluster = cluster().await.with_embedder(Arc::new(embedder));
+    let schema = json!({"body": {"type": "string", "embed": true}});
+
+    // when
+    cluster
+        .write(
+            "docs",
+            write_request(json!({
+                "schema": schema,
+                "upsert_documents": [{
+                    "id": "d1",
+                    "attributes": {"body": "alpha beta\n\ngamma delta", "kind": "guide"},
+                }],
+                "upsert_rows": [{"id": "r", "body": "a row longer than twelve"}],
+            })),
+        )
+        .await
+        .unwrap();
+
+    // then: each passage row holds its part of the text and its embedding
+    let first = cluster.get_row("docs", "d1#0").await.unwrap().unwrap();
+    let second = cluster.get_row("docs", "d1#1").await.unwrap().unwrap();
+    assert_eq!(first["body"], "alpha beta");
+    assert_eq!(second["body"], "gamma delta");
+    assert_eq!(second["kind"], "guide");
+    assert_eq!(second["$doc_id"], "d1");
+    assert_eq!(as_vector(&second["vector"]), model.vector("gamma delta"));
+    assert!(cluster.get_row("docs", "d1#2").await.unwrap().is_none());
+    // then: texts longer than the model takes are cut, but stored whole
+    let row = cluster.get_row("docs", "r").await.unwrap().unwrap();
+    assert_eq!(row["body"], "a row longer than twelve");
+    assert_eq!(as_vector(&row["vector"]), model.vector("a row longer"));
+
+    // when: a query text is longer than the model takes
+    let nearest = query_ids(
+        &cluster,
+        "docs",
+        json!({"rank_by": {"op": "kNN", "text": "gamma delta, and more"}, "top_k": 1}),
+    )
+    .await;
+
+    // then: it's cut too
+    assert_eq!(nearest, vec!["d1#1"]);
+    assert_eq!(model.texts().last().unwrap(), "gamma delta,");
+
+    // then: a document needs passages or text to split
+    let err = cluster
+        .write(
+            "docs",
+            write_request(json!({"upsert_documents": [{"id": "d2", "attributes": {"kind": "x"}}]})),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("a string 'body' to split"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn should_reject_embedding_without_a_model_or_text() {
     let unconfigured = cluster().await;
     let create = CreateNamespaceRequest {

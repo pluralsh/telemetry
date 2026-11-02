@@ -77,6 +77,13 @@ type renderVectorEmbedding struct {
 	BatchSize  *int32                `json:"batch_size,omitempty"`
 	Timeout    *int64                `json:"timeout,omitempty"`
 	Cache      *renderEmbeddingCache `json:"cache,omitempty"`
+	MaxInputChars *int64               `json:"max_input_chars,omitempty"`
+	Split         *renderEmbeddingSplit `json:"split,omitempty"`
+}
+
+type renderEmbeddingSplit struct {
+	MaxChars     *int64 `json:"max_chars,omitempty"`
+	OverlapChars *int64 `json:"overlap_chars,omitempty"`
 }
 
 type renderEmbeddingCache struct {
@@ -228,7 +235,10 @@ func renderEmbedding(data map[string][]byte, spec *telemetryv1alpha1.VectorEmbed
 	if spec == nil {
 		return nil, nil
 	}
-	embedding := &renderVectorEmbedding{Provider: spec.Provider, Model: spec.Model, Endpoint: spec.Endpoint, Region: spec.Region, Dimensions: spec.Dimensions, BatchSize: spec.BatchSize, Timeout: spec.TimeoutSeconds}
+	embedding := &renderVectorEmbedding{Provider: spec.Provider, Model: spec.Model, Endpoint: spec.Endpoint, Region: spec.Region, Dimensions: spec.Dimensions, BatchSize: spec.BatchSize, Timeout: spec.TimeoutSeconds, MaxInputChars: spec.MaxInputChars}
+	if spec.Split != nil {
+		embedding.Split = &renderEmbeddingSplit{MaxChars: spec.Split.MaxChars, OverlapChars: spec.Split.OverlapChars}
+	}
 	if spec.CacheSize != nil {
 		capacity, ok := spec.CacheSize.AsInt64()
 		if !ok || capacity < 0 {

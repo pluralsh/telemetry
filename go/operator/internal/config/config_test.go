@@ -993,6 +993,17 @@ func TestRenderSizesVectorMemoryAroundItsReservations(t *testing.T) {
 			t.Errorf("%s missing the set cache size:\n%s", key, rendered)
 		}
 	}
+
+	// when input and passage sizes are set, then they render in the server's field names
+	embedding = testEmbedding()
+	embedding.MaxInputChars = lo.ToPtr(int64(4000))
+	embedding.Split = &telemetryv1alpha1.VectorEmbeddingSplitSpec{MaxChars: lo.ToPtr(int64(2000)), OverlapChars: lo.ToPtr(int64(200))}
+	rendered := string(render(embedding).Data[VectorKey])
+	for _, value := range []string{"max_input_chars: 4000", "max_chars: 2000", "overlap_chars: 200"} {
+		if !strings.Contains(rendered, value) {
+			t.Errorf("missing %q:\n%s", value, rendered)
+		}
+	}
 }
 
 func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {

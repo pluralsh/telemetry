@@ -56,6 +56,8 @@ curl -X POST localhost:8080/api/v1/namespaces/articles/write \
 
 Passage `i` of document `d` becomes row `d#i`, carrying the document's `attributes`, the passage's own attributes, and two system attributes, `$doc_id` and `$passage`. Upserting a document again replaces all its passages, including removing any beyond the new count.
 
+In a namespace that [embeds](/vector/embeddings/) an attribute, `passages` can be left out: the server splits the document's text in that attribute into passages sized for the embedding model, and embeds each. See [input limits and splitting](/vector/embeddings/#input-limits-and-splitting).
+
 To return documents rather than passages, collapse by `$doc_id`. This returns the five best documents, each represented by its closest passage:
 
 ```json

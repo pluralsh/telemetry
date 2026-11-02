@@ -117,12 +117,14 @@ struct Document {
     #[schema(value_type = Value)]
     id: serde_json::Value,
     /// Attributes copied onto every passage row.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Object, required = false)]
     attributes: Option<serde_json::Value>,
     /// Passages in order, each `{"vector": [..], attribute: value, ..}`.
-    /// Passage attributes override document attributes.
-    #[schema(value_type = Vec<Object>)]
-    passages: Vec<serde_json::Value>,
+    /// Passage attributes override document attributes. Without passages,
+    /// in a namespace with an `embed` attribute, the server splits that
+    /// attribute's text into passages sized for the embedding model.
+    #[schema(value_type = Vec<Object>, required = false)]
+    passages: Option<Vec<serde_json::Value>>,
 }
 
 /// Changes to one namespace. Writing to a missing namespace creates it,

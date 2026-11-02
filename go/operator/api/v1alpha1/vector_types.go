@@ -75,11 +75,12 @@ type VectorConfigSpec struct {
 type VectorEmbeddingSpec struct {
 	// Provider is the API: openai (or an OpenAI-compatible endpoint, such
 	// as Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon
-	// Bedrock's Titan Text Embeddings v2).
+	// Bedrock's Titan Text Embeddings v2, Cohere Embed v3 or Cohere Embed
+	// v4).
 	// +kubebuilder:validation:Enum=openai;cohere;gemini;bedrock
 	Provider string `json:"provider"`
-	// Model is the provider's model name, e.g. text-embedding-3-small or
-	// amazon.titan-embed-text-v2:0.
+	// Model is the provider's model name, e.g. text-embedding-3-small,
+	// amazon.titan-embed-text-v2:0 or cohere.embed-v4:0.
 	// +kubebuilder:validation:MinLength=1
 	Model string `json:"model"`
 	// APIKeySecretRef holds the provider API key. Rotating the Secret
@@ -95,8 +96,8 @@ type VectorEmbeddingSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Region string `json:"region,omitempty"`
 	// Dimensions asks models that can shorten their vectors for this many
-	// dimensions: OpenAI's text-embedding-3 models, Gemini, and Titan v2
-	// (256, 512 or 1024).
+	// dimensions: OpenAI's text-embedding-3 models, Gemini, Titan v2 (256,
+	// 512 or 1024) and Cohere Embed v4 on Bedrock (256, 512, 1024 or 1536).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	Dimensions *int32 `json:"dimensions,omitempty"`
@@ -113,6 +114,29 @@ type VectorEmbeddingSpec struct {
 	// Without it, 4% of what each component's memory limit leaves after
 	// headroom and reservations, and at least 16Mi.
 	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
+	// MaxInputChars is the most characters of one text sent to the model;
+	// longer texts are cut. Without it, the model's input limit, with
+	// limits in tokens taken at 3 characters per token. Set it for models
+	// of OpenAI-compatible endpoints, which are assumed to take 8191
+	// tokens.
+	// +kubebuilder:validation:Minimum=1
+	MaxInputChars *int64 `json:"maxInputChars,omitempty"`
+	// Split sizes the passages of documents written without any, which the
+	// servers split from the namespace's embed attribute.
+	Split *VectorEmbeddingSplitSpec `json:"split,omitempty"`
+}
+
+// VectorEmbeddingSplitSpec sizes the passages a document's text is split
+// into, at paragraph, line, sentence and word boundaries.
+type VectorEmbeddingSplitSpec struct {
+	// MaxChars is the most characters of one passage. Without it, 8000, or
+	// the model's input limit if smaller.
+	// +kubebuilder:validation:Minimum=1
+	MaxChars *int64 `json:"maxChars,omitempty"`
+	// OverlapChars is how much of a passage's end is repeated at the start
+	// of the next, so text near a boundary is found from either side.
+	// +kubebuilder:validation:Minimum=0
+	OverlapChars *int64 `json:"overlapChars,omitempty"`
 }
 
 // VectorSpec defines the desired state of Vector.

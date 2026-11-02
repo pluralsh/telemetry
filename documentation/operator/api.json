@@ -4383,7 +4383,7 @@
           "fields": [
             {
               "default": "",
-              "doc": "Provider is the API: openai (or an OpenAI-compatible endpoint, such\nas Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon\nBedrock's Titan Text Embeddings v2).",
+              "doc": "Provider is the API: openai (or an OpenAI-compatible endpoint, such\nas Azure OpenAI, vLLM or Ollama), cohere, gemini, or bedrock (Amazon\nBedrock's Titan Text Embeddings v2, Cohere Embed v3 or Cohere Embed\nv4).",
               "name": "provider",
               "rules": [],
               "type": "string",
@@ -4393,7 +4393,7 @@
             },
             {
               "default": "",
-              "doc": "Model is the provider's model name, e.g. text-embedding-3-small or\namazon.titan-embed-text-v2:0.",
+              "doc": "Model is the provider's model name, e.g. text-embedding-3-small,\namazon.titan-embed-text-v2:0 or cohere.embed-v4:0.",
               "name": "model",
               "rules": [],
               "type": "string",
@@ -4429,7 +4429,7 @@
             },
             {
               "default": "",
-              "doc": "Dimensions asks models that can shorten their vectors for this many\ndimensions: OpenAI's text-embedding-3 models, Gemini, and Titan v2\n(256, 512 or 1024).",
+              "doc": "Dimensions asks models that can shorten their vectors for this many\ndimensions: OpenAI's text-embedding-3 models, Gemini, Titan v2 (256,\n512 or 1024) and Cohere Embed v4 on Bedrock (256, 512, 1024 or 1536).",
               "name": "dimensions",
               "rules": [],
               "type": "integer",
@@ -4465,6 +4465,24 @@
               "rules": [],
               "type": "[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#quantity-resource-api)",
               "validation": []
+            },
+            {
+              "default": "",
+              "doc": "MaxInputChars is the most characters of one text sent to the model;\nlonger texts are cut. Without it, the model's input limit, with\nlimits in tokens taken at 3 characters per token. Set it for models\nof OpenAI-compatible endpoints, which are assumed to take 8191\ntokens.",
+              "name": "maxInputChars",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "Split sizes the passages of documents written without any, which the\nservers split from the namespace's embed attribute.",
+              "name": "split",
+              "rules": [],
+              "type": "[VectorEmbeddingSplitSpec](#vectorembeddingsplitspec)",
+              "validation": []
             }
           ],
           "kind": "",
@@ -4484,6 +4502,41 @@
               "rule": "self.provider != 'cohere' || !has(self.dimensions)"
             }
           ],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "VectorEmbeddingSpec"
+          ],
+          "doc": "VectorEmbeddingSplitSpec sizes the passages a document's text is split\ninto, at paragraph, line, sentence and word boundaries.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "",
+              "doc": "MaxChars is the most characters of one passage. Without it, 8000, or\nthe model's input limit if smaller.",
+              "name": "maxChars",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "OverlapChars is how much of a passage's end is repeated at the start\nof the next, so text near a boundary is found from either side.",
+              "name": "overlapChars",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "VectorEmbeddingSplitSpec",
+          "resource": {},
+          "rules": [],
           "underlying": "",
           "validation": []
         },
