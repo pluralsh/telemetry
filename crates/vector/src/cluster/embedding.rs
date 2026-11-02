@@ -192,6 +192,15 @@ impl BedrockFamily {
             .map(|(_, family)| *family)
     }
 
+    /// The foundation model id inside `model`, without an inference profile's
+    /// region prefix or ARN, so every route to one model pins the same id.
+    fn base_model(model: &str) -> &str {
+        BEDROCK_MODELS
+            .iter()
+            .find_map(|(id, _)| model.find(id))
+            .map_or(model, |start| &model[start..])
+    }
+
     /// The output sizes the model can be asked for; empty for a fixed size.
     fn dimensions(self) -> &'static [u16] {
         match self {
@@ -358,7 +367,11 @@ struct ProviderModel {
 
 /// The id pinned in namespaces: provider, model and requested dimensions.
 fn model_id(config: &EmbeddingConfig) -> String {
-    let mut id = format!("{}:{}", config.provider.name(), config.model);
+    let model = match config.provider {
+        EmbeddingProvider::Bedrock => BedrockFamily::base_model(&config.model),
+        _ => &config.model,
+    };
+    let mut id = format!("{}:{}", config.provider.name(), model);
     if let Some(dimensions) = config.dimensions {
         id.push_str(&format!(":{dimensions}"));
     }
@@ -1218,8 +1231,13 @@ pub(crate) mod tests {
             ),
             (
                 "provider: bedrock\nmodel: us.cohere.embed-v4:0\n",
-                "bedrock:us.cohere.embed-v4:0",
+                "bedrock:cohere.embed-v4:0",
                 None,
+            ),
+            (
+                "provider: bedrock\nmodel: arn:aws:bedrock:us-east-2:123456789012:inference-profile/global.cohere.embed-v4:0\ndimensions: 512\n",
+                "bedrock:cohere.embed-v4:0:512",
+                Some(512),
             ),
             (
                 "provider: bedrock\nmodel: cohere.embed-multilingual-v3\n",

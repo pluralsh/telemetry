@@ -57,12 +57,12 @@ embedding:
 ```yaml
 embedding:
   provider: bedrock
-  model: cohere.embed-v4:0  # or cohere.embed-english-v3, cohere.embed-multilingual-v3
+  model: us.cohere.embed-v4:0  # or cohere.embed-english-v3, cohere.embed-multilingual-v3
   region: us-east-2
-  dimensions: 1024          # optional, v4 only: 256, 512, 1024 or 1536 (the default)
+  dimensions: 1024             # optional, v4 only: 256, 512, 1024 or 1536 (the default)
 ```
 
-The supported models are Titan Text Embeddings v2 and Cohere Embed v3 (English or multilingual) and v4; `model` can also be an inference profile id or ARN for one of them, such as `us.cohere.embed-v4:0`. Titan embeds one text per request, so a batch is sent as consecutive requests. Cohere models take up to 96 texts per request, so `batch_size` can't exceed 96 for them. Cohere Embed v3 embeds at a fixed 1024 dimensions, and Bedrock rejects v3 texts over 2,048 characters, which the server's [input limit](#input-limits-and-splitting) keeps them under.
+The supported models are Titan Text Embeddings v2 and Cohere Embed v3 (English or multilingual) and v4; `model` can also be a cross-region inference profile id or ARN for one of them, such as `us.cohere.embed-v4:0` or `global.cohere.embed-v4:0`. Where Bedrock serves a model only through inference profiles, as it does Cohere Embed v4 in most regions, the bare model id fails with "on-demand throughput isn't supported" and `model` must be a profile. The role then needs `bedrock:InvokeModel` on the profile and on the foundation model in every region the profile routes to. Namespaces pin the foundation model id without the profile, so moving between profiles of one model keeps existing namespaces usable. Application inference profiles aren't supported, because their ARNs don't name the model. Titan embeds one text per request, so a batch is sent as consecutive requests. Cohere models take up to 96 texts per request, so `batch_size` can't exceed 96 for them. Cohere Embed v3 embeds at a fixed 1024 dimensions, and Bedrock rejects v3 texts over 2,048 characters, which the server's [input limit](#input-limits-and-splitting) keeps them under.
 
 ### On Kubernetes
 
