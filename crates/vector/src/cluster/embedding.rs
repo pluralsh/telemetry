@@ -638,7 +638,7 @@ pub(crate) fn for_namespace<'a>(
             meta.name
         )));
     };
-    if embedder.model_id() != pinned {
+    if !embeds_with(pinned, embedder.model_id()) {
         return Err(Error::InvalidInput(format!(
             "namespace '{}' embeds with {pinned}, but the configured model is {}",
             meta.name,
@@ -646,6 +646,17 @@ pub(crate) fn for_namespace<'a>(
         )));
     }
     Ok(embedder)
+}
+
+/// Whether a namespace pinned to `pinned` embeds with `model_id`. Namespaces
+/// pinned before Bedrock ids dropped their inference profile prefix or ARN
+/// (see [`BedrockFamily::base_model`]) hold the raw id, which still names
+/// the same foundation model.
+fn embeds_with(pinned: &str, model_id: &str) -> bool {
+    pinned == model_id
+        || pinned.strip_prefix("bedrock:").is_some_and(|model| {
+            model_id.strip_prefix("bedrock:") == Some(BedrockFamily::base_model(model))
+        })
 }
 
 /// Pins the namespace's model when its schema first embeds, checking that
@@ -1250,6 +1261,30 @@ pub(crate) mod tests {
             assert_eq!(embedder.model_id(), id);
             assert_eq!(embedder.dimensions.get().copied(), dimensions, "{yaml}");
         }
+    }
+
+    #[test]
+    fn should_match_namespaces_pinned_to_a_bedrock_inference_profile() {
+        let model_id = "bedrock:cohere.embed-v4:0";
+        for pinned in [
+            "bedrock:cohere.embed-v4:0",
+            "bedrock:us.cohere.embed-v4:0",
+            "bedrock:arn:aws:bedrock:us-east-2:123456789012:inference-profile/global.cohere.embed-v4:0",
+        ] {
+            assert!(embeds_with(pinned, model_id), "{pinned}");
+        }
+        for pinned in [
+            "bedrock:us.cohere.embed-v4:0:512",
+            "bedrock:cohere.embed-english-v3",
+            "openai:cohere.embed-v4:0",
+            "openai:text-embedding-3-small",
+        ] {
+            assert!(!embeds_with(pinned, model_id), "{pinned}");
+        }
+        assert!(embeds_with(
+            "bedrock:us.cohere.embed-v4:0:1024",
+            "bedrock:cohere.embed-v4:0:1024"
+        ));
     }
 
     #[test]
