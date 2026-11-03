@@ -68,16 +68,16 @@ func (plan memoryPlan) vectorMemory(role string) renderVectorMemory {
 func (plan memoryPlan) embeddingCache() int64 { return plan.share(4, 16*mebibyte) }
 
 type renderVectorEmbedding struct {
-	Provider   string                `json:"provider"`
-	Model      string                `json:"model"`
-	APIKey     *renderFileSecret     `json:"api_key,omitempty"`
-	Endpoint   string                `json:"endpoint,omitempty"`
-	Region     string                `json:"region,omitempty"`
-	Dimensions *int32                `json:"dimensions,omitempty"`
-	BatchSize  *int32                `json:"batch_size,omitempty"`
-	Timeout    *int64                `json:"timeout,omitempty"`
-	Cache      *renderEmbeddingCache `json:"cache,omitempty"`
-	MaxInputChars *int64               `json:"max_input_chars,omitempty"`
+	Provider      string                `json:"provider"`
+	Model         string                `json:"model"`
+	APIKey        *renderFileSecret     `json:"api_key,omitempty"`
+	Endpoint      string                `json:"endpoint,omitempty"`
+	Region        string                `json:"region,omitempty"`
+	Dimensions    *int32                `json:"dimensions,omitempty"`
+	BatchSize     *int32                `json:"batch_size,omitempty"`
+	Timeout       *int64                `json:"timeout,omitempty"`
+	Cache         *renderEmbeddingCache `json:"cache,omitempty"`
+	MaxInputChars *int64                `json:"max_input_chars,omitempty"`
 	Split         *renderEmbeddingSplit `json:"split,omitempty"`
 }
 
