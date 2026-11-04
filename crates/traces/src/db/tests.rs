@@ -41,6 +41,7 @@ fn test_config() -> Config {
         },
         write_buffer: Default::default(),
         read_cache: Default::default(),
+        compaction_memory_bytes: Config::default().compaction_memory_bytes,
     }
 }
 

@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
+use common::storage::compaction::CompactionMemory;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
@@ -78,10 +79,12 @@ impl ShardedTraces {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
+        let compaction = CompactionMemory::new(config.compaction_memory_bytes);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let cache = shard_cache.clone();
-            async move { TraceDb::open_with_cache(config, &cache).await }
+            let compaction = compaction.clone();
+            async move { TraceDb::open_with_cache(config, &cache, &compaction).await }
         });
         Self::new(
             ShardSet::open(ShardRole::Writer, options, opener, shards).await,

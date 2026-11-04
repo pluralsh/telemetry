@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
-use slatedb::manifest::{SsTableId, SsTableInfo};
+use slatedb::manifest::{SsTableHandle, SsTableId, SsTableInfo};
 use slatedb::{CacheTarget, DbCacheManagerOps};
 use tokio_util::sync::CancellationToken;
 
@@ -183,6 +183,7 @@ pub fn payload_estimate(info: &SsTableInfo) -> u64 {
 struct PlannedSst {
     db: usize,
     id: SsTableId,
+    sst: SsTableHandle,
     targets: Arc<[CacheTarget]>,
     recency: i64,
     estimate: u64,
@@ -229,14 +230,14 @@ impl WarmPlan {
         key
     }
 
-    /// Plans warming `targets` of SST `id` of database `db`. `recency` (any
+    /// Plans warming `targets` of SST `sst` of database `db`. `recency` (any
     /// unit, larger is newer, comparable across passes) orders the pass.
     /// `estimate` is its metadata's [`metadata_estimate`], and `payload` its
     /// data blocks' [`payload_estimate`] when `targets` warm them.
     pub fn push(
         &mut self,
         db: usize,
-        id: SsTableId,
+        sst: SsTableHandle,
         targets: Arc<[CacheTarget]>,
         recency: i64,
         estimate: u64,
@@ -244,7 +245,8 @@ impl WarmPlan {
     ) {
         let mut sst = PlannedSst {
             db,
-            id,
+            id: sst.id,
+            sst,
             targets,
             recency,
             estimate,
@@ -267,8 +269,10 @@ impl WarmPlan {
 
 type LedgerKey = (usize, SsTableId);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Warmed {
+    /// Names its cache entries for eviction once its database drops it.
+    sst: SsTableHandle,
     bytes: u64,
     /// Data-block bytes it warmed and still counts.
     payload: u64,
@@ -357,23 +361,24 @@ impl WarmLedger {
 
     /// Forgets what `plan` shows is gone. Returns the SSTs to evict: warmed
     /// ones their database's manifest no longer holds.
-    fn reap(&self, plan: &WarmPlan) -> Vec<LedgerKey> {
+    fn reap(&self, plan: &WarmPlan) -> Vec<(usize, SsTableHandle)> {
         let in_pass: HashSet<LedgerKey> = plan.ssts.iter().map(|sst| (sst.db, sst.id)).collect();
         let mut state = self.lock();
         let live = |key: &LedgerKey| plan.dbs.get(&key.0).map(|(_, live)| live.contains(&key.1));
-        let removed: Vec<LedgerKey> = state
+        let removed: Vec<(LedgerKey, SsTableHandle)> = state
             .warmed
-            .keys()
-            .filter(|key| live(key) != Some(true))
-            .copied()
+            .iter()
+            .filter(|(key, _)| live(key) != Some(true))
+            .map(|(key, warmed)| (*key, warmed.sst.clone()))
             .collect();
-        for key in &removed {
+        for (key, _) in &removed {
             state.forget(key);
         }
         state.ignored.retain(|key| in_pass.contains(key));
         removed
             .into_iter()
-            .filter(|key| live(key) == Some(false))
+            .filter(|(key, _)| live(key) == Some(false))
+            .map(|((db, _), sst)| (db, sst))
             .collect()
     }
 
@@ -476,6 +481,7 @@ impl WarmLedger {
             state.warmed.insert(
                 key,
                 Warmed {
+                    sst: sst.sst.clone(),
                     bytes,
                     payload,
                     recency: sst.recency,
@@ -762,15 +768,15 @@ pub async fn warm_planned(
 async fn evict(
     product: &'static str,
     plan: &WarmPlan,
-    removed: Vec<LedgerKey>,
+    removed: Vec<(usize, SsTableHandle)>,
     concurrency: usize,
     cancel: &CancellationToken,
 ) -> usize {
     futures::stream::iter(removed)
-        .map(|(db, id)| {
+        .map(|(db, sst)| {
             let db = Arc::clone(&plan.dbs[&db].0);
             async move {
-                let result = db.evict_cached_sst(id).await;
+                let result = db.evict_cached_sst(&sst, &CacheTarget::all()).await;
                 metrics::counter!(
                     "telemetry_cache_warmer_evicted_ssts_total",
                     "product" => product,
@@ -849,7 +855,41 @@ mod tests {
     use super::*;
 
     fn id(n: u64) -> SsTableId {
-        SsTableId::Wal(n)
+        SsTableId::from(ulid::Ulid::from_parts(n, 0))
+    }
+
+    /// A real SST's handle, with the id of fake SST `n`.
+    fn handle(n: u64) -> SsTableHandle {
+        static TEMPLATE: std::sync::OnceLock<SsTableHandle> = std::sync::OnceLock::new();
+        let template = TEMPLATE.get_or_init(|| {
+            std::thread::spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+                    let db = slatedb::Db::builder("template", store)
+                        .with_settings(slatedb::Settings {
+                            compactor_options: None,
+                            ..slatedb::Settings::default()
+                        })
+                        .build()
+                        .await
+                        .unwrap();
+                    db.put(b"key", b"value").await.unwrap();
+                    db.flush_with_options(slatedb::config::FlushOptions {
+                        flush_type: slatedb::config::FlushType::MemTable,
+                    })
+                    .await
+                    .unwrap();
+                    let sst = db.status().current_manifest.l0()[0].sst.clone();
+                    db.close().await.unwrap();
+                    sst
+                })
+            })
+            .join()
+            .unwrap()
+        });
+        let mut handle = template.clone();
+        handle.id = id(n);
+        handle
     }
 
     #[test]
@@ -935,8 +975,16 @@ mod tests {
             Ok(())
         }
 
-        async fn evict_cached_sst(&self, id: SsTableId) -> Result<(), slatedb::Error> {
-            self.evicted.lock().unwrap().push(id);
+        async fn evict_cached_sst(
+            &self,
+            sst: &SsTableHandle,
+            _targets: &[CacheTarget],
+        ) -> Result<(), slatedb::Error> {
+            self.evicted.lock().unwrap().push(sst.id);
+            Ok(())
+        }
+
+        async fn flush_cache_to_disk(&self) -> Result<(), slatedb::Error> {
             Ok(())
         }
     }
@@ -950,7 +998,7 @@ mod tests {
         let key = plan.add_database(Arc::clone(db) as WarmDb, ids.clone().into_iter().map(id));
         let targets: Arc<[CacheTarget]> = vec![CacheTarget::Filters, CacheTarget::Index].into();
         for n in ids {
-            plan.push(key, id(n), Arc::clone(&targets), n as i64, ESTIMATE, 0);
+            plan.push(key, handle(n), Arc::clone(&targets), n as i64, ESTIMATE, 0);
         }
         plan
     }
@@ -971,7 +1019,7 @@ mod tests {
         for n in ids {
             plan.push(
                 key,
-                id(n),
+                handle(n),
                 Arc::clone(&targets),
                 n as i64,
                 ESTIMATE,
@@ -1023,7 +1071,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(SsTableId::unwrap_wal_id)
+            .map(|id| id.value().timestamp_ms())
             .collect();
         ids.sort_unstable();
         ids
@@ -1148,7 +1196,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(SsTableId::unwrap_wal_id)
+            .map(|id| id.value().timestamp_ms())
             .collect();
         evicted.sort_unstable();
         assert_eq!(evicted, vec![0, 1]);
@@ -1296,7 +1344,7 @@ mod tests {
 
         let cache = SharedDbCache::from_slatedb_config(&config).await.unwrap();
         let reader = slatedb::DbReader::builder(config.path.clone(), store)
-            .with_db_cache(cache.cache().unwrap())
+            .with_db_cache(cache.cache().unwrap(), crate::storage::factory::DB_CACHE_ID)
             .build()
             .await
             .unwrap();
@@ -1328,7 +1376,7 @@ mod tests {
             let payload = payload_estimate(&view.sst.info);
             plan.push(
                 key,
-                view.sst.id,
+                view.sst.clone(),
                 Arc::clone(&targets),
                 n as i64,
                 estimate,

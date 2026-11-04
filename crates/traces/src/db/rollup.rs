@@ -278,6 +278,7 @@ mod tests {
             },
             write_buffer: Default::default(),
             read_cache: Default::default(),
+            compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
         }
     }
 

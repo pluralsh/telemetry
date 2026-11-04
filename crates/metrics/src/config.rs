@@ -66,6 +66,10 @@ pub struct Config {
 
     /// Background rollup of closed hour buckets into wider buckets.
     pub rollup: RollupConfig,
+
+    /// Estimated bytes SlateDB's compactions of every shard of the process
+    /// hold at once; see [`common::storage::compaction::CompactionMemory`].
+    pub compaction_memory_bytes: u64,
 }
 
 /// Background rollup of closed hour buckets into wider buckets.
@@ -179,6 +183,7 @@ impl Default for Config {
             query_cache: QueryCacheConfig::default(),
             query_limits: crate::QueryLimitsConfig::default(),
             rollup: RollupConfig::default(),
+            compaction_memory_bytes: common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES,
         }
     }
 }

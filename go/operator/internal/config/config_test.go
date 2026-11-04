@@ -869,12 +869,12 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 		LogsKey: {
 			"reader_cache_capacity: 773094096", "result_cache_capacity: 193273524",
 			"max_in_flight_query_bytes: 515396064", "max_in_flight_body_bytes: 536870912",
-			"buffer_size_threshold_bytes: 16777216",
+			"buffer_size_threshold_bytes: 16777216", "compaction_bytes: 322122540",
 		},
 		ReaderKey: {
 			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",
 			"result_cache_capacity: 40265316", "max_in_flight_query_bytes: 107374176",
-			"max_in_flight_body_bytes: 67108864",
+			"max_in_flight_body_bytes: 67108864", "compaction_bytes: 167772160",
 		},
 	} {
 		rendered := string(result.Data[key])

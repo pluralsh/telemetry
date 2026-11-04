@@ -140,7 +140,7 @@ fn profile_config(
             rows_per_block: 256,
         },
         compaction: CompactionConfig {
-            enabled: false,
+            enabled: std::env::var("PROFILE_COMPACTION").is_ok(),
             ..CompactionConfig::default()
         },
         write_buffer,
@@ -385,6 +385,99 @@ async fn profile_rollup_rounds() {
     }
     Arc::into_inner(db).unwrap().close().await.unwrap();
     phase("closed".to_owned(), String::new());
+}
+
+/// Ingests `PROFILE_ROWS` rows over the past hour in `PROFILE_REQUEST_ROWS`-row
+/// requests as fast as the budgets admit, as a writer under sustained ingest
+/// does, then idles `PROFILE_TAIL_SECONDS` while compactions drain. Prints
+/// SlateDB's statistics every `PROFILE_STATS_SECONDS` for the sampler.
+/// `PROFILE_COMPACTION` enables object compaction; SlateDB's compactor runs
+/// with `PROFILE_SLATEDB_SETTINGS` over logs' defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_ingest_compaction() {
+    static STATS: std::sync::OnceLock<&'static StatsRecorder> = std::sync::OnceLock::new();
+    let stats = *STATS.get_or_init(|| Box::leak(Box::default()));
+    let _ = metrics::set_global_recorder(stats);
+    let started = Instant::now();
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let rows: usize = env("PROFILE_ROWS", 10_000_000);
+    let request_rows: usize = env("PROFILE_REQUEST_ROWS", 10_000);
+    let streams: usize = env("PROFILE_STREAMS", 4_660);
+    let db = Arc::new(
+        LogDb::open(profile_config(
+            &store,
+            common::coordinator::WriteCoordinatorConfig::default(),
+            MemoryConfig::default(),
+        ))
+        .await
+        .unwrap(),
+    );
+    let namespace = Namespace::new("default").unwrap();
+    let stop = CancellationToken::new();
+    let reporter = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(env("PROFILE_STATS_SECONDS", 5)));
+            while !stop.is_cancelled() {
+                tick.tick().await;
+                println!(
+                    "phase stats at {:.1}s merges={} compaction_held_mib={:.0} {}",
+                    started.elapsed().as_secs_f64(),
+                    stats.value("logs_compaction_merges_total", false),
+                    stats.value("storage_compaction_memory_held_bytes", true) / f64::from(1 << 20),
+                    slatedb_stats(stats)
+                );
+            }
+        }
+    });
+    let end_ns = common::time::now_ns();
+    // With PROFILE_HOLD, merges of the ingested segments wait as they do
+    // while a rollup copies them, so their sources pile up until the tail.
+    let holds: Vec<_> = if std::env::var("PROFILE_HOLD").is_ok() {
+        [end_ns - 3600 * SECOND, end_ns]
+            .into_iter()
+            .map(|ts| {
+                db.merge_holds.copying(crate::codec::segment_prefix(
+                    &namespace,
+                    crate::codec::segment_for(ts, db.segment_ns),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (mut written, mut rejected, mut seed) = (0usize, 0usize, 0i64);
+    while written < rows {
+        seed += 1;
+        let request = requests(request_rows, request_rows, streams, end_ns + seed).remove(0);
+        loop {
+            match db
+                .write_with_durability(&namespace, request.clone(), Durability::Applied)
+                .await
+            {
+                Ok(_) => break,
+                Err(Error::Backpressure) => {
+                    rejected += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        written += request_rows;
+    }
+    println!(
+        "phase ingested at {:.1}s rows={written} rejected={rejected} rows_per_second={:.0}",
+        started.elapsed().as_secs_f64(),
+        written as f64 / started.elapsed().as_secs_f64()
+    );
+    drop(holds);
+    tokio::time::sleep(Duration::from_secs(env("PROFILE_TAIL_SECONDS", 60))).await;
+    stop.cancel();
+    let _ = reporter.await;
+    Arc::into_inner(db).unwrap().close().await.unwrap();
+    println!("phase closed at {:.1}s", started.elapsed().as_secs_f64());
 }
 
 /// Opens a reader over `PROFILE_STORE` that replays the WAL, as reader

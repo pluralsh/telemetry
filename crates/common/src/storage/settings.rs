@@ -20,13 +20,23 @@ use super::{StorageError, StorageResult};
 /// compaction or the newest L0.
 pub const DEFAULT_COMPACTED_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
+/// L0 SSTs one database uploads at once. Each streams through an upload
+/// buffer that holds up to about 90 MiB of parts, so SlateDB's 4 held about
+/// 350 MiB more at the end of an ingest burst than one, for the same ingest
+/// rate.
+pub const DEFAULT_L0_FLUSH_PARALLELISM: usize = 1;
+
 /// SlateDB's defaults with the overrides every database shares:
 ///
 /// - `compacted_options.min_age` of [`DEFAULT_COMPACTED_GC_MIN_AGE`].
 /// - `enable_trivial_move`, so a compaction whose inputs don't overlap
 ///   relinks them instead of rewriting them.
+/// - `l0_flush_parallelism` of [`DEFAULT_L0_FLUSH_PARALLELISM`].
 pub fn base_settings() -> Settings {
-    let mut settings = Settings::default();
+    let mut settings = Settings {
+        l0_flush_parallelism: DEFAULT_L0_FLUSH_PARALLELISM,
+        ..Settings::default()
+    };
     if let Some(compacted) = settings
         .garbage_collector_options
         .as_mut()
@@ -108,12 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn base_settings_shorten_gc_and_enable_trivial_moves() {
+    fn base_settings_shorten_gc_enable_trivial_moves_and_upload_one_l0() {
         let settings = load_settings_over(base_settings(), &config(None)).unwrap();
         assert_eq!(
             compacted_min_age(&settings),
             Some(DEFAULT_COMPACTED_GC_MIN_AGE)
         );
+        assert_eq!(settings.l0_flush_parallelism, DEFAULT_L0_FLUSH_PARALLELISM);
         assert!(settings.compactor_options.unwrap().enable_trivial_move);
     }
 

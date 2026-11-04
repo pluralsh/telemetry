@@ -23,14 +23,20 @@
 //!   of 35 times its estimated bytes for production-shaped logs (a 64 MiB
 //!   delta of 450k rows became 4.2M storage operations and 2.3 GiB), so
 //!   the write path holds roughly `(35 + 2) * write_bytes` at most.
+//! - **merge**: [`MERGE_BYTES_PER_INPUT_BYTE`] times the stored bytes of
+//!   the objects each compactor merge reads: their blocks, the merged
+//!   object's and the copy SlateDB's memtable takes of its write.
+//! - **compaction**: the estimate of what SlateDB's compactions of every
+//!   shard hold; see [`CompactionMemory`].
 //!
-//! A unit or write larger than a whole budget waits for all of it rather
-//! than forever, so one budget holds at most
+//! A unit, write or merge larger than a whole budget waits for all of it
+//! rather than forever, so one budget holds at most
 //! `max(capacity, largest single acquisition)`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use common::storage::compaction::{CompactionMemory, DEFAULT_COMPACTION_MEMORY_BYTES};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::error::{Error, Result};
@@ -41,6 +47,15 @@ pub const DEFAULT_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Default [`MemoryConfig::write_bytes`]: 16 MiB. A flush holds about 23
 /// times its bytes while it builds its storage writes, so about 370 MiB.
 pub const DEFAULT_WRITE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Resident bytes a compactor merge holds per stored byte it reads: the
+/// inputs' blocks, the merged object's, and SlateDB's memtable copy of its
+/// write, which holds about 1.5 times what it is given beyond that.
+pub const MERGE_BYTES_PER_INPUT_BYTE: u64 = 4;
+
+/// Default [`MemoryConfig::merge_bytes`]: one merge of the default 32 MiB
+/// `max_object_bytes` of inputs.
+pub const DEFAULT_MERGE_BUDGET_BYTES: u64 = MERGE_BYTES_PER_INPUT_BYTE * 32 * 1024 * 1024;
 
 /// Logs' SlateDB `max_unflushed_bytes`, 128 MiB rather than SlateDB's
 /// 1 GiB: the estimated encoded size of the memtables and WAL buffer past
@@ -71,6 +86,10 @@ pub struct MemoryConfig {
     /// write that finds it full flushes the buffer, so it may be below the
     /// write buffer's `flush_size_threshold`.
     pub write_bytes: u64,
+    /// Estimated bytes the compactor merges of every shard hold at once.
+    pub merge_bytes: u64,
+    /// Estimated bytes SlateDB's compactions of every shard hold at once.
+    pub compaction_bytes: u64,
 }
 
 impl Default for MemoryConfig {
@@ -78,6 +97,8 @@ impl Default for MemoryConfig {
         Self {
             decode_bytes: DEFAULT_DECODE_BUDGET_BYTES,
             write_bytes: DEFAULT_WRITE_BUDGET_BYTES,
+            merge_bytes: DEFAULT_MERGE_BUDGET_BYTES,
+            compaction_bytes: DEFAULT_COMPACTION_MEMORY_BYTES,
         }
     }
 }
@@ -91,6 +112,8 @@ pub(crate) struct MemoryBudget {
     /// The half of `write` rollup copies may hold at most, so they never
     /// keep ingest out of the other half.
     copy: Arc<Budget>,
+    merge: Arc<Budget>,
+    compaction: CompactionMemory,
 }
 
 /// Who a write's bytes are held for.
@@ -108,12 +131,27 @@ impl MemoryBudget {
             decode: Arc::new(Budget::new("decode", config.decode_bytes)),
             write: Arc::new(Budget::new("write", config.write_bytes)),
             copy: Arc::new(Budget::new("copy", (config.write_bytes / 2).max(1))),
+            merge: Arc::new(Budget::new("merge", config.merge_bytes)),
+            compaction: CompactionMemory::new(config.compaction_bytes),
         }
     }
 
     /// Holds `bytes` of decoding until the permit drops.
     pub(crate) async fn decode(&self, bytes: u64) -> Result<BudgetPermit> {
         self.decode.acquire(bytes).await
+    }
+
+    /// Holds a compactor merge of `input_bytes` stored bytes until the
+    /// permit drops.
+    pub(crate) async fn merge(&self, input_bytes: u64) -> Result<BudgetPermit> {
+        self.merge
+            .acquire(input_bytes.saturating_mul(MERGE_BYTES_PER_INPUT_BYTE))
+            .await
+    }
+
+    /// The budget SlateDB's compactions of every shard share.
+    pub(crate) fn compaction(&self) -> CompactionMemory {
+        self.compaction.clone()
     }
 
     /// Holds `bytes` of applied writes until the permit drops. Ingest fails
@@ -282,7 +320,27 @@ mod tests {
         MemoryBudget::new(&MemoryConfig {
             decode_bytes,
             write_bytes,
+            ..MemoryConfig::default()
         })
+    }
+
+    #[tokio::test]
+    async fn merges_wait_for_their_share_of_the_merge_budget() {
+        let budget = MemoryBudget::new(&MemoryConfig {
+            merge_bytes: 100,
+            ..MemoryConfig::default()
+        });
+        let held = budget.merge(20).await.unwrap();
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.merge(10).await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "80 of 100 bytes are held");
+        drop(held);
+        waiting.await.unwrap().unwrap();
+        // A merge larger than the budget takes all of it.
+        drop(budget.merge(1_000).await.unwrap());
     }
 
     #[tokio::test]

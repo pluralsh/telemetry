@@ -138,6 +138,11 @@ pub struct Config {
     pub retention_seconds: Option<u64>,
     pub page: PageConfig,
     pub read_cache: ReadCacheConfig,
+    /// Estimated bytes SlateDB's compactions of every shard hold at once;
+    /// it caps their concurrency, subcompactions and prefetch. Defaults to
+    /// 640 MiB. Binaries before this option reject configs that set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_memory_bytes: Option<u64>,
     /// Rollup of closed days of segments into wider segments.
     pub rollup: SegmentRollupConfig,
     pub write: WriteConfig,
@@ -164,6 +169,7 @@ impl Default for Config {
             retention_seconds: core.retention.map(|value| value.as_secs()),
             page: PageConfig::default(),
             read_cache: ReadCacheConfig::default(),
+            compaction_memory_bytes: None,
             rollup: SegmentRollupConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
@@ -253,6 +259,11 @@ impl Config {
         self.sharding
             .validate(self.mode)
             .map_err(ConfigError::Validation)?;
+        if self.compaction_memory_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "compaction_memory_bytes must be greater than zero".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -273,6 +284,9 @@ impl Config {
                 pages_bytes: self.read_cache.pages_bytes,
                 locators_bytes: self.read_cache.locators_bytes,
             },
+            compaction_memory_bytes: self
+                .compaction_memory_bytes
+                .unwrap_or(common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES),
         }
     }
 }

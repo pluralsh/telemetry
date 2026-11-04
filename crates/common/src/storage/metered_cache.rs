@@ -1,20 +1,19 @@
 //! An in-memory SlateDB cache weighed by the memory its entries hold.
 //!
 //! SlateDB's own in-memory cache weighs an entry by its payload alone
-//! ([`CachedEntry::size`]: the bloom filter bits or the index flatbuffer) and
-//! inserts what a fetch loaded without copying it out of the read buffer it
-//! may share. This cache copies every fetched entry into an allocation of its
-//! own and adds [`ENTRY_OVERHEAD_BYTES`] to its weight, so its capacity bounds
-//! the memory its entries keep alive.
+//! ([`CachedEntry::size`]: the bloom filter bits or the index flatbuffer).
+//! SlateDB copies each entry out of the read buffer it may share when it
+//! builds it; this cache adds [`ENTRY_OVERHEAD_BYTES`] to its weight, so its
+//! capacity bounds the memory its entries keep alive.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use foyer::{Cache, CacheBuilder, Event, EventListener};
-use slatedb::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache};
+use slatedb::db_cache::{CacheFetch, CacheLoader, CachedEntry, CachedKey, DbCache};
 use slatedb::manifest::SsTableId;
 
 use super::metrics_recorder::MixtricsBridge;
@@ -137,22 +136,11 @@ impl Residency {
 /// format, which disk caches persist and so keeps stable.
 fn sst_block(key: &CachedKey) -> Option<(SsTableId, u64)> {
     #[derive(serde::Deserialize)]
-    enum Id {
-        Wal(u64),
-        Compacted(String),
-    }
-    #[derive(serde::Deserialize)]
     enum Key {
-        V1(Id, u64),
-        V2(serde::de::IgnoredAny, Id, u64),
+        V3(serde::de::IgnoredAny, String, u64),
     }
-    let (Key::V1(id, block) | Key::V2(_, id, block)) =
-        serde_json::from_value(serde_json::to_value(key).ok()?).ok()?;
-    let id = match id {
-        Id::Wal(id) => SsTableId::Wal(id),
-        Id::Compacted(id) => SsTableId::Compacted(ulid::Ulid::from_string(&id).ok()?),
-    };
-    Some((id, block))
+    let Key::V3(_, id, block) = serde_json::from_value(serde_json::to_value(key).ok()?).ok()?;
+    Some((SsTableId::from(ulid::Ulid::from_string(&id).ok()?), block))
 }
 
 struct EvictionCounter {
@@ -229,18 +217,21 @@ impl MeteredCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         let attribution = self
             .attributes
             .then(|| ATTRIBUTION.try_with(Arc::clone).ok())
             .flatten();
         let resident = self.usage.resident.clone();
         let loaded = key.clone();
+        let missed = Arc::new(AtomicBool::new(false));
+        let miss = Arc::clone(&missed);
         let entry = self
             .usage
             .cache
             .get_or_fetch(&key, move || async move {
-                let entry = loader().await.map(|entry| entry.clamp_allocated_size());
+                miss.store(true, Ordering::Relaxed);
+                let entry = loader().await;
                 if entry.is_ok()
                     && let Some(resident) = resident
                 {
@@ -254,7 +245,11 @@ impl MeteredCache {
         if let Some(bytes) = attribution {
             bytes.fetch_add(entry_weight(&entry) as u64, Ordering::Relaxed);
         }
-        Ok(entry)
+        Ok(if missed.load(Ordering::Relaxed) {
+            CacheFetch::miss(entry)
+        } else {
+            CacheFetch::hit(entry)
+        })
     }
 }
 
@@ -295,7 +290,7 @@ impl DbCache for MeteredCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
 
@@ -303,7 +298,7 @@ impl DbCache for MeteredCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
 
@@ -311,7 +306,7 @@ impl DbCache for MeteredCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
 
@@ -319,7 +314,7 @@ impl DbCache for MeteredCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
 }
@@ -330,8 +325,7 @@ mod tests {
 
     #[test]
     fn reads_the_sst_and_block_of_slatedb_cache_keys() {
-        for id in [SsTableId::Compacted(ulid::Ulid::new()), SsTableId::Wal(7)] {
-            assert_eq!(sst_block(&CachedKey::from((id, 42))), Some((id, 42)));
-        }
+        let id = SsTableId::from(ulid::Ulid::new());
+        assert_eq!(sst_block(&CachedKey::from((id, 42))), Some((id, 42)));
     }
 }

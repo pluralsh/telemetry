@@ -225,6 +225,11 @@ pub struct Config {
     pub result_cache: ResultCacheConfig,
     pub query: QueryConfig,
     pub rollup: RollupConfig,
+    /// Estimated bytes SlateDB's compactions of every shard hold at once;
+    /// it caps their concurrency, subcompactions and prefetch. Defaults to
+    /// 640 MiB. Binaries before this option reject configs that set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_memory_bytes: Option<u64>,
     /// Merged over [`server_common::warmer::reader_warmer_defaults`]: keys a
     /// config leaves out keep the reader defaults.
     #[serde(deserialize_with = "server_common::warmer::deserialize_reader_warmer")]
@@ -254,6 +259,7 @@ impl Default for Config {
             result_cache: ResultCacheConfig::default(),
             query: QueryConfig::default(),
             rollup: RollupConfig::default(),
+            compaction_memory_bytes: None,
             cache_warmer: server_common::warmer::reader_warmer_defaults(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),
@@ -308,6 +314,11 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "query limits must be greater than zero".to_owned(),
+            ));
+        }
+        if self.compaction_memory_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "compaction_memory_bytes must be greater than zero".to_owned(),
             ));
         }
         self.cache_warmer

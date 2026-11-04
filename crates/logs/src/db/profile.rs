@@ -970,7 +970,7 @@ fn slate_layout(db: &LogDb) -> Vec<(usize, usize, usize)> {
                 segment
                     .compacted()
                     .iter()
-                    .map(|run| run.sst_views.len())
+                    .map(|run| run.sst_views().len())
                     .sum(),
             )
         })
@@ -2676,7 +2676,7 @@ async fn plan_window(db: &LogDb, namespace: &Namespace, hours: i64) -> (usize, u
             segment
                 .compacted()
                 .iter()
-                .flat_map(|run| run.sst_views.iter()),
+                .flat_map(|run| run.sst_views().iter()),
         ) {
             filters += view.sst.info.filter_len;
             index += view.sst.info.index_len;

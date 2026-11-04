@@ -8,6 +8,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use common::storage::compaction::CompactionMemory;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -174,13 +175,16 @@ impl TimeSeriesDb {
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
         let cache = common::SharedDbCache::from_slatedb_config(&config.storage).await?;
-        Self::open_with_cache(config, &cache).await
+        let compaction = CompactionMemory::new(config.compaction_memory_bytes);
+        Self::open_with_cache(config, &cache, &compaction).await
     }
 
-    /// Opens a writer that uses `cache` instead of building its own.
+    /// Opens a writer that uses `cache` instead of building its own and
+    /// compacts within `compaction`.
     pub(crate) async fn open_with_cache(
         config: Config,
         cache: &common::SharedDbCache,
+        compaction: &CompactionMemory,
     ) -> Result<Self> {
         let storage = Arc::new(
             Storage::try_new_with_cache(
@@ -188,6 +192,7 @@ impl TimeSeriesDb {
                 common::create_object_store(&config.storage.object_store)?,
                 cache,
                 config.retention,
+                compaction,
             )
             .await?,
         );

@@ -59,7 +59,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::manifest::{SortedRun, SsTableView, VersionedManifest};
-use slatedb::{RowEntry, SstReader, SstStats, ValueDeletable};
+use slatedb::{RowEntry, SstIndex, SstReader, SstStats, ValueDeletable};
 
 use crate::{BytesRange, StorageError, StorageResult};
 
@@ -481,10 +481,11 @@ fn count_rows_in_range_with_max(
     (counts, max_key)
 }
 
-fn block_key_range(index: &[(u64, Bytes)], i: usize, sst_last_entry: Option<&Bytes>) -> BytesRange {
-    let start = Bound::Included(index[i].1.clone());
+fn block_key_range(index: &SstIndex, i: usize, sst_last_entry: Option<&Bytes>) -> BytesRange {
+    let first_key = |i| Bytes::copy_from_slice(index.get(i).expect("block in index").1);
+    let start = Bound::Included(first_key(i));
     let end = if i + 1 < index.len() {
-        Bound::Excluded(index[i + 1].1.clone())
+        Bound::Excluded(first_key(i + 1))
     } else {
         match sst_last_entry {
             Some(last) => Bound::Included(last.clone()),

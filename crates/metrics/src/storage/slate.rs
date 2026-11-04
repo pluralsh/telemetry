@@ -64,7 +64,7 @@ use crate::storage::segment_extractor::{
     Segment, TimeseriesSegmentExtractor, bucket_span, parse_bucket, parse_segment, superseded,
     unsealed,
 };
-use common::storage::compaction::{MergeHold, MergeHolds, SegmentCompaction};
+use common::storage::compaction::{CompactionMemory, MergeHold, MergeHolds, SegmentCompaction};
 use common::storage::settings::{base_settings, load_settings_over};
 use slatedb::CompactorBuilder;
 
@@ -501,17 +501,26 @@ impl Storage {
         object_store: Arc<dyn ObjectStore>,
     ) -> crate::util::Result<Self> {
         let cache = SharedDbCache::from_slatedb_config(slate_config).await?;
-        Self::try_new_with_cache(slate_config, object_store, &cache, None).await
+        Self::try_new_with_cache(
+            slate_config,
+            object_store,
+            &cache,
+            None,
+            &CompactionMemory::default(),
+        )
+        .await
     }
 
     /// Like [`Self::try_new_with_object_store`] but uses `cache` instead of
     /// building one from the config. With a `retention`, compaction drops
-    /// bucket segments once everything in them has expired.
+    /// bucket segments once everything in them has expired. Compactions
+    /// share `compaction` with every other store built with it.
     pub(crate) async fn try_new_with_cache(
         slate_config: &SlateDbStorageConfig,
         object_store: Arc<dyn ObjectStore>,
         cache: &SharedDbCache,
         retention: Option<Duration>,
+        compaction: &CompactionMemory,
     ) -> crate::util::Result<Self> {
         let mut settings = load_settings(slate_config)?;
         info!(
@@ -521,11 +530,13 @@ impl Storage {
 
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
         let policy = SegmentCompaction::new(bucket_span)
+            .with_memory(compaction.clone())
             .with_retention(retention)
             .with_superseded(Arc::new(superseded))
             .with_unsealed(Arc::new(unsealed));
         let merge_holds = policy.holds();
-        let compactor = settings.compactor_options.take().map(|options| {
+        let compactor = settings.compactor_options.take().map(|mut options| {
+            policy.bound(&mut options);
             CompactorBuilder::new(slate_config.path.clone(), Arc::clone(&object_store))
                 .with_options(options)
                 .with_scheduler_supplier(policy.supplier(&slate_config.path))
@@ -538,7 +549,7 @@ impl Storage {
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
         if let Some(cache) = cache.cache() {
-            builder = builder.with_db_cache(cache);
+            builder = builder.with_db_cache(cache, common::storage::factory::DB_CACHE_ID);
         }
         if let Some(compactor) = compactor {
             builder = builder.with_compactor_builder(compactor);
@@ -643,15 +654,17 @@ impl Storage {
         batch: WriteBatch,
         options: WriteOptions,
     ) -> StorageResult<WriteResult> {
-        let slate_options = SlateDbWriteOptions {
-            await_durable: options.await_durable,
-            ..SlateDbWriteOptions::default()
-        };
         let write_handle = self
             .db
-            .write_with_options(batch, &slate_options)
+            .write_with_options(batch, &SlateDbWriteOptions::default())
             .await
             .map_err(StorageError::from_storage)?;
+        if options.await_durable {
+            write_handle
+                .await_durable()
+                .await
+                .map_err(StorageError::from_storage)?;
+        }
         self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
@@ -665,11 +678,7 @@ impl Storage {
     /// `DbSnapshot` exposes no status, so the writer's segment list is
     /// captured here and served unchanged for the snapshot's lifetime.
     pub(crate) async fn snapshot(&self) -> StorageResult<StorageSnapshot> {
-        let snapshot = self
-            .db
-            .snapshot()
-            .await
-            .map_err(StorageError::from_storage)?;
+        let snapshot = self.db.snapshot().map_err(StorageError::from_storage)?;
         let segments = self.db.status().list_segments();
         Ok(StorageSnapshot {
             reader: StorageReaderInner {
@@ -722,7 +731,7 @@ impl Storage {
             segments
                 .iter()
                 .flat_map(|segment| segment.compacted())
-                .map(|run| run.sst_views.len())
+                .map(|run| run.sst_views().len())
                 .sum(),
         )
     }

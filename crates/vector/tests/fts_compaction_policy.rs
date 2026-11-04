@@ -128,7 +128,7 @@ async fn fts_compacted_runs(admin: &Admin, fts_prefix: &[u8]) -> Vec<(u32, Vec<S
                     .compacted()
                     .iter()
                     .map(|run| {
-                        let ssts = run.sst_views.iter().map(|v| v.id.to_string()).collect();
+                        let ssts = run.sst_views().iter().map(|v| v.id.to_string()).collect();
                         (run.id, ssts)
                     })
                     .collect()

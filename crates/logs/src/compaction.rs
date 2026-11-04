@@ -28,6 +28,7 @@ use crate::codec::{
 };
 use crate::config::{CompactionConfig, PageConfig};
 use crate::error::{Error, Result};
+use crate::memory::MemoryBudget;
 use crate::model::SegmentId;
 use crate::object::{
     MergeInput, ObjectLocation, ObjectProperties, ReadNeeds, merge_objects, object_records,
@@ -93,6 +94,7 @@ pub(crate) struct Compactor {
     config: CompactionConfig,
     page: PageConfig,
     segment_ns: i64,
+    memory: MemoryBudget,
     segments: HashMap<(Namespace, SegmentId), SegmentState>,
     deletes: BinaryHeap<Reverse<PendingDelete>>,
 }
@@ -103,12 +105,14 @@ impl Compactor {
         config: CompactionConfig,
         page: PageConfig,
         segment_ns: i64,
+        memory: MemoryBudget,
     ) -> Self {
         Self {
             storage,
             config,
             page,
             segment_ns,
+            memory,
             segments: HashMap::new(),
             deletes: BinaryHeap::new(),
         }
@@ -374,7 +378,8 @@ impl Compactor {
     /// Replaces `inputs` with one object in a single atomic write and
     /// schedules their blocks and directories for deletion. The merged object
     /// takes the first input's ID, so its run records overwrite that input's;
-    /// every other input's run records are deleted.
+    /// every other input's run records are deleted. Holds the inputs' share
+    /// of the process's merge budget until the write is applied.
     async fn merge(
         &self,
         namespace: &Namespace,
@@ -382,6 +387,10 @@ impl Compactor {
         inputs: &[Tracked],
         now_unix_ms: u64,
     ) -> Result<(Tracked, Vec<PendingDelete>)> {
+        let _merging = self
+            .memory
+            .merge(inputs.iter().map(|tracked| tracked.stored.bytes()).sum())
+            .await?;
         let started = Instant::now();
         let blocks = futures::future::try_join_all(inputs.iter().map(|tracked| {
             read_blocks(

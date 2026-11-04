@@ -424,6 +424,7 @@ impl LogDb {
         .with_semantics(
             storage_semantics().with_segment_compaction(
                 SegmentCompaction::new(crate::codec::segment_span)
+                    .with_memory(memory.compaction())
                     .with_retention(config.retention)
                     .with_holds(merge_holds.clone())
                     .with_superseded(common::storage::rollup::superseded(
@@ -462,6 +463,7 @@ impl LogDb {
                 config.compaction.clone(),
                 config.page.clone(),
                 segment_ns,
+                memory.clone(),
             )
         });
         let mut write_coordinator = WriteCoordinator::new(

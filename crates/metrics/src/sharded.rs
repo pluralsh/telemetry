@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
+use common::storage::compaction::CompactionMemory;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
 use futures::{FutureExt, Stream, StreamExt, stream};
@@ -183,12 +184,14 @@ impl ShardedMetrics {
         let limits = config.query_limits;
         let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
         let shard_cache = block_cache.clone();
+        let compaction = CompactionMemory::new(config.compaction_memory_bytes);
         let opener = shard_opener(move |shard| {
             let mut config = config.clone();
             config.storage = shard_storage(&config, shard);
             let cache = shard_cache.clone();
+            let compaction = compaction.clone();
             async move {
-                TimeSeriesDb::open_with_cache(config, &cache)
+                TimeSeriesDb::open_with_cache(config, &cache, &compaction)
                     .await
                     .map(MetricsShard::Writer)
             }

@@ -77,6 +77,7 @@ fn default_scan_options() -> ScanOptions {
         max_fetch_tasks: 8,
         order: IterationOrder::Ascending,
         filter_context: None,
+        tracing_options: None,
     }
 }
 
@@ -270,7 +271,7 @@ impl SlateReadHandle {
                             segment
                                 .compacted()
                                 .iter()
-                                .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
+                                .flat_map(|run| run.sst_views().iter().map(|view| view.sst.id)),
                         )
                         .map(move |id| (id, targets.clone()))
                         .collect::<Vec<_>>(),
@@ -341,7 +342,7 @@ impl SlateReadHandle {
                 manifest
                     .compacted()
                     .iter()
-                    .flat_map(|run| run.sst_views.iter()),
+                    .flat_map(|run| run.sst_views().iter()),
             )
             .map(|view| view.sst.id)
             .collect();
@@ -354,7 +355,7 @@ impl SlateReadHandle {
                     segment
                         .compacted()
                         .iter()
-                        .flat_map(|run| run.sst_views.iter()),
+                        .flat_map(|run| run.sst_views().iter()),
                 )
                 .collect();
             live.extend(views.iter().map(|view| view.sst.id));
@@ -384,7 +385,7 @@ impl SlateReadHandle {
                 };
                 let payload = warm::payload_estimate(&view.sst.info);
                 (
-                    view.sst.id,
+                    view.sst.clone(),
                     Arc::clone(&targets),
                     recency,
                     estimate,
@@ -397,21 +398,15 @@ impl SlateReadHandle {
             ManifestSource::Reader(reader) => Arc::clone(reader) as warm::WarmDb,
         };
         let db = plan.add_database(db, live);
-        for (id, targets, recency, estimate, payload) in planned {
-            plan.push(db, id, targets, recency, estimate, payload);
+        for (sst, targets, recency, estimate, payload) in planned {
+            plan.push(db, sst, targets, recency, estimate, payload);
         }
     }
 }
 
-/// When an SST was written, in epoch milliseconds: compacted SST ids are
-/// ULIDs. WAL SSTs rank first.
+/// When an SST was written, in epoch milliseconds: SST ids are ULIDs.
 fn written_ms(id: &slatedb::manifest::SsTableId) -> i64 {
-    match id {
-        slatedb::manifest::SsTableId::Compacted(ulid) => {
-            i64::try_from(ulid.timestamp_ms()).unwrap_or(i64::MAX)
-        }
-        slatedb::manifest::SsTableId::Wal(_) => i64::MAX,
-    }
+    i64::try_from(id.value().timestamp_ms()).unwrap_or(i64::MAX)
 }
 
 /// SlateDB-backed implementation of the Storage trait.
@@ -490,15 +485,18 @@ impl SlateDbStorage {
         batch: WriteBatch,
         options: WriteOptions,
     ) -> StorageResult<WriteResult> {
-        let slate_options = SlateDbWriteOptions {
-            await_durable: options.await_durable,
-            ..SlateDbWriteOptions::default()
-        };
+        let slate_options = SlateDbWriteOptions::default();
         let write_handle = self
             .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
+        if options.await_durable {
+            write_handle
+                .await_durable()
+                .await
+                .map_err(StorageError::from_storage)?;
+        }
         self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
@@ -818,15 +816,18 @@ impl Storage for SlateDbStorage {
         for op in records {
             batch.put_with_options(op.record.key, op.record.value, &op.options.into());
         }
-        let slate_options = SlateDbWriteOptions {
-            await_durable: options.await_durable,
-            ..SlateDbWriteOptions::default()
-        };
+        let slate_options = SlateDbWriteOptions::default();
         let write_handle = self
             .db
             .write_with_options(batch, &slate_options)
             .await
             .map_err(StorageError::from_storage)?;
+        if options.await_durable {
+            write_handle
+                .await_durable()
+                .await
+                .map_err(StorageError::from_storage)?;
+        }
         self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
@@ -842,10 +843,7 @@ impl Storage for SlateDbStorage {
         for op in records {
             batch.merge_with_options(op.record.key, op.record.value, &op.options.into());
         }
-        let slate_options = SlateDbWriteOptions {
-            await_durable: options.await_durable,
-            ..SlateDbWriteOptions::default()
-        };
+        let slate_options = SlateDbWriteOptions::default();
         let write_handle = self
             .db
             .write_with_options(batch, &slate_options)
@@ -860,6 +858,12 @@ impl Storage for SlateDbStorage {
                     StorageError::from_storage(e)
                 }
             })?;
+        if options.await_durable {
+            write_handle
+                .await_durable()
+                .await
+                .map_err(StorageError::from_storage)?;
+        }
         self.unflushed.store(true, Ordering::Release);
         Ok(WriteResult {
             seqnum: write_handle.seqnum(),
@@ -871,11 +875,7 @@ impl Storage for SlateDbStorage {
     }
 
     async fn snapshot(&self) -> StorageResult<Arc<dyn StorageSnapshot>> {
-        let snapshot = self
-            .db
-            .snapshot()
-            .await
-            .map_err(StorageError::from_storage)?;
+        let snapshot = self.db.snapshot().map_err(StorageError::from_storage)?;
         Ok(Arc::new(SlateDbStorageSnapshot { snapshot }))
     }
 
@@ -911,8 +911,8 @@ impl From<Ttl> for slatedb::config::Ttl {
         match value {
             Ttl::Default => slatedb::config::Ttl::Default,
             Ttl::NoExpiry => slatedb::config::Ttl::NoExpiry,
-            Ttl::ExpireAfter(ts) => slatedb::config::Ttl::ExpireAfter(ts),
-            Ttl::ExpireAt(ts) => slatedb::config::Ttl::ExpireAt(ts),
+            Ttl::ExpireAfter(ts) => slatedb::config::Ttl::ExpireAfterMillis(ts),
+            Ttl::ExpireAt(ts) => slatedb::config::Ttl::ExpireAtMillis(ts),
         }
     }
 }

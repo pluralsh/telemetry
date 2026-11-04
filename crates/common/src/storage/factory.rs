@@ -17,7 +17,7 @@ use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegi
 use super::settings::{base_settings, load_settings_over};
 use super::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
-use slatedb::config::{Settings, SstBlockSize};
+use slatedb::config::{CompactorOptions, Settings, SstBlockSize};
 pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
@@ -66,9 +66,7 @@ enum StorageBuilderInner {
     InMemory,
     SlateDb {
         db_builder: Box<DbBuilder<String>>,
-        /// The compactor from the settings' `compactor_options`, attached at
-        /// [`StorageBuilder::build`] so it can take the semantics' scheduler.
-        compactor: Option<Box<CompactorBuilder<String>>>,
+        compactor: Option<Box<PendingCompactor>>,
         path: String,
         /// Built alongside the writer so [`SlateDbStorage::slate_read`] can
         /// serve the count path from the same path/object store/cache.
@@ -76,6 +74,17 @@ enum StorageBuilderInner {
         /// See [`SlateDbStorage::with_meta_cache`].
         meta: Option<CacheUsage>,
     },
+}
+
+type CompactorMap = Box<dyn FnOnce(CompactorBuilder<String>) -> CompactorBuilder<String> + Send>;
+
+/// The compactor from the settings' `compactor_options`, built at
+/// [`StorageBuilder::build`] so the semantics' segment compaction policy can
+/// bound its options and supply its scheduler.
+struct PendingCompactor {
+    object_store: Arc<dyn ObjectStore>,
+    options: CompactorOptions,
+    maps: Vec<CompactorMap>,
 }
 
 impl StorageBuilder {
@@ -130,10 +139,11 @@ impl StorageBuilder {
                     slate_config, settings
                 );
                 let compactor = settings.compactor_options.take().map(|options| {
-                    Box::new(
-                        CompactorBuilder::new(slate_config.path.clone(), object_store.clone())
-                            .with_options(options),
-                    )
+                    Box::new(PendingCompactor {
+                        object_store: object_store.clone(),
+                        options,
+                        maps: Vec::new(),
+                    })
                 });
                 let meta = cache.meta_usage();
                 let cache = cache.cache();
@@ -142,7 +152,7 @@ impl StorageBuilder {
                         .with_settings(settings)
                         .with_sst_block_size(sst_block_size(&slate_config.disk));
                 if let Some(cache) = cache.clone() {
-                    db_builder = db_builder.with_db_cache(cache);
+                    db_builder = db_builder.with_db_cache(cache, DB_CACHE_ID);
                 }
                 // Share the writer's path/object store/cache so the count path
                 // reads the same SSTs the writer produces.
@@ -207,10 +217,14 @@ impl StorageBuilder {
     /// No-op for InMemory storage and when compaction is disabled.
     pub fn map_compactor(
         mut self,
-        f: impl FnOnce(CompactorBuilder<String>) -> CompactorBuilder<String>,
+        f: impl FnOnce(CompactorBuilder<String>) -> CompactorBuilder<String> + Send + 'static,
     ) -> Self {
-        if let StorageBuilderInner::SlateDb { compactor, .. } = &mut self.inner {
-            *compactor = compactor.take().map(|c| Box::new(f(*c)));
+        if let StorageBuilderInner::SlateDb {
+            compactor: Some(compactor),
+            ..
+        } = &mut self.inner
+        {
+            compactor.maps.push(Box::new(f));
         }
         self
     }
@@ -235,8 +249,22 @@ impl StorageBuilder {
                 meta,
             } => {
                 let mut db_builder = *db_builder;
-                if let Some(mut compactor) = compactor.map(|compactor| *compactor) {
-                    if let Some(policy) = &self.semantics.segment_compaction {
+                if let Some(pending) = compactor {
+                    let PendingCompactor {
+                        object_store,
+                        mut options,
+                        maps,
+                    } = *pending;
+                    let policy = self.semantics.segment_compaction.as_ref();
+                    if let Some(policy) = policy {
+                        policy.bound(&mut options);
+                    }
+                    let mut compactor =
+                        CompactorBuilder::new(path.clone(), object_store).with_options(options);
+                    for map in maps {
+                        compactor = map(compactor);
+                    }
+                    if let Some(policy) = policy {
                         compactor = compactor.with_scheduler_supplier(policy.supplier(&path));
                     }
                     db_builder = db_builder.with_compactor_builder(compactor);
@@ -600,7 +628,7 @@ pub async fn create_storage_read(
                 builder = builder.with_segment_extractor(extractor);
             }
             if let Some(cache) = cache.clone() {
-                builder = builder.with_db_cache(cache);
+                builder = builder.with_db_cache(cache, DB_CACHE_ID);
             }
             let reader = builder.build().await.map_err(|e| {
                 StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
@@ -615,11 +643,15 @@ pub async fn create_storage_read(
     }
 }
 
+/// The cache scope every database opens its cache with. SST ids are ULIDs,
+/// unique across databases, so one scope lets a shard's writer, readers and
+/// warmer share entries, and a restart recovers a hybrid cache's disk tier.
+pub const DB_CACHE_ID: u64 = 0;
+
 /// One SlateDB block and metadata cache shared by every database opened with
 /// it, such as all storage shards of a process.
 ///
-/// SlateDB scopes cache keys per `Db` / `DbReader`, so sharing is safe. One
-/// cache keeps the configured capacities a per-process bound rather than a
+/// Every database uses [`DB_CACHE_ID`]. One cache keeps the configured capacities a per-process bound rather than a
 /// per-shard one, and gives a hybrid cache's disk tier a single owner of its
 /// `disk_path`; Foyer names its files deterministically, so two caches on one
 /// directory overwrite each other.
@@ -1545,7 +1577,7 @@ mod tests {
                 .index()
                 .await
                 .unwrap()
-                .into_iter()
+                .iter()
                 .map(|(offset, _)| offset)
                 .collect();
             assert!(offsets.len() > 2, "SST {id} has {} blocks", offsets.len());

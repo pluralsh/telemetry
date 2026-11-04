@@ -509,6 +509,9 @@ pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {
         },
         query_limits: config.query.limits(),
         rollup: config.rollup.rollup(),
+        compaction_memory_bytes: config
+            .compaction_memory_bytes
+            .unwrap_or(common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES),
     }
 }
 

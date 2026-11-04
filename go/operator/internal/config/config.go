@@ -164,10 +164,11 @@ func Render(input Input) (Result, error) {
 				MaxRequestBytes:        int64Value(input.Metrics.Spec.Config.Request.MaxRequestBytes, defaultMaxRequestBytes),
 				MaxDecodedRequestBytes: int64Value(input.Metrics.Spec.Config.Request.MaxDecodedRequestBytes, defaultMaxDecodedRequestBytes),
 			},
-			Rollup:     renderRollupConfig(plan),
-			Sharding:   renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, workload, grpcPort(input.Metrics), mode),
-			Auth:       renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
-			Namespaces: namespaces,
+			Rollup:                renderRollupConfig(plan),
+			CompactionMemoryBytes: plan.compactionBudget(metricsCompactionPercent),
+			Sharding:              renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, workload, grpcPort(input.Metrics), mode),
+			Auth:                  renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
+			Namespaces:            namespaces,
 		})
 	}
 	writerMode := modeStandalone
@@ -344,6 +345,7 @@ func renderLogs(input Input) (Result, error) {
 			Rollup:                 renderRollupConfig(plan),
 			ReaderCacheCapacity:    plan.logsObjectBlockCache(),
 			ResultCacheCapacity:    plan.logsResultCache(),
+			Memory:                 renderLogsMemory{CompactionBytes: plan.compactionBudget(logsCompactionPercent)},
 			Page: renderLogsPage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
@@ -462,6 +464,7 @@ func renderTraces(input Input) (Result, error) {
 			RetentionSeconds:       retention,
 			Rollup:                 renderRollupConfig(plan),
 			ReadCache:              plan.tracesReadCache(),
+			CompactionMemoryBytes:  plan.compactionBudget(tracesCompactionPercent),
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
@@ -822,6 +825,19 @@ func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
 	}
 }
 
+// compactionBudget bounds what SlateDB's compactions of every shard hold at
+// once. One subcompaction of eight sources holds about 154 MiB, so the floor
+// still runs one; metrics, whose other shares leave 3%, gets the least.
+func (plan memoryPlan) compactionBudget(percent int64) int64 {
+	return plan.share(percent, 160*mebibyte)
+}
+
+const (
+	logsCompactionPercent    = 10
+	tracesCompactionPercent  = 10
+	metricsCompactionPercent = 3
+)
+
 func renderRollupConfig(plan memoryPlan) renderRollup {
 	return renderRollup{CopyBufferBytes: plan.rollupCopyBuffer()}
 }
@@ -905,6 +921,7 @@ type renderConfig struct {
 	Write                          renderWrite          `json:"write"`
 	Request                        renderMetricsRequest `json:"request"`
 	Rollup                         renderRollup         `json:"rollup"`
+	CompactionMemoryBytes          int64                `json:"compaction_memory_bytes"`
 	Sharding                       renderSharding       `json:"sharding"`
 	Auth                           renderAuth           `json:"auth"`
 	Namespaces                     []renderNamespace    `json:"namespaces"`
@@ -938,9 +955,13 @@ type renderLogsConfig struct {
 	Rollup                 renderRollup        `json:"rollup"`
 	ReaderCacheCapacity    int64               `json:"reader_cache_capacity"`
 	ResultCacheCapacity    int64               `json:"result_cache_capacity"`
+	Memory                 renderLogsMemory    `json:"memory"`
 	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
 	Auth                   renderAuth          `json:"auth"`
 	Namespaces             []renderNamespace   `json:"namespaces"`
+}
+type renderLogsMemory struct {
+	CompactionBytes int64 `json:"compaction_bytes"`
 }
 type renderTracesReadCache struct {
 	MetadataBytes int64 `json:"metadata_bytes"`
@@ -969,6 +990,7 @@ type renderTracesConfig struct {
 	Request                renderTracesRequest   `json:"request"`
 	Rollup                 renderRollup          `json:"rollup"`
 	ReadCache              renderTracesReadCache `json:"read_cache"`
+	CompactionMemoryBytes  int64                 `json:"compaction_memory_bytes"`
 	CacheWarmer            renderCacheWarmer     `json:"cache_warmer"`
 	Auth                   renderAuth            `json:"auth"`
 	Namespaces             []renderNamespace     `json:"namespaces"`

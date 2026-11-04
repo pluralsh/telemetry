@@ -289,6 +289,8 @@ impl Config {
             || self.write.has_zero_limit()
             || self.memory.decode_bytes == Some(0)
             || self.memory.write_bytes == Some(0)
+            || self.memory.merge_bytes == Some(0)
+            || self.memory.compaction_bytes == Some(0)
         {
             return Err(ConfigError::Validation(
                 "durations and resource limits must be greater than zero".to_owned(),
@@ -421,6 +423,14 @@ impl Config {
                 .memory
                 .write_bytes
                 .unwrap_or(plural_logs::DEFAULT_WRITE_BUDGET_BYTES),
+            merge_bytes: self
+                .memory
+                .merge_bytes
+                .unwrap_or(plural_logs::DEFAULT_MERGE_BUDGET_BYTES),
+            compaction_bytes: self
+                .memory
+                .compaction_bytes
+                .unwrap_or(plural_logs::DEFAULT_COMPACTION_MEMORY_BYTES),
         }
     }
 }
@@ -440,11 +450,23 @@ pub struct MemoryConfig {
     /// and rollups wait. Defaults to 16 MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_bytes: Option<u64>,
+    /// Estimated bytes the object compactor's merges of every shard hold at
+    /// once, four per stored byte they read. Defaults to 128 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_bytes: Option<u64>,
+    /// Estimated bytes SlateDB's compactions of every shard hold at once;
+    /// it caps their concurrency, subcompactions and prefetch. Defaults to
+    /// 640 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_bytes: Option<u64>,
 }
 
 impl MemoryConfig {
     fn is_unset(&self) -> bool {
-        self.decode_bytes.is_none() && self.write_bytes.is_none()
+        self.decode_bytes.is_none()
+            && self.write_bytes.is_none()
+            && self.merge_bytes.is_none()
+            && self.compaction_bytes.is_none()
     }
 }
 
@@ -521,11 +543,22 @@ mod tests {
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(!yaml.contains("memory"), "{yaml}");
 
-        let config =
-            Config::from_yaml("memory:\n  decode_bytes: 1024\n  write_bytes: 2048\n").unwrap();
+        let config = Config::from_yaml(
+            "memory:\n  decode_bytes: 1024\n  write_bytes: 2048\n  merge_bytes: 4096\n  compaction_bytes: 8192\n",
+        )
+        .unwrap();
         let memory = config.logs_config().memory;
-        assert_eq!((memory.decode_bytes, memory.write_bytes), (1024, 2048));
+        assert_eq!(
+            (
+                memory.decode_bytes,
+                memory.write_bytes,
+                memory.merge_bytes,
+                memory.compaction_bytes
+            ),
+            (1024, 2048, 4096, 8192)
+        );
         assert!(Config::from_yaml("memory:\n  write_bytes: 0\n").is_err());
+        assert!(Config::from_yaml("memory:\n  compaction_bytes: 0\n").is_err());
     }
 
     #[test]

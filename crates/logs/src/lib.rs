@@ -35,7 +35,10 @@ pub use config::{
 };
 pub use db::{Durability, LogDb, WriteReport};
 pub use error::{Error, Result};
-pub use memory::{DEFAULT_DECODE_BUDGET_BYTES, DEFAULT_WRITE_BUDGET_BYTES};
+pub use memory::{
+    DEFAULT_COMPACTION_MEMORY_BYTES, DEFAULT_DECODE_BUDGET_BYTES, DEFAULT_MERGE_BUDGET_BYTES,
+    DEFAULT_WRITE_BUDGET_BYTES,
+};
 pub use model::{Field, Fields, Label, Labels, LogBatch, LogEntry, LogRow};
 pub use query::{
     DEFAULT_INSTANT_LOG_LOOKBACK_NS, Direction, LogStream, MatrixSeries, QueryOptions,

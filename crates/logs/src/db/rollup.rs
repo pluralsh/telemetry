@@ -549,6 +549,7 @@ mod tests {
             memory: crate::MemoryConfig {
                 decode_bytes: 1,
                 write_bytes: 1,
+                ..crate::MemoryConfig::default()
             },
             ..config()
         })

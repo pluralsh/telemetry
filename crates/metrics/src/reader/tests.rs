@@ -260,6 +260,7 @@ async fn slatedb_writer_and_reader_coexist_no_fencing() {
         query_cache: Default::default(),
         query_limits: Default::default(),
         rollup: Default::default(),
+        compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
     })
     .await
     .unwrap();
@@ -397,6 +398,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         query_cache: Default::default(),
         query_limits: Default::default(),
         rollup: Default::default(),
+        compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
     })
     .await
     .unwrap();
@@ -424,6 +426,7 @@ async fn should_persist_data_after_flush_and_writer_reopen() {
         query_cache: Default::default(),
         query_limits: Default::default(),
         rollup: Default::default(),
+        compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
     })
     .await
     .unwrap();
@@ -588,6 +591,7 @@ async fn should_open_reader_pinned_to_checkpoint() {
         query_cache: Default::default(),
         query_limits: Default::default(),
         rollup: Default::default(),
+        compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
     })
     .await
     .unwrap();

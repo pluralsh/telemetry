@@ -286,10 +286,7 @@ impl Harness {
                 key,
                 vec![0x5a; 192],
                 &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..WriteOptions::default()
-                },
+                &WriteOptions::default(),
             )
             .await
             .is_ok()

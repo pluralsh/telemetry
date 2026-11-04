@@ -28,11 +28,21 @@
 //!   reports as superseded (every record it holds is held by another
 //!   segment), also without rewriting it.
 //!
+//! A merge reads every source at once, so it takes at most
+//! [`SegmentCompaction::with_max_merge_sources`] of them: past that it
+//! merges a segment's oldest L0s into a fresh run, or its newest sources
+//! once it has at most one L0, and later polls merge what remains.
+//!
 //! Every proposal, size-tiered ones included, then passes [`admit`], which
 //! holds back the ones SlateDB would reject and all but one of those that
 //! finish without a worker; see there for why a second one panics SlateDB.
+//! What it passes on runs only while the estimated memory of every
+//! compaction of the process fits its [`CompactionMemory`].
 
 mod admit;
+mod memory;
+
+pub use memory::{CompactionMemory, DEFAULT_COMPACTION_MEMORY_BYTES};
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -64,6 +74,10 @@ pub const DEFAULT_MERGE_GRACE: Duration = Duration::from_secs(5 * 60);
 /// about 10 sources; capping it at 8 costs about one more rewrite of the
 /// hour, and lower caps cost several.
 pub const DEFAULT_MAX_OPEN_SOURCES: usize = 8;
+/// Default [`SegmentCompaction::with_max_merge_sources`]: a rollup's held
+/// segment or one compaction fell behind on can have hundreds of sources,
+/// each holding its own prefetch while a merge of all of them runs.
+pub const DEFAULT_MAX_MERGE_SOURCES: usize = 8;
 /// A merged segment's late L0s and runs are merged in once they hold this
 /// fraction (as a divisor) of its largest source's bytes...
 const LATE_BYTES_DIVISOR: u64 = 16;
@@ -157,10 +171,12 @@ pub struct SegmentCompaction {
     span: SegmentSpan,
     grace: Duration,
     max_open_sources: usize,
+    max_merge_sources: usize,
     retention: Option<Duration>,
     superseded: Option<Superseded>,
     unsealed: Option<Superseded>,
     holds: MergeHolds,
+    memory: CompactionMemory,
 }
 
 impl std::fmt::Debug for SegmentCompaction {
@@ -168,6 +184,8 @@ impl std::fmt::Debug for SegmentCompaction {
         f.debug_struct("SegmentCompaction")
             .field("grace", &self.grace)
             .field("max_open_sources", &self.max_open_sources)
+            .field("max_merge_sources", &self.max_merge_sources)
+            .field("memory", &self.memory.budget())
             .field("retention", &self.retention)
             .field("superseded", &self.superseded.is_some())
             .field("unsealed", &self.unsealed.is_some())
@@ -181,11 +199,32 @@ impl SegmentCompaction {
             span,
             grace: DEFAULT_MERGE_GRACE,
             max_open_sources: DEFAULT_MAX_OPEN_SOURCES,
+            max_merge_sources: DEFAULT_MAX_MERGE_SOURCES,
             retention: None,
             superseded: None,
             unsealed: None,
             holds: MergeHolds::default(),
+            memory: CompactionMemory::default(),
         }
+    }
+
+    /// Most sources one merge reads at once.
+    pub fn with_max_merge_sources(mut self, max_merge_sources: usize) -> Self {
+        self.max_merge_sources = max_merge_sources.max(2);
+        self
+    }
+
+    /// Runs compactions within `memory`, which the process's other databases
+    /// share; otherwise within a default budget of this database's own.
+    pub fn with_memory(mut self, memory: CompactionMemory) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// Shrinks `options`, which the compactor of this policy's database runs
+    /// with, until one merge of its most sources fits the memory budget.
+    pub fn bound(&self, options: &mut CompactorOptions) {
+        self.memory.bound(options, self.max_merge_sources);
     }
 
     /// Most sources a segment keeps before it's merged, whether or not it
@@ -266,6 +305,8 @@ impl CompactionSchedulerSupplier for Supplier {
             trivial_moves: options.enable_trivial_move,
             deferred: Mutex::default(),
             path: self.path.clone(),
+            cost: memory::Cost::new(options),
+            memory: self.policy.memory.holder(),
         })
     }
 }
@@ -275,6 +316,9 @@ struct Scheduler {
     policy: SegmentCompaction,
     max_concurrent: usize,
     trivial_moves: bool,
+    /// `None` when compactions run in another process.
+    cost: Option<memory::Cost>,
+    memory: memory::Holder,
     /// Segments whose proposals the last poll deferred, which go first in the
     /// next so that one kind of proposal can't hold back another for good.
     deferred: Mutex<HashSet<Bytes>>,
@@ -319,7 +363,8 @@ impl Scheduler {
         .increment(1);
     }
 
-    /// [`Self::proposed`], less what [`admit`] holds back.
+    /// [`Self::proposed`], less what [`admit`] holds back and what doesn't
+    /// fit the memory budget beside the compactions already running.
     fn admitted(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
         let (mut proposed, kinds) = self.proposed(state);
         let mut deferred = self
@@ -352,6 +397,37 @@ impl Scheduler {
             }
             self.rejected(rejection.label());
         }
+        let specs = match self.cost {
+            Some(cost) => {
+                let running: u64 = state
+                    .compactions()
+                    .into_iter()
+                    .flat_map(|compactions| compactions.recent_compactions())
+                    .filter(|compaction| compaction.active())
+                    .map(|compaction| {
+                        cost.of(compaction.spec(), Some(compaction.subcompactions().len()))
+                    })
+                    .sum();
+                let costed = specs
+                    .into_iter()
+                    .map(|spec| {
+                        let bytes = cost.of(&spec, None);
+                        (spec, bytes)
+                    })
+                    .collect();
+                let others = self.memory.others();
+                let (specs, over, admitted) =
+                    within_budget(costed, running + others, self.memory.budget());
+                for spec in over {
+                    tracing::debug!(path = %self.path, %spec, "deferring compaction until the memory budget has room");
+                    deferred.insert(spec.segment().clone());
+                    self.rejected("memory");
+                }
+                self.memory.set(running + admitted);
+                specs
+            }
+            None => specs,
+        };
         for spec in &specs {
             if let Some(kind) = kinds.get(spec.segment()) {
                 metrics::counter!(
@@ -413,7 +489,7 @@ impl Scheduler {
                     segment
                         .l0()
                         .iter()
-                        .chain(segment.compacted().iter().flat_map(|run| &run.sst_views))
+                        .chain(segment.compacted().iter().flat_map(|run| run.sst_views()))
                         .map(|view| view.id.timestamp_ms())
                 };
                 let sizes = segment
@@ -615,7 +691,8 @@ fn plan(
         })
         .partition(|(_, _, segment)| requested(segment));
     let merges = requested.into_iter().chain(routine).map(|(_, _, segment)| {
-        let destination = match segment.runs.iter().min() {
+        let (sources, runs) = merge_window(segment, policy.max_merge_sources);
+        let destination = match runs.iter().min() {
             Some(id) => *id,
             None => {
                 next_run += 1;
@@ -624,11 +701,52 @@ fn plan(
         };
         Planned::Merge {
             prefix: segment.prefix.clone(),
-            sources: segment.sources(),
+            sources,
             destination,
         }
     });
     drains.chain(merges).take(slots).collect()
+}
+
+/// The sources of `segment`'s next merge, and the sorted runs among them:
+/// all of them when they number at most `cap`. Otherwise a window SlateDB
+/// accepts, consecutive in its newest-to-oldest order: its oldest `cap` L0s
+/// while it has two or more, which go into a fresh run, then its newest
+/// `cap` sources, which go into the oldest run among them. Each pass
+/// rewrites only its window, so a segment of `n` sources is rewritten about
+/// `log_cap(n)` times rather than read through `n` iterators at once.
+fn merge_window(segment: &SegmentState, cap: usize) -> (Vec<SourceId>, &[u32]) {
+    let sources = segment.sources();
+    let l0 = segment.l0.len();
+    if sources.len() <= cap {
+        (sources, &segment.runs)
+    } else if l0 >= 2 {
+        (sources[l0 - l0.min(cap)..l0].to_vec(), &[])
+    } else {
+        (sources[..cap].to_vec(), &segment.runs[..cap - l0])
+    }
+}
+
+/// The `specs` that fit `budget` beside the `held` bytes of compactions
+/// already running, in order, then the rest, and the bytes of those that
+/// fit. With nothing held the first always runs, however large, so
+/// compaction never stalls on one that alone exceeds the budget.
+fn within_budget(
+    specs: Vec<(CompactionSpec, u64)>,
+    mut held: u64,
+    budget: u64,
+) -> (Vec<CompactionSpec>, Vec<CompactionSpec>, u64) {
+    let (mut fit, mut over, mut admitted) = (Vec::new(), Vec::new(), 0);
+    for (spec, bytes) in specs {
+        if bytes == 0 || held == 0 || held.saturating_add(bytes) <= budget {
+            held = held.saturating_add(bytes);
+            admitted += bytes;
+            fit.push(spec);
+        } else {
+            over.push(spec);
+        }
+    }
+    (fit, over, admitted)
 }
 
 fn unix_ms(time: SystemTime) -> u64 {
@@ -810,6 +928,63 @@ mod tests {
             prefixes(&plan(&policy, at_hour(1.5), &over, &none, 4, 10)),
             vec![("merge", 1)]
         );
+    }
+
+    fn merged(planned: &[Planned]) -> Vec<(Vec<SourceId>, u32)> {
+        planned
+            .iter()
+            .map(|planned| match planned {
+                Planned::Merge {
+                    sources,
+                    destination,
+                    ..
+                } => (sources.clone(), *destination),
+                Planned::Drain { .. } => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merges_a_held_segment_of_many_sources_a_window_at_a_time() {
+        let policy = policy().with_max_merge_sources(4);
+        let none = HashSet::new();
+        // Ten L0s and two runs: the four oldest L0s into a fresh run.
+        let many = segment(1, 10, &[9, 3], 0);
+        let sources = many.sources();
+        assert_eq!(
+            merged(&plan(&policy, at_hour(10.0), &[many], &none, 4, 10)),
+            vec![(sources[6..10].to_vec(), 10)]
+        );
+        // One L0 and five runs: the L0 and the three newest runs, into the
+        // oldest of them.
+        let runs = segment(1, 1, &[8, 7, 6, 5, 4], 0);
+        let sources = runs.sources();
+        assert_eq!(
+            merged(&plan(&policy, at_hour(10.0), &[runs], &none, 4, 10)),
+            vec![(sources[..4].to_vec(), 6)]
+        );
+        // Within the cap, everything into the oldest run, as before.
+        let few = segment(1, 2, &[5, 4], 0);
+        let sources = few.sources();
+        assert_eq!(
+            merged(&plan(&policy, at_hour(10.0), &[few], &none, 4, 10)),
+            vec![(sources, 4)]
+        );
+    }
+
+    #[test]
+    fn admits_compactions_while_they_fit_and_one_when_nothing_runs() {
+        let spec = |run| (CompactionSpec::new(vec![SourceId::SortedRun(run)], run), 40);
+        let (fit, over, admitted) = within_budget(vec![spec(1), spec(2), spec(3)], 10, 100);
+        assert_eq!((fit.len(), over.len(), admitted), (2, 1, 80));
+        // Alone, a compaction larger than the budget still runs.
+        let (fit, over, admitted) = within_budget(vec![(spec(1).0, 500), spec(2)], 0, 100);
+        assert_eq!((fit.len(), over.len(), admitted), (1, 1, 500));
+        // Beside running ones it waits, though drains hold nothing.
+        let drain = CompactionSpec::drain_segment(Bytes::from_static(&[1]), Vec::new());
+        let (fit, over, _) = within_budget(vec![spec(1), (drain, 0)], 90, 100);
+        assert_eq!((fit.len(), over.len()), (1, 1));
+        assert!(fit[0].is_drain());
     }
 
     #[test]

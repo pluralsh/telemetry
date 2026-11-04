@@ -179,7 +179,7 @@ async fn should_set_expire_ts_based_on_ttl() {
 
     let db = DbBuilder::new(path, object_store.clone())
         .with_settings(Settings {
-            default_ttl: Some(30_000),
+            default_ttl_millis: Some(30_000),
             ..Default::default()
         })
         .with_system_clock(clock.clone())
@@ -256,7 +256,7 @@ async fn should_set_expire_ts_on_merge_records_based_on_ttl() {
     let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
     let db = DbBuilder::new(path, object_store.clone())
         .with_settings(Settings {
-            default_ttl: Some(30_000),
+            default_ttl_millis: Some(30_000),
             ..Default::default()
         })
         .with_system_clock(clock.clone())

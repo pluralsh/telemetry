@@ -805,6 +805,7 @@ async fn databases_opened_with_one_budget_share_it() {
     let memory = MemoryBudget::new(&crate::MemoryConfig {
         decode_bytes: 1 << 20,
         write_bytes: 4_096,
+        ..crate::MemoryConfig::default()
     });
     let cache = SharedDbCache::default();
     let blocks = BlockCache::new(0);

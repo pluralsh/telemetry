@@ -17,6 +17,9 @@ pub struct Config {
     pub page: PageConfig,
     pub write_buffer: WriteCoordinatorConfig,
     pub read_cache: crate::ReadCacheConfig,
+    /// Estimated bytes SlateDB's compactions of every shard of the process
+    /// hold at once; see [`common::storage::compaction::CompactionMemory`].
+    pub compaction_memory_bytes: u64,
 }
 
 /// Default [`Config::retention`]: 14 days.
@@ -51,6 +54,7 @@ impl Default for Config {
             page: PageConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),
             read_cache: crate::ReadCacheConfig::default(),
+            compaction_memory_bytes: common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES,
         }
     }
 }

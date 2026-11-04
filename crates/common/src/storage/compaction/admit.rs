@@ -42,7 +42,7 @@ impl Tree {
             l0: l0.iter().map(|view| (view.id, key_range(view))).collect(),
             runs: runs
                 .iter()
-                .map(|run| (run.id, run.sst_views.iter().map(key_range).collect()))
+                .map(|run| (run.id, run.sst_views().iter().map(key_range).collect()))
                 .collect(),
         }
     }

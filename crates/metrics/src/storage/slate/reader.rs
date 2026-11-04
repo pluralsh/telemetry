@@ -37,6 +37,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
             max_fetch_tasks: 8,
             order: IterationOrder::Ascending,
             filter_context: None,
+            tracing_options: None,
         }
     }
 
@@ -479,7 +480,7 @@ where
                     segment
                         .compacted()
                         .iter()
-                        .flat_map(|run| run.sst_views.iter()),
+                        .flat_map(|run| run.sst_views().iter()),
                 )
                 .collect();
             live.extend(views.iter().map(|view| view.sst.id));
@@ -496,7 +497,7 @@ where
                 bucket_cache_targets(&namespace, &bucket, include_samples).into();
             planned.extend(views.into_iter().map(|view| {
                 (
-                    view.sst.id,
+                    view.sst.clone(),
                     Arc::clone(&targets),
                     bucket.end_ms(),
                     metadata_estimate(&view.sst.info),
@@ -505,8 +506,8 @@ where
             }));
         }
         let db = plan.add_database(Arc::clone(&self.db) as WarmDb, live);
-        for (id, targets, recency, estimate, payload) in planned {
-            plan.push(db, id, targets, recency, estimate, payload);
+        for (sst, targets, recency, estimate, payload) in planned {
+            plan.push(db, sst, targets, recency, estimate, payload);
         }
     }
 }
@@ -595,7 +596,7 @@ impl StorageReader {
         }
 
         if let Some(cache) = cache.cache() {
-            builder = builder.with_db_cache(cache);
+            builder = builder.with_db_cache(cache, common::storage::factory::DB_CACHE_ID);
         }
 
         let reader = builder.build().await.map_err(|e| {
@@ -649,7 +650,7 @@ impl StorageReader {
                         .compacted()
                         .iter()
                         .map(|run| {
-                            run.sst_views
+                            run.sst_views()
                                 .iter()
                                 .map(|view| format!("{:?}", view.sst.id))
                                 .collect()

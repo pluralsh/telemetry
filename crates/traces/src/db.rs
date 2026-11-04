@@ -14,7 +14,7 @@ use common::coordinator::{
     WriteError,
 };
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
-use common::storage::compaction::{MergeHolds, SegmentCompaction};
+use common::storage::compaction::{CompactionMemory, MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
 use common::storage::slate::warm::WarmPlan;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
@@ -245,11 +245,17 @@ impl TraceDb {
     pub async fn open(config: Config) -> Result<Self> {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
-        Self::open_with_cache(config, &cache).await
+        let compaction = CompactionMemory::new(config.compaction_memory_bytes);
+        Self::open_with_cache(config, &cache, &compaction).await
     }
 
-    /// Opens a writer that uses `cache` instead of building its own.
-    pub(crate) async fn open_with_cache(config: Config, cache: &SharedDbCache) -> Result<Self> {
+    /// Opens a writer that uses `cache` instead of building its own and
+    /// compacts within `compaction`.
+    pub(crate) async fn open_with_cache(
+        config: Config,
+        cache: &SharedDbCache,
+        compaction: &CompactionMemory,
+    ) -> Result<Self> {
         config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
@@ -258,6 +264,7 @@ impl TraceDb {
             .with_semantics(
                 storage_semantics().with_segment_compaction(
                     SegmentCompaction::new(crate::codec::segment_span)
+                        .with_memory(compaction.clone())
                         .with_retention(config.retention)
                         .with_holds(merge_holds.clone())
                         .with_superseded(common::storage::rollup::superseded(

@@ -384,6 +384,7 @@ fn end_to_end_benches(c: &mut Criterion, traces: &[Trace]) {
             page: PageConfig::default(),
             write_buffer: Default::default(),
             read_cache: Default::default(),
+            compaction_memory_bytes: plural_traces::Config::default().compaction_memory_bytes,
         })
         .await
         .unwrap();
