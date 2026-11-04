@@ -638,12 +638,9 @@ async fn sst_bytes(values: &[&[u8]], codec: Option<CompressionCodec>) -> u64 {
         .await
         .unwrap();
     let put = PutOptions {
-        ttl: Ttl::ExpireAfter(30 * 24 * 3_600_000),
+        ttl: Ttl::ExpireAfterMillis(30 * 24 * 3_600_000),
     };
-    let write = WriteOptions {
-        await_durable: false,
-        ..WriteOptions::default()
-    };
+    let write = WriteOptions::default();
     for (series_id, value) in values.iter().enumerate() {
         let mut key = Vec::with_capacity(20);
         key.extend_from_slice(&[0x02, 0x01]);
