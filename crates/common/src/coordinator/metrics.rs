@@ -50,9 +50,16 @@ pub(crate) const COORDINATOR_FLUSH_TOTAL: &str = "opendata_write_coordinator_flu
 
 // ── Flush task (background) ──
 
-/// Histogram of `Flusher::flush_delta` durations on the background flush task.
+/// Histogram of `Flusher::begin_flush` durations on the background flush
+/// task: a whole flush, or the part before its commit. Its rate is how busy
+/// the flush task's serial part is.
 pub(crate) const COORDINATOR_FLUSH_DELTA_DURATION_SECONDS: &str =
     "opendata_write_coordinator_flush_delta_duration_seconds";
+
+/// Histogram of `FlushStep::Commit` durations, which overlap the next
+/// delta's `begin_flush`.
+pub(crate) const COORDINATOR_FLUSH_COMMIT_DURATION_SECONDS: &str =
+    "opendata_write_coordinator_flush_commit_duration_seconds";
 
 /// Histogram of `Flusher::flush_storage` durations on the background flush task.
 pub(crate) const COORDINATOR_FLUSH_STORAGE_DURATION_SECONDS: &str =
@@ -99,7 +106,11 @@ pub fn describe_coordinator_metrics() {
     );
     metrics::describe_histogram!(
         COORDINATOR_FLUSH_DELTA_DURATION_SECONDS,
-        "Background Flusher::flush_delta duration (seconds)"
+        "Background Flusher::begin_flush duration, before any commit (seconds)"
+    );
+    metrics::describe_histogram!(
+        COORDINATOR_FLUSH_COMMIT_DURATION_SECONDS,
+        "Background flush commit duration, overlapping the next flush (seconds)"
     );
     metrics::describe_histogram!(
         COORDINATOR_FLUSH_STORAGE_DURATION_SECONDS,

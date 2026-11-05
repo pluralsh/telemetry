@@ -64,6 +64,50 @@ Alert on `storage_compaction_oldest_active_seconds` staying high. Garbage
 collection never deletes anything newer than the oldest running compaction,
 so a stuck compaction stops `compacted/` from shrinking.
 
+## Compaction memory
+
+SlateDB bounds neither how many sources a compaction reads nor how many
+compactions run at once by bytes, and each one holds about
+
+```text
+subcompactions × (sources × max_fetch_tasks × bytes_to_fetch + 90 MiB)
+```
+
+however small its inputs are: every source keeps its prefetches in flight,
+and every subcompaction's output buffers multipart uploads. SlateDB plans
+one subcompaction per `max_sst_size` of input, up to `max_subcompactions`.
+
+Every database in a process shares one budget: Logs' `memory.compaction_bytes`,
+and Metrics' and Traces' `compaction_memory_bytes`, 640 MiB by default. At
+startup each compactor's options are shrunk until one compaction of its most
+sources fits: first its prefetch, then `max_subcompactions` (also capped at
+the process's cores), and `max_concurrent_compactions` is set to as many
+single-subcompaction compactions as fit. While running, a proposal is
+admitted only while the estimates of every running compaction, its own
+included, fit. A compaction larger than the whole budget runs only when no
+other does, so a process holds at most `max(budget, largest compaction)`.
+
+Writes stall once a segment taking them has 8 L0 SSTs, and only a
+compaction of those L0s clears them. Every other compaction, such as the
+merge of a closed hour or a rollup, is a merge: merges together take at
+most three quarters of the budget and leave one compactor slot free, so a
+large merge never holds back the compaction that unblocks writes.
+
+The Kubernetes operator sets the budget from the writer's resources: 208 MiB
+per CPU core of its limit (its request without one), and for Logs at least
+640 MiB, capped at a quarter of the memory the writer has left after its
+headroom and fixed reservations. It is never below 160 MiB or the product's
+fixed percentage of that memory.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `storage_compaction_memory_budget_bytes` | | The process's budget |
+| `storage_compaction_memory_held_bytes` | `kind` (`relief`, `merge`) | Estimated bytes running compactions hold |
+| `storage_compaction_proposals_rejected_total` | `path`, `reason` | Proposals deferred, for example because they did not fit |
+
+`proposals_rejected_total` rising while `slatedb_db_l0_stall_count` rises
+means compaction needs more memory or cores, not that it is misbehaving.
+
 ## SlateDB defaults
 
 Every database starts from SlateDB's defaults with these overrides. Each

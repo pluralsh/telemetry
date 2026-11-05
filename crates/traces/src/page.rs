@@ -69,14 +69,14 @@ impl SidecarBounds {
 }
 
 /// One trace encoded and compressed exactly once, ready to be laid out.
-struct EncodedTrace {
+pub(crate) struct EncodedTrace {
     trace: Trace,
     compressed: Vec<u8>,
     uncompressed_len: usize,
 }
 
 impl EncodedTrace {
-    fn new(trace: Trace) -> Result<Self> {
+    pub(crate) fn new(trace: Trace) -> Result<Self> {
         let raw = encode_trace(&trace)?;
         let compressed = snap::raw::Encoder::new().compress_vec(&raw)?;
         Ok(Self {
@@ -84,6 +84,10 @@ impl EncodedTrace {
             compressed,
             uncompressed_len: raw.len(),
         })
+    }
+
+    pub(crate) fn trace(&self) -> &Trace {
+        &self.trace
     }
 }
 
@@ -107,7 +111,7 @@ impl Page {
     ///
     /// `max_size_bytes` bounds the trace data; the column sidecar is written
     /// in addition.
-    fn assemble(
+    pub(crate) fn assemble(
         mut traces: Vec<EncodedTrace>,
         max_size_bytes: usize,
     ) -> Result<(Self, Vec<Trace>)> {
@@ -425,7 +429,24 @@ impl PageBuilder {
         &mut self,
         trace: Trace,
     ) -> Result<Option<(Page, Vec<Trace>)>> {
-        let encoded = EncodedTrace::new(trace)?;
+        self.append_encoded(EncodedTrace::new(trace)?)?
+            .map(|traces| Page::assemble(traces, self.config.max_size_bytes))
+            .transpose()
+    }
+
+    pub(crate) fn finish_with_traces(&mut self) -> Result<Option<(Page, Vec<Trace>)>> {
+        self.finish_encoded()
+            .map(|traces| Page::assemble(traces, self.config.max_size_bytes))
+            .transpose()
+    }
+
+    /// Adds an encoded trace, returning the traces of the page it completes,
+    /// for [`Page::assemble`]. Cuts depend only on encoded sizes, so traces
+    /// can be encoded ahead and pages assembled apart.
+    pub(crate) fn append_encoded(
+        &mut self,
+        encoded: EncodedTrace,
+    ) -> Result<Option<Vec<EncodedTrace>>> {
         let alone = page_len(1, encoded.compressed.len());
         if alone.is_none_or(|len| len > self.config.max_size_bytes) {
             return Err(Error::Invalid(format!(
@@ -442,7 +463,7 @@ impl PageBuilder {
                     .and_then(|payload_bytes| page_len(self.traces.len() + 1, payload_bytes))
                     .is_none_or(|len| len > self.config.target_size_bytes));
         let completed = if should_cut {
-            self.finish_with_traces()?
+            self.finish_encoded()
         } else {
             None
         };
@@ -452,13 +473,15 @@ impl PageBuilder {
         Ok(completed)
     }
 
-    pub(crate) fn finish_with_traces(&mut self) -> Result<Option<(Page, Vec<Trace>)>> {
+    /// The traces of the page under construction, if any, for
+    /// [`Page::assemble`].
+    pub(crate) fn finish_encoded(&mut self) -> Option<Vec<EncodedTrace>> {
         if self.traces.is_empty() {
-            return Ok(None);
+            return None;
         }
         self.trace_ids.clear();
         self.payload_bytes = 0;
-        Page::assemble(std::mem::take(&mut self.traces), self.config.max_size_bytes).map(Some)
+        Some(std::mem::take(&mut self.traces))
     }
 }
 

@@ -2467,3 +2467,226 @@ async fn should_pause_and_resume_write_channel() {
     expected.insert("a".into());
     assert_eq!(data.keys().cloned().collect::<HashSet<_>>(), expected);
 }
+
+// ============================================================================
+// Committing Flusher Tests
+// ============================================================================
+
+/// Leaves each flush's storage write to a [`FlushStep::Commit`] that waits
+/// for a permit, recording the order begins, commits and storage flushes
+/// happen in.
+#[derive(Clone)]
+struct CommitFlusher {
+    events: Arc<Mutex<Vec<String>>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    fail_commits: bool,
+    storage: Arc<InMemoryStorage>,
+}
+
+impl CommitFlusher {
+    fn new(fail_commits: bool) -> Self {
+        Self {
+            events: Arc::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(0)),
+            fail_commits,
+            storage: Arc::new(InMemoryStorage::new()),
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+
+    async fn wait_for(&self, event: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.events().iter().any(|seen| seen == event) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {event:?} in {:?}", self.events()));
+    }
+}
+
+#[async_trait]
+impl Flusher<TestDelta> for CommitFlusher {
+    async fn flush_delta(
+        &mut self,
+        _frozen: FrozenTestDelta,
+        _epoch_range: &Range<u64>,
+    ) -> Result<Arc<dyn StorageSnapshot>, String> {
+        unreachable!("flushes begin with begin_flush")
+    }
+
+    async fn begin_flush(
+        &mut self,
+        frozen: FrozenTestDelta,
+        epoch_range: &Range<u64>,
+    ) -> Result<FlushStep<Arc<dyn StorageSnapshot>>, String> {
+        let last = epoch_range.end - 1;
+        self.events.lock().unwrap().push(format!("begin {last}"));
+        let records: Vec<PutRecordOp> = frozen
+            .writes
+            .iter()
+            .map(|(key, (seq, value))| {
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&seq.to_le_bytes());
+                buf.extend_from_slice(&value.to_le_bytes());
+                Record::new(Bytes::from(key.clone()), Bytes::from(buf)).into()
+            })
+            .collect();
+        let flusher = self.clone();
+        Ok(FlushStep::Commit(Box::pin(async move {
+            flusher.permits.acquire().await.unwrap().forget();
+            if flusher.fail_commits {
+                return Err("commit failed".to_owned());
+            }
+            flusher
+                .storage
+                .put(records)
+                .await
+                .map_err(|error| error.to_string())?;
+            flusher
+                .events
+                .lock()
+                .unwrap()
+                .push(format!("commit {last}"));
+            flusher
+                .storage
+                .snapshot()
+                .await
+                .map_err(|error| error.to_string())
+        })))
+    }
+
+    async fn flush_storage(&self) -> Result<(), String> {
+        self.events.lock().unwrap().push("storage".to_owned());
+        Ok(())
+    }
+}
+
+async fn committing_coordinator(
+    flusher: &CommitFlusher,
+) -> (
+    WriteCoordinator<TestDelta, CommitFlusher>,
+    WriteCoordinatorHandle<TestDelta>,
+) {
+    let mut coordinator = WriteCoordinator::new(
+        test_config(),
+        vec!["writes"],
+        TestContext::default(),
+        flusher.storage.snapshot().await.unwrap(),
+        flusher.clone(),
+    );
+    let handle = coordinator.handle("writes");
+    coordinator.start();
+    (coordinator, handle)
+}
+
+async fn write_and_flush(handle: &WriteCoordinatorHandle<TestDelta>, key: &str) -> WriteHandle {
+    let mut write = handle
+        .try_write(TestWrite {
+            key: key.into(),
+            value: 1,
+            size: 1,
+        })
+        .await
+        .unwrap();
+    write.wait(Durability::Applied).await.unwrap();
+    handle.flush(false).await.unwrap();
+    write
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_begin_the_next_flush_while_a_commit_writes_and_commit_in_order() {
+    let flusher = CommitFlusher::new(false);
+    let (coordinator, handle) = committing_coordinator(&flusher).await;
+
+    let mut first = write_and_flush(&handle, "a").await;
+    flusher.wait_for("begin 1").await;
+    let mut second = write_and_flush(&handle, "b").await;
+    flusher.wait_for("begin 2").await;
+    // The first commit still holds its write, so neither is written.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), first.wait(Durability::Written))
+            .await
+            .is_err()
+    );
+
+    flusher.permits.add_permits(2);
+    first.wait(Durability::Written).await.unwrap();
+    second.wait(Durability::Written).await.unwrap();
+    assert_eq!(
+        flusher.events(),
+        ["begin 1", "begin 2", "commit 1", "commit 2"]
+    );
+    assert_snapshot_has_rows(&coordinator.view().snapshot, &[("a", 0, 1), ("b", 1, 1)]).await;
+    coordinator.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_publish_a_commit_without_waiting_for_another_flush() {
+    let flusher = CommitFlusher::new(false);
+    let (coordinator, handle) = committing_coordinator(&flusher).await;
+
+    let mut write = write_and_flush(&handle, "a").await;
+    flusher.permits.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), write.wait(Durability::Written))
+        .await
+        .expect("an idle flush task publishes its commit")
+        .unwrap();
+    coordinator.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_flush_storage_only_after_the_commit_in_flight() {
+    let flusher = CommitFlusher::new(false);
+    let (coordinator, handle) = committing_coordinator(&flusher).await;
+
+    let mut write = handle
+        .try_write(TestWrite {
+            key: "a".into(),
+            value: 1,
+            size: 1,
+        })
+        .await
+        .unwrap();
+    write.wait(Durability::Applied).await.unwrap();
+    handle.flush(true).await.unwrap();
+    flusher.wait_for("begin 1").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(flusher.events(), ["begin 1"]);
+
+    flusher.permits.add_permits(1);
+    write.wait(Durability::Durable).await.unwrap();
+    assert_eq!(flusher.events(), ["begin 1", "commit 1", "storage"]);
+    coordinator.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_fail_writes_whose_commit_fails() {
+    let flusher = CommitFlusher::new(true);
+    let (coordinator, handle) = committing_coordinator(&flusher).await;
+
+    let mut write = write_and_flush(&handle, "a").await;
+    flusher.permits.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(5), write.wait(Durability::Written))
+        .await
+        .expect("Written waiter hung")
+        .unwrap_err();
+    assert!(matches!(error, WriteError::FlushError(message) if message == "commit failed"));
+    assert!(coordinator.stop().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_commit_the_last_flush_on_stop() {
+    let flusher = CommitFlusher::new(false);
+    let (coordinator, handle) = committing_coordinator(&flusher).await;
+
+    let mut write = write_and_flush(&handle, "a").await;
+    flusher.wait_for("begin 1").await;
+    flusher.permits.add_permits(1);
+    coordinator.stop().await.unwrap();
+    write.wait(Durability::Written).await.unwrap();
+    assert_eq!(flusher.events(), ["begin 1", "commit 1"]);
+}

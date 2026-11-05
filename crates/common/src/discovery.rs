@@ -341,6 +341,17 @@ impl CatalogBatch {
         self.metadata.insert(name.into(), value);
     }
 
+    /// Adds every record of `other`; its metadata wins over this batch's.
+    pub fn extend(&mut self, other: CatalogBatch) {
+        if self.is_empty() {
+            *self = other;
+            return;
+        }
+        self.names.extend(other.names);
+        self.values.extend(other.values);
+        self.metadata.extend(other.metadata);
+    }
+
     pub fn len(&self) -> usize {
         self.names.len() + self.values.len() + self.metadata.len()
     }

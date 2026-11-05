@@ -41,14 +41,14 @@ use crate::codec::{
     rollup_forward_prefix, rollup_next_stream_id_key, rollup_posting_key, rollup_prefix,
     segment_for, segment_prefix,
 };
-use crate::compaction::{Compactor, WrittenObject};
+use crate::compaction::{CompactorHandle, WrittenObject};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::memory::{BudgetPermit, MemoryBudget, WritePermit, Writer};
 use crate::model::{
     Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
 };
-use crate::object::{BuiltObject, ObjectBuilder, ObjectLocation, ObjectProperties, object_records};
+use crate::object::{ObjectBuilder, ObjectLocation, ObjectProperties, object_records};
 use crate::search::{
     FieldStats, IndexDelta, block_max_scores, encode_field_stats, source_matches, term_index_ops,
 };
@@ -273,6 +273,8 @@ pub struct LogDb {
     rollup_ns: Option<i64>,
     write_handle: Option<WriteCoordinatorHandle<LogsWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<LogsWriteDelta, LogsFlusher>>>,
+    /// Merges the objects flushes write, off the flush path.
+    compactor: Option<CompactorHandle>,
     caches: DiscoveryCaches,
     blocks: BlockCache,
     /// This database's ID in `blocks`.
@@ -458,7 +460,7 @@ impl LogDb {
             rollup_ns,
         );
         let compactor = config.compaction.enabled.then(|| {
-            Compactor::new(
+            CompactorHandle::spawn(
                 storage.clone(),
                 config.compaction.clone(),
                 config.page.clone(),
@@ -466,15 +468,24 @@ impl LogDb {
                 memory.clone(),
             )
         });
+        // A buffer frozen at the whole write budget leaves no room for ingest
+        // until its flush is written, so freeze at half and let the other half
+        // absorb writes meanwhile.
+        let mut write_buffer = config.write_buffer.clone();
+        write_buffer.flush_size_threshold = write_buffer.flush_size_threshold.min(
+            usize::try_from(memory.write_capacity() / 2)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        );
         let mut write_coordinator = WriteCoordinator::new(
-            config.write_buffer.clone(),
+            write_buffer,
             vec![WRITE_CHANNEL],
             (),
             (),
             LogsFlusher {
                 direct_writer,
                 storage: storage.clone(),
-                compactor,
+                compactor: compactor.clone(),
             },
         );
         let write_handle = write_coordinator.handle(WRITE_CHANNEL);
@@ -486,6 +497,7 @@ impl LogDb {
             rollup_ns,
             write_handle: Some(write_handle),
             write_coordinator: Mutex::new(Some(write_coordinator)),
+            compactor,
             caches: DiscoveryCaches::new(),
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),
@@ -580,6 +592,7 @@ impl LogDb {
             rollup_ns: config.discovery_rollup.map(duration_ns).transpose()?,
             write_handle: None,
             write_coordinator: Mutex::new(None),
+            compactor: None,
             caches: DiscoveryCaches::new(),
             blocks: blocks.clone(),
             database_id: block_cache::next_database_id(),

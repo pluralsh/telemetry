@@ -82,9 +82,9 @@ pub struct MemoryConfig {
     pub decode_bytes: u64,
     /// Estimated bytes of writes the process has applied but not yet
     /// written to storage, and so the most one flush holds. Ingest past it
-    /// fails with [`Error::Backpressure`]; rollup copies wait for room. A
-    /// write that finds it full flushes the buffer, so it may be below the
-    /// write buffer's `flush_size_threshold`.
+    /// fails with [`Error::Backpressure`]; rollup copies wait for room. The
+    /// write buffer freezes at half of it at most, whatever its
+    /// `flush_size_threshold`, so ingest has room while a flush is written.
     pub write_bytes: u64,
     /// Estimated bytes the compactor merges of every shard hold at once.
     pub merge_bytes: u64,

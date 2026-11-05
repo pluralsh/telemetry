@@ -1146,6 +1146,7 @@ dependencies = [
  "metrics",
  "mixtrics",
  "proptest",
+ "rayon",
  "ryu",
  "serde",
  "serde_json",

@@ -770,31 +770,58 @@ async fn applied_writes_hold_the_write_budget_until_written() {
     config.memory.write_bytes = 4_096;
     let db = LogDb::open(config).await.unwrap();
     let namespace = Namespace::new("budgeted").unwrap();
-    let batch = |timestamp| {
+    let batch = |timestamp, bytes| {
         vec![LogBatch::new(
             labels("api", "prod"),
-            vec![LogEntry::new(timestamp, "x".repeat(3_000))],
+            vec![LogEntry::new(timestamp, "x".repeat(bytes))],
         )]
     };
 
-    db.write_with_durability(&namespace, batch(1), Durability::Applied)
+    // Below half the budget, so the buffer is not frozen for it.
+    db.write_with_durability(&namespace, batch(1, 1_500), Durability::Applied)
         .await
         .unwrap();
-    assert!(db.memory.write_available() < 1_024);
-    // Neither fits beside the unwritten first; ingest is turned away rather
-    // than buffered past the budget.
+    assert!(db.memory.write_available() <= 4_096 - 1_500);
+    // It does not fit beside the unwritten first; ingest is turned away
+    // rather than buffered past the budget.
     assert!(matches!(
-        db.write_with_durability(&namespace, batch(2), Durability::Applied)
+        db.write_with_durability(&namespace, batch(2, 3_000), Durability::Applied)
             .await,
         Err(Error::Backpressure)
     ));
 
     db.flush_written().await.unwrap();
     assert_eq!(settled_write_budget(&db).await, 4_096);
-    db.write_with_durability(&namespace, batch(2), Durability::Written)
+    db.write_with_durability(&namespace, batch(2, 3_000), Durability::Written)
         .await
         .unwrap();
     assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
+    assert_eq!(settled_write_budget(&db).await, 4_096);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_write_buffer_freezes_at_half_the_write_budget() {
+    let mut config = test_config();
+    config.memory.write_bytes = 4_096;
+    // Far past the budget, and an interval the test does not wait for.
+    config.write_buffer.flush_size_threshold = 1 << 30;
+    config.write_buffer.flush_interval = Duration::from_secs(3_600);
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("budgeted").unwrap();
+
+    db.write_with_durability(
+        &namespace,
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            vec![LogEntry::new(1, "x".repeat(3_000))],
+        )],
+        Durability::Applied,
+    )
+    .await
+    .unwrap();
+    // Written without a flush being asked for, so its budget is free for
+    // the ingest that follows.
     assert_eq!(settled_write_budget(&db).await, 4_096);
     db.close().await.unwrap();
 }
@@ -998,6 +1025,47 @@ async fn flush_drains_and_close_stops_the_coordinator() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("shut down"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_encoded_in_parallel_indexes_every_object_and_term() {
+    let db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    // Two rows per object and more terms than one encoding job takes.
+    let rows = 1_200i64;
+    let entries = (1..=rows)
+        .map(|row| LogEntry::new(row, format!("shared unique{row}")))
+        .collect();
+    db.write(
+        &namespace,
+        vec![LogBatch::new(labels("search", "prod"), entries)],
+    )
+    .await
+    .unwrap();
+    let stats = async |term: &str| {
+        let stats = db
+            .storage
+            .get(crate::codec::term_stats_key(&namespace, seg(0), term))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no statistics for {term}"));
+        crate::search::decode_term_stats(&stats.value).unwrap()
+    };
+    assert_eq!(stats("shared").await.documents, rows as u64);
+    for row in [1, 2, 599, 600, 601, rows] {
+        assert_eq!(stats(&format!("unique{row}")).await.documents, 1);
+    }
+    let read = db
+        .read(&namespace, 0, rows, &[Label::new("service", "search")])
+        .await
+        .unwrap();
+    assert_eq!(
+        read.iter()
+            .map(|row| row.entry.timestamp_ns)
+            .collect::<Vec<_>>(),
+        (1..=rows).collect::<Vec<_>>()
+    );
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1333,6 +1401,7 @@ async fn count_records(
     count
 }
 
+/// Writes one line and waits for the compactor to merge after its flush.
 async fn write_line(db: &LogDb, namespace: &Namespace, service: &str, timestamp: i64, line: &str) {
     db.write(
         namespace,
@@ -1343,6 +1412,7 @@ async fn write_line(db: &LogDb, namespace: &Namespace, service: &str, timestamp:
     )
     .await
     .unwrap();
+    db.compacted().await;
 }
 
 async fn lines(db: &LogDb, namespace: &Namespace, start: i64, end: i64) -> Vec<String> {
@@ -1428,6 +1498,45 @@ async fn open_segments_merge_equal_level_pages_and_delete_replaced_payloads() {
 }
 
 #[tokio::test]
+async fn flushes_do_not_wait_for_merges() {
+    use crate::codec::RecordType;
+
+    let db = LogDb::open(compacting_config()).await.unwrap();
+    let namespace = Namespace::new("unblocked").unwrap();
+    let segment = current_segment().start_ns;
+    // Every merge waits for the whole merge budget, which this holds.
+    let held = db.memory.merge(u64::MAX).await.unwrap();
+    for offset in 1..=8 {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            db.write(
+                &namespace,
+                vec![LogBatch::new(
+                    labels("api", "prod"),
+                    vec![LogEntry::new(segment + offset, "needle")],
+                )],
+            ),
+        )
+        .await
+        .expect("a flush waited for a merge")
+        .unwrap();
+    }
+    assert_eq!(
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
+        8
+    );
+
+    // Eight level-0 objects fold into one once merges can run.
+    drop(held);
+    db.compacted().await;
+    assert_eq!(
+        count_records(&db, &namespace, seg(segment), RecordType::Run).await,
+        1
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn settled_segments_merge_below_fan_in() {
     use crate::codec::RecordType;
 
@@ -1478,6 +1587,7 @@ async fn open_segments_merge_runs_the_page_limits_cut_short() {
         )
         .await
         .unwrap();
+        db.compacted().await;
     }
 
     // The first three merge once the fourth cannot join them.
@@ -1517,6 +1627,7 @@ async fn merges_grow_past_the_page_limits_flushes_cut_at() {
         )
         .await
         .unwrap();
+        db.compacted().await;
     }
 
     assert_eq!(
@@ -2481,6 +2592,7 @@ async fn cross_stream_merges_keep_write_order_for_out_of_order_rows() {
         )
         .await
         .unwrap();
+        db.compacted().await;
     }
     // Four two-stream objects fold into one holding a run per stream.
     assert_eq!(
@@ -4028,6 +4140,7 @@ async fn prefiltered_line_filters_match_unfiltered_reads() {
                 })
                 .collect();
             db.write(&namespace, batches).await.unwrap();
+            db.compacted().await;
         }
         let counting = count_reads(
             &mut db,

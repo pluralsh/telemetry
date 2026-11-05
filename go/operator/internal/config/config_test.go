@@ -844,6 +844,45 @@ func TestRenderSizesMetricsMemoryFromTheLimit(t *testing.T) {
 	}
 }
 
+func TestRenderGivesCompactionASubcompactionPerCore(t *testing.T) {
+	workload := func(cpu, memory string) telemetryv1alpha1.WorkloadSpec {
+		return telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(cpu),
+				corev1.ResourceMemory: resource.MustParse(memory),
+			},
+		}}
+	}
+	for _, tc := range []struct {
+		name, cpu, memory, expected string
+	}{
+		// (16Gi - 4Gi headroom - 1.5Gi reserved) shares 10.5Gi: 10% is
+		// 1,075Mi, 8 cores take 8 × 208Mi.
+		{"cores above the share", "8", "16Gi", "compaction_bytes: 1744830464"},
+		// 64Gi shares 46.5Gi: 10% is 4,761Mi, more than 12 cores take.
+		{"share above the cores", "12", "64Gi", "compaction_bytes: 4992899480"},
+		// 4Gi shares 1.5Gi: 24 cores are capped at a quarter of it.
+		{"a quarter of a small limit", "24", "4Gi", "compaction_bytes: 402653184"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := Render(Input{Logs: &telemetryv1alpha1.Logs{
+				ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
+				Spec: telemetryv1alpha1.LogsSpec{
+					Mode:   telemetryv1alpha1.ProductModeSharded,
+					Writer: workload(tc.cpu, tc.memory),
+					Reader: workload("1", "2Gi"),
+				},
+			}, InternalToken: []byte("token")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rendered := string(result.Data[LogsKey]); !strings.Contains(rendered, tc.expected) {
+				t.Errorf("logs.yaml missing %q:\n%s", tc.expected, rendered)
+			}
+		})
+	}
+}
+
 func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 	limit := func(quantity string) telemetryv1alpha1.WorkloadSpec {
 		return telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
@@ -871,7 +910,7 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 		LogsKey: {
 			"reader_cache_capacity: 773094096", "result_cache_capacity: 193273524",
 			"max_in_flight_query_bytes: 515396064", "max_in_flight_body_bytes: 536870912",
-			"buffer_size_threshold_bytes: 16777216", "compaction_bytes: 671088640",
+			"buffer_size_threshold_bytes: 8388608", "compaction_bytes: 671088640",
 		},
 		ReaderKey: {
 			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",

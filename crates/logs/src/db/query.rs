@@ -1437,6 +1437,13 @@ impl LogDb {
         Ok(())
     }
 
+    /// Waits until the object compactor has merged after every flush so far.
+    pub async fn compacted(&self) {
+        if let Some(compactor) = &self.compactor {
+            compactor.settled().await;
+        }
+    }
+
     pub async fn close(&self) -> Result<()> {
         let coordinator_result =
             if let Some(coordinator) = self.write_coordinator.lock().await.take() {
@@ -1444,6 +1451,9 @@ impl LogDb {
             } else {
                 Ok(())
             };
+        if let Some(compactor) = &self.compactor {
+            compactor.stop().await;
+        }
         let storage_result = self.storage.close().await.map_err(Error::from);
         coordinator_result?;
         storage_result?;

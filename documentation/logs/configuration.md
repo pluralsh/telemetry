@@ -168,9 +168,9 @@ write:
   # up to two frozen deltas, and queued request payloads.
   buffer_queue_capacity: 10000
   buffer_flush_interval_milliseconds: 30000
-  # 16 MiB. The write budget below flushes a buffer at its size whatever
-  # this threshold is.
-  buffer_size_threshold_bytes: 16777216
+  # 8 MiB. A buffer is frozen at half the write budget below at most,
+  # whatever this threshold is, so ingest has room while a flush is written.
+  buffer_size_threshold_bytes: 8388608
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
 

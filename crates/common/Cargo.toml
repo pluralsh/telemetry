@@ -23,6 +23,7 @@ futures.workspace = true
 figment = { version = "0.10.19", features = ["env", "json", "toml", "yaml"] }
 metrics.workspace = true
 mixtrics.workspace = true
+rayon = "1.12.0"
 ryu.workspace = true
 serde.workspace = true
 serde_json.workspace = true

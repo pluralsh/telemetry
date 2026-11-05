@@ -77,6 +77,7 @@ async fn database(path: &str, enabled: bool) -> (LogDb, Namespace) {
         )
         .await
         .unwrap();
+        db.compacted().await;
     }
     (db, namespace)
 }

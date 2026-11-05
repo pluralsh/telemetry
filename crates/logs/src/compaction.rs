@@ -4,21 +4,27 @@
 
 //! Writer-side merging of each segment's small objects.
 //!
-//! The compactor runs inside the write flusher after every flush, so merges
-//! are serialized with object writes and never race an ID allocation. Its
-//! in-memory index of small objects is rebuilt from object directories the
-//! first time a flush touches a segment, which also re-queues the segment's
-//! pending deletions from their tombstones.
+//! The compactor runs on its own task, fed the objects every flush writes,
+//! so merges never hold up the flushes that free the write budget. Flushes
+//! only write objects with newly allocated IDs, and a merge only rewrites
+//! objects it was told were written, reusing the first input's ID, so the
+//! two never write the same keys. Its in-memory index of small objects is
+//! rebuilt from object directories the first time a flush touches a
+//! segment, which also re-queues the segment's pending deletions from their
+//! tombstones.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::BytesRange;
 use common::storage::{ReadHints, RecordOp, Storage, Ttl, WriteOptions};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::Namespace;
 use crate::codec::{
@@ -38,6 +44,10 @@ use crate::object::{
 /// Deletions applied per storage write.
 const DELETE_BATCH: usize = 1024;
 
+/// Flushes whose objects may wait for the compactor before flushes wait for
+/// it in turn, which bounds what a compactor falling behind queues.
+const QUEUED_FLUSHES: usize = 64;
+
 /// An object written by a flush, reported to the compactor.
 pub(crate) struct WrittenObject {
     pub namespace: Namespace,
@@ -55,6 +65,9 @@ struct Tracked {
 struct SegmentState {
     /// Small objects, ordered by ID.
     objects: Vec<Tracked>,
+    /// The ID after every object recovery found. Flushes write a segment's
+    /// objects in ID order, so any below it was already in storage.
+    recovered_until: u64,
     touched: Instant,
 }
 
@@ -89,25 +102,30 @@ impl PendingDelete {
     }
 }
 
-pub(crate) struct Compactor {
-    storage: Arc<dyn Storage>,
-    config: CompactionConfig,
-    page: PageConfig,
-    segment_ns: i64,
-    memory: MemoryBudget,
-    segments: HashMap<(Namespace, SegmentId), SegmentState>,
-    deletes: BinaryHeap<Reverse<PendingDelete>>,
+enum Message {
+    Written(Vec<WrittenObject>),
+    Settled(oneshot::Sender<()>),
+    Stop,
 }
 
-impl Compactor {
-    pub(crate) fn new(
+/// A [`Compactor`] running on its own task. Clones share it.
+#[derive(Clone)]
+pub(crate) struct CompactorHandle {
+    sender: mpsc::Sender<Message>,
+    stop: Arc<AtomicBool>,
+    task: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl CompactorHandle {
+    pub(crate) fn spawn(
         storage: Arc<dyn Storage>,
         config: CompactionConfig,
         page: PageConfig,
         segment_ns: i64,
         memory: MemoryBudget,
     ) -> Self {
-        Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let compactor = Compactor {
             storage,
             config,
             page,
@@ -115,13 +133,87 @@ impl Compactor {
             memory,
             segments: HashMap::new(),
             deletes: BinaryHeap::new(),
+            stop: stop.clone(),
+        };
+        let (sender, receiver) = mpsc::channel(QUEUED_FLUSHES);
+        Self {
+            sender,
+            stop,
+            task: Arc::new(Mutex::new(Some(tokio::spawn(compactor.serve(receiver))))),
         }
+    }
+
+    /// Hands a flush's objects to the compactor, waiting only while it is
+    /// [`QUEUED_FLUSHES`] behind.
+    pub(crate) async fn written(&self, written: Vec<WrittenObject>) {
+        if !written.is_empty() {
+            let _ = self.sender.send(Message::Written(written)).await;
+        }
+    }
+
+    /// Waits until the compactor has merged after every flush handed to it.
+    pub(crate) async fn settled(&self) {
+        let (sender, receiver) = oneshot::channel();
+        if self.sender.send(Message::Settled(sender)).await.is_ok() {
+            let _ = receiver.await;
+        }
+    }
+
+    /// Stops the compactor after its current merge, so storage can close.
+    /// A merge is one atomic write, and recovery rebuilds what it tracked.
+    pub(crate) async fn stop(&self) {
+        let Some(task) = self.task.lock().await.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.sender.send(Message::Stop).await;
+        let _ = task.await;
+    }
+}
+
+struct Compactor {
+    storage: Arc<dyn Storage>,
+    config: CompactionConfig,
+    page: PageConfig,
+    segment_ns: i64,
+    memory: MemoryBudget,
+    segments: HashMap<(Namespace, SegmentId), SegmentState>,
+    deletes: BinaryHeap<Reverse<PendingDelete>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Compactor {
+    /// Merges after every batch of flushes queued while it last merged.
+    async fn serve(mut self, mut receiver: mpsc::Receiver<Message>) {
+        while let Some(message) = receiver.recv().await {
+            let mut written = Vec::new();
+            let mut settled = Vec::new();
+            let mut next = Some(message);
+            while let Some(message) = next {
+                match message {
+                    Message::Written(objects) => written.extend(objects),
+                    Message::Settled(sender) => settled.push(sender),
+                    Message::Stop => return,
+                }
+                next = receiver.try_recv().ok();
+            }
+            if !written.is_empty() {
+                self.after_flush(written).await;
+            }
+            for sender in settled {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Tracks `written`, applies due deletions, and performs merges up to the
     /// per-flush budget. Failures are logged rather than failing the flush,
     /// whose objects are already written; the index is rebuilt from storage.
-    pub(crate) async fn after_flush(&mut self, written: Vec<WrittenObject>) {
+    async fn after_flush(&mut self, written: Vec<WrittenObject>) {
         if let Err(error) = self.run(written).await {
             tracing::warn!(%error, "log object compaction failed; rebuilding its index");
             ::metrics::counter!("logs_compaction_errors_total").increment(1);
@@ -139,7 +231,7 @@ impl Compactor {
         let mut budget = self.config.max_merges_per_flush;
         let keys = self.segments.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            if budget == 0 {
+            if budget == 0 || self.stopping() {
                 break;
             }
             let Some(mut state) = self.segments.remove(&key) else {
@@ -162,7 +254,10 @@ impl Compactor {
         let key = (written.namespace, written.segment);
         if let Some(state) = self.segments.get_mut(&key) {
             state.touched = now;
-            if is_small(&self.config, &written.stored) {
+            // Recovery may have scanned, and since merged, objects that later
+            // flushes wrote; those flushes report them only now.
+            if is_small(&self.config, &written.stored) && written.object.id >= state.recovered_until
+            {
                 let at = state
                     .objects
                     .partition_point(|tracked| tracked.object.id < written.object.id);
@@ -215,6 +310,7 @@ impl Compactor {
             dead.insert(object);
         }
         let mut objects = Vec::new();
+        let mut recovered_until = 0;
         let mut directories = self
             .storage
             .scan_prefix_iter_with(
@@ -226,10 +322,12 @@ impl Compactor {
             .await?;
         while let Some(record) = directories.next().await? {
             let object = decode_directory_key(&record.key)?;
+            recovered_until = recovered_until.max(object.id.saturating_add(1));
             if dead.contains(&object) {
                 continue;
             }
             let stored = decode_object(&record.value)?;
+            recovered_until = recovered_until.max(object.id.saturating_add(stored.span));
             if is_small(&self.config, &stored) && !stored.is_expired_at(now_unix_ms) {
                 objects.push(Tracked { object, stored });
             }
@@ -237,6 +335,7 @@ impl Compactor {
         objects.sort_by_key(|tracked| tracked.object.id);
         Ok(SegmentState {
             objects,
+            recovered_until,
             touched: now,
         })
     }
@@ -269,7 +368,7 @@ impl Compactor {
         state
             .objects
             .retain(|tracked| !tracked.stored.is_expired_at(now_unix_ms));
-        while *budget > 0 {
+        while *budget > 0 && !self.stopping() {
             let Some(range) = self.select(&state.objects, finalize, now_unix_ms) else {
                 break;
             };

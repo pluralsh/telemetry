@@ -21,6 +21,12 @@
 //! estimates of the compactions they all run, the proposal's included, fit.
 //! A compaction larger than the whole budget runs only when no other does,
 //! so the process holds at most `max(budget, largest compaction)`.
+//!
+//! Writes stall once a segment taking them has too many L0 SSTs, and only
+//! compactions of those L0s (relief) clear them. Every other compaction (a
+//! merge) takes at most [`CompactionMemory::merge_budget`], so a merge of a
+//! closed hour or a rollup, however large, leaves a quarter of the budget for
+//! relief.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,9 +39,13 @@ use crate::storage::config::DiskPerformance;
 
 const MIB: u64 = 1024 * 1024;
 
-/// Default [`CompactionMemory`] budget: one compaction of eight sources with
-/// SlateDB's default prefetch and subcompactions takes about 620 MiB.
+/// Default [`CompactionMemory`] budget: four compactions of eight sources
+/// with SlateDB's default prefetch, of one subcompaction each, take about
+/// 620 MiB, and its merge share fits one of three subcompactions.
 pub const DEFAULT_COMPACTION_MEMORY_BYTES: u64 = 640 * MIB;
+
+/// The share of the budget, as a divisor, that only relief may use.
+const RELIEF_DIVISOR: u64 = 4;
 
 /// What one subcompaction's output writer holds at most: object_store's
 /// `BufWriter`, which SlateDB builds with its defaults, buffers a 10 MiB
@@ -56,8 +66,37 @@ struct Inner {
     budget: u64,
     /// Estimated bytes each scheduler's admitted compactions hold, by
     /// scheduler.
-    held: Mutex<HashMap<u64, u64>>,
+    held: Mutex<HashMap<u64, Held>>,
     next_scheduler: AtomicU64,
+}
+
+/// Estimated bytes admitted compactions hold: all of them, and merges alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Held {
+    pub(super) total: u64,
+    pub(super) merges: u64,
+}
+
+impl Held {
+    pub(super) fn add(self, bytes: u64, relief: bool) -> Self {
+        Self {
+            total: self.total.saturating_add(bytes),
+            merges: if relief {
+                self.merges
+            } else {
+                self.merges.saturating_add(bytes)
+            },
+        }
+    }
+}
+
+impl std::iter::Sum for Held {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |sum, held| Self {
+            total: sum.total.saturating_add(held.total),
+            merges: sum.merges.saturating_add(held.merges),
+        })
+    }
 }
 
 impl Default for CompactionMemory {
@@ -68,10 +107,8 @@ impl Default for CompactionMemory {
 
 impl CompactionMemory {
     pub fn new(budget_bytes: u64) -> Self {
-        let budget = budget_bytes.max(1);
-        ::metrics::gauge!("storage_compaction_memory_budget_bytes").set(budget as f64);
         Self(Arc::new(Inner {
-            budget,
+            budget: budget_bytes.max(1),
             held: Mutex::default(),
             next_scheduler: AtomicU64::new(0),
         }))
@@ -81,29 +118,47 @@ impl CompactionMemory {
         self.0.budget
     }
 
+    /// What merges may hold together: the budget less the share kept for
+    /// relief.
+    pub fn merge_budget(&self) -> u64 {
+        self.budget() - self.budget() / RELIEF_DIVISOR
+    }
+
     /// Estimated bytes the compactions of every database sharing this budget
     /// hold.
     pub fn held(&self) -> u64 {
-        self.lock().values().sum()
+        self.lock().values().copied().sum::<Held>().total
+    }
+
+    /// [`Self::bound_for`] the cores this process may run on.
+    pub fn bound(&self, options: &mut CompactorOptions, max_sources: usize) {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        self.bound_for(options, max_sources, cores);
     }
 
     /// Shrinks `options` until a compaction of `max_sources` sources fits the
-    /// budget: prefetch first, down to one block per read and one read per
-    /// source, then subcompactions. How many compactions run at once is
-    /// capped at what the budget fits of compactions of one subcompaction,
-    /// which compactions under `max_sst_size` of input are; admission holds
-    /// larger ones back. Options already below what the budget allows are
-    /// kept. Without an embedded worker, compactions run in another process
-    /// and nothing changes.
-    pub fn bound(&self, options: &mut CompactorOptions, max_sources: usize) {
+    /// merge budget: prefetch first, down to one block per read and one read
+    /// per source, then subcompactions, which also stay within `cores`, since
+    /// more than run at once only add memory. How many compactions run at
+    /// once is capped at what the budget fits of compactions of one
+    /// subcompaction, which compactions under `max_sst_size` of input are;
+    /// admission holds larger ones back. Options already below what the
+    /// budget allows are kept. Without an embedded worker, compactions run
+    /// in another process and nothing changes.
+    pub(super) fn bound_for(
+        &self,
+        options: &mut CompactorOptions,
+        max_sources: usize,
+        cores: usize,
+    ) {
         let Some(worker) = options.worker.as_mut() else {
             return;
         };
         let sources = max_sources.max(1) as u64;
-        let budget = self.budget();
+        let (budget, merges) = (self.budget(), self.merge_budget());
         let subcompaction =
             |worker: &CompactionWorkerOptions| sources * Cost::per_source(worker) + OUTPUT_BYTES;
-        while subcompaction(worker) > budget {
+        while subcompaction(worker) > merges {
             if worker.bytes_to_fetch as u64 > MAX_BLOCK_BYTES {
                 worker.bytes_to_fetch = (worker.bytes_to_fetch / 2).max(MAX_BLOCK_BYTES as usize);
             } else if worker.max_fetch_tasks > 1 {
@@ -113,8 +168,9 @@ impl CompactionMemory {
             }
         }
         let subcompaction = subcompaction(worker);
-        let subcompactions = usize::try_from(budget / subcompaction)
+        let subcompactions = usize::try_from(merges / subcompaction)
             .unwrap_or(usize::MAX)
+            .min(cores)
             .max(1);
         worker.max_subcompactions = worker.max_subcompactions.clamp(1, subcompactions);
         let concurrent = usize::try_from(budget / subcompaction)
@@ -144,23 +200,29 @@ impl CompactionMemory {
     }
 
     /// A share of the budget for one scheduler, released when it drops.
+    /// Reports the budget, since policies build a default before taking the
+    /// process's shared one.
     pub(super) fn holder(&self) -> Holder {
+        ::metrics::gauge!("storage_compaction_memory_budget_bytes").set(self.0.budget as f64);
         Holder {
             memory: self.clone(),
             id: self.0.next_scheduler.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, u64>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Held>> {
         self.0
             .held
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn report(&self, held: &HashMap<u64, u64>) {
-        ::metrics::gauge!("storage_compaction_memory_held_bytes")
-            .set(held.values().sum::<u64>() as f64);
+    fn report(&self, held: &HashMap<u64, Held>) {
+        let held: Held = held.values().copied().sum();
+        ::metrics::gauge!("storage_compaction_memory_held_bytes", "kind" => "relief")
+            .set(held.total.saturating_sub(held.merges) as f64);
+        ::metrics::gauge!("storage_compaction_memory_held_bytes", "kind" => "merge")
+            .set(held.merges as f64);
     }
 }
 
@@ -172,24 +234,24 @@ pub(super) struct Holder {
 }
 
 impl Holder {
-    pub(super) fn budget(&self) -> u64 {
-        self.memory.budget()
+    pub(super) fn memory(&self) -> &CompactionMemory {
+        &self.memory
     }
 
     /// What the other schedulers sharing the budget hold.
-    pub(super) fn others(&self) -> u64 {
+    pub(super) fn others(&self) -> Held {
         self.memory
             .lock()
             .iter()
             .filter(|(id, _)| **id != self.id)
-            .map(|(_, bytes)| *bytes)
+            .map(|(_, held)| *held)
             .sum()
     }
 
-    pub(super) fn set(&self, bytes: u64) {
-        let mut held = self.memory.lock();
-        held.insert(self.id, bytes);
-        self.memory.report(&held);
+    pub(super) fn set(&self, held: Held) {
+        let mut all = self.memory.lock();
+        all.insert(self.id, held);
+        self.memory.report(&all);
     }
 }
 
@@ -263,10 +325,12 @@ mod tests {
         CompactorOptions::default()
     }
 
+    const CORES: usize = 16;
+
     #[test]
     fn a_large_budget_keeps_slatedb_defaults_and_caps_sources() {
         let mut bounded = options();
-        CompactionMemory::new(64 * 1024 * MIB).bound(&mut bounded, 8);
+        CompactionMemory::new(64 * 1024 * MIB).bound_for(&mut bounded, 8, CORES);
         let (worker, defaults) = (bounded.worker.clone().unwrap(), options().worker.unwrap());
         assert_eq!(worker.max_subcompactions, defaults.max_subcompactions);
         assert_eq!(
@@ -279,31 +343,45 @@ mod tests {
     }
 
     #[test]
-    fn the_default_budget_fits_one_compaction_of_eight_sources() {
+    fn the_default_budget_fits_a_merge_of_eight_sources_beside_relief() {
         let mut bounded = options();
         let memory = CompactionMemory::default();
-        memory.bound(&mut bounded, 8);
+        memory.bound_for(&mut bounded, 8, CORES);
         let cost = Cost::new(&bounded).unwrap();
         let sources = (0..8).map(SourceId::SortedRun).collect::<Vec<_>>();
         let spec = CompactionSpec::new(sources, 0);
-        assert!(cost.of(&spec, None, None) <= memory.budget());
-        assert_eq!(bounded.worker.unwrap().max_subcompactions, 4);
+        // The widest merge fits the merge share, leaving relief its quarter.
+        assert!(cost.of(&spec, None, None) <= memory.merge_budget());
+        assert!(memory.budget() - memory.merge_budget() >= cost.of(&spec, Some(1), None));
+        assert_eq!(bounded.worker.unwrap().max_subcompactions, 3);
         // Compactions of one subcompaction each, four of them fit.
         assert!(4 * cost.of(&spec, Some(1), None) <= memory.budget());
         assert_eq!(bounded.max_concurrent_compactions, 4);
     }
 
     #[test]
+    fn subcompactions_stay_within_the_cores() {
+        let (mut one, mut two) = (options(), options());
+        let memory = CompactionMemory::new(64 * 1024 * MIB);
+        memory.bound_for(&mut one, 8, 1);
+        memory.bound_for(&mut two, 8, 2);
+        assert_eq!(one.worker.unwrap().max_subcompactions, 1);
+        assert_eq!(two.worker.as_ref().unwrap().max_subcompactions, 2);
+        // Compactions still run beside each other on few cores.
+        assert_eq!(two.max_concurrent_compactions, 4);
+    }
+
+    #[test]
     fn small_budgets_shrink_prefetch_then_subcompactions() {
         let mut bounded = options();
-        CompactionMemory::new(128 * MIB).bound(&mut bounded, 8);
+        CompactionMemory::new(128 * MIB).bound_for(&mut bounded, 8, CORES);
         let worker = bounded.worker.clone().unwrap();
         assert_eq!(worker.max_subcompactions, 1);
         assert_eq!(worker.max_concurrent_compactions, 1);
-        assert!(8 * Cost::per_source(&worker) + OUTPUT_BYTES <= 128 * MIB);
+        assert!(8 * Cost::per_source(&worker) + OUTPUT_BYTES <= 96 * MIB);
         // Below one subcompaction's floor, prefetch stops at one block.
         let mut tiny = options();
-        CompactionMemory::new(MIB).bound(&mut tiny, 8);
+        CompactionMemory::new(MIB).bound_for(&mut tiny, 8, CORES);
         let worker = tiny.worker.unwrap();
         assert_eq!(
             (worker.max_fetch_tasks, worker.bytes_to_fetch as u64),
@@ -318,7 +396,7 @@ mod tests {
         bounded
             .scheduler_options
             .insert("min_compaction_sources".to_owned(), "12".to_owned());
-        CompactionMemory::new(64 * 1024 * MIB).bound(&mut bounded, 8);
+        CompactionMemory::new(64 * 1024 * MIB).bound_for(&mut bounded, 8, CORES);
         assert_eq!(bounded.max_concurrent_compactions, 1);
         assert_eq!(bounded.scheduler_options["min_compaction_sources"], "8");
     }
@@ -327,14 +405,16 @@ mod tests {
     fn holders_share_the_budget_until_they_drop() {
         let memory = CompactionMemory::new(100);
         let (first, second) = (memory.holder(), memory.holder());
-        first.set(30);
-        second.set(50);
+        let held = |total, merges| Held { total, merges };
+        first.set(held(30, 10));
+        second.set(held(50, 50));
         assert_eq!(
             (first.others(), second.others(), memory.held()),
-            (50, 30, 80)
+            (held(50, 50), held(30, 10), 80)
         );
         drop(second);
-        assert_eq!((first.others(), memory.held()), (0, 30));
+        assert_eq!((first.others(), memory.held()), (held(0, 0), 30));
+        assert_eq!(memory.merge_budget(), 75);
     }
 
     #[test]

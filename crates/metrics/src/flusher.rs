@@ -4,13 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::coordinator::Flusher;
+use common::coordinator::{FlushStep, Flusher};
+use common::cpu::spawn_map;
 use common::discovery::{CatalogBatch, DiscoveryValue};
 use common::storage::{RecordOp, Ttl};
 
+use std::collections::HashMap;
+
+use crate::Namespace;
 use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
-use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
-use crate::model::TimeBucket;
+use crate::delta::{FrozenTsdbDelta, SeriesSamples, TsdbWriteDelta};
+use crate::model::{SeriesId, TimeBucket};
 use crate::postings_cache::PostingsCache;
 use crate::storage::{
     Store, insert_forward_index, insert_series_fingerprint, insert_series_id, merge_inverted_index,
@@ -46,8 +50,9 @@ pub(crate) struct TsdbFlusher {
     pub(crate) active_series: Arc<ActiveSeriesTracker>,
     /// Stamped with the bucket once a flush adding series is visible.
     pub(crate) postings_cache: Option<Arc<PostingsCache>>,
-    /// The bucket's latest stored write generation: seeded from storage when
-    /// the bucket is loaded, then advanced by every successful flush.
+    /// The bucket's latest write generation: seeded from storage when the
+    /// bucket is loaded, then advanced by every flush as it is encoded, so the
+    /// next can encode while it is written. A failed write ends the flusher.
     pub(crate) last_generation: u64,
 }
 
@@ -102,9 +107,20 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
     async fn flush_delta(
         &mut self,
         frozen: FrozenTsdbDelta,
-        _epoch_range: &Range<u64>,
+        epoch_range: &Range<u64>,
     ) -> Result<(), String> {
-        self.flush(frozen).await.map_err(|error| error.to_string())
+        match self.begin_flush(frozen, epoch_range).await? {
+            FlushStep::Done(()) => Ok(()),
+            FlushStep::Commit(commit) => commit.await,
+        }
+    }
+
+    async fn begin_flush(
+        &mut self,
+        frozen: FrozenTsdbDelta,
+        _epoch_range: &Range<u64>,
+    ) -> Result<FlushStep<()>, String> {
+        self.begin(frozen).await.map_err(|error| error.to_string())
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
@@ -116,7 +132,8 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 }
 
 impl TsdbFlusher {
-    async fn flush(&mut self, frozen: FrozenTsdbDelta) -> crate::Result<()> {
+    /// Builds the flush's ops here, leaving their write to the commit.
+    async fn begin(&mut self, frozen: FrozenTsdbDelta) -> crate::Result<FlushStep<()>> {
         // Advance the active-series ring to the current minute and republish
         // the gauge. Done unconditionally (even on empty deltas) so the window
         // continues to slide for idle workloads.
@@ -124,7 +141,7 @@ impl TsdbFlusher {
         ::metrics::gauge!(tsdb_metrics::TSDB_ACTIVE_SERIES).set(active_estimate as f64);
 
         if frozen.is_empty() {
-            return Ok(());
+            return Ok(FlushStep::Done(()));
         }
 
         let bucket = frozen.bucket;
@@ -140,7 +157,7 @@ impl TsdbFlusher {
         // Phase 1: build storage ops.
         let build_start = std::time::Instant::now();
         let generation = next_generation(self.last_generation);
-        let batch = flush_ops(frozen, ttl, generation)?;
+        let batch = flush_ops(frozen, ttl, generation).await?;
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS)
             .record(build_start.elapsed().as_secs_f64());
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_OPS).record(batch.ops.len() as f64);
@@ -149,36 +166,43 @@ impl TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_NEW_SERIES).record(new_series_count as f64);
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_SAMPLES).record(sample_count as f64);
 
-        // Phase 2: SlateDB apply. Time spent here reflects SlateDB write
-        // backpressure (memtable full, WAL stall, etc.).
-        let apply_start = std::time::Instant::now();
-        let result = self.storage.apply(batch.ops).await;
-        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS)
-            .record(apply_start.elapsed().as_secs_f64());
-
-        let elapsed = start.elapsed().as_secs_f64();
-        match &result {
-            Ok(_) => {
-                ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "success")
-                    .increment(1);
-                ::metrics::counter!(tsdb_metrics::TSDB_SERIES_CREATED).increment(new_series_count);
-            }
-            Err(_) => {
-                ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "error")
-                    .increment(1);
-            }
-        }
-        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
-
-        result?;
         self.last_generation = generation;
-        // Postings only change when a flush adds series.
-        if new_series_count > 0
-            && let Some(cache) = &self.postings_cache
-        {
-            cache.stamp(bucket);
-        }
-        Ok(())
+
+        // Phase 2: SlateDB apply, while the next flush builds. Time spent
+        // here reflects SlateDB write backpressure (memtable full, WAL
+        // stall, etc.).
+        let storage = self.storage.clone();
+        let postings_cache = self.postings_cache.clone();
+        Ok(FlushStep::Commit(Box::pin(async move {
+            let apply_start = std::time::Instant::now();
+            let result = storage.apply(batch.ops).await;
+            ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS)
+                .record(apply_start.elapsed().as_secs_f64());
+
+            let elapsed = start.elapsed().as_secs_f64();
+            match &result {
+                Ok(_) => {
+                    ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "success")
+                        .increment(1);
+                    ::metrics::counter!(tsdb_metrics::TSDB_SERIES_CREATED)
+                        .increment(new_series_count);
+                }
+                Err(_) => {
+                    ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "error")
+                        .increment(1);
+                }
+            }
+            ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
+
+            result.map_err(|error| error.to_string())?;
+            // Postings only change when a flush adds series.
+            if new_series_count > 0
+                && let Some(cache) = postings_cache
+            {
+                cache.stamp(bucket);
+            }
+            Ok(())
+        })))
     }
 }
 
@@ -197,10 +221,25 @@ impl OpBatch {
     }
 }
 
+/// Series one encoding job writes the samples of: enough that dispatch is
+/// noise next to encoding them.
+const SERIES_PER_CHUNK: usize = 1_024;
+
 /// Every op that persists `frozen`, ending with the bucket's new
 /// `generation`. They must be applied as one batch so a reader never sees
-/// samples without the generation that announces them.
-fn flush_ops(frozen: FrozenTsdbDelta, ttl: Ttl, generation: u64) -> crate::Result<OpBatch> {
+/// samples without the generation that announces them. Samples, most of a
+/// flush's encoding, are encoded off the flush task.
+async fn flush_ops(
+    mut frozen: FrozenTsdbDelta,
+    ttl: Ttl,
+    generation: u64,
+) -> crate::Result<OpBatch> {
+    let samples = encode_samples(
+        std::mem::take(&mut frozen.samples),
+        frozen.namespace.clone(),
+        frozen.bucket,
+        ttl,
+    );
     let namespace = &frozen.namespace;
     let bucket = frozen.bucket;
     let mut batch = OpBatch::default();
@@ -243,19 +282,53 @@ fn flush_ops(frozen: FrozenTsdbDelta, ttl: Ttl, generation: u64) -> crate::Resul
     for op in catalog_ops(&frozen, ttl) {
         batch.push(op);
     }
-    for (series_id, samples) in frozen.samples {
-        batch.push(merge_samples(
-            namespace,
-            bucket,
-            series_id,
-            &samples.metric_name,
-            samples.points,
-            samples.histograms,
-            ttl,
-        )?);
+    let samples = samples
+        .await
+        .map_err(|error| crate::Error::Internal(format!("sample encoding failed: {error}")))?;
+    for chunk in samples {
+        for op in chunk? {
+            batch.push(op);
+        }
     }
     batch.push(put_bucket_generation(namespace, bucket, generation, ttl));
     Ok(batch)
+}
+
+/// Starts encoding the merge operands adding `samples`, a chunk of series
+/// per job.
+fn encode_samples(
+    samples: HashMap<SeriesId, SeriesSamples>,
+    namespace: Namespace,
+    bucket: TimeBucket,
+    ttl: Ttl,
+) -> tokio::task::JoinHandle<Vec<crate::Result<Vec<RecordOp>>>> {
+    let mut chunks = Vec::with_capacity(samples.len().div_ceil(SERIES_PER_CHUNK));
+    let mut chunk = Vec::new();
+    for series in samples {
+        chunk.push(series);
+        if chunk.len() == SERIES_PER_CHUNK {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    spawn_map(chunks, move |chunk| {
+        chunk
+            .into_iter()
+            .map(|(series_id, samples)| {
+                merge_samples(
+                    &namespace,
+                    bucket,
+                    series_id,
+                    &samples.metric_name,
+                    samples.points,
+                    samples.histograms,
+                    ttl,
+                )
+            })
+            .collect()
+    })
 }
 
 /// The discovery catalog entries for the label values and metric metadata
@@ -552,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_advance_generation_when_apply_fails() {
+    async fn should_never_reissue_the_generation_of_a_failed_write() {
         // given
         let storage = FailingStorage::wrap_in_memory().await;
         storage.fail_apply(StorageError::Storage("test apply error".into()));
@@ -564,9 +637,12 @@ mod tests {
             .flush_delta(create_non_empty_frozen(), &(1..2))
             .await;
 
-        // then
+        // then: the generation was issued as the flush was encoded, before
+        // its write failed, and later ones follow it
         assert!(result.is_err());
-        assert_eq!(flusher.last_generation, 7);
+        let failed = flusher.last_generation;
+        assert!(failed > 7);
+        assert!(next_generation(failed) > failed);
     }
 
     #[test]

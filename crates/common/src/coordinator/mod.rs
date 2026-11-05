@@ -15,7 +15,7 @@ use futures::stream::{self, SelectAll, StreamExt};
 pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
 pub use metrics::describe_coordinator_metrics;
 pub use subscriber::{SubscribeError, ViewMonitor, ViewSubscriber};
-pub use traits::{Delta, Durability, EpochStamped, Flusher};
+pub use traits::{Delta, Durability, EpochStamped, FlushCommit, FlushStep, Flusher};
 
 /// Event sent from the write coordinator task to the flush task.
 enum FlushEvent<D: Delta> {
@@ -143,6 +143,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
             watermarks: watermarks.clone(),
             view: view.clone(),
             last_flushed_epoch: 0,
+            in_flight: None,
         };
 
         Self {
@@ -506,6 +507,51 @@ struct FlushTask<D: Delta, F: Flusher<D>> {
     watermarks: Arc<EpochWatermarks>,
     view: Arc<BroadcastedView<D>>,
     last_flushed_epoch: u64,
+    /// The one commit writing while the next delta's flush begins.
+    in_flight: Option<InFlight<D::Snapshot>>,
+}
+
+struct InFlight<S> {
+    commit: tokio::task::JoinHandle<Result<S, String>>,
+    epoch_range: Range<u64>,
+    started: std::time::Instant,
+}
+
+/// A finished [`InFlight`] commit.
+struct Committed<S> {
+    result: Result<S, String>,
+    epoch_range: Range<u64>,
+}
+
+/// Waits for the commit in flight, which must exist, and takes it.
+/// Cancel-safe: dropped before it resolves, the commit stays in flight.
+async fn committed<S>(in_flight: &mut Option<InFlight<S>>) -> Committed<S> {
+    let flight = in_flight.as_mut().expect("a commit is in flight");
+    let result = (&mut flight.commit)
+        .await
+        .map_err(|error| format!("flush commit panicked: {error}"))
+        .and_then(|result| result);
+    let flight = in_flight.take().expect("a commit is in flight");
+    ::metrics::histogram!(metrics::COORDINATOR_FLUSH_COMMIT_DURATION_SECONDS)
+        .record(flight.started.elapsed().as_secs_f64());
+    Committed {
+        result,
+        epoch_range: flight.epoch_range,
+    }
+}
+
+/// Publishes a written flush: the view first, so any waiter woken by the
+/// watermark observes a view that already includes it. Reversing the order
+/// races on multi-thread runtimes: a waiter on `Written` can schedule on
+/// another worker and read `view.snapshot` before the view update.
+fn publish<D: Delta>(
+    (last_flushed_epoch, view, watermarks): (&mut u64, &BroadcastedView<D>, &EpochWatermarks),
+    snapshot: D::Snapshot,
+    epoch_range: Range<u64>,
+) {
+    *last_flushed_epoch = epoch_range.end - 1;
+    view.update_flush_finished(snapshot, epoch_range);
+    watermarks.update_written(*last_flushed_epoch);
 }
 
 impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
@@ -520,6 +566,9 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
                             };
                             self.handle_event(event).await?;
                         }
+                        committed = committed(&mut self.in_flight), if self.in_flight.is_some() => {
+                            self.finish(committed)?;
+                        }
                         _ = self.stop_tok.cancelled() => {
                             break;
                         }
@@ -529,7 +578,7 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
                 while let Ok(event) = self.flush_rx.try_recv() {
                     self.handle_event(event).await?;
                 }
-                Ok(())
+                self.settle().await
             }
             .await;
             if let Err(WriteError::FlushError(error)) = &result {
@@ -543,6 +592,8 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
         match event {
             FlushEvent::FlushDelta { frozen } => self.handle_flush(frozen).await,
             FlushEvent::FlushStorage => {
+                // Durability covers every flush queued before it.
+                self.settle().await?;
                 let start = std::time::Instant::now();
                 let result = self
                     .flusher
@@ -558,27 +609,70 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
         }
     }
 
+    /// Begins flushing `frozen` while the previous commit, if any, writes,
+    /// then leaves this one's commit in flight.
     async fn handle_flush(&mut self, frozen: EpochStamped<D::Frozen>) -> WriteResult<()> {
         let delta = frozen.val;
         let epoch_range = frozen.epoch_range;
         let start = std::time::Instant::now();
-        let result = self
-            .flusher
-            .flush_delta(delta, &epoch_range)
-            .await
-            .map_err(|e| WriteError::FlushError(e.to_string()));
+        let step = {
+            let begin = self.flusher.begin_flush(delta, &epoch_range);
+            tokio::pin!(begin);
+            loop {
+                tokio::select! {
+                    step = &mut begin => break step,
+                    committed = committed(&mut self.in_flight), if self.in_flight.is_some() => {
+                        let Committed { result, epoch_range } = committed;
+                        let snapshot = result.map_err(WriteError::FlushError)?;
+                        publish(
+                            (&mut self.last_flushed_epoch, &self.view, &self.watermarks),
+                            snapshot,
+                            epoch_range,
+                        );
+                    }
+                }
+            }
+        };
         ::metrics::histogram!(metrics::COORDINATOR_FLUSH_DELTA_DURATION_SECONDS)
             .record(start.elapsed().as_secs_f64());
-        let snapshot = result?;
-        self.last_flushed_epoch = epoch_range.end - 1;
-        // Publish the refreshed view first so any waiter awoken by the
-        // watermark notification below observes a view that already includes
-        // this flush. Reversing the order races on multi-thread runtimes:
-        // a waiter on `Written` can schedule on another worker and read
-        // `view.snapshot` before this task completes the view update.
-        self.view.update_flush_finished(snapshot, epoch_range);
-        self.watermarks.update_written(self.last_flushed_epoch);
+        let step = step.map_err(WriteError::FlushError)?;
+        self.settle().await?;
+        match step {
+            FlushStep::Done(snapshot) => {
+                self.publish(snapshot, epoch_range);
+            }
+            FlushStep::Commit(commit) => {
+                self.in_flight = Some(InFlight {
+                    commit: tokio::spawn(commit),
+                    epoch_range,
+                    started: std::time::Instant::now(),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Waits for the commit in flight, if any, and publishes it.
+    async fn settle(&mut self) -> WriteResult<()> {
+        if self.in_flight.is_some() {
+            let committed = committed(&mut self.in_flight).await;
+            self.finish(committed)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, committed: Committed<D::Snapshot>) -> WriteResult<()> {
+        let snapshot = committed.result.map_err(WriteError::FlushError)?;
+        self.publish(snapshot, committed.epoch_range);
+        Ok(())
+    }
+
+    fn publish(&mut self, snapshot: D::Snapshot, epoch_range: Range<u64>) {
+        publish(
+            (&mut self.last_flushed_epoch, &self.view, &self.watermarks),
+            snapshot,
+            epoch_range,
+        );
     }
 }
 

@@ -6,11 +6,16 @@
 
 use std::time::Instant;
 
+use common::coordinator::FlushStep;
 use common::storage::StorageBatch;
 
 use super::*;
 use crate::codec::{decode_dictionary_key, dictionary_prefix, rollup_dictionary_prefix};
+use crate::config::PageConfig;
 use crate::model::{Field, locality_key, locality_order};
+use crate::object::PlannedObject;
+use crate::query::parallel::map_blocking;
+use crate::search::Posting;
 
 /// How long a segment's or rollup period's IDs stay in memory after its
 /// last write. A later write reloads them.
@@ -245,8 +250,14 @@ impl DirectWriter {
         }
     }
 
-    /// Writes every group atomically and returns the objects it wrote.
-    async fn write_groups(&mut self, groups: FrozenLogsWriteDelta) -> Result<Vec<WrittenObject>> {
+    /// Encodes every group into one atomic batch, returned with the objects
+    /// it writes. IDs advance as they are allocated, so the next flush can
+    /// encode before this batch is written: a failed write ends the
+    /// flusher, and a restarted one resumes from what storage holds.
+    async fn encode_groups(
+        &mut self,
+        groups: FrozenLogsWriteDelta,
+    ) -> Result<(StorageBatch, Vec<WrittenObject>)> {
         self.load_ids(&groups).await?;
         let FrozenLogsWriteDelta { groups, ops } = groups;
         let ttl = self.ttl()?;
@@ -264,8 +275,8 @@ impl DirectWriter {
         }
         let mut batch = self.writer.new_batch();
         batch.extend(ops);
-        let mut written = Vec::new();
-        let mut next_objects = Vec::new();
+        let mut writes = Vec::new();
+        let mut objects = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
             self.allocate_in_locality_order(&namespace, &groups)?;
@@ -317,42 +328,31 @@ impl DirectWriter {
             for (segment, mut streams) in runs {
                 streams.sort_unstable_by_key(|(stream_id, _)| *stream_id);
                 let first = self.segment_ids(&namespace, segment).next_object;
+                let location = (writes.len(), &namespace, segment, first);
                 let next =
-                    self.append_segment_objects(&mut write, &namespace, segment, first, streams)?;
-                next_objects.push(((namespace.clone(), segment), next));
+                    self.plan_segment_objects(&mut write, location, streams, &mut objects)?;
+                self.segment_ids(&namespace, segment).next_object = next;
             }
-            written.extend(write.written.drain(..).map(|(segment, object, stored)| {
-                WrittenObject {
-                    namespace: namespace.clone(),
-                    segment,
-                    object,
-                    stored,
-                }
-            }));
-            self.finish_write(write, &namespace, &mut batch)?;
+            writes.push((namespace, write));
+        }
+        let page = self.config.page.clone();
+        let encoded = map_blocking(objects, move |object| object.encode(&page)).await?;
+        let mut written = Vec::with_capacity(encoded.len());
+        for object in encoded {
+            let (namespace, write) = &mut writes[object.write];
+            written.push(write.add_object(namespace, object)?);
+        }
+        let mut terms = Vec::new();
+        for (namespace, write) in writes {
+            self.finish_write(write, &namespace, &mut batch, &mut terms)?;
+        }
+        for ops in map_blocking(terms, TermChunk::encode).await? {
+            batch.extend(ops);
         }
         #[cfg(test)]
         FLUSHED_OPS.fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
-        if !batch.is_empty() {
-            self.writer
-                .apply_batch(
-                    batch,
-                    WriteOptions {
-                        await_durable: false,
-                    },
-                )
-                .await?;
-        }
-        // Object IDs advance only once their objects are written, so a failed
-        // write leaves no gap that would keep neighbouring objects unmerged.
-        // Stream IDs need no rollback: an unwritten ID is never referenced.
-        for (key, next) in next_objects {
-            if let Some(ids) = self.segments.get_mut(&key) {
-                ids.next_object = next;
-            }
-        }
         self.evict_idle();
-        Ok(written)
+        Ok((batch, written))
     }
 
     /// Allocates the IDs of the streams `groups` adds to each segment and
@@ -489,26 +489,38 @@ impl DirectWriter {
     }
 
     /// Packs one segment's streams, in stream order, into level-0 objects
-    /// numbered from `first`, and returns the next unallocated object ID.
-    fn append_segment_objects(
+    /// numbered from `first`, added to `objects` for encoding, and returns
+    /// the next unallocated object ID.
+    fn plan_segment_objects(
         &self,
         write: &mut PendingWrite,
-        namespace: &Namespace,
-        segment: SegmentId,
-        first: u64,
+        (index, namespace, segment, first): (usize, &Namespace, SegmentId, u64),
         streams: Vec<(StreamId, Vec<LogEntry>)>,
+        objects: &mut Vec<ObjectJob>,
     ) -> Result<u64> {
         let mut builder = ObjectBuilder::new(self.config.page.clone())?;
         for (stream_id, entries) in streams {
             builder.push_run(stream_id, entries)?;
         }
         let mut next = first;
-        for built in builder.finish() {
+        for planned in builder.finish() {
             let object = ObjectRef { id: next, level: 0 };
             next = next
                 .checked_add(1)
                 .ok_or_else(|| Error::Invalid("segment exhausted object IDs".to_owned()))?;
-            write.add_object(namespace, segment, object, built)?;
+            objects.push(ObjectJob {
+                write: index,
+                namespace: namespace.clone(),
+                segment,
+                object,
+                planned,
+                properties: ObjectProperties {
+                    expires_at_unix_ms: write.retention.expires_at_unix_ms,
+                    written_at_unix_ms: write.retention.written_at_unix_ms,
+                    span: 1,
+                    ttl: write.retention.physical_ttl,
+                },
+            });
         }
         write.flush_objects.insert(segment, first);
         write.put(
@@ -519,12 +531,14 @@ impl DirectWriter {
     }
 
     /// Adds to `ops` the records accumulated across streams: stream ID
-    /// counters, label postings, and the full-text index.
+    /// counters, label postings and search statistics, and to `terms` the
+    /// full-text index terms left to encode.
     fn finish_write(
         &self,
         write: PendingWrite,
         namespace: &Namespace,
         ops: &mut StorageBatch,
+        terms: &mut Vec<TermChunk>,
     ) -> Result<()> {
         let PendingWrite {
             ttl,
@@ -599,16 +613,15 @@ impl DirectWriter {
                 }),
                 ttl,
             ));
-            let flush_object = flush_objects[&segment];
-            for (term, postings) in delta.postings {
-                term_index_ops(
-                    ops,
-                    (namespace, segment),
-                    &term,
-                    postings,
-                    flush_object,
+            let mut postings = delta.postings.into_iter().peekable();
+            while postings.peek().is_some() {
+                terms.push(TermChunk {
+                    namespace: namespace.clone(),
+                    segment,
+                    flush_object: flush_objects[&segment],
                     ttl,
-                )?;
+                    terms: postings.by_ref().take(TERMS_PER_CHUNK).collect(),
+                });
             }
         }
         Ok(())
@@ -858,7 +871,7 @@ impl Delta for LogsWriteDelta {
 pub(super) struct LogsFlusher {
     pub(super) direct_writer: DirectWriter,
     pub(super) storage: Arc<dyn Storage>,
-    pub(super) compactor: Option<Compactor>,
+    pub(super) compactor: Option<CompactorHandle>,
 }
 
 #[async_trait]
@@ -866,17 +879,45 @@ impl Flusher<LogsWriteDelta> for LogsFlusher {
     async fn flush_delta(
         &mut self,
         frozen: FrozenLogsWriteDelta,
-        _epoch_range: &Range<u64>,
+        epoch_range: &Range<u64>,
     ) -> std::result::Result<(), String> {
-        let written = self
+        match self.begin_flush(frozen, epoch_range).await? {
+            FlushStep::Done(()) => Ok(()),
+            FlushStep::Commit(commit) => commit.await,
+        }
+    }
+
+    /// Encodes here; the commit writes the batch, then hands its objects to
+    /// the compactor, which must only see written objects.
+    async fn begin_flush(
+        &mut self,
+        frozen: FrozenLogsWriteDelta,
+        _epoch_range: &Range<u64>,
+    ) -> std::result::Result<FlushStep<()>, String> {
+        let (batch, written) = self
             .direct_writer
-            .write_groups(frozen)
+            .encode_groups(frozen)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(compactor) = &mut self.compactor {
-            compactor.after_flush(written).await;
-        }
-        Ok(())
+        let writer = self.direct_writer.writer.clone();
+        let compactor = self.compactor.clone();
+        Ok(FlushStep::Commit(Box::pin(async move {
+            if !batch.is_empty() {
+                writer
+                    .apply_batch(
+                        batch,
+                        WriteOptions {
+                            await_durable: false,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(compactor) = compactor {
+                compactor.written(written).await;
+            }
+            Ok(())
+        })))
     }
 
     async fn flush_storage(&self) -> std::result::Result<(), String> {
@@ -940,8 +981,91 @@ struct PendingWrite {
     /// First object ID this write allocated in each segment, which names
     /// its full-text blocks.
     flush_objects: HashMap<SegmentId, u64>,
-    written: Vec<(SegmentId, ObjectRef, StoredObject)>,
     report: WriteReport,
+}
+
+/// One planned level-0 object of a flush, encoded off the flush task.
+struct ObjectJob {
+    /// Index of the namespace's [`PendingWrite`] in the flush.
+    write: usize,
+    namespace: Namespace,
+    segment: SegmentId,
+    object: ObjectRef,
+    planned: PlannedObject,
+    properties: ObjectProperties,
+}
+
+/// An [`ObjectJob`]'s records and the full-text index of its rows.
+struct EncodedObject {
+    write: usize,
+    segment: SegmentId,
+    object: ObjectRef,
+    ops: Vec<RecordOp>,
+    stored: StoredObject,
+    delta: IndexDelta,
+}
+
+impl ObjectJob {
+    fn encode(self, page: &PageConfig) -> Result<EncodedObject> {
+        let built = self.planned.build(page)?;
+        let mut delta = IndexDelta::default();
+        for run in &built.runs {
+            delta.add_run(
+                &DEFAULT_ANALYZER,
+                run.stream_id,
+                self.object.id,
+                run.entries.iter().map(|entry| entry.line.as_str()),
+            )?;
+        }
+        let mut ops = Vec::new();
+        let stored = object_records(
+            &mut ops,
+            ObjectLocation {
+                namespace: &self.namespace,
+                segment: self.segment,
+                object: self.object,
+            },
+            built,
+            self.properties,
+        )?;
+        Ok(EncodedObject {
+            write: self.write,
+            segment: self.segment,
+            object: self.object,
+            ops,
+            stored,
+            delta,
+        })
+    }
+}
+
+/// Full-text terms one job of a flush encodes; enough that dispatch is
+/// noise next to encoding their postings.
+const TERMS_PER_CHUNK: usize = 512;
+
+struct TermChunk {
+    namespace: Namespace,
+    segment: SegmentId,
+    flush_object: u64,
+    ttl: Ttl,
+    terms: Vec<(String, Vec<Posting>)>,
+}
+
+impl TermChunk {
+    fn encode(self) -> Result<Vec<RecordOp>> {
+        let mut ops = Vec::new();
+        for (term, postings) in self.terms {
+            term_index_ops(
+                &mut ops,
+                (&self.namespace, self.segment),
+                &term,
+                postings,
+                self.flush_object,
+                self.ttl,
+            )?;
+        }
+        Ok(ops)
+    }
 }
 
 impl PendingWrite {
@@ -954,7 +1078,6 @@ impl PendingWrite {
             rollup_postings: HashMap::new(),
             search_deltas: BTreeMap::new(),
             flush_objects: HashMap::new(),
-            written: Vec::new(),
             report: WriteReport {
                 streams,
                 ..WriteReport::default()
@@ -966,40 +1089,24 @@ impl PendingWrite {
         self.ops.push(RecordOp::put_with_ttl(key, value, self.ttl));
     }
 
+    /// Adds an encoded object's records and index, in object order.
     fn add_object(
         &mut self,
         namespace: &Namespace,
-        segment: SegmentId,
-        object: ObjectRef,
-        built: BuiltObject,
-    ) -> Result<()> {
-        let delta = self.search_deltas.entry(segment).or_default();
-        for run in &built.runs {
-            delta.add_run(
-                &DEFAULT_ANALYZER,
-                run.stream_id,
-                object.id,
-                run.entries.iter().map(|entry| entry.line.as_str()),
-            )?;
-        }
-        let stored = object_records(
-            &mut self.ops,
-            ObjectLocation {
-                namespace,
-                segment,
-                object,
-            },
-            built,
-            ObjectProperties {
-                expires_at_unix_ms: self.retention.expires_at_unix_ms,
-                written_at_unix_ms: self.retention.written_at_unix_ms,
-                span: 1,
-                ttl: self.retention.physical_ttl,
-            },
-        )?;
-        self.written.push((segment, object, stored));
+        encoded: EncodedObject,
+    ) -> Result<WrittenObject> {
+        self.search_deltas
+            .entry(encoded.segment)
+            .or_default()
+            .absorb(encoded.delta)?;
+        self.ops.extend(encoded.ops);
         self.report.pages += 1;
-        Ok(())
+        Ok(WrittenObject {
+            namespace: namespace.clone(),
+            segment: encoded.segment,
+            object: encoded.object,
+            stored: encoded.stored,
+        })
     }
 }
 

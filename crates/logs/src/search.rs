@@ -145,6 +145,26 @@ impl IndexDelta {
         }
         Ok(())
     }
+
+    /// Adds `other`, the index of rows after this one's.
+    pub(crate) fn absorb(&mut self, other: IndexDelta) -> Result<()> {
+        self.documents = self
+            .documents
+            .checked_add(other.documents)
+            .ok_or_else(|| Error::Invalid("segment document count overflow".to_owned()))?;
+        self.total_terms = self
+            .total_terms
+            .checked_add(other.total_terms)
+            .ok_or_else(|| Error::Invalid("segment token count overflow".to_owned()))?;
+        if self.postings.is_empty() {
+            self.postings = other.postings;
+            return Ok(());
+        }
+        for (term, mut postings) in other.postings {
+            self.postings.entry(term).or_default().append(&mut postings);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn token_frequencies(analyzer: &dyn Analyzer, value: &str) -> HashMap<String, u32> {

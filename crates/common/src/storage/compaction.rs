@@ -44,6 +44,8 @@ mod memory;
 
 pub use memory::{CompactionMemory, DEFAULT_COMPACTION_MEMORY_BYTES};
 
+use memory::Held;
+
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
@@ -278,6 +280,24 @@ impl SegmentCompaction {
         self.grace
     }
 
+    /// Whether `spec` is relief: it reads L0s of a segment still taking
+    /// writes, unbounded or not yet past its end and grace, which is what
+    /// SlateDB stalls flushes on.
+    fn relief(&self, spec: &CompactionSpec, now_ms: u64) -> bool {
+        if spec.is_drain()
+            || !spec
+                .sources()
+                .iter()
+                .any(|source| matches!(source, SourceId::SstView(_)))
+        {
+            return false;
+        }
+        let grace_ms = i64::try_from(self.grace.as_millis()).unwrap_or(i64::MAX);
+        (self.span)(spec.segment()).is_none_or(|(_, end_ms)| {
+            i64::try_from(now_ms).unwrap_or(i64::MAX) < end_ms.saturating_add(grace_ms)
+        })
+    }
+
     /// The scheduler supplier for the database at `path`, which labels its
     /// metrics.
     pub fn supplier(&self, path: &str) -> Arc<dyn CompactionSchedulerSupplier> {
@@ -399,35 +419,67 @@ impl Scheduler {
         }
         let specs = match self.cost {
             Some(cost) => {
-                let running: u64 = state
+                let now_ms = unix_ms(SystemTime::now());
+                let running_specs: Vec<_> = state
                     .compactions()
                     .into_iter()
                     .flat_map(|compactions| compactions.recent_compactions())
                     .filter(|compaction| compaction.active())
                     .map(|compaction| {
-                        cost.of(
-                            compaction.spec(),
+                        let spec = compaction.spec();
+                        let bytes = cost.of(
+                            spec,
                             Some(compaction.subcompactions().len()),
-                            input_bytes(manifest, compaction.spec()),
-                        )
+                            input_bytes(manifest, spec),
+                        );
+                        (bytes, self.policy.relief(spec, now_ms))
                     })
+                    .collect();
+                let running: Held = running_specs
+                    .iter()
+                    .map(|(bytes, relief)| Held::default().add(*bytes, *relief))
                     .sum();
+                let running_merges = running_specs
+                    .iter()
+                    .filter(|(bytes, relief)| *bytes > 0 && !relief)
+                    .count();
                 let costed = specs
                     .into_iter()
                     .map(|spec| {
                         let bytes = cost.of(&spec, None, input_bytes(manifest, &spec));
-                        (spec, bytes)
+                        let relief = self.policy.relief(&spec, now_ms);
+                        Costed {
+                            spec,
+                            bytes,
+                            relief,
+                        }
                     })
                     .collect();
                 let others = self.memory.others();
-                let (specs, over, admitted) =
-                    within_budget(costed, running + others, self.memory.budget());
+                let held = Held {
+                    total: running.total + others.total,
+                    merges: running.merges + others.merges,
+                };
+                let memory = self.memory.memory();
+                let limits = Limits {
+                    budget: memory.budget(),
+                    merge_budget: memory.merge_budget(),
+                    merge_slots: self
+                        .max_concurrent
+                        .saturating_sub(1)
+                        .max(1)
+                        .saturating_sub(running_merges),
+                };
+                let (specs, over, admitted) = within_budget(costed, held, limits);
                 for spec in over {
                     tracing::debug!(path = %self.path, %spec, "deferring compaction until the memory budget has room");
                     deferred.insert(spec.segment().clone());
                     self.rejected("memory");
                 }
-                self.memory.set(running + admitted);
+                self.memory.set(Held {
+                    total: running.total + admitted.total,
+                    merges: running.merges + admitted.merges,
+                });
                 specs
             }
             None => specs,
@@ -731,20 +783,54 @@ fn merge_window(segment: &SegmentState, cap: usize) -> (Vec<SourceId>, &[u32]) {
     }
 }
 
-/// The `specs` that fit `budget` beside the `held` bytes of compactions
-/// already running, in order, then the rest, and the bytes of those that
-/// fit. With nothing held the first always runs, however large, so
-/// compaction never stalls on one that alone exceeds the budget.
-fn within_budget(
-    specs: Vec<(CompactionSpec, u64)>,
-    mut held: u64,
+/// A proposal, its estimated bytes, and whether it is relief.
+struct Costed {
+    spec: CompactionSpec,
+    bytes: u64,
+    relief: bool,
+}
+
+/// What [`within_budget`] admits within.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
     budget: u64,
-) -> (Vec<CompactionSpec>, Vec<CompactionSpec>, u64) {
-    let (mut fit, mut over, mut admitted) = (Vec::new(), Vec::new(), 0);
-    for (spec, bytes) in specs {
-        if bytes == 0 || held == 0 || held.saturating_add(bytes) <= budget {
-            held = held.saturating_add(bytes);
-            admitted += bytes;
+    merge_budget: u64,
+    /// Merges that may start beside the running ones, which leave
+    /// SlateDB's last compaction slot to relief.
+    merge_slots: usize,
+}
+
+/// The `specs` that fit beside the `held` bytes of compactions already
+/// running, in order, then the rest, and the bytes of those that fit.
+/// Relief fits within the whole budget; a merge also within the merge
+/// budget and a free merge slot. With nothing held the first always runs,
+/// however large, so compaction never stalls on one that alone exceeds the
+/// budget, and drains, which read nothing, always run.
+fn within_budget(
+    specs: Vec<Costed>,
+    mut held: Held,
+    limits: Limits,
+) -> (Vec<CompactionSpec>, Vec<CompactionSpec>, Held) {
+    let (mut fit, mut over, mut admitted) = (Vec::new(), Vec::new(), Held::default());
+    let mut merge_slots = limits.merge_slots;
+    for Costed {
+        spec,
+        bytes,
+        relief,
+    } in specs
+    {
+        let fits = bytes == 0
+            || held.total == 0
+            || (held.total.saturating_add(bytes) <= limits.budget
+                && (relief
+                    || (merge_slots > 0
+                        && held.merges.saturating_add(bytes) <= limits.merge_budget)));
+        if fits {
+            if !relief && bytes > 0 {
+                merge_slots = merge_slots.saturating_sub(1);
+            }
+            held = held.add(bytes, relief);
+            admitted = admitted.add(bytes, relief);
             fit.push(spec);
         } else {
             over.push(spec);
@@ -997,19 +1083,92 @@ mod tests {
         );
     }
 
+    fn costed(run: u32, bytes: u64, relief: bool) -> Costed {
+        Costed {
+            spec: CompactionSpec::new(vec![SourceId::SortedRun(run)], run),
+            bytes,
+            relief,
+        }
+    }
+
+    const LIMITS: Limits = Limits {
+        budget: 100,
+        merge_budget: 75,
+        merge_slots: 3,
+    };
+
+    fn held(total: u64, merges: u64) -> Held {
+        Held { total, merges }
+    }
+
     #[test]
     fn admits_compactions_while_they_fit_and_one_when_nothing_runs() {
-        let spec = |run| (CompactionSpec::new(vec![SourceId::SortedRun(run)], run), 40);
-        let (fit, over, admitted) = within_budget(vec![spec(1), spec(2), spec(3)], 10, 100);
-        assert_eq!((fit.len(), over.len(), admitted), (2, 1, 80));
+        let relief = |run| costed(run, 40, true);
+        let (fit, over, admitted) =
+            within_budget(vec![relief(1), relief(2), relief(3)], held(10, 0), LIMITS);
+        assert_eq!((fit.len(), over.len(), admitted), (2, 1, held(80, 0)));
         // Alone, a compaction larger than the budget still runs.
-        let (fit, over, admitted) = within_budget(vec![(spec(1).0, 500), spec(2)], 0, 100);
-        assert_eq!((fit.len(), over.len(), admitted), (1, 1, 500));
+        let (fit, over, admitted) =
+            within_budget(vec![costed(1, 500, false), relief(2)], held(0, 0), LIMITS);
+        assert_eq!((fit.len(), over.len(), admitted), (1, 1, held(500, 500)));
         // Beside running ones it waits, though drains hold nothing.
-        let drain = CompactionSpec::drain_segment(Bytes::from_static(&[1]), Vec::new());
-        let (fit, over, _) = within_budget(vec![spec(1), (drain, 0)], 90, 100);
+        let drain = Costed {
+            spec: CompactionSpec::drain_segment(Bytes::from_static(&[1]), Vec::new()),
+            bytes: 0,
+            relief: false,
+        };
+        let (fit, over, _) = within_budget(vec![relief(1), drain], held(90, 0), LIMITS);
         assert_eq!((fit.len(), over.len()), (1, 1));
         assert!(fit[0].is_drain());
+    }
+
+    #[test]
+    fn merges_leave_relief_its_share_and_a_slot() {
+        // Merges stop at the merge budget, relief takes the rest.
+        let (fit, over, admitted) = within_budget(
+            vec![
+                costed(1, 40, false),
+                costed(2, 40, false),
+                costed(3, 20, true),
+            ],
+            held(10, 10),
+            LIMITS,
+        );
+        assert_eq!((fit.len(), over.len()), (2, 1));
+        assert_eq!(admitted, held(60, 40));
+        // A large merge running doesn't hold relief back.
+        let (fit, _, admitted) = within_budget(vec![costed(1, 25, true)], held(75, 75), LIMITS);
+        assert_eq!((fit.len(), admitted), (1, held(25, 0)));
+        // Merges stop at their slots, however small.
+        let limits = Limits {
+            merge_slots: 1,
+            ..LIMITS
+        };
+        let (fit, over, _) = within_budget(
+            vec![costed(1, 1, false), costed(2, 1, false), costed(3, 1, true)],
+            held(1, 0),
+            limits,
+        );
+        assert_eq!((fit.len(), over.len()), (2, 1));
+    }
+
+    #[test]
+    fn relief_is_l0s_of_a_segment_still_taking_writes() {
+        let policy = policy();
+        let l0 = vec![SourceId::SstView(ulid::Ulid::from_parts(1, 0))];
+        let runs = vec![SourceId::SortedRun(1), SourceId::SortedRun(2)];
+        let hour = |sources: &Vec<SourceId>| {
+            CompactionSpec::for_segment(Bytes::from_static(&[1]), sources.clone(), 1)
+        };
+        // Hour 1 ends at 2h and its grace at 2.5h.
+        assert!(policy.relief(&hour(&l0), at_hour(1.5)));
+        assert!(policy.relief(&hour(&l0), at_hour(2.4)));
+        assert!(!policy.relief(&hour(&l0), at_hour(2.5)));
+        assert!(!policy.relief(&hour(&runs), at_hour(1.5)));
+        let unbounded = CompactionSpec::for_segment(Bytes::from_static(&[0xff]), l0.clone(), 1);
+        assert!(policy.relief(&unbounded, at_hour(100.0)));
+        let drain = CompactionSpec::drain_segment(Bytes::from_static(&[1]), l0);
+        assert!(!policy.relief(&drain, at_hour(1.5)));
     }
 
     #[test]

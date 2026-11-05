@@ -146,7 +146,10 @@ func Render(input Input) (Result, error) {
 		if mode == modeReader {
 			workload = input.Metrics.Spec.Reader
 		}
-		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(mode))}
+		plan := memoryPlan{
+			limit: resources.MemoryLimit(workload, descriptor, resources.Component(mode)),
+			cores: resources.CPUCores(workload, descriptor, resources.Component(mode)),
+		}
 		return yaml.Marshal(renderConfig{
 			Mode:                           mode,
 			Listeners:                      renderListeners{HTTP: fmt.Sprintf("0.0.0.0:%d", httpPort(input.Metrics)), GRPC: fmt.Sprintf("0.0.0.0:%d", grpcPort(input.Metrics))},
@@ -331,6 +334,7 @@ func renderLogs(input Input) (Result, error) {
 			limit:    resources.MemoryLimit(workload, descriptor, resources.Component(component)),
 			reserved: lo.Ternary(component == modeReader, logsReaderReserved, logsWriterReserved),
 			bodies:   lo.Ternary(component == modeReader, logsReaderBodies, logsWriterBodies),
+			cores:    resources.CPUCores(workload, descriptor, resources.Component(component)),
 		}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
@@ -450,7 +454,10 @@ func renderTraces(input Input) (Result, error) {
 		if component == modeReader {
 			workload = traces.Spec.Reader
 		}
-		plan := memoryPlan{limit: resources.MemoryLimit(workload, descriptor, resources.Component(component))}
+		plan := memoryPlan{
+			limit: resources.MemoryLimit(workload, descriptor, resources.Component(component)),
+			cores: resources.CPUCores(workload, descriptor, resources.Component(component)),
+		}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
 			PathPrefix: traces.Spec.Ingress.PathPrefix,
@@ -753,6 +760,9 @@ type memoryPlan struct {
 	reserved int64
 	// bodies is the part of reserved that bounds request bodies.
 	bodies int64
+	// cores is the container's whole CPU cores, which compaction can use
+	// at once.
+	cores int64
 }
 
 const mebibyte = int64(1024 * 1024)
@@ -834,16 +844,21 @@ func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
 // compactionBudget bounds what SlateDB's compactions of every shard hold at
 // once. One subcompaction of eight sources holds about 154 MiB, so the
 // floor of 160 MiB still runs one; metrics, whose other shares leave 3%,
-// gets the least. Logs and traces get at least the servers' default of
-// 640 MiB, which runs four of them at once, or a quarter of the shareable
-// memory on limits too small for it.
+// gets the least. Every product gets enough for one subcompaction per core
+// beside the quarter kept for L0 relief, and logs and traces at least the
+// servers' default of 640 MiB, which runs four at once, either way at most
+// a quarter of the shareable memory.
 func (plan memoryPlan) compactionBudget(percent int64) int64 {
-	floor := int64(160 * mebibyte)
+	wanted := plan.cores * compactionBytesPerCore
 	if percent >= logsCompactionPercent {
-		floor = max(floor, min(640*mebibyte, plan.shareable()/4))
+		wanted = max(wanted, 640*mebibyte)
 	}
-	return plan.share(percent, floor)
+	return plan.share(percent, max(160*mebibyte, min(wanted, plan.shareable()/4)))
 }
+
+// compactionBytesPerCore is one subcompaction of eight sources, about
+// 154 MiB, as three quarters of the budget.
+const compactionBytesPerCore = 208 * mebibyte
 
 const (
 	logsCompactionPercent    = 10
@@ -910,9 +925,9 @@ func uniqueDataKey(data map[string][]byte, base string) string {
 const (
 	defaultMaxRequestBytes        = 33554432
 	defaultMaxDecodedRequestBytes = 134217728
-	// The Logs server's write budget, which flushes a buffer at that size
-	// whatever its threshold.
-	logsBufferSizeThresholdBytes = 16777216
+	// Half the Logs server's 16 MiB write budget, the most it freezes a
+	// buffer at so ingest has room while a flush is written.
+	logsBufferSizeThresholdBytes = 8388608
 )
 
 func int64Value(value *int64, fallback int64) int64 { return lo.FromPtrOr(value, fallback) }

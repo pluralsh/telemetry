@@ -7,7 +7,11 @@
 use std::collections::hash_map::Entry;
 use std::time::Instant;
 
+use common::coordinator::FlushStep;
+use common::cpu::map_blocking;
+
 use super::*;
+use crate::page::EncodedTrace;
 
 /// How long a segment's next page sequence stays in memory after its last
 /// write. A later write reads it again.
@@ -108,16 +112,40 @@ type FlushHeads = HashMap<Namespace, HashMap<TraceId, TraceHead>>;
 impl Flusher<TraceWriteDelta> for TraceFlusher {
     async fn flush_delta(
         &mut self,
+        frozen: <TraceWriteDelta as Delta>::Frozen,
+        epoch_range: &Range<u64>,
+    ) -> std::result::Result<(), String> {
+        match self.begin_flush(frozen, epoch_range).await? {
+            FlushStep::Done(()) => Ok(()),
+            FlushStep::Commit(commit) => commit.await,
+        }
+    }
+
+    /// Encodes here; the commit writes, then drops cached locators of the
+    /// traces written, which reads must not cache again before the write.
+    async fn begin_flush(
+        &mut self,
         (groups, rebased): <TraceWriteDelta as Delta>::Frozen,
         _epoch_range: &Range<u64>,
-    ) -> std::result::Result<(), String> {
-        let (pages, written) = self
-            .direct_write(groups, &rebased)
+    ) -> std::result::Result<FlushStep<()>, String> {
+        let (ops, pages, written) = self
+            .encode_groups(groups, &rebased)
             .await
             .map_err(|error| error.to_string())?;
-        self.read_cache.invalidate_traces(written).await;
-        metrics::histogram!(TRACES_FLUSH_PAGES).record(pages as f64);
-        Ok(())
+        if ops.is_empty() {
+            return Ok(FlushStep::Done(()));
+        }
+        let storage = self.storage.clone();
+        let read_cache = self.read_cache.clone();
+        Ok(FlushStep::Commit(Box::pin(async move {
+            storage
+                .apply(ops)
+                .await
+                .map_err(|error| error.to_string())?;
+            read_cache.invalidate_traces(written).await;
+            metrics::histogram!(TRACES_FLUSH_PAGES).record(pages as f64);
+            Ok(())
+        })))
     }
 
     async fn flush_storage(&self) -> std::result::Result<(), String> {
@@ -177,31 +205,33 @@ impl TraceFlusher {
         Ok(())
     }
 
-    /// Writes every group atomically, returning the pages written and every
-    /// trace they hold. A failed write ends the flusher, so the sequences it
-    /// advanced are never reused.
-    async fn direct_write(
+    /// Encodes every group into one atomic write, returned with its page
+    /// count and every trace it holds. Sequences advance as pages are cut, so
+    /// the next flush can encode before this one is written: a failed write
+    /// ends the flusher, so the sequences it advanced are never reused.
+    async fn encode_groups(
         &mut self,
         groups: BTreeMap<TraceGroup, Vec<Trace>>,
         rebased: &Rebased,
-    ) -> Result<(usize, Vec<(Namespace, TraceId)>)> {
+    ) -> Result<(Vec<RecordOp>, usize, Vec<(Namespace, TraceId)>)> {
         if groups.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((Vec::new(), 0, Vec::new()));
         }
         let retention = retention_values(self.retention)?;
         self.load_sequences(&groups).await?;
+        let groups = encode_traces(groups).await?;
         let mut heads = FlushHeads::new();
         let mut ops = Vec::new();
         let mut catalogs = BTreeMap::<(Namespace, SegmentId), CatalogBatch>::new();
         let mut partition_catalogs = BTreeMap::<Namespace, CatalogBatch>::new();
-        let mut pages = 0usize;
+        let mut jobs = Vec::new();
         for ((namespace, segment), traces) in groups {
             let state = self
                 .sequences
                 .get_mut(&(namespace.clone(), segment))
                 .expect("load_sequences loads every written segment");
             state.touched = Instant::now();
-            pages = pages.saturating_add(append_segment(
+            plan_segment(
                 &mut ops,
                 (&namespace, segment),
                 traces,
@@ -209,10 +239,23 @@ impl TraceFlusher {
                 (&self.page_config, self.segment_ns, retention),
                 (
                     partition_catalogs.entry(namespace.clone()).or_default(),
-                    catalogs.entry((namespace.clone(), segment)).or_default(),
                     heads.entry(namespace.clone()).or_default(),
                 ),
-            )?);
+                &mut jobs,
+            )?;
+        }
+        let pages = jobs.len();
+        let max_size_bytes = self.page_config.max_size_bytes;
+        let encoded = map_blocking(jobs, move |job| job.encode(max_size_bytes, retention))
+            .await
+            .map_err(|error| Error::Invalid(format!("trace page encoding failed: {error}")))?;
+        for page in encoded {
+            let page = page?;
+            ops.extend(page.ops);
+            catalogs
+                .entry((page.namespace, page.segment))
+                .or_default()
+                .extend(page.catalog);
         }
         for ((namespace, segment), catalog) in catalogs {
             ops.extend(
@@ -237,27 +280,57 @@ impl TraceFlusher {
                 written.push((namespace.clone(), trace_id));
             }
         }
-        self.storage.apply(ops).await?;
         self.sequences
             .retain(|_, state| state.touched.elapsed() < SEQUENCE_IDLE_EVICTION);
-        Ok((pages, written))
+        Ok((ops, pages, written))
     }
 }
 
-/// Appends one segment's pages, numbered from `sequence`, which it advances,
-/// and returns how many it wrote.
-fn append_segment(
+/// Traces one encoding job compresses: enough that dispatch is noise next
+/// to encoding them.
+const TRACES_PER_CHUNK: usize = 256;
+
+/// Every group's traces, in order, encoded and compressed off the flush
+/// task.
+async fn encode_traces(
+    groups: BTreeMap<TraceGroup, Vec<Trace>>,
+) -> Result<Vec<(TraceGroup, Vec<EncodedTrace>)>> {
+    let mut keys = Vec::with_capacity(groups.len());
+    let mut chunks = Vec::new();
+    for (index, (group, mut traces)) in groups.into_iter().enumerate() {
+        keys.push((group, Vec::with_capacity(traces.len())));
+        while !traces.is_empty() {
+            let rest = traces.split_off(traces.len().min(TRACES_PER_CHUNK));
+            chunks.push((index, std::mem::replace(&mut traces, rest)));
+        }
+    }
+    let encoded = map_blocking(chunks, |(index, traces)| {
+        traces
+            .into_iter()
+            .map(EncodedTrace::new)
+            .collect::<Result<Vec<_>>>()
+            .map(|encoded| (index, encoded))
+    })
+    .await
+    .map_err(|error| Error::Invalid(format!("trace encoding failed: {error}")))?;
+    for chunk in encoded {
+        let (index, encoded) = chunk?;
+        keys[index].1.extend(encoded);
+    }
+    Ok(keys)
+}
+
+/// Cuts one segment's pages, numbered from `sequence`, which it advances,
+/// into `jobs`, and writes their trace locators.
+fn plan_segment(
     ops: &mut Vec<RecordOp>,
     (namespace, segment): (&Namespace, SegmentId),
-    traces: Vec<Trace>,
+    traces: Vec<EncodedTrace>,
     sequence: &mut u64,
     (page_config, segment_ns, retention): (&PageConfig, u64, Retention),
-    (partition_catalog, catalog, heads): (
-        &mut CatalogBatch,
-        &mut CatalogBatch,
-        &mut HashMap<TraceId, TraceHead>,
-    ),
-) -> Result<usize> {
+    (partition_catalog, heads): (&mut CatalogBatch, &mut HashMap<TraceId, TraceHead>),
+    jobs: &mut Vec<PageJob>,
+) -> Result<()> {
     partition_catalog.insert(
         PARTITION_SCOPE,
         PARTITION_NAME,
@@ -265,7 +338,7 @@ fn append_segment(
     );
     let last_segment = traces
         .iter()
-        .map(|trace| segment_for(trace.timestamp_range().1, segment_ns))
+        .map(|trace| segment_for(trace.trace().timestamp_range().1, segment_ns))
         .max()
         .unwrap_or(segment);
     if segment
@@ -278,33 +351,45 @@ fn append_segment(
             DiscoveryValue::String(format!("{segment}:{last_segment}")),
         );
     }
-    let mut pages = 0usize;
     let mut builder = PageBuilder::new(page_config.clone())?;
-    let mut cut_page = |(page, traces): (Page, Vec<Trace>)| -> Result<()> {
-        append_page_ops(
-            ops,
-            namespace,
-            PageWriteId {
+    let mut cut_page = |mut traces: Vec<EncodedTrace>| -> Result<()> {
+        // In directory order, which `Page::assemble` keeps.
+        traces.sort_by_key(|trace| trace.trace().trace_id);
+        let id = PageWriteId {
+            segment,
+            sequence: *sequence,
+        };
+        let mut continued = Vec::with_capacity(traces.len());
+        for (index, trace) in traces.iter().enumerate() {
+            let here = TraceLocator {
                 segment,
-                sequence: *sequence,
-            },
-            &page,
-            &traces,
-            retention,
-            (catalog, heads),
-        )?;
+                page_sequence: id.sequence,
+                trace_index: u32::try_from(index)
+                    .map_err(|_| Error::Invalid("trace index exceeds u32".to_owned()))?,
+                expires_at_unix_ms: retention.expires_at_unix_ms,
+            };
+            let trace_id = trace.trace().trace_id;
+            continued.push(record_page(
+                ops, namespace, heads, trace_id, here, retention,
+            )?);
+        }
+        jobs.push(PageJob {
+            namespace: namespace.clone(),
+            id,
+            traces,
+            continued,
+        });
         *sequence = sequence
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("page sequence exhausted".to_owned()))?;
-        pages = pages.saturating_add(1);
         Ok(())
     };
     for trace in traces {
-        if let Some(completed) = builder.append_with_traces(trace)? {
+        if let Some(completed) = builder.append_encoded(trace)? {
             cut_page(completed)?;
         }
     }
-    if let Some(completed) = builder.finish_with_traces()? {
+    if let Some(completed) = builder.finish_encoded() {
         cut_page(completed)?;
     }
     ops.push(RecordOp::put_with_ttl(
@@ -312,7 +397,47 @@ fn append_segment(
         encode_sequence(*sequence),
         retention.physical_ttl,
     ));
-    Ok(pages)
+    Ok(())
+}
+
+/// One cut page of a flush, assembled and indexed off the flush task.
+struct PageJob {
+    namespace: Namespace,
+    id: PageWriteId,
+    /// In directory order.
+    traces: Vec<EncodedTrace>,
+    /// Whether an earlier page of the flush holds each trace.
+    continued: Vec<bool>,
+}
+
+/// A [`PageJob`]'s records and the catalog terms of its traces.
+struct EncodedPage {
+    namespace: Namespace,
+    segment: SegmentId,
+    ops: Vec<RecordOp>,
+    catalog: CatalogBatch,
+}
+
+impl PageJob {
+    fn encode(self, max_size_bytes: usize, retention: Retention) -> Result<EncodedPage> {
+        let (page, traces) = Page::assemble(self.traces, max_size_bytes)?;
+        let mut ops = Vec::new();
+        let mut catalog = CatalogBatch::default();
+        append_page_ops(
+            &mut ops,
+            &self.namespace,
+            self.id,
+            (&page, &traces, &self.continued),
+            retention,
+            &mut catalog,
+        )?;
+        Ok(EncodedPage {
+            namespace: self.namespace,
+            segment: self.id.segment,
+            ops,
+            catalog,
+        })
+    }
 }
 
 pub(super) fn retention_values(retention: Option<Duration>) -> Result<Retention> {
@@ -391,14 +516,15 @@ fn record_page(
     }
 }
 
+/// Appends a page's metadata, payload and postings, given whether an earlier
+/// page of the flush holds each of its traces, in directory order.
 fn append_page_ops(
     ops: &mut Vec<RecordOp>,
     namespace: &Namespace,
     id: PageWriteId,
-    page: &Page,
-    traces: &[Trace],
+    (page, traces, continued): (&Page, &[Trace], &[bool]),
     retention: Retention,
-    (catalog, heads): (&mut CatalogBatch, &mut HashMap<TraceId, TraceHead>),
+    catalog: &mut CatalogBatch,
 ) -> Result<()> {
     let directory = page.directory();
     let (Some(min_timestamp_ns), Some(max_timestamp_ns)) = (
@@ -409,16 +535,13 @@ fn append_page_ops(
             "cannot write an empty trace page".to_owned(),
         ));
     };
+    if continued.len() != directory.len() {
+        return Err(Error::Invalid(
+            "trace page directory differs from its plan".to_owned(),
+        ));
+    }
     let mut page_traces = Vec::with_capacity(directory.len());
-    for (index, entry) in directory.iter().enumerate() {
-        let here = TraceLocator {
-            segment: id.segment,
-            page_sequence: id.sequence,
-            trace_index: u32::try_from(index)
-                .map_err(|_| Error::Invalid("trace index exceeds u32".to_owned()))?,
-            expires_at_unix_ms: retention.expires_at_unix_ms,
-        };
-        let continued = record_page(ops, namespace, heads, entry.trace_id, here, retention)?;
+    for (entry, continued) in directory.iter().zip(continued.iter().copied()) {
         page_traces.push(PageTrace {
             trace_id: entry.trace_id,
             min_timestamp_ns: entry.min_timestamp_ns,

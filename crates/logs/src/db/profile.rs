@@ -1459,6 +1459,7 @@ async fn cold_reader_cached(
             .transpose()
             .unwrap(),
         write_handle: None,
+        compactor: None,
         write_coordinator: Mutex::new(None),
         caches: DiscoveryCaches::new(),
         blocks: BlockCache::new(config.block_cache_capacity_bytes),

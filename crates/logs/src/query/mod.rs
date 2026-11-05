@@ -30,7 +30,7 @@ mod columnar;
 pub(crate) use columnar::{BatchSlice, ColumnBatch, StreamBatches, Tie};
 mod label_regex;
 mod metric;
-mod parallel;
+pub(crate) mod parallel;
 mod pipeline;
 pub(crate) use pipeline::is_error_label;
 mod regex_cache;

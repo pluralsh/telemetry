@@ -989,6 +989,22 @@ func defaultMemory(descriptor Descriptor, component Component) resource.Quantity
 // MemoryLimit is the byte memory limit the operator renders for the
 // workload's descriptor container in component.
 func MemoryLimit(workload telemetryv1alpha1.WorkloadSpec, descriptor Descriptor, component Component) int64 {
+	limit := renderedResources(workload, descriptor, component).Limits[corev1.ResourceMemory]
+	return limit.Value()
+}
+
+// CPUCores is the workload's descriptor container's CPU limit in component,
+// or its request without one, rounded up to whole cores and at least one.
+func CPUCores(workload telemetryv1alpha1.WorkloadSpec, descriptor Descriptor, component Component) int64 {
+	rendered := renderedResources(workload, descriptor, component)
+	cpu, limited := rendered.Limits[corev1.ResourceCPU]
+	if !limited {
+		cpu = rendered.Requests[corev1.ResourceCPU]
+	}
+	return max((cpu.MilliValue()+999)/1000, 1)
+}
+
+func renderedResources(workload telemetryv1alpha1.WorkloadSpec, descriptor Descriptor, component Component) corev1.ResourceRequirements {
 	var template corev1.ResourceRequirements
 	if workload.PodTemplate != nil {
 		if found, ok := lo.Find(workload.PodTemplate.Spec.Containers, func(candidate corev1.Container) bool {
@@ -997,8 +1013,7 @@ func MemoryLimit(workload telemetryv1alpha1.WorkloadSpec, descriptor Descriptor,
 			template = found.Resources
 		}
 	}
-	limit := containerResources(template, workload.Resources, defaultMemory(descriptor, component)).Limits[corev1.ResourceMemory]
-	return limit.Value()
+	return containerResources(template, workload.Resources, defaultMemory(descriptor, component))
 }
 
 func objectStoreEnv(metrics *Product) []corev1.EnvVar {

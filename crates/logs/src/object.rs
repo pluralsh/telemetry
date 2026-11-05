@@ -449,13 +449,31 @@ pub(crate) struct BuiltObject {
 
 /// Packs written rows, pushed in increasing stream order, into objects, cut
 /// once an object reaches the page size or row limit, so one large stream
-/// may span objects.
+/// may span objects. Cuts depend only on row counts and estimated sizes, so
+/// objects are planned here and encoded independently by
+/// [`PlannedObject::build`].
 pub(crate) struct ObjectBuilder {
     config: PageConfig,
-    objects: Vec<BuiltObject>,
-    current: BuiltObject,
+    objects: Vec<PlannedObject>,
+    current: PlannedObject,
     rows: usize,
     estimated_bytes: usize,
+}
+
+/// The runs [`ObjectBuilder`] cut into one object, not yet encoded.
+#[derive(Debug, Default)]
+pub(crate) struct PlannedObject {
+    runs: Vec<(StreamId, Vec<LogEntry>)>,
+}
+
+impl PlannedObject {
+    pub(crate) fn build(self, config: &PageConfig) -> Result<BuiltObject> {
+        let mut object = BuiltObject::default();
+        for (stream_id, entries) in self.runs {
+            close_run(config, &mut object, stream_id, entries)?;
+        }
+        Ok(object)
+    }
 }
 
 impl ObjectBuilder {
@@ -464,7 +482,7 @@ impl ObjectBuilder {
         Ok(Self {
             config,
             objects: Vec::new(),
-            current: BuiltObject::default(),
+            current: PlannedObject::default(),
             rows: 0,
             estimated_bytes: 0,
         })
@@ -478,7 +496,7 @@ impl ObjectBuilder {
             .current
             .runs
             .last()
-            .is_some_and(|last| last.stream_id >= stream_id)
+            .is_some_and(|(last, _)| *last >= stream_id)
         {
             return Err(Error::Invalid(
                 "object runs must be pushed in stream order".to_owned(),
@@ -492,7 +510,9 @@ impl ObjectBuilder {
                     || self.estimated_bytes.saturating_add(size) > self.config.target_size_bytes)
             {
                 if !run.is_empty() {
-                    self.close_run(stream_id, std::mem::take(&mut run))?;
+                    self.current
+                        .runs
+                        .push((stream_id, std::mem::take(&mut run)));
                 }
                 self.cut();
             }
@@ -501,35 +521,23 @@ impl ObjectBuilder {
             run.push(entry);
         }
         if !run.is_empty() {
-            self.close_run(stream_id, run)?;
+            self.current.runs.push((stream_id, run));
         }
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Vec<BuiltObject> {
+    pub(crate) fn finish(mut self) -> Vec<PlannedObject> {
         self.cut();
         self.objects
     }
 
-    fn close_run(&mut self, stream_id: StreamId, entries: Vec<LogEntry>) -> Result<()> {
-        let mut run = RunBlocks::new(stream_id);
-        for chunk in entries.chunks(self.config.rows_per_block) {
-            run.push(encode_block(chunk)?)?;
-        }
-        let duplicate_free = duplicate_free(&entries);
-        let error_metadata = entries.iter().any(|entry| {
-            entry
-                .structured_metadata
-                .iter()
-                .any(|field| field.name == ERROR_METADATA)
-        });
-        run.finish_into(
-            &mut self.current,
-            entries,
-            Vec::new(),
-            duplicate_free,
-            error_metadata,
-        )
+    #[cfg(test)]
+    fn build(self) -> Result<Vec<BuiltObject>> {
+        let config = self.config.clone();
+        self.finish()
+            .into_iter()
+            .map(|object| object.build(&config))
+            .collect()
     }
 
     fn cut(&mut self) {
@@ -539,6 +547,27 @@ impl ObjectBuilder {
         self.rows = 0;
         self.estimated_bytes = 0;
     }
+}
+
+/// Encodes one run's rows into `object`.
+fn close_run(
+    config: &PageConfig,
+    object: &mut BuiltObject,
+    stream_id: StreamId,
+    entries: Vec<LogEntry>,
+) -> Result<()> {
+    let mut run = RunBlocks::new(stream_id);
+    for chunk in entries.chunks(config.rows_per_block) {
+        run.push(encode_block(chunk)?)?;
+    }
+    let duplicate_free = duplicate_free(&entries);
+    let error_metadata = entries.iter().any(|entry| {
+        entry
+            .structured_metadata
+            .iter()
+            .any(|field| field.name == ERROR_METADATA)
+    });
+    run.finish_into(object, entries, Vec::new(), duplicate_free, error_metadata)
 }
 
 /// Whether no two of `entries` share a timestamp, line and structured
@@ -1774,7 +1803,7 @@ mod tests {
         builder.push_run(4, entries(10..14)).unwrap();
         builder.push_run(7, entries(20..21)).unwrap();
         assert!(builder.push_run(7, entries(30..31)).is_err());
-        let objects = builder.finish();
+        let objects = builder.build().unwrap();
         // Five rows fill the first object; stream 4 continues in the next.
         let layout = objects
             .iter()
@@ -1827,7 +1856,7 @@ mod tests {
         for (stream_id, entries) in runs {
             builder.push_run(stream_id, entries).unwrap();
         }
-        let built = builder.finish().pop().unwrap();
+        let built = builder.build().unwrap().pop().unwrap();
         let stored = StoredObject {
             expires_at_unix_ms: None,
             written_at_unix_ms: 0,

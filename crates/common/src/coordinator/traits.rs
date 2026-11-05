@@ -1,7 +1,9 @@
 use crate::StorageRead;
 use crate::coordinator::WriteCommand;
 use async_trait::async_trait;
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// The level of durability for a write.
@@ -95,6 +97,21 @@ impl<T> EpochStamped<T> {
     }
 }
 
+/// The rest of a flush [`Flusher::begin_flush`] started: usually the storage
+/// write of what it encoded.
+pub type FlushCommit<S> = Pin<Box<dyn Future<Output = Result<S, String>> + Send + 'static>>;
+
+/// What [`Flusher::begin_flush`] leaves to do.
+pub enum FlushStep<S> {
+    /// The flush is written.
+    Done(S),
+    /// The flush is written once this completes. The flush task runs it
+    /// while the next delta's [`Flusher::begin_flush`] encodes, and starts
+    /// a commit only once the one before it completes, so commits write in
+    /// delta order. A failed commit ends the flush task.
+    Commit(FlushCommit<S>),
+}
+
 /// A flusher persists frozen deltas and ensures storage durability.
 #[async_trait]
 pub trait Flusher<D: Delta>: Send + Sync + 'static {
@@ -107,6 +124,21 @@ pub trait Flusher<D: Delta>: Send + Sync + 'static {
         frozen: D::Frozen,
         epoch_range: &Range<u64>,
     ) -> Result<D::Snapshot, String>;
+
+    /// Starts flushing a frozen delta, leaving the storage write to a
+    /// [`FlushStep::Commit`] so the next delta can encode while it runs. A
+    /// flusher that commits must not let its next `begin_flush` depend on
+    /// the previous commit having completed. By default, flushes entirely
+    /// with [`Self::flush_delta`].
+    async fn begin_flush(
+        &mut self,
+        frozen: D::Frozen,
+        epoch_range: &Range<u64>,
+    ) -> Result<FlushStep<D::Snapshot>, String> {
+        self.flush_delta(frozen, epoch_range)
+            .await
+            .map(FlushStep::Done)
+    }
 
     /// Ensure storage durability (e.g. call storage.flush()).
     async fn flush_storage(&self) -> Result<(), String>;
