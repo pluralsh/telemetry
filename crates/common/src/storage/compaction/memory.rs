@@ -11,8 +11,9 @@
 //! subcompactions * (sources * max_fetch_tasks * bytes_to_fetch + 90 MiB)
 //! ```
 //!
-//! however small its inputs are, and SlateDB bounds neither the sources of
-//! a compaction nor how many run at once by bytes.
+//! however small its inputs are. SlateDB plans one subcompaction per
+//! `max_sst_size` of input, up to `max_subcompactions`, and bounds neither
+//! the sources of a compaction nor how many run at once by bytes.
 //!
 //! [`CompactionMemory`] does: [`CompactionMemory::bound`] shrinks a
 //! compactor's options until one compaction of its most sources fits the
@@ -88,10 +89,12 @@ impl CompactionMemory {
 
     /// Shrinks `options` until a compaction of `max_sources` sources fits the
     /// budget: prefetch first, down to one block per read and one read per
-    /// source, then subcompactions, then how many compactions run at once.
-    /// Options already below what the budget allows are kept. Without an
-    /// embedded worker, compactions run in another process and nothing
-    /// changes.
+    /// source, then subcompactions. How many compactions run at once is
+    /// capped at what the budget fits of compactions of one subcompaction,
+    /// which compactions under `max_sst_size` of input are; admission holds
+    /// larger ones back. Options already below what the budget allows are
+    /// kept. Without an embedded worker, compactions run in another process
+    /// and nothing changes.
     pub fn bound(&self, options: &mut CompactorOptions, max_sources: usize) {
         let Some(worker) = options.worker.as_mut() else {
             return;
@@ -114,8 +117,7 @@ impl CompactionMemory {
             .unwrap_or(usize::MAX)
             .max(1);
         worker.max_subcompactions = worker.max_subcompactions.clamp(1, subcompactions);
-        let compaction = subcompaction * worker.max_subcompactions as u64;
-        let concurrent = usize::try_from(budget / compaction)
+        let concurrent = usize::try_from(budget / subcompaction)
             .unwrap_or(usize::MAX)
             .max(1);
         worker.max_concurrent_compactions = worker.max_concurrent_compactions.clamp(1, concurrent);
@@ -204,6 +206,7 @@ impl Drop for Holder {
 pub(super) struct Cost {
     per_source: u64,
     subcompactions: u64,
+    max_sst_size: u64,
 }
 
 impl Cost {
@@ -213,6 +216,7 @@ impl Cost {
         Some(Self {
             per_source: Self::per_source(worker),
             subcompactions: worker.max_subcompactions.max(1) as u64,
+            max_sst_size: (worker.max_sst_size as u64).max(1),
         })
     }
 
@@ -224,15 +228,26 @@ impl Cost {
         worker.max_fetch_tasks.max(1) as u64 * fetch
     }
 
-    /// What `spec` holds while it runs, split into `subcompactions` when the
-    /// worker has planned them; drains read nothing.
-    pub(super) fn of(&self, spec: &CompactionSpec, subcompactions: Option<usize>) -> u64 {
+    /// What `spec` holds while it runs, split into the `planned`
+    /// subcompactions once the worker has planned them, before that into as
+    /// many as SlateDB plans for `input_bytes`, and into the most when its
+    /// inputs aren't known; drains read nothing.
+    pub(super) fn of(
+        &self,
+        spec: &CompactionSpec,
+        planned: Option<usize>,
+        input_bytes: Option<u64>,
+    ) -> u64 {
         if spec.is_drain() {
             return 0;
         }
-        let subcompactions = subcompactions
-            .filter(|planned| *planned > 0)
-            .map_or(self.subcompactions, |planned| planned as u64);
+        let subcompactions = match (planned.filter(|planned| *planned > 0), input_bytes) {
+            (Some(planned), _) => planned as u64,
+            (None, Some(bytes)) => bytes
+                .div_ceil(self.max_sst_size)
+                .clamp(1, self.subcompactions),
+            (None, None) => self.subcompactions,
+        };
         let sources = spec.sources().len() as u64;
         subcompactions * (sources * self.per_source + OUTPUT_BYTES)
     }
@@ -271,9 +286,11 @@ mod tests {
         let cost = Cost::new(&bounded).unwrap();
         let sources = (0..8).map(SourceId::SortedRun).collect::<Vec<_>>();
         let spec = CompactionSpec::new(sources, 0);
-        assert!(cost.of(&spec, None) <= memory.budget());
-        assert_eq!(bounded.max_concurrent_compactions, 1);
+        assert!(cost.of(&spec, None, None) <= memory.budget());
         assert_eq!(bounded.worker.unwrap().max_subcompactions, 4);
+        // Compactions of one subcompaction each, four of them fit.
+        assert!(4 * cost.of(&spec, Some(1), None) <= memory.budget());
+        assert_eq!(bounded.max_concurrent_compactions, 4);
     }
 
     #[test]
@@ -325,8 +342,26 @@ mod tests {
         let cost = Cost::new(&options()).unwrap();
         let sources = vec![SourceId::SortedRun(1), SourceId::SortedRun(2)];
         let merge = CompactionSpec::new(sources.clone(), 1);
-        assert_eq!(cost.of(&merge, Some(1)) * 4, cost.of(&merge, None));
+        assert_eq!(
+            cost.of(&merge, Some(1), None) * 4,
+            cost.of(&merge, None, None)
+        );
         let drain = CompactionSpec::drain_segment(bytes::Bytes::from_static(b"s"), sources);
-        assert_eq!(cost.of(&drain, None), 0);
+        assert_eq!(cost.of(&drain, None, None), 0);
+    }
+
+    #[test]
+    fn unplanned_compactions_take_a_subcompaction_per_max_sst_size_of_input() {
+        let options = options();
+        let max_sst_size = options.worker.as_ref().unwrap().max_sst_size as u64;
+        let cost = Cost::new(&options).unwrap();
+        let merge = CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(2)], 1);
+        let one = cost.of(&merge, Some(1), None);
+        assert_eq!(cost.of(&merge, None, Some(0)), one);
+        assert_eq!(cost.of(&merge, None, Some(max_sst_size)), one);
+        assert_eq!(cost.of(&merge, None, Some(max_sst_size + 1)), 2 * one);
+        assert_eq!(cost.of(&merge, None, Some(100 * max_sst_size)), 4 * one);
+        // Planned subcompactions win over the input estimate.
+        assert_eq!(cost.of(&merge, Some(3), Some(0)), 3 * one);
     }
 }

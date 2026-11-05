@@ -862,14 +862,16 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Writer: (6Gi - 1.5Gi headroom - 1.5Gi reserved) / 100 per percent,
-	// with 512Mi of the reservation for request bodies.
+	// with 512Mi of the reservation for request bodies, and compaction's
+	// 640Mi floor above its 10%.
 	// Reader: (2Gi - 768Mi headroom - 640Mi reserved) / 100 per percent,
-	// with 64Mi of it for request bodies.
+	// with 64Mi of it for request bodies, and compaction's floor at a
+	// quarter of the 640Mi shared.
 	for key, expected := range map[string][]string{
 		LogsKey: {
 			"reader_cache_capacity: 773094096", "result_cache_capacity: 193273524",
 			"max_in_flight_query_bytes: 515396064", "max_in_flight_body_bytes: 536870912",
-			"buffer_size_threshold_bytes: 16777216", "compaction_bytes: 322122540",
+			"buffer_size_threshold_bytes: 16777216", "compaction_bytes: 671088640",
 		},
 		ReaderKey: {
 			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",

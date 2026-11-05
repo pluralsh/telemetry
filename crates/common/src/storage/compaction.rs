@@ -405,13 +405,17 @@ impl Scheduler {
                     .flat_map(|compactions| compactions.recent_compactions())
                     .filter(|compaction| compaction.active())
                     .map(|compaction| {
-                        cost.of(compaction.spec(), Some(compaction.subcompactions().len()))
+                        cost.of(
+                            compaction.spec(),
+                            Some(compaction.subcompactions().len()),
+                            input_bytes(manifest, compaction.spec()),
+                        )
                     })
                     .sum();
                 let costed = specs
                     .into_iter()
                     .map(|spec| {
-                        let bytes = cost.of(&spec, None);
+                        let bytes = cost.of(&spec, None, input_bytes(manifest, &spec));
                         (spec, bytes)
                     })
                     .collect();
@@ -747,6 +751,27 @@ fn within_budget(
         }
     }
     (fit, over, admitted)
+}
+
+/// Estimated bytes of `spec`'s inputs; `None` when its segment or a source
+/// isn't in `manifest`.
+fn input_bytes(manifest: &VersionedManifest, spec: &CompactionSpec) -> Option<u64> {
+    let (l0, runs) = if spec.segment().is_empty() {
+        (manifest.l0(), manifest.compacted())
+    } else {
+        let segment = manifest
+            .segments()
+            .iter()
+            .find(|segment| segment.prefix() == spec.segment())?;
+        (segment.l0(), segment.compacted())
+    };
+    spec.sources().iter().try_fold(0u64, |total, source| {
+        let bytes = match source {
+            SourceId::SstView(id) => l0.iter().find(|view| view.id == *id)?.estimate_size(),
+            SourceId::SortedRun(id) => runs.iter().find(|run| run.id == *id)?.estimate_size(),
+        };
+        Some(total.saturating_add(bytes))
+    })
 }
 
 fn unix_ms(time: SystemTime) -> u64 {

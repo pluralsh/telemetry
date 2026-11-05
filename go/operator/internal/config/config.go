@@ -793,8 +793,14 @@ func (plan memoryPlan) bodyBudget() int64 {
 	return plan.reservation() / mebibyte * plan.bodies / plan.reserved * mebibyte
 }
 
+// shareable is what the shares divide: the limit less headroom and the
+// reservation.
+func (plan memoryPlan) shareable() int64 {
+	return plan.limit - plan.headroom() - plan.reservation()
+}
+
 func (plan memoryPlan) share(percent, floor int64) int64 {
-	return max((plan.limit-plan.headroom()-plan.reservation())/100*percent, floor)
+	return max(plan.shareable()/100*percent, floor)
 }
 
 func (plan memoryPlan) blockCache() int64 { return plan.share(22, 64*mebibyte) }
@@ -826,10 +832,17 @@ func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
 }
 
 // compactionBudget bounds what SlateDB's compactions of every shard hold at
-// once. One subcompaction of eight sources holds about 154 MiB, so the floor
-// still runs one; metrics, whose other shares leave 3%, gets the least.
+// once. One subcompaction of eight sources holds about 154 MiB, so the
+// floor of 160 MiB still runs one; metrics, whose other shares leave 3%,
+// gets the least. Logs and traces get at least the servers' default of
+// 640 MiB, which runs four of them at once, or a quarter of the shareable
+// memory on limits too small for it.
 func (plan memoryPlan) compactionBudget(percent int64) int64 {
-	return plan.share(percent, 160*mebibyte)
+	floor := int64(160 * mebibyte)
+	if percent >= logsCompactionPercent {
+		floor = max(floor, min(640*mebibyte, plan.shareable()/4))
+	}
+	return plan.share(percent, floor)
 }
 
 const (
