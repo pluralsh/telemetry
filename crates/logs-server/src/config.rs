@@ -186,6 +186,12 @@ pub struct Config {
     /// How long data is kept, counted from ingestion; 14 days by default,
     /// `null` keeps it forever.
     pub retention_seconds: Option<u64>,
+    /// Whether writers keep a full-text index of lines, for `| match`
+    /// ranking and for `|=` filters to skip rows that cannot match. Off by
+    /// default: segments are scanned as Loki scans chunks, and writers skip
+    /// most of their storage writes. Turning it on indexes segments written
+    /// from then on. Binaries before this option reject configs that set it.
+    pub full_text_index: bool,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
     /// Rollup of closed days of segments into wider segments.
@@ -231,6 +237,7 @@ impl Default for Config {
             stream_locality_labels: core.stream_locality_labels,
             stream_id_block_size: core.stream_id_block_size,
             retention_seconds: core.retention.map(|value| value.as_secs()),
+            full_text_index: core.full_text_index,
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             rollup: SegmentRollupConfig::default(),
@@ -387,6 +394,7 @@ impl Config {
             stream_locality_labels: self.stream_locality_labels.clone(),
             stream_id_block_size: self.stream_id_block_size,
             retention: self.retention_seconds.map(Duration::from_secs),
+            full_text_index: self.full_text_index,
             page: plural_logs::PageConfig {
                 target_size_bytes: self.page.target_size_bytes,
                 max_rows: self.page.max_rows,

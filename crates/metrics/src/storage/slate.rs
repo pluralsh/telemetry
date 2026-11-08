@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -547,12 +547,15 @@ impl Storage {
                 .with_options(options)
                 .with_scheduler_supplier(policy.supplier(&slate_config.path))
         });
+        let unflushed = Arc::new(AtomicU64::new(0));
         let mut builder = DbBuilder::new(slate_config.path.clone(), object_store)
             .with_settings(settings)
             .with_sst_block_size(sst_block_size(&slate_config.disk))
             .with_merge_operator(Arc::new(adapter))
             .with_segment_extractor(TimeseriesSegmentExtractor::shared())
-            .with_metrics_recorder(Arc::new(MetricsRsRecorder));
+            .with_metrics_recorder(Arc::new(MetricsRsRecorder::tracking_unflushed(Arc::clone(
+                &unflushed,
+            ))));
 
         if let Some(cache) = cache.cache() {
             builder = builder.with_db_cache(cache, common::storage::factory::DB_CACHE_ID);
@@ -571,6 +574,7 @@ impl Storage {
             .watch(slate_config.path.clone(), db.subscribe());
 
         let admission = Admission::follow(db.subscribe(), l0_limit);
+        admission.track_unflushed(unflushed);
         let mut storage = Self::from_db(db);
         storage.merge_holds = merge_holds;
         storage.admission = admission;

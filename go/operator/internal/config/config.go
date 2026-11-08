@@ -337,10 +337,14 @@ func renderLogs(input Input) (Result, error) {
 		}
 		plan := memoryPlan{
 			limit:    resources.MemoryLimit(workload, descriptor, resources.Component(component)),
-			reserved: lo.Ternary(component == modeReader, logsReaderReserved, logsWriterReserved),
+			reserved: logsReaderReserved,
 			bodies:   lo.Ternary(component == modeReader, logsReaderBodies, logsWriterBodies),
 			writer:   component == modeWriter,
 			cores:    resources.CPUCores(workload, descriptor, resources.Component(component)),
+		}
+		if component != modeReader {
+			plan.writes, plan.writeFactor = logsWriterWrites(plan.cores), logsResidentPerWriteByte
+			plan.reserved = logsWriterFixed + plan.writes + logsWriterBodies
 		}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
@@ -355,7 +359,11 @@ func renderLogs(input Input) (Result, error) {
 			Rollup:                 renderRollupConfig(plan),
 			ReaderCacheCapacity:    plan.logsObjectBlockCache(),
 			ResultCacheCapacity:    plan.logsResultCache(),
-			Memory:                 renderLogsMemory{CompactionBytes: plan.compactionBudget(logsCompactionPercent)},
+			FullTextIndex:          boolValue(spec.FullTextIndex, false),
+			Memory: renderLogsMemory{
+				WriteBytes:      plan.writeBudget(),
+				CompactionBytes: plan.compactionBudget(logsCompactionPercent),
+			},
 			Page: renderLogsPage{
 				TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576),
 				MaxRows:         int64Value(spec.Page.MaxRows, 8192),
@@ -789,8 +797,7 @@ type memoryPlan struct {
 const mebibyte = int64(1024 * 1024)
 
 // Logs memory outside its caches and budgets that the server's fixed
-// defaults bound: a writer's flushes of a third of its 24 MiB write budget
-// (about 23 resident bytes per byte while they build storage writes), its SlateDB
+// defaults bound: a writer's write path (logsWriterWrites), its SlateDB
 // memtables and L0 uploads (writerMemtables) and compactor, and a reader's
 // replay of the writer's WAL not yet in L0, bounded by the same 192 MiB and
 // one flush. Each is the peak measured under rollups and
@@ -802,17 +809,18 @@ const mebibyte = int64(1024 * 1024)
 // write budgets and fixed defaults bound: the write path at the measured
 // resident bytes per budget byte (traces' 48 MiB at 6, decoded spans and
 // their encoded flushes; metrics' 192 MiB at 4, new series' indexes and
-// their encoded flushes), SlateDB memtables and L0 uploads (192 MiB
+// their encoded flushes), half again for the rollup copies' allowance
+// beside it, SlateDB memtables and L0 uploads (192 MiB
 // unflushed at about 2.5 bytes per byte, and a second upload's 90 MiB of
 // buffered parts), and 256 MiB for request bodies being decoded, which only
 // request size and concurrency limits bound.
 const (
 	writerMemtables             = 576 * mebibyte
 	writerBodies                = 256 * mebibyte
-	tracesResidentPerWriteByte  = 6
+	tracesResidentPerWriteByte  = 6 * 3 / 2
 	tracesWriterWrites          = 48 * mebibyte * tracesResidentPerWriteByte
 	tracesWriterReserved        = tracesWriterWrites + writerMemtables + writerBodies
-	metricsResidentPerWriteByte = 4
+	metricsResidentPerWriteByte = 4 * 3 / 2
 	metricsWriterWrites         = 192 * mebibyte * metricsResidentPerWriteByte
 	metricsWriterReserved       = metricsWriterWrites + writerMemtables + writerBodies
 )
@@ -820,9 +828,26 @@ const (
 const (
 	logsWriterBodies   = 512 * mebibyte
 	logsReaderBodies   = 64 * mebibyte
-	logsWriterReserved = 1280*mebibyte + logsWriterBodies
+	logsWriterFixed    = 1096 * mebibyte
 	logsReaderReserved = 736*mebibyte + logsReaderBodies
+	// logsWriteBytesPerCore is the logs write budget per core, at least
+	// logsMinWriteBytes. The budget holds what ingest has applied until its
+	// flush is written, so it must grow with the ingest rate a writer's
+	// cores sustain: at 24 MiB, a 2-core writer near its capacity turned
+	// ingest away whenever a commit slowed.
+	logsWriteBytesPerCore = 16 * mebibyte
+	logsMinWriteBytes     = 24 * mebibyte
+	// logsResidentPerWriteByte is what the write path holds per byte of
+	// the budget: flushes of a third of it at about 23 bytes per byte while
+	// they build storage writes, about 8, and half again for the rollup
+	// copies' allowance beside it.
+	logsResidentPerWriteByte = 12
 )
+
+// logsWriterWrites is what a logs writer's write path holds resident.
+func logsWriterWrites(cores int64) int64 {
+	return max(logsMinWriteBytes, cores*logsWriteBytesPerCore) * logsResidentPerWriteByte
+}
 
 func (plan memoryPlan) headroom() int64 {
 	return min(max(plan.limit/4, 768*mebibyte), plan.limit/2)
@@ -912,10 +937,11 @@ func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
 // compactionBudget bounds what SlateDB's compactions of every shard hold at
 // once. One subcompaction of eight sources holds about 154 MiB, so the
 // floor of 160 MiB still runs one; metrics, whose other shares leave 3%,
-// gets the least. Every product gets enough for one subcompaction per core
-// beside the quarter kept for L0 relief, and logs and traces at least the
-// servers' default of 640 MiB, which runs four at once, either way at most
-// a quarter of the shareable memory.
+// gets the least. Every product gets 208 MiB per core, of which merges may
+// hold half and relief the other half: about one subcompaction of an L0
+// compaction (five sources' prefetch and one 64 MiB SST of output) per
+// core each. Logs and traces get at least the servers' default of 640 MiB,
+// either way at most a quarter of the shareable memory.
 func (plan memoryPlan) compactionBudget(percent int64) int64 {
 	wanted := plan.cores * compactionBytesPerCore
 	if percent >= logsCompactionPercent {
@@ -924,8 +950,7 @@ func (plan memoryPlan) compactionBudget(percent int64) int64 {
 	return plan.writeShare(percent, max(160*mebibyte, min(wanted, plan.shareable()/4)))
 }
 
-// compactionBytesPerCore is one subcompaction of eight sources, about
-// 154 MiB, as three quarters of the budget.
+// compactionBytesPerCore is twice one L0 subcompaction, about 104 MiB.
 const compactionBytesPerCore = 208 * mebibyte
 
 const (
@@ -1051,6 +1076,7 @@ type renderLogsConfig struct {
 	Elasticsearch          renderElasticsearch `json:"elasticsearch"`
 	Rollup                 renderRollup        `json:"rollup"`
 	ReaderCacheCapacity    int64               `json:"reader_cache_capacity"`
+	FullTextIndex          bool                `json:"full_text_index,omitempty"`
 	ResultCacheCapacity    int64               `json:"result_cache_capacity"`
 	Memory                 renderLogsMemory    `json:"memory"`
 	CacheWarmer            renderCacheWarmer   `json:"cache_warmer"`
@@ -1058,6 +1084,7 @@ type renderLogsConfig struct {
 	Namespaces             []renderNamespace   `json:"namespaces"`
 }
 type renderLogsMemory struct {
+	WriteBytes      int64 `json:"write_bytes,omitempty"`
 	CompactionBytes int64 `json:"compaction_bytes"`
 }
 type renderTracesReadCache struct {

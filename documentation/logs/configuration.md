@@ -97,6 +97,15 @@ stream_locality_labels: [cluster, k8s_cluster_name, namespace, k8s_namespace_nam
 # option refuse a config that sets it: leave it unset (256) during a rolling
 # upgrade or rollback. Either setting can resume data the other wrote.
 # stream_id_block_size: 256
+# Builds a BM25 index of log lines at write time (CRD:
+# `spec.config.fullTextIndex`). It narrows `|=` filters on rare tokens and
+# ranks `| match` from postings, but costs writers about a dozen storage
+# records per entry on typical Kubernetes lines, cutting entries per core.
+# Off, every query scans like Loki and returns the same rows. Segments
+# written while it was off are scanned even after it is turned on. Binaries
+# older than this option reject a config that sets it, so leave it unset
+# during a rolling upgrade or rollback.
+# full_text_index: false
 
 # Each write-buffer flush packs every written stream of a segment into
 # multi-stream objects; these limits cut larger flushes into several objects.
@@ -185,8 +194,10 @@ memory:
   # writer's WAL holds about one flush, so this bounds both. Ingest beyond it
   # waits up to a second for room, then is answered with HTTP 429 and
   # Retry-After (gRPC UNAVAILABLE); requests
-  # larger than a quarter of it are written a quarter at a time, and rollup
-  # copies use at most half.
+  # larger than a quarter of it are written a quarter at a time. Rollup
+  # copies hold an allowance of their own beside it, half its size, so they
+  # never take room from ingest. The operator renders 16 MiB per CPU core of
+  # a writer, at least 24 MiB.
   write_bytes: 25165824
 
 sharding:

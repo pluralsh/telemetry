@@ -1,4 +1,5 @@
-//! Turns ingest away before SlateDB stalls it on L0.
+//! Turns ingest away before SlateDB stalls it on L0 or holds it on
+//! unflushed memtables.
 //!
 //! SlateDB holds a memtable's flush once a segment it touches has
 //! `l0_max_ssts` L0 SSTs, and every write then waits until compaction
@@ -8,11 +9,18 @@
 //! limit, so clients back off while flushes still go through. Writes it
 //! already took still reach L0 after it stops taking more: up to
 //! `max_unflushed_bytes` of memtables and the uploads in flight, so it stops
-//! that many SSTs short of the limit. Rollup copies are not asked: they
-//! already wait for room in their half of the write budget.
+//! that many SSTs short of the limit.
+//!
+//! SlateDB also holds every write once its unflushed WAL and memtables reach
+//! `max_unflushed_bytes`, which happens when L0 uploads fall behind ingest,
+//! such as on a writer out of CPU. It holds for seconds, so ingest waiting
+//! on it times out in bursts. [`Admission`] sheds a growing share of ingest
+//! from five eighths of `max_unflushed_bytes` too, whichever of the two is
+//! deeper, so those writers turn some ingest away instead. Rollup copies are
+//! not asked: they wait for room in their own write allowance.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use slatedb::DbStatus;
 use slatedb::config::Settings;
@@ -31,6 +39,8 @@ pub struct L0Limit {
     /// L0 SSTs that writes already taken can still add: unflushed
     /// memtables and uploads in flight.
     pub backlog: usize,
+    /// SlateDB's `max_unflushed_bytes`; zero sheds nothing on it.
+    pub max_unflushed_bytes: usize,
 }
 
 impl L0Limit {
@@ -41,6 +51,7 @@ impl L0Limit {
                 .max_unflushed_bytes
                 .div_ceil(settings.l0_sst_size_bytes.max(1))
                 + settings.l0_flush_parallelism,
+            max_unflushed_bytes: settings.max_unflushed_bytes,
         }
     }
 }
@@ -56,6 +67,9 @@ struct Inner {
     depth: AtomicUsize,
     max_ssts: AtomicUsize,
     backlog: AtomicUsize,
+    max_unflushed: AtomicUsize,
+    /// SlateDB's unflushed bytes, once the database reports them.
+    unflushed: OnceLock<Arc<AtomicU64>>,
     turns: AtomicU64,
 }
 
@@ -73,6 +87,8 @@ impl Admission {
                 depth: AtomicUsize::new(0),
                 max_ssts: AtomicUsize::new(0),
                 backlog: AtomicUsize::new(0),
+                max_unflushed: AtomicUsize::new(0),
+                unflushed: OnceLock::new(),
                 turns: AtomicU64::new(0),
             }),
         }
@@ -98,6 +114,16 @@ impl Admission {
     pub fn limit_to(&self, limit: L0Limit) {
         self.inner.max_ssts.store(limit.max_ssts, Ordering::Relaxed);
         self.inner.backlog.store(limit.backlog, Ordering::Relaxed);
+        self.inner
+            .max_unflushed
+            .store(limit.max_unflushed_bytes, Ordering::Relaxed);
+    }
+
+    /// Sheds against `unflushed` as well, which the database's metrics
+    /// recorder keeps; see
+    /// [`MetricsRsRecorder::tracking_unflushed`](super::metrics_recorder::MetricsRsRecorder::tracking_unflushed).
+    pub fn track_unflushed(&self, unflushed: Arc<AtomicU64>) {
+        let _ = self.inner.unflushed.set(unflushed);
     }
 
     /// Follows `status`'s manifest: the deepest segment's L0 count.
@@ -114,30 +140,59 @@ impl Admission {
         metrics::gauge!(SEGMENT_L0_DEPTH).set(depth as f64);
     }
 
-    /// Whether to take on an ingest write now. Below five eighths of the
-    /// limit every write is admitted; from there each further L0 SST turns
-    /// away an equal further share, all of it once the backlog would fill
-    /// L0 to the limit, or one SST short of it at least.
+    /// Whether to take on an ingest write now: the deeper of the L0 and the
+    /// unflushed shares decides. Below five eighths of the L0 limit every
+    /// write is admitted; from there each further L0 SST turns away an equal
+    /// further share, all of it once the backlog would fill L0 to the limit,
+    /// or one SST short of it at least. Likewise each further eighth of
+    /// `max_unflushed_bytes` past five turns away a further quarter.
     pub fn admits(&self) -> bool {
-        let limit = self.inner.max_ssts.load(Ordering::Relaxed);
-        let backlog = self.inner.backlog.load(Ordering::Relaxed);
-        let depth = self.inner.depth.load(Ordering::Relaxed);
-        // A limit below two stalls on any L0, which shedding cannot avoid.
-        if limit < 2 {
-            return true;
-        }
-        let last = limit.saturating_sub(backlog.max(1)).max(1);
-        let from = (limit * 5).div_ceil(8).min(last);
-        if depth < from {
-            return true;
-        }
-        let span = (last - from + 1) as u64;
-        let shed = (depth.min(last) - from + 1) as u64;
+        let (shed, span) = match (self.l0_share(), self.unflushed_share()) {
+            (Some(l0), Some(unflushed)) => {
+                if l0.0 * unflushed.1 >= unflushed.0 * l0.1 {
+                    l0
+                } else {
+                    unflushed
+                }
+            }
+            (Some(share), None) | (None, Some(share)) => share,
+            (None, None) => return true,
+        };
         let admitted = self.inner.turns.fetch_add(1, Ordering::Relaxed) % span >= shed;
         if !admitted {
             metrics::counter!(ADMISSION_REJECTIONS).increment(1);
         }
         admitted
+    }
+
+    /// `(shed, of)` ingest writes to turn away for L0 depth, if any.
+    fn l0_share(&self) -> Option<(u64, u64)> {
+        let limit = self.inner.max_ssts.load(Ordering::Relaxed);
+        let backlog = self.inner.backlog.load(Ordering::Relaxed);
+        let depth = self.inner.depth.load(Ordering::Relaxed);
+        // A limit below two stalls on any L0, which shedding cannot avoid.
+        if limit < 2 {
+            return None;
+        }
+        let last = limit.saturating_sub(backlog.max(1)).max(1);
+        let from = (limit * 5).div_ceil(8).min(last);
+        (depth >= from).then(|| {
+            (
+                (depth.min(last) - from + 1) as u64,
+                (last - from + 1) as u64,
+            )
+        })
+    }
+
+    /// `(shed, of)` ingest writes to turn away for unflushed bytes, if any.
+    fn unflushed_share(&self) -> Option<(u64, u64)> {
+        let max = self.inner.max_unflushed.load(Ordering::Relaxed) as u64;
+        let unflushed = self.inner.unflushed.get()?.load(Ordering::Relaxed);
+        if max == 0 {
+            return None;
+        }
+        let eighths = unflushed.saturating_mul(8) / max;
+        (eighths >= 5).then(|| ((eighths - 4).min(4), 4))
     }
 
     #[cfg(test)]
@@ -162,6 +217,7 @@ mod tests {
         admission.limit_to(L0Limit {
             max_ssts: 16,
             backlog: 3,
+            max_unflushed_bytes: 0,
         });
         assert_eq!(admitted(&admission, 9), 300);
         assert_eq!(admitted(&admission, 10), 225);
@@ -177,6 +233,7 @@ mod tests {
         admission.limit_to(L0Limit {
             max_ssts: 8,
             backlog: 3,
+            max_unflushed_bytes: 0,
         });
         assert_eq!(admitted(&admission, 4), 300);
         assert_eq!(admitted(&admission, 5), 0);
@@ -195,9 +252,49 @@ mod tests {
             L0Limit::of(&settings),
             L0Limit {
                 max_ssts: 8,
-                backlog: 3
+                backlog: 3,
+                max_unflushed_bytes: 128 << 20,
             }
         );
+    }
+
+    #[test]
+    fn sheds_a_further_quarter_per_eighth_of_unflushed_bytes_past_five() {
+        let admission = Admission::unlimited();
+        admission.limit_to(L0Limit {
+            max_ssts: 0,
+            backlog: 0,
+            max_unflushed_bytes: 800,
+        });
+        let unflushed = Arc::new(AtomicU64::new(0));
+        admission.track_unflushed(Arc::clone(&unflushed));
+        for (bytes, expected) in [
+            (499, 300),
+            (500, 225),
+            (600, 150),
+            (700, 75),
+            (800, 0),
+            (900, 0),
+        ] {
+            unflushed.store(bytes, Ordering::Relaxed);
+            assert_eq!(admitted(&admission, 0), expected, "{bytes} unflushed");
+        }
+    }
+
+    #[test]
+    fn the_deeper_of_l0_and_unflushed_bytes_sheds() {
+        let admission = Admission::unlimited();
+        admission.limit_to(L0Limit {
+            max_ssts: 16,
+            backlog: 3,
+            max_unflushed_bytes: 800,
+        });
+        let unflushed = Arc::new(AtomicU64::new(600));
+        admission.track_unflushed(Arc::clone(&unflushed));
+        assert_eq!(admitted(&admission, 10), 150);
+        assert_eq!(admitted(&admission, 12), 75);
+        unflushed.store(0, Ordering::Relaxed);
+        assert_eq!(admitted(&admission, 0), 300);
     }
 
     #[test]
@@ -206,6 +303,7 @@ mod tests {
         admission.limit_to(L0Limit {
             max_ssts: 2,
             backlog: 0,
+            max_unflushed_bytes: 0,
         });
         assert_eq!(admitted(&admission, 0), 300);
         assert_eq!(admitted(&admission, 1), 0);

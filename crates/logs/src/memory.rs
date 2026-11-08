@@ -23,6 +23,8 @@
 //!   of 35 times its estimated bytes for production-shaped logs (a 64 MiB
 //!   delta of 450k rows became 4.2M storage operations and 2.3 GiB), so
 //!   the write path holds roughly `(35 + 2) * write_bytes` at most.
+//!   Rollup copies hold an allowance of their own beside it, half its
+//!   size, so a copy never takes room ingest needs.
 //! - **merge**: [`MERGE_BYTES_PER_INPUT_BYTE`] times the stored bytes of
 //!   the objects each compactor merge reads: their blocks, the merged
 //!   object's and the copy SlateDB's memtable takes of its write.
@@ -106,8 +108,9 @@ impl Default for MemoryConfig {
 pub(crate) struct MemoryBudget {
     decode: Arc<Budget>,
     write: Arc<Budget>,
-    /// The half of `write` rollup copies may hold at most, so they never
-    /// keep ingest out of the other half.
+    /// What rollup copies hold, half the size of `write` and beside it: with
+    /// copies drawing on `write`, a rollup on a busy writer turned ingest
+    /// away.
     copy: Arc<Budget>,
     merge: Arc<Budget>,
     compaction: CompactionMemory,
@@ -119,7 +122,7 @@ pub(crate) enum Writer {
     /// Waits up to [`INGEST_WAIT`] for room, then fails so clients retry
     /// later.
     Ingest,
-    /// Waits for room in its half of the budget.
+    /// Waits for room in the copies' allowance.
     Copy,
 }
 
@@ -153,8 +156,8 @@ impl MemoryBudget {
     }
 
     /// Holds `bytes` of applied writes until the permit drops. Ingest waits
-    /// up to `wait` for the budget, a copy for its half of the budget and
-    /// then the budget; either fails with [`Error::Backpressure`] after.
+    /// up to `wait` for the write budget, a copy for the copies' allowance;
+    /// either fails with [`Error::Backpressure`] after.
     pub(crate) async fn write(
         &self,
         writer: Writer,
@@ -163,19 +166,13 @@ impl MemoryBudget {
     ) -> Result<WritePermit> {
         match writer {
             Writer::Ingest => Ok(WritePermit {
-                _copy: None,
-                _write: self.write.acquire_within(bytes, wait).await?,
+                _held: self.write.acquire_within(bytes, wait).await?,
             }),
-            Writer::Copy => tokio::time::timeout(wait, async {
-                let bytes = bytes.min(u64::from(self.copy.capacity));
-                let copy = self.copy.acquire(bytes).await?;
-                Ok(WritePermit {
-                    _copy: Some(copy),
-                    _write: self.write.acquire(bytes).await?,
-                })
-            })
-            .await
-            .map_err(|_| Error::Backpressure)?,
+            Writer::Copy => Ok(WritePermit {
+                _held: tokio::time::timeout(wait, self.copy.acquire(bytes))
+                    .await
+                    .map_err(|_| Error::Backpressure)??,
+            }),
         }
     }
 
@@ -184,10 +181,7 @@ impl MemoryBudget {
         let fits = |budget: &Budget| budget.available() >= bytes.min(u64::from(budget.capacity));
         match writer {
             Writer::Ingest => fits(&self.write),
-            Writer::Copy => {
-                fits(&self.copy)
-                    && self.write.available() >= bytes.min(u64::from(self.copy.capacity))
-            }
+            Writer::Copy => fits(&self.copy),
         }
     }
 
@@ -199,6 +193,11 @@ impl MemoryBudget {
 
     pub(crate) fn write_capacity(&self) -> u64 {
         u64::from(self.write.capacity)
+    }
+
+    /// What rollup copies may hold at once.
+    pub(crate) fn copy_capacity(&self) -> u64 {
+        u64::from(self.copy.capacity)
     }
 
     /// The most one ingest write holds, a quarter of the write budget; larger
@@ -298,12 +297,11 @@ impl Budget {
     }
 }
 
-/// Bytes of a write held in the write budget, and in the copy half of it
+/// Bytes of a write held in the write budget, or in the copies' allowance
 /// for rollup copies, until this drops.
 #[derive(Debug)]
 pub(crate) struct WritePermit {
-    _copy: Option<BudgetPermit>,
-    _write: BudgetPermit,
+    _held: BudgetPermit,
 }
 
 /// Bytes of a [`MemoryBudget`] held until this drops.
@@ -390,42 +388,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_write_budget_rejects_ingest_and_times_copies_out() {
+    async fn a_full_write_budget_rejects_ingest_and_leaves_copies_their_room() {
         let budget = budget(100, 100);
         let held = budget.write(Writer::Ingest, 80, WAIT).await.unwrap();
         assert!(matches!(
             budget.write(Writer::Ingest, 30, WAIT).await,
             Err(Error::Backpressure)
         ));
-        assert!(matches!(
-            budget.write(Writer::Copy, 30, WAIT).await,
-            Err(Error::Backpressure)
-        ));
+        let copy = budget.write(Writer::Copy, 30, WAIT).await.unwrap();
         budget.write(Writer::Ingest, 20, WAIT).await.unwrap();
-        drop(held);
+        drop((held, copy));
         assert_eq!(budget.write_available(), 100);
     }
 
     #[tokio::test]
-    async fn copies_hold_at_most_half_the_write_budget() {
+    async fn copies_hold_half_the_write_budget_beside_it() {
         let budget = budget(100, 100);
+        assert_eq!(budget.copy_capacity(), 50);
         let copies = [
             budget.write(Writer::Copy, 30, WAIT).await.unwrap(),
             budget.write(Writer::Copy, 20, WAIT).await.unwrap(),
         ];
+        assert!(!budget.write_fits(Writer::Copy, 1));
         assert!(matches!(
             budget.write(Writer::Copy, 1, WAIT).await,
             Err(Error::Backpressure)
         ));
-        // Ingest still has the half copies cannot take.
-        let ingest = budget.write(Writer::Ingest, 50, WAIT).await.unwrap();
+        // Ingest still has the whole write budget.
+        let ingest = budget.write(Writer::Ingest, 100, WAIT).await.unwrap();
         assert_eq!(budget.write_available(), 0);
-        drop(copies);
-        drop(ingest);
+        drop((copies, ingest));
         assert_eq!(budget.write_available(), 100);
-        // A copy larger than its half takes all of the half.
+        // A copy larger than its allowance takes all of it.
         let large = budget.write(Writer::Copy, 1_000, WAIT).await.unwrap();
-        assert_eq!(budget.write_available(), 50);
+        assert!(!budget.write_fits(Writer::Copy, 1));
+        assert_eq!(budget.write_available(), 100);
         drop(large);
     }
 }

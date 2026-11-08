@@ -12,9 +12,9 @@ sizes the derived ones from the writer's CPU and memory limits; see
 |---|---|---|---|
 | Request bodies | request size and in-flight body limits | `max_in_flight_body_bytes` (Logs 512 MiB) | HTTP 429 or 413 before decoding |
 | Admission | per request | none | `storage_admission_rejections_total` |
-| Write budget | one process-wide budget | `write_budget_bytes`/`memory.write_bytes`: Logs 24 MiB, Traces 48 MiB, Metrics 192 MiB, resident at about 23, 6 and 4 times | ingest waits up to 1 s, then HTTP 429 (`logs_memory_budget_rejections_total` for Logs) |
+| Write budget | one process-wide budget, and beside it half its size for rollup copies | `write_budget_bytes`/`memory.write_bytes`: Logs 16 MiB per core (at least 24 MiB), Traces 48 MiB, Metrics 192 MiB; with the copies' allowance resident at about 12, 9 and 6 times | ingest waits up to 1 s, then HTTP 429 (`logs_memory_budget_rejections_total` for Logs) |
 | Write coordinator | one per database (per hour bucket for Metrics); encodes on the rayon pool; one commit in flight | a delta frozen at a third of the write budget | the write budget fills behind it |
-| SlateDB memtables | one filling, `l0_flush_parallelism` (2) uploading | `max_unflushed_bytes` 192 MiB, about 2.5 times resident, plus about 90 MiB per upload | SlateDB holds writes ("unflushed bytes" warnings); the write budget fills behind it |
+| SlateDB memtables | one filling, `l0_flush_parallelism` (2) uploading | `max_unflushed_bytes` 192 MiB, about 2.5 times resident, plus about 90 MiB per upload | admission sheds from five eighths of it; at it SlateDB holds writes ("unflushed bytes" warnings) and the write budget fills behind it |
 | L0 | one L0 compaction per segment at a time | `l0_max_ssts` (24; Metrics 48) SSTs per segment on the object store | admission sheds from five eighths of the limit |
 | Compaction | subcompactions up to the cores; compactions as the budget fits | `memory.compaction_bytes`, a subcompaction holding about `sources × prefetch + 90 MiB` | proposals deferred for memory; L0 depth rises |
 
@@ -41,6 +41,13 @@ the back:
 So a 429 names its stage by its metric, not its message: both read
 "writer is at capacity, retry later".
 
+The write budget holds what ingest has applied until its flush is written,
+so it must grow with the ingest rate the cores sustain: Logs' fixed 24 MiB
+turned ingest away on a 2-core writer near its capacity whenever a commit
+slowed. Rollup copies write through the same path, and when they drew on
+the same budget a rollup on a busy writer took the room ingest needed; they
+now wait in an allowance of their own.
+
 ## Derived limits
 
 - **L0 limit.** Admission stops taking writes `backlog` SSTs short of
@@ -62,6 +69,7 @@ So a 429 names its stage by its metric, not its message: both read
 - **Operator reservations.** A writer's memory limit holds its caches and
   budgets plus fixed reservations: memtables and uploads (576 MiB for
   Traces and Metrics: 192 MiB at 2.5 times plus a second upload), the write
-  path at its resident factor, and request bodies. Logs reserves 1.25 GiB
-  besides its 512 MiB of bodies, and a Logs reader 736 MiB for replaying the
-  writer's unflushed WAL.
+  path at its resident factor, and request bodies. A Logs writer reserves
+  1,096 MiB, its write path at 12 times its write budget (288 MiB on 1 core,
+  768 MiB on 4) and 512 MiB of bodies, and a Logs reader 736 MiB for
+  replaying the writer's unflushed WAL.

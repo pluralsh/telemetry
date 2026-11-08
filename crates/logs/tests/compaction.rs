@@ -23,6 +23,7 @@ fn config(path: &str, enabled: bool) -> Config {
         stream_locality_labels: Vec::new(),
         stream_id_block_size: 0,
         retention: None,
+        full_text_index: true,
         write_buffer: Default::default(),
         block_cache_capacity_bytes: plural_logs::DEFAULT_BLOCK_CACHE_CAPACITY_BYTES,
         result_cache_capacity_bytes: plural_logs::DEFAULT_RESULT_CACHE_CAPACITY_BYTES,

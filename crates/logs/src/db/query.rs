@@ -22,7 +22,7 @@ use crate::object::{
     decode_block_where, decode_samples_where, read_blocks,
 };
 use crate::query::{BatchSlice, ColumnBatch, StreamBatches, Tie, is_error_label};
-use crate::search::{self, TermStats};
+use crate::search::{self, TermDirectory, TermStats};
 
 #[cfg(test)]
 #[path = "profile.rs"]
@@ -1278,9 +1278,10 @@ impl LogDb {
     /// Rows of the selected runs whose lines may hold every one of `terms`,
     /// keyed by `(stream, object)` run, from the postings of the rarest term;
     /// runs without a candidate are absent. `None` when postings would not
-    /// narrow the read: the segment predates the index, or the rarest term
-    /// is in more than a fifth of its rows or has more posting blocks than
-    /// the selected runs have blocks.
+    /// narrow the read: some of the segment's rows are not indexed, or the
+    /// rarest term is in more than a fifth of its rows or has more posting
+    /// blocks than the selected runs have blocks. A term's directory is read
+    /// only up to that fifth.
     async fn line_candidates(
         &self,
         namespace: &Namespace,
@@ -1293,27 +1294,29 @@ impl LogDb {
         let Some(field) = search::field_stats(storage, namespace, segment).await? else {
             return Ok(None);
         };
-        let stats = futures::future::try_join_all(
-            terms
-                .iter()
-                .map(|term| search::term_stats(storage, namespace, segment, term)),
-        )
+        let selective = field.documents / 5;
+        let directories = futures::future::try_join_all(terms.iter().map(|term| {
+            search::term_directory(storage, namespace, segment, term, Some(selective))
+        }))
         .await?;
-        let mut rarest = None;
-        for (term, stats) in terms.iter().zip(stats) {
-            match stats {
-                Some(stats) if stats.documents > 0 => {
-                    if rarest.is_none_or(|(_, rarest): (_, TermStats)| {
-                        stats.documents < rarest.documents
-                    }) {
-                        rarest = Some((term, stats));
-                    }
-                }
-                // Postings are written with the rows they index.
-                _ => return Ok(Some(HashMap::new())),
+        let mut rarest: Option<(&String, TermDirectory, TermStats)> = None;
+        for (term, directory) in terms.iter().zip(directories) {
+            let Some(directory) = directory else {
+                continue;
+            };
+            let stats = directory.stats();
+            // Postings are written with the rows they index.
+            if stats.documents == 0 {
+                return Ok(Some(HashMap::new()));
+            }
+            if rarest
+                .as_ref()
+                .is_none_or(|(_, _, rarest)| stats.documents < rarest.documents)
+            {
+                rarest = Some((term, directory, stats));
             }
         }
-        let Some((term, stats)) = rarest else {
+        let Some((term, directory, stats)) = rarest else {
             return Ok(None);
         };
         let blocks = streams
@@ -1321,12 +1324,12 @@ impl LogDb {
             .flat_map(|stream| &stream.runs)
             .map(|(_, run)| u64::from(run.blocks))
             .sum::<u64>();
-        if stats.documents.saturating_mul(5) > field.documents || u64::from(stats.blocks) > blocks {
+        if u64::from(stats.blocks) > blocks {
             return Ok(None);
         }
         let leaves = self.run_leaves(namespace, segment, streams).await?;
         let mut by_run: HashMap<(StreamId, u64), HashSet<u32>> = HashMap::new();
-        for posting in search::term_postings(storage, namespace, segment, term, stats).await? {
+        for posting in search::term_postings(storage, namespace, segment, term, directory).await? {
             let address = posting.address;
             if let Some(&(object_id, first_row)) = leaves.get(&(address.stream_id, address.leaf)) {
                 by_run

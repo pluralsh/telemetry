@@ -4,6 +4,7 @@
 //! based on configuration, supporting both InMemory and SlateDB backends.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use super::admission::L0Limit;
 use super::coalescing::CoalescingObjectStore;
@@ -277,7 +278,10 @@ impl StorageBuilder {
                     }
                     db_builder = db_builder.with_compactor_builder(compactor);
                 }
-                db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
+                let unflushed = Arc::new(AtomicU64::new(0));
+                db_builder = db_builder.with_metrics_recorder(Arc::new(
+                    MetricsRsRecorder::tracking_unflushed(Arc::clone(&unflushed)),
+                ));
                 if let Some(op) = self.semantics.merge_operator {
                     let adapter = SlateDbStorage::merge_operator_adapter(op);
                     db_builder = db_builder.with_merge_operator(Arc::new(adapter));
@@ -296,7 +300,8 @@ impl StorageBuilder {
                         .with_sst_reader(sst_reader)
                         .with_meta_cache(meta)
                         .with_memtable_flush(MEMTABLE_FLUSH_INTERVAL)
-                        .with_l0_limit(l0_limit),
+                        .with_l0_limit(l0_limit)
+                        .with_unflushed(unflushed),
                 ))
             }
         }
@@ -621,7 +626,7 @@ pub async fn create_storage_read(
 
             let mut builder = DbReader::builder(slate_config.path.clone(), object_store.clone())
                 .with_options(reader_options)
-                .with_metrics_recorder(Arc::new(MetricsRsRecorder));
+                .with_metrics_recorder(Arc::new(MetricsRsRecorder::default()));
             if let Some(checkpoint_id) = runtime.checkpoint_id {
                 builder =
                     builder.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint_id));

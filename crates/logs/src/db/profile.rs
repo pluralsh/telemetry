@@ -79,6 +79,7 @@ fn config(path: &std::path::Path, production: bool) -> Config {
         stream_locality_labels: Vec::new(),
         stream_id_block_size: 0,
         retention: None,
+        full_text_index: true,
         page: if production {
             PageConfig::default()
         } else {
@@ -588,6 +589,7 @@ async fn profile_fuzz_cases() {
     let mut config = Config {
         storage: config(&store, true).storage,
         retention: None,
+        full_text_index: true,
         ..Config::default()
     };
     config.compaction.min_age = Duration::ZERO;
@@ -991,6 +993,7 @@ async fn profile_repeat_case() {
     let mut config = Config {
         storage: config(&store, true).storage,
         retention: None,
+        full_text_index: true,
         ..Config::default()
     };
     config.compaction.min_age = Duration::ZERO;
@@ -1081,6 +1084,7 @@ async fn profile_store_shape() {
     let config = Config {
         storage: config(&store, true).storage,
         retention: None,
+        full_text_index: true,
         ..Config::default()
     };
     let db = LogDb::open_reader(config, DbReaderOptions::default())
@@ -1150,6 +1154,7 @@ fn production_config(store: &std::path::Path) -> Config {
     let mut config = Config {
         storage: config(store, true).storage,
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 8192,

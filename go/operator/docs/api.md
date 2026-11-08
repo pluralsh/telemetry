@@ -631,6 +631,7 @@ _Appears in:_
 | `request` _[LogsRequestSpec](#logsrequestspec)_ |  |  |  |
 | `elasticsearch` _[LogsElasticsearchSpec](#logselasticsearchspec)_ |  | \{  \} |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
+| `fullTextIndex` _boolean_ | FullTextIndex builds a BM25 index of log lines at write time. It speeds up<br />`\|=` line filters on rare terms and enables ranked `\| match` queries, but<br />costs writers roughly a dozen storage records per entry. When off, the<br />default, line filters scan like Loki. | false |  |
 | `auth` _[AuthSpec](#authspec)_ |  |  |  |
 | `namespaces` _string array_ |  | [default] |  |
 

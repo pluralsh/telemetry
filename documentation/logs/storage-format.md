@@ -45,11 +45,12 @@ backfill.
 | `0x05` | Run | One stream's blocks in one object: pruning and retention |
 | `0x06` | Object block | Compressed rows of one stream, as a meta and a lines value |
 | `0x07` | Next object ID | Allocates object IDs within a segment |
-| `0x08`–`0x0b` | Search records | Full-text term index |
+| `0x08`–`0x0b` | Search records | Full-text term index (`full_text_index`) |
 | `0x0c` | Object tombstone | Replaced object awaiting deletion |
 | `0x0d` | Rollup | Discovery records of a whole rollup period |
 | `0x0e` | Object directory | Every run of one object, with its leaves |
 | `0x0f` | Summary | Per-stream row counts of a settled segment |
+| `0x10` | Search unindexed | Marks a segment holding rows written without the index |
 
 ## Stream and label records
 
@@ -436,7 +437,7 @@ SearchFieldStats (0x08)
 KEY   record prefix
 VALUE 0x01 │ documents: var_u64 │ total tokens: var_u64
 
-SearchTermStats (0x09)
+SearchTermStats (0x09), read-only: no longer written
 KEY   record prefix │ term: TerminatedBytes
 VALUE 0x01 │ document frequency: var_u64 │ posting blocks: var_u32
 
@@ -444,6 +445,8 @@ SearchTermDirectory (0x0a), one fragment per flush and 256 entries
 KEY   record prefix │ term: TerminatedBytes │ first block ID: u64 BE
 VALUE 0x01 │ count: var_u32 │ entry × count
       entry: block ID Δ: var_u64 │ postings │ max frequency │ min length   (var_u32)
+   or 0x02 │ postings │ max frequency │ min length (var_u32) │ posting block body
+      the single block of a term with at most 128 postings in the flush
 
 SearchPostingBlock (0x0b)
 KEY   record prefix │ term: TerminatedBytes │ block ID: u64 BE
@@ -452,26 +455,38 @@ VALUE 0x01 │ count: var_u32 │ posting × count, sorted by address
                stream Δ ≠ 0 → leaf object ID: var_u64 │ row ID: var_u32
                stream Δ = 0 → leaf Δ: var_u64 │ (leaf Δ = 0 ? row Δ : row ID): var_u32
                frequency: var_u32 │ length: var_u32
+
+SearchUnindexed (0x10)
+KEY   record prefix
+VALUE 0x01
 ```
 
 `var_u32`/`var_u64` are the length-prefixed varints from `common::serde::varint`.
 Posting addresses are delta-encoded against their predecessor, so a typical
-posting costs about five bytes. The leading `0x01` is the value format version;
-readers reject values with any other leading byte.
+posting costs about five bytes. The leading byte is the value format version;
+readers reject versions they do not know.
 
 Directory and posting values are bounded, so a common term never becomes one
 unbounded SlateDB value. Writes never read the index: each flush writes new
 blocks of at most 128 postings per term, named `first object ID of the flush
 << 24 | block index`, so IDs never collide and increase across flushes, plus
-directory fragments keyed by their first block ID. Field and term statistics
-are merge operands that the logs merge operator sums. A reader scans a term's
-fragments and requires at least the blocks its statistics count; a concurrent
-flush may add more. The cost is that every flush starts new blocks, so small
+directory fragments keyed by their first block ID. A term with at most 128
+postings in a flush, which is most terms, is written as one `0x02` fragment
+holding its postings, so it costs one record instead of a block, a fragment
+and a statistics merge. A term's document frequency and block count are the
+sums over its fragments. Field statistics are merge operands that the logs
+merge operator sums; it still sums term statistics written by older
+versions. The cost is that every flush starts new blocks, so small
 frequent flushes leave partially filled blocks. Queries load directories first, fetch posting blocks
 concurrently, visit the rarest term first, and fetch only blocks whose impact
-bound can still enter a single-term top-k result. Field statistics, term
-statistics, directories, posting blocks, and write deltas are all
-segment-local.
+bound can still enter a single-term top-k result. Field statistics,
+directories, posting blocks, and write deltas are all segment-local.
+
+The index is written only when `full_text_index` is on. A flush with it off
+writes `SearchUnindexed` for each segment it touches, and readers treat a
+segment with that marker as having no field statistics, so a segment written
+partly with the index off is scanned whole rather than narrowed by postings
+that miss some of its rows.
 
 Postings also narrow plain `|=` filters. Each single-branch `|=` that runs
 before the line is rewritten (`line_format`, `decolorize`, `unpack`)

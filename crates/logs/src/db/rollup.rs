@@ -88,10 +88,7 @@ impl LogDb {
         wide: SegmentId,
         config: &RollupConfig,
     ) -> Result<()> {
-        // Half the write budget at most, so ingest keeps the rest of it.
-        let buffer = config
-            .copy_buffer_bytes
-            .min(self.memory.write_capacity() / 2);
+        let buffer = config.copy_buffer_bytes.min(self.memory.copy_capacity());
         let writer = self.writer()?;
         let ttl = self.marker_ttl()?;
         let prefix = segment_prefix(namespace, wide);

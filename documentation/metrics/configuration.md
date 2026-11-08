@@ -183,7 +183,8 @@ write:
 # buffer_size_threshold_bytes is. Writes hold about four times it resident,
 # most of it new series' labels and indexes and their encoded flushes. Ingest
 # beyond it waits up to a second for room, then is answered with HTTP 429;
-# rollup copies use at most half. The operator sizes it from the memory limit.
+# rollup copies hold an allowance of their own beside it, half its size. The
+# operator sizes it from the memory limit.
 write_budget_bytes: 201326592
 
 request:

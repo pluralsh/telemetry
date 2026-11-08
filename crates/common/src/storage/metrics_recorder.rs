@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mixtrics::metrics::{
     BoxedCounter, BoxedCounterVec, BoxedGauge, BoxedGaugeVec, BoxedHistogram, BoxedHistogramVec,
@@ -20,7 +21,24 @@ use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, 
 /// Metric names are forwarded as-is (dot-separated, e.g.
 /// `slatedb.db.write_ops`). Labels become `metrics::Label`s. Descriptions
 /// are registered via `metrics::describe_*`.
-pub struct MetricsRsRecorder;
+#[derive(Default)]
+pub struct MetricsRsRecorder {
+    unflushed: Option<Arc<AtomicU64>>,
+}
+
+/// SlateDB's estimate of its unflushed WAL and memtables, which it sets on
+/// every write's backpressure check.
+const UNFLUSHED_BYTES: &str = "slatedb.db.total_mem_size_bytes";
+
+impl MetricsRsRecorder {
+    /// Also keeps the database's unflushed bytes in `unflushed`, for ingest
+    /// admission to shed against before SlateDB holds writes.
+    pub fn tracking_unflushed(unflushed: Arc<AtomicU64>) -> Self {
+        Self {
+            unflushed: Some(unflushed),
+        }
+    }
+}
 
 impl MetricsRecorder for MetricsRsRecorder {
     fn register_counter(
@@ -44,7 +62,11 @@ impl MetricsRecorder for MetricsRsRecorder {
         let name = name.to_string();
         let labels = to_labels(labels);
         metrics::describe_gauge!(name.clone(), description.to_string());
-        Arc::new(GaugeHandle(metrics::gauge!(name, labels)))
+        let gauge = metrics::gauge!(name.clone(), labels);
+        match self.unflushed.as_ref().filter(|_| name == UNFLUSHED_BYTES) {
+            Some(unflushed) => Arc::new(TrackedGaugeHandle(gauge, Arc::clone(unflushed))),
+            None => Arc::new(GaugeHandle(gauge)),
+        }
     }
 
     fn register_up_down_counter(
@@ -97,6 +119,16 @@ struct GaugeHandle(metrics::Gauge);
 impl GaugeFn for GaugeHandle {
     fn set(&self, value: i64) {
         self.0.set(value as f64);
+    }
+}
+
+struct TrackedGaugeHandle(metrics::Gauge, Arc<AtomicU64>);
+
+impl GaugeFn for TrackedGaugeHandle {
+    fn set(&self, value: i64) {
+        self.0.set(value as f64);
+        self.1
+            .store(u64::try_from(value).unwrap_or(0), Ordering::Relaxed);
     }
 }
 

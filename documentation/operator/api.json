@@ -1682,6 +1682,14 @@
               "validation": []
             },
             {
+              "default": "false",
+              "doc": "FullTextIndex builds a BM25 index of log lines at write time. It speeds up\n`|=` line filters on rare terms and enables ranked `| match` queries, but\ncosts writers roughly a dozen storage records per entry. When off, the\ndefault, line filters scan like Loki.",
+              "name": "fullTextIndex",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
               "default": "",
               "doc": "",
               "name": "auth",

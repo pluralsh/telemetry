@@ -22,8 +22,9 @@ Differences:
 - Empty stream labels are dropped at ingest, so `{app="a", env=""}` is stored
   as `{app="a"}`.
 
-Logs also adds `| match "..."`, an indexed full-text search stage that Loki
-does not have.
+Logs also adds `| match "..."`, a ranked full-text search stage that Loki
+does not have. It is served by the full-text index when `full_text_index` is
+on (off by default) and by a scan otherwise.
 
 ## Parsers and label stages
 

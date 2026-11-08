@@ -28,6 +28,7 @@ fn test_config() -> Config {
         stream_locality_labels: Vec::new(),
         stream_id_block_size: 0,
         retention: Some(Duration::from_secs(60)),
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 64,
             max_rows: 2,
@@ -497,6 +498,7 @@ async fn pipelined_log_reads_match_reads_segment_by_segment() {
 
     let mut db = LogDb::open(Config {
         retention: None,
+        full_text_index: true,
         ..test_config()
     })
     .await
@@ -603,6 +605,7 @@ async fn limited_backward_queries_keep_the_newest_rows_of_a_large_page() {
     // chunk, so its newest rows are in its last batches.
     let db = LogDb::open(Config {
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 10_000,
@@ -949,6 +952,94 @@ async fn concurrent_queries_finish_within_a_decode_budget_smaller_than_one_unit(
     db.close().await.unwrap();
 }
 
+/// A segment written partly without the index is scanned, so `|=` and
+/// `| match` return every row whichever writes indexed it.
+#[tokio::test]
+async fn segments_written_partly_unindexed_are_scanned() {
+    use crate::{QueryOptions, QueryRequest, QueryResult};
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+        path: "partly-indexed".to_owned(),
+        object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+            path: directory.path().to_string_lossy().into_owned(),
+        }),
+        settings_path: None,
+        block_cache: None,
+        meta_cache: None,
+        disk: Default::default(),
+    });
+    let namespace = Namespace::default();
+    let phases = [true, false, true];
+    for (phase, index) in phases.into_iter().enumerate() {
+        config.full_text_index = index;
+        let db = LogDb::open(config.clone()).await.unwrap();
+        let entries = (0..4)
+            .map(|row| {
+                let id = phase * 4 + row;
+                LogEntry::new(id as i64 + 1, format!("needle rare{id:02}"))
+            })
+            .collect();
+        db.write(
+            &namespace,
+            vec![LogBatch::new(labels("api", "prod"), entries)],
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        if phase == 0 {
+            assert!(
+                crate::search::field_stats(db.storage.as_ref(), &namespace, seg(0))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        db.close().await.unwrap();
+    }
+
+    config.full_text_index = true;
+    let db = LogDb::open(config).await.unwrap();
+    assert!(
+        crate::search::field_stats(db.storage.as_ref(), &namespace, seg(0))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows = async |query: String| {
+        let QueryResult::Streams(streams) = db
+            .query(
+                &namespace,
+                &QueryRequest::range(&query, 0, 9_000_000_000, 1_000_000_000),
+                QueryOptions {
+                    limit: 1_000,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected streams");
+        };
+        streams
+            .iter()
+            .map(|stream| stream.entries.len())
+            .sum::<usize>()
+    };
+    for id in 0..phases.len() * 4 {
+        assert_eq!(
+            rows(format!(r#"{{service="api"}} |= "rare{id:02}""#)).await,
+            1,
+            "rare{id}"
+        );
+    }
+    assert_eq!(
+        rows(r#"{service="api"} | match "needle""#.to_owned()).await,
+        12
+    );
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn written_and_durable_force_the_expected_flushes() {
     let directory = tempfile::tempdir().unwrap();
@@ -1055,13 +1146,11 @@ async fn a_flush_encoded_in_parallel_indexes_every_object_and_term() {
     .await
     .unwrap();
     let stats = async |term: &str| {
-        let stats = db
-            .storage
-            .get(crate::codec::term_stats_key(&namespace, seg(0), term))
+        crate::search::term_directory(db.storage.as_ref(), &namespace, seg(0), term, None)
             .await
             .unwrap()
-            .unwrap_or_else(|| panic!("no statistics for {term}"));
-        crate::search::decode_term_stats(&stats.value).unwrap()
+            .unwrap()
+            .stats()
     };
     assert_eq!(stats("shared").await.documents, rows as u64);
     for row in [1, 2, 599, 600, 601, rows] {
@@ -1095,13 +1184,12 @@ async fn each_flush_appends_posting_blocks_without_reading_the_index() {
         .await
         .unwrap();
     }
-    let stats = db
-        .storage
-        .get(crate::codec::term_stats_key(&namespace, seg(0), "needle"))
-        .await
-        .unwrap()
-        .unwrap();
-    let stats = crate::search::decode_term_stats(&stats.value).unwrap();
+    let stats =
+        crate::search::term_directory(db.storage.as_ref(), &namespace, seg(0), "needle", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .stats();
     assert_eq!(stats.documents, 5);
     assert_eq!(stats.blocks, 5);
 
@@ -3060,6 +3148,7 @@ async fn lineless_metric_reads_match_full_row_reads() {
     for seed in 1..=30u64 {
         let db = LogDb::open(Config {
             retention: None,
+            full_text_index: true,
             page: PageConfig {
                 target_size_bytes: 4096,
                 max_rows: 12,
@@ -3162,6 +3251,7 @@ async fn summarized_metric_reads_match_full_row_reads() {
         let errors = seed % 5 == 0;
         let mut db = LogDb::open(Config {
             retention: None,
+            full_text_index: true,
             page: PageConfig {
                 target_size_bytes: 4096,
                 max_rows: 12,
@@ -3314,6 +3404,7 @@ async fn summary_passes_skip_segments_that_fail() {
     const SECOND: i64 = 1_000_000_000;
     let db = LogDb::open(Config {
         retention: None,
+        full_text_index: true,
         ..test_config()
     })
     .await
@@ -3364,6 +3455,7 @@ async fn reads_splitting_summary_buckets_count_the_rest_from_summaries() {
     const MS: i64 = 1_000_000;
     let mut db = LogDb::open(Config {
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 48,
@@ -3457,6 +3549,7 @@ async fn level_reads_count_from_summaries() {
     const MS: i64 = 1_000_000;
     let mut db = LogDb::open(Config {
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 48,
@@ -3678,6 +3771,7 @@ async fn projected_metadata_reads_match_full_metadata_reads() {
     for seed in 1..=30u64 {
         let db = LogDb::open(Config {
             retention: None,
+            full_text_index: true,
             page: PageConfig {
                 target_size_bytes: 4096,
                 max_rows: 12,
@@ -3872,6 +3966,7 @@ async fn projected_stream_labels_match_full_stream_labels() {
             segment_duration: Duration::from_secs(3_600),
             discovery_rollup: rolled.then_some(Duration::from_secs(24 * 3_600)),
             retention: None,
+            full_text_index: true,
             page: PageConfig {
                 target_size_bytes: 4096,
                 max_rows: 12,
@@ -3976,6 +4071,7 @@ async fn lineless_reads_stay_within_the_page_estimate() {
             segment_duration: Duration::from_secs(60),
             discovery_rollup: None,
             retention: None,
+            full_text_index: true,
             page: PageConfig {
                 target_size_bytes: 1 << 20,
                 max_rows: 1_000,
@@ -4038,6 +4134,7 @@ async fn page_limit_counts_objects_instead_of_sparse_read_ranges() {
         segment_duration: Duration::from_secs(60),
         discovery_rollup: None,
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 1_000,

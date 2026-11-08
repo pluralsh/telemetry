@@ -111,6 +111,12 @@ memtable keeps filling while two upload; that is a backlog of 5 SSTs for
 Logs and Traces and 14 for Metrics, and each limit is the least that leaves
 admission 4 SSTs to taper over. Clients back off and retry while flushes keep going through,
 instead of every write waiting on a stall and then timing out.
+
+Uploads falling behind ingest, as on a writer out of CPU, fill memtables
+before L0, and at `max_unflushed_bytes` SlateDB holds every write for
+seconds. So writers also shed from five eighths of it: each further eighth
+turns away a further quarter of ingest, all of it at the limit, and the
+deeper of the two signals decides.
 `storage_admission_rejections_total` counts the turned-away requests and
 `storage_segment_l0_depth` is the depth admission follows.
 

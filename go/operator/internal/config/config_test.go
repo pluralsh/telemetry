@@ -61,11 +61,11 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 857651274", "forward_index_cache_capacity_bytes: 285883758", testFlushIntervalConfig,
-		"memory_capacity: 1048240446", "capacity: 285883758", "matcher_cache_capacity_bytes: 142941879",
-		"result_cache:\n  capacity_bytes: 285883758",
-		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 762356688\n  memory_budget_bytes: 1524713376\n  queue_timeout_seconds: 30",
-		"rollup:\n  copy_buffer_bytes: 190589172", "write_budget_bytes: 201326592",
+		"reader_cache_capacity: 785173698", "forward_index_cache_capacity_bytes: 261724566", testFlushIntervalConfig,
+		"memory_capacity: 959656742", "capacity: 261724566", "matcher_cache_capacity_bytes: 130862283",
+		"result_cache:\n  capacity_bytes: 261724566",
+		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 697932176\n  memory_budget_bytes: 1395864352\n  queue_timeout_seconds: 30",
+		"rollup:\n  copy_buffer_bytes: 174483044", "write_budget_bytes: 201326592",
 		testCacheWarmerConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
@@ -856,11 +856,12 @@ func TestRenderGivesCompactionASubcompactionPerCore(t *testing.T) {
 	for _, tc := range []struct {
 		name, cpu, memory, expected string
 	}{
-		// (16Gi - 4Gi headroom - 1.5Gi reserved) shares 10.5Gi: a writer's
-		// doubled 20% is 2,150Mi, 12 cores take 12 × 208Mi.
-		{"cores above the share", "12", "16Gi", "compaction_bytes: 2617245696"},
-		// 64Gi shares 46.5Gi: 20% is 9,523Mi, more than 12 cores take.
-		{"share above the cores", "12", "64Gi", "compaction_bytes: 9932111860"},
+		// (16Gi - 4Gi headroom - about 3.5Gi reserved, with 12 cores' write
+		// budget) shares about 8.5Gi: a writer's doubled 20% is 2,094Mi,
+		// below 12 × 208Mi, so the share bounds it.
+		{"cores above the share", "12", "16Gi", "compaction_bytes: 2195718144"},
+		// 64Gi shares about 44Gi: 20% is 9,048Mi, more than 12 cores take.
+		{"share above the cores", "12", "64Gi", "compaction_bytes: 9487515640"},
 		// 4Gi shares 1.5Gi: 24 cores are capped at a quarter of it.
 		{"a quarter of a small limit", "24", "4Gi", "compaction_bytes: 402653184"},
 	} {
@@ -924,6 +925,31 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 				t.Errorf("%s missing %q:\n%s", key, value, rendered)
 			}
 		}
+	}
+}
+
+func TestRenderLogsFullTextIndexOnlyWhenEnabled(t *testing.T) {
+	render := func(enabled *bool) string {
+		result, err := Render(Input{Logs: &telemetryv1alpha1.Logs{
+			ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
+			Spec: telemetryv1alpha1.LogsSpec{
+				Mode:   telemetryv1alpha1.ProductModeSharded,
+				Config: telemetryv1alpha1.LogsConfigSpec{FullTextIndex: enabled},
+			},
+		}, InternalToken: []byte("token")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(result.Data[LogsKey]) + string(result.Data[ReaderKey])
+	}
+	if rendered := render(nil); strings.Contains(rendered, "full_text_index") {
+		t.Errorf("default render enables the index:\n%s", rendered)
+	}
+	if rendered := render(lo.ToPtr(false)); strings.Contains(rendered, "full_text_index") {
+		t.Errorf("disabled render mentions the index:\n%s", rendered)
+	}
+	if rendered := render(lo.ToPtr(true)); strings.Count(rendered, "full_text_index: true") != 2 {
+		t.Errorf("enabled render must set the index on writer and reader:\n%s", rendered)
 	}
 }
 
@@ -1056,10 +1082,12 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 		// bounds, including any of the reservedBounds within it.
 		reserved       func(key string) int64
 		reservedBounds []string
-		// writeBudget is the resident bytes per byte of a writer's
-		// write_budget_bytes, which its reservation holds.
-		writeBudget int64
-		input       func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
+		// writeBudget is the resident bytes per byte of a writer's write
+		// budget, at writeBudgetPath (write_budget_bytes by default), which
+		// its reservation holds.
+		writeBudget     int64
+		writeBudgetPath string
+		input           func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
 	}{
 		{
 			name: testMetricsProduct,
@@ -1082,9 +1110,12 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 			name:   testLogsProduct,
 			bounds: []string{"reader_cache_capacity", "result_cache_capacity", "request.max_in_flight_query_bytes", testCopyBufferPath},
 			reserved: func(key string) int64 {
-				return lo.Ternary(key == ReaderKey, logsReaderReserved, logsWriterReserved)
+				// One core: the default 250m request rounds up.
+				return lo.Ternary(key == ReaderKey, logsReaderReserved, logsWriterFixed+logsWriterWrites(1)+logsWriterBodies)
 			},
-			reservedBounds: []string{"request.max_in_flight_body_bytes"},
+			reservedBounds:  []string{"request.max_in_flight_body_bytes"},
+			writeBudget:     logsResidentPerWriteByte,
+			writeBudgetPath: "memory.write_bytes",
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Logs: &telemetryv1alpha1.Logs{
 					ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
@@ -1169,9 +1200,10 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 							reservedTotal += int64(value)
 						}
 						if product.writeBudget != 0 && key != ReaderKey {
-							value, found := lookupPath(rendered, "write_budget_bytes")
+							path := lo.CoalesceOrEmpty(product.writeBudgetPath, "write_budget_bytes")
+							value, found := lookupPath(rendered, path)
 							if !found || value <= 0 {
-								t.Fatalf("%s is missing write_budget_bytes:\n%s", key, data)
+								t.Fatalf("%s is missing %s:\n%s", key, path, data)
 							}
 							reservedTotal += int64(value) * product.writeBudget
 						}

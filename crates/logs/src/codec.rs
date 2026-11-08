@@ -44,6 +44,8 @@ pub(crate) enum RecordType {
     ObjectDirectory = 14,
     /// Per-stream row counts of a settled segment; see [`summary_key`].
     Summary = 15,
+    /// Present when some of a segment's rows are not in its search index.
+    SearchUnindexed = 16,
 }
 
 /// Records under the [`RecordType::Summary`] prefix.
@@ -377,10 +379,16 @@ pub(crate) fn field_stats_key(namespace: &Namespace, segment: SegmentId) -> Byte
     record_prefix(namespace, segment, RecordType::SearchFieldStats).freeze()
 }
 
+/// Term statistics, which flushes no longer write; older segments hold them.
+#[cfg(test)]
 pub(crate) fn term_stats_key(namespace: &Namespace, segment: SegmentId, term: &str) -> Bytes {
     let mut bytes = record_prefix(namespace, segment, RecordType::SearchTermStats);
     common::serde::terminated_bytes::serialize(term.as_bytes(), &mut bytes);
     bytes.freeze()
+}
+
+pub(crate) fn unindexed_key(namespace: &Namespace, segment: SegmentId) -> Bytes {
+    record_prefix(namespace, segment, RecordType::SearchUnindexed).freeze()
 }
 
 /// One directory fragment of `term`, keyed by its first block's ID.
@@ -1284,6 +1292,7 @@ fn parse_record_prefix(bytes: &[u8]) -> Result<(Namespace, SegmentId, RecordType
         13 => RecordType::Rollup,
         14 => RecordType::ObjectDirectory,
         15 => RecordType::Summary,
+        16 => RecordType::SearchUnindexed,
         value => return Err(Error::Corrupt(format!("unknown record type {value}"))),
     };
     Ok((namespace, segment, record_type, scope_len + 1))

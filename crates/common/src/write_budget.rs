@@ -10,7 +10,9 @@
 //! committed all count against it, however far flushes fall behind. Ingest
 //! waits up to [`INGEST_WAIT`] for its share and then fails, so clients back
 //! off rather than the process growing until it is killed. Rollup copies
-//! wait for room and hold at most half, so they never keep ingest out.
+//! wait for room in an allowance of their own, half the budget beside it,
+//! so a copy never takes room ingest needs: with copies drawing on the
+//! budget too, a rollup on a busy writer turned ingest away.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,10 +85,12 @@ impl WriteBudget {
 
     /// Whether `bytes` of ingest, or of a copy, would find room now.
     pub fn fits(&self, copy: bool, bytes: u64) -> bool {
-        let fits = |semaphore: &Semaphore| {
-            semaphore.available_permits() as u64 >= u64::from(self.weight(bytes))
+        let (semaphore, weight) = if copy {
+            (&self.copy, self.weight(bytes).min(self.copy_capacity()))
+        } else {
+            (&self.write, self.weight(bytes))
         };
-        fits(&self.write) && (!copy || fits(&self.copy))
+        semaphore.available_permits() as u64 >= u64::from(weight)
     }
 
     /// Holds `bytes` of ingest, waiting up to `wait` for room, or `None`
@@ -94,13 +98,13 @@ impl WriteBudget {
     pub async fn ingest(&self, bytes: u64, wait: Duration) -> Option<WritePermit> {
         let weight = self.weight(bytes);
         match Arc::clone(&self.write).try_acquire_many_owned(weight) {
-            Ok(write) => return Some(self.held(None, write)),
+            Ok(write) => return Some(self.held(None, Some(write))),
             Err(TryAcquireError::Closed) => return None,
             Err(TryAcquireError::NoPermits) => {}
         }
         ::metrics::counter!("write_budget_waits_total", "budget" => self.name).increment(1);
         match tokio::time::timeout(wait, Arc::clone(&self.write).acquire_many_owned(weight)).await {
-            Ok(Ok(write)) => Some(self.held(None, write)),
+            Ok(Ok(write)) => Some(self.held(None, Some(write))),
             Ok(Err(_)) => None,
             Err(_) => {
                 ::metrics::counter!("write_budget_rejections_total", "budget" => self.name)
@@ -110,27 +114,18 @@ impl WriteBudget {
         }
     }
 
-    /// Holds `bytes` of a copy, waiting up to `wait` for its half of the
-    /// budget and then the budget, or `None` when it runs out.
+    /// Holds `bytes` of a copy, waiting up to `wait` for room in the copies'
+    /// allowance, or `None` when it runs out.
     pub async fn copy(&self, bytes: u64, wait: Duration) -> Option<WritePermit> {
         let weight = self.weight(bytes).min(self.copy_capacity());
-        tokio::time::timeout(wait, async {
-            let copy = Arc::clone(&self.copy)
-                .acquire_many_owned(weight)
-                .await
-                .ok()?;
-            let write = Arc::clone(&self.write)
-                .acquire_many_owned(weight)
-                .await
-                .ok()?;
-            Some(self.held(Some(copy), write))
-        })
-        .await
-        .ok()
-        .flatten()
+        let copy = tokio::time::timeout(wait, Arc::clone(&self.copy).acquire_many_owned(weight))
+            .await
+            .ok()?
+            .ok()?;
+        Some(self.held(Some(copy), None))
     }
 
-    /// Bytes no write holds.
+    /// Bytes of the budget no ingest holds.
     pub fn available(&self) -> u64 {
         self.write.available_permits() as u64
     }
@@ -147,10 +142,14 @@ impl WriteBudget {
             .clamp(1, self.capacity)
     }
 
-    fn held(&self, copy: Option<OwnedSemaphorePermit>, write: OwnedSemaphorePermit) -> WritePermit {
+    fn held(
+        &self,
+        copy: Option<OwnedSemaphorePermit>,
+        write: Option<OwnedSemaphorePermit>,
+    ) -> WritePermit {
         let permit = WritePermit {
             _copy: copy,
-            write: Some(write),
+            write,
             budget: self.clone(),
         };
         self.report();
@@ -186,13 +185,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copies_hold_at_most_half_and_time_out() {
+    async fn copies_hold_half_beside_ingest_and_time_out() {
         let budget = WriteBudget::new("test", 100);
         let copy = budget.copy(1_000, WAIT).await.unwrap();
-        assert_eq!(budget.available(), 50);
+        assert_eq!(budget.available(), 100);
+        assert!(!budget.fits(true, 1));
         assert!(budget.copy(1, WAIT).await.is_none());
-        let ingest = budget.ingest(50, WAIT).await.unwrap();
+        let ingest = budget.ingest(100, WAIT).await.unwrap();
         drop((copy, ingest));
+        assert!(budget.fits(true, 50));
         assert_eq!(budget.available(), 100);
     }
 
@@ -204,7 +205,7 @@ mod tests {
         ingest.shrink(10);
         copy.shrink(5);
         copy.shrink(20);
-        assert_eq!(budget.available(), 85);
+        assert_eq!(budget.available(), 90);
         assert!(budget.copy(45, WAIT).await.is_some());
         drop((ingest, copy));
         assert_eq!(budget.available(), 100);

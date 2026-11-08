@@ -103,7 +103,13 @@ type LogsConfigSpec struct {
 	// +kubebuilder:default={}
 	Elasticsearch LogsElasticsearchSpec `json:"elasticsearch,omitempty"`
 	CacheWarmer   *CacheWarmerSpec      `json:"cacheWarmer,omitempty"`
-	Auth          AuthSpec              `json:"auth,omitempty"`
+	// FullTextIndex builds a BM25 index of log lines at write time. It speeds up
+	// `|=` line filters on rare terms and enables ranked `| match` queries, but
+	// costs writers roughly a dozen storage records per entry. When off, the
+	// default, line filters scan like Loki.
+	// +kubebuilder:default=false
+	FullTextIndex *bool    `json:"fullTextIndex,omitempty"`
+	Auth          AuthSpec `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
 }

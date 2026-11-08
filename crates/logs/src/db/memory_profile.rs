@@ -134,6 +134,7 @@ fn profile_config(
         stream_locality_labels: Vec::new(),
         stream_id_block_size: 0,
         retention: None,
+        full_text_index: true,
         page: PageConfig {
             target_size_bytes: 1 << 20,
             max_rows: 8192,

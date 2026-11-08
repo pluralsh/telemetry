@@ -15,7 +15,7 @@ use crate::config::PageConfig;
 use crate::model::{Field, locality_key, locality_order};
 use crate::object::PlannedObject;
 use crate::query::parallel::map_blocking;
-use crate::search::Posting;
+use crate::search::{Posting, unindexed_op};
 
 /// How long a segment's or rollup period's IDs stay in memory after its
 /// last write. A later write reloads them.
@@ -336,7 +336,8 @@ impl DirectWriter {
             writes.push((namespace, write));
         }
         let page = self.config.page.clone();
-        let encoded = map_blocking(objects, move |object| object.encode(&page)).await?;
+        let index = self.config.full_text_index;
+        let encoded = map_blocking(objects, move |object| object.encode(&page, index)).await?;
         let mut written = Vec::with_capacity(encoded.len());
         for object in encoded {
             let (namespace, write) = &mut writes[object.write];
@@ -603,6 +604,13 @@ impl DirectWriter {
         }
         for (segment, catalog) in catalogs {
             ops.extend(catalog.into_ops(&segment_prefix(namespace, segment), ttl));
+        }
+        if !self.config.full_text_index {
+            // Reads must not trust an index that misses these rows.
+            for segment in flush_objects.keys() {
+                ops.push(unindexed_op(namespace, *segment, ttl));
+            }
+            return Ok(());
         }
         for (segment, delta) in search_deltas {
             ops.push(RecordOp::merge_with_ttl(
@@ -1006,10 +1014,10 @@ struct EncodedObject {
 }
 
 impl ObjectJob {
-    fn encode(self, page: &PageConfig) -> Result<EncodedObject> {
+    fn encode(self, page: &PageConfig, index: bool) -> Result<EncodedObject> {
         let built = self.planned.build(page)?;
         let mut delta = IndexDelta::default();
-        for run in &built.runs {
+        for run in built.runs.iter().filter(|_| index) {
             delta.add_run(
                 &DEFAULT_ANALYZER,
                 run.stream_id,

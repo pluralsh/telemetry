@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -550,6 +550,13 @@ impl SlateDbStorage {
     /// [`Admission`].
     pub fn with_l0_limit(self, limit: L0Limit) -> Self {
         self.admission.limit_to(limit);
+        self
+    }
+
+    /// Sheds ingest as `unflushed`, the database's unflushed bytes, nears
+    /// its `max_unflushed_bytes`; see [`Admission`].
+    pub fn with_unflushed(self, unflushed: Arc<AtomicU64>) -> Self {
+        self.admission.track_unflushed(unflushed);
         self
     }
 

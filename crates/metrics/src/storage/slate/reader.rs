@@ -589,7 +589,7 @@ impl StorageReader {
             .with_options(reader_options)
             .with_merge_operator(Arc::new(adapter))
             .with_segment_extractor(TimeseriesSegmentExtractor::shared())
-            .with_metrics_recorder(Arc::new(MetricsRsRecorder));
+            .with_metrics_recorder(Arc::new(MetricsRsRecorder::default()));
 
         if let Some(checkpoint_id) = checkpoint_id {
             builder = builder.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint_id));

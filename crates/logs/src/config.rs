@@ -35,6 +35,11 @@ pub struct Config {
     /// How long data is kept, counted from ingestion; `None` keeps it
     /// forever.
     pub retention: Option<Duration>,
+    /// Whether flushes index lines for `| match` ranking and for `|=`
+    /// filters to skip rows that cannot match. Off, every segment written is
+    /// scanned like Loki's chunks; the index costs most of a writer's
+    /// storage writes, so it is opt-in.
+    pub full_text_index: bool,
     pub page: PageConfig,
     pub compaction: CompactionConfig,
     pub write_buffer: WriteCoordinatorConfig,
@@ -125,6 +130,7 @@ impl Default for Config {
             stream_locality_labels: DEFAULT_STREAM_LOCALITY_LABELS.map(String::from).to_vec(),
             stream_id_block_size: DEFAULT_STREAM_ID_BLOCK_SIZE,
             retention: Some(DEFAULT_RETENTION),
+            full_text_index: false,
             page: PageConfig::default(),
             compaction: CompactionConfig::default(),
             write_buffer: WriteCoordinatorConfig::default(),

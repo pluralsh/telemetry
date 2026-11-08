@@ -6,9 +6,12 @@
 //!
 //! The BM25 arithmetic and block-impact idea are adapted from OpenData's MIT
 //! licensed `vector` crate. Logs deliberately uses a different persistence
-//! layout: every postings block is an independently addressable SlateDB value,
-//! described by bounded directory fragments that each flush writes alongside
-//! its blocks, so writes never read the index they extend.
+//! layout: each flush writes bounded directory fragments for the terms it
+//! indexes, so writes never read the index they extend. A term with a single
+//! posting block in a flush, as most are, keeps the block inside its one
+//! fragment; larger terms' blocks are independently addressable values. A
+//! term's statistics are the sum of its directory, which reads load anyway,
+//! so a flush writes one record for most terms.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
@@ -24,7 +27,7 @@ use crate::Namespace;
 use crate::analyzer::Analyzer;
 use crate::codec::{
     field_stats_key, term_directory_key, term_directory_prefix, term_posting_block_key,
-    term_stats_key,
+    unindexed_key,
 };
 use crate::error::{Error, Result};
 use crate::model::{SegmentId, StreamId};
@@ -39,6 +42,8 @@ const K1: f32 = 1.2;
 const B: f32 = 0.75;
 /// Leading byte of search index values.
 const VALUE_FORMAT: u8 = 1;
+/// Leading byte of a directory fragment holding one entry and its postings.
+const INLINE_FORMAT: u8 = 2;
 /// Posting blocks fetched ahead of the scorer. Top-k traversal may discard up
 /// to this many reads once the block-max bound terminates it.
 const BLOCK_PREFETCH: usize = 16;
@@ -69,6 +74,32 @@ pub(crate) struct FieldStats {
 pub(crate) struct TermStats {
     pub(crate) documents: u64,
     pub(crate) blocks: u32,
+}
+
+/// A directory entry, with its postings when its fragment holds them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DirectoryBlock {
+    pub(crate) entry: BlockDirectoryEntry,
+    inline: Option<Vec<Posting>>,
+}
+
+/// Every block of one term in a segment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TermDirectory {
+    pub(crate) blocks: Vec<DirectoryBlock>,
+}
+
+impl TermDirectory {
+    pub(crate) fn stats(&self) -> TermStats {
+        TermStats {
+            documents: self
+                .blocks
+                .iter()
+                .map(|block| u64::from(block.entry.postings))
+                .sum(),
+            blocks: u32::try_from(self.blocks.len()).unwrap_or(u32::MAX),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -231,44 +262,77 @@ pub(crate) fn source_matches(analyzer: &dyn Analyzer, line: &str, terms: &[Strin
     remaining == 0
 }
 
-/// A segment's field statistics; `None` when the segment predates the index.
+/// A segment's field statistics; `None` when some of its rows are not
+/// indexed: the segment predates the index, or the index was off for some
+/// of its writes.
 pub(crate) async fn field_stats(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
 ) -> Result<Option<FieldStats>> {
-    storage
-        .get(field_stats_key(namespace, segment))
-        .await?
+    let (stats, unindexed) = futures::future::try_join(
+        storage.get(field_stats_key(namespace, segment)),
+        storage.get(unindexed_key(namespace, segment)),
+    )
+    .await?;
+    if unindexed.is_some() {
+        return Ok(None);
+    }
+    stats
         .map(|record| decode_field_stats(&record.value))
         .transpose()
 }
 
-pub(crate) async fn term_stats(
+/// The record marking `segment` as holding rows the index does not cover.
+pub(crate) fn unindexed_op(namespace: &Namespace, segment: SegmentId, ttl: Ttl) -> RecordOp {
+    RecordOp::put_with_ttl(
+        unindexed_key(namespace, segment),
+        Bytes::from_static(&[VALUE_FORMAT]),
+        ttl,
+    )
+}
+
+/// `term`'s directory in `segment`, or `None` once it covers more than
+/// `max_documents` rows.
+pub(crate) async fn term_directory(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
     term: &str,
-) -> Result<Option<TermStats>> {
-    storage
-        .get(term_stats_key(namespace, segment, term))
-        .await?
-        .map(|record| decode_term_stats(&record.value))
-        .transpose()
+    max_documents: Option<u64>,
+) -> Result<Option<TermDirectory>> {
+    let mut fragments = storage
+        .scan_prefix_iter(
+            term_directory_prefix(namespace, segment, term),
+            BytesRange::unbounded(),
+            None,
+        )
+        .await?;
+    let mut directory = TermDirectory::default();
+    let mut documents = 0u64;
+    while let Some(record) = fragments.next().await? {
+        for block in decode_fragment(&record.value)? {
+            documents = documents.saturating_add(u64::from(block.entry.postings));
+            directory.blocks.push(block);
+        }
+        if max_documents.is_some_and(|max| documents > max) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(directory))
 }
 
-/// Every posting of `term`, unscored and in no particular order. `stats`
-/// must have been read before the directory, as the term may gain blocks.
+/// Every posting of `term` in `directory`, unscored and in no particular
+/// order.
 pub(crate) async fn term_postings(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
     term: &str,
-    stats: TermStats,
+    directory: TermDirectory,
 ) -> Result<Vec<Posting>> {
-    let directory = load_directory(storage, namespace, segment, term, stats).await?;
-    let blocks: Vec<Vec<Posting>> = futures::stream::iter(directory)
-        .map(|entry| load_block(storage, namespace, segment, term, entry))
+    let blocks: Vec<Vec<Posting>> = futures::stream::iter(directory.blocks)
+        .map(|block| load_block(storage, namespace, segment, term, block))
         .buffer_unordered(BLOCK_PREFETCH)
         .try_collect()
         .await?;
@@ -356,13 +420,64 @@ pub(crate) fn decode_directory(value: &[u8]) -> Result<Vec<BlockDirectoryEntry>>
     Ok(entries)
 }
 
+/// One fragment holding `entry` and its block's `postings`.
+pub(crate) fn encode_inline_fragment(
+    entry: BlockDirectoryEntry,
+    postings: &[Posting],
+) -> Result<Bytes> {
+    let mut buf = BytesMut::with_capacity(16 + postings.len() * 6);
+    buf.put_u8(INLINE_FORMAT);
+    var_u64::serialize(entry.block, &mut buf);
+    var_u32::serialize(entry.max_frequency, &mut buf);
+    var_u32::serialize(entry.min_length, &mut buf);
+    write_postings(postings, &mut buf)?;
+    Ok(buf.freeze())
+}
+
+/// A directory fragment's blocks, either format.
+pub(crate) fn decode_fragment(value: &[u8]) -> Result<Vec<DirectoryBlock>> {
+    if value.first() != Some(&INLINE_FORMAT) {
+        return Ok(decode_directory(value)?
+            .into_iter()
+            .map(|entry| DirectoryBlock {
+                entry,
+                inline: None,
+            })
+            .collect());
+    }
+    let mut buf = &value[1..];
+    let block = var_u64::deserialize(&mut buf)?;
+    let max_frequency = var_u32::deserialize(&mut buf)?;
+    let min_length = var_u32::deserialize(&mut buf)?;
+    let postings = read_postings(&mut buf)?;
+    ensure_consumed(buf, "search value")?;
+    if postings.is_empty() {
+        return Err(Error::Corrupt("inline posting block is empty".into()));
+    }
+    let entry = BlockDirectoryEntry {
+        block,
+        postings: postings.len() as u16,
+        max_frequency,
+        min_length,
+    };
+    Ok(vec![DirectoryBlock {
+        entry,
+        inline: Some(postings),
+    }])
+}
+
 /// Postings must be strictly ordered by address. Each address is encoded
 /// relative to its predecessor: a stream delta, then either an absolute leaf
 /// and row (new stream) or a leaf delta, then either an absolute row (new
 /// leaf) or a row delta.
 pub(crate) fn encode_postings(postings: &[Posting]) -> Result<Bytes> {
     let mut buf = value_buffer(5 + postings.len() * 6);
-    var_u32::serialize(count_u32(postings.len())?, &mut buf);
+    write_postings(postings, &mut buf)?;
+    Ok(buf.freeze())
+}
+
+fn write_postings(postings: &[Posting], buf: &mut BytesMut) -> Result<()> {
+    var_u32::serialize(count_u32(postings.len())?, buf);
     let mut previous = DocAddress {
         stream_id: 0,
         leaf: 0,
@@ -376,30 +491,36 @@ pub(crate) fn encode_postings(postings: &[Posting]) -> Result<Bytes> {
             ));
         }
         let stream_delta = address.stream_id - previous.stream_id;
-        var_u32::serialize(stream_delta, &mut buf);
+        var_u32::serialize(stream_delta, buf);
         if stream_delta != 0 {
-            var_u64::serialize(address.leaf, &mut buf);
-            var_u32::serialize(address.row_id, &mut buf);
+            var_u64::serialize(address.leaf, buf);
+            var_u32::serialize(address.row_id, buf);
         } else {
             let leaf_delta = address.leaf - previous.leaf;
-            var_u64::serialize(leaf_delta, &mut buf);
+            var_u64::serialize(leaf_delta, buf);
             let row = if leaf_delta == 0 {
                 address.row_id - previous.row_id
             } else {
                 address.row_id
             };
-            var_u32::serialize(row, &mut buf);
+            var_u32::serialize(row, buf);
         }
-        var_u32::serialize(posting.frequency, &mut buf);
-        var_u32::serialize(posting.length, &mut buf);
+        var_u32::serialize(posting.frequency, buf);
+        var_u32::serialize(posting.length, buf);
         previous = address;
     }
-    Ok(buf.freeze())
+    Ok(())
 }
 
 pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
     let mut buf = binary_body(value)?;
-    let count = read_count(&mut buf, POSTINGS_PER_BLOCK, "posting block")?;
+    let postings = read_postings(&mut buf)?;
+    ensure_consumed(buf, "search value")?;
+    Ok(postings)
+}
+
+fn read_postings(buf: &mut &[u8]) -> Result<Vec<Posting>> {
+    let count = read_count(buf, POSTINGS_PER_BLOCK, "posting block")?;
     let mut postings = Vec::with_capacity(count);
     let mut address = DocAddress {
         stream_id: 0,
@@ -408,17 +529,17 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
     };
     let overflow = || Error::Corrupt("posting address overflow".into());
     for _ in 0..count {
-        let stream_delta = var_u32::deserialize(&mut buf)?;
+        let stream_delta = var_u32::deserialize(buf)?;
         if stream_delta != 0 {
             address.stream_id = address
                 .stream_id
                 .checked_add(stream_delta)
                 .ok_or_else(overflow)?;
-            address.leaf = var_u64::deserialize(&mut buf)?;
-            address.row_id = var_u32::deserialize(&mut buf)?;
+            address.leaf = var_u64::deserialize(buf)?;
+            address.row_id = var_u32::deserialize(buf)?;
         } else {
-            let leaf_delta = var_u64::deserialize(&mut buf)?;
-            let row = var_u32::deserialize(&mut buf)?;
+            let leaf_delta = var_u64::deserialize(buf)?;
+            let row = var_u32::deserialize(buf)?;
             if leaf_delta != 0 {
                 address.leaf = address.leaf.checked_add(leaf_delta).ok_or_else(overflow)?;
                 address.row_id = row;
@@ -428,11 +549,10 @@ pub(crate) fn decode_postings(value: &[u8]) -> Result<Vec<Posting>> {
         }
         postings.push(Posting {
             address,
-            frequency: var_u32::deserialize(&mut buf)?,
-            length: var_u32::deserialize(&mut buf)?,
+            frequency: var_u32::deserialize(buf)?,
+            length: var_u32::deserialize(buf)?,
         });
     }
-    ensure_consumed(buf, "search value")?;
     Ok(postings)
 }
 
@@ -485,6 +605,15 @@ pub(crate) fn term_index_ops(
     let first_block = flush_object
         .checked_mul(1 << BLOCK_INDEX_BITS)
         .ok_or_else(|| Error::Invalid("object ID exceeds the block ID space".into()))?;
+    if postings.len() <= POSTINGS_PER_BLOCK {
+        let entry = BlockDirectoryEntry::describe(first_block, &postings)?;
+        ops.extend([RecordOp::put_with_ttl(
+            term_directory_key(namespace, segment, term, first_block),
+            encode_inline_fragment(entry, &postings)?,
+            ttl,
+        )]);
+        return Ok(());
+    }
     let mut entries = Vec::with_capacity(postings.len().div_ceil(POSTINGS_PER_BLOCK));
     for (index, chunk) in postings.chunks(POSTINGS_PER_BLOCK).enumerate() {
         if index >> BLOCK_INDEX_BITS != 0 {
@@ -505,14 +634,6 @@ pub(crate) fn term_index_ops(
             ttl,
         )]);
     }
-    ops.extend([RecordOp::merge_with_ttl(
-        term_stats_key(namespace, segment, term),
-        encode_term_stats(TermStats {
-            documents: postings.len() as u64,
-            blocks: count_u32(entries.len())?,
-        }),
-        ttl,
-    )]);
     Ok(())
 }
 
@@ -561,7 +682,8 @@ impl Ord for Score {
 
 struct TermQuery<'a> {
     term: &'a str,
-    stats: TermStats,
+    directory: TermDirectory,
+    documents: u64,
     idf: f32,
 }
 
@@ -591,25 +713,29 @@ pub(crate) async fn block_max_scores(
     }
     let average_length = field.total_terms as f32 / field.documents as f32;
 
-    let stats = futures::future::try_join_all(
+    let directories = futures::future::try_join_all(
         terms
             .iter()
-            .map(|term| term_stats(storage, namespace, segment, term)),
+            .map(|term| term_directory(storage, namespace, segment, term, None)),
     )
     .await?;
     let mut queries = Vec::with_capacity(terms.len());
-    for (term, stats) in terms.iter().zip(stats) {
-        match stats {
-            Some(stats) if stats.documents > 0 => queries.push(TermQuery {
-                term,
-                stats,
-                idf: idf(field.documents, stats.documents),
-            }),
-            _ => return Ok(Some(HashMap::new())),
+    for (term, directory) in terms.iter().zip(directories) {
+        let directory = directory.unwrap_or_default();
+        let documents = directory.stats().documents;
+        if documents == 0 {
+            return Ok(Some(HashMap::new()));
         }
+        queries.push(TermQuery {
+            term,
+            directory,
+            documents,
+            idf: idf(field.documents, documents),
+        });
     }
 
-    if let ([query], Some(limit)) = (queries.as_slice(), limit) {
+    if let (1, Some(limit)) = (queries.len(), limit) {
+        let query = queries.pop().expect("one query");
         return single_term_top_k(
             storage,
             SearchSegment { namespace, segment },
@@ -622,14 +748,13 @@ pub(crate) async fn block_max_scores(
         .map(Some);
     }
 
-    queries.sort_by_key(|query| query.stats.documents);
+    queries.sort_by_key(|query| query.documents);
     let mut candidates: HashMap<DocAddress, Vec<Hit>> = HashMap::new();
-    for (index, query) in queries.iter().enumerate() {
-        let directory =
-            load_directory(storage, namespace, segment, query.term, query.stats).await?;
+    for (index, query) in queries.into_iter().enumerate() {
+        let term = query.term;
         let mut blocks = std::pin::pin!(
-            futures::stream::iter(directory)
-                .map(|entry| load_block(storage, namespace, segment, query.term, entry))
+            futures::stream::iter(query.directory.blocks)
+                .map(|block| load_block(storage, namespace, segment, term, block))
                 .buffer_unordered(BLOCK_PREFETCH)
         );
         while let Some(postings) = blocks.try_next().await? {
@@ -688,33 +813,32 @@ struct SearchSegment<'a> {
 async fn single_term_top_k(
     storage: &dyn StorageRead,
     scope: SearchSegment<'_>,
-    query: &TermQuery<'_>,
+    query: TermQuery<'_>,
     allowed_leaves: &HashSet<(StreamId, u64)>,
     limit: usize,
     average_length: f32,
 ) -> Result<HashMap<DocAddress, f32>> {
-    let mut directory = load_directory(
-        storage,
-        scope.namespace,
-        scope.segment,
-        query.term,
-        query.stats,
-    )
-    .await?;
+    let TermQuery {
+        term,
+        mut directory,
+        idf: term_idf,
+        ..
+    } = query;
     // Highest-bound blocks establish the top-k floor early.
-    directory.sort_by(|left, right| {
-        block_bound(*right, query.idf, average_length)
-            .total_cmp(&block_bound(*left, query.idf, average_length))
-            .then_with(|| left.block.cmp(&right.block))
+    directory.blocks.sort_by(|left, right| {
+        block_bound(right.entry, term_idf, average_length)
+            .total_cmp(&block_bound(left.entry, term_idf, average_length))
+            .then_with(|| left.entry.block.cmp(&right.entry.block))
     });
 
     let mut scores = HashMap::new();
     let mut floor: BinaryHeap<Reverse<Score>> = BinaryHeap::with_capacity(limit + 1);
     let mut blocks = std::pin::pin!(
-        futures::stream::iter(directory)
-            .map(|entry| async move {
+        futures::stream::iter(directory.blocks)
+            .map(|block| async move {
+                let entry = block.entry;
                 let postings =
-                    load_block(storage, scope.namespace, scope.segment, query.term, entry).await?;
+                    load_block(storage, scope.namespace, scope.segment, term, block).await?;
                 Ok::<_, Error>((entry, postings))
             })
             .buffered(BLOCK_PREFETCH)
@@ -722,7 +846,7 @@ async fn single_term_top_k(
     while let Some((entry, postings)) = blocks.try_next().await? {
         if floor.len() >= limit
             && let Some(Reverse(Score(kth))) = floor.peek()
-            && block_bound(entry, query.idf, average_length) < *kth
+            && block_bound(entry, term_idf, average_length) < *kth
         {
             break;
         }
@@ -734,7 +858,7 @@ async fn single_term_top_k(
                 Hit {
                     frequency: posting.frequency,
                     length: posting.length,
-                    idf: query.idf,
+                    idf: term_idf,
                 },
                 average_length,
             );
@@ -748,40 +872,17 @@ async fn single_term_top_k(
     Ok(scores)
 }
 
-async fn load_directory(
-    storage: &dyn StorageRead,
-    namespace: &Namespace,
-    segment: SegmentId,
-    term: &str,
-    stats: TermStats,
-) -> Result<Vec<BlockDirectoryEntry>> {
-    let mut fragments = storage
-        .scan_prefix_iter(
-            term_directory_prefix(namespace, segment, term),
-            BytesRange::unbounded(),
-            None,
-        )
-        .await?;
-    let mut directory = Vec::with_capacity(stats.blocks as usize);
-    while let Some(record) = fragments.next().await? {
-        directory.extend(decode_directory(&record.value)?);
-    }
-    // Flushes after `stats` was read may have added fragments, never removed.
-    if directory.len() < stats.blocks as usize {
-        return Err(Error::Corrupt(
-            "term stats reference missing directory".into(),
-        ));
-    }
-    Ok(directory)
-}
-
 async fn load_block(
     storage: &dyn StorageRead,
     namespace: &Namespace,
     segment: SegmentId,
     term: &str,
-    entry: BlockDirectoryEntry,
+    block: DirectoryBlock,
 ) -> Result<Vec<Posting>> {
+    let entry = block.entry;
+    if let Some(postings) = block.inline {
+        return Ok(postings);
+    }
     let record = storage
         .get(term_posting_block_key(
             namespace,
@@ -883,7 +984,6 @@ mod tests {
         let first = 3 << BLOCK_INDEX_BITS;
         let mut blocks = 0;
         let mut fragments = Vec::new();
-        let mut stats = None;
         for op in ops {
             match op {
                 RecordOp::Put(put)
@@ -895,14 +995,7 @@ mod tests {
                     fragments.push((put.record.key, decode_directory(&put.record.value).unwrap()));
                 }
                 RecordOp::Put(_) => blocks += 1,
-                RecordOp::Merge(merge) => {
-                    assert_eq!(
-                        merge.record.key,
-                        term_stats_key(&namespace, SEGMENT, "error")
-                    );
-                    stats = Some(decode_term_stats(&merge.record.value).unwrap());
-                }
-                RecordOp::Delete(_) => unreachable!(),
+                RecordOp::Merge(_) | RecordOp::Delete(_) => unreachable!(),
             }
         }
         assert_eq!(blocks, DIRECTORY_ENTRIES + 1);
@@ -928,11 +1021,91 @@ mod tests {
             ]
         );
         assert_eq!(fragments[1].1[0].block, first | DIRECTORY_ENTRIES as u64);
-        let stats = stats.unwrap();
-        assert_eq!(stats.blocks as usize, DIRECTORY_ENTRIES + 1);
+        let directory = TermDirectory {
+            blocks: fragments
+                .iter()
+                .flat_map(|(_, entries)| entries)
+                .map(|&entry| DirectoryBlock {
+                    entry,
+                    inline: None,
+                })
+                .collect(),
+        };
         assert_eq!(
-            stats.documents as usize,
-            POSTINGS_PER_BLOCK * DIRECTORY_ENTRIES + 1
+            directory.stats(),
+            TermStats {
+                documents: (POSTINGS_PER_BLOCK * DIRECTORY_ENTRIES + 1) as u64,
+                blocks: (DIRECTORY_ENTRIES + 1) as u32,
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_block_term_is_one_fragment_holding_its_postings() {
+        let namespace = Namespace::default();
+        let postings: Vec<_> = (0..POSTINGS_PER_BLOCK as u64)
+            .rev()
+            .map(|document| posting(document, (document % 7) as u32 + 1, 40))
+            .collect();
+        let mut ops = Vec::new();
+        term_index_ops(
+            &mut ops,
+            (&namespace, SEGMENT),
+            "error",
+            postings.clone(),
+            3,
+            Ttl::NoExpiry,
+        )
+        .unwrap();
+
+        let [RecordOp::Put(put)] = ops.as_slice() else {
+            panic!("expected one put, got {ops:?}");
+        };
+        let first = 3 << BLOCK_INDEX_BITS;
+        assert_eq!(
+            put.record.key,
+            term_directory_key(&namespace, SEGMENT, "error", first)
+        );
+        let mut sorted = postings;
+        sorted.sort_unstable_by_key(|posting| posting.address);
+        let [block] = decode_fragment(&put.record.value)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            block,
+            DirectoryBlock {
+                entry: BlockDirectoryEntry::describe(first, &sorted).unwrap(),
+                inline: Some(sorted),
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_directory_fragments_still_decode() {
+        let entries = [
+            BlockDirectoryEntry {
+                block: 7,
+                postings: 128,
+                max_frequency: 3,
+                min_length: 10,
+            },
+            BlockDirectoryEntry {
+                block: 9,
+                postings: 4,
+                max_frequency: 1,
+                min_length: 2,
+            },
+        ];
+        let blocks = decode_fragment(&encode_directory(&entries).unwrap()).unwrap();
+        assert_eq!(
+            blocks,
+            entries
+                .map(|entry| DirectoryBlock {
+                    entry,
+                    inline: None
+                })
+                .to_vec()
         );
     }
 

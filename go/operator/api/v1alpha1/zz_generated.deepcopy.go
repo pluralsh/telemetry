@@ -828,6 +828,11 @@ func (in *LogsConfigSpec) DeepCopyInto(out *LogsConfigSpec) {
 		*out = new(CacheWarmerSpec)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.FullTextIndex != nil {
+		in, out := &in.FullTextIndex, &out.FullTextIndex
+		*out = new(bool)
+		**out = **in
+	}
 	in.Auth.DeepCopyInto(&out.Auth)
 	if in.Namespaces != nil {
 		in, out := &in.Namespaces, &out.Namespaces

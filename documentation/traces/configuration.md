@@ -154,7 +154,7 @@ write:
 # about six times it resident: decoded spans are about 2.4 times their
 # encoding, and a flush building its storage writes peaks at about 5.6. Ingest
 # beyond it waits up to a second for room, then is answered with HTTP 429;
-# rollup copies use at most half. SlateDB memtables hold at most 192 MiB
+# rollup copies hold an allowance of their own beside it, half its size. SlateDB memtables hold at most 192 MiB
 # unflushed besides. The operator sizes it from the memory limit.
 write_budget_bytes: 50331648
 
