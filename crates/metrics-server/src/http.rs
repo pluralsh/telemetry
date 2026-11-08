@@ -703,6 +703,9 @@ mod protocol_tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let status = GoogleRpcStatus::decode(body).unwrap();
         assert_eq!(status.code, 8);
-        assert_eq!(status.message, "Backpressure: writer is at capacity, retry later");
+        assert_eq!(
+            status.message,
+            "Backpressure: writer is at capacity, retry later"
+        );
     }
 }

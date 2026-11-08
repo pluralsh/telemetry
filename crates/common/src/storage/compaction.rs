@@ -973,7 +973,11 @@ fn input_bytes(manifest: &VersionedManifest, spec: &CompactionSpec) -> Option<In
                 }
                 SourceId::SortedRun(id) => {
                     let run = runs.iter().find(|run| run.id == *id)?;
-                    let largest = run.sst_views().iter().map(|view| view.estimate_size()).max();
+                    let largest = run
+                        .sst_views()
+                        .iter()
+                        .map(|view| view.estimate_size())
+                        .max();
                     (run.estimate_size(), largest.unwrap_or(0))
                 }
             };
