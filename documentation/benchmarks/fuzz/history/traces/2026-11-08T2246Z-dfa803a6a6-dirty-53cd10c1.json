@@ -1,0 +1,442 @@
+{
+  "schema_version": 1,
+  "name": "2026-11-08T2246Z-dfa803a6a6-dirty-53cd10c1",
+  "product": "traces",
+  "run_id": "20261108T224618Z-53cd10c1",
+  "batch": "bench-20261108T211203Z",
+  "started_at": "2026-11-08T22:46:37Z",
+  "finished_at": "2026-11-08T23:16:07Z",
+  "git": {
+    "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+    "short": "dfa803a6a6",
+    "branch": "main",
+    "dirty": true
+  },
+  "host": {
+    "label": null,
+    "os": "Darwin",
+    "os_release": "23.4.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 12,
+    "memory_gib": 18.0,
+    "python": "3.13.7",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 1800.0,
+    "seed": 1405948097,
+    "scale": 1.0,
+    "window_s": 600.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 30.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "historical",
+    "isolated": true
+  },
+  "settings": {
+    "impl_config": "production",
+    "oracle": "tempo-s3"
+  },
+  "environment": {
+    "FUZZ_SCENARIO": "historical",
+    "FUZZ_TRACES_CONFIG": "production",
+    "MINIO_FIRST_BYTE_MS": "15",
+    "REGRESSION_BUILD": "0",
+    "TEMPO_IMAGE": "grafana/tempo:2.10.8"
+  },
+  "images": {
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    },
+    "minio-latency": {
+      "image": "python:3.13-slim",
+      "id": "3874bc630edc"
+    },
+    "tempo": {
+      "image": "grafana/tempo:2.10.8",
+      "id": "432b0c85b622"
+    },
+    "traces-s3": {
+      "image": "telemetry-regression/plural-traces-server:local",
+      "id": "ec95700b28bc"
+    }
+  },
+  "layout": {
+    "network": "host-ports",
+    "cpus": {
+      "docker_cpus": 12,
+      "lane": "0-5",
+      "pinned": true,
+      "cpusets": {
+        "shared": "0",
+        "impl": "1-2",
+        "oracle": "3-4"
+      }
+    }
+  },
+  "variant": "impl_config=production, oracle=tempo-s3, scenario=historical, pinned",
+  "results": {
+    "status": "passed",
+    "reasons": [],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 1770.5,
+    "rounds": 39,
+    "invisible_rounds": 0,
+    "cases": 3922,
+    "non_match": 607,
+    "outcomes": {
+      "match": 3315,
+      "inconclusive": 607
+    },
+    "ingest": {
+      "batches": 78,
+      "outcomes": {
+        "ok": 78
+      },
+      "oracle_ms": {
+        "p50": 3.6,
+        "p90": 18.063,
+        "p99": 68.59,
+        "max": 68.59
+      },
+      "impl_ms": {
+        "p50": 1.983,
+        "p90": 7.253,
+        "p99": 14.29,
+        "max": 14.29
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": 371.121,
+        "p90": 505.892,
+        "p99": 653.568,
+        "p99.9": 1183.084,
+        "max": 2069.05
+      },
+      "impl_ms": {
+        "p50": 3.606,
+        "p90": 14.692,
+        "p99": 40.746,
+        "p99.9": 110.131,
+        "max": 194.572
+      },
+      "ratio": {
+        "p50": 0.013,
+        "p90": 0.04,
+        "p99": 0.118
+      },
+      "outliers": 0
+    },
+    "families": {
+      "tags.names": {
+        "cases": 187,
+        "non_match": 131,
+        "outcomes": {
+          "match": 56,
+          "inconclusive": 131
+        },
+        "oracle_ms": {
+          "p50": 210.333,
+          "p90": 354.049,
+          "p99": 417.625
+        },
+        "impl_ms": {
+          "p50": 2.135,
+          "p90": 4.046,
+          "p99": 19.585
+        },
+        "ratio": {
+          "p50": 0.011,
+          "p90": 0.027
+        }
+      },
+      "tags.values": {
+        "cases": 178,
+        "non_match": 0,
+        "outcomes": {
+          "match": 178
+        },
+        "oracle_ms": {
+          "p50": 107.821,
+          "p90": 135.796,
+          "p99": 336.184
+        },
+        "impl_ms": {
+          "p50": 2.305,
+          "p90": 5.164,
+          "p99": 25.348
+        },
+        "ratio": {
+          "p50": 0.026,
+          "p90": 0.064
+        }
+      },
+      "trace.by_id": {
+        "cases": 710,
+        "non_match": 0,
+        "outcomes": {
+          "match": 710
+        },
+        "oracle_ms": {
+          "p50": 176.83,
+          "p90": 288.46,
+          "p99": 561.979
+        },
+        "impl_ms": {
+          "p50": 2.0,
+          "p90": 3.957,
+          "p99": 17.168
+        },
+        "ratio": {
+          "p50": 0.011,
+          "p90": 0.048
+        }
+      },
+      "traceql.aggregate": {
+        "cases": 432,
+        "non_match": 32,
+        "outcomes": {
+          "match": 400,
+          "inconclusive": 32
+        },
+        "oracle_ms": {
+          "p50": 380.575,
+          "p90": 489.902,
+          "p99": 609.091
+        },
+        "impl_ms": {
+          "p50": 4.567,
+          "p90": 15.393,
+          "p99": 42.215
+        },
+        "ratio": {
+          "p50": 0.015,
+          "p90": 0.039
+        }
+      },
+      "traceql.by": {
+        "cases": 157,
+        "non_match": 28,
+        "outcomes": {
+          "match": 129,
+          "inconclusive": 28
+        },
+        "oracle_ms": {
+          "p50": 432.742,
+          "p90": 520.919,
+          "p99": 776.449
+        },
+        "impl_ms": {
+          "p50": 4.459,
+          "p90": 17.368,
+          "p99": 43.818
+        },
+        "ratio": {
+          "p50": 0.012,
+          "p90": 0.037
+        }
+      },
+      "traceql.pipeline": {
+        "cases": 151,
+        "non_match": 9,
+        "outcomes": {
+          "match": 142,
+          "inconclusive": 9
+        },
+        "oracle_ms": {
+          "p50": 410.17,
+          "p90": 532.214,
+          "p99": 695.827
+        },
+        "impl_ms": {
+          "p50": 3.669,
+          "p90": 11.205,
+          "p99": 38.144
+        },
+        "ratio": {
+          "p50": 0.011,
+          "p90": 0.03
+        }
+      },
+      "traceql.select": {
+        "cases": 105,
+        "non_match": 29,
+        "outcomes": {
+          "match": 76,
+          "inconclusive": 29
+        },
+        "oracle_ms": {
+          "p50": 444.613,
+          "p90": 539.317,
+          "p99": 645.899
+        },
+        "impl_ms": {
+          "p50": 4.642,
+          "p90": 22.434,
+          "p99": 41.96
+        },
+        "ratio": {
+          "p50": 0.014,
+          "p90": 0.042
+        }
+      },
+      "traceql.spanset": {
+        "cases": 1353,
+        "non_match": 284,
+        "outcomes": {
+          "match": 1069,
+          "inconclusive": 284
+        },
+        "oracle_ms": {
+          "p50": 406.872,
+          "p90": 496.351,
+          "p99": 670.424
+        },
+        "impl_ms": {
+          "p50": 4.732,
+          "p90": 17.505,
+          "p99": 49.056
+        },
+        "ratio": {
+          "p50": 0.013,
+          "p90": 0.04
+        }
+      },
+      "traceql.structural": {
+        "cases": 649,
+        "non_match": 94,
+        "outcomes": {
+          "match": 555,
+          "inconclusive": 94
+        },
+        "oracle_ms": {
+          "p50": 449.045,
+          "p90": 560.966,
+          "p99": 735.584
+        },
+        "impl_ms": {
+          "p50": 4.828,
+          "p90": 16.749,
+          "p99": 38.608
+        },
+        "ratio": {
+          "p50": 0.013,
+          "p90": 0.034
+        }
+      }
+    },
+    "floor": {
+      "tempo": {
+        "role": "oracle",
+        "p50": 1.358,
+        "p99": 21.002
+      },
+      "traces-s3": {
+        "role": "impl",
+        "p50": 0.872,
+        "p99": 16.288
+      }
+    },
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 1770.5,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "traces-s3"
+          ],
+          "cpu_seconds": 37.0,
+          "cpu_cores": {
+            "mean": 0.021,
+            "p95": 0.047,
+            "max": 0.194
+          },
+          "memory_mib": {
+            "mean": 115.6,
+            "p95": 162.9,
+            "max": 183.0
+          }
+        },
+        "oracle": {
+          "services": [
+            "tempo"
+          ],
+          "cpu_seconds": 231.4,
+          "cpu_cores": {
+            "mean": 0.131,
+            "p95": 0.26,
+            "max": 0.683
+          },
+          "memory_mib": {
+            "mean": 376.6,
+            "p95": 515.1,
+            "max": 617.9
+          }
+        },
+        "shared": {
+          "services": [
+            "minio",
+            "minio-latency"
+          ],
+          "cpu_seconds": 331.3,
+          "cpu_cores": {
+            "mean": 0.187,
+            "p95": 0.364,
+            "max": 0.85
+          },
+          "memory_mib": {
+            "mean": 329.8,
+            "p95": 393.9,
+            "max": 448.7
+          }
+        }
+      },
+      "services": {
+        "minio": {
+          "cpu_seconds": 261.0,
+          "peak_memory_mib": 412.9
+        },
+        "minio-latency": {
+          "cpu_seconds": 70.3,
+          "peak_memory_mib": 43.4
+        },
+        "tempo": {
+          "cpu_seconds": 231.4,
+          "peak_memory_mib": 617.9
+        },
+        "traces-s3": {
+          "cpu_seconds": 37.0,
+          "peak_memory_mib": 183.0
+        }
+      }
+    }
+  }
+}

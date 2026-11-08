@@ -2,13 +2,13 @@
   "schema_version": 1,
   "products": {
     "logs": {
-      "runs": 7,
-      "latest": "2026-10-18T0206Z-b7041ee877-a5efa26d",
+      "runs": 9,
+      "latest": "2026-11-08T2216Z-dfa803a6a6-dirty-c2ce44e2",
       "readme": "history/logs/README.md"
     },
     "metrics": {
-      "runs": 9,
-      "latest": "2026-10-18T0255Z-b7041ee877-dirty-a991ff0b",
+      "runs": 12,
+      "latest": "2026-11-08T2246Z-dfa803a6a6-dirty-ee4ab8ef",
       "readme": "history/metrics/README.md"
     },
     "pseudofs": {
@@ -17,8 +17,8 @@
       "readme": "history/pseudofs/README.md"
     },
     "traces": {
-      "runs": 5,
-      "latest": "2026-10-18T0318Z-b7041ee877-dirty-bc7f0783",
+      "runs": 7,
+      "latest": "2026-11-08T2246Z-dfa803a6a6-dirty-53cd10c1",
       "readme": "history/traces/README.md"
     }
   },
@@ -666,6 +666,152 @@
               "get_p50": 3
             }
           }
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2116Z-dfa803a6a6-dirty-29486c16",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T21:16:06Z",
+      "finished_at": "2026-11-08T21:45:40Z",
+      "json": "history/logs/2026-11-08T2116Z-dfa803a6a6-dirty-29486c16.json",
+      "markdown": "history/logs/2026-11-08T2116Z-dfa803a6a6-dirty-29486c16.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 692612118,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 100,
+      "cases": 10225,
+      "mismatch": 62,
+      "non_match": 422,
+      "outcomes": {
+        "match": 9803,
+        "mismatch": 62,
+        "inconclusive": 135,
+        "oracle_error": 8,
+        "oracle_timeout": 8,
+        "both_error": 209
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 7.831,
+          "p90": 44.187,
+          "p99": 197.975
+        },
+        "oracle_ms": {
+          "p50": 9.554,
+          "p90": 95.477,
+          "p99": 545.595
+        },
+        "ratio_p50": 0.592
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.154,
+          "memory_mib_p95": 1097.7
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.345,
+          "memory_mib_p95": 2006.6
+        },
+        "shared": {
+          "cpu_cores_mean": 0.02,
+          "memory_mib_p95": 222.6
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2216Z-dfa803a6a6-dirty-c2ce44e2",
+      "product": "logs",
+      "variant": "impl_config=production, storage=s3, scenario=historical, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T22:16:26Z",
+      "finished_at": "2026-11-08T22:45:56Z",
+      "json": "history/logs/2026-11-08T2216Z-dfa803a6a6-dirty-c2ce44e2.json",
+      "markdown": "history/logs/2026-11-08T2216Z-dfa803a6a6-dirty-c2ce44e2.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 3268297954,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 99,
+      "cases": 9583,
+      "mismatch": 4,
+      "non_match": 302,
+      "outcomes": {
+        "match": 9281,
+        "mismatch": 4,
+        "inconclusive": 116,
+        "oracle_error": 2,
+        "oracle_timeout": 6,
+        "both_error": 174
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 9.118,
+          "p90": 46.47,
+          "p99": 199.318
+        },
+        "oracle_ms": {
+          "p50": 13.744,
+          "p90": 146.391,
+          "p99": 524.06
+        },
+        "ratio_p50": 0.487
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.146,
+          "memory_mib_p95": 813.6
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.399,
+          "memory_mib_p95": 746.5
+        },
+        "shared": {
+          "cpu_cores_mean": 0.044,
+          "memory_mib_p95": 278.3
         }
       }
     },
@@ -1449,6 +1595,223 @@
       }
     },
     {
+      "name": "2026-11-08T2115Z-dfa803a6a6-dirty-cb8a37fd",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=prometheus, storage=s3, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T21:15:51Z",
+      "finished_at": "2026-11-08T21:45:22Z",
+      "json": "history/metrics/2026-11-08T2115Z-dfa803a6a6-dirty-cb8a37fd.json",
+      "markdown": "history/metrics/2026-11-08T2115Z-dfa803a6a6-dirty-cb8a37fd.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 3414833149,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "prometheus",
+        "storage": "s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 171,
+      "cases": 16580,
+      "mismatch": 0,
+      "non_match": 292,
+      "outcomes": {
+        "match": 16288,
+        "inconclusive": 6,
+        "oracle_error": 1,
+        "both_error": 285
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.613,
+          "p90": 15.489,
+          "p99": 89.435
+        },
+        "oracle_ms": {
+          "p50": 2.013,
+          "p90": 14.948,
+          "p99": 145.211
+        },
+        "ratio_p50": 1.19
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.084,
+          "memory_mib_p95": 723.1
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.105,
+          "memory_mib_p95": 390.7
+        },
+        "shared": {
+          "cpu_cores_mean": 0.022,
+          "memory_mib_p95": 206.9
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2145Z-dfa803a6a6-dirty-613886f1",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=mimir, storage=s3, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T21:45:44Z",
+      "finished_at": "2026-11-08T22:15:25Z",
+      "json": "history/metrics/2026-11-08T2145Z-dfa803a6a6-dirty-613886f1.json",
+      "markdown": "history/metrics/2026-11-08T2145Z-dfa803a6a6-dirty-613886f1.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 1631094513,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "mimir",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 171,
+      "cases": 16945,
+      "mismatch": 48,
+      "non_match": 350,
+      "outcomes": {
+        "match": 16595,
+        "mismatch": 48,
+        "inconclusive": 81,
+        "oracle_error": 2,
+        "both_error": 219
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.744,
+          "p90": 15.864,
+          "p99": 91.51
+        },
+        "oracle_ms": {
+          "p50": 5.246,
+          "p90": 28.061,
+          "p99": 139.322
+        },
+        "ratio_p50": 0.591
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.088,
+          "memory_mib_p95": 932.2
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.162,
+          "memory_mib_p95": 415.9
+        },
+        "shared": {
+          "cpu_cores_mean": 0.024,
+          "memory_mib_p95": 253.8
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2246Z-dfa803a6a6-dirty-ee4ab8ef",
+      "product": "metrics",
+      "variant": "impl_config=production, oracle=mimir-blocks, storage=s3, scenario=historical, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T22:46:08Z",
+      "finished_at": "2026-11-08T23:15:48Z",
+      "json": "history/metrics/2026-11-08T2246Z-dfa803a6a6-dirty-ee4ab8ef.json",
+      "markdown": "history/metrics/2026-11-08T2246Z-dfa803a6a6-dirty-ee4ab8ef.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 3997874415,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "mimir-blocks",
+        "storage": "s3"
+      },
+      "status": "failed",
+      "reasons": 1,
+      "rounds": 26,
+      "cases": 2616,
+      "mismatch": 1,
+      "non_match": 51,
+      "outcomes": {
+        "match": 2565,
+        "mismatch": 1,
+        "inconclusive": 8,
+        "both_error": 42
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.05,
+          "p90": 5.477,
+          "p99": 26.202
+        },
+        "oracle_ms": {
+          "p50": 24.35,
+          "p90": 69.756,
+          "p99": 198.316
+        },
+        "ratio_p50": 0.092
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.013,
+          "memory_mib_p95": 217.2
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.346,
+          "memory_mib_p95": 950.4
+        },
+        "shared": {
+          "cpu_cores_mean": 0.036,
+          "memory_mib_p95": 324.4
+        }
+      }
+    },
+    {
       "name": "2026-10-11T1751Z-b03cb4f7ea-dirty-e8d21cb4",
       "product": "pseudofs",
       "variant": "concurrency=8, crash_every=4, impl_config=production, max_file_bytes=100663296, race_rate=0.5, tenant=fuzz-e8d21cb4, pinned",
@@ -2110,6 +2473,144 @@
               "get_p50": 175
             }
           }
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2146Z-dfa803a6a6-dirty-59c72ade",
+      "product": "traces",
+      "variant": "impl_config=production, oracle=tempo, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T21:46:13Z",
+      "finished_at": "2026-11-08T22:15:43Z",
+      "json": "history/traces/2026-11-08T2146Z-dfa803a6a6-dirty-59c72ade.json",
+      "markdown": "history/traces/2026-11-08T2146Z-dfa803a6a6-dirty-59c72ade.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 1506224862,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "tempo"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 149,
+      "cases": 15645,
+      "mismatch": 0,
+      "non_match": 2743,
+      "outcomes": {
+        "match": 12902,
+        "inconclusive": 2743
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 2.748,
+          "p90": 17.883,
+          "p99": 46.564
+        },
+        "oracle_ms": {
+          "p50": 36.354,
+          "p90": 94.512,
+          "p99": 206.045
+        },
+        "ratio_p50": 0.124
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.071,
+          "memory_mib_p95": 417.9
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.686,
+          "memory_mib_p95": 1087.6
+        },
+        "shared": {
+          "cpu_cores_mean": 0.022,
+          "memory_mib_p95": 254.2
+        }
+      }
+    },
+    {
+      "name": "2026-11-08T2246Z-dfa803a6a6-dirty-53cd10c1",
+      "product": "traces",
+      "variant": "impl_config=production, oracle=tempo-s3, scenario=historical, pinned",
+      "batch": "bench-20261108T211203Z",
+      "started_at": "2026-11-08T22:46:37Z",
+      "finished_at": "2026-11-08T23:16:07Z",
+      "json": "history/traces/2026-11-08T2246Z-dfa803a6a6-dirty-53cd10c1.json",
+      "markdown": "history/traces/2026-11-08T2246Z-dfa803a6a6-dirty-53cd10c1.md",
+      "git": {
+        "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+        "short": "dfa803a6a6",
+        "branch": "main",
+        "dirty": true
+      },
+      "host": {
+        "label": null,
+        "cpu": "Apple M3 Pro",
+        "cores": 12,
+        "docker_cpus": 12,
+        "docker_memory_gib": 8.8
+      },
+      "config": {
+        "duration_s": 1800.0,
+        "seed": 1405948097,
+        "scale": 1.0
+      },
+      "settings": {
+        "impl_config": "production",
+        "oracle": "tempo-s3"
+      },
+      "status": "passed",
+      "reasons": 0,
+      "rounds": 39,
+      "cases": 3922,
+      "mismatch": 0,
+      "non_match": 607,
+      "outcomes": {
+        "match": 3315,
+        "inconclusive": 607
+      },
+      "latency": {
+        "impl_ms": {
+          "p50": 3.606,
+          "p90": 14.692,
+          "p99": 40.746
+        },
+        "oracle_ms": {
+          "p50": 371.121,
+          "p90": 505.892,
+          "p99": 653.568
+        },
+        "ratio_p50": 0.013
+      },
+      "resources": {
+        "impl": {
+          "cpu_cores_mean": 0.021,
+          "memory_mib_p95": 162.9
+        },
+        "oracle": {
+          "cpu_cores_mean": 0.131,
+          "memory_mib_p95": 515.1
+        },
+        "shared": {
+          "cpu_cores_mean": 0.187,
+          "memory_mib_p95": 393.9
         }
       }
     }

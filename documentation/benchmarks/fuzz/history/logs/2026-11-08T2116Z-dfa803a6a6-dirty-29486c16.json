@@ -1,0 +1,442 @@
+{
+  "schema_version": 1,
+  "name": "2026-11-08T2116Z-dfa803a6a6-dirty-29486c16",
+  "product": "logs",
+  "run_id": "20261108T211546Z-29486c16",
+  "batch": "bench-20261108T211203Z",
+  "started_at": "2026-11-08T21:16:06Z",
+  "finished_at": "2026-11-08T21:45:40Z",
+  "git": {
+    "commit": "dfa803a6a61dde6faa9bf5339e469b6bff7bdf79",
+    "short": "dfa803a6a6",
+    "branch": "main",
+    "dirty": true
+  },
+  "host": {
+    "label": null,
+    "os": "Darwin",
+    "os_release": "23.4.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 12,
+    "memory_gib": 18.0,
+    "python": "3.13.7",
+    "docker": {
+      "version": "29.4.0",
+      "os": "OrbStack",
+      "arch": "aarch64",
+      "cpus": 12,
+      "memory_gib": 8.8
+    }
+  },
+  "ci": null,
+  "config": {
+    "duration_s": 1800.0,
+    "seed": 692612118,
+    "scale": 1.0,
+    "window_s": 1200.0,
+    "queries_per_round": [
+      40,
+      160
+    ],
+    "max_rounds": 0,
+    "max_cases": 0,
+    "request_timeout_s": 30.0,
+    "visibility_timeout_s": 90.0,
+    "latency_ratio": 10.0,
+    "latency_floor_ms": 250.0,
+    "recheck": true,
+    "fail_on": [
+      "impl_error",
+      "impl_timeout",
+      "ingest",
+      "mismatch",
+      "unstable_impl"
+    ],
+    "stack": "compose",
+    "scenario": "recent",
+    "isolated": true
+  },
+  "settings": {
+    "impl_config": "production",
+    "storage": "s3"
+  },
+  "environment": {
+    "FUZZ_LOGS_CONFIG": "production",
+    "FUZZ_SCENARIO": "recent",
+    "REGRESSION_BUILD": "0"
+  },
+  "images": {
+    "logs-s3": {
+      "image": "telemetry-regression/plural-logs-server:local",
+      "id": "52dc15a48351"
+    },
+    "loki-fuzz": {
+      "image": "grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6",
+      "id": "590b5e7b8ca4"
+    },
+    "minio": {
+      "image": "cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1",
+      "id": "1e675da17ce5"
+    }
+  },
+  "layout": {
+    "network": "host-ports",
+    "cpus": {
+      "docker_cpus": 12,
+      "lane": "0-5",
+      "pinned": true,
+      "cpusets": {
+        "shared": "0",
+        "impl": "1-2",
+        "oracle": "3-4"
+      }
+    }
+  },
+  "variant": "impl_config=production, storage=s3, pinned",
+  "results": {
+    "status": "failed",
+    "reasons": [
+      "62 mismatch case(s)"
+    ],
+    "notes": [],
+    "notes_truncated": 0,
+    "elapsed_s": 1774.5,
+    "rounds": 100,
+    "invisible_rounds": 0,
+    "cases": 10225,
+    "non_match": 422,
+    "outcomes": {
+      "match": 9803,
+      "mismatch": 62,
+      "inconclusive": 135,
+      "oracle_error": 8,
+      "oracle_timeout": 8,
+      "both_error": 209
+    },
+    "ingest": {
+      "batches": 234,
+      "outcomes": {
+        "ok": 234
+      },
+      "oracle_ms": {
+        "p50": 5.493,
+        "p90": 23.646,
+        "p99": 55.882,
+        "max": 97.788
+      },
+      "impl_ms": {
+        "p50": 1.692,
+        "p90": 4.895,
+        "p99": 12.503,
+        "max": 18.018
+      }
+    },
+    "latency": {
+      "oracle_ms": {
+        "p50": 9.554,
+        "p90": 95.477,
+        "p99": 545.595,
+        "p99.9": 2013.284,
+        "max": 21812.258
+      },
+      "impl_ms": {
+        "p50": 7.831,
+        "p90": 44.187,
+        "p99": 197.975,
+        "p99.9": 737.45,
+        "max": 4885.853
+      },
+      "ratio": {
+        "p50": 0.592,
+        "p90": 1.517,
+        "p99": 3.336
+      },
+      "outliers": 0
+    },
+    "families": {
+      "logql.label_values": {
+        "cases": 344,
+        "non_match": 62,
+        "outcomes": {
+          "match": 282,
+          "mismatch": 62
+        },
+        "oracle_ms": {
+          "p50": 2.407,
+          "p90": 5.841,
+          "p99": 26.277
+        },
+        "impl_ms": {
+          "p50": 1.454,
+          "p90": 4.039,
+          "p99": 12.008
+        },
+        "ratio": {
+          "p50": 0.602,
+          "p90": 1.289
+        }
+      },
+      "logql.labels": {
+        "cases": 333,
+        "non_match": 0,
+        "outcomes": {
+          "match": 333
+        },
+        "oracle_ms": {
+          "p50": 2.273,
+          "p90": 4.309,
+          "p99": 18.211
+        },
+        "impl_ms": {
+          "p50": 1.15,
+          "p90": 2.108,
+          "p99": 6.25
+        },
+        "ratio": {
+          "p50": 0.503,
+          "p90": 0.785
+        }
+      },
+      "logql.log": {
+        "cases": 1182,
+        "non_match": 56,
+        "outcomes": {
+          "match": 1126,
+          "inconclusive": 56
+        },
+        "oracle_ms": {
+          "p50": 12.692,
+          "p90": 96.574,
+          "p99": 329.586
+        },
+        "impl_ms": {
+          "p50": 9.303,
+          "p90": 39.809,
+          "p99": 117.016
+        },
+        "ratio": {
+          "p50": 0.564,
+          "p90": 1.414
+        }
+      },
+      "logql.log.limited": {
+        "cases": 301,
+        "non_match": 25,
+        "outcomes": {
+          "match": 276,
+          "inconclusive": 25
+        },
+        "oracle_ms": {
+          "p50": 6.319,
+          "p90": 33.442,
+          "p99": 112.14
+        },
+        "impl_ms": {
+          "p50": 4.715,
+          "p90": 20.431,
+          "p99": 67.805
+        },
+        "ratio": {
+          "p50": 0.682,
+          "p90": 1.741
+        }
+      },
+      "logql.log.parsed": {
+        "cases": 1527,
+        "non_match": 40,
+        "outcomes": {
+          "match": 1487,
+          "inconclusive": 40
+        },
+        "oracle_ms": {
+          "p50": 12.852,
+          "p90": 138.579,
+          "p99": 342.304
+        },
+        "impl_ms": {
+          "p50": 10.37,
+          "p90": 56.175,
+          "p99": 151.439
+        },
+        "ratio": {
+          "p50": 0.555,
+          "p90": 1.514
+        }
+      },
+      "logql.log.parsed.limited": {
+        "cases": 387,
+        "non_match": 11,
+        "outcomes": {
+          "match": 376,
+          "inconclusive": 11
+        },
+        "oracle_ms": {
+          "p50": 8.511,
+          "p90": 57.764,
+          "p99": 311.395
+        },
+        "impl_ms": {
+          "p50": 6.649,
+          "p90": 28.597,
+          "p99": 91.832
+        },
+        "ratio": {
+          "p50": 0.621,
+          "p90": 1.724
+        }
+      },
+      "logql.metric.instant": {
+        "cases": 2095,
+        "non_match": 89,
+        "outcomes": {
+          "match": 2006,
+          "inconclusive": 2,
+          "oracle_error": 1,
+          "both_error": 86
+        },
+        "oracle_ms": {
+          "p50": 7.744,
+          "p90": 40.105,
+          "p99": 202.956
+        },
+        "impl_ms": {
+          "p50": 7.148,
+          "p90": 27.706,
+          "p99": 84.253
+        },
+        "ratio": {
+          "p50": 0.717,
+          "p90": 1.787
+        }
+      },
+      "logql.metric.range": {
+        "cases": 3340,
+        "non_match": 139,
+        "outcomes": {
+          "match": 3201,
+          "inconclusive": 1,
+          "oracle_error": 7,
+          "oracle_timeout": 8,
+          "both_error": 123
+        },
+        "oracle_ms": {
+          "p50": 15.82,
+          "p90": 166.376,
+          "p99": 1203.47
+        },
+        "impl_ms": {
+          "p50": 11.843,
+          "p90": 77.928,
+          "p99": 366.735
+        },
+        "ratio": {
+          "p50": 0.529,
+          "p90": 1.288
+        }
+      },
+      "logql.series": {
+        "cases": 716,
+        "non_match": 0,
+        "outcomes": {
+          "match": 716
+        },
+        "oracle_ms": {
+          "p50": 6.849,
+          "p90": 29.184,
+          "p99": 99.377
+        },
+        "impl_ms": {
+          "p50": 6.254,
+          "p90": 24.615,
+          "p99": 59.11
+        },
+        "ratio": {
+          "p50": 0.801,
+          "p90": 1.798
+        }
+      }
+    },
+    "floor": {
+      "logs-s3": {
+        "role": "impl",
+        "p50": 1.006,
+        "p99": 4.676
+      },
+      "loki-fuzz": {
+        "role": "oracle",
+        "p50": 1.866,
+        "p99": 26.22
+      }
+    },
+    "resources": {
+      "interval_s": 2.0,
+      "elapsed_s": 1774.5,
+      "samples_failed": 0,
+      "roles": {
+        "impl": {
+          "services": [
+            "logs-s3"
+          ],
+          "cpu_seconds": 274.0,
+          "cpu_cores": {
+            "mean": 0.154,
+            "p95": 0.434,
+            "max": 1.01
+          },
+          "memory_mib": {
+            "mean": 744.5,
+            "p95": 1097.7,
+            "max": 1933.9
+          }
+        },
+        "oracle": {
+          "services": [
+            "loki-fuzz"
+          ],
+          "cpu_seconds": 612.4,
+          "cpu_cores": {
+            "mean": 0.345,
+            "p95": 0.904,
+            "max": 1.285
+          },
+          "memory_mib": {
+            "mean": 789.2,
+            "p95": 2006.6,
+            "max": 3531.2
+          }
+        },
+        "shared": {
+          "services": [
+            "minio"
+          ],
+          "cpu_seconds": 34.9,
+          "cpu_cores": {
+            "mean": 0.02,
+            "p95": 0.084,
+            "max": 0.235
+          },
+          "memory_mib": {
+            "mean": 184.1,
+            "p95": 222.6,
+            "max": 234.9
+          }
+        }
+      },
+      "services": {
+        "logs-s3": {
+          "cpu_seconds": 274.0,
+          "peak_memory_mib": 1933.9
+        },
+        "loki-fuzz": {
+          "cpu_seconds": 612.4,
+          "peak_memory_mib": 3531.2
+        },
+        "minio": {
+          "cpu_seconds": 34.9,
+          "peak_memory_mib": 234.9
+        }
+      }
+    }
+  }
+}

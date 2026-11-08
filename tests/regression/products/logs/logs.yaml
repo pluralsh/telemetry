@@ -8,6 +8,8 @@ storage:
   meta_cache: { type: FoyerMemory, capacity: 16777216 }
 segment_duration_seconds: 60
 retention_seconds: 3600
+# `| match` scores lines only from the index; the fuzz configs leave it off.
+full_text_index: true
 page:
   target_size_bytes: 16384
   max_rows: 128

@@ -548,11 +548,19 @@ fn should_derive_absent_labels_from_equality_matchers() {
         absent_labels_of(r#"absent_over_time(foo{job="a"}[5m])"#),
         vec![pair("job", "a")]
     );
-    // a later `=` cannot restore a label an earlier matcher removed, and
-    // empty values never become labels
+    // matchers apply in order, so a first `=` after another matcher still
+    // sets the label, and empty values never become labels
     assert_eq!(
         absent_labels_of(r#"absent(foo{env=~"p.*", env="prod", code="", job="a"})"#),
-        vec![pair("job", "a")]
+        vec![pair("env", "prod"), pair("job", "a")]
+    );
+    assert_eq!(
+        absent_labels_of(r#"absent(foo{job="a", job!="b", zone="z"})"#),
+        vec![pair("zone", "z")]
+    );
+    assert_eq!(
+        absent_labels_of(r#"absent(foo{job="a", job="b", job="c"})"#),
+        vec![]
     );
     // non-selector arguments carry no labels
     assert!(absent_labels_of(r#"absent(sum(foo{job="a"}))"#).is_empty());

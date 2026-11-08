@@ -29,7 +29,7 @@ use common::{
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
 use slatedb::config::DbReaderOptions;
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::Namespace;
 use crate::analyzer::DEFAULT_ANALYZER;
@@ -187,19 +187,22 @@ pub enum Durability {
 pub(crate) struct PageBudget {
     limit: usize,
     remaining: AtomicUsize,
-    decoding: Semaphore,
-    /// Taken while a unit acquires its permits, so this budget's units take
-    /// both its and the process's in the order they first ask. A unit then
-    /// only ever waits behind units it reads after, or other budgets', and
-    /// those holding permits release them without waiting on it.
+    decoding: Arc<Semaphore>,
+    /// Taken while a unit acquires its permits, so a unit holds both its
+    /// share of this budget and of the process's or waits for them, never
+    /// holding one while another of this budget's units holds the other.
     admission: Mutex<()>,
 }
 
 /// A read unit's share of its [`PageBudget`] and of the process's
 /// [`MemoryBudget`].
+///
+/// A read that hands rows on in scan order holds each unit's permit until
+/// the units before it are handed on, so it must take permits in that
+/// order too, a unit at a time; see [`PageBudget::admit`].
 #[derive(Debug)]
-pub(crate) struct DecodePermit<'a> {
-    _budget: SemaphorePermit<'a>,
+pub(crate) struct DecodePermit {
+    _budget: OwnedSemaphorePermit,
     _process: BudgetPermit,
 }
 
@@ -208,7 +211,7 @@ impl PageBudget {
         Self {
             limit,
             remaining: AtomicUsize::new(limit),
-            decoding: Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize),
+            decoding: Arc::new(Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize)),
             admission: Mutex::new(()),
         }
     }
@@ -216,14 +219,13 @@ impl PageBudget {
     /// Holds `bytes` of decoding in this budget and in `memory` until the
     /// permit drops. A unit larger than either allowance waits for all of
     /// it rather than forever.
-    async fn decode(&self, memory: &MemoryBudget, bytes: u64) -> Result<DecodePermit<'_>> {
+    async fn decode(&self, memory: &MemoryBudget, bytes: u64) -> Result<DecodePermit> {
         let weight = u32::try_from(bytes)
             .unwrap_or(u32::MAX)
             .clamp(1, DECODE_BYTES_IN_FLIGHT);
         let _admission = self.admission.lock().await;
-        let budget = self
-            .decoding
-            .acquire_many(weight)
+        let budget = Arc::clone(&self.decoding)
+            .acquire_many_owned(weight)
             .await
             .map_err(|_| Error::Query("decode budget closed".into()))?;
         Ok(DecodePermit {

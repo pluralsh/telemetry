@@ -698,12 +698,12 @@ impl LogDb {
     /// which the receiver holds until it is done with the rows. Rows a unit
     /// leaves pending go out under a later chunk's permit, so no unit waits
     /// on permits that rows read before it hold.
-    pub(super) async fn read_bounded_chunks<'a>(
+    pub(super) async fn read_bounded_chunks(
         &self,
         namespace: &Namespace,
         targets: ScanTargets,
-        budget: &'a PageBudget,
-        sender: tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit<'a>)>,
+        budget: &PageBudget,
+        sender: tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit)>,
     ) -> Result<()> {
         for (ordinal, (segment, streams)) in (targets.first_ordinal..).zip(targets.segments) {
             self.read_segment_chunks(
@@ -719,22 +719,28 @@ impl LogDb {
         Ok(())
     }
 
-    async fn read_segment_chunks<'a>(
+    async fn read_segment_chunks(
         &self,
         namespace: &Namespace,
         (segment, ordinal): (SegmentId, usize),
         streams: Vec<SegmentStream>,
         range: (i64, i64),
-        budget: &'a PageBudget,
-        sender: &tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit<'a>)>,
+        budget: &PageBudget,
+        sender: &tokio::sync::mpsc::Sender<(Vec<LogRow>, DecodePermit)>,
     ) -> Result<()> {
         let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
         let units = plan_reads(&streams, false, COALESCE_GAP_BLOCKS);
         let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
         let mut decoded = futures::stream::iter(units)
-            .map(|unit| async move {
-                budget.take()?;
-                let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
+            .then(|unit| async move {
+                let bytes = unit.decode_bytes(true);
+                budget.admit(&self.memory, unit, bytes).await
+            })
+            // Boxed, or rustc's higher-ranked `Send` check of the query traits
+            // rejects the chain.
+            .boxed()
+            .map(|admitted| async move {
+                let (unit, decoding) = admitted?;
                 // A copy reads each block once, so caching would only evict
                 // blocks that queries reread.
                 let blocks = read_blocks(
@@ -939,14 +945,18 @@ impl LogDb {
         let units = plan_reads(&streams, reverse, COALESCE_GAP_BLOCKS);
         let bounds = units.iter().map(|unit| unit.bound).collect::<Vec<_>>();
         let mut decoded = futures::stream::iter(units)
-            .map(move |unit| {
+            .then(|unit| async move {
+                let bytes = unit.decode_bytes(true);
+                budget.admit(&self.memory, unit, bytes).await
+            })
+            // Boxed, or rustc's higher-ranked `Send` check of the query traits
+            // rejects the chain.
+            .boxed()
+            .map(move |admitted| {
                 let candidates = Arc::clone(&candidates);
                 async move {
-                    budget.take()?;
-                    // Held until the unit's rows are pending. Units ask the fair
-                    // semaphore in read order, so a segment's earliest holder
-                    // never waits behind a later one.
-                    let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
+                    // Decoding is held until the unit's rows are pending.
+                    let (unit, decoding) = admitted?;
                     let blocks = self
                         .load_blocks(
                             namespace,
@@ -1088,18 +1098,26 @@ impl LogDb {
             }
         };
         let units = futures::stream::poll_fn(move |context| receiver.poll_recv(context))
-            .map_ok(|units| futures::stream::iter(units.into_iter().map(Ok)))
+            .map_ok(|units| futures::stream::iter(units.into_iter().map(Ok::<_, Error>)))
             .try_flatten()
-            .map(|unit: Result<PipelinedUnit>| async move {
-                let PipelinedUnit {
-                    segment,
-                    ordinal,
-                    next_bound,
-                    candidates,
-                    unit,
-                } = unit?;
-                budget.take()?;
-                let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
+            .and_then(|unit: PipelinedUnit| async move {
+                let bytes = unit.unit.decode_bytes(true);
+                budget.admit(&self.memory, unit, bytes).await
+            })
+            // Boxed, or rustc's higher-ranked `Send` check of the query traits
+            // rejects the chain.
+            .boxed()
+            .map(|admitted| async move {
+                let (
+                    PipelinedUnit {
+                        segment,
+                        ordinal,
+                        next_bound,
+                        candidates,
+                        unit,
+                    },
+                    decoding,
+                ) = admitted?;
                 let blocks = self
                     .load_blocks(
                         namespace,
@@ -2444,6 +2462,25 @@ impl ReadUnit {
         let span = u64::from(self.end_block.saturating_sub(self.first_block));
         let encoded = bytes.saturating_mul(span) / blocks.max(1);
         encoded.saturating_mul(2) + if lines { line_bytes } else { 0 }
+    }
+}
+
+impl PageBudget {
+    /// Charges `unit` a page and holds `bytes` of decoding for it. Reads
+    /// that hand rows on in scan order call this in the stream feeding
+    /// their concurrent reads, a unit at a time in that order, rather than
+    /// in the reads: those are polled in no fixed order, and a later unit
+    /// that took the budget first would hold it, waiting to be handed on,
+    /// while the unit before it waited for that budget.
+    async fn admit<T>(
+        &self,
+        memory: &MemoryBudget,
+        unit: T,
+        bytes: u64,
+    ) -> Result<(T, DecodePermit)> {
+        self.take()?;
+        let decoding = self.decode(memory, bytes).await?;
+        Ok((unit, decoding))
     }
 }
 

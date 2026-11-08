@@ -98,6 +98,9 @@ eval instant at 50m absent(nonexistent{job="testjob",job="testjob2",job="three",
 eval instant at 50m absent(nonexistent{job="testjob",job=~"testjob2",foo="bar"})
 	{foo="bar"} 1
 
+eval instant at 50m absent(nonexistent{job=~"testjob2",job="testjob",foo="bar"})
+	{foo="bar", job="testjob"} 1
+
 clear
 
 # Don't return anything when there's something there.

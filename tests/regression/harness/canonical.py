@@ -33,7 +33,8 @@ def canonicalize(response: dict[str, Any]) -> dict[str, Any]:
     """Remove implementation metadata and deterministically order Loki results."""
     if response.get("status") != "success":
         return response
-    data = response["data"]
+    # Loki omits `data` from discovery answers with no values.
+    data = response.get("data", [])
     if isinstance(data, list):
         return {"status": "success", "data": _metadata(data)}
     kind = data["resultType"]

@@ -952,6 +952,76 @@ async fn concurrent_queries_finish_within_a_decode_budget_smaller_than_one_unit(
     db.close().await.unwrap();
 }
 
+/// A broad `|=` that matches nothing reads every segment of every stream
+/// through the pipelined early-stop read, under a decode budget a few units
+/// fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broad_sparse_line_filter_finishes_within_a_small_decode_budget() {
+    use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
+
+    for (index, decode_bytes) in [(false, 1), (false, 4_096), (true, 4_096)] {
+        let mut config = test_config();
+        config.full_text_index = index;
+        config.memory.decode_bytes = decode_bytes;
+        config.block_cache_capacity_bytes = 64 << 20;
+        let db = LogDb::open(config).await.unwrap();
+        let namespace = Namespace::new("sparse-filter").unwrap();
+        for segment in 0..6i64 {
+            let batches = (0..48)
+                .map(|stream| {
+                    LogBatch::new(
+                        labels(&format!("service-{stream}"), "prod"),
+                        (0..12)
+                            .map(|row| {
+                                LogEntry::new(
+                                    segment * 10_000_000_000 + row * 100_000_000 + stream,
+                                    format!("stream {stream} row {row} common words"),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            db.write(&namespace, batches).await.unwrap();
+        }
+        db.flush().await.unwrap();
+        for direction in [Direction::Backward, Direction::Forward] {
+            for filter in ["absent", "row 3 common"] {
+                let query = format!(r#"{{environment="prod"}} |= "{filter}""#);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    db.query(
+                        &namespace,
+                        &QueryRequest::range(&query, 0, 60_000_000_000, 1_000_000_000),
+                        QueryOptions {
+                            limit: 100,
+                            direction,
+                            max_pages: usize::MAX,
+                            ..QueryOptions::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{query} ({direction:?}, index {index}, decode {decode_bytes}) hung; \
+                         {} decode bytes free",
+                        db.memory.decode_available()
+                    )
+                })
+                .unwrap();
+                let QueryResult::Streams(streams) = result else {
+                    panic!("expected streams");
+                };
+                let rows = streams.iter().map(|s| s.entries.len()).sum::<usize>();
+                assert_eq!(rows, if filter == "absent" { 0 } else { 100 }, "{query}");
+            }
+        }
+        assert_eq!(db.memory.decode_available(), decode_bytes);
+        db.close().await.unwrap();
+    }
+}
+
 /// A segment written partly without the index is scanned, so `|=` and
 /// `| match` return every row whichever writes indexed it.
 #[tokio::test]

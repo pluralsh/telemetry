@@ -469,32 +469,30 @@ fn lower_instant_vector_arg(
 }
 
 /// Output labels for `absent` / `absent_over_time`, per Prometheus'
-/// `createLabelsForAbsentFunction`: the first equality matcher of each
-/// label except `__name__`, dropping any label that has a second matcher.
-/// Arguments other than a bare selector yield no labels.
+/// `createLabelsForAbsentFunction`. Arguments other than a bare selector
+/// yield no labels.
 fn absent_labels(arg: &parser::Expr) -> Labels {
     let selector = match arg {
         parser::Expr::VectorSelector(vs) => vs,
         parser::Expr::MatrixSelector(ms) => &ms.vs,
         _ => return Labels::empty(),
     };
-    // Prometheus' `createLabelsForAbsentFunction`: the first `=` matcher
-    // sets a label, any other matcher on that name deletes it afterwards,
-    // and an empty value never becomes a label.
+    // Matchers apply in order: a label's first `=` sets it, and every other
+    // matcher on it deletes it as of that point, so `{a=~"x", a="y"}` keeps
+    // `a="y"` but `{a="y", a=~"x"}` drops it. Empty values never become
+    // labels.
     let mut labels: Vec<Label> = Vec::new();
     let mut set: HashSet<&str> = HashSet::new();
-    let mut removed: HashSet<&str> = HashSet::new();
     for matcher in &selector.matchers.matchers {
         if matcher.name == "__name__" {
             continue;
         }
+        labels.retain(|label| label.name != matcher.name);
         if matches!(matcher.op, MatchOp::Equal) && set.insert(&matcher.name) {
             labels.push(Label::new(&matcher.name, &matcher.value));
-        } else {
-            removed.insert(&matcher.name);
         }
     }
-    labels.retain(|label| !label.value.is_empty() && !removed.contains(label.name.as_str()));
+    labels.retain(|label| !label.value.is_empty());
     labels.sort();
     Labels::new(labels)
 }
