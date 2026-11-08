@@ -3,8 +3,8 @@ name: telemetry-stack
 description: >-
   Plural Telemetry metrics, logs, traces, vector, bucket cleaner, and namespace
   authentication resources
-appVersion: 0.3.27
-version: 0.1.41
+appVersion: 0.3.28
+version: 0.1.42
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
