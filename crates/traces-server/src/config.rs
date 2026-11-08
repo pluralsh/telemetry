@@ -143,6 +143,13 @@ pub struct Config {
     /// 640 MiB. Binaries before this option reject configs that set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_memory_bytes: Option<u64>,
+    /// Encoded OTLP bytes of writes applied but not yet written to storage;
+    /// one flush holds a third of it at most, and writes hold about six
+    /// times it resident. Ingest past it is rejected with 429 and rollups
+    /// wait. Defaults to 48 MiB. Binaries before this option reject configs
+    /// that set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_budget_bytes: Option<u64>,
     /// Rollup of closed days of segments into wider segments.
     pub rollup: SegmentRollupConfig,
     pub write: WriteConfig,
@@ -170,6 +177,7 @@ impl Default for Config {
             page: PageConfig::default(),
             read_cache: ReadCacheConfig::default(),
             compaction_memory_bytes: None,
+            write_budget_bytes: None,
             rollup: SegmentRollupConfig::default(),
             write: WriteConfig::default(),
             sharding: ShardingConfig::default(),
@@ -264,6 +272,11 @@ impl Config {
                 "compaction_memory_bytes must be greater than zero".into(),
             ));
         }
+        if self.write_budget_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "write_budget_bytes must be greater than zero".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -287,6 +300,9 @@ impl Config {
             compaction_memory_bytes: self
                 .compaction_memory_bytes
                 .unwrap_or(common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES),
+            write_budget_bytes: self
+                .write_budget_bytes
+                .unwrap_or(plural_traces::DEFAULT_WRITE_BUDGET_BYTES),
         }
     }
 }

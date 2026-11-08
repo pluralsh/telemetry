@@ -945,7 +945,7 @@ mod parameter_tests {
         let body = to_bytes(protobuf.into_body(), usize::MAX).await.unwrap();
         let status = GoogleRpcStatus::decode(body).unwrap();
         assert_eq!(status.code, 8);
-        assert_eq!(status.message, "write buffer is full");
+        assert_eq!(status.message, "writer is at capacity, retry later");
 
         let json = ApiError::unavailable("flusher stopped").into_otlp_response(true);
         assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);

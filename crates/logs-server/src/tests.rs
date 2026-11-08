@@ -1243,15 +1243,29 @@ async fn gzip_loki_json_and_visibility_flush_make_writes_queryable() {
         "visibility task did not flush the accepted write"
     );
 
-    let body = response_json(
-        query(
-            &state,
-            "/read/ns/tenant/loki/api/v1/query_range?query=%7Bapp%3D%22visible%22%7D&start=0&end=2",
+    // The task clears the flag as its flush starts, and flushes encode on
+    // blocking threads the paused clock does not wait for.
+    let mut visible = false;
+    for _ in 0..200 {
+        let body = response_json(
+            query(
+                &state,
+                "/read/ns/tenant/loki/api/v1/query_range?query=%7Bapp%3D%22visible%22%7D&start=0&end=2",
+            )
+            .await,
         )
-        .await,
-    )
-    .await;
-    assert!(!body["data"]["result"].as_array().unwrap().is_empty());
+        .await;
+        if !body["data"]["result"].as_array().unwrap().is_empty() {
+            visible = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        visible,
+        "the visibility flush did not make the write queryable"
+    );
     state.shutdown().await.unwrap();
 }
 

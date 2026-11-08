@@ -11,8 +11,9 @@
 //! subcompactions * (sources * max_fetch_tasks * bytes_to_fetch + 90 MiB)
 //! ```
 //!
-//! however small its inputs are. SlateDB plans one subcompaction per
-//! `max_sst_size` of input, up to `max_subcompactions`, and bounds neither
+//! however small its inputs are. SlateDB splits a compaction into ranges of
+//! at least its largest input SST, up to `max_subcompactions` of them, and
+//! every range reads every source; it bounds neither
 //! the sources of a compaction nor how many run at once by bytes.
 //!
 //! [`CompactionMemory`] does: [`CompactionMemory::bound`] shrinks a
@@ -24,9 +25,11 @@
 //!
 //! Writes stall once a segment taking them has too many L0 SSTs, and only
 //! compactions of those L0s (relief) clear them. Every other compaction (a
-//! merge) takes at most [`CompactionMemory::merge_budget`], so a merge of a
-//! closed hour or a rollup, however large, leaves a quarter of the budget for
-//! relief.
+//! merge) takes at most [`CompactionMemory::merge_budget`], half the budget.
+//! Subcompactions are capped at what that half fits, so relief always has
+//! room for one compaction as wide as any, however much merges hold: with a
+//! quarter, a merge of a segment's runs held back the next compaction of its
+//! L0s for many seconds at a time.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,15 +44,16 @@ const MIB: u64 = 1024 * 1024;
 
 /// Default [`CompactionMemory`] budget: four compactions of eight sources
 /// with SlateDB's default prefetch, of one subcompaction each, take about
-/// 620 MiB, and its merge share fits one of three subcompactions.
+/// 620 MiB, and its merge share fits one of two subcompactions.
 pub const DEFAULT_COMPACTION_MEMORY_BYTES: u64 = 640 * MIB;
 
 /// The share of the budget, as a divisor, that only relief may use.
-const RELIEF_DIVISOR: u64 = 4;
+const RELIEF_DIVISOR: u64 = 2;
 
 /// What one subcompaction's output writer holds at most: object_store's
 /// `BufWriter`, which SlateDB builds with its defaults, buffers a 10 MiB
-/// part and uploads up to 8 at once.
+/// part and uploads up to 8 at once. A subcompaction writing less, about its
+/// share of the input, holds at most that.
 const OUTPUT_BYTES: u64 = 9 * 10 * MIB;
 
 /// The largest SST block writers produce. A fetch is rounded up to whole
@@ -141,8 +145,8 @@ impl CompactionMemory {
     /// per source, then subcompactions, which also stay within `cores`, since
     /// more than run at once only add memory. How many compactions run at
     /// once is capped at what the budget fits of compactions of one
-    /// subcompaction, which compactions under `max_sst_size` of input are;
-    /// admission holds larger ones back. Options already below what the
+    /// subcompaction, which compactions of one input SST's worth of input
+    /// are; admission holds larger ones back. Options already below what the
     /// budget allows are kept. Without an embedded worker, compactions run
     /// in another process and nothing changes.
     pub(super) fn bound_for(
@@ -263,12 +267,18 @@ impl Drop for Holder {
     }
 }
 
+/// The estimated sizes of a compaction's input SSTs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Inputs {
+    pub(super) total: u64,
+    pub(super) largest: u64,
+}
+
 /// The estimated bytes compactions hold under one compactor's options.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Cost {
     per_source: u64,
     subcompactions: u64,
-    max_sst_size: u64,
 }
 
 impl Cost {
@@ -278,7 +288,6 @@ impl Cost {
         Some(Self {
             per_source: Self::per_source(worker),
             subcompactions: worker.max_subcompactions.max(1) as u64,
-            max_sst_size: (worker.max_sst_size as u64).max(1),
         })
     }
 
@@ -292,26 +301,32 @@ impl Cost {
 
     /// What `spec` holds while it runs, split into the `planned`
     /// subcompactions once the worker has planned them, before that into as
-    /// many as SlateDB plans for `input_bytes`, and into the most when its
-    /// inputs aren't known; drains read nothing.
+    /// many as SlateDB plans for `inputs`, a range per largest input SST of
+    /// input, and into the most when its inputs aren't known; drains read
+    /// nothing. Each holds its prefetch and its output, up to its share of
+    /// the inputs.
     pub(super) fn of(
         &self,
         spec: &CompactionSpec,
         planned: Option<usize>,
-        input_bytes: Option<u64>,
+        inputs: Option<Inputs>,
     ) -> u64 {
         if spec.is_drain() {
             return 0;
         }
-        let subcompactions = match (planned.filter(|planned| *planned > 0), input_bytes) {
+        let subcompactions = match (planned.filter(|planned| *planned > 0), inputs) {
             (Some(planned), _) => planned as u64,
-            (None, Some(bytes)) => bytes
-                .div_ceil(self.max_sst_size)
+            (None, Some(inputs)) => inputs
+                .total
+                .div_ceil(inputs.largest.max(1))
                 .clamp(1, self.subcompactions),
             (None, None) => self.subcompactions,
         };
+        let output = inputs.map_or(OUTPUT_BYTES, |inputs| {
+            inputs.total.div_ceil(subcompactions).min(OUTPUT_BYTES)
+        });
         let sources = spec.sources().len() as u64;
-        subcompactions * (sources * self.per_source + OUTPUT_BYTES)
+        subcompactions * (sources * self.per_source + output)
     }
 }
 
@@ -350,10 +365,11 @@ mod tests {
         let cost = Cost::new(&bounded).unwrap();
         let sources = (0..8).map(SourceId::SortedRun).collect::<Vec<_>>();
         let spec = CompactionSpec::new(sources, 0);
-        // The widest merge fits the merge share, leaving relief its quarter.
+        // The widest merge fits the merge share, and the widest relief what
+        // merges leave.
         assert!(cost.of(&spec, None, None) <= memory.merge_budget());
-        assert!(memory.budget() - memory.merge_budget() >= cost.of(&spec, Some(1), None));
-        assert_eq!(bounded.worker.unwrap().max_subcompactions, 3);
+        assert!(memory.budget() - memory.merge_budget() >= cost.of(&spec, None, None));
+        assert_eq!(bounded.worker.unwrap().max_subcompactions, 2);
         // Compactions of one subcompaction each, four of them fit.
         assert!(4 * cost.of(&spec, Some(1), None) <= memory.budget());
         assert_eq!(bounded.max_concurrent_compactions, 4);
@@ -414,7 +430,7 @@ mod tests {
         );
         drop(second);
         assert_eq!((first.others(), memory.held()), (held(0, 0), 30));
-        assert_eq!(memory.merge_budget(), 75);
+        assert_eq!(memory.merge_budget(), 50);
     }
 
     #[test]
@@ -431,17 +447,31 @@ mod tests {
     }
 
     #[test]
-    fn unplanned_compactions_take_a_subcompaction_per_max_sst_size_of_input() {
-        let options = options();
-        let max_sst_size = options.worker.as_ref().unwrap().max_sst_size as u64;
-        let cost = Cost::new(&options).unwrap();
+    fn unplanned_compactions_take_a_subcompaction_per_largest_input_sst_of_input() {
+        let cost = Cost::new(&options()).unwrap();
         let merge = CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(2)], 1);
         let one = cost.of(&merge, Some(1), None);
-        assert_eq!(cost.of(&merge, None, Some(0)), one);
-        assert_eq!(cost.of(&merge, None, Some(max_sst_size)), one);
-        assert_eq!(cost.of(&merge, None, Some(max_sst_size + 1)), 2 * one);
-        assert_eq!(cost.of(&merge, None, Some(100 * max_sst_size)), 4 * one);
+        let prefetch = one - OUTPUT_BYTES;
+        let inputs = |total, largest| Some(Inputs { total, largest });
+        assert_eq!(cost.of(&merge, None, Some(Inputs::default())), prefetch);
+        assert_eq!(
+            cost.of(&merge, None, inputs(64 * MIB, 64 * MIB)),
+            prefetch + 64 * MIB
+        );
+        // Four L0 SSTs of 64 MiB split four ways however small they are
+        // beside `max_sst_size`, each writing about one SST's worth.
+        assert_eq!(
+            cost.of(&merge, None, inputs(256 * MIB, 64 * MIB)),
+            4 * (prefetch + 64 * MIB)
+        );
+        assert_eq!(
+            cost.of(&merge, None, inputs(100 * 64 * MIB, 64 * MIB)),
+            4 * one
+        );
         // Planned subcompactions win over the input estimate.
-        assert_eq!(cost.of(&merge, Some(3), Some(0)), 3 * one);
+        assert_eq!(
+            cost.of(&merge, Some(3), inputs(3 * 64 * MIB, 64 * MIB)),
+            3 * (prefetch + 64 * MIB)
+        );
     }
 }

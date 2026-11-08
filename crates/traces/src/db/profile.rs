@@ -169,6 +169,7 @@ fn config(path: &std::path::Path) -> Config {
         write_buffer: Default::default(),
         read_cache: Default::default(),
         compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
+        write_budget_bytes: crate::Config::default().write_budget_bytes,
     }
 }
 
@@ -1571,4 +1572,352 @@ async fn profile_warm_memory_writer() {
         tokio::time::sleep(pace.saturating_sub(started.elapsed())).await;
     }
     writer.close().await.unwrap();
+}
+
+// ── Write memory ─────────────────────────────────────────────────────
+
+/// Request `request` of ones shaped like the scalability runner's:
+/// `per_request` spans of five string attributes, one 256-byte, five spans
+/// to a trace, under one resource.
+fn runner_request(request: usize, per_request: usize, start_ns: u64) -> Vec<TraceBatch> {
+    let padding = "x".repeat(256);
+    let first = request * per_request;
+    let traces = (first..first + per_request)
+        .collect::<Vec<_>>()
+        .chunks(5)
+        .map(|ordinals| {
+            let mut id = [0u8; 16];
+            id[8..].copy_from_slice(&(ordinals[0] as u64 / 5).to_be_bytes());
+            id[0] = 1;
+            let spans = ordinals
+                .iter()
+                .map(|&ordinal| Span {
+                    trace_id: id.to_vec(),
+                    span_id: (ordinal as u64 + 1).to_be_bytes().to_vec(),
+                    name: format!("scale-operation-{}", ordinal % 100),
+                    kind: 2,
+                    start_time_unix_nano: start_ns + ordinal as u64 * 1_000,
+                    end_time_unix_nano: start_ns + ordinal as u64 * 1_000 + 1_000_000,
+                    attributes: vec![
+                        kv(
+                            "deployment.environment",
+                            any_value::Value::StringValue("benchmark".into()),
+                        ),
+                        kv(
+                            "http.request.method",
+                            any_value::Value::StringValue("GET".into()),
+                        ),
+                        kv(
+                            "scale.payload",
+                            any_value::Value::StringValue(padding.clone()),
+                        ),
+                        kv("scale.run_id", any_value::Value::StringValue(RUN.into())),
+                        kv(
+                            "service.instance.id",
+                            any_value::Value::StringValue(format!("instance-{}", ordinal % 10_000)),
+                        ),
+                    ],
+                    ..Default::default()
+                })
+                .collect();
+            Trace::new(
+                TraceId::new(id).unwrap(),
+                vec![ResourceSpans {
+                    resource: Some(Resource {
+                        attributes: vec![
+                            kv(
+                                "service.name",
+                                any_value::Value::StringValue(format!(
+                                    "scale-service-{}",
+                                    request % 100
+                                )),
+                            ),
+                            kv("scale.run_id", any_value::Value::StringValue(RUN.into())),
+                        ],
+                        ..Default::default()
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        spans,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            )
+            .unwrap()
+        })
+        .collect();
+    vec![TraceBatch::new(traces)]
+}
+
+/// Samples this process's resident set every 10 ms and keeps the peak
+/// since the last [`PeakRss::take`].
+struct PeakRss(Arc<std::sync::atomic::AtomicU64>);
+
+impl PeakRss {
+    fn start() -> Self {
+        let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sampled = peak.clone();
+        std::thread::spawn(move || {
+            let mut system = sysinfo::System::new();
+            let pid = sysinfo::get_current_pid().unwrap();
+            loop {
+                sampled.fetch_max(rss(&mut system, pid), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self(peak)
+    }
+
+    fn take(&self) -> u64 {
+        let mut system = sysinfo::System::new();
+        let now = rss(&mut system, sysinfo::get_current_pid().unwrap());
+        self.0
+            .swap(now, std::sync::atomic::Ordering::Relaxed)
+            .max(now)
+    }
+}
+
+/// Keeps the latest value of every counter and gauge, summed over labels,
+/// so the profile can print SlateDB's and the coordinator's own figures.
+#[derive(Default)]
+struct StatsRecorder(std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>);
+
+impl StatsRecorder {
+    fn handle(&self, key: &metrics::Key) -> Arc<std::sync::atomic::AtomicU64> {
+        let mut name = key.name().to_owned();
+        for label in key.labels() {
+            name.push_str(&format!(",{}={}", label.key(), label.value()));
+        }
+        self.0.lock().unwrap().entry(name).or_default().clone()
+    }
+
+    fn value(&self, name: &str, gauge: bool) -> f64 {
+        let prefix = format!("{name},");
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| *key == name || key.starts_with(&prefix))
+            .map(|(_, value)| {
+                let bits = value.load(std::sync::atomic::Ordering::Relaxed);
+                if gauge {
+                    f64::from_bits(bits)
+                } else {
+                    bits as f64
+                }
+            })
+            .sum()
+    }
+}
+
+impl metrics::Recorder for StatsRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(self.handle(key))
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(self.handle(key))
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Writes `PROFILE_SPANS` runner-shaped spans in `PROFILE_REQUEST_SPANS`
+/// span requests and prints the peak resident set of each phase against
+/// the encoded bytes the write budget counts.
+///
+/// With `PROFILE_ONE_DELTA` every span lands in one delta that one flush
+/// writes, which is what the delta and its flush hold per budgeted byte.
+/// Otherwise the writer keeps its defaults, or `PROFILE_WRITE_MB` and
+/// `PROFILE_THRESHOLD_MB`, and `PROFILE_CONCURRENCY` tasks write as fast
+/// as the budget admits, as a writer under overload does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_write_memory() {
+    let parse = |name: &str, default: u64| {
+        std::env::var(name).map_or(default, |value| value.parse().unwrap())
+    };
+    let stats: &'static StatsRecorder = Box::leak(Box::default());
+    let _ = metrics::set_global_recorder(stats);
+    let started = Instant::now();
+    let peak = Arc::new(PeakRss::start());
+    let phase = move |name: &str, detail: String| {
+        println!(
+            "phase {name} at {:.1}s peak_rss_mib={:.0} {detail}",
+            started.elapsed().as_secs_f64(),
+            mib(peak.take())
+        );
+    };
+    let store = std::path::PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let _ = std::fs::remove_dir_all(&store);
+    let mut config = config(&store);
+    if let StorageConfig::SlateDb(slate) = &mut config.storage {
+        slate.settings_path = std::env::var("PROFILE_SLATEDB_SETTINGS").ok();
+    }
+    config.compaction_memory_bytes = parse(
+        "PROFILE_COMPACTION_MB",
+        config.compaction_memory_bytes >> 20,
+    ) << 20;
+    let one_delta = std::env::var("PROFILE_ONE_DELTA").is_ok();
+    if one_delta {
+        config.write_buffer.flush_interval = Duration::from_secs(24 * 3600);
+        config.write_buffer.flush_size_threshold = usize::MAX;
+        config.write_budget_bytes = u64::from(u32::MAX);
+    } else {
+        config.write_budget_bytes =
+            parse("PROFILE_WRITE_MB", config.write_budget_bytes >> 20) << 20;
+        config.write_buffer.flush_size_threshold = (parse(
+            "PROFILE_THRESHOLD_MB",
+            config.write_buffer.flush_size_threshold as u64 >> 20,
+        ) << 20) as usize;
+    }
+    let spans = parse("PROFILE_SPANS", 400_000) as usize;
+    let per_request = parse("PROFILE_REQUEST_SPANS", 2_000) as usize;
+    let start_ns = common::time::now_ns().unsigned_abs() - 1_800 * 1_000_000_000;
+    let db = Arc::new(TraceDb::open(config).await.unwrap());
+    let namespace = Namespace::new("default").unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    phase("open", String::new());
+    let requests = spans.div_ceil(per_request);
+    let pregenerated: Vec<_> = if one_delta {
+        (0..requests)
+            .map(|request| runner_request(request, per_request, start_ns))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let encoded_len = |request: &[TraceBatch]| -> usize {
+        request
+            .iter()
+            .flat_map(|batch| &batch.traces)
+            .flat_map(|trace| &trace.resource_spans)
+            .map(prost::Message::encoded_len)
+            .sum()
+    };
+    let per_request_encoded = encoded_len(&runner_request(0, per_request, start_ns));
+    phase(
+        "generated",
+        format!(
+            "spans={spans} encoded_mib={:.0}",
+            mib((per_request_encoded * requests) as u64)
+        ),
+    );
+    let reporter = tokio::spawn({
+        let db = db.clone();
+        let phase = phase.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let budget = db.write_budget.as_ref().unwrap();
+                let gauge = |name| stats.value(name, true) / f64::from(1u32 << 20);
+                phase(
+                    "stats",
+                    format!(
+                        "budget_held_mib={:.0} slate_mem_mib={:.0} delta_mib={:.0} \
+                         compaction_held_mib={:.0} l0={} slate_backpressure={} l0_flush_mib={:.0}",
+                        mib(budget.capacity() - budget.available()),
+                        gauge("slatedb.db.total_mem_size_bytes"),
+                        gauge("opendata_write_coordinator_delta_estimated_bytes"),
+                        gauge("storage_compaction_memory_held_bytes"),
+                        stats.value("slatedb.db.l0_sst_count", true),
+                        stats.value("slatedb.db.backpressure_count", false),
+                        stats.value("slatedb.db.l0_flush_bytes", false) / f64::from(1u32 << 20),
+                    ),
+                );
+            }
+        }
+    });
+    let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pregenerated = Arc::new(std::sync::Mutex::new(pregenerated));
+    let tasks: Vec<_> = (0..parse("PROFILE_CONCURRENCY", 1))
+        .map(|_| {
+            let (db, namespace, next, rejected, pregenerated) = (
+                db.clone(),
+                namespace.clone(),
+                next.clone(),
+                rejected.clone(),
+                pregenerated.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= requests {
+                        return;
+                    }
+                    let request = pregenerated
+                        .lock()
+                        .unwrap()
+                        .pop()
+                        .unwrap_or_else(|| runner_request(index, per_request, start_ns));
+                    loop {
+                        match db
+                            .write_with_durability(&namespace, request.clone(), Durability::Applied)
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(Error::Backpressure) => {
+                                rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    reporter.abort();
+    let budget = db.write_budget.as_ref().unwrap();
+    phase(
+        "applied",
+        format!(
+            "rejected={} budget_held_mib={:.0} spans_per_second={:.0}",
+            rejected.load(std::sync::atomic::Ordering::Relaxed),
+            mib(budget.capacity() - budget.available()),
+            spans as f64
+                / started
+                    .elapsed()
+                    .saturating_sub(Duration::from_secs(2))
+                    .as_secs_f64()
+        ),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    phase("idle", String::new());
+    db.flush().await.unwrap();
+    phase("flushed", String::new());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    db.rollup_writer().unwrap().flush_memtable().await.unwrap();
+    phase("memtable", String::new());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    Arc::into_inner(db).unwrap().close().await.unwrap();
+    phase("closed", String::new());
 }

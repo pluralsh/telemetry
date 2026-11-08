@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
 use common::storage::compaction::CompactionMemory;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
+use common::write_budget::WriteBudget;
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
     ShardDatabase, ShardId, ShardMap, ShardRole, ShardSet, ShardingOptions, shard_opener,
@@ -80,11 +81,13 @@ impl ShardedTraces {
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let shard_cache = cache.clone();
         let compaction = CompactionMemory::new(config.compaction_memory_bytes);
+        let budget = WriteBudget::new("traces", config.write_budget_bytes);
         let opener = shard_opener(move |shard| {
             let config = shard_config(&config, shard);
             let cache = shard_cache.clone();
             let compaction = compaction.clone();
-            async move { TraceDb::open_with_cache(config, &cache, &compaction).await }
+            let budget = budget.clone();
+            async move { TraceDb::open_with_cache(config, &cache, &compaction, &budget).await }
         });
         Self::new(
             ShardSet::open(ShardRole::Writer, options, opener, shards).await,

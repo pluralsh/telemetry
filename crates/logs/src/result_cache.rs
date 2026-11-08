@@ -131,6 +131,7 @@ struct ResultEntry {
 
 pub(crate) struct ResultCache {
     entries: Cache<Arc<ResultKey>, Arc<ResultEntry>>,
+    used: common::cache_gauge::CacheGauge,
 }
 
 /// How a request splits into reused and evaluated steps.
@@ -151,6 +152,7 @@ impl ResultCache {
                     u32::try_from(bytes).unwrap_or(u32::MAX)
                 })
                 .build(),
+            used: common::cache_gauge::CacheGauge::new("logs_results"),
         }
     }
 
@@ -233,6 +235,7 @@ impl ResultCache {
         self.entries
             .insert(Arc::clone(&plan.key), Arc::new(entry))
             .await;
+        self.used.set(self.entries.weighted_size());
     }
 
     pub(crate) fn record(reused: usize, computed: usize) {

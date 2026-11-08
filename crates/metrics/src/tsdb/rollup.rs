@@ -222,7 +222,7 @@ impl Tsdb {
         mini.flush_written().await
     }
 
-    /// Copies `source` into `mini`. `ingest_batch` waits only until the
+    /// Copies `source` into `mini`. `copy_batch` waits only until the
     /// coordinator accepts a batch, so once `queued` copied bytes exceed
     /// `buffer` the copy waits for them to be written.
     async fn copy_bucket(
@@ -279,7 +279,7 @@ impl Tsdb {
                 histograms: data.histograms,
             });
             if batch.len() == COPY_BATCH || *queued >= buffer {
-                mini.ingest_batch(&batch, Some(COPY_WRITE_TIMEOUT)).await?;
+                mini.copy_batch(&batch, COPY_WRITE_TIMEOUT).await?;
                 batch.clear();
                 if *queued >= buffer {
                     mini.flush_written().await?;
@@ -288,7 +288,7 @@ impl Tsdb {
             }
         }
         if !batch.is_empty() {
-            mini.ingest_batch(&batch, Some(COPY_WRITE_TIMEOUT)).await?;
+            mini.copy_batch(&batch, COPY_WRITE_TIMEOUT).await?;
         }
         Ok(())
     }

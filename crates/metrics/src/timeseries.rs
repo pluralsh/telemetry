@@ -71,6 +71,7 @@ struct Tenants {
     namespaces: RwLock<std::collections::HashMap<Namespace, Arc<Tsdb>>>,
     retention: Option<Duration>,
     write_buffer: common::coordinator::WriteCoordinatorConfig,
+    write_budget: common::write_budget::WriteBudget,
     query_cache: crate::config::QueryCacheConfig,
 }
 
@@ -83,13 +84,16 @@ impl Tenants {
         namespaces
             .entry(namespace.clone())
             .or_insert_with(|| {
-                Arc::new(Tsdb::with_retention_scoped_and_buffer(
-                    namespace.clone(),
-                    Arc::clone(&self.storage),
-                    self.retention,
-                    self.write_buffer.clone(),
-                    self.query_cache,
-                ))
+                Arc::new(
+                    Tsdb::with_retention_scoped_and_buffer(
+                        namespace.clone(),
+                        Arc::clone(&self.storage),
+                        self.retention,
+                        self.write_buffer.clone(),
+                        self.query_cache,
+                    )
+                    .with_write_budget(Some(self.write_budget.clone())),
+                )
             })
             .clone()
     }
@@ -176,15 +180,17 @@ impl TimeSeriesDb {
     pub async fn open(config: Config) -> Result<Self> {
         let cache = common::SharedDbCache::from_slatedb_config(&config.storage).await?;
         let compaction = CompactionMemory::new(config.compaction_memory_bytes);
-        Self::open_with_cache(config, &cache, &compaction).await
+        let budget = common::write_budget::WriteBudget::new("metrics", config.write_budget_bytes);
+        Self::open_with_cache(config, &cache, &compaction, &budget).await
     }
 
-    /// Opens a writer that uses `cache` instead of building its own and
-    /// compacts within `compaction`.
+    /// Opens a writer that uses `cache` instead of building its own,
+    /// compacts within `compaction` and holds its writes in `budget`.
     pub(crate) async fn open_with_cache(
         config: Config,
         cache: &common::SharedDbCache,
         compaction: &CompactionMemory,
+        budget: &common::write_budget::WriteBudget,
     ) -> Result<Self> {
         let storage = Arc::new(
             Storage::try_new_with_cache(
@@ -201,6 +207,7 @@ impl TimeSeriesDb {
             namespaces: RwLock::new(std::collections::HashMap::new()),
             retention: config.retention,
             write_buffer: config.write_buffer,
+            write_budget: budget.clone(),
             query_cache: config.query_cache,
         });
         let rollup = config
@@ -551,6 +558,64 @@ mod tests {
                 "{visibility:?} result was {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn applied_writes_hold_the_write_budget_until_written() {
+        let config = Config {
+            storage: SlateDbStorageConfig {
+                path: "budget".to_string(),
+                object_store: ObjectStoreConfig::InMemory,
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+                disk: Default::default(),
+            },
+            write_budget_bytes: 16_384,
+            ..Default::default()
+        };
+        let namespace = Namespace::new("budgeted").unwrap();
+        let db = TimeSeriesDb::open(config).await.unwrap();
+        let budget = db.tenants.write_budget.clone();
+        let series = |host: usize, bytes: usize| {
+            vec![
+                Series::builder("budget_metric")
+                    .label("host", format!("{host}{}", "x".repeat(bytes)))
+                    .sample(1_700_000_000_000, 1.0)
+                    .build(),
+            ]
+        };
+        let settled = || async {
+            for _ in 0..100 {
+                if budget.available() == budget.capacity() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            budget.available()
+        };
+
+        // Applied but unwritten, it holds what it grew the delta by, which
+        // for a new series is more than its label.
+        db.write(&namespace, series(1, 1_000)).await.unwrap();
+        let held = budget.capacity() - budget.available();
+        assert!((1_000..16_384 / 3).contains(&held), "held {held}");
+        // Written, it frees its share.
+        db.write_with_visibility(&namespace, series(2, 1_000), Visibility::Written)
+            .await
+            .unwrap();
+        assert_eq!(settled().await, budget.capacity());
+
+        // Room no flush frees turns ingest away once it has waited.
+        let all = budget
+            .ingest(budget.capacity(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.write(&namespace, series(3, 1_000)).await,
+            Err(crate::error::Error::Backpressure)
+        ));
+        drop(all);
     }
 
     #[tokio::test]

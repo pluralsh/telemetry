@@ -185,13 +185,15 @@ impl ShardedMetrics {
         let block_cache = SharedDbCache::from_slatedb_config(&config.storage).await?;
         let shard_cache = block_cache.clone();
         let compaction = CompactionMemory::new(config.compaction_memory_bytes);
+        let budget = common::write_budget::WriteBudget::new("metrics", config.write_budget_bytes);
         let opener = shard_opener(move |shard| {
             let mut config = config.clone();
             config.storage = shard_storage(&config, shard);
             let cache = shard_cache.clone();
             let compaction = compaction.clone();
+            let budget = budget.clone();
             async move {
-                TimeSeriesDb::open_with_cache(config, &cache, &compaction)
+                TimeSeriesDb::open_with_cache(config, &cache, &compaction, &budget)
                     .await
                     .map(MetricsShard::Writer)
             }

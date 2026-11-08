@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::storage::admission::{Admission, L0Limit};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{SharedDbCache, sst_block_size};
 use common::storage::metrics_recorder::MetricsRsRecorder;
@@ -65,7 +66,10 @@ use crate::storage::segment_extractor::{
     unsealed,
 };
 use common::storage::compaction::{CompactionMemory, MergeHold, MergeHolds, SegmentCompaction};
-use common::storage::settings::{base_settings, load_settings_over};
+use common::storage::settings::{
+    DEFAULT_MAX_UNFLUSHED_BYTES, DEFAULT_WRITER_L0_FLUSH_PARALLELISM, base_settings,
+    l0_max_ssts_for, load_settings_over,
+};
 use slatedb::CompactorBuilder;
 
 mod reader;
@@ -476,6 +480,7 @@ pub(crate) struct Storage {
     unflushed: Arc<AtomicBool>,
     /// Holds on the merges of buckets a rollup copies into.
     merge_holds: MergeHolds,
+    admission: Admission,
 }
 
 impl HasReader for Storage {
@@ -523,6 +528,7 @@ impl Storage {
         compaction: &CompactionMemory,
     ) -> crate::util::Result<Self> {
         let mut settings = load_settings(slate_config)?;
+        let l0_limit = L0Limit::of(&settings);
         info!(
             "create slatedb storage with config: {:?}, settings: {:?}",
             slate_config, settings
@@ -564,8 +570,10 @@ impl Storage {
         common::storage::health::StorageHealth::global()
             .watch(slate_config.path.clone(), db.subscribe());
 
+        let admission = Admission::follow(db.subscribe(), l0_limit);
         let mut storage = Self::from_db(db);
         storage.merge_holds = merge_holds;
+        storage.admission = admission;
         storage.spawn_memtable_flusher(MEMTABLE_FLUSH_INTERVAL);
         Ok(storage)
     }
@@ -579,7 +587,13 @@ impl Storage {
             },
             unflushed: Arc::new(AtomicBool::new(false)),
             merge_holds: MergeHolds::default(),
+            admission: Admission::unlimited(),
         }
+    }
+
+    /// Whether ingest may write now; see [`Admission`].
+    pub(crate) fn admission(&self) -> &Admission {
+        &self.admission
     }
 
     /// Flushes the memtable to L0 every `every` while writes arrive; see
@@ -872,6 +886,11 @@ impl Store for Storage {
 /// over recent data pays to merge them; see
 /// `documentation/metrics/configuration.md`.
 pub(crate) const DEFAULT_L0_SST_SIZE_BYTES: usize = 16 << 20;
+/// Metrics' `l0_max_ssts` and `l0_max_ssts_per_key`. Its unflushed
+/// memtables alone flush to 12 SSTs of [`DEFAULT_L0_SST_SIZE_BYTES`], 14
+/// with the uploads in flight, which ingest admission must leave room for
+/// below the limit; see [`l0_max_ssts_for`].
+pub(crate) const DEFAULT_L0_MAX_SSTS: usize = l0_max_ssts_for(14);
 /// Metrics' size-tiered `min_compaction_sources`, so small L0 SSTs are
 /// folded into the sorted runs sooner than with SlateDB's 4; 2 merges
 /// barely fewer operands for about twice the compaction bytes.
@@ -882,6 +901,10 @@ pub(crate) const DEFAULT_MIN_COMPACTION_SOURCES: usize = 3;
 pub(crate) fn default_settings() -> Settings {
     let mut settings = Settings {
         l0_sst_size_bytes: DEFAULT_L0_SST_SIZE_BYTES,
+        max_unflushed_bytes: DEFAULT_MAX_UNFLUSHED_BYTES,
+        l0_flush_parallelism: DEFAULT_WRITER_L0_FLUSH_PARALLELISM,
+        l0_max_ssts: DEFAULT_L0_MAX_SSTS,
+        l0_max_ssts_per_key: DEFAULT_L0_MAX_SSTS,
         ..base_settings()
     };
     if let Some(compactor) = settings.compactor_options.as_mut() {

@@ -147,8 +147,12 @@ func Render(input Input) (Result, error) {
 			workload = input.Metrics.Spec.Reader
 		}
 		plan := memoryPlan{
-			limit: resources.MemoryLimit(workload, descriptor, resources.Component(mode)),
-			cores: resources.CPUCores(workload, descriptor, resources.Component(mode)),
+			limit:  resources.MemoryLimit(workload, descriptor, resources.Component(mode)),
+			writer: mode == modeWriter,
+			cores:  resources.CPUCores(workload, descriptor, resources.Component(mode)),
+		}
+		if mode != modeReader {
+			plan.reserved, plan.writes, plan.writeFactor = metricsWriterReserved, metricsWriterWrites, metricsResidentPerWriteByte
 		}
 		return yaml.Marshal(renderConfig{
 			Mode:                           mode,
@@ -169,6 +173,7 @@ func Render(input Input) (Result, error) {
 			},
 			Rollup:                renderRollupConfig(plan),
 			CompactionMemoryBytes: plan.compactionBudget(metricsCompactionPercent),
+			WriteBudgetBytes:      plan.writeBudget(),
 			Sharding:              renderShardingConfig(input.Metrics.Name, input.Metrics.Namespace, input.Metrics.Spec.Config.Sharding, workload, grpcPort(input.Metrics), mode),
 			Auth:                  renderAuth{Unauthenticated: input.Metrics.Spec.Config.Auth.Unauthenticated, JWT: jwt, Global: global, Internal: &renderFileSecret{Source: sourceFile, Path: internalTokenPath}},
 			Namespaces:            namespaces,
@@ -334,6 +339,7 @@ func renderLogs(input Input) (Result, error) {
 			limit:    resources.MemoryLimit(workload, descriptor, resources.Component(component)),
 			reserved: lo.Ternary(component == modeReader, logsReaderReserved, logsWriterReserved),
 			bodies:   lo.Ternary(component == modeReader, logsReaderBodies, logsWriterBodies),
+			writer:   component == modeWriter,
 			cores:    resources.CPUCores(workload, descriptor, resources.Component(component)),
 		}
 		return yaml.Marshal(renderLogsConfig{
@@ -455,8 +461,12 @@ func renderTraces(input Input) (Result, error) {
 			workload = traces.Spec.Reader
 		}
 		plan := memoryPlan{
-			limit: resources.MemoryLimit(workload, descriptor, resources.Component(component)),
-			cores: resources.CPUCores(workload, descriptor, resources.Component(component)),
+			limit:  resources.MemoryLimit(workload, descriptor, resources.Component(component)),
+			writer: component == modeWriter,
+			cores:  resources.CPUCores(workload, descriptor, resources.Component(component)),
+		}
+		if component != modeReader {
+			plan.reserved, plan.writes, plan.writeFactor = tracesWriterReserved, tracesWriterWrites, tracesResidentPerWriteByte
 		}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
@@ -472,6 +482,7 @@ func renderTraces(input Input) (Result, error) {
 			Rollup:                 renderRollupConfig(plan),
 			ReadCache:              plan.tracesReadCache(),
 			CompactionMemoryBytes:  plan.compactionBudget(tracesCompactionPercent),
+			WriteBudgetBytes:       plan.writeBudget(),
 			Page:                   renderTracesPage{TargetSizeBytes: int64Value(spec.Page.TargetSizeBytes, 1048576), MaxSizeBytes: int64Value(spec.Page.MaxSizeBytes, 4194304), MaxTraces: int64Value(spec.Page.MaxTraces, 1024)},
 			Write: renderWrite{
 				Durability:                      lo.CoalesceOrEmpty(string(spec.Write.Durability), string(telemetryv1alpha1.DurabilityApplied)),
@@ -755,11 +766,21 @@ func inferredIOConcurrencyLimit(configured *int32, workload telemetryv1alpha1.Wo
 // and every product's shares sum to at most all of it, so the rendered
 // bounds, the reservation and the headroom fit the limit; the floors matter
 // only for limits too small to run well.
+//
+// A writer serves no queries, so its read caches and query budgets get only
+// their floors, and compaction and the rollup copy get twice their shares.
+// What its shares leave unassigned is allocator overhead: the allocator
+// holds about a third more than the live heap of a writer under ingest.
 type memoryPlan struct {
 	limit    int64
 	reserved int64
+	writer   bool
 	// bodies is the part of reserved that bounds request bodies.
 	bodies int64
+	// writes is the part of reserved its write budget holds resident, at
+	// writeFactor resident bytes per byte of the budget.
+	writes      int64
+	writeFactor int64
 	// cores is the container's whole CPU cores, which compaction can use
 	// at once.
 	cores int64
@@ -768,20 +789,39 @@ type memoryPlan struct {
 const mebibyte = int64(1024 * 1024)
 
 // Logs memory outside its caches and budgets that the server's fixed
-// defaults bound: a writer's flushes of its 16 MiB write budget (about 23
-// resident bytes per byte while they build storage writes), its SlateDB
-// memtables (128 MiB unflushed at about 2.5 bytes per byte) and compactor,
-// and a reader's replay of the writer's WAL not yet in L0, bounded by the
-// same 128 MiB and one flush. Each is the peak measured under rollups and
+// defaults bound: a writer's flushes of a third of its 24 MiB write budget
+// (about 23 resident bytes per byte while they build storage writes), its SlateDB
+// memtables and L0 uploads (writerMemtables) and compactor, and a reader's
+// replay of the writer's WAL not yet in L0, bounded by the same 192 MiB and
+// one flush. Each is the peak measured under rollups and
 // ingest bursts, rounded up. Each also holds its request body budget: a
 // writer's admits one largest write (32 MiB received, 128 MiB decoded, and
 // twice that parsed and re-encoded) beside smaller ones, and a reader's
 // query forms and shard queries.
+// Traces and metrics writer memory outside caches and budgets that their
+// write budgets and fixed defaults bound: the write path at the measured
+// resident bytes per budget byte (traces' 48 MiB at 6, decoded spans and
+// their encoded flushes; metrics' 192 MiB at 4, new series' indexes and
+// their encoded flushes), SlateDB memtables and L0 uploads (192 MiB
+// unflushed at about 2.5 bytes per byte, and a second upload's 90 MiB of
+// buffered parts), and 256 MiB for request bodies being decoded, which only
+// request size and concurrency limits bound.
+const (
+	writerMemtables             = 576 * mebibyte
+	writerBodies                = 256 * mebibyte
+	tracesResidentPerWriteByte  = 6
+	tracesWriterWrites          = 48 * mebibyte * tracesResidentPerWriteByte
+	tracesWriterReserved        = tracesWriterWrites + writerMemtables + writerBodies
+	metricsResidentPerWriteByte = 4
+	metricsWriterWrites         = 192 * mebibyte * metricsResidentPerWriteByte
+	metricsWriterReserved       = metricsWriterWrites + writerMemtables + writerBodies
+)
+
 const (
 	logsWriterBodies   = 512 * mebibyte
 	logsReaderBodies   = 64 * mebibyte
-	logsWriterReserved = 1024*mebibyte + logsWriterBodies
-	logsReaderReserved = 576*mebibyte + logsReaderBodies
+	logsWriterReserved = 1280*mebibyte + logsWriterBodies
+	logsReaderReserved = 736*mebibyte + logsReaderBodies
 )
 
 func (plan memoryPlan) headroom() int64 {
@@ -800,7 +840,22 @@ func (plan memoryPlan) bodyBudget() int64 {
 	if plan.reserved == 0 {
 		return plan.bodies
 	}
-	return plan.reservation() / mebibyte * plan.bodies / plan.reserved * mebibyte
+	return plan.scaled(plan.bodies)
+}
+
+// writeBudget is the write budget whose resident memory is plan.writes,
+// shrunk with the reservation when the limit caps it; zero leaves the
+// server's default.
+func (plan memoryPlan) writeBudget() int64 {
+	if plan.writes == 0 || plan.writeFactor == 0 {
+		return 0
+	}
+	return plan.scaled(plan.writes) / plan.writeFactor
+}
+
+// scaled is part of the reservation shrunk as the reservation is.
+func (plan memoryPlan) scaled(part int64) int64 {
+	return plan.reservation() / mebibyte * part / plan.reserved * mebibyte
 }
 
 // shareable is what the shares divide: the limit less headroom and the
@@ -813,31 +868,44 @@ func (plan memoryPlan) share(percent, floor int64) int64 {
 	return max(plan.shareable()/100*percent, floor)
 }
 
+// readShare is a share only queries use, which a writer holds at its floor.
+func (plan memoryPlan) readShare(percent, floor int64) int64 {
+	if plan.writer {
+		return floor
+	}
+	return plan.share(percent, floor)
+}
+
+// writeShare is a share a writer's own work uses, which it doubles.
+func (plan memoryPlan) writeShare(percent, floor int64) int64 {
+	return plan.share(lo.Ternary(plan.writer, 2*percent, percent), floor)
+}
+
 func (plan memoryPlan) blockCache() int64 { return plan.share(22, 64*mebibyte) }
 func (plan memoryPlan) metaCache() int64  { return plan.share(6, 32*mebibyte) }
 
 // rollupCopyBuffer bounds the copied bytes a rollup queues for the writer.
-func (plan memoryPlan) rollupCopyBuffer() int64 { return plan.share(4, 32*mebibyte) }
+func (plan memoryPlan) rollupCopyBuffer() int64 { return plan.writeShare(4, 32*mebibyte) }
 
 // readerCache is twice the series cache, which takes half of it.
-func (plan memoryPlan) readerCache() int64       { return plan.share(18, 64*mebibyte) }
-func (plan memoryPlan) forwardIndexCache() int64 { return plan.share(6, 32*mebibyte) }
-func (plan memoryPlan) matcherCache() int64      { return plan.share(3, 16*mebibyte) }
-func (plan memoryPlan) resultCache() int64       { return plan.share(6, 16*mebibyte) }
-func (plan memoryPlan) queryBudget() int64       { return plan.share(32, 128*mebibyte) }
+func (plan memoryPlan) readerCache() int64       { return plan.readShare(18, 64*mebibyte) }
+func (plan memoryPlan) forwardIndexCache() int64 { return plan.readShare(6, 32*mebibyte) }
+func (plan memoryPlan) matcherCache() int64      { return plan.readShare(3, 16*mebibyte) }
+func (plan memoryPlan) resultCache() int64       { return plan.readShare(6, 16*mebibyte) }
+func (plan memoryPlan) queryBudget() int64       { return plan.readShare(32, 128*mebibyte) }
 
 // logsObjectBlockCache holds object blocks with their bodies decompressed,
 // which warm queries read without the SST block cache.
-func (plan memoryPlan) logsObjectBlockCache() int64 { return plan.share(24, 64*mebibyte) }
-func (plan memoryPlan) logsResultCache() int64      { return plan.share(6, 16*mebibyte) }
-func (plan memoryPlan) logsInFlightQuery() int64    { return plan.share(16, 64*mebibyte) }
+func (plan memoryPlan) logsObjectBlockCache() int64 { return plan.readShare(24, 64*mebibyte) }
+func (plan memoryPlan) logsResultCache() int64      { return plan.readShare(6, 16*mebibyte) }
+func (plan memoryPlan) logsInFlightQuery() int64    { return plan.readShare(16, 64*mebibyte) }
 
 func (plan memoryPlan) tracesReadCache() renderTracesReadCache {
 	return renderTracesReadCache{
-		MetadataBytes: plan.share(2, 8*mebibyte),
-		PostingsBytes: plan.share(4, 16*mebibyte),
-		PagesBytes:    plan.share(8, 32*mebibyte),
-		LocatorsBytes: plan.share(2, 8*mebibyte),
+		MetadataBytes: plan.readShare(2, 8*mebibyte),
+		PostingsBytes: plan.readShare(4, 16*mebibyte),
+		PagesBytes:    plan.readShare(8, 32*mebibyte),
+		LocatorsBytes: plan.readShare(2, 8*mebibyte),
 	}
 }
 
@@ -853,7 +921,7 @@ func (plan memoryPlan) compactionBudget(percent int64) int64 {
 	if percent >= logsCompactionPercent {
 		wanted = max(wanted, 640*mebibyte)
 	}
-	return plan.share(percent, max(160*mebibyte, min(wanted, plan.shareable()/4)))
+	return plan.writeShare(percent, max(160*mebibyte, min(wanted, plan.shareable()/4)))
 }
 
 // compactionBytesPerCore is one subcompaction of eight sources, about
@@ -950,6 +1018,7 @@ type renderConfig struct {
 	Request                        renderMetricsRequest `json:"request"`
 	Rollup                         renderRollup         `json:"rollup"`
 	CompactionMemoryBytes          int64                `json:"compaction_memory_bytes"`
+	WriteBudgetBytes               int64                `json:"write_budget_bytes,omitempty"`
 	Sharding                       renderSharding       `json:"sharding"`
 	Auth                           renderAuth           `json:"auth"`
 	Namespaces                     []renderNamespace    `json:"namespaces"`
@@ -1019,6 +1088,7 @@ type renderTracesConfig struct {
 	Rollup                 renderRollup          `json:"rollup"`
 	ReadCache              renderTracesReadCache `json:"read_cache"`
 	CompactionMemoryBytes  int64                 `json:"compaction_memory_bytes"`
+	WriteBudgetBytes       int64                 `json:"write_budget_bytes,omitempty"`
 	CacheWarmer            renderCacheWarmer     `json:"cache_warmer"`
 	Auth                   renderAuth            `json:"auth"`
 	Namespaces             []renderNamespace     `json:"namespaces"`

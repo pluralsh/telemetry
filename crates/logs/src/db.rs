@@ -44,7 +44,7 @@ use crate::codec::{
 use crate::compaction::{CompactorHandle, WrittenObject};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::memory::{BudgetPermit, MemoryBudget, WritePermit, Writer};
+use crate::memory::{BudgetPermit, INGEST_WAIT, MemoryBudget, WritePermit, Writer};
 use crate::model::{
     Label, Labels, LogBatch, LogEntry, LogRow, SegmentId, StreamFingerprint, StreamId,
 };
@@ -268,6 +268,7 @@ struct PageRetention {
 pub struct LogDb {
     storage: Arc<dyn StorageRead>,
     writer: Option<Arc<dyn Storage>>,
+    admission: common::storage::admission::Admission,
     segment_ns: i64,
     /// Discovery rollup period, a whole multiple of `segment_ns`.
     rollup_ns: Option<i64>,
@@ -468,12 +469,12 @@ impl LogDb {
                 memory.clone(),
             )
         });
-        // A buffer frozen at the whole write budget leaves no room for ingest
-        // until its flush is written, so freeze at half and let the other half
-        // absorb writes meanwhile.
+        // Writes hold the budget until their delta is written, and while one
+        // delta commits the next is encoded, so freeze at a third: the
+        // committing, encoding and live deltas then fit in it together.
         let mut write_buffer = config.write_buffer.clone();
         write_buffer.flush_size_threshold = write_buffer.flush_size_threshold.min(
-            usize::try_from(memory.write_capacity() / 2)
+            usize::try_from(memory.write_capacity() / 3)
                 .unwrap_or(usize::MAX)
                 .max(1),
         );
@@ -492,6 +493,7 @@ impl LogDb {
         write_coordinator.start();
         Ok(Self {
             storage: storage_read,
+            admission: storage.admission(),
             writer: Some(storage),
             segment_ns,
             rollup_ns,
@@ -587,6 +589,7 @@ impl LogDb {
         .await?;
         Ok(Self {
             storage,
+            admission: common::storage::admission::Admission::unlimited(),
             writer: None,
             segment_ns,
             rollup_ns: config.discovery_rollup.map(duration_ns).transpose()?,
@@ -770,17 +773,21 @@ impl LogDb {
     }
 
     /// Holds `write`'s bytes in the process's write budget: a rollup copy,
-    /// which has a `wait`, waits up to it for room in its half; ingest fails
-    /// at once without room. Only written deltas free the budget, so a write
+    /// which has a `wait`, waits up to it for room in its half; ingest waits
+    /// up to [`INGEST_WAIT`]. Only written deltas free the budget, so a write
     /// that finds its share full first asks for the applied ones to be
     /// flushed rather than wait for the flush interval; a copy holding its
     /// whole half would otherwise wait out its timeout on its own writes.
+    /// Ingest is first turned away while L0 nears its stall limit.
     async fn write_budget(
         &self,
         handle: &WriteCoordinatorHandle<LogsWriteDelta>,
         write: &LogsWrite,
         wait: Option<Duration>,
     ) -> Result<WritePermit> {
+        if wait.is_none() && !self.admission.admits() {
+            return Err(Error::Backpressure);
+        }
         let bytes = write.estimated_bytes();
         let writer = if wait.is_some() {
             Writer::Copy
@@ -791,7 +798,7 @@ impl LogDb {
             handle.flush(false).await.map_err(map_write_error)?;
         }
         self.memory
-            .write(writer, bytes, wait.unwrap_or(Duration::ZERO))
+            .write(writer, bytes, wait.unwrap_or(INGEST_WAIT))
             .await
     }
 

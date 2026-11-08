@@ -22,7 +22,6 @@ use serde::Serialize;
 use tokio::{task::JoinSet, time::Instant as TokioInstant};
 use uuid::Uuid;
 
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,6 +57,17 @@ struct CommonArgs {
     #[arg(long, default_value_t = 0)]
     target_rate: u64,
 
+    /// Ramps the measured phase linearly from this many events per second to
+    /// `--target-rate`; the warmup runs at this rate. Zero holds
+    /// `--target-rate` throughout.
+    #[arg(long, default_value_t = 0)]
+    ramp_from_rate: u64,
+
+    /// Adds a timeline of the measured phase to the report, in windows of
+    /// this many seconds. Zero leaves it out.
+    #[arg(long, default_value_t = 0)]
+    timeline_seconds: u64,
+
     /// Per-request timeout in seconds.
     #[arg(long, default_value_t = 30)]
     timeout_seconds: u64,
@@ -85,7 +95,15 @@ struct CommonArgs {
     /// Required acknowledgement that the target will receive persistent data.
     #[arg(long, default_value_t = false)]
     allow_production_write: bool,
+
+    /// Seconds to stamp generated events in the past, so the target's
+    /// rollup windows close while they still receive writes.
+    #[arg(long, default_value_t = 0)]
+    backdate_seconds: u64,
 }
+
+/// Nanoseconds generated events are stamped in the past.
+static BACKDATE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Subcommand, Clone, Debug)]
 enum ProductArgs {
@@ -212,6 +230,78 @@ struct Payload {
     content_encoding: Option<&'static str>,
 }
 
+/// When open-loop requests are due: events offered grow at `from` events
+/// per second, rising linearly to `to` by `over`.
+#[derive(Clone, Copy, Debug)]
+struct Schedule {
+    from: f64,
+    to: f64,
+    over: f64,
+}
+
+impl Schedule {
+    fn hold(rate: u64) -> Self {
+        Self {
+            from: rate as f64,
+            to: rate as f64,
+            over: 1.0,
+        }
+    }
+
+    fn ramp(common: &CommonArgs, over: Duration) -> Self {
+        if common.ramp_from_rate == 0 {
+            return Self::hold(common.target_rate);
+        }
+        Self {
+            from: common.ramp_from_rate as f64,
+            to: common.target_rate as f64,
+            over: over.as_secs_f64().max(f64::MIN_POSITIVE),
+        }
+    }
+
+    /// The rate offered `at` seconds in.
+    fn rate(&self, at: f64) -> f64 {
+        self.from + (self.to - self.from) * (at / self.over).min(1.0)
+    }
+
+    /// Seconds in at which the `events`th event is due: the inverse of
+    /// `from·t + (to - from)·t² / 2·over`.
+    fn due(&self, events: f64) -> f64 {
+        let slope = (self.to - self.from) / self.over;
+        if slope.abs() < f64::EPSILON {
+            return events / self.from;
+        }
+        let ramped = (self.from * self.from + 2.0 * slope * events).max(0.0).sqrt();
+        let at = (ramped - self.from) / slope;
+        if at <= self.over {
+            at
+        } else {
+            let at_end = self.from * self.over + slope * self.over * self.over / 2.0;
+            self.over + (events - at_end) / self.to
+        }
+    }
+}
+
+/// One window of the measured phase, by when its requests were sent.
+struct Window {
+    attempted_events: u64,
+    successful_events: u64,
+    rejected_requests: u64,
+    failed_requests: u64,
+    latency_micros: Histogram<u64>,
+}
+
+#[derive(Serialize)]
+struct WindowReport {
+    start_seconds: u64,
+    offered_events_per_second: f64,
+    attempted_events_per_second: f64,
+    successful_events_per_second: f64,
+    rejected_requests: u64,
+    failed_requests: u64,
+    p99_ms: f64,
+}
+
 struct Stats {
     requests: AtomicU64,
     successful_requests: AtomicU64,
@@ -223,10 +313,39 @@ struct Stats {
     client_build_nanos: AtomicU64,
     latency_micros: Mutex<Histogram<u64>>,
     errors: Mutex<BTreeMap<String, u64>>,
+    window_seconds: u64,
+    windows: Mutex<Vec<Window>>,
 }
 
 impl Stats {
     fn new() -> Result<Self> {
+        Self::with_windows(0, Duration::ZERO)
+    }
+
+    fn with_windows(window_seconds: u64, duration: Duration) -> Result<Self> {
+        let windows = if window_seconds == 0 {
+            Vec::new()
+        } else {
+            (0..duration.as_secs().div_ceil(window_seconds).max(1))
+                .map(|_| {
+                    Ok(Window {
+                        attempted_events: 0,
+                        successful_events: 0,
+                        rejected_requests: 0,
+                        failed_requests: 0,
+                        latency_micros: Histogram::new_with_bounds(1, 600_000_000, 3)?,
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
+        Ok(Self {
+            window_seconds,
+            windows: Mutex::new(windows),
+            ..Self::empty()?
+        })
+    }
+
+    fn empty() -> Result<Self> {
         Ok(Self {
             requests: AtomicU64::new(0),
             successful_requests: AtomicU64::new(0),
@@ -238,7 +357,44 @@ impl Stats {
             client_build_nanos: AtomicU64::new(0),
             latency_micros: Mutex::new(Histogram::new_with_bounds(1, 600_000_000, 3)?),
             errors: Mutex::new(BTreeMap::new()),
+            window_seconds: 0,
+            windows: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Records a request sent `sent` into the phase in its window.
+    fn window(&self, sent: Duration, record: impl FnOnce(&mut Window)) {
+        if self.window_seconds == 0 {
+            return;
+        }
+        let mut windows = self.windows.lock().expect("window lock poisoned");
+        let index = usize::try_from(sent.as_secs() / self.window_seconds).unwrap_or(usize::MAX);
+        if let Some(window) = windows.get_mut(index) {
+            record(window);
+        }
+    }
+
+    fn timeline(&self, schedule: Option<Schedule>) -> Vec<WindowReport> {
+        let width = self.window_seconds as f64;
+        self.windows
+            .lock()
+            .expect("window lock poisoned")
+            .iter()
+            .enumerate()
+            .map(|(index, window)| {
+                let start = index as f64 * width;
+                WindowReport {
+                    start_seconds: index as u64 * self.window_seconds,
+                    offered_events_per_second: schedule
+                        .map_or(0.0, |schedule| schedule.rate(start + width / 2.0)),
+                    attempted_events_per_second: window.attempted_events as f64 / width,
+                    successful_events_per_second: window.successful_events as f64 / width,
+                    rejected_requests: window.rejected_requests,
+                    failed_requests: window.failed_requests,
+                    p99_ms: window.latency_micros.value_at_quantile(0.99) as f64 / 1_000.0,
+                }
+            })
+            .collect()
     }
 
     fn error(&self, key: String) {
@@ -276,6 +432,8 @@ struct Report {
     latency_ms: LatencyReport,
     errors: BTreeMap<String, u64>,
     workload: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    timeline: Vec<WindowReport>,
 }
 
 #[derive(Serialize)]
@@ -291,6 +449,10 @@ struct LatencyReport {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate(&cli)?;
+    BACKDATE_NANOS.store(
+        cli.common.backdate_seconds.saturating_mul(1_000_000_000),
+        Ordering::Relaxed,
+    );
     let run_id = cli
         .common
         .run_id
@@ -311,12 +473,20 @@ async fn main() -> Result<()> {
             cli.common.concurrency,
             cli.common.warmup_seconds
         );
+        let warmup = Duration::from_secs(cli.common.warmup_seconds);
+        let rate = if cli.common.ramp_from_rate > 0 {
+            cli.common.ramp_from_rate
+        } else {
+            cli.common.target_rate
+        };
         let warmup = run_phase(
             &client,
             &cli.common,
             &cli.product,
             &run_id,
-            Duration::from_secs(cli.common.warmup_seconds),
+            (rate > 0).then(|| Schedule::hold(rate)),
+            Arc::new(Stats::new()?),
+            warmup,
         )
         .await?;
         if warmup.successful_requests.load(Ordering::Relaxed) == 0 {
@@ -334,17 +504,21 @@ async fn main() -> Result<()> {
         cli.common.target_rate,
         cli.product.event_name()
     );
+    let duration = Duration::from_secs(cli.common.duration_seconds);
+    let schedule = (cli.common.target_rate > 0).then(|| Schedule::ramp(&cli.common, duration));
     let started = Instant::now();
     let stats = run_phase(
         &client,
         &cli.common,
         &cli.product,
         &run_id,
-        Duration::from_secs(cli.common.duration_seconds),
+        schedule,
+        Arc::new(Stats::with_windows(cli.common.timeline_seconds, duration)?),
+        duration,
     )
     .await?;
     let elapsed = started.elapsed();
-    let report = report(&cli, run_id, elapsed, &stats)?;
+    let report = report(&cli, run_id, elapsed, &stats, schedule)?;
     let encoded = serde_json::to_string_pretty(&report)?;
     println!("{encoded}");
     if let Some(path) = &cli.common.output {
@@ -411,9 +585,10 @@ async fn run_phase(
     common: &CommonArgs,
     product: &ProductArgs,
     run_id: &str,
+    schedule: Option<Schedule>,
+    stats: Arc<Stats>,
     duration: Duration,
 ) -> Result<Arc<Stats>> {
-    let stats = Arc::new(Stats::new()?);
     let request_number = Arc::new(AtomicU64::new(0));
     let start = TokioInstant::now();
     let deadline = start + duration;
@@ -429,15 +604,12 @@ async fn run_phase(
         workers.spawn(async move {
             loop {
                 let sequence = request_number.fetch_add(1, Ordering::Relaxed);
-                if common.target_rate > 0 {
-                    let event_offset =
-                        u128::from(sequence).saturating_mul(product.events_per_request() as u128);
-                    let offset_nanos = event_offset.saturating_mul(NANOS_PER_SECOND)
-                        / u128::from(common.target_rate);
-                    let Ok(offset_nanos) = u64::try_from(offset_nanos) else {
+                if let Some(schedule) = schedule {
+                    let events = sequence as f64 * product.events_per_request() as f64;
+                    let Ok(offset) = Duration::try_from_secs_f64(schedule.due(events)) else {
                         break;
                     };
-                    let scheduled = start + Duration::from_nanos(offset_nanos);
+                    let scheduled = start + offset;
                     if scheduled >= deadline {
                         break;
                     }
@@ -465,6 +637,8 @@ async fn run_phase(
                 stats.attempted_bytes.fetch_add(bytes, Ordering::Relaxed);
 
                 let request_started = Instant::now();
+                let sent = start.elapsed();
+                stats.window(sent, |window| window.attempted_events += events);
                 let mut request = client
                     .post(&common.url)
                     .header(CONTENT_TYPE, payload.content_type)
@@ -483,6 +657,18 @@ async fn run_phase(
                     .lock()
                     .expect("latency lock poisoned")
                     .record(latency);
+                stats.window(sent, |window| {
+                    let _ = window.latency_micros.record(latency);
+                    match &response {
+                        Ok(response) if response.status().is_success() => {
+                            window.successful_events += events;
+                        }
+                        Ok(response) if response.status().as_u16() == 429 => {
+                            window.rejected_requests += 1;
+                        }
+                        _ => window.failed_requests += 1,
+                    }
+                });
                 match response {
                     Ok(response) if response.status().is_success() => {
                         stats.successful_requests.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +698,13 @@ async fn run_phase(
     Ok(stats)
 }
 
-fn report(cli: &Cli, run_id: String, elapsed: Duration, stats: &Stats) -> Result<Report> {
+fn report(
+    cli: &Cli,
+    run_id: String,
+    elapsed: Duration,
+    stats: &Stats,
+    schedule: Option<Schedule>,
+) -> Result<Report> {
     let seconds = elapsed.as_secs_f64();
     let successful_requests = stats.successful_requests.load(Ordering::Relaxed);
     let successful_events = stats.successful_events.load(Ordering::Relaxed);
@@ -554,6 +746,7 @@ fn report(cli: &Cli, run_id: String, elapsed: Duration, stats: &Stats) -> Result
         },
         errors: stats.errors.lock().expect("error lock poisoned").clone(),
         workload,
+        timeline: stats.timeline(schedule),
     })
 }
 
@@ -597,7 +790,10 @@ fn logs_payload(args: &LogsArgs, request_id: u64, run_id: &str) -> Result<Payloa
                 r#"{{"level":"info","request":{},"stream":{},"message":""#,
                 request_id, stream_id
             );
-            let padding = "x".repeat(bytes.saturating_sub(prefix.len() + 2));
+            let padding = filler(
+                request_id ^ (event as u64).rotate_left(32),
+                bytes.saturating_sub(prefix.len() + 2),
+            );
             values.push([
                 (now + event as u128).to_string(),
                 format!("{prefix}{padding}\"}}"),
@@ -769,7 +965,6 @@ mod any_value {
 fn traces_payload(args: &TracesArgs, request_id: u64, run_id: &str) -> Result<Payload> {
     let now = unix_nanos() as u64;
     let mut spans = Vec::with_capacity(args.events_per_request);
-    let padding = "x".repeat(args.attribute_bytes);
     for offset in 0..args.events_per_request {
         let ordinal = request_id
             .saturating_mul(args.events_per_request as u64)
@@ -790,7 +985,7 @@ fn traces_payload(args: &TracesArgs, request_id: u64, run_id: &str) -> Result<Pa
             attributes: vec![
                 string_kv("deployment.environment", "benchmark"),
                 string_kv("http.request.method", "GET"),
-                string_kv("scale.payload", padding.clone()),
+                string_kv("scale.payload", filler(ordinal, args.attribute_bytes)),
                 string_kv("scale.run_id", run_id),
                 string_kv(
                     "service.instance.id",
@@ -822,6 +1017,42 @@ fn traces_payload(args: &TracesArgs, request_id: u64, run_id: &str) -> Result<Pa
     })
 }
 
+const FILLER_WORDS: &[&str] = &[
+    "request", "completed", "failed", "retrying", "connection", "timeout", "user", "session",
+    "cache", "miss", "hit", "upstream", "downstream", "status", "handler", "worker", "queue",
+    "latency", "bytes", "read", "write", "commit", "rollback", "token", "expired", "refresh",
+    "pool", "acquired", "released", "batch", "flushed", "received", "sent", "path", "method",
+    "GET", "POST", "PUT", "200", "404", "500", "ms", "id", "trace", "span", "error", "warn",
+    "info", "debug", "client", "server", "region", "shard", "replica", "lease", "renewed",
+];
+
+/// `bytes` of log-like text, deterministic in `seed`: common words with a
+/// small number every eighth and a unique id every 25th, about the
+/// request and trace ids a real line carries. It compresses about as well
+/// as real log messages and span attributes rather than as a run of one
+/// byte, and adds as many distinct terms to a full-text index.
+fn filler(seed: u64, bytes: usize) -> String {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut text = String::with_capacity(bytes + 24);
+    while text.len() < bytes {
+        let pick = next();
+        match pick % 200 {
+            0..8 => text.push_str(&format!("{:016x}", next())),
+            8..33 => text.push_str(&(next() % 1_000).to_string()),
+            _ => text.push_str(FILLER_WORDS[(pick >> 8) as usize % FILLER_WORDS.len()]),
+        }
+        text.push(' ');
+    }
+    text.truncate(bytes);
+    text
+}
+
 fn string_kv(key: impl Into<String>, value: impl Into<String>) -> KeyValue {
     KeyValue {
         key: key.into(),
@@ -842,6 +1073,7 @@ fn unix_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+        .saturating_sub(u128::from(BACKDATE_NANOS.load(Ordering::Relaxed)))
 }
 
 fn unix_millis() -> i64 {
@@ -851,6 +1083,19 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filler_compresses_like_text() {
+        let text = filler(7, 64 * 1024);
+        assert_eq!(text.len(), 64 * 1024);
+        assert_eq!(text, filler(7, 64 * 1024));
+        assert_ne!(text, filler(8, 64 * 1024));
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(text.as_bytes())
+            .unwrap();
+        let ratio = text.len() as f64 / compressed.len() as f64;
+        assert!((1.3..4.0).contains(&ratio), "snappy ratio {ratio}");
+    }
 
     #[test]
     fn payloads_are_nonempty_and_report_expected_encodings() {
@@ -907,6 +1152,8 @@ mod tests {
             warmup_seconds: 0,
             concurrency: 1,
             target_rate: 0,
+            ramp_from_rate: 0,
+            timeline_seconds: 0,
             timeout_seconds: 1,
             bearer_token_env: None,
             basic_username_env: None,
@@ -914,6 +1161,7 @@ mod tests {
             output: None,
             run_id: None,
             allow_production_write: false,
+            backdate_seconds: 0,
         };
         let cli = Cli {
             common,
@@ -924,6 +1172,23 @@ mod tests {
             }),
         };
         assert!(validate(&cli).is_err());
+    }
+
+    #[test]
+    fn a_ramp_offers_its_events_on_a_linear_rate() {
+        let ramp = Schedule {
+            from: 100.0,
+            to: 300.0,
+            over: 10.0,
+        };
+        // 2000 events by the end of the ramp, then 300 a second.
+        assert!((ramp.due(0.0)).abs() < 1e-9);
+        assert!((ramp.due(2_000.0) - 10.0).abs() < 1e-9);
+        assert!((ramp.due(2_300.0) - 11.0).abs() < 1e-9);
+        assert!((ramp.due(1_000.0) - (-100.0 + 50_000f64.sqrt()) / 20.0).abs() < 1e-9);
+        assert!((ramp.rate(5.0) - 200.0).abs() < 1e-9);
+        let hold = Schedule::hold(50);
+        assert!((hold.due(100.0) - 2.0).abs() < 1e-9);
     }
 
     #[test]

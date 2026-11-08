@@ -18,6 +18,7 @@ use common::storage::compaction::{CompactionMemory, MergeHolds, SegmentCompactio
 use common::storage::rollup::Rollups;
 use common::storage::slate::warm::WarmPlan;
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
+use common::write_budget::{INGEST_WAIT, WriteBudget, WritePermit};
 use common::{
     BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics, WarmWindow,
     create_storage_read,
@@ -173,8 +174,10 @@ fn catalog_values_weight((_, values): &(u64, Vec<DiscoveryValue>)) -> usize {
 pub struct TraceDb {
     storage: Arc<dyn StorageRead>,
     writer: Option<Arc<dyn Storage>>,
+    admission: common::storage::admission::Admission,
     write_handle: Option<WriteCoordinatorHandle<TraceWriteDelta>>,
     write_coordinator: Mutex<Option<WriteCoordinator<TraceWriteDelta, TraceFlusher>>>,
+    write_budget: Option<WriteBudget>,
     segment_ns: u64,
     catalog_names_cache: SequencedCatalog<(Namespace, SegmentId, Option<AttributeScope>), String>,
     catalog_values_cache:
@@ -246,39 +249,45 @@ impl TraceDb {
         config.validate()?;
         let cache = SharedDbCache::from_config(&config.storage).await?;
         let compaction = CompactionMemory::new(config.compaction_memory_bytes);
-        Self::open_with_cache(config, &cache, &compaction).await
+        let budget = WriteBudget::new("traces", config.write_budget_bytes);
+        Self::open_with_cache(config, &cache, &compaction, &budget).await
     }
 
-    /// Opens a writer that uses `cache` instead of building its own and
-    /// compacts within `compaction`.
+    /// Opens a writer that uses `cache` instead of building its own,
+    /// compacts within `compaction` and holds its writes in `budget`.
     pub(crate) async fn open_with_cache(
         config: Config,
         cache: &SharedDbCache,
         compaction: &CompactionMemory,
+        budget: &WriteBudget,
     ) -> Result<Self> {
         config.validate()?;
         let segment_ns = u64::try_from(config.segment_duration.as_nanos())
             .map_err(|_| Error::Invalid("segment duration exceeds u64 nanoseconds".to_owned()))?;
         let merge_holds = MergeHolds::default();
-        let storage = StorageBuilder::with_cache(&config.storage, cache)?
-            .with_semantics(
-                storage_semantics().with_segment_compaction(
-                    SegmentCompaction::new(crate::codec::segment_span)
-                        .with_memory(compaction.clone())
-                        .with_retention(config.retention)
-                        .with_holds(merge_holds.clone())
-                        .with_superseded(common::storage::rollup::superseded(
-                            crate::codec::KEY_SCOPE,
-                            i64::try_from(segment_ns).unwrap_or(i64::MAX),
-                        ))
-                        .with_unsealed(common::storage::rollup::unsealed(
-                            crate::codec::KEY_SCOPE,
-                            i64::try_from(segment_ns).unwrap_or(i64::MAX),
-                        )),
-                ),
-            )
-            .build()
-            .await?;
+        let storage = StorageBuilder::with_cache_over(
+            &config.storage,
+            cache,
+            common::storage::settings::writer_settings(),
+        )?
+        .with_semantics(
+            storage_semantics().with_segment_compaction(
+                SegmentCompaction::new(crate::codec::segment_span)
+                    .with_memory(compaction.clone())
+                    .with_retention(config.retention)
+                    .with_holds(merge_holds.clone())
+                    .with_superseded(common::storage::rollup::superseded(
+                        crate::codec::KEY_SCOPE,
+                        i64::try_from(segment_ns).unwrap_or(i64::MAX),
+                    ))
+                    .with_unsealed(common::storage::rollup::unsealed(
+                        crate::codec::KEY_SCOPE,
+                        i64::try_from(segment_ns).unwrap_or(i64::MAX),
+                    )),
+            ),
+        )
+        .build()
+        .await?;
         let storage_read = storage.clone();
         let rolled = storage_read
             .slate_read()
@@ -298,20 +307,26 @@ impl TraceDb {
             segment_ns,
             read_cache.clone(),
         );
-        let mut write_coordinator = WriteCoordinator::new(
-            config.write_buffer.clone(),
-            vec![WRITE_CHANNEL],
-            (),
-            (),
-            flusher,
+        // Writes hold the budget until their delta is written, and while one
+        // delta commits the next is encoded, so freeze at a third: the
+        // committing, encoding and live deltas then fit in it together.
+        let mut write_buffer = config.write_buffer.clone();
+        write_buffer.flush_size_threshold = write_buffer.flush_size_threshold.min(
+            usize::try_from(budget.capacity() / 3)
+                .unwrap_or(usize::MAX)
+                .max(1),
         );
+        let mut write_coordinator =
+            WriteCoordinator::new(write_buffer, vec![WRITE_CHANNEL], (), (), flusher);
         let write_handle = write_coordinator.handle(WRITE_CHANNEL);
         write_coordinator.start();
         Ok(Self {
             storage: storage_read,
+            admission: storage.admission(),
             writer: Some(storage),
             write_handle: Some(write_handle),
             write_coordinator: Mutex::new(Some(write_coordinator)),
+            write_budget: Some(budget.clone()),
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
             catalog_values_cache: DiscoveryCache::weighted(
@@ -356,9 +371,11 @@ impl TraceDb {
         .await?;
         Ok(Self {
             storage,
+            admission: common::storage::admission::Admission::unlimited(),
             writer: None,
             write_handle: None,
             write_coordinator: Mutex::new(None),
+            write_budget: None,
             segment_ns,
             catalog_names_cache: DiscoveryCache::new(1_024, Duration::from_secs(5)),
             catalog_values_cache: DiscoveryCache::weighted(
@@ -451,7 +468,7 @@ impl TraceDb {
 
 impl TraceDb {
     /// Applies `groups` to the write delta, waiting up to `wait` for room
-    /// in the queue, or failing at once without it.
+    /// in the write budget and queue, or failing at once without it.
     async fn apply_groups(
         &self,
         namespace: &Namespace,
@@ -463,6 +480,12 @@ impl TraceDb {
         for traces in groups.values_mut() {
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
+        let bytes = groups
+            .values()
+            .flatten()
+            .flat_map(|trace| &trace.resource_spans)
+            .map(|spans| spans.encoded_len() as u64)
+            .sum();
         let write = TraceWrite {
             namespace: namespace.clone(),
             groups,
@@ -470,15 +493,51 @@ impl TraceDb {
             rebased,
         };
         let handle = self.write_handle()?;
+        let permit = self.write_permit(handle, bytes, wait).await?;
         let mut write_handle = match wait {
             Some(timeout) => handle.write_timeout(write, timeout).await,
             None => handle.try_write(write).await,
         }
         .map_err(|error| map_write_error(error.discard_inner()))?;
-        write_handle
+        let report = write_handle
             .wait(CoordinatorDurability::Applied)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error)?;
+        // Frees the budget once the write is in storage, or the writer has
+        // failed or stopped, so it covers every applied delta in memory.
+        tokio::spawn(async move {
+            let _ = write_handle.wait(CoordinatorDurability::Written).await;
+            drop(permit);
+        });
+        Ok(report)
+    }
+
+    /// Holds `bytes` of the write budget: a rollup copy, which has a `wait`,
+    /// waits up to it for room in its half; ingest waits up to
+    /// [`INGEST_WAIT`]. Only written deltas free the budget, so a write that finds it
+    /// full first asks for the applied ones to be flushed rather than wait
+    /// for the flush interval. Ingest is first turned away while L0 nears
+    /// its stall limit.
+    async fn write_permit(
+        &self,
+        handle: &WriteCoordinatorHandle<TraceWriteDelta>,
+        bytes: u64,
+        wait: Option<Duration>,
+    ) -> Result<WritePermit> {
+        if wait.is_none() && !self.admission.admits() {
+            return Err(Error::Backpressure);
+        }
+        let budget = self.write_budget.as_ref().ok_or_else(|| {
+            Error::Invalid("writes are unavailable on a read-only database".into())
+        })?;
+        if !budget.fits(wait.is_some(), bytes) {
+            handle.flush(false).await.map_err(map_write_error)?;
+        }
+        match wait {
+            Some(wait) => budget.copy(bytes, wait).await,
+            None => budget.ingest(bytes, INGEST_WAIT).await,
+        }
+        .ok_or(Error::Backpressure)
     }
 
     pub async fn flush(&self) -> Result<()> {

@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::storage::admission::{Admission, L0Limit};
 use crate::storage::health::{self, StorageHealth};
 use crate::storage::metered_cache::CacheUsage;
 use crate::storage::sst_blocks;
@@ -426,6 +427,8 @@ pub struct SlateDbStorage {
     unflushed: Arc<AtomicBool>,
     /// See [`Self::with_meta_cache`].
     meta: Option<CacheUsage>,
+    /// Follows the manifest from the status bridge; see [`Self::with_l0_limit`].
+    admission: Admission,
 }
 
 /// How often a writer with new writes flushes its memtable to L0. A
@@ -508,12 +511,19 @@ impl SlateDbStorage {
         StorageHealth::global().watch(health::unnamed("writer"), db.subscribe());
         let slate_rx = db.subscribe();
         let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
+        let admission = Admission::unlimited();
+        admission.observe(&slate_rx.borrow());
         let task = tokio::spawn({
             let tx = durable_tx.clone();
+            let admission = admission.clone();
             async move {
                 let mut slate_rx = slate_rx;
                 while slate_rx.changed().await.is_ok() {
-                    let durable_seq = slate_rx.borrow_and_update().durable_seq;
+                    let durable_seq = {
+                        let status = slate_rx.borrow_and_update();
+                        admission.observe(&status);
+                        status.durable_seq
+                    };
                     // Use send_replace rather than send: SlateDB may publish
                     // a DbStatus change during `open` (e.g. manifest write)
                     // before any consumer has subscribed, and `send` would
@@ -532,7 +542,15 @@ impl SlateDbStorage {
             sst_reader: None,
             unflushed: Arc::new(AtomicBool::new(false)),
             meta: None,
+            admission,
         }
+    }
+
+    /// Sheds ingest as the deepest segment's L0 nears `limit`; see
+    /// [`Admission`].
+    pub fn with_l0_limit(self, limit: L0Limit) -> Self {
+        self.admission.limit_to(limit);
+        self
     }
 
     /// Flushes the memtable to L0 every `every` while writes arrive; see
@@ -780,6 +798,10 @@ impl StorageSnapshot for SlateDbStorageSnapshot {}
 
 #[async_trait]
 impl Storage for SlateDbStorage {
+    fn admission(&self) -> Admission {
+        self.admission.clone()
+    }
+
     async fn apply_with_options(
         &self,
         records: Vec<RecordOp>,

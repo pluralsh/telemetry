@@ -512,6 +512,9 @@ pub(crate) fn metrics_config(config: &Config) -> plural_metrics::Config {
         compaction_memory_bytes: config
             .compaction_memory_bytes
             .unwrap_or(common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES),
+        write_budget_bytes: config
+            .write_budget_bytes
+            .unwrap_or(plural_metrics::DEFAULT_WRITE_BUDGET_BYTES),
     }
 }
 

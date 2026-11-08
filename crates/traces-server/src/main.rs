@@ -10,8 +10,13 @@ use tonic::transport::Server;
 
 /// Query paths allocate and free per row; the system allocator made this
 /// most of their CPU time.
+#[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "plural-traces-server")]
@@ -25,6 +30,8 @@ async fn main() -> anyhow::Result<()> {
     server_common::runtime::install_rustls_crypto_provider()?;
     tracing_subscriber::fmt::init();
     server_common::runtime::install_metrics_recorder()?;
+    #[cfg(feature = "heap-profile")]
+    server_common::runtime::spawn_jemalloc_stats();
     metrics::gauge!("telemetry_server_up", "product" => "traces").set(1.0);
     let path = Args::parse().config;
     let config = Config::from_path(&path)?;

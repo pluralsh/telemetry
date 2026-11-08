@@ -128,8 +128,10 @@ impl TraceDb {
         Ok(())
     }
 
-    /// Copies `segment` into `wide` in steps of about `buffer` page bytes.
-    /// Each step waits for the one before it to be written.
+    /// Copies `segment` into `wide` in steps of about `buffer` encoded OTLP
+    /// bytes, the write budget's unit, and at most a third of the budget, so
+    /// a step's decoded traces fit in it as one delta does. Each step waits
+    /// for the one before it to be written.
     async fn copy_segment(
         &self,
         namespace: &Namespace,
@@ -137,6 +139,10 @@ impl TraceDb {
         wide: SegmentId,
         buffer: u64,
     ) -> Result<()> {
+        let buffer = self
+            .write_budget
+            .as_ref()
+            .map_or(buffer, |budget| buffer.min(budget.capacity() / 3));
         let now = unix_time_ms()?;
         let mut sequences = Vec::new();
         let mut metadata = self
@@ -168,13 +174,18 @@ impl TraceDb {
             };
             let page = Page::decode(payload.value)?;
             for index in 0..page.directory().len() {
-                traces.push(page.decode_trace(index)?);
-            }
-            chunk += page.retained_bytes() as u64;
-            if chunk >= buffer {
-                self.copy_traces(namespace, (segment, wide), std::mem::take(&mut traces))
-                    .await?;
-                chunk = 0;
+                let trace = page.decode_trace(index)?;
+                chunk += trace
+                    .resource_spans
+                    .iter()
+                    .map(|spans| spans.encoded_len() as u64)
+                    .sum::<u64>();
+                traces.push(trace);
+                if chunk >= buffer {
+                    self.copy_traces(namespace, (segment, wide), std::mem::take(&mut traces))
+                        .await?;
+                    chunk = 0;
+                }
             }
         }
         if !traces.is_empty() {
@@ -279,6 +290,7 @@ mod tests {
             write_buffer: Default::default(),
             read_cache: Default::default(),
             compaction_memory_bytes: crate::Config::default().compaction_memory_bytes,
+            write_budget_bytes: crate::Config::default().write_budget_bytes,
         }
     }
 
@@ -408,6 +420,30 @@ mod tests {
 
         let config = RollupConfig {
             copy_buffer_bytes: 1,
+            ..RollupConfig::default()
+        };
+        assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);
+
+        assert_eq!(db.rollups(&namespace()).sealed(), &[day()]);
+        assert_eq!(spans(&db).await, before);
+        assert_heads_rebased(&db).await;
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copies_in_steps_of_a_third_of_the_write_budget_within_pages() {
+        // A budget a few traces wide cuts steps inside pages of four.
+        let db = TraceDb::open(Config {
+            write_budget_bytes: 300,
+            ..config()
+        })
+        .await
+        .unwrap();
+        write_day(&db).await;
+        let before = spans(&db).await;
+
+        let config = RollupConfig {
+            copy_buffer_bytes: u64::MAX,
             ..RollupConfig::default()
         };
         assert_eq!(db.rollup_at(&config, after_delay()).await.unwrap(), 1);

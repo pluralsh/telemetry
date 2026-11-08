@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod coalescing;
 pub mod compaction;
 pub mod config;
@@ -470,6 +471,11 @@ pub trait StorageSnapshot: StorageRead {}
 /// The storage type encapsulates access to the underlying storage (e.g. SlateDB).
 #[async_trait]
 pub trait Storage: StorageRead {
+    /// Whether ingest may write now; see [`admission`].
+    fn admission(&self) -> admission::Admission {
+        admission::Admission::unlimited()
+    }
+
     /// Applies a batch of mixed operations (puts, merges, and deletes) atomically.
     ///
     /// All operations in the batch are written together in a single `WriteBatch`,

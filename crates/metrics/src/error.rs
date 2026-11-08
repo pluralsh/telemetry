@@ -47,7 +47,8 @@ pub enum Error {
     /// typically indicate a bug in the implementation.
     Internal(String),
 
-    /// The write coordinator queue is full.
+    /// The write budget is full, or ingest admission is shedding while L0
+    /// compaction catches up.
     Backpressure,
 
     /// A storage shard is not open here or cannot be closed yet.
@@ -63,7 +64,7 @@ impl std::fmt::Display for Error {
             Error::Encoding(msg) => write!(f, "Encoding error: {}", msg),
             Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             Error::Internal(msg) => write!(f, "Internal error: {}", msg),
-            Error::Backpressure => write!(f, "Backpressure: write queue is full"),
+            Error::Backpressure => write!(f, "Backpressure: writer is at capacity, retry later"),
             Error::Shard(error) => write!(f, "{error}"),
         }
     }

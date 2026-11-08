@@ -492,3 +492,156 @@ async fn profile_fuzz_cases() {
         Engine::Reader(reader) => reader.close().await.unwrap(),
     }
 }
+
+// ── Write memory ─────────────────────────────────────────────────────
+
+/// Request `request` of ones shaped like the scalability runner's:
+/// `per_request` one-sample series rotating through `active` series of
+/// seven labels.
+fn runner_request(
+    request: u64,
+    per_request: u64,
+    active: u64,
+    timestamp_ms: i64,
+) -> Vec<crate::model::Series> {
+    (0..per_request)
+        .map(|offset| {
+            let ordinal = request * per_request + offset;
+            let series = ordinal % active;
+            crate::model::Series::builder(format!("scale_metric_{}", series % 100))
+                .label("cluster", "scale-cluster")
+                .label("environment", "benchmark")
+                .label("instance", format!("instance-{}", series % 100_000))
+                .label("job", format!("job-{}", series % 1_000))
+                .label("run_id", "profile")
+                .label("series", series.to_string())
+                .label("zone", format!("zone-{}", series % 3))
+                .sample(timestamp_ms, (ordinal % 10_000) as f64 / 10.0)
+                .build()
+        })
+        .collect()
+}
+
+/// Writes `PROFILE_REQUESTS` runner-shaped requests of
+/// `PROFILE_REQUEST_SAMPLES` samples over `PROFILE_ACTIVE_SERIES` series
+/// from `PROFILE_CONCURRENCY` tasks as fast as the writer admits them, and
+/// prints the peak resident set every two seconds for the sampler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual profiling"]
+async fn profile_write_memory() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let parse = |name: &str, default: u64| {
+        std::env::var(name).map_or(default, |value| value.parse().unwrap())
+    };
+    let started = Instant::now();
+    let peak = Arc::new(AtomicU64::new(0));
+    std::thread::spawn({
+        let peak = peak.clone();
+        move || {
+            let mut system = sysinfo::System::new();
+            let pid = sysinfo::get_current_pid().unwrap();
+            loop {
+                system.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    false,
+                    sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                );
+                let rss = system.process(pid).map_or(0, |process| process.memory());
+                peak.fetch_max(rss, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let phase = {
+        let peak = peak.clone();
+        move |name: &str, detail: String| {
+            println!(
+                "phase {name} at {:.1}s peak_rss_mib={:.0} {detail}",
+                started.elapsed().as_secs_f64(),
+                peak.swap(0, Ordering::Relaxed) as f64 / f64::from(1u32 << 20)
+            );
+        }
+    };
+    let store = PathBuf::from(std::env::var("PROFILE_STORE").unwrap());
+    let _ = std::fs::remove_dir_all(&store);
+    let mut config = Config {
+        storage: storage(&store),
+        ..Default::default()
+    };
+    config.rollup.enabled = false;
+    if let Ok(value) = std::env::var("PROFILE_WRITE_MB") {
+        config.write_budget_bytes = value.parse::<u64>().unwrap() << 20;
+    }
+    let db = Arc::new(TimeSeriesDb::open(config).await.unwrap());
+    let namespace = Namespace::default();
+    phase("open", String::new());
+    let requests = parse("PROFILE_REQUESTS", 600);
+    let per_request = parse("PROFILE_REQUEST_SAMPLES", 5_000);
+    let active = parse("PROFILE_ACTIVE_SERIES", 4_000_000);
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 1_800_000;
+    let next = Arc::new(AtomicU64::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let reporter = tokio::spawn({
+        let phase = phase.clone();
+        let next = next.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                phase(
+                    "stats",
+                    format!("requests={}", next.load(Ordering::Relaxed)),
+                );
+            }
+        }
+    });
+    let tasks: Vec<_> = (0..parse("PROFILE_CONCURRENCY", 32))
+        .map(|_| {
+            let (db, namespace, next, rejected) = (
+                db.clone(),
+                namespace.clone(),
+                next.clone(),
+                rejected.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let request = next.fetch_add(1, Ordering::Relaxed);
+                    if request >= requests {
+                        return;
+                    }
+                    let series = runner_request(request, per_request, active, timestamp_ms);
+                    loop {
+                        match db.write(&namespace, series.clone()).await {
+                            Ok(()) => break,
+                            Err(crate::Error::Backpressure) => {
+                                rejected.fetch_add(1, Ordering::Relaxed);
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    reporter.abort();
+    phase(
+        "applied",
+        format!(
+            "rejected={} samples_per_second={:.0}",
+            rejected.load(Ordering::Relaxed),
+            (requests * per_request) as f64 / started.elapsed().as_secs_f64()
+        ),
+    );
+    db.flush().await.unwrap();
+    phase("flushed", String::new());
+    Arc::into_inner(db).unwrap().close().await.unwrap();
+    phase("closed", String::new());
+}

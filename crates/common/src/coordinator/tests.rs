@@ -1066,6 +1066,59 @@ async fn should_keep_applying_writes_when_flush_queue_is_full() {
     coordinator.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_hold_writes_while_a_full_live_delta_waits_for_the_flush_queue() {
+    // given: every write fills a delta, and the first flush blocks
+    let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
+    let mut coordinator = WriteCoordinator::new(
+        WriteCoordinatorConfig {
+            flush_size_threshold: 10,
+            ..test_config()
+        },
+        vec!["default".to_string()],
+        TestContext::default(),
+        flusher.initial_snapshot().await,
+        flusher.clone(),
+    );
+    let handle = coordinator.handle("default");
+    coordinator.start();
+    let write = |key: String| TestWrite {
+        key,
+        value: 1,
+        size: 10,
+    };
+    handle.try_write(write("blocked".into())).await.unwrap();
+    flush_started_rx.await.unwrap();
+    let applied = Duration::from_secs(5);
+    for i in 0..=FLUSH_QUEUE_CAPACITY {
+        let mut queued = handle.try_write(write(format!("queued{i}"))).await.unwrap();
+        tokio::time::timeout(applied, queued.wait(Durability::Applied))
+            .await
+            .expect("a write was held before the live delta filled")
+            .unwrap();
+    }
+
+    // when: the flush queue is full and the live delta is at the threshold
+    let mut held = handle.try_write(write("held".into())).await.unwrap();
+
+    // then: the write waits rather than growing the live delta
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), held.wait(Durability::Applied))
+            .await
+            .is_err()
+    );
+
+    // and: it is applied once flushing resumes
+    unblock_tx.send(()).await.unwrap();
+    tokio::time::timeout(applied, held.wait(Durability::Applied))
+        .await
+        .expect("a held write was never applied")
+        .unwrap();
+    handle.flush(false).await.unwrap();
+    held.wait(Durability::Written).await.unwrap();
+    coordinator.stop().await;
+}
+
 // ============================================================================
 // Backpressure Tests
 // ============================================================================

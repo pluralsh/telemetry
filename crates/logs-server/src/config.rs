@@ -445,9 +445,9 @@ pub struct MemoryConfig {
     /// `request.max_in_flight_query_bytes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_bytes: Option<u64>,
-    /// Estimated bytes of writes applied but not yet written to storage,
-    /// and so the most one flush holds; ingest past it is rejected with 429
-    /// and rollups wait. Defaults to 16 MiB.
+    /// Estimated bytes of writes applied but not yet written to storage;
+    /// one flush holds a third of it at most. Ingest past it is rejected
+    /// with 429 and rollups wait. Defaults to 24 MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_bytes: Option<u64>,
     /// Estimated bytes the object compactor's merges of every shard hold at

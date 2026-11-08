@@ -13,12 +13,21 @@
 //!
 //! - **Merge**: [`SegmentCompaction::grace`] after a segment ends, merge its
 //!   L0s and sorted runs into one sorted run. Late writes add L0s again,
-//!   which are merged in once they hold a share of the segment's bytes or
-//!   leave it with too many sources, so a trickle of late writes doesn't
-//!   rewrite a large segment every few seconds.
-//! - **Cap**: until then, merge a segment whenever size-tiered compaction
-//!   leaves it more than [`SegmentCompaction::with_max_open_sources`]
-//!   sources, which bounds what reads of the newest data probe.
+//!   which are merged into a run of their own once they hold a share of the
+//!   segment's bytes or leave it with too many sources, and its runs are
+//!   merged into its largest only once the late ones hold half as much. A
+//!   trickle of late writes then doesn't rewrite a large segment every few
+//!   seconds, and a stream of them, such as a backlog replayed hours late,
+//!   is written about four times rather than once per sixteenth it adds.
+//!   SlateDB runs one compaction of a segment's L0s at a time, but one of
+//!   only its runs beside it, so late L0s keep draining through a rewrite.
+//! - **Cap**: until then, whenever size-tiered compaction leaves a segment
+//!   more than [`SegmentCompaction::with_max_open_sources`] sources and two
+//!   or more L0s, merge its L0s into a fresh run, which bounds what reads of
+//!   the newest data probe. Its runs stay size-tiered compaction's: a run
+//!   merge chosen by count rewrites a run that grows with the segment, once
+//!   per flush. Nor L0s and runs in one merge, which would hold the
+//!   segment's L0 through a rewrite of everything while flushes stall.
 //! - **Hold**: a rollup copying into a segment holds its merges
 //!   ([`MergeHolds`]) and then asks for one, so the segment is rewritten
 //!   once rather than every time the copy adds L0s.
@@ -44,7 +53,7 @@ mod memory;
 
 pub use memory::{CompactionMemory, DEFAULT_COMPACTION_MEMORY_BYTES};
 
-use memory::Held;
+use memory::{Held, Inputs};
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -80,10 +89,15 @@ pub const DEFAULT_MAX_OPEN_SOURCES: usize = 8;
 /// segment or one compaction fell behind on can have hundreds of sources,
 /// each holding its own prefetch while a merge of all of them runs.
 pub const DEFAULT_MAX_MERGE_SOURCES: usize = 8;
-/// A merged segment's late L0s and runs are merged in once they hold this
-/// fraction (as a divisor) of its largest source's bytes...
-const LATE_BYTES_DIVISOR: u64 = 16;
-/// ...or once they're past the source cap and hold this fraction of them.
+/// A merged segment's late L0s are merged into a run of their own once they
+/// hold this fraction (as a divisor) of its largest source's bytes...
+const LATE_L0_BYTES_DIVISOR: u64 = 16;
+/// ...and the whole segment once its late L0s and runs hold this fraction,
+/// so each rewrite of its largest source is paid for by late bytes of at
+/// least half its size...
+const LATE_BYTES_DIVISOR: u64 = 2;
+/// ...or once they're past the source cap with fewer than two L0s to merge
+/// and hold this fraction of it.
 const LATE_CAPPED_BYTES_DIVISOR: u64 = 64;
 
 /// Whether a rollup is copying into a segment or waiting for its merge.
@@ -280,17 +294,16 @@ impl SegmentCompaction {
         self.grace
     }
 
-    /// Whether `spec` is relief: it reads L0s of a segment still taking
-    /// writes, unbounded or not yet past its end and grace, which is what
-    /// SlateDB stalls flushes on.
+    /// Whether `spec` is relief: it reads L0s, which is what SlateDB stalls
+    /// flushes on, and only those or those of a segment still taking writes,
+    /// unbounded or not yet past its end and grace. A merged segment's late
+    /// L0s then drain beside a rewrite of its runs rather than behind it.
     fn relief(&self, spec: &CompactionSpec, now_ms: u64) -> bool {
-        if spec.is_drain()
-            || !spec
-                .sources()
-                .iter()
-                .any(|source| matches!(source, SourceId::SstView(_)))
-        {
+        if spec.is_drain() || !spec.has_l0_sources() {
             return false;
+        }
+        if !spec.has_sr_sources() {
+            return true;
         }
         let grace_ms = i64::try_from(self.grace.as_millis()).unwrap_or(i64::MAX);
         (self.span)(spec.segment()).is_none_or(|(_, end_ms)| {
@@ -530,12 +543,16 @@ impl Scheduler {
         if slots == 0 {
             return (specs, kinds);
         }
-        let busy: HashSet<Bytes> = active
+        let mut busy: HashMap<Bytes, Busy> = HashMap::new();
+        for spec in active
             .iter()
             .map(|compaction| compaction.spec())
             .chain(specs.iter())
-            .map(|spec| spec.segment().clone())
-            .collect();
+        {
+            let segment = busy.entry(spec.segment().clone()).or_default();
+            segment.l0 |= spec.is_drain() || spec.has_l0_sources();
+            segment.runs |= spec.is_drain() || spec.has_sr_sources();
+        }
         let manifest = state.manifest();
         let segments: Vec<SegmentState> = manifest
             .segments()
@@ -560,6 +577,7 @@ impl Scheduler {
                     newest_ms: created().max().unwrap_or(0),
                     oldest_ms: created().min().unwrap_or(0),
                     bytes: sizes.clone().sum(),
+                    l0_bytes: segment.l0().iter().map(|view| view.estimate_size()).sum(),
                     largest: sizes.max().unwrap_or(0),
                 }
             })
@@ -613,8 +631,9 @@ struct SegmentState {
     /// Creation time of the segment's oldest SST. Once a merge rewrites
     /// the segment every SST it has is newer than the merge's grace.
     oldest_ms: u64,
-    /// Estimated bytes of all its SSTs and of its largest source.
+    /// Estimated bytes of all its SSTs, of its L0s and of its largest source.
     bytes: u64,
+    l0_bytes: u64,
     largest: u64,
 }
 
@@ -658,13 +677,22 @@ impl Planned {
     }
 }
 
+/// Which of a segment's sources its active compactions take. SlateDB runs
+/// one compaction of a segment's L0s at a time, but one of its runs alone
+/// can run beside it.
+#[derive(Clone, Copy, Default)]
+struct Busy {
+    l0: bool,
+    runs: bool,
+}
+
 /// Plans at most `slots` drains and merges, drains first and oldest segment
 /// first. `next_run` is the first sorted-run id free for a new run.
 fn plan(
     policy: &SegmentCompaction,
     now_ms: u64,
     segments: &[SegmentState],
-    busy: &HashSet<Bytes>,
+    busy: &HashMap<Bytes, Busy>,
     slots: usize,
     mut next_run: u32,
 ) -> Vec<Planned> {
@@ -682,9 +710,13 @@ fn plan(
             .as_ref()
             .is_some_and(|superseded| superseded(&segment.prefix, &is_present))
     };
+    let busy = |segment: &SegmentState| busy.get(&segment.prefix).copied().unwrap_or_default();
     let mut candidates: Vec<(i64, bool, &SegmentState)> = segments
         .iter()
-        .filter(|segment| !busy.contains(&segment.prefix))
+        .filter(|segment| {
+            let busy = busy(segment);
+            !busy.l0 || !busy.runs
+        })
         .filter(live)
         .filter_map(|segment| {
             let end_ms = (policy.span)(&segment.prefix)?.1;
@@ -708,32 +740,80 @@ fn plan(
             .is_some_and(|unsealed| unsealed(&segment.prefix, &is_present))
     };
     let grace_ms = i64::try_from(policy.grace.as_millis()).unwrap_or(i64::MAX);
+    // A merged segment's late sources, once past its grace: its runs into its
+    // largest once they're worth rewriting it, its L0s into a fresh run once
+    // they're worth a run of their own, so neither waits on the other.
+    let late = |end_ms: i64, segment: &SegmentState, busy: Busy| {
+        let merged_at = i64::try_from(segment.oldest_ms).unwrap_or(i64::MAX);
+        if now_ms < end_ms.saturating_add(grace_ms) || merged_at < end_ms.saturating_add(grace_ms) {
+            return None;
+        }
+        let over_cap = segment.l0.len() + segment.runs.len() > policy.max_open_sources;
+        let late_runs = segment
+            .bytes
+            .saturating_sub(segment.l0_bytes)
+            .saturating_sub(segment.largest);
+        let runs_due = segment.runs.len() >= 2
+            && (late_runs.saturating_mul(LATE_BYTES_DIVISOR) >= segment.largest
+                || (over_cap
+                    && segment.l0.len() < 2
+                    && late_runs.saturating_mul(LATE_CAPPED_BYTES_DIVISOR) >= segment.largest));
+        let l0_due = segment.l0.len() >= 2
+            && (over_cap
+                || segment.l0_bytes.saturating_mul(LATE_L0_BYTES_DIVISOR) >= segment.largest);
+        if runs_due && !busy.runs {
+            Some(Merge::LateRuns)
+        } else if l0_due && !busy.l0 {
+            Some(Merge::LateL0s)
+        } else {
+            None
+        }
+    };
+    // A segment past the source cap while it still takes writes: its L0s
+    // into a fresh run. Its runs are left to size-tiered compaction, which
+    // merges runs of similar size: any run merge picked by count rewrites a
+    // run that grows with the segment, so an hour of writes would be
+    // rewritten once per flush. And never L0s and runs at once, which would
+    // hold the segment's L0 until it rewrites everything while flushes stall
+    // on L0.
+    let open = |segment: &SegmentState, busy: Busy| {
+        (segment.l0.len() >= 2 && !busy.l0).then_some(Merge::LateL0s)
+    };
     let requested = |segment: &SegmentState| policy.holds.get(&segment.prefix) == Some(Hold::Merge);
     let mergeable = |end_ms: i64, segment: &SegmentState| {
         let sources = segment.l0.len() + segment.runs.len();
+        let busy = busy(segment);
         if sources <= 1 {
-            return false;
+            return None;
         }
+        let idle = !busy.l0 && !busy.runs;
         match policy.holds.get(&segment.prefix) {
-            Some(Hold::Copying) => return false,
-            Some(Hold::Merge) => return true,
-            None if unsealed(segment) => return false,
+            Some(Hold::Copying) => return None,
+            Some(Hold::Merge) => return idle.then_some(Merge::All),
+            None if unsealed(segment) => return None,
             None => {}
         }
         let merge_at = end_ms.saturating_add(grace_ms);
         if now_ms < merge_at {
-            return sources > policy.max_open_sources;
+            return (sources > policy.max_open_sources)
+                .then(|| open(segment, busy))
+                .flatten();
         }
-        let rest = segment.bytes.saturating_sub(segment.largest);
-        i64::try_from(segment.oldest_ms).unwrap_or(i64::MAX) < merge_at
-            || rest.saturating_mul(LATE_BYTES_DIVISOR) >= segment.largest
-            || (sources > policy.max_open_sources
-                && rest.saturating_mul(LATE_CAPPED_BYTES_DIVISOR) >= segment.largest)
+        if !idle {
+            return late(end_ms, segment, busy);
+        }
+        if i64::try_from(segment.oldest_ms).unwrap_or(i64::MAX) < merge_at {
+            return Some(Merge::All);
+        }
+        late(end_ms, segment, busy)
     };
 
     let drains = candidates
         .iter()
-        .filter(|(end_ms, superseded, segment)| *superseded || expired(*end_ms, segment))
+        .filter(|(end_ms, superseded, segment)| {
+            let busy = busy(segment);
+            !busy.l0 && !busy.runs && (*superseded || expired(*end_ms, segment))
+        })
         .map(|(end_ms, superseded, segment)| Planned::Drain {
             prefix: segment.prefix.clone(),
             sources: segment.sources(),
@@ -742,26 +822,58 @@ fn plan(
     // A rollup waits on its requested merge, so those go first.
     let (requested, routine): (Vec<_>, Vec<_>) = candidates
         .iter()
-        .filter(|(end_ms, superseded, segment)| {
-            !superseded && !expired(*end_ms, segment) && mergeable(*end_ms, segment)
-        })
-        .partition(|(_, _, segment)| requested(segment));
-    let merges = requested.into_iter().chain(routine).map(|(_, _, segment)| {
-        let (sources, runs) = merge_window(segment, policy.max_merge_sources);
-        let destination = match runs.iter().min() {
-            Some(id) => *id,
-            None => {
-                next_run += 1;
-                next_run - 1
+        .filter(|(end_ms, superseded, segment)| !superseded && !expired(*end_ms, segment))
+        .filter_map(|(end_ms, _, segment)| Some((mergeable(*end_ms, segment)?, *segment)))
+        .partition(|(_, segment)| requested(segment));
+    let merges = requested
+        .into_iter()
+        .chain(routine)
+        .map(|(merge, segment)| {
+            let (sources, runs) = match merge {
+                Merge::All => merge_window(segment, policy.max_merge_sources),
+                Merge::LateL0s => late_l0s(segment, policy.max_merge_sources),
+                Merge::LateRuns => late_runs(segment, policy.max_merge_sources),
+            };
+            let destination = match runs.iter().min() {
+                Some(id) => *id,
+                None => {
+                    next_run += 1;
+                    next_run - 1
+                }
+            };
+            Planned::Merge {
+                prefix: segment.prefix.clone(),
+                sources,
+                destination,
             }
-        };
-        Planned::Merge {
-            prefix: segment.prefix.clone(),
-            sources,
-            destination,
-        }
-    });
+        });
     drains.chain(merges).take(slots).collect()
+}
+
+/// What a segment's next merge takes.
+#[derive(Clone, Copy)]
+enum Merge {
+    /// Every source, within [`merge_window`].
+    All,
+    /// Its oldest L0s, at most `cap`, into a fresh run, leaving its runs.
+    LateL0s,
+    /// Its oldest runs, at most `cap`, into the oldest, leaving its L0s.
+    LateRuns,
+}
+
+/// The oldest `cap` of `segment`'s L0s, which SlateDB takes as a window
+/// since L0s precede runs in its newest-to-oldest order.
+fn late_l0s(segment: &SegmentState, cap: usize) -> (Vec<SourceId>, &[u32]) {
+    let sources = segment.sources();
+    let l0 = segment.l0.len();
+    (sources[l0 - l0.min(cap)..l0].to_vec(), &[])
+}
+
+/// The oldest `cap` of `segment`'s runs, which end its newest-to-oldest order.
+fn late_runs(segment: &SegmentState, cap: usize) -> (Vec<SourceId>, &[u32]) {
+    let sources = segment.sources();
+    let runs = &segment.runs[segment.runs.len() - segment.runs.len().min(cap)..];
+    (sources[sources.len() - runs.len()..].to_vec(), runs)
 }
 
 /// The sources of `segment`'s next merge, and the sorted runs among them:
@@ -839,9 +951,9 @@ fn within_budget(
     (fit, over, admitted)
 }
 
-/// Estimated bytes of `spec`'s inputs; `None` when its segment or a source
-/// isn't in `manifest`.
-fn input_bytes(manifest: &VersionedManifest, spec: &CompactionSpec) -> Option<u64> {
+/// Estimated sizes of `spec`'s input SSTs; `None` when its segment or a
+/// source isn't in `manifest`.
+fn input_bytes(manifest: &VersionedManifest, spec: &CompactionSpec) -> Option<Inputs> {
     let (l0, runs) = if spec.segment().is_empty() {
         (manifest.l0(), manifest.compacted())
     } else {
@@ -851,13 +963,25 @@ fn input_bytes(manifest: &VersionedManifest, spec: &CompactionSpec) -> Option<u6
             .find(|segment| segment.prefix() == spec.segment())?;
         (segment.l0(), segment.compacted())
     };
-    spec.sources().iter().try_fold(0u64, |total, source| {
-        let bytes = match source {
-            SourceId::SstView(id) => l0.iter().find(|view| view.id == *id)?.estimate_size(),
-            SourceId::SortedRun(id) => runs.iter().find(|run| run.id == *id)?.estimate_size(),
-        };
-        Some(total.saturating_add(bytes))
-    })
+    spec.sources()
+        .iter()
+        .try_fold(Inputs::default(), |inputs, source| {
+            let (bytes, largest) = match source {
+                SourceId::SstView(id) => {
+                    let size = l0.iter().find(|view| view.id == *id)?.estimate_size();
+                    (size, size)
+                }
+                SourceId::SortedRun(id) => {
+                    let run = runs.iter().find(|run| run.id == *id)?;
+                    let largest = run.sst_views().iter().map(|view| view.estimate_size()).max();
+                    (run.estimate_size(), largest.unwrap_or(0))
+                }
+            };
+            Some(Inputs {
+                total: inputs.total.saturating_add(bytes),
+                largest: inputs.largest.max(largest),
+            })
+        })
 }
 
 fn unix_ms(time: SystemTime) -> u64 {
@@ -888,6 +1012,7 @@ mod tests {
             newest_ms,
             oldest_ms: 0,
             bytes: (l0 + runs.len()) as u64,
+            l0_bytes: l0 as u64,
             largest: 1,
         }
     }
@@ -913,7 +1038,7 @@ mod tests {
     #[test]
     fn merges_a_segment_once_its_grace_has_passed() {
         let segments = [segment(1, 2, &[4, 7], 0)];
-        let none = HashSet::new();
+        let none = HashMap::new();
         assert!(plan(&policy(), at_hour(2.4), &segments, &none, 4, 10).is_empty());
         assert_eq!(
             plan(&policy(), at_hour(2.5), &segments, &none, 4, 10),
@@ -928,7 +1053,7 @@ mod tests {
     #[test]
     fn merging_l0s_alone_takes_a_fresh_run() {
         let segments = [segment(1, 2, &[], 0), segment(2, 3, &[], 0)];
-        let planned = plan(&policy(), at_hour(10.0), &segments, &HashSet::new(), 4, 10);
+        let planned = plan(&policy(), at_hour(10.0), &segments, &HashMap::new(), 4, 10);
         let destinations: Vec<_> = planned
             .iter()
             .map(|planned| match planned {
@@ -947,7 +1072,13 @@ mod tests {
             segment(3, 2, &[5], 0),
             segment(0xff, 4, &[6], 0),
         ];
-        let busy = HashSet::from([Bytes::from_static(&[3])]);
+        let busy = HashMap::from([(
+            Bytes::from_static(&[3]),
+            Busy {
+                l0: true,
+                runs: true,
+            },
+        )]);
         assert!(plan(&policy(), at_hour(100.0), &segments, &busy, 4, 10).is_empty());
     }
 
@@ -958,7 +1089,7 @@ mod tests {
             segment(1, 0, &[3], at_hour(1.5)),
             segment(2, 0, &[4], at_hour(5.0)),
         ];
-        let none = HashSet::new();
+        let none = HashMap::new();
         // Hour 1 ends at 2h; its newest SST is from 1.5h: expires at 4h.
         assert!(plan(&policy, at_hour(3.9), &segments, &none, 4, 10).is_empty());
         assert_eq!(
@@ -991,7 +1122,7 @@ mod tests {
             segment(2, 2, &[4], 0),
             segment(0x81, 1, &[], 0),
         ];
-        let planned = plan(&policy, at_hour(10.0), &segments, &HashSet::new(), 4, 10);
+        let planned = plan(&policy, at_hour(10.0), &segments, &HashMap::new(), 4, 10);
         assert_eq!(prefixes(&planned), vec![("drain", 1), ("merge", 2)]);
         assert!(matches!(
             planned[0],
@@ -1001,7 +1132,13 @@ mod tests {
             }
         ));
 
-        let busy = HashSet::from([Bytes::from_static(&[1])]);
+        let busy = HashMap::from([(
+            Bytes::from_static(&[1]),
+            Busy {
+                l0: true,
+                runs: true,
+            },
+        )]);
         let planned = plan(&policy, at_hour(10.0), &segments, &busy, 4, 10);
         assert_eq!(prefixes(&planned), vec![("merge", 2)]);
     }
@@ -1020,7 +1157,7 @@ mod tests {
                 &policy,
                 at_hour(34.0),
                 &segments,
-                &HashSet::new(),
+                &HashMap::new(),
                 3,
                 10
             )),
@@ -1031,14 +1168,19 @@ mod tests {
     #[test]
     fn merges_an_open_segment_only_past_the_source_cap() {
         let policy = policy().with_max_open_sources(8);
-        let none = HashSet::new();
+        let none = HashMap::new();
         let at_cap = [segment(1, 4, &[5, 4, 3, 2], 0)];
         assert!(plan(&policy, at_hour(1.5), &at_cap, &none, 4, 10).is_empty());
-        let over = [segment(1, 5, &[5, 4, 3, 2], 0)];
+        // Over it, the L0s into a fresh run, leaving the runs alone.
+        let over = segment(1, 5, &[5, 4, 3, 2], 0);
+        let sources = over.sources();
         assert_eq!(
-            prefixes(&plan(&policy, at_hour(1.5), &over, &none, 4, 10)),
-            vec![("merge", 1)]
+            merged(&plan(&policy, at_hour(1.5), &[over], &none, 4, 10)),
+            vec![(sources[..5].to_vec(), 10)]
         );
+        // With one L0, nothing: its runs are size-tiered compaction's.
+        let runs = segment(1, 1, &[9, 8, 7, 6, 5, 4, 3, 2], 0);
+        assert!(plan(&policy, at_hour(1.5), &[runs], &none, 4, 10).is_empty());
     }
 
     fn merged(planned: &[Planned]) -> Vec<(Vec<SourceId>, u32)> {
@@ -1058,7 +1200,7 @@ mod tests {
     #[test]
     fn merges_a_held_segment_of_many_sources_a_window_at_a_time() {
         let policy = policy().with_max_merge_sources(4);
-        let none = HashSet::new();
+        let none = HashMap::new();
         // Ten L0s and two runs: the four oldest L0s into a fresh run.
         let many = segment(1, 10, &[9, 3], 0);
         let sources = many.sources();
@@ -1080,6 +1222,101 @@ mod tests {
         assert_eq!(
             merged(&plan(&policy, at_hour(10.0), &[few], &none, 4, 10)),
             vec![(sources, 4)]
+        );
+    }
+
+    /// Hour 1, merged past its grace into run 3 of `base` bytes, since given late
+    /// L0s of `l0_bytes` and late runs `late_runs` of `run_bytes` each.
+    fn merged_late(l0: usize, l0_bytes: u64, late_runs: &[u32], run_bytes: u64) -> SegmentState {
+        let base = 1_600;
+        SegmentState {
+            oldest_ms: at_hour(2.6),
+            bytes: base + l0_bytes + run_bytes * late_runs.len() as u64,
+            l0_bytes,
+            largest: base,
+            ..segment(1, l0, &[late_runs, &[3]].concat(), at_hour(3.0))
+        }
+    }
+
+    #[test]
+    fn merges_late_l0s_into_a_run_of_their_own_past_a_sixteenth() {
+        let none = HashMap::new();
+        let below = merged_late(3, 99, &[], 0);
+        assert!(plan(&policy(), at_hour(10.0), &[below], &none, 4, 10).is_empty());
+        let past = merged_late(3, 100, &[7], 100);
+        let sources = past.sources();
+        assert_eq!(
+            merged(&plan(&policy(), at_hour(10.0), &[past], &none, 4, 10)),
+            vec![(sources[..3].to_vec(), 10)]
+        );
+    }
+
+    #[test]
+    fn rewrites_a_merged_segments_runs_once_late_runs_reach_half_of_it() {
+        let none = HashMap::new();
+        // Late L0s don't count, as they don't go into the rewrite.
+        let below = merged_late(1, 800, &[7, 6, 5, 4], 199);
+        assert!(plan(&policy(), at_hour(10.0), &[below], &none, 4, 10).is_empty());
+        let half = merged_late(1, 0, &[7, 6, 5, 4], 200);
+        let sources = half.sources();
+        assert_eq!(
+            merged(&plan(&policy(), at_hour(10.0), &[half], &none, 4, 10)),
+            vec![(sources[1..].to_vec(), 3)]
+        );
+    }
+
+    #[test]
+    fn merges_late_l0s_and_runs_beside_each_other() {
+        let late = merged_late(2, 100, &[7, 6, 5, 4], 200);
+        let sources = late.sources();
+        let busy = |l0, runs| HashMap::from([(late.prefix.clone(), Busy { l0, runs })]);
+        let planned = |busy| {
+            merged(&plan(
+                &policy(),
+                at_hour(10.0),
+                std::slice::from_ref(&late),
+                &busy,
+                4,
+                10,
+            ))
+        };
+        assert_eq!(planned(busy(true, false)), vec![(sources[2..].to_vec(), 3)]);
+        assert_eq!(
+            planned(busy(false, true)),
+            vec![(sources[..2].to_vec(), 10)]
+        );
+        assert!(planned(busy(true, true)).is_empty());
+        // Nor beside a segment's first merge, which takes all its sources.
+        let unmerged = SegmentState {
+            oldest_ms: 0,
+            ..late.clone()
+        };
+        let busy = HashMap::from([(
+            late.prefix.clone(),
+            Busy {
+                l0: false,
+                runs: true,
+            },
+        )]);
+        assert!(plan(&policy(), at_hour(10.0), &[unmerged], &busy, 4, 10).is_empty());
+    }
+
+    #[test]
+    fn bounds_a_merged_segment_past_the_source_cap_by_its_late_l0s() {
+        let policy = policy().with_max_open_sources(4);
+        let none = HashMap::new();
+        let over = merged_late(2, 2, &[7, 6], 10);
+        let sources = over.sources();
+        assert_eq!(
+            merged(&plan(&policy, at_hour(10.0), &[over], &none, 4, 10)),
+            vec![(sources[..2].to_vec(), 10)]
+        );
+        // With one L0 left, its runs once their late bytes are worth it.
+        let runs = merged_late(1, 1, &[7, 6, 5], 10);
+        let sources = runs.sources();
+        assert_eq!(
+            merged(&plan(&policy, at_hour(10.0), &[runs], &none, 4, 10)),
+            vec![(sources[1..].to_vec(), 3)]
         );
     }
 
@@ -1153,17 +1390,19 @@ mod tests {
     }
 
     #[test]
-    fn relief_is_l0s_of_a_segment_still_taking_writes() {
+    fn relief_is_l0s_alone_or_of_a_segment_still_taking_writes() {
         let policy = policy();
         let l0 = vec![SourceId::SstView(ulid::Ulid::from_parts(1, 0))];
         let runs = vec![SourceId::SortedRun(1), SourceId::SortedRun(2)];
+        let both = [l0.clone(), runs.clone()].concat();
         let hour = |sources: &Vec<SourceId>| {
             CompactionSpec::for_segment(Bytes::from_static(&[1]), sources.clone(), 1)
         };
         // Hour 1 ends at 2h and its grace at 2.5h.
-        assert!(policy.relief(&hour(&l0), at_hour(1.5)));
-        assert!(policy.relief(&hour(&l0), at_hour(2.4)));
-        assert!(!policy.relief(&hour(&l0), at_hour(2.5)));
+        assert!(policy.relief(&hour(&both), at_hour(1.5)));
+        assert!(policy.relief(&hour(&both), at_hour(2.4)));
+        assert!(!policy.relief(&hour(&both), at_hour(2.5)));
+        assert!(policy.relief(&hour(&l0), at_hour(2.5)));
         assert!(!policy.relief(&hour(&runs), at_hour(1.5)));
         let unbounded = CompactionSpec::for_segment(Bytes::from_static(&[0xff]), l0.clone(), 1);
         assert!(policy.relief(&unbounded, at_hour(100.0)));
@@ -1173,11 +1412,12 @@ mod tests {
 
     #[test]
     fn re_merges_late_writes_only_once_they_add_up() {
-        let none = HashSet::new();
+        let none = HashMap::new();
         let merged_at = at_hour(2.6);
         let late = |l0: usize, bytes: u64| SegmentState {
             oldest_ms: merged_at,
             bytes: 1_000 + bytes,
+            l0_bytes: bytes,
             largest: 1_000,
             ..segment(1, l0, &[3], at_hour(5.0))
         };
@@ -1187,11 +1427,10 @@ mod tests {
             prefixes(&plan(&policy(), at_hour(5.0), &[late(3, 63)], &none, 4, 10)),
             vec![("merge", 1)]
         );
-        // Past the source cap, a smaller share is enough.
-        assert!(plan(&policy(), at_hour(5.0), &[late(8, 10)], &none, 4, 10).is_empty());
+        // Past the source cap, any share, since they leave the run alone.
         assert_eq!(
-            prefixes(&plan(&policy(), at_hour(5.0), &[late(8, 16)], &none, 4, 10)),
-            vec![("merge", 1)]
+            merged(&plan(&policy(), at_hour(5.0), &[late(8, 1)], &none, 4, 10)),
+            vec![(late(8, 1).sources()[..8].to_vec(), 10)]
         );
     }
 
@@ -1201,7 +1440,7 @@ mod tests {
         let policy = policy()
             .with_holds(holds.clone())
             .with_unsealed(Arc::new(|prefix, _| prefix == [2]));
-        let none = HashSet::new();
+        let none = HashMap::new();
         let segments = [segment(1, 2, &[3], 0), segment(2, 2, &[4], 0)];
         // No hold, as after a failed rollup or a restart.
         assert_eq!(
@@ -1220,7 +1459,7 @@ mod tests {
     fn holds_a_copy_target_then_merges_it_first_on_request() {
         let holds = MergeHolds::default();
         let policy = policy().with_holds(holds.clone());
-        let none = HashSet::new();
+        let none = HashMap::new();
         let segments = [
             segment(1, 2, &[3], 0),
             SegmentState {

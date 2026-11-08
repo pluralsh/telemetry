@@ -7,7 +7,9 @@
 pub enum Error {
     #[error("invalid log data: {0}")]
     Invalid(String),
-    #[error("write buffer is full")]
+    /// The write budget is full, or ingest admission is shedding while L0
+    /// compaction catches up.
+    #[error("writer is at capacity, retry later")]
     Backpressure,
     #[error("Logs is temporarily unavailable: {0}")]
     Unavailable(String),

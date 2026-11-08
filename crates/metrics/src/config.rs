@@ -70,7 +70,23 @@ pub struct Config {
     /// Estimated bytes SlateDB's compactions of every shard of the process
     /// hold at once; see [`common::storage::compaction::CompactionMemory`].
     pub compaction_memory_bytes: u64,
+
+    /// Estimated bytes of writes, summed over every bucket, namespace and
+    /// shard of the process, applied but not yet written to storage; see
+    /// [`common::write_budget::WriteBudget`]. Ingest past it is rejected
+    /// with backpressure. Writes hold about
+    /// [`RESIDENT_BYTES_PER_WRITE_BYTE`] times this resident.
+    pub write_budget_bytes: u64,
 }
+
+/// Resident bytes per byte of [`Config::write_budget_bytes`] the write path
+/// holds at most: ingesting only new series, peak RSS grows about 3.5 times
+/// as fast as the budget, the deltas plus their encoded flushes.
+pub const RESIDENT_BYTES_PER_WRITE_BYTE: u64 = 4;
+
+/// Default [`Config::write_budget_bytes`]: 192 MiB, so the default 64 MiB
+/// deltas fit three times and the write path holds about 768 MiB.
+pub const DEFAULT_WRITE_BUDGET_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Background rollup of closed hour buckets into wider buckets.
 ///
@@ -184,6 +200,7 @@ impl Default for Config {
             query_limits: crate::QueryLimitsConfig::default(),
             rollup: RollupConfig::default(),
             compaction_memory_bytes: common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES,
+            write_budget_bytes: DEFAULT_WRITE_BUDGET_BYTES,
         }
     }
 }

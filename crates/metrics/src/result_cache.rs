@@ -146,6 +146,7 @@ pub(crate) struct ResultCache {
     entries: Cache<Arc<ResultKey>, Arc<ResultEntry>>,
     reused_steps: AtomicU64,
     computed_steps: AtomicU64,
+    used: common::cache_gauge::CacheGauge,
 }
 
 /// How a request splits into reused and evaluated steps.
@@ -168,6 +169,7 @@ impl ResultCache {
                 .build(),
             reused_steps: AtomicU64::new(0),
             computed_steps: AtomicU64::new(0),
+            used: common::cache_gauge::CacheGauge::new("metrics_results"),
         }
     }
 
@@ -251,6 +253,7 @@ impl ResultCache {
         self.entries
             .insert(Arc::clone(&plan.key), Arc::new(entry))
             .await;
+        self.used.set(self.entries.weighted_size());
     }
 
     pub(crate) fn record(&self, reused: usize, computed: usize) {

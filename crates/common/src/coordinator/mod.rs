@@ -205,7 +205,10 @@ const FLUSH_QUEUE_CAPACITY: usize = 2;
 /// Flush work requested while the flush queue was full, sent in order
 /// (delta first, then storage) as soon as the queue has room. Deferring the
 /// freeze keeps the write loop applying writes to the live delta instead of
-/// stalling on the flush task.
+/// stalling on the flush task, until the live delta reaches the size
+/// threshold: later writes then wait in their queue, so a coordinator holds
+/// at most the delta committing, the one encoding, the queued ones and a
+/// live one of about the threshold.
 #[derive(Default)]
 struct PendingFlush {
     delta: Option<FlushReason>,
@@ -310,7 +313,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
         loop {
             tokio::select! {
-                cmd = write_stream.next() => {
+                cmd = write_stream.next(), if !self.live_delta_full() => {
                     match cmd {
                         Some(WriteCommand::Write { write, result_tx }) => {
                             self.handle_write(write, result_tx).await?;
@@ -401,6 +404,13 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         }
 
         Ok(())
+    }
+
+    /// Whether the live delta has reached the size threshold while its
+    /// flush waits for room in the flush queue.
+    fn live_delta_full(&self) -> bool {
+        self.pending.delta.is_some()
+            && self.delta.estimate_size() >= self.config.flush_size_threshold
     }
 
     /// Queues a delta flush (if the delta has writes) and optionally a

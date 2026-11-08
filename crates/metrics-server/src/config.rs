@@ -230,6 +230,13 @@ pub struct Config {
     /// 640 MiB. Binaries before this option reject configs that set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_memory_bytes: Option<u64>,
+    /// Estimated bytes of writes applied but not yet written to storage,
+    /// summed over every shard; ingest past it is rejected with 429. Writes
+    /// hold about [`plural_metrics::RESIDENT_BYTES_PER_WRITE_BYTE`] times
+    /// it resident. Defaults to 192 MiB. Binaries before this option reject
+    /// configs that set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_budget_bytes: Option<u64>,
     /// Merged over [`server_common::warmer::reader_warmer_defaults`]: keys a
     /// config leaves out keep the reader defaults.
     #[serde(deserialize_with = "server_common::warmer::deserialize_reader_warmer")]
@@ -260,6 +267,7 @@ impl Default for Config {
             query: QueryConfig::default(),
             rollup: RollupConfig::default(),
             compaction_memory_bytes: None,
+            write_budget_bytes: None,
             cache_warmer: server_common::warmer::reader_warmer_defaults(),
             write: WriteConfig::default(),
             request: RequestConfig::default(),
@@ -319,6 +327,11 @@ impl Config {
         if self.compaction_memory_bytes == Some(0) {
             return Err(ConfigError::Validation(
                 "compaction_memory_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        if self.write_budget_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "write_budget_bytes must be greater than zero".to_owned(),
             ));
         }
         self.cache_warmer

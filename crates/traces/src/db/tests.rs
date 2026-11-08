@@ -42,6 +42,7 @@ fn test_config() -> Config {
         write_buffer: Default::default(),
         read_cache: Default::default(),
         compaction_memory_bytes: Config::default().compaction_memory_bytes,
+        write_budget_bytes: Config::default().write_budget_bytes,
     }
 }
 
@@ -87,6 +88,64 @@ fn trace(
         }],
     )
     .unwrap()
+}
+
+async fn settled_write_budget(db: &TraceDb) -> u64 {
+    let budget = db.write_budget.as_ref().unwrap();
+    for _ in 0..100 {
+        if budget.available() == budget.capacity() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    budget.available()
+}
+
+#[tokio::test]
+async fn applied_writes_hold_the_write_budget_until_written() {
+    let mut config = test_config();
+    config.write_budget_bytes = 4_096;
+    let db = TraceDb::open(config).await.unwrap();
+    let namespace = Namespace::new("budgeted").unwrap();
+    let batch = |id, bytes| {
+        vec![TraceBatch {
+            traces: vec![trace(
+                id,
+                u64::from(id),
+                &"x".repeat(bytes),
+                Vec::new(),
+                Vec::new(),
+            )],
+        }]
+    };
+
+    // Below a third of the budget, so the buffer is not frozen for it.
+    db.write_with_durability(&namespace, batch(1, 1_000), Durability::Applied)
+        .await
+        .unwrap();
+    assert!(db.write_budget.as_ref().unwrap().available() <= 4_096 - 1_000);
+    // It does not fit beside the unwritten first, so it has the first
+    // flushed and waits for the room that frees rather than being turned
+    // away.
+    db.write_with_durability(&namespace, batch(2, 3_000), Durability::Written)
+        .await
+        .unwrap();
+    assert_eq!(settled_write_budget(&db).await, 4_096);
+
+    // Room no flush frees turns ingest away once it has waited.
+    let held = db
+        .write_budget
+        .as_ref()
+        .unwrap()
+        .ingest(4_096, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.write_with_durability(&namespace, batch(3, 1_000), Durability::Applied)
+            .await,
+        Err(Error::Backpressure)
+    ));
+    drop(held);
 }
 
 #[tokio::test]

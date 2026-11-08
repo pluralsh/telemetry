@@ -11,8 +11,11 @@
 //! and age out.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use common::cache_gauge::CacheGauge;
 
 use crate::Namespace;
 use crate::codec::ObjectRef;
@@ -26,6 +29,7 @@ const BLOCK_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 #[derive(Clone)]
 pub(crate) struct BlockCache {
     blocks: Option<moka::sync::Cache<BlockKey, Block>>,
+    used: Arc<CacheGauge>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -58,6 +62,7 @@ impl BlockCache {
                     })
                     .build()
             }),
+            used: Arc::new(CacheGauge::new("logs_blocks")),
         }
     }
 
@@ -121,5 +126,6 @@ impl BlockCache {
             }
             cache.insert(key.clone(), block.clone());
         }
+        self.used.set(cache.weighted_size());
     }
 }

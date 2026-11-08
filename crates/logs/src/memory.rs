@@ -41,12 +41,19 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::error::{Error, Result};
 
+/// How long ingest waits for room in the write budget before it is turned
+/// away, as long as clients are told to wait before retrying. Concurrent
+/// requests arrive faster than one flush frees the budget, so failing at
+/// once would reject bursts that fit a moment later.
+pub(crate) const INGEST_WAIT: Duration = Duration::from_secs(1);
+
 /// Default [`MemoryConfig::decode_bytes`]: 256 MiB.
 pub const DEFAULT_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Default [`MemoryConfig::write_bytes`]: 16 MiB. A flush holds about 23
-/// times its bytes while it builds its storage writes, so about 370 MiB.
-pub const DEFAULT_WRITE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+/// Default [`MemoryConfig::write_bytes`]: 24 MiB, so the default 8 MiB
+/// buffer threshold fits three times. A flush holds about 23 times its
+/// bytes while it builds its storage writes, so about 185 MiB.
+pub const DEFAULT_WRITE_BUDGET_BYTES: u64 = 24 * 1024 * 1024;
 
 /// Resident bytes a compactor merge holds per stored byte it reads: the
 /// inputs' blocks, the merged object's, and SlateDB's memtable copy of its
@@ -57,21 +64,10 @@ pub const MERGE_BYTES_PER_INPUT_BYTE: u64 = 4;
 /// `max_object_bytes` of inputs.
 pub const DEFAULT_MERGE_BUDGET_BYTES: u64 = MERGE_BYTES_PER_INPUT_BYTE * 32 * 1024 * 1024;
 
-/// Logs' SlateDB `max_unflushed_bytes`, 128 MiB rather than SlateDB's
-/// 1 GiB: the estimated encoded size of the memtables and WAL buffer past
-/// which SlateDB holds new writes until L0 flushes catch up. Memtables hold
-/// about 2.5 times their estimate, and readers replay the same unflushed
-/// WAL, so this bounds both. It must exceed `l0_sst_size_bytes`, which
-/// stays at SlateDB's 64 MiB: smaller L0 SSTs stall writes on L0 count.
-pub const DEFAULT_MAX_UNFLUSHED_BYTES: usize = 128 * 1024 * 1024;
-
-/// SlateDB's settings with logs' memtable bound, the base a settings file
-/// or `SLATEDB_` environment variables override.
+/// SlateDB's settings with the writers' memtable bound, the base a settings
+/// file or `SLATEDB_` environment variables override.
 pub(crate) fn slatedb_settings() -> slatedb::config::Settings {
-    slatedb::config::Settings {
-        max_unflushed_bytes: DEFAULT_MAX_UNFLUSHED_BYTES,
-        ..common::storage::settings::base_settings()
-    }
+    common::storage::settings::writer_settings()
 }
 
 /// Byte budgets of a process's [`MemoryBudget`].
@@ -83,8 +79,9 @@ pub struct MemoryConfig {
     /// Estimated bytes of writes the process has applied but not yet
     /// written to storage, and so the most one flush holds. Ingest past it
     /// fails with [`Error::Backpressure`]; rollup copies wait for room. The
-    /// write buffer freezes at half of it at most, whatever its
-    /// `flush_size_threshold`, so ingest has room while a flush is written.
+    /// write buffer freezes at a third of it at most, whatever its
+    /// `flush_size_threshold`, so ingest has room while one flush is encoded
+    /// and the one before it written.
     pub write_bytes: u64,
     /// Estimated bytes the compactor merges of every shard hold at once.
     pub merge_bytes: u64,
@@ -119,7 +116,8 @@ pub(crate) struct MemoryBudget {
 /// Who a write's bytes are held for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Writer {
-    /// Fails at once when the budget is full, so clients retry later.
+    /// Waits up to [`INGEST_WAIT`] for room, then fails so clients retry
+    /// later.
     Ingest,
     /// Waits for room in its half of the budget.
     Copy,
@@ -154,9 +152,9 @@ impl MemoryBudget {
         self.compaction.clone()
     }
 
-    /// Holds `bytes` of applied writes until the permit drops. Ingest fails
-    /// with [`Error::Backpressure`] at once when they do not fit; a copy
-    /// waits up to `wait` for its half of the budget and then the budget.
+    /// Holds `bytes` of applied writes until the permit drops. Ingest waits
+    /// up to `wait` for the budget, a copy for its half of the budget and
+    /// then the budget; either fails with [`Error::Backpressure`] after.
     pub(crate) async fn write(
         &self,
         writer: Writer,
@@ -166,7 +164,7 @@ impl MemoryBudget {
         match writer {
             Writer::Ingest => Ok(WritePermit {
                 _copy: None,
-                _write: self.write.try_acquire(bytes)?,
+                _write: self.write.acquire_within(bytes, wait).await?,
             }),
             Writer::Copy => tokio::time::timeout(wait, async {
                 let bytes = bytes.min(u64::from(self.copy.capacity));
@@ -258,16 +256,26 @@ impl Budget {
         Ok(self.held(permit))
     }
 
-    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Result<BudgetPermit> {
-        match Arc::clone(&self.semaphore).try_acquire_many_owned(self.weight(bytes)) {
-            Ok(permit) => Ok(self.held(permit)),
-            Err(TryAcquireError::NoPermits) => {
+    /// Waits up to `wait` for `bytes`, then fails with backpressure.
+    async fn acquire_within(self: &Arc<Self>, bytes: u64, wait: Duration) -> Result<BudgetPermit> {
+        let weight = self.weight(bytes);
+        match Arc::clone(&self.semaphore).try_acquire_many_owned(weight) {
+            Ok(permit) => return Ok(self.held(permit)),
+            Err(TryAcquireError::Closed) => {
+                return Err(Error::Unavailable(format!("{} budget closed", self.name)));
+            }
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        ::metrics::counter!("logs_memory_budget_waits_total", "budget" => self.name).increment(1);
+        match tokio::time::timeout(wait, Arc::clone(&self.semaphore).acquire_many_owned(weight))
+            .await
+        {
+            Ok(Ok(permit)) => Ok(self.held(permit)),
+            Ok(Err(_)) => Err(Error::Unavailable(format!("{} budget closed", self.name))),
+            Err(_) => {
                 ::metrics::counter!("logs_memory_budget_rejections_total", "budget" => self.name)
                     .increment(1);
                 Err(Error::Backpressure)
-            }
-            Err(TryAcquireError::Closed) => {
-                Err(Error::Unavailable(format!("{} budget closed", self.name)))
             }
         }
     }
@@ -374,7 +382,10 @@ mod tests {
     #[test]
     fn slatedb_settings_cap_unflushed_bytes_above_the_l0_sst_size() {
         let settings = slatedb_settings();
-        assert_eq!(settings.max_unflushed_bytes, DEFAULT_MAX_UNFLUSHED_BYTES);
+        assert_eq!(
+            settings.max_unflushed_bytes,
+            common::storage::settings::DEFAULT_MAX_UNFLUSHED_BYTES
+        );
         assert!(settings.max_unflushed_bytes > settings.l0_sst_size_bytes);
     }
 

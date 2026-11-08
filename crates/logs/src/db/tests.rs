@@ -777,31 +777,37 @@ async fn applied_writes_hold_the_write_budget_until_written() {
         )]
     };
 
-    // Below half the budget, so the buffer is not frozen for it.
-    db.write_with_durability(&namespace, batch(1, 1_500), Durability::Applied)
+    // Below a third of the budget, so the buffer is not frozen for it.
+    db.write_with_durability(&namespace, batch(1, 1_000), Durability::Applied)
         .await
         .unwrap();
-    assert!(db.memory.write_available() <= 4_096 - 1_500);
-    // It does not fit beside the unwritten first; ingest is turned away
-    // rather than buffered past the budget.
-    assert!(matches!(
-        db.write_with_durability(&namespace, batch(2, 3_000), Durability::Applied)
-            .await,
-        Err(Error::Backpressure)
-    ));
-
-    db.flush_written().await.unwrap();
-    assert_eq!(settled_write_budget(&db).await, 4_096);
+    assert!(db.memory.write_available() <= 4_096 - 1_000);
+    // It does not fit beside the unwritten first, so it has the first
+    // flushed and waits for the room that frees rather than being turned
+    // away.
     db.write_with_durability(&namespace, batch(2, 3_000), Durability::Written)
         .await
         .unwrap();
     assert_eq!(db.read(&namespace, 0, 3, &[]).await.unwrap().len(), 2);
     assert_eq!(settled_write_budget(&db).await, 4_096);
+
+    // Room no flush frees turns ingest away once it has waited.
+    let held = db
+        .memory
+        .write(Writer::Ingest, 4_096, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.write_with_durability(&namespace, batch(3, 1_000), Durability::Applied)
+            .await,
+        Err(Error::Backpressure)
+    ));
+    drop(held);
     db.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn the_write_buffer_freezes_at_half_the_write_budget() {
+async fn the_write_buffer_freezes_at_a_third_of_the_write_budget() {
     let mut config = test_config();
     config.memory.write_bytes = 4_096;
     // Far past the budget, and an interval the test does not wait for.
@@ -814,7 +820,7 @@ async fn the_write_buffer_freezes_at_half_the_write_budget() {
         &namespace,
         vec![LogBatch::new(
             labels("api", "prod"),
-            vec![LogEntry::new(1, "x".repeat(3_000))],
+            vec![LogEntry::new(1, "x".repeat(1_500))],
         )],
         Durability::Applied,
     )
@@ -828,7 +834,9 @@ async fn the_write_buffer_freezes_at_half_the_write_budget() {
 
 #[tokio::test]
 async fn databases_opened_with_one_budget_share_it() {
-    let config = test_config();
+    let mut config = test_config();
+    // Only the test's flushes free the budget the shards share.
+    config.write_buffer.flush_interval = Duration::from_secs(3_600);
     let memory = MemoryBudget::new(&crate::MemoryConfig {
         decode_bytes: 1 << 20,
         write_bytes: 4_096,
@@ -848,25 +856,29 @@ async fn databases_opened_with_one_budget_share_it() {
         open("shard-1").await.unwrap(),
     );
     let namespace = Namespace::new("shared").unwrap();
-    let batch = vec![LogBatch::new(
-        labels("api", "prod"),
-        vec![LogEntry::new(1, "x".repeat(3_000))],
-    )];
+    let batch = |bytes| {
+        vec![LogBatch::new(
+            labels("api", "prod"),
+            vec![LogEntry::new(1, "x".repeat(bytes))],
+        )]
+    };
 
+    // Below a third of the budget, so the first shard holds it unwritten.
     first
-        .write_with_durability(&namespace, batch.clone(), Durability::Applied)
+        .write_with_durability(&namespace, batch(1_000), Durability::Applied)
         .await
         .unwrap();
+    // The second shard's flushes cannot free the first's share.
     assert!(matches!(
         second
-            .write_with_durability(&namespace, batch.clone(), Durability::Applied)
+            .write_with_durability(&namespace, batch(3_500), Durability::Applied)
             .await,
         Err(Error::Backpressure)
     ));
     first.flush_written().await.unwrap();
     assert_eq!(settled_write_budget(&second).await, 4_096);
     second
-        .write_with_durability(&namespace, batch, Durability::Written)
+        .write_with_durability(&namespace, batch(3_500), Durability::Written)
         .await
         .unwrap();
     first.close().await.unwrap();

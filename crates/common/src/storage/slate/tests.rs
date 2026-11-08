@@ -48,6 +48,52 @@ async fn should_read_data_written_by_storage_via_reader() {
 }
 
 #[tokio::test]
+async fn should_shed_ingest_as_l0_nears_its_stall_limit() {
+    // given: a writer whose L0 nothing compacts
+    let settings = Settings {
+        compactor_options: None,
+        l0_max_ssts: 16,
+        max_unflushed_bytes: 128 << 20,
+        l0_sst_size_bytes: 64 << 20,
+        l0_flush_parallelism: 1,
+        ..Settings::default()
+    };
+    let limit = L0Limit::of(&settings);
+    let db = DbBuilder::new("admission", Arc::new(InMemory::new()))
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap();
+    let storage = SlateDbStorage::new(Arc::new(db)).with_l0_limit(limit);
+    let admission = storage.admission();
+    let admitted = |admission: &Admission| (0..40).filter(|_| admission.admits()).count();
+    assert_eq!(admitted(&admission), 40);
+
+    // when: ten L0 SSTs, five eighths of the limit
+    for i in 0..10 {
+        storage
+            .put(vec![
+                Record::new(Bytes::from(format!("k{i}")), Bytes::from("v")).into(),
+            ])
+            .await
+            .unwrap();
+        storage.flush_memtable().await.unwrap();
+    }
+
+    // then: a quarter of ingest is turned away
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while storage.db().manifest().l0().len() < 10 || admitted(&admission) == 40 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "admission never saw the L0"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(admitted(&admission), 30);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn should_flush_memtable_to_l0_periodically_only_after_writes() {
     // given: a storage whose periodic flusher runs every 50 ms
     let db = DbBuilder::new("periodic-flush", Arc::new(InMemory::new()))

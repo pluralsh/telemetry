@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use super::admission::L0Limit;
 use super::coalescing::CoalescingObjectStore;
 use super::compaction::SegmentCompaction;
 use super::config::{
@@ -73,6 +74,8 @@ enum StorageBuilderInner {
         sst_reader: SstReader,
         /// See [`SlateDbStorage::with_meta_cache`].
         meta: Option<CacheUsage>,
+        /// What ingest admission sheds against.
+        l0_limit: L0Limit,
     },
 }
 
@@ -134,6 +137,7 @@ impl StorageBuilder {
                     None => create_object_store(&slate_config.object_store)?,
                 };
                 let mut settings = load_settings_over(base, slate_config)?;
+                let l0_limit = L0Limit::of(&settings);
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
@@ -164,6 +168,7 @@ impl StorageBuilder {
                     path: slate_config.path.clone(),
                     sst_reader,
                     meta,
+                    l0_limit,
                 }
             }
         };
@@ -194,6 +199,7 @@ impl StorageBuilder {
             path,
             sst_reader,
             meta,
+            l0_limit,
         } = self.inner
         {
             self.inner = StorageBuilderInner::SlateDb {
@@ -202,6 +208,7 @@ impl StorageBuilder {
                 path,
                 sst_reader,
                 meta,
+                l0_limit,
             };
         }
         self
@@ -247,6 +254,7 @@ impl StorageBuilder {
                 path,
                 sst_reader,
                 meta,
+                l0_limit,
             } => {
                 let mut db_builder = *db_builder;
                 if let Some(pending) = compactor {
@@ -287,7 +295,8 @@ impl StorageBuilder {
                     SlateDbStorage::new(Arc::new(db))
                         .with_sst_reader(sst_reader)
                         .with_meta_cache(meta)
-                        .with_memtable_flush(MEMTABLE_FLUSH_INTERVAL),
+                        .with_memtable_flush(MEMTABLE_FLUSH_INTERVAL)
+                        .with_l0_limit(l0_limit),
                 ))
             }
         }

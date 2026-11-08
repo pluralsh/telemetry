@@ -275,6 +275,9 @@ pub(crate) struct Tsdb {
     /// per-record expiration.
     retention: Option<Duration>,
     write_buffer: common::coordinator::WriteCoordinatorConfig,
+    /// Shared by every bucket's writes, and every namespace's and shard's,
+    /// so applied deltas not yet written stay within it together.
+    write_budget: Option<common::write_budget::WriteBudget>,
 
     /// Rolling HLL ring estimating unique series seen in the last ~15 min.
     /// Updated and published to `tsdb_active_series` by the flusher.
@@ -340,6 +343,7 @@ impl Tsdb {
             rollup_lock: Mutex::new(()),
             retention,
             write_buffer,
+            write_budget: None,
             active_series,
             postings_cache: Arc::new(PostingsCache::new(
                 retention,
@@ -350,6 +354,15 @@ impl Tsdb {
             )),
             series_cache: Arc::new(SeriesCache::new(query_cache.series_capacity_bytes)),
         }
+    }
+
+    /// Holds every bucket's writes in `budget`.
+    pub(crate) fn with_write_budget(
+        mut self,
+        budget: Option<common::write_budget::WriteBudget>,
+    ) -> Self {
+        self.write_budget = budget;
+        self
     }
 
     /// Returns a read handle to the underlying storage, for background tasks
@@ -384,6 +397,7 @@ impl Tsdb {
                 self.active_series.clone(),
                 self.write_buffer.clone(),
                 Some(self.postings_cache.clone()),
+                self.write_budget.clone(),
             )
             .await?,
         );
@@ -580,6 +594,7 @@ impl Tsdb {
         }
 
         let buckets_touched = bucket_series_map.len();
+        self.flush_if_budget_full(&bucket_series_map).await?;
 
         // Second pass: ingest all series for each bucket in a single batch
         for (bucket, series_list) in bucket_series_map {
@@ -622,6 +637,27 @@ impl Tsdb {
             "Completed ingesting all samples"
         );
 
+        Ok(())
+    }
+
+    /// Asks every open bucket to flush when `batches` would not fit in the
+    /// write budget: a bucket no longer written to holds its share until
+    /// its flush interval otherwise, which flushing the written ones alone
+    /// cannot free.
+    async fn flush_if_budget_full(&self, batches: &HashMap<TimeBucket, Vec<Series>>) -> Result<()> {
+        let Some(budget) = &self.write_budget else {
+            return Ok(());
+        };
+        let bytes = batches
+            .values()
+            .map(|series| crate::minitsdb::write_bytes(series, true))
+            .sum();
+        if budget.fits(false, bytes) {
+            return Ok(());
+        }
+        self.ingest_cache.run_pending_tasks().await;
+        let minis: Vec<_> = self.ingest_cache.iter().map(|(_, mini)| mini).collect();
+        futures::future::try_join_all(minis.iter().map(|mini| mini.request_flush())).await?;
         Ok(())
     }
 

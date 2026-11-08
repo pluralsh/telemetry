@@ -88,6 +88,8 @@ pub(crate) struct TsdbWriteDelta {
     first_series_id: u32,
     next_series_id: u32,
     active_series: Arc<ActiveSeriesTracker>,
+    /// [`Delta::estimate_size`], kept as writes apply.
+    estimated_bytes: usize,
 }
 
 impl TsdbWriteDelta {
@@ -153,6 +155,7 @@ impl TsdbWriteDelta {
             points: Vec::new(),
             histograms: Vec::new(),
         });
+        self.estimated_bytes += samples_bytes(&samples, &histograms);
         entry.points.extend(samples);
         entry.histograms.extend(histograms);
         Ok(())
@@ -189,6 +192,7 @@ impl TsdbWriteDelta {
             .ok_or_else(|| Error::Internal("series ID space exhausted for bucket".to_owned()))?;
 
         self.series_dict_delta.insert(fingerprint, id);
+        self.estimated_bytes += SERIES_BYTES + labels_bytes(labels);
 
         let series_spec = SeriesSpec {
             unit: unit.clone(),
@@ -198,12 +202,15 @@ impl TsdbWriteDelta {
         self.forward_index.series.insert(id, series_spec);
 
         for label in labels {
-            self.inverted_index
+            let mut postings = self
+                .inverted_index
                 .postings
                 .entry(label.clone())
-                .or_default()
-                .value_mut()
-                .insert(id);
+                .or_insert_with(|| {
+                    self.estimated_bytes += POSTING_BYTES + label_bytes(label);
+                    Default::default()
+                });
+            postings.value_mut().insert(id);
         }
 
         Ok(id)
@@ -261,12 +268,43 @@ impl TsdbWriteDelta {
     }
 }
 
+/// Rough estimates of what a delta holds beyond its label bytes: per new
+/// series, with its dictionary entry, and per new posting of its indexes.
+/// Samples are in [`samples_bytes`].
+const SERIES_BYTES: usize = 192;
+const POSTING_BYTES: usize = 96;
+
+/// A label's strings and their allocation overhead.
+fn label_bytes(label: &Label) -> usize {
+    48 + label.name.len() + label.value.len()
+}
+
+fn labels_bytes(labels: &[Label]) -> usize {
+    labels.iter().map(label_bytes).sum()
+}
+
+/// The most registering a series with `labels` adds to a delta's
+/// [`Delta::estimate_size`]: the series and every posting new.
+pub(crate) fn new_series_bytes(labels: &[Label]) -> usize {
+    SERIES_BYTES + labels_bytes(labels) + labels.len() * POSTING_BYTES + labels_bytes(labels)
+}
+
+/// 16 bytes per float sample, and 64 per histogram plus 32 per bucket.
+pub(crate) fn samples_bytes(samples: &[Sample], histograms: &[HistogramSample]) -> usize {
+    samples.len() * 16
+        + histograms
+            .iter()
+            .map(|h| 64 + 32 * (h.histogram.positive.len() + h.histogram.negative.len()))
+            .sum::<usize>()
+}
+
 impl Delta for TsdbWriteDelta {
     type Context = TsdbContext;
     type Write = TsdbWrite;
     type Frozen = FrozenTsdbDelta;
     type FrozenView = ();
-    type ApplyResult = ();
+    /// How much the write grew [`Delta::estimate_size`].
+    type ApplyResult = usize;
     type DeltaView = ();
     /// Readers take a fresh storage snapshot per query instead. A SlateDB
     /// snapshot held in the coordinator's view would live as long as the
@@ -288,10 +326,12 @@ impl Delta for TsdbWriteDelta {
             first_series_id: context.next_series_id,
             next_series_id: context.next_series_id,
             active_series: context.active_series,
+            estimated_bytes: 0,
         }
     }
 
     fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
+        let before = self.estimated_bytes;
         match write {
             TsdbWrite::Samples(series) => series
                 .into_iter()
@@ -300,43 +340,25 @@ impl Delta for TsdbWriteDelta {
                 .into_iter()
                 .try_for_each(|series| self.register(series)),
         }
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        Ok(self.estimated_bytes - before)
     }
 
     fn estimate_size(&self) -> usize {
-        // Rough estimate: 16 bytes per float sample, 32 bytes per histogram
-        // bucket + index overhead
-        let sample_bytes: usize = self
-            .samples
-            .values()
-            .map(|s| {
-                s.points.len() * 16
-                    + s.histograms
-                        .iter()
-                        .map(|h| {
-                            64 + 32 * (h.histogram.positive.len() + h.histogram.negative.len())
-                        })
-                        .sum::<usize>()
-            })
-            .sum();
-        sample_bytes
-            + self.forward_index.series.len() * 128
-            + self.inverted_index.postings.len() * 64
+        self.estimated_bytes
     }
 
     fn freeze(mut self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         if crate::read_tuning::write_layout().sorted_series_ids {
             self.sort_new_series();
         }
-        // Merge base + delta into new Arc for the next context
-        let merged_dict = if self.series_dict_delta.is_empty() {
-            // O(1) when no new series
-            self.series_dict_base.clone()
-        } else {
-            let mut merged = (*self.series_dict_base).clone();
-            merged.extend(self.series_dict_delta.iter());
-            Arc::new(merged)
-        };
+        // Merge the overlay into the base for the next context. The live
+        // delta holds the only reference to the base, so this extends it in
+        // place rather than copying every series of the bucket per freeze.
+        let mut merged_dict = std::mem::take(&mut self.series_dict_base);
+        if !self.series_dict_delta.is_empty() {
+            Arc::make_mut(&mut merged_dict).extend(self.series_dict_delta.iter());
+        }
 
         let context = TsdbContext {
             namespace: self.namespace.clone(),
@@ -638,6 +660,30 @@ mod tests {
 
         // then: Arc should be the same pointer (O(1) clone, no merge)
         assert_eq!(Arc::as_ptr(&new_ctx.series_dict), base_ptr);
+    }
+
+    #[test]
+    fn should_extend_the_series_dict_in_place_when_new_series_freeze() {
+        // given
+        let mut delta = TsdbWriteDelta::init(create_test_context());
+        let base_ptr = Arc::as_ptr(&delta.series_dict_base);
+        delta
+            .apply(
+                vec![create_test_series(
+                    "up",
+                    vec![("job", "a")],
+                    create_test_sample(),
+                )]
+                .into(),
+            )
+            .unwrap();
+
+        // when
+        let (_, _, context) = delta.freeze();
+
+        // then
+        assert_eq!(Arc::as_ptr(&context.series_dict), base_ptr);
+        assert_eq!(context.series_dict.len(), 1);
     }
 
     #[test]

@@ -18,6 +18,10 @@ path = "src/main.rs"
 [features]
 default = ["kubernetes"]
 kubernetes = ["sharding/kubernetes", "dep:kube"]
+# Swaps in jemalloc with heap profiling, which `_RJEM_MALLOC_CONF`
+# (e.g. `prof:true,lg_prof_interval:30`) turns on, for finding what holds
+# memory. Off by default: mimalloc is faster on query paths.
+heap-profile = ["dep:tikv-jemallocator", "server-common/jemalloc-stats"]
 
 [lints]
 workspace = true
@@ -33,6 +37,7 @@ futures.workspace = true
 kube = { workspace = true, optional = true }
 metrics.workspace = true
 mimalloc.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }
 opentelemetry-proto = { workspace = true, features = ["trace", "with-serde", "gen-tonic"] }
 plural-traces = { path = "../traces" }
 prost.workspace = true

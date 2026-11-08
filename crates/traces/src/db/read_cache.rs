@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use common::cache_gauge::CacheGauge;
 use moka::future::Cache;
 
 use crate::codec::{StoredPageMetadata, TraceLocator};
@@ -86,6 +87,7 @@ pub(crate) struct ReadCache {
     /// Advanced by every locator invalidation, so a read that raced one
     /// drops what it cached.
     locator_epoch: AtomicU64,
+    used: CacheGauge,
 }
 
 fn weight(bytes: usize) -> u32 {
@@ -143,7 +145,18 @@ impl ReadCache {
             }),
             local_writer,
             locator_epoch: AtomicU64::new(0),
+            used: CacheGauge::new("traces_reads"),
         }
+    }
+
+    fn report(&self) {
+        let used = |cache: Option<u64>| cache.unwrap_or(0);
+        self.used.set(
+            used(self.metadata.as_ref().map(Cache::weighted_size))
+                + used(self.pages.as_ref().map(Cache::weighted_size))
+                + used(self.postings.as_ref().map(Cache::weighted_size))
+                + used(self.locators.as_ref().map(Cache::weighted_size)),
+        );
     }
 
     /// `trace_id`'s pages, if cached and known current without its head.
@@ -198,6 +211,7 @@ impl ReadCache {
         if self.locator_epoch.load(Ordering::SeqCst) != epoch {
             cache.invalidate(&key).await;
         }
+        self.report();
     }
 
     /// Drops the locators of every trace a flush wrote, after it is written.
@@ -233,6 +247,7 @@ impl ReadCache {
             cache
                 .insert((namespace.clone(), segment, sequence), Arc::clone(metadata))
                 .await;
+            self.report();
         }
     }
 
@@ -257,6 +272,7 @@ impl ReadCache {
             cache
                 .insert((namespace.clone(), segment, sequence), Arc::clone(page))
                 .await;
+            self.report();
         }
     }
 
@@ -278,6 +294,7 @@ impl ReadCache {
             .is_some_and(|cached| Arc::ptr_eq(&cached, page))
         {
             cache.insert(key, Arc::clone(page)).await;
+            self.report();
         }
     }
 
@@ -288,6 +305,7 @@ impl ReadCache {
     pub(crate) async fn insert_postings(&self, prefix: Bytes, postings: &Arc<SegmentPostings>) {
         if let Some(cache) = &self.postings {
             cache.insert(prefix, Arc::clone(postings)).await;
+            self.report();
         }
     }
 }

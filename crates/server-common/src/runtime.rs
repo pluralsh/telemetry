@@ -29,6 +29,33 @@ pub fn install_metrics_recorder() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("Prometheus recorder is already installed"))
 }
 
+/// Publishes jemalloc's byte counters every five seconds as
+/// `jemalloc_<counter>_bytes`, so what the process holds can be compared
+/// with what it has allocated.
+#[cfg(feature = "jemalloc-stats")]
+pub fn spawn_jemalloc_stats() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    std::thread::spawn(|| {
+        loop {
+            if epoch::advance().is_ok() {
+                for (name, value) in [
+                    ("allocated", stats::allocated::read()),
+                    ("active", stats::active::read()),
+                    ("metadata", stats::metadata::read()),
+                    ("resident", stats::resident::read()),
+                    ("mapped", stats::mapped::read()),
+                    ("retained", stats::retained::read()),
+                ] {
+                    if let Ok(value) = value {
+                        metrics::gauge!(format!("jemalloc_{name}_bytes")).set(value as f64);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
 /// Renders all process metrics using the Prometheus text exposition format.
 pub async fn scrape_metrics() -> String {
     PROMETHEUS_HANDLE

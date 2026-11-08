@@ -26,12 +26,22 @@ pub const DEFAULT_COMPACTED_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 /// rate.
 pub const DEFAULT_L0_FLUSH_PARALLELISM: usize = 1;
 
+/// How often the compactor looks for work and its worker for compactions to
+/// claim, 1 s rather than SlateDB's 5 s each. A segment runs one L0
+/// compaction at a time, so both waits fall between every two of them: at
+/// 5 s, a writer flushing an L0 SST every few seconds gains several L0 SSTs
+/// per compaction while its cores sit idle. Each poll reads the manifest,
+/// a request a second.
+pub const DEFAULT_COMPACTOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// SlateDB's defaults with the overrides every database shares:
 ///
 /// - `compacted_options.min_age` of [`DEFAULT_COMPACTED_GC_MIN_AGE`].
 /// - `enable_trivial_move`, so a compaction whose inputs don't overlap
 ///   relinks them instead of rewriting them.
 /// - `l0_flush_parallelism` of [`DEFAULT_L0_FLUSH_PARALLELISM`].
+/// - the compactor's and its worker's poll intervals of
+///   [`DEFAULT_COMPACTOR_POLL_INTERVAL`].
 pub fn base_settings() -> Settings {
     let mut settings = Settings {
         l0_flush_parallelism: DEFAULT_L0_FLUSH_PARALLELISM,
@@ -46,8 +56,60 @@ pub fn base_settings() -> Settings {
     }
     if let Some(compactor) = settings.compactor_options.as_mut() {
         compactor.enable_trivial_move = true;
+        compactor.poll_interval = DEFAULT_COMPACTOR_POLL_INTERVAL;
+        if let Some(worker) = compactor.worker.as_mut() {
+            worker.compactions_poll_interval = DEFAULT_COMPACTOR_POLL_INTERVAL;
+        }
     }
     settings
+}
+
+/// L0 SSTs a writer uploads at once. With one, a memtable that fills while
+/// the previous one still uploads holds every write: at about 15 MB/s of L0
+/// a 64 MiB upload competing with compaction for the object store did so
+/// every few seconds, and the write budget then turned ingest away. Each
+/// upload buffers up to about 90 MiB of parts.
+pub const DEFAULT_WRITER_L0_FLUSH_PARALLELISM: usize = 2;
+
+/// A writer's SlateDB `max_unflushed_bytes`, 192 MiB rather than SlateDB's
+/// 1 GiB: the estimated encoded size of the memtables and WAL buffer past
+/// which SlateDB holds new writes until L0 flushes catch up. That is one
+/// memtable filling beside [`DEFAULT_WRITER_L0_FLUSH_PARALLELISM`] flushing,
+/// of SlateDB's 64 MiB `l0_sst_size_bytes`. Memtables hold about 2.5 times
+/// their estimate, and readers replay the same unflushed WAL, so this
+/// bounds both.
+pub const DEFAULT_MAX_UNFLUSHED_BYTES: usize = 192 * 1024 * 1024;
+
+/// A writer's SlateDB `l0_max_ssts` and `l0_max_ssts_per_key`, 24 rather
+/// than SlateDB's 8: the L0 SSTs a segment may hold before flushes stall.
+/// Ingest admission stops taking writes [`L0Limit::backlog`] short of it,
+/// 5 SSTs here, and starts shedding at five eighths, so it tapers over 4.
+/// See [`l0_max_ssts_for`].
+///
+/// [`L0Limit::backlog`]: super::admission::L0Limit::backlog
+pub const DEFAULT_WRITER_L0_MAX_SSTS: usize = 24;
+
+/// The least `l0_max_ssts` over which admission tapers ingest across 4 L0
+/// SSTs before it stops taking writes, for a writer whose unflushed writes
+/// and uploads add `backlog` SSTs: shedding starts at five eighths of the
+/// limit and stops `backlog` short of it, so the limit is at least
+/// `8 (backlog + 3) / 3`, rounded up to a multiple of 8.
+pub const fn l0_max_ssts_for(backlog: usize) -> usize {
+    (8 * (backlog + 3)).div_ceil(3).next_multiple_of(8)
+}
+
+/// [`base_settings`] with a writer's unflushed bytes, L0 uploads and L0
+/// limit: [`DEFAULT_MAX_UNFLUSHED_BYTES`],
+/// [`DEFAULT_WRITER_L0_FLUSH_PARALLELISM`] and
+/// [`DEFAULT_WRITER_L0_MAX_SSTS`].
+pub fn writer_settings() -> Settings {
+    Settings {
+        max_unflushed_bytes: DEFAULT_MAX_UNFLUSHED_BYTES,
+        l0_flush_parallelism: DEFAULT_WRITER_L0_FLUSH_PARALLELISM,
+        l0_max_ssts: DEFAULT_WRITER_L0_MAX_SSTS,
+        l0_max_ssts_per_key: DEFAULT_WRITER_L0_MAX_SSTS,
+        ..base_settings()
+    }
 }
 
 /// Loads SlateDB settings the way `Settings::from_file` / `Settings::load`
@@ -125,7 +187,34 @@ mod tests {
             Some(DEFAULT_COMPACTED_GC_MIN_AGE)
         );
         assert_eq!(settings.l0_flush_parallelism, DEFAULT_L0_FLUSH_PARALLELISM);
-        assert!(settings.compactor_options.unwrap().enable_trivial_move);
+        let compactor = settings.compactor_options.unwrap();
+        assert!(compactor.enable_trivial_move);
+        assert_eq!(compactor.poll_interval, DEFAULT_COMPACTOR_POLL_INTERVAL);
+        assert_eq!(
+            compactor.worker.unwrap().compactions_poll_interval,
+            DEFAULT_COMPACTOR_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn writer_settings_cap_unflushed_bytes_above_the_l0_sst_size() {
+        let settings = load_settings_over(writer_settings(), &config(None)).unwrap();
+        assert_eq!(settings.max_unflushed_bytes, DEFAULT_MAX_UNFLUSHED_BYTES);
+        assert!(settings.max_unflushed_bytes > settings.l0_sst_size_bytes);
+        assert_eq!(
+            settings.l0_flush_parallelism,
+            DEFAULT_WRITER_L0_FLUSH_PARALLELISM
+        );
+        assert_eq!(settings.l0_max_ssts, DEFAULT_WRITER_L0_MAX_SSTS);
+        assert_eq!(settings.l0_max_ssts_per_key, DEFAULT_WRITER_L0_MAX_SSTS);
+    }
+
+    #[test]
+    fn writers_shed_ingest_over_several_l0_ssts_before_stalling() {
+        let limit = super::super::admission::L0Limit::of(&writer_settings());
+        assert_eq!(limit.backlog, 5);
+        assert_eq!(limit.max_ssts, l0_max_ssts_for(limit.backlog));
+        assert!(limit.max_ssts.div_ceil(8) * 5 + 3 <= limit.max_ssts - limit.backlog);
     }
 
     #[test]

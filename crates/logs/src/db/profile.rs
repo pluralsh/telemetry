@@ -1451,6 +1451,7 @@ async fn cold_reader_cached(
     .unwrap();
     let db = LogDb {
         storage,
+        admission: common::storage::admission::Admission::unlimited(),
         writer: None,
         segment_ns: duration_ns(config.segment_duration).unwrap(),
         rollup_ns: config

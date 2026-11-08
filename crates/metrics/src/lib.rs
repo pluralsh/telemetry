@@ -47,7 +47,10 @@ pub mod testing;
 
 pub use admission::{DEFAULT_MAX_QUERY_MEMORY_BYTES, QueryLimitsConfig};
 pub use common::namespace::{Namespace, NamespaceError};
-pub use config::{Config, DEFAULT_RETENTION, QueryCacheConfig, RollupConfig};
+pub use config::{
+    Config, DEFAULT_RETENTION, DEFAULT_WRITE_BUDGET_BYTES, QueryCacheConfig,
+    RESIDENT_BYTES_PER_WRITE_BYTE, RollupConfig,
+};
 pub use error::{Error, QueryError, Result};
 pub use histogram::{Bucket, CounterResetHint, FloatHistogram};
 pub use model::{

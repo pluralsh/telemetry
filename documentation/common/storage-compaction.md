@@ -29,9 +29,14 @@ remaining `max_concurrent_compactions` slots, oldest segment first:
   sixteenth of its largest run, or a sixty-fourth once it has more than 8
   sources, so a trickle of late writes doesn't rewrite a large segment each
   time.
-- **Cap.** A segment still taking writes is merged whenever it has more than
-  8 L0 SSTs and sorted runs, so a query over the open hour never reads more
-  than 8 of them. Size-tiered compaction alone leaves up to about 10.
+- **Cap.** A segment still taking writes has its L0 SSTs merged into a new
+  sorted run whenever it has more than 8 L0 SSTs and sorted runs, so a query
+  over the open hour reads only a few more than 8. Its sorted runs are left
+  to size-tiered compaction, which merges runs of similar size: a merge of
+  runs chosen by count would rewrite the run that grows with the open hour
+  after every flush. Nor does it merge L0 SSTs and runs together, which
+  would hold the segment's L0 until all of it is rewritten while writes
+  stall on L0.
 - **Hold.** A [rollup](segment-rollup.md) segment is not merged while it is
   being copied, since reads can't see it until it is sealed. Once copied,
   its merge goes ahead of every other one, and the rollup is sealed after.
@@ -87,11 +92,27 @@ admitted only while the estimates of every running compaction, its own
 included, fit. A compaction larger than the whole budget runs only when no
 other does, so a process holds at most `max(budget, largest compaction)`.
 
-Writes stall once a segment taking them has 8 L0 SSTs, and only a
-compaction of those L0s clears them. Every other compaction, such as the
-merge of a closed hour or a rollup, is a merge: merges together take at
-most three quarters of the budget and leave one compactor slot free, so a
-large merge never holds back the compaction that unblocks writes.
+Writes stall once a segment taking them has `l0_max_ssts` L0 SSTs: 24 for
+Logs and Traces writers, and 48 for Metrics, whose SSTs are a quarter the
+size. Only a compaction of those L0s clears them. Every other compaction,
+such as the merge of a closed hour or a rollup, is a merge: merges together
+take at most half of the budget and leave one compactor slot free.
+Subcompactions are capped at what that half fits, so the other half always
+holds a relief compaction as wide as any, and a large merge never holds back
+the compaction that unblocks writes.
+
+Writers answer ingest with 429 before L0 gets there. From five eighths of
+`l0_max_ssts` in the deepest segment, each further L0 SST turns away an
+equal further share of ingest requests, and all of them once the writes
+already taken would fill L0 to the limit: `max_unflushed_bytes` of
+memtables over `l0_sst_size_bytes`, plus `l0_flush_parallelism` uploads in
+flight. Writers keep 192 MiB unflushed and upload 2 L0 SSTs at once, so a
+memtable keeps filling while two upload; that is a backlog of 5 SSTs for
+Logs and Traces and 14 for Metrics, and each limit is the least that leaves
+admission 4 SSTs to taper over. Clients back off and retry while flushes keep going through,
+instead of every write waiting on a stall and then timing out.
+`storage_admission_rejections_total` counts the turned-away requests and
+`storage_segment_l0_depth` is the depth admission follows.
 
 The Kubernetes operator sets the budget from the writer's resources: 208 MiB
 per CPU core of its limit (its request without one), and for Logs at least

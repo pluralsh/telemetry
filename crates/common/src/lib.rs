@@ -1,4 +1,5 @@
 pub mod bytes;
+pub mod cache_gauge;
 pub mod clock;
 pub mod coordinator;
 pub mod cpu;
@@ -9,6 +10,7 @@ pub mod sequence;
 pub mod serde;
 pub mod storage;
 pub mod time;
+pub mod write_budget;
 
 pub use bytes::BytesRange;
 pub use clock::Clock;

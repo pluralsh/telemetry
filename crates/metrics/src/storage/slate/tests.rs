@@ -43,7 +43,8 @@ fn should_apply_metrics_slatedb_defaults_without_settings_file() {
         min_compaction_sources(&settings),
         Some(DEFAULT_MIN_COMPACTION_SOURCES.to_string().as_str())
     );
-    assert_eq!(settings.l0_max_ssts, Settings::default().l0_max_ssts);
+    assert_eq!(settings.l0_max_ssts, DEFAULT_L0_MAX_SSTS);
+    assert_eq!(settings.l0_max_ssts_per_key, DEFAULT_L0_MAX_SSTS);
     let compactor = settings.compactor_options.as_ref().unwrap();
     assert!(compactor.enable_trivial_move);
     assert_eq!(
@@ -630,4 +631,12 @@ async fn should_warm_rollup_bucket_samples() {
     );
 
     storage.close().await.unwrap();
+}
+
+#[test]
+fn should_shed_ingest_over_several_l0_ssts_before_stalling() {
+    let limit = common::storage::admission::L0Limit::of(&default_settings());
+    assert_eq!(limit.backlog, 14);
+    assert_eq!(limit.max_ssts, 48);
+    assert!(limit.max_ssts.div_ceil(8) * 5 + 3 <= limit.max_ssts - limit.backlog);
 }

@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Publishes jemalloc's byte counters, for servers built with jemalloc.
+jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
+
 [lints]
 workspace = true
 
@@ -33,6 +37,7 @@ sharding = { path = "../sharding" }
 snap.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true

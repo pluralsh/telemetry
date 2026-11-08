@@ -177,6 +177,15 @@ write:
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
 
+# Process-wide bound on the estimated bytes of applied writes not yet in
+# storage, over every hour bucket and storage shard; 192 MiB by default. A
+# bucket's delta is frozen at a third of it at most, whatever
+# buffer_size_threshold_bytes is. Writes hold about four times it resident,
+# most of it new series' labels and indexes and their encoded flushes. Ingest
+# beyond it waits up to a second for room, then is answered with HTTP 429;
+# rollup copies use at most half. The operator sizes it from the memory limit.
+write_budget_bytes: 201326592
+
 request:
   max_request_bytes: 33554432 # Maximum request body as received; 32 MiB.
   max_decoded_request_bytes: 134217728 # Maximum write body after gzip or snappy decoding; 128 MiB. At least max_request_bytes.
@@ -566,6 +575,9 @@ database shares; see [storage compaction](../common/storage-compaction.md).
 | Setting | Metrics | SlateDB |
 |---|---|---|
 | `l0_sst_size_bytes` | 16 MiB | 64 MiB |
+| `max_unflushed_bytes` | 192 MiB | 1 GiB |
+| `l0_flush_parallelism` | 2 | 1 |
+| `l0_max_ssts`, `l0_max_ssts_per_key` | 48 | 8 |
 | `compactor_options.scheduler_options.min_compaction_sources` | `"3"` | `"4"` |
 
 Every scrape adds a merge operand per series key, and a query merges all

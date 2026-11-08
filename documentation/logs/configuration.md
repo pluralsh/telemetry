@@ -168,8 +168,9 @@ write:
   # up to two frozen deltas, and queued request payloads.
   buffer_queue_capacity: 10000
   buffer_flush_interval_milliseconds: 30000
-  # 8 MiB. A buffer is frozen at half the write budget below at most,
-  # whatever this threshold is, so ingest has room while a flush is written.
+  # 8 MiB. A buffer is frozen at a third of the write budget below at most,
+  # whatever this threshold is, so ingest has room while one flush is encoded
+  # and the one before it is written.
   buffer_size_threshold_bytes: 8388608
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
@@ -178,13 +179,15 @@ memory:
   # Process-wide bound on the bytes queries decode at once; defaults to
   # request.max_in_flight_query_bytes.
   decode_bytes: 214748364
-  # Process-wide bound on applied writes not yet in storage, 16 MiB by
-  # default. Each flush costs about 23 times its bytes while it builds its
-  # storage writes, and a reader replaying the writer's WAL holds about one
-  # flush, so this bounds both. Ingest beyond it is answered with HTTP 429
-  # and Retry-After (gRPC UNAVAILABLE); requests larger than a quarter of it
-  # are written a quarter at a time, and rollup copies use at most half.
-  write_bytes: 16777216
+  # Process-wide bound on applied writes not yet in storage, 24 MiB by
+  # default. Each flush holds a third of it at most and costs about 23 times
+  # its bytes while it builds its storage writes, and a reader replaying the
+  # writer's WAL holds about one flush, so this bounds both. Ingest beyond it
+  # waits up to a second for room, then is answered with HTTP 429 and
+  # Retry-After (gRPC UNAVAILABLE); requests
+  # larger than a quarter of it are written a quarter at a time, and rollup
+  # copies use at most half.
+  write_bytes: 25165824
 
 sharding:
   # Storage-shard count fixed when the dataset is created.

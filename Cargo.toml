@@ -32,6 +32,8 @@ lz4_flex = "0.14.0"
 memchr = "2"
 metrics = "0.24"
 mimalloc = "0.1"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 mixtrics = "0.2"
 moka = { version = "0.12", features = ["future", "sync"] }
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "trace", "gen-tonic-messages"] }

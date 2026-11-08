@@ -21,7 +21,10 @@ mod sidecar;
 pub mod traceql;
 
 pub use common::namespace::{MAX_NAMESPACE_LEN, Namespace, NamespaceError};
-pub use config::{Config, DEFAULT_RETENTION, PageConfig};
+pub use config::{
+    Config, DEFAULT_RETENTION, DEFAULT_WRITE_BUDGET_BYTES, PageConfig,
+    RESIDENT_BYTES_PER_ENCODED_BYTE,
+};
 pub use db::{Durability, ReadCacheConfig, TraceDb, WriteReport};
 pub use error::{Error, Result};
 pub use model::{

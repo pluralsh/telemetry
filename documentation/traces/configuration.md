@@ -148,6 +148,16 @@ write:
   remote_concurrency: 16 # Concurrent shard-forwarding batches.
   remote_retries: 2 # Retries after a stale-ownership response.
 
+# Process-wide bound on the encoded OTLP bytes of applied writes not yet in
+# storage, over every storage shard; 48 MiB by default. A delta is frozen at a
+# third of it at most, whatever buffer_size_threshold_bytes is. Writes hold
+# about six times it resident: decoded spans are about 2.4 times their
+# encoding, and a flush building its storage writes peaks at about 5.6. Ingest
+# beyond it waits up to a second for room, then is answered with HTTP 429;
+# rollup copies use at most half. SlateDB memtables hold at most 192 MiB
+# unflushed besides. The operator sizes it from the memory limit.
+write_budget_bytes: 50331648
+
 sharding:
   # Storage-shard count fixed when the dataset is created.
   shards: 1

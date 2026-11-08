@@ -61,11 +61,11 @@ func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
 	rendered := string(result.Data[MetricsKey])
 	for _, expected := range []string{
 		"mode: standalone", "http: 0.0.0.0:8080", "grpc: 0.0.0.0:9090",
-		"reader_cache_capacity: 1159641162", "forward_index_cache_capacity_bytes: 386547054", testFlushIntervalConfig,
-		"memory_capacity: 1417339198", "capacity: 386547054", "matcher_cache_capacity_bytes: 193273527",
-		"result_cache:\n  capacity_bytes: 386547054",
-		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 1030792144\n  memory_budget_bytes: 2061584288\n  queue_timeout_seconds: 30",
-		"rollup:\n  copy_buffer_bytes: 257698036",
+		"reader_cache_capacity: 857651274", "forward_index_cache_capacity_bytes: 285883758", testFlushIntervalConfig,
+		"memory_capacity: 1048240446", "capacity: 285883758", "matcher_cache_capacity_bytes: 142941879",
+		"result_cache:\n  capacity_bytes: 285883758",
+		"query:\n  max_concurrent: 32\n  max_concurrent_shard_reads: 16\n  max_memory_bytes: 762356688\n  memory_budget_bytes: 1524713376\n  queue_timeout_seconds: 30",
+		"rollup:\n  copy_buffer_bytes: 190589172", "write_budget_bytes: 201326592",
 		testCacheWarmerConfig, testWarmTimeoutConfig, testWarmConcurrency, testWarmPayloadsConfig,
 		testContinuousWarmer, testContinuousInterval,
 		"shards: 1", "io_concurrency_limit: 128",
@@ -290,9 +290,9 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 	if !strings.Contains(string(result.Data[MetricsKey]), "io_concurrency_limit: 192") {
 		t.Fatalf("writer config did not infer I/O concurrency from its memory request:\n%s", result.Data[MetricsKey])
 	}
-	// A request without a limit gets the 8Gi writer default.
-	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 386547054") {
-		t.Fatalf("writer config did not infer forward-index capacity from its memory limit:\n%s", result.Data[MetricsKey])
+	// A writer serves no queries, so its forward-index cache is the floor.
+	if !strings.Contains(string(result.Data[MetricsKey]), "forward_index_cache_capacity_bytes: 33554432") {
+		t.Fatalf("writer config did not floor its forward-index cache:\n%s", result.Data[MetricsKey])
 	}
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
 		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
@@ -856,11 +856,11 @@ func TestRenderGivesCompactionASubcompactionPerCore(t *testing.T) {
 	for _, tc := range []struct {
 		name, cpu, memory, expected string
 	}{
-		// (16Gi - 4Gi headroom - 1.5Gi reserved) shares 10.5Gi: 10% is
-		// 1,075Mi, 8 cores take 8 × 208Mi.
-		{"cores above the share", "8", "16Gi", "compaction_bytes: 1744830464"},
-		// 64Gi shares 46.5Gi: 10% is 4,761Mi, more than 12 cores take.
-		{"share above the cores", "12", "64Gi", "compaction_bytes: 4992899480"},
+		// (16Gi - 4Gi headroom - 1.5Gi reserved) shares 10.5Gi: a writer's
+		// doubled 20% is 2,150Mi, 12 cores take 12 × 208Mi.
+		{"cores above the share", "12", "16Gi", "compaction_bytes: 2617245696"},
+		// 64Gi shares 46.5Gi: 20% is 9,523Mi, more than 12 cores take.
+		{"share above the cores", "12", "64Gi", "compaction_bytes: 9932111860"},
 		// 4Gi shares 1.5Gi: 24 cores are capped at a quarter of it.
 		{"a quarter of a small limit", "24", "4Gi", "compaction_bytes: 402653184"},
 	} {
@@ -900,22 +900,22 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Writer: (6Gi - 1.5Gi headroom - 1.5Gi reserved) / 100 per percent,
-	// with 512Mi of the reservation for request bodies, and compaction's
-	// 640Mi floor above its 10%.
-	// Reader: (2Gi - 768Mi headroom - 640Mi reserved) / 100 per percent,
-	// with 64Mi of it for request bodies, and compaction's floor at a
+	// Writer: its read caches and query budget at their floors, 512Mi of
+	// its reservation for request bodies, and compaction's 640Mi floor
+	// above its doubled 20% of (6Gi - 1.5Gi headroom - 1.75Gi reserved).
+	// Reader: (2Gi - 768Mi headroom - 800Mi reserved) / 100 per percent,
+	// with what is left of its 64Mi for request bodies, and compaction's floor at a
 	// quarter of the 640Mi shared.
 	for key, expected := range map[string][]string{
 		LogsKey: {
-			"reader_cache_capacity: 773094096", "result_cache_capacity: 193273524",
-			"max_in_flight_query_bytes: 515396064", "max_in_flight_body_bytes: 536870912",
+			"reader_cache_capacity: 67108864", "result_cache_capacity: 16777216",
+			"max_in_flight_query_bytes: 67108864", "max_in_flight_body_bytes: 536870912",
 			"buffer_size_threshold_bytes: 8388608", "compaction_bytes: 671088640",
 		},
 		ReaderKey: {
 			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",
 			"result_cache_capacity: 40265316", "max_in_flight_query_bytes: 107374176",
-			"max_in_flight_body_bytes: 67108864", "compaction_bytes: 167772160",
+			"max_in_flight_body_bytes: 53477376", "compaction_bytes: 167772160",
 		},
 	} {
 		rendered := string(result.Data[key])
@@ -1056,7 +1056,10 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 		// bounds, including any of the reservedBounds within it.
 		reserved       func(key string) int64
 		reservedBounds []string
-		input          func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
+		// writeBudget is the resident bytes per byte of a writer's
+		// write_budget_bytes, which its reservation holds.
+		writeBudget int64
+		input       func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input
 	}{
 		{
 			name: testMetricsProduct,
@@ -1064,6 +1067,10 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 				"reader_cache_capacity", "forward_index_cache_capacity_bytes", "matcher_cache_capacity_bytes",
 				"result_cache.capacity_bytes", "query.memory_budget_bytes", testCopyBufferPath,
 			},
+			reserved: func(key string) int64 {
+				return lo.Ternary(key == ReaderKey, 0, metricsWriterReserved)
+			},
+			writeBudget: metricsResidentPerWriteByte,
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Metrics: &telemetryv1alpha1.Metrics{
 					ObjectMeta: metav1.ObjectMeta{Name: testMetricsName, Namespace: testMetricsNamespace},
@@ -1107,6 +1114,10 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 				"read_cache.metadata_bytes", "read_cache.postings_bytes", "read_cache.pages_bytes", "read_cache.locators_bytes",
 				testCopyBufferPath,
 			},
+			reserved: func(key string) int64 {
+				return lo.Ternary(key == ReaderKey, 0, tracesWriterReserved)
+			},
+			writeBudget: tracesResidentPerWriteByte,
 			input: func(mode telemetryv1alpha1.ProductMode, workload telemetryv1alpha1.WorkloadSpec) Input {
 				return Input{Traces: &telemetryv1alpha1.Traces{
 					ObjectMeta: metav1.ObjectMeta{Name: testTracesProduct, Namespace: testMetricsNamespace},
@@ -1156,6 +1167,13 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 								t.Fatalf("%s is missing %s:\n%s", key, path, data)
 							}
 							reservedTotal += int64(value)
+						}
+						if product.writeBudget != 0 && key != ReaderKey {
+							value, found := lookupPath(rendered, "write_budget_bytes")
+							if !found || value <= 0 {
+								t.Fatalf("%s is missing write_budget_bytes:\n%s", key, data)
+							}
+							reservedTotal += int64(value) * product.writeBudget
 						}
 						if reservedTotal > plan.reservation() {
 							t.Fatalf("%s reserved bounds total %d, over the %d reservation:\n%s", key, reservedTotal, plan.reservation(), data)

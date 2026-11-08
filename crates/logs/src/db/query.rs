@@ -735,15 +735,18 @@ impl LogDb {
             .map(|unit| async move {
                 budget.take()?;
                 let decoding = budget.decode(&self.memory, unit.decode_bytes(true)).await?;
-                let blocks = self
-                    .load_blocks(
-                        namespace,
-                        segment,
-                        unit.object,
-                        unit.first_block..unit.end_block,
-                        ReadNeeds { lines: true },
-                    )
-                    .await?;
+                // A copy reads each block once, so caching would only evict
+                // blocks that queries reread.
+                let blocks = read_blocks(
+                    self.reads().as_ref(),
+                    namespace,
+                    segment,
+                    unit.object,
+                    unit.first_block..unit.end_block,
+                    ReadNeeds { lines: true },
+                    ReadHints::default(),
+                )
+                .await?;
                 let runs = tokio::spawn(async move {
                     let mut runs = Vec::with_capacity(unit.runs.len());
                     for run in unit.runs {

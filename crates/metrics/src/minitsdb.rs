@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
+use common::write_budget::{INGEST_WAIT, WriteBudget, WritePermit};
 use common::{BytesRange, StorageError};
 use futures::{StreamExt, TryStreamExt};
 
@@ -1289,6 +1290,25 @@ pub(crate) struct MiniTsdb {
     namespace: Namespace,
     bucket: TimeBucket,
     write_coordinator: WriteCoordinator<TsdbWriteDelta, TsdbFlusher>,
+    write_budget: Option<WriteBudget>,
+    admission: common::storage::admission::Admission,
+}
+
+/// The most `series` can add to a delta's [`TsdbWriteDelta::estimate_size`],
+/// as if every series and label were new.
+pub(crate) fn write_bytes(series: &[Series], samples: bool) -> u64 {
+    use crate::delta::{new_series_bytes, samples_bytes};
+    series
+        .iter()
+        .map(|series| {
+            let data = if samples {
+                samples_bytes(&series.samples, &series.histograms)
+            } else {
+                0
+            };
+            (new_series_bytes(&series.labels) + data) as u64
+        })
+        .sum()
 }
 
 impl MiniTsdb {
@@ -1297,15 +1317,28 @@ impl MiniTsdb {
         &self.bucket
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load(
         namespace: Namespace,
         bucket: TimeBucket,
         storage: Arc<Storage>,
         retention: Option<Duration>,
         active_series: Arc<ActiveSeriesTracker>,
-        write_buffer: WriteCoordinatorConfig,
+        mut write_buffer: WriteCoordinatorConfig,
         postings_cache: Option<Arc<PostingsCache>>,
+        write_budget: Option<WriteBudget>,
     ) -> Result<Self> {
+        // Writes hold the budget until their delta is written, and while one
+        // delta commits the next is encoded, so freeze at a third: the
+        // committing, encoding and live deltas then fit in it together.
+        if let Some(budget) = &write_budget {
+            write_buffer.flush_size_threshold = write_buffer.flush_size_threshold.min(
+                usize::try_from(budget.capacity() / 3)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            );
+        }
+        let admission = storage.admission().clone();
         let snapshot = storage.snapshot().await?;
 
         let mut series_dict = HashMap::new();
@@ -1357,6 +1390,8 @@ impl MiniTsdb {
             namespace,
             bucket,
             write_coordinator,
+            write_budget,
+            admission,
         })
     }
 
@@ -1387,8 +1422,14 @@ impl MiniTsdb {
             "Starting MiniTsdb batch ingest"
         );
 
-        self.write(TsdbWrite::Samples(series_list.to_vec()), timeout)
-            .await?;
+        let bytes = write_bytes(series_list, true);
+        self.write(
+            TsdbWrite::Samples(series_list.to_vec()),
+            bytes,
+            timeout,
+            false,
+        )
+        .await?;
 
         tracing::debug!(
             bucket = ?self.bucket,
@@ -1400,17 +1441,76 @@ impl MiniTsdb {
         Ok(())
     }
 
-    /// Registers `series` without their samples, waiting up to `timeout`
-    /// for queue space.
+    /// Copies `series` with their samples, as a rollup does, waiting up to
+    /// `timeout` for its half of the write budget and for queue space.
+    pub(crate) async fn copy_batch(&self, series: &[Series], timeout: Duration) -> Result<()> {
+        let bytes = write_bytes(series, true);
+        self.write(
+            TsdbWrite::Samples(series.to_vec()),
+            bytes,
+            Some(timeout),
+            true,
+        )
+        .await
+    }
+
+    /// Registers `series` without their samples, as a rollup copy, waiting
+    /// up to `timeout` for room.
     pub(crate) async fn register_batch(
         &self,
         series: Vec<Series>,
         timeout: Duration,
     ) -> Result<()> {
-        self.write(TsdbWrite::Register(series), Some(timeout)).await
+        let bytes = write_bytes(&series, false);
+        self.write(TsdbWrite::Register(series), bytes, Some(timeout), true)
+            .await
     }
 
-    async fn write(&self, write: TsdbWrite, timeout: Option<Duration>) -> Result<()> {
+    /// Asks for the live delta to be flushed, without waiting for it.
+    pub(crate) async fn request_flush(&self) -> Result<()> {
+        let handle = self.write_coordinator.handle(WRITE_CHANNEL);
+        handle.flush(false).await.map_err(map_write_error)?;
+        Ok(())
+    }
+
+    /// Holds `bytes` of the write budget, if there is one: a copy waits up
+    /// to `timeout` for room in its half, ingest up to [`INGEST_WAIT`] or
+    /// `timeout` if longer. Only written deltas free the budget, so a write
+    /// that finds it full first asks for this bucket's delta to be flushed
+    /// rather than wait for the flush interval. Ingest is first turned away
+    /// while L0 nears its stall limit.
+    async fn write_permit(
+        &self,
+        bytes: u64,
+        timeout: Option<Duration>,
+        copy: bool,
+    ) -> Result<Option<WritePermit>> {
+        if !copy && !self.admission.admits() {
+            return Err(Error::Backpressure);
+        }
+        let Some(budget) = &self.write_budget else {
+            return Ok(None);
+        };
+        if !budget.fits(copy, bytes) {
+            self.request_flush().await?;
+        }
+        let wait = timeout.map_or(INGEST_WAIT, |timeout| timeout.max(INGEST_WAIT));
+        let permit = if copy {
+            budget.copy(bytes, wait).await
+        } else {
+            budget.ingest(bytes, wait).await
+        };
+        permit.map(Some).ok_or(Error::Backpressure)
+    }
+
+    async fn write(
+        &self,
+        write: TsdbWrite,
+        bytes: u64,
+        timeout: Option<Duration>,
+        copy: bool,
+    ) -> Result<()> {
+        let permit = self.write_permit(bytes, timeout, copy).await?;
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);
         let mut write_handle = match timeout {
             Some(t) => handle
@@ -1423,10 +1523,21 @@ impl MiniTsdb {
                 .map_err(|e| map_write_error(e.discard_inner()))?,
         };
 
-        write_handle
+        let grown = write_handle
             .wait(Durability::Applied)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error)?;
+        // Reserved as if every series were new; keep only what the delta
+        // grew by. Frees the budget once the write is in storage, or the writer has
+        // failed or stopped, so it covers every applied delta in memory.
+        if let Some(mut permit) = permit {
+            permit.shrink(grown as u64);
+            tokio::spawn(async move {
+                let _ = write_handle.wait(Durability::Written).await;
+                drop(permit);
+            });
+        }
+        Ok(())
     }
 
     /// Ingest a single series with samples.
@@ -1536,6 +1647,8 @@ mod tests {
             namespace: crate::Namespace::default(),
             bucket,
             write_coordinator,
+            write_budget: None,
+            admission: common::storage::admission::Admission::unlimited(),
         }
     }
 
@@ -1598,6 +1711,7 @@ mod tests {
             None,
             Arc::new(ActiveSeriesTracker::new(0)),
             WriteCoordinatorConfig::default(),
+            None,
             None,
         )
         .await

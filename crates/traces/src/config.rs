@@ -20,7 +20,23 @@ pub struct Config {
     /// Estimated bytes SlateDB's compactions of every shard of the process
     /// hold at once; see [`common::storage::compaction::CompactionMemory`].
     pub compaction_memory_bytes: u64,
+    /// Encoded OTLP bytes of writes every shard of the process has applied
+    /// but not yet written to storage; see
+    /// [`common::write_budget::WriteBudget`]. Ingest past it is rejected
+    /// with backpressure, and the write buffer freezes at a third of it at
+    /// most. Writes hold [`RESIDENT_BYTES_PER_ENCODED_BYTE`] times this
+    /// while they are decoded, buffered and encoded into storage writes.
+    pub write_budget_bytes: u64,
 }
+
+/// Peak resident bytes a delta and its flush hold per encoded OTLP byte:
+/// decoded spans hold about 2.4 times their encoding, and encoding them into
+/// pages, locators and postings peaks at 5.6 times.
+pub const RESIDENT_BYTES_PER_ENCODED_BYTE: u64 = 6;
+
+/// Default [`Config::write_budget_bytes`]: 48 MiB, so deltas of 16 MiB fit
+/// three times and the write path holds about 290 MiB.
+pub const DEFAULT_WRITE_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
 
 /// Default [`Config::retention`]: 14 days.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
@@ -55,6 +71,7 @@ impl Default for Config {
             write_buffer: WriteCoordinatorConfig::default(),
             read_cache: crate::ReadCacheConfig::default(),
             compaction_memory_bytes: common::storage::compaction::DEFAULT_COMPACTION_MEMORY_BYTES,
+            write_budget_bytes: DEFAULT_WRITE_BUDGET_BYTES,
         }
     }
 }
@@ -82,6 +99,7 @@ impl Config {
             || self.write_buffer.queue_capacity == 0
             || self.write_buffer.flush_interval.is_zero()
             || self.write_buffer.flush_size_threshold == 0
+            || self.write_budget_bytes == 0
         {
             return Err(crate::Error::Invalid(
                 "page size and trace limits must be positive".to_owned(),
