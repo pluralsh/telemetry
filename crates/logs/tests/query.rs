@@ -15,6 +15,7 @@ fn config(path: &str) -> Config {
             path: path.to_owned(),
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),

@@ -104,11 +104,32 @@ impl Tenants {
 
     /// One rollup pass over every namespace in storage.
     async fn rollup(&self, config: &RollupConfig, now_ms: i64) -> Result<usize> {
+        use futures::StreamExt;
+        let slots = tokio::sync::Semaphore::new(config.concurrency.max(1));
+        let results: Vec<Result<usize>> = futures::stream::iter(self.storage.namespaces())
+            .map(|namespace| {
+                let slots = &slots;
+                async move {
+                    self.get(&namespace)
+                        .await
+                        .rollup_within(config, now_ms, slots)
+                        .await
+                }
+            })
+            .buffer_unordered(config.concurrency.max(1))
+            .collect()
+            .await;
         let mut sealed = 0;
-        for namespace in self.storage.namespaces() {
-            sealed += self.get(&namespace).await.rollup(config, now_ms).await?;
+        let mut failed = None;
+        for result in results {
+            match result {
+                Ok(count) => sealed += count,
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
         }
-        Ok(sealed)
+        failed.map_or(Ok(sealed), Err)
     }
 }
 
@@ -515,6 +536,7 @@ mod tests {
                 path: "visibility".to_string(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -567,6 +589,7 @@ mod tests {
                 path: "budget".to_string(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -627,6 +650,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -689,6 +713,7 @@ mod tests {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -757,6 +782,7 @@ mod tests {
                 path: "tenant-isolation".to_string(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

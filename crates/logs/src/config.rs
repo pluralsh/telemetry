@@ -121,6 +121,7 @@ impl Default for Config {
                     path: ".data".to_owned(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

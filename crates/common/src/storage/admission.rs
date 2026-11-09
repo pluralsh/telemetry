@@ -17,10 +17,13 @@
 //! on it times out in bursts. [`Admission`] sheds a growing share of ingest
 //! from five eighths of `max_unflushed_bytes` too, whichever of the two is
 //! deeper, so those writers turn some ingest away instead. Rollup copies are
-//! not asked: they wait for room in their own write allowance.
+//! never turned away, but before each copy buffer they wait while any ingest
+//! is shed ([`Admission::yield_to_ingest`]), so a rollup slows down rather
+//! than take L0 and memtable room from ingest.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use slatedb::DbStatus;
 use slatedb::config::Settings;
@@ -28,6 +31,13 @@ use tokio::sync::watch;
 
 /// Ingest a writer turned away to keep L0 short of the stall limit.
 pub const ADMISSION_REJECTIONS: &str = "storage_admission_rejections_total";
+/// Milliseconds rollup copies waited for ingest to stop being shed.
+pub const COPY_YIELD_MILLISECONDS: &str = "storage_admission_copy_yield_milliseconds_total";
+/// Longest a rollup copy waits per copy buffer for ingest to stop being
+/// shed. A writer shedding all along still copies a buffer this often, so
+/// a 4 GiB rollup through 64 MiB buffers waits at most about 11 minutes.
+pub const COPY_YIELD_WAIT: Duration = Duration::from_secs(10);
+const YIELD_POLL: Duration = Duration::from_millis(50);
 /// L0 SSTs in a writer's deepest segment.
 pub const SEGMENT_L0_DEPTH: &str = "storage_segment_l0_depth";
 
@@ -165,6 +175,26 @@ impl Admission {
         admitted
     }
 
+    /// Whether any ingest is being turned away now.
+    pub fn sheds(&self) -> bool {
+        self.l0_share().is_some() || self.unflushed_share().is_some()
+    }
+
+    /// Waits while ingest is being shed, for at most `wait`, so a rollup
+    /// copy leaves L0 and the memtables to ingest; past `wait` it goes
+    /// ahead so rollups still finish on a writer that sheds all along.
+    pub async fn yield_to_ingest(&self, wait: Duration) {
+        if !self.sheds() {
+            return;
+        }
+        let started = tokio::time::Instant::now();
+        while self.sheds() && started.elapsed() < wait {
+            tokio::time::sleep(YIELD_POLL.min(wait)).await;
+        }
+        let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        metrics::counter!(COPY_YIELD_MILLISECONDS).increment(waited);
+    }
+
     /// `(shed, of)` ingest writes to turn away for L0 depth, if any.
     fn l0_share(&self) -> Option<(u64, u64)> {
         let limit = self.inner.max_ssts.load(Ordering::Relaxed);
@@ -295,6 +325,36 @@ mod tests {
         assert_eq!(admitted(&admission, 12), 75);
         unflushed.store(0, Ordering::Relaxed);
         assert_eq!(admitted(&admission, 0), 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copies_wait_while_ingest_is_shed_then_go_ahead() {
+        let admission = Admission::unlimited();
+        admission.limit_to(L0Limit {
+            max_ssts: 16,
+            backlog: 3,
+            max_unflushed_bytes: 0,
+        });
+        admission.set_depth(9);
+        assert!(!admission.sheds());
+        let started = tokio::time::Instant::now();
+        admission.yield_to_ingest(Duration::from_secs(10)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        admission.set_depth(10);
+        assert!(admission.sheds());
+        admission.yield_to_ingest(Duration::from_secs(10)).await;
+        assert!(started.elapsed() >= Duration::from_secs(10));
+
+        let started = tokio::time::Instant::now();
+        let waiting = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.yield_to_ingest(Duration::from_secs(10)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        admission.set_depth(4);
+        waiting.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

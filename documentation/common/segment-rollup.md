@@ -57,7 +57,12 @@ with the span of their rollup segment.
    goes stale before its copy is applied.
    The writer accepts copied data before writing it, so once
    `rollup.copy_buffer_bytes` of it are queued the copy waits until they are
-   written. Traces copies in steps of about that many page bytes.
+   written. Traces copies in steps of about that many page bytes. Logs first
+   gives every stream of the tile its ID, in writes of about that many label
+   bytes. Before each of these the copy waits, up to 10 seconds, while the
+   writer is turning any ingest away for L0 depth or unflushed bytes, so a
+   rollup slows down rather than take room ingest needs
+   (`storage_admission_copy_yield_milliseconds_total`).
 5. It flushes the copy, asks compaction to merge the rollup segment ahead of
    anything else, and waits until the copy is one SST or sorted run, at most
    `rollup.merge_wait_seconds`, so a sealed rollup reads as one file.
@@ -67,6 +72,12 @@ with the span of their rollup segment.
 So a window is readable as one merged segment a little over
 `rollup.delay_seconds` after it ends, plus the copy and the merge, and the
 day the same after the day ends.
+
+The tiles of one pass, over every namespace, never overlap: a tile covers
+nothing another holds, and a day waits for a later pass once its windows
+are sealed. So a pass runs `rollup.concurrency` of them at once, sharing the
+copy allowance and the compactor's budget; mostly one copies while others
+wait for their merges, as every namespace's window closes at the same time.
 
 ## Reads
 
@@ -103,6 +114,7 @@ rollup:
   merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
   interval_seconds: 300 # How often closed windows and days are looked for.
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
+  concurrency: 1 # Rollups run at once; the operator renders one per 3 cores and 4 GiB of limit, up to 4.
 ```
 
 Reader-mode servers never roll up.

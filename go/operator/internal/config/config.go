@@ -335,16 +335,22 @@ func renderLogs(input Input) (Result, error) {
 		if component == modeReader {
 			workload = logs.Spec.Reader
 		}
+		writerComponent := resources.Component(lo.Ternary(component == modeReader, modeWriter, component))
+		uploads := writerL0Uploads(
+			resources.CPUCores(logs.Spec.Writer, descriptor, writerComponent),
+			resources.MemoryLimit(logs.Spec.Writer, descriptor, writerComponent),
+		)
 		plan := memoryPlan{
 			limit:    resources.MemoryLimit(workload, descriptor, resources.Component(component)),
-			reserved: logsReaderReserved,
+			reserved: logsReaderReserved + extraL0Uploads(uploads)*readerBytesPerL0Upload,
 			bodies:   lo.Ternary(component == modeReader, logsReaderBodies, logsWriterBodies),
 			writer:   component == modeWriter,
 			cores:    resources.CPUCores(workload, descriptor, resources.Component(component)),
 		}
 		if component != modeReader {
 			plan.writes, plan.writeFactor = logsWriterWrites(plan.cores), logsResidentPerWriteByte
-			plan.reserved = logsWriterFixed + plan.writes + logsWriterBodies
+			plan.reserved = logsWriterFixed + plan.writes + logsWriterBodies + extraL0Uploads(uploads)*writerBytesPerL0Upload
+			plan.l0Uploads = uploads
 		}
 		return yaml.Marshal(renderLogsConfig{
 			Mode:       component,
@@ -475,6 +481,8 @@ func renderTraces(input Input) (Result, error) {
 		}
 		if component != modeReader {
 			plan.reserved, plan.writes, plan.writeFactor = tracesWriterReserved, tracesWriterWrites, tracesResidentPerWriteByte
+			plan.l0Uploads = writerL0Uploads(plan.cores, plan.limit)
+			plan.reserved += extraL0Uploads(plan.l0Uploads) * writerBytesPerL0Upload
 		}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
@@ -605,6 +613,9 @@ func renderStorageConfigForMode(spec telemetryv1alpha1.StorageSpec, descriptor r
 	result := renderStorageConfig(spec, descriptor, diskCapacity, plan)
 	if mode == modeWriter && spec.BlockCache == nil {
 		result.BlockCache = nil
+	}
+	if mode != modeReader && plan.l0Uploads > defaultWriterL0Uploads {
+		result.L0FlushParallelism = plan.l0Uploads
 	}
 	return result
 }
@@ -792,7 +803,37 @@ type memoryPlan struct {
 	// cores is the container's whole CPU cores, which compaction can use
 	// at once.
 	cores int64
+	// l0Uploads is a writer's SlateDB l0_flush_parallelism, rendered when
+	// it differs from the servers' default; see writerL0Uploads.
+	l0Uploads int64
 }
+
+// A writer flushes each memtable to L0 on one task, so the servers' two
+// uploads left a 6-core logs writer on S3 flushing about 35 MB/s on two
+// cores, turning the rest of its ingest away once 192 MiB sat unflushed.
+// A writer uploads one L0 SST per core instead, up to maxWriterL0Uploads.
+// Every upload past the default holds another 64 MiB memtable unflushed, at
+// about 2.5 resident bytes per byte, and 90 MiB of buffered parts; readers
+// replay the larger unflushed WAL too.
+const (
+	defaultWriterL0Uploads = 2
+	maxWriterL0Uploads     = 6
+	writerBytesPerL0Upload = 64*mebibyte*5/2 + 90*mebibyte
+	readerBytesPerL0Upload = 64 * mebibyte * 5 / 2
+)
+
+// writerL0Uploads is the L0 uploads a writer of cores and a memory limit
+// runs: one per core, while what the uploads past the default hold fits an
+// eighth of the limit.
+func writerL0Uploads(cores, limit int64) int64 {
+	uploads := min(max(cores, defaultWriterL0Uploads), maxWriterL0Uploads)
+	for uploads > defaultWriterL0Uploads && extraL0Uploads(uploads)*writerBytesPerL0Upload > limit/8 {
+		uploads--
+	}
+	return uploads
+}
+
+func extraL0Uploads(uploads int64) int64 { return max(uploads-defaultWriterL0Uploads, 0) }
 
 const mebibyte = int64(1024 * 1024)
 
@@ -960,7 +1001,23 @@ const (
 )
 
 func renderRollupConfig(plan memoryPlan) renderRollup {
-	return renderRollup{CopyBufferBytes: plan.rollupCopyBuffer()}
+	return renderRollup{CopyBufferBytes: plan.rollupCopyBuffer(), Concurrency: plan.rollupConcurrency()}
+}
+
+// Each rollup copies on about a core while the others wait for their
+// merges, and holds what it reads (a copy buffer of traces or series, or a
+// day's stream labels) beside the budgets it shares with the rest, so a
+// writer runs one per three cores and per 4 GiB of its limit, up to
+// maxRollupConcurrency, and renders only more than the servers' one.
+const (
+	coresPerRollup       = 3
+	bytesPerRollup       = 4 << 30
+	maxRollupConcurrency = 4
+)
+
+func (plan memoryPlan) rollupConcurrency() int64 {
+	concurrency := min(plan.cores/coresPerRollup, plan.limit/bytesPerRollup, maxRollupConcurrency)
+	return lo.Ternary(concurrency > 1, concurrency, 0)
 }
 
 func renderMetricsQuery(spec *telemetryv1alpha1.MetricsQuerySpec, plan memoryPlan) renderQuery {
@@ -1095,6 +1152,7 @@ type renderTracesReadCache struct {
 }
 type renderRollup struct {
 	CopyBufferBytes int64 `json:"copy_buffer_bytes"`
+	Concurrency     int64 `json:"concurrency,omitempty"`
 }
 type renderElasticsearch struct {
 	MessageFields []string `json:"message_fields"`
@@ -1214,9 +1272,12 @@ type renderStorage struct {
 	Path         string            `json:"path"`
 	ObjectStore  renderObjectStore `json:"object_store"`
 	SettingsPath string            `json:"settings_path,omitempty"`
-	BlockCache   *renderCache      `json:"block_cache,omitempty"`
-	MetaCache    *renderCache      `json:"meta_cache,omitempty"`
-	Disk         *renderDisk       `json:"disk,omitempty"`
+	// L0FlushParallelism sizes a writer's SlateDB L0 uploads, unflushed
+	// bytes and L0 limit together; zero leaves the servers' defaults.
+	L0FlushParallelism int64        `json:"l0_flush_parallelism,omitempty"`
+	BlockCache         *renderCache `json:"block_cache,omitempty"`
+	MetaCache          *renderCache `json:"meta_cache,omitempty"`
+	Disk               *renderDisk  `json:"disk,omitempty"`
 }
 type renderDisk struct {
 	ThroughputBytesPerSecond *int64 `json:"throughput_bytes_per_second,omitempty"`

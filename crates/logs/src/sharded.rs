@@ -713,6 +713,7 @@ mod tests {
                     path: tmp.path().join("objects").to_str().unwrap().to_owned(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: Some(BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
                     memory_capacity: 1 << 20,
                     // Foyer's disk tier uses 16 MiB blocks, and closing the
@@ -785,6 +786,7 @@ mod tests {
                     path: tmp.path().join("objects").to_str().unwrap().to_owned(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: Some(BlockCacheConfig::FoyerMemory(
                     common::storage::config::FoyerMemoryCacheConfig {
                         capacity: 8 << 20,
@@ -1151,6 +1153,7 @@ mod tests {
                     path: tmp.path().to_str().unwrap().to_owned(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

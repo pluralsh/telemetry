@@ -375,6 +375,7 @@ fn end_to_end_benches(c: &mut Criterion, traces: &[Trace]) {
                 path: "traces-bench".to_owned(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

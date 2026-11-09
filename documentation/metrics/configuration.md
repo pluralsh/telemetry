@@ -141,6 +141,7 @@ rollup:
   merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
   interval_seconds: 300
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
+  concurrency: 1 # Rollups run at once, over every namespace; the operator renders one per 3 cores and 4 GiB of limit, up to 4.
 
 # Readers warm the SST filters and indexes of recent buckets into meta_cache,
 # newest bucket first, in the background: they are ready at once, and queries

@@ -1071,6 +1071,7 @@ mod tests {
                 path: dir.to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -1089,6 +1090,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1119,6 +1121,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1160,6 +1163,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1220,6 +1224,7 @@ mod tests {
                 path: obj_dir.to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1268,6 +1273,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1318,6 +1324,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -1372,6 +1379,7 @@ mod tests {
                     path: tmp.path().join("obj").to_str().unwrap().to_string(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 // Foyer's disk tier uses 16 MiB blocks, and closing the cache
                 // waits for a free block to flush into.
                 block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(

@@ -377,6 +377,7 @@ fn main() {
                 path: directory.path().to_string_lossy().into_owned(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: cache(512 << 20),
             meta_cache: cache(128 << 20),
             disk: Default::default(),

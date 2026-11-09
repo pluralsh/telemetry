@@ -186,6 +186,7 @@ fn storage(path: &Path) -> SlateDbStorageConfig {
             path: path.display().to_string(),
         }),
         settings_path: std::env::var("PROFILE_SLATEDB_SETTINGS").ok(),
+        l0_flush_parallelism: None,
         block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
             capacity: 64 << 20,
             shards: None,

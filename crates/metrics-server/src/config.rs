@@ -148,6 +148,8 @@ pub struct RollupConfig {
     pub interval_seconds: u64,
     /// Copied bytes a rollup may queue before waiting for storage.
     pub copy_buffer_bytes: u64,
+    /// Rollups run at once; those of one pass never overlap.
+    pub concurrency: usize,
 }
 
 impl Default for RollupConfig {
@@ -161,6 +163,7 @@ impl Default for RollupConfig {
             merge_wait_seconds: defaults.merge_wait.as_secs(),
             interval_seconds: defaults.interval.as_secs(),
             copy_buffer_bytes: defaults.copy_buffer_bytes,
+            concurrency: defaults.concurrency,
         }
     }
 }
@@ -175,6 +178,7 @@ impl RollupConfig {
             merge_wait: std::time::Duration::from_secs(self.merge_wait_seconds),
             interval: std::time::Duration::from_secs(self.interval_seconds.max(1)),
             copy_buffer_bytes: self.copy_buffer_bytes.max(1),
+            concurrency: self.concurrency.max(1),
         }
     }
 }

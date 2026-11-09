@@ -68,6 +68,10 @@ pub struct RollupConfig {
     /// before it is sealed anyway, as it must be when no compactor runs in
     /// the writer's process.
     pub merge_wait: Duration,
+    /// Rollups run at once. A pass's rollups never overlap, so they run
+    /// independently, sharing the copy allowance and the compactor's
+    /// budget; mostly this lets one copy while others wait for their merge.
+    pub concurrency: usize,
 }
 
 /// Default [`RollupConfig::copy_buffer_bytes`].
@@ -124,8 +128,39 @@ impl Default for RollupConfig {
             interval: Duration::from_secs(300),
             copy_buffer_bytes: DEFAULT_COPY_BUFFER_BYTES,
             merge_wait: DEFAULT_MERGE_WAIT,
+            concurrency: 1,
         }
     }
+}
+
+/// Runs `roll_up` on each of `planned`, `concurrency` at once, and returns
+/// how many sealed, or once every one has finished the first error. One
+/// failing leaves the others to finish, as the next pass retries it.
+pub async fn run_all<T, E, Fut>(
+    planned: impl IntoIterator<Item = T>,
+    concurrency: usize,
+    roll_up: impl FnMut(T) -> Fut,
+) -> Result<usize, E>
+where
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    use futures::StreamExt;
+    let results: Vec<Result<(), E>> = futures::stream::iter(planned)
+        .map(roll_up)
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+    let mut sealed = 0;
+    let mut failed = None;
+    for result in results {
+        match result {
+            Ok(()) => sealed += 1,
+            Err(error) => {
+                failed.get_or_insert(error);
+            }
+        }
+    }
+    failed.map_or(Ok(sealed), Err)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -926,6 +961,26 @@ mod tests {
         assert!(!hook(&pending, &started));
         assert!(hook(&prefix(Segment::new(DAY, HOUR)), &started));
         assert!(!hook(&prefix(Segment::new(DAY + DAY_NS, HOUR)), &started));
+    }
+
+    #[tokio::test]
+    async fn runs_rollups_concurrently_up_to_the_limit_and_finishes_past_a_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let result = run_all(0..8, 3, |index| {
+            let (running, most) = (&running, &most);
+            async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                if index == 2 { Err(index) } else { Ok(()) }
+            }
+        })
+        .await;
+        assert_eq!(result, Err(2));
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+        assert_eq!(run_all(0..8, 3, |_| async { Ok::<_, ()>(()) }).await, Ok(8));
     }
 
     #[test]

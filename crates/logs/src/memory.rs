@@ -66,10 +66,13 @@ pub const MERGE_BYTES_PER_INPUT_BYTE: u64 = 4;
 /// `max_object_bytes` of inputs.
 pub const DEFAULT_MERGE_BUDGET_BYTES: u64 = MERGE_BYTES_PER_INPUT_BYTE * 32 * 1024 * 1024;
 
-/// SlateDB's settings with the writers' memtable bound, the base a settings
-/// file or `SLATEDB_` environment variables override.
-pub(crate) fn slatedb_settings() -> slatedb::config::Settings {
-    common::storage::settings::writer_settings()
+/// SlateDB's settings with the writers' memtable bound, sized for the L0
+/// uploads `storage` asks for, the base a settings file or `SLATEDB_`
+/// environment variables override.
+pub(crate) fn slatedb_settings(
+    storage: &common::storage::config::StorageConfig,
+) -> slatedb::config::Settings {
+    common::storage::settings::writer_settings_for(storage)
 }
 
 /// Byte budgets of a process's [`MemoryBudget`].
@@ -379,7 +382,7 @@ mod tests {
 
     #[test]
     fn slatedb_settings_cap_unflushed_bytes_above_the_l0_sst_size() {
-        let settings = slatedb_settings();
+        let settings = slatedb_settings(&common::storage::config::StorageConfig::InMemory);
         assert_eq!(
             settings.max_unflushed_bytes,
             common::storage::settings::DEFAULT_MAX_UNFLUSHED_BYTES

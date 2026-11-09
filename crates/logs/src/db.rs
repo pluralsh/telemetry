@@ -299,6 +299,9 @@ pub struct LogDb {
     rolled: tokio::sync::RwLock<HashMap<Namespace, BTreeSet<SegmentId>>>,
     /// Serializes rollup passes.
     rollup_lock: Mutex<()>,
+    /// [`Config::stream_locality_labels`], which rollups register streams
+    /// in the order of.
+    stream_locality_labels: Vec<String>,
     /// Holds on the merges of segments a rollup copies into.
     merge_holds: MergeHolds,
     retention: Option<Duration>,
@@ -423,7 +426,7 @@ impl LogDb {
         let storage = StorageBuilder::with_cache_over_store(
             &config.storage,
             cache,
-            crate::memory::slatedb_settings(),
+            crate::memory::slatedb_settings(&config.storage),
             object_store,
         )?
         .with_semantics(
@@ -512,6 +515,7 @@ impl LogDb {
             tuning: ReadTuning::default(),
             rolled: tokio::sync::RwLock::new(rolled),
             rollup_lock: Mutex::new(()),
+            stream_locality_labels: config.stream_locality_labels.clone(),
             merge_holds,
             retention: config.retention,
             settle_after: config.compaction.finalize_after,
@@ -608,6 +612,7 @@ impl LogDb {
             tuning: ReadTuning::default(),
             rolled: tokio::sync::RwLock::new(HashMap::new()),
             rollup_lock: Mutex::new(()),
+            stream_locality_labels: config.stream_locality_labels.clone(),
             merge_holds: MergeHolds::default(),
             retention: config.retention,
             settle_after: config.compaction.finalize_after,
@@ -716,18 +721,6 @@ impl LogDb {
         Ok(report)
     }
 
-    /// Applies `groups` to the write delta, waiting up to `wait` for room
-    /// in the queue, or failing at once without it.
-    async fn apply_groups(
-        &self,
-        namespace: &Namespace,
-        groups: StreamGroups,
-        wait: Option<Duration>,
-    ) -> Result<WriteReport> {
-        self.apply_groups_with_ops(namespace, groups, Vec::new(), wait)
-            .await
-    }
-
     /// Applies `groups` and `ops` in the same coordinator delta and SlateDB
     /// write batch.
     async fn apply_groups_with_ops(
@@ -738,6 +731,26 @@ impl LogDb {
         wait: Option<Duration>,
     ) -> Result<WriteReport> {
         let (report, write) = self.apply_write(namespace, groups, ops, wait).await?;
+        tokio::spawn(write.written());
+        Ok(report)
+    }
+
+    /// Applies `groups` with the ID blocks `reserve` sizes, as a rollup
+    /// registering its streams over several writes does.
+    async fn apply_reserving(
+        &self,
+        namespace: &Namespace,
+        groups: StreamGroups,
+        reserve: Reservations,
+        wait: Option<Duration>,
+    ) -> Result<WriteReport> {
+        let write = LogsWrite {
+            namespace: namespace.clone(),
+            groups,
+            ops: Vec::new(),
+            reserve,
+        };
+        let (report, write) = self.apply_logs_write(write, wait).await?;
         tokio::spawn(write.written());
         Ok(report)
     }
@@ -753,7 +766,16 @@ impl LogDb {
             namespace: namespace.clone(),
             groups,
             ops,
+            reserve: Reservations::new(),
         };
+        self.apply_logs_write(write, wait).await
+    }
+
+    async fn apply_logs_write(
+        &self,
+        write: LogsWrite,
+        wait: Option<Duration>,
+    ) -> Result<(WriteReport, AppliedWrite)> {
         let handle = self.write_handle()?;
         let permit = self.write_budget(handle, &write, wait).await?;
         let mut write_handle = match wait {

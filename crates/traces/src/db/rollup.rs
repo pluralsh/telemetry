@@ -41,14 +41,21 @@ impl TraceDb {
             return Ok(0);
         };
         let base_ns = i64::try_from(self.segment_ns).unwrap_or(i64::MAX);
-        let mut sealed = 0;
+        let mut planned = Vec::new();
         for (namespace, rollups) in Rollups::load_all(&slate, crate::codec::KEY_SCOPE) {
-            for wide in rollups.plan(base_ns, None, config, self.retention, now_ns) {
-                self.roll_up(&namespace, wide, config).await?;
-                sealed += 1;
-            }
+            planned.extend(
+                rollups
+                    .plan(base_ns, None, config, self.retention, now_ns)
+                    .into_iter()
+                    .map(|wide| (namespace.clone(), wide)),
+            );
         }
-        Ok(sealed)
+        common::storage::rollup::run_all(
+            planned,
+            config.concurrency,
+            |(namespace, wide)| async move { self.roll_up(&namespace, wide, config).await },
+        )
+        .await
     }
 
     pub(crate) fn rollup_writer(&self) -> Result<&Arc<dyn Storage>> {
@@ -203,6 +210,10 @@ impl TraceDb {
     ) -> Result<()> {
         // A trace written in several flushes has a page in each.
         let traces = merge_traces(traces)?;
+        // Before the routing lock, which would hold ingest while this waits.
+        self.admission
+            .yield_to_ingest(common::storage::admission::COPY_YIELD_WAIT)
+            .await;
         // With no write in flight and none pending, a head read here stays
         // current until this copy is applied: a later write to the trace
         // lands in this copy's flush or after it.
@@ -276,6 +287,7 @@ mod tests {
                 path: "traces-rollup-test".to_owned(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

@@ -143,6 +143,7 @@ rollup:
   merge_wait_seconds: 1800 # Longest a rollup waits for its merge before it is sealed anyway.
   interval_seconds: 300 # How often closed windows and days are looked for.
   copy_buffer_bytes: 67108864 # Copied bytes queued before waiting for storage; the operator sizes it from the memory limit.
+  concurrency: 1 # Rollups run at once; the operator renders one per 3 cores and 4 GiB of limit, up to 4.
 
 # How often writers summarize settled segments into per-minute row counts, split
 # by detected_level, which metric queries that read no lines, or filter only on

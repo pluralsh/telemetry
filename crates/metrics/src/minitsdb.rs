@@ -1466,6 +1466,14 @@ impl MiniTsdb {
             .await
     }
 
+    /// Waits, as a rollup copy does before each buffer, while ingest is
+    /// being shed; see [`Admission::yield_to_ingest`](common::storage::admission::Admission::yield_to_ingest).
+    pub(crate) async fn yield_to_ingest(&self) {
+        self.admission
+            .yield_to_ingest(common::storage::admission::COPY_YIELD_WAIT)
+            .await;
+    }
+
     /// Asks for the live delta to be flushed, without waiting for it.
     pub(crate) async fn request_flush(&self) -> Result<()> {
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);

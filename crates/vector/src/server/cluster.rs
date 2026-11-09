@@ -1009,6 +1009,7 @@ mod tests {
                             path: self.dir.path().to_string_lossy().to_string(),
                         }),
                         settings_path: None,
+                        l0_flush_parallelism: None,
                         block_cache: None,
                         meta_cache: None,
                         disk: Default::default(),

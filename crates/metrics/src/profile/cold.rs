@@ -345,6 +345,7 @@ fn storage_config(dir: &Path, path: String) -> SlateDbStorageConfig {
             path: dir.display().to_string(),
         }),
         settings_path: std::env::var("PROFILE_SLATEDB_SETTINGS").ok(),
+        l0_flush_parallelism: None,
         // The metrics example config unless overridden: 512 MiB of blocks,
         // 128 MiB of metadata.
         block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {

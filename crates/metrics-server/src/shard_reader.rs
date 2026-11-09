@@ -320,6 +320,7 @@ mod tests {
                     path: directory.path().to_string_lossy().into_owned(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

@@ -130,7 +130,7 @@ impl StreamIds {
 
     /// Gives `fingerprint` an ID unless it has one: from its `key`'s block
     /// when `block_ids` is positive, reserving one of at least `block_ids`
-    /// IDs, or of `hint` for a key's first, when the key has none left.
+    /// IDs, or of `hint` IDs for a key's first, when the key has none left.
     /// Returns whether it allocated.
     fn allocate(
         &mut self,
@@ -167,7 +167,7 @@ impl StreamIds {
         let reserved = match self.blocks.get(&key) {
             Some(block) => block.reserved,
             None if self.blocks.len() >= MAX_BLOCK_KEYS => return self.plain_id(),
-            None => hint(&key).map_or(0, |streams| streams.saturating_add(streams / 4)),
+            None => hint(&key).unwrap_or(0),
         };
         let size = reserved.max(block_ids).min(MAX_BLOCK_IDS);
         let start = self.next;
@@ -259,7 +259,11 @@ impl DirectWriter {
         groups: FrozenLogsWriteDelta,
     ) -> Result<(StorageBatch, Vec<WrittenObject>)> {
         self.load_ids(&groups).await?;
-        let FrozenLogsWriteDelta { groups, ops } = groups;
+        let FrozenLogsWriteDelta {
+            groups,
+            ops,
+            reserve,
+        } = groups;
         let ttl = self.ttl()?;
         let retention = PageRetention {
             physical_ttl: ttl,
@@ -279,7 +283,7 @@ impl DirectWriter {
         let mut objects = Vec::new();
         for (namespace, groups) in by_namespace {
             let mut write = PendingWrite::new(ttl, retention, groups.len());
-            self.allocate_in_locality_order(&namespace, &groups)?;
+            self.allocate_in_locality_order(&namespace, &groups, &reserve)?;
             let mut runs: BTreeMap<SegmentId, Vec<(StreamId, Vec<LogEntry>)>> = BTreeMap::new();
             for ((segment, fingerprint), (labels, entries)) in groups {
                 let stream_id = self
@@ -357,11 +361,13 @@ impl DirectWriter {
     }
 
     /// Allocates the IDs of the streams `groups` adds to each segment and
-    /// rollup period in [`locality_order`].
+    /// rollup period in [`locality_order`], a key's first block in a
+    /// segment sized as `reserve` asks.
     fn allocate_in_locality_order(
         &mut self,
         namespace: &Namespace,
         groups: &StreamGroups,
+        reserve: &CoordinatedReservations,
     ) -> Result<()> {
         let mut segments: BTreeMap<SegmentId, Vec<(StreamFingerprint, &Labels)>> = BTreeMap::new();
         let mut periods: BTreeMap<SegmentId, Vec<(StreamFingerprint, &Labels)>> = BTreeMap::new();
@@ -402,8 +408,14 @@ impl DirectWriter {
                     .get(&(namespace.clone(), previous))
                     .map(|ids| &ids.streams)
             });
-            let allocated =
-                allocate_streams(&mut ids.streams, previous, &streams, priority, block_ids);
+            let allocated = allocate_streams(
+                &mut ids.streams,
+                previous,
+                reserve.get(&(namespace.clone(), segment)),
+                &streams,
+                priority,
+                block_ids,
+            );
             self.segments.insert(key, ids);
             allocated?;
         }
@@ -419,7 +431,8 @@ impl DirectWriter {
             ids.touched = Instant::now();
             let previous = preceding(period)
                 .and_then(|previous| self.periods.get(&(namespace.clone(), previous)));
-            let allocated = allocate_streams(&mut ids, previous, &streams, priority, block_ids);
+            let allocated =
+                allocate_streams(&mut ids, previous, None, &streams, priority, block_ids);
             self.periods.insert(key, ids);
             allocated?;
         }
@@ -662,11 +675,13 @@ impl DirectWriter {
 }
 
 /// Gives `streams`, in locality order, the IDs they lack in `ids`. With
-/// `block_ids` positive, a key's first block in `ids` is sized by how many
-/// of its streams `previous`, the preceding partition, gave IDs.
+/// `block_ids` positive, a key's first block in `ids` holds the streams
+/// `reserved` counts for it, or else how many of its streams `previous`, the
+/// preceding partition, gave IDs and a quarter more.
 fn allocate_streams(
     ids: &mut StreamIds,
     previous: Option<&StreamIds>,
+    reserved: Option<&HashMap<LocalityKey, u32>>,
     streams: &[(StreamFingerprint, &Labels)],
     priority: &[String],
     block_ids: u32,
@@ -681,7 +696,12 @@ fn allocate_streams(
             .then(|| locality_key(labels, priority))
             .flatten();
         allocated |= ids.allocate(*fingerprint, key, block_ids, |key| {
-            previous?.blocks.get(key).map(|block| block.streams)
+            reserved
+                .and_then(|reserved| reserved.get(key).copied())
+                .or_else(|| {
+                    let streams = previous?.blocks.get(key)?.streams;
+                    Some(streams.saturating_add(streams / 4))
+                })
         })?;
     }
     if allocated {
@@ -701,14 +721,19 @@ fn preceding(partition: SegmentId) -> Option<SegmentId> {
 pub(super) type StreamGroups = BTreeMap<(SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
 type CoordinatedStreamGroups =
     BTreeMap<(Namespace, SegmentId, StreamFingerprint), (Labels, Vec<LogEntry>)>;
+/// IDs to reserve for each locality key's first block in a segment, for a
+/// rollup that registers the segment's streams over several writes.
+pub(super) type Reservations = HashMap<SegmentId, HashMap<LocalityKey, u32>>;
+type CoordinatedReservations = HashMap<(Namespace, SegmentId), HashMap<LocalityKey, u32>>;
 
 pub(super) struct LogsWrite {
     pub(super) namespace: Namespace,
     pub(super) groups: StreamGroups,
     pub(super) ops: Vec<RecordOp>,
+    pub(super) reserve: Reservations,
 }
 
-fn labels_bytes(labels: &Labels) -> usize {
+pub(super) fn labels_bytes(labels: &Labels) -> usize {
     labels
         .iter()
         .map(|label| size_of::<Label>() + label.name.len() + label.value.len())
@@ -789,11 +814,13 @@ impl LogsWrite {
 pub(super) struct FrozenLogsWriteDelta {
     groups: CoordinatedStreamGroups,
     ops: Vec<RecordOp>,
+    reserve: CoordinatedReservations,
 }
 
 pub(super) struct LogsWriteDelta {
     groups: CoordinatedStreamGroups,
     ops: Vec<RecordOp>,
+    reserve: CoordinatedReservations,
 }
 
 impl Delta for LogsWriteDelta {
@@ -809,6 +836,7 @@ impl Delta for LogsWriteDelta {
         Self {
             groups: BTreeMap::new(),
             ops: Vec::new(),
+            reserve: HashMap::new(),
         }
     }
 
@@ -839,6 +867,16 @@ impl Delta for LogsWriteDelta {
             group.1.append(&mut entries);
         }
         self.ops.extend(write.ops);
+        for (segment, keys) in write.reserve {
+            let reserved = self
+                .reserve
+                .entry((write.namespace.clone(), segment))
+                .or_default();
+            for (key, ids) in keys {
+                let slot = reserved.entry(key).or_default();
+                *slot = (*slot).max(ids);
+            }
+        }
         Ok(report)
     }
 
@@ -867,6 +905,7 @@ impl Delta for LogsWriteDelta {
             FrozenLogsWriteDelta {
                 groups: self.groups,
                 ops: self.ops,
+                reserve: self.reserve,
             },
             (),
             (),
@@ -1138,6 +1177,7 @@ mod tests {
                 path: "logs-write-test".to_owned(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -1265,8 +1305,8 @@ mod tests {
         assert_eq!(allocate(&mut ids, key("b"), None), 5);
         // Streams without a key take the next unreserved ID.
         assert_eq!(allocate(&mut ids, None, None), 20);
-        // A new key's first block holds its hinted streams and a quarter more.
-        assert_eq!(allocate(&mut ids, key("c"), Some(8)), 21);
+        // A new key's first block holds its hinted IDs.
+        assert_eq!(allocate(&mut ids, key("c"), Some(10)), 21);
         assert_eq!(ids.next, 31);
         assert_eq!(allocate(&mut ids, key("d"), Some(1 << 20)), 31);
         assert_eq!(ids.next, 31 + MAX_BLOCK_IDS);
@@ -1494,6 +1534,7 @@ mod tests {
                     path: directory.display().to_string(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -1606,6 +1647,7 @@ mod tests {
                 namespace: Namespace::new("tenant").unwrap(),
                 groups: groups.clone(),
                 ops: Vec::new(),
+                reserve: Reservations::new(),
             }
             .estimated_bytes()
         };

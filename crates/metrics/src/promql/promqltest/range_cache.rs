@@ -26,6 +26,7 @@ async fn open(path: &str, result_cache_enabled: bool) -> ShardedMetrics {
             path: path.to_string(),
             object_store: common::storage::config::ObjectStoreConfig::InMemory,
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),

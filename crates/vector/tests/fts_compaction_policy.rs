@@ -86,6 +86,7 @@ fn make_config(dir: &std::path::Path, settings_path: &std::path::Path) -> Config
                 path: dir.to_str().unwrap().to_string(),
             }),
             settings_path: Some(settings_path.to_str().unwrap().to_string()),
+            l0_flush_parallelism: None,
             block_cache: None,
             ..Default::default()
         }),

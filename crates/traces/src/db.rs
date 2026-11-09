@@ -268,7 +268,7 @@ impl TraceDb {
         let storage = StorageBuilder::with_cache_over(
             &config.storage,
             cache,
-            common::storage::settings::writer_settings(),
+            common::storage::settings::writer_settings_for(&config.storage),
         )?
         .with_semantics(
             storage_semantics().with_segment_compaction(

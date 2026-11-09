@@ -236,6 +236,7 @@ impl Default for StorageConfig {
                 path: ".data".to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -259,6 +260,15 @@ pub struct SlateDbStorageConfig {
     /// and merges any `SLATEDB_` prefixed environment variables.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_path: Option<String>,
+
+    /// L0 SSTs a writer uploads at once, from which its unflushed bytes and
+    /// L0 limit follow: see
+    /// [`writer_settings_for`](super::settings::writer_settings_for). Each
+    /// flush encodes its memtable on one task, so this bounds the cores L0
+    /// flushes use. Unset keeps the writer defaults; a settings file or
+    /// `SLATEDB_` variables still override what it derives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l0_flush_parallelism: Option<usize>,
 
     /// Optional cache for SST *data* block lookups.
     ///
@@ -417,6 +427,7 @@ impl Default for SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::default(),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: DiskPerformance::default(),
@@ -436,6 +447,7 @@ impl StorageConfig {
                 path: format!("{}/{}", config.path, suffix),
                 object_store: config.object_store.clone(),
                 settings_path: config.settings_path.clone(),
+                l0_flush_parallelism: config.l0_flush_parallelism,
                 block_cache: config.block_cache.clone(),
                 meta_cache: config.meta_cache.clone(),
                 disk: config.disk,
@@ -847,6 +859,7 @@ object_store:
                 path: "/tmp/slatedb".to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -1031,6 +1044,7 @@ meta_cache:
             path: "data".to_string(),
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
                 capacity: 64 * 1024 * 1024,
                 shards: Some(8),

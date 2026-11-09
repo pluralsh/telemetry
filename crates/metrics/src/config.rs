@@ -113,6 +113,9 @@ pub struct RollupConfig {
     /// How long a copied rollup waits for its merge into one sorted run
     /// before it is sealed anyway.
     pub merge_wait: Duration,
+    /// Rollups run at once, over every namespace; those of one pass never
+    /// overlap.
+    pub concurrency: usize,
 }
 
 impl Default for RollupConfig {
@@ -125,6 +128,7 @@ impl Default for RollupConfig {
             interval: Duration::from_secs(5 * 60),
             copy_buffer_bytes: common::storage::rollup::DEFAULT_COPY_BUFFER_BYTES,
             merge_wait: common::storage::rollup::DEFAULT_MERGE_WAIT,
+            concurrency: 1,
         }
     }
 }
@@ -140,6 +144,7 @@ impl RollupConfig {
             interval: self.interval,
             copy_buffer_bytes: self.copy_buffer_bytes,
             merge_wait: self.merge_wait,
+            concurrency: self.concurrency,
         }
     }
 }
@@ -189,6 +194,7 @@ impl Default for Config {
                     path: ".data".to_string(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),

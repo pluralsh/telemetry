@@ -109,7 +109,9 @@ memtables over `l0_sst_size_bytes`, plus `l0_flush_parallelism` uploads in
 flight. Writers keep 192 MiB unflushed and upload 2 L0 SSTs at once, so a
 memtable keeps filling while two upload; that is a backlog of 5 SSTs for
 Logs and Traces and 14 for Metrics, and each limit is the least that leaves
-admission 4 SSTs to taper over. Clients back off and retry while flushes keep going through,
+admission 4 SSTs to taper over. Logs and Traces writers with more cores
+upload more at once (see [writer budget](writer-budget.md)) and keep a
+memtable unflushed per upload, so their backlog and limit grow with them. Clients back off and retry while flushes keep going through,
 instead of every write waiting on a stall and then timing out.
 
 Uploads falling behind ingest, as on a writer out of CPU, fill memtables

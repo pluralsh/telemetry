@@ -153,6 +153,7 @@ fn config(path: &std::path::Path) -> Config {
                 path: path.display().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
                 capacity: env_bytes("PROFILE_BLOCK_CACHE_BYTES").unwrap_or(64 << 20),
                 shards: None,

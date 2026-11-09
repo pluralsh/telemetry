@@ -59,21 +59,30 @@ impl LogDb {
         let Some(slate) = self.storage.slate_read() else {
             return Ok(0);
         };
-        let mut sealed = 0;
+        let mut planned = Vec::new();
         for (namespace, rollups) in Rollups::load_all(&slate, crate::codec::KEY_SCOPE) {
-            let planned = rollups.plan(
-                self.segment_ns,
-                self.rollup_ns,
-                config,
-                self.retention,
-                now_ns,
+            planned.extend(
+                rollups
+                    .plan(
+                        self.segment_ns,
+                        self.rollup_ns,
+                        config,
+                        self.retention,
+                        now_ns,
+                    )
+                    .into_iter()
+                    .map(|wide| (namespace.clone(), wide)),
             );
-            for wide in planned {
-                tracing::info!(%namespace, segment = %wide, "starting logs rollup segment");
-                self.roll_up(&namespace, wide, config).await?;
-                sealed += 1;
-            }
         }
+        let sealed = common::storage::rollup::run_all(
+            planned,
+            config.concurrency,
+            |(namespace, wide)| async move {
+                tracing::info!(%namespace, segment = %wide, "starting logs rollup segment");
+                self.roll_up(&namespace, wide, config).await
+            },
+        )
+        .await?;
         if sealed > 0 {
             tracing::info!(sealed, "finished logs rollup pass");
         }
@@ -127,7 +136,8 @@ impl LogDb {
             copied: self.copy_progress(namespace, wide).await?,
             ttl,
         };
-        self.register_streams(namespace, &sources, wide).await?;
+        self.register_streams(namespace, &sources, wide, buffer)
+            .await?;
         for segment in sources {
             self.copy_segment(namespace, segment, wide, &mut copy)
                 .await?;
@@ -172,28 +182,71 @@ impl LogDb {
     }
 
     /// Gives every stream of `sources` its ID in `wide` before any row is
-    /// copied, all in one write the writer allocates in
-    /// [`locality_order`](crate::model::locality_order), so streams that the
-    /// copy finds segment by segment still get neighbouring IDs when they
-    /// share coarse labels.
+    /// copied, so streams sharing a locality key get neighbouring IDs
+    /// however the copy finds them segment by segment. A first read of the
+    /// sources keeps only each stream's fingerprint and how many streams
+    /// each key has, which sizes the key's ID block in `wide` to hold them
+    /// all; a second registers them in writes of about `buffer` label
+    /// bytes, each in [`locality_order`](crate::model::locality_order) and
+    /// written before the next. So a day of many streams never holds all
+    /// their labels at once.
     async fn register_streams(
         &self,
         namespace: &Namespace,
         sources: &[SegmentId],
         wide: SegmentId,
+        buffer: u64,
     ) -> Result<()> {
-        let mut streams = BTreeSet::new();
+        let mut unregistered = HashSet::new();
+        let mut keys: HashMap<Label, u32> = HashMap::new();
         for segment in sources {
             for read in self.segment_reads(namespace, *segment, usize::MAX).await? {
-                streams.extend(read.streams().map(|(_, labels)| labels.clone()));
+                for (_, labels) in read.streams() {
+                    if unregistered.insert(labels.fingerprint())
+                        && let Some(key) =
+                            crate::model::locality_key(labels, &self.stream_locality_labels)
+                    {
+                        *keys.entry(key).or_default() += 1;
+                    }
+                }
             }
         }
-        let groups: StreamGroups = streams
-            .into_iter()
-            .map(|labels| ((wide, labels.fingerprint()), (labels, Vec::new())))
-            .collect();
+        let reserve = Reservations::from([(wide, keys)]);
+        let mut groups = StreamGroups::new();
+        let mut queued = 0u64;
+        for segment in sources {
+            for read in self.segment_reads(namespace, *segment, usize::MAX).await? {
+                for (_, labels) in read.streams() {
+                    let fingerprint = labels.fingerprint();
+                    if !unregistered.remove(&fingerprint) {
+                        continue;
+                    }
+                    queued += labels_bytes(labels) as u64;
+                    groups.insert((wide, fingerprint), (labels.clone(), Vec::new()));
+                    if queued >= buffer {
+                        self.register_chunk(namespace, std::mem::take(&mut groups), &reserve)
+                            .await?;
+                        queued = 0;
+                    }
+                }
+            }
+        }
+        self.register_chunk(namespace, groups, &reserve).await
+    }
+
+    /// Registers `groups`' streams once ingest stops being shed, and waits
+    /// for them to be written.
+    async fn register_chunk(
+        &self,
+        namespace: &Namespace,
+        groups: StreamGroups,
+        reserve: &Reservations,
+    ) -> Result<()> {
         if !groups.is_empty() {
-            self.apply_groups(namespace, groups, Some(COPY_WRITE_TIMEOUT))
+            self.admission
+                .yield_to_ingest(common::storage::admission::COPY_YIELD_WAIT)
+                .await;
+            self.apply_reserving(namespace, groups, reserve.clone(), Some(COPY_WRITE_TIMEOUT))
                 .await?;
         }
         self.flush_written().await
@@ -252,6 +305,9 @@ impl LogDb {
                     if copy.queued >= copy.buffer {
                         self.flush_written().await?;
                         copy.queued = 0;
+                        self.admission
+                            .yield_to_ingest(common::storage::admission::COPY_YIELD_WAIT)
+                            .await;
                     }
                 }
                 if !pending.is_empty() {
@@ -424,6 +480,7 @@ mod tests {
                 path: "logs-rollup-test".to_owned(),
                 object_store: ObjectStoreConfig::InMemory,
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -667,7 +724,25 @@ mod tests {
 
     #[tokio::test]
     async fn gives_streams_sharing_coarse_labels_neighbouring_ids() {
-        let db = LogDb::open(config()).await.unwrap();
+        let one_per_write = RollupConfig {
+            copy_buffer_bytes: 1,
+            ..RollupConfig::default()
+        };
+        neighbouring_ids_with(RollupConfig::default(), config().stream_id_block_size).await;
+        neighbouring_ids_with(one_per_write.clone(), config().stream_id_block_size).await;
+        // Registered a stream per write with blocks far smaller than a
+        // cluster's streams, each cluster's block is still sized to hold all
+        // of them.
+        neighbouring_ids_with(one_per_write, 2).await;
+    }
+
+    async fn neighbouring_ids_with(rollup: RollupConfig, stream_id_block_size: u32) {
+        let db = LogDb::open(Config {
+            stream_id_block_size,
+            ..config()
+        })
+        .await
+        .unwrap();
         // Each hour brings in new apps on both clusters, so the copy finds
         // the clusters' streams interleaved.
         for hour in 0..8 {
@@ -684,12 +759,7 @@ mod tests {
             db.write(&namespace(), batches).await.unwrap();
         }
         db.flush_memtable().await.unwrap();
-        assert_eq!(
-            db.rollup_at(&RollupConfig::default(), after_delay())
-                .await
-                .unwrap(),
-            1
-        );
+        assert_eq!(db.rollup_at(&rollup, after_delay()).await.unwrap(), 1);
 
         let mut ids: BTreeMap<String, Vec<StreamId>> = BTreeMap::new();
         for read in db
@@ -975,6 +1045,7 @@ mod tests {
                     path: directory.path().display().to_string(),
                 }),
                 settings_path: None,
+                l0_flush_parallelism: None,
                 block_cache: None,
                 meta_cache: None,
                 disk: Default::default(),
@@ -1039,7 +1110,7 @@ mod tests {
             .or_default()
             .insert(day());
         let sources = db.rollups(&namespace()).sources(day(), db.segment_ns);
-        db.register_streams(&namespace(), &sources, day())
+        db.register_streams(&namespace(), &sources, day(), u64::MAX)
             .await
             .unwrap();
         let mut copy = CopyState {
@@ -1129,5 +1200,311 @@ mod tests {
                 .contains("started without retry checkpoints")
         );
         db.close().await.unwrap();
+    }
+
+    /// Random days of streams across namespaces, rolled up under random
+    /// copy buffers, concurrency, segment caps, stream ID blocks and
+    /// locality labels, with late writes between the windows' and the day's
+    /// passes. `PROPTEST_CASES` runs more than the default few.
+    mod fuzz {
+        use std::collections::BTreeSet;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// `(cluster, namespace label, app)` of a stream; the labels it
+        /// lacks are absent.
+        type StreamSpec = (Option<u8>, Option<u8>, u8);
+        /// `(namespace, stream, hour, rows)` written.
+        type Rows = (usize, usize, u8, u8);
+
+        #[derive(Clone, Debug)]
+        struct Case {
+            namespaces: usize,
+            streams: Vec<StreamSpec>,
+            rows: Vec<Rows>,
+            late: Vec<Rows>,
+            window_hour: i64,
+            copy_buffer_bytes: u64,
+            concurrency: usize,
+            max_segment_bytes: u64,
+            stream_id_block_size: u32,
+            priority: Vec<String>,
+            merge_wait: Duration,
+        }
+
+        fn case() -> impl Strategy<Value = Case> {
+            let streams = prop::collection::vec(
+                (prop::option::of(0u8..3), prop::option::of(0u8..3), 0u8..64),
+                1..64,
+            );
+            let rows = || prop::collection::vec((0usize..3, 0usize..64, 0u8..24, 1u8..4), 1..120);
+            let priority = prop::sample::select(vec![
+                Vec::new(),
+                vec!["cluster".to_owned()],
+                crate::config::DEFAULT_STREAM_LOCALITY_LABELS
+                    .map(String::from)
+                    .to_vec(),
+            ]);
+            (
+                (1usize..=3, streams, rows(), rows(), 4i64..24),
+                (
+                    prop::sample::select(vec![1u64, 1, 256, 4 << 10, 64 << 20]),
+                    1usize..=4,
+                    prop::sample::select(vec![8u64 << 10, 64 << 10, 4 << 30]),
+                    prop::sample::select(vec![0u32, 2, 256]),
+                    priority,
+                    prop::sample::select(vec![0u64, 2_000]),
+                ),
+            )
+                .prop_map(
+                    |(
+                        (namespaces, streams, rows, late, window_hour),
+                        (
+                            copy_buffer_bytes,
+                            concurrency,
+                            max_segment_bytes,
+                            stream_id_block_size,
+                            priority,
+                            merge_wait_ms,
+                        ),
+                    )| Case {
+                        namespaces,
+                        streams,
+                        rows,
+                        late,
+                        window_hour,
+                        copy_buffer_bytes,
+                        concurrency,
+                        max_segment_bytes,
+                        stream_id_block_size,
+                        priority,
+                        merge_wait: Duration::from_millis(merge_wait_ms),
+                    },
+                )
+        }
+
+        fn labels((cluster, kube_namespace, app): StreamSpec) -> Labels {
+            let mut labels = vec![
+                Label::new("app", format!("a{app}")),
+                Label::new("env", "prod"),
+            ];
+            if let Some(cluster) = cluster {
+                labels.push(Label::new("cluster", format!("c{cluster}")));
+            }
+            if let Some(kube_namespace) = kube_namespace {
+                labels.push(Label::new("namespace", format!("n{kube_namespace}")));
+            }
+            Labels::new(labels).unwrap()
+        }
+
+        fn tenant(index: usize) -> Namespace {
+            Namespace::new(format!("tenant{index}")).unwrap()
+        }
+
+        type Expected = Vec<BTreeSet<(String, i64, String)>>;
+
+        /// Writes `rows` of `case`'s streams, recording each in `expected`.
+        async fn write(
+            db: &LogDb,
+            case: &Case,
+            rows: &[Rows],
+            expected: &mut Expected,
+            line: &mut u64,
+        ) {
+            for (namespace, expected) in expected.iter_mut().enumerate() {
+                let mut batches = Vec::new();
+                for (_, stream, hour, count) in rows
+                    .iter()
+                    .filter(|(row_namespace, ..)| row_namespace % case.namespaces == namespace)
+                {
+                    let labels = labels(case.streams[stream % case.streams.len()]);
+                    let entries: Vec<_> = (0..*count)
+                        .map(|_| {
+                            *line += 1;
+                            let at = DAY + i64::from(*hour) * HOUR + (*line as i64) * 1_000_000_000;
+                            let text = format!("line {line}");
+                            expected.insert((format!("{labels:?}"), at, text.clone()));
+                            LogEntry::new(at, text)
+                        })
+                        .collect();
+                    batches.push(LogBatch::new(labels, entries));
+                }
+                if !batches.is_empty() {
+                    db.write(&tenant(namespace), batches).await.unwrap();
+                }
+            }
+            db.flush_memtable().await.unwrap();
+        }
+
+        async fn rows_of(db: &LogDb, namespace: &Namespace) -> BTreeSet<(String, i64, String)> {
+            db.read(
+                namespace,
+                DAY,
+                DAY + 24 * HOUR - 1,
+                &[Label::new("env", "prod")],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    format!("{:?}", row.labels),
+                    row.entry.timestamp_ns,
+                    row.entry.line,
+                )
+            })
+            .collect()
+        }
+
+        async fn queried_in(db: &LogDb, namespace: &Namespace) -> usize {
+            let result = db
+                .query(
+                    namespace,
+                    &QueryRequest::range(
+                        r#"{env="prod"}"#,
+                        DAY,
+                        DAY + 24 * HOUR - 1,
+                        60_000_000_000,
+                    ),
+                    QueryOptions {
+                        limit: 100_000,
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let QueryResult::Streams(streams) = result else {
+                panic!("expected streams");
+            };
+            streams.iter().map(|stream| stream.entries.len()).sum()
+        }
+
+        /// Every namespace reads and queries exactly what was written, and
+        /// each rollup sealed since `sealed` gives each stream one ID, each
+        /// locality key's in one dense range when streams take ID blocks.
+        async fn check(
+            db: &LogDb,
+            case: &Case,
+            expected: &Expected,
+            sealed: &mut [BTreeSet<SegmentId>],
+            phase: &str,
+        ) {
+            for (index, expected) in expected.iter().enumerate() {
+                let namespace = tenant(index);
+                let rows = rows_of(db, &namespace).await;
+                assert_eq!(&rows, expected, "{phase}: rows of {namespace} differ");
+                assert_eq!(
+                    queried_in(db, &namespace).await,
+                    expected.len(),
+                    "{phase}: query of {namespace} differs"
+                );
+                let now: BTreeSet<SegmentId> =
+                    db.rollups(&namespace).sealed().iter().copied().collect();
+                for wide in now.difference(&sealed[index]) {
+                    let mut ids = BTreeMap::new();
+                    let mut keys: BTreeMap<String, Vec<StreamId>> = BTreeMap::new();
+                    for read in db
+                        .segment_reads(&namespace, *wide, usize::MAX)
+                        .await
+                        .unwrap()
+                    {
+                        for (id, labels) in read.streams() {
+                            assert!(
+                                ids.insert(labels.fingerprint(), id).is_none(),
+                                "{phase}: {wide} lists a stream twice"
+                            );
+                            if let Some(key) = crate::model::locality_key(labels, &case.priority) {
+                                keys.entry(format!("{key:?}")).or_default().push(id);
+                            }
+                        }
+                    }
+                    let distinct: BTreeSet<_> = ids.values().collect();
+                    assert_eq!(
+                        distinct.len(),
+                        ids.len(),
+                        "{phase}: {wide} reuses a stream ID"
+                    );
+                    if case.stream_id_block_size > 0 {
+                        for (key, mut ids) in keys {
+                            ids.sort_unstable();
+                            let dense: Vec<_> = (ids[0]..ids[0] + ids.len() as StreamId).collect();
+                            assert_eq!(ids, dense, "{phase}: {wide} scatters {key}");
+                        }
+                    }
+                }
+                sealed[index] = now;
+            }
+        }
+
+        async fn run(case: Case) {
+            let db = LogDb::open(Config {
+                stream_id_block_size: case.stream_id_block_size,
+                stream_locality_labels: case.priority.clone(),
+                ..config()
+            })
+            .await
+            .unwrap();
+            let rollup = RollupConfig {
+                copy_buffer_bytes: case.copy_buffer_bytes,
+                concurrency: case.concurrency,
+                max_segment_bytes: case.max_segment_bytes,
+                merge_wait: case.merge_wait,
+                ..RollupConfig::default()
+            };
+            let mut expected: Expected = vec![BTreeSet::new(); case.namespaces];
+            let mut sealed = vec![BTreeSet::new(); case.namespaces];
+            let mut line = 0;
+            write(&db, &case, &case.rows, &mut expected, &mut line).await;
+            check(&db, &case, &expected, &mut sealed, "written").await;
+
+            let windows_at = DAY + case.window_hour * HOUR + 15 * 60_000_000_000;
+            db.rollup_at(&rollup, windows_at).await.unwrap();
+            check(&db, &case, &expected, &mut sealed, "windows").await;
+
+            // Late rows land in sealed windows' rollups and in hours yet to
+            // roll up alike.
+            write(&db, &case, &case.late, &mut expected, &mut line).await;
+            check(&db, &case, &expected, &mut sealed, "late").await;
+
+            for pass in 0.. {
+                assert!(pass < 8, "rollups never settled");
+                let rolled = db.rollup_at(&rollup, after_delay()).await.unwrap();
+                check(
+                    &db,
+                    &case,
+                    &expected,
+                    &mut sealed,
+                    &format!("day pass {pass}"),
+                )
+                .await;
+                if rolled == 0 {
+                    break;
+                }
+            }
+            db.close().await.unwrap();
+        }
+
+        fn cases() -> u32 {
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|cases| cases.parse().ok())
+                .unwrap_or(6)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(cases()))]
+
+            #[test]
+            fn rollups_keep_every_row_and_stream(case in case()) {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run(case));
+            }
+        }
     }
 }

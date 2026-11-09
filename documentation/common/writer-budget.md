@@ -14,8 +14,8 @@ sizes the derived ones from the writer's CPU and memory limits; see
 | Admission | per request | none | `storage_admission_rejections_total` |
 | Write budget | one process-wide budget, and beside it half its size for rollup copies | `write_budget_bytes`/`memory.write_bytes`: Logs 16 MiB per core (at least 24 MiB), Traces 48 MiB, Metrics 192 MiB; with the copies' allowance resident at about 12, 9 and 6 times | ingest waits up to 1 s, then HTTP 429 (`logs_memory_budget_rejections_total` for Logs) |
 | Write coordinator | one per database (per hour bucket for Metrics); encodes on the rayon pool; one commit in flight | a delta frozen at a third of the write budget | the write budget fills behind it |
-| SlateDB memtables | one filling, `l0_flush_parallelism` (2) uploading | `max_unflushed_bytes` 192 MiB, about 2.5 times resident, plus about 90 MiB per upload | admission sheds from five eighths of it; at it SlateDB holds writes ("unflushed bytes" warnings) and the write budget fills behind it |
-| L0 | one L0 compaction per segment at a time | `l0_max_ssts` (24; Metrics 48) SSTs per segment on the object store | admission sheds from five eighths of the limit |
+| SlateDB memtables | one filling, `l0_flush_parallelism` uploading: Logs and Traces one per core from 2 to 6, Metrics 2 | `max_unflushed_bytes`, a 64 MiB memtable per upload and one filling (192 MiB at 2), about 2.5 times resident, plus about 90 MiB per upload | admission sheds from five eighths of it; at it SlateDB holds writes ("unflushed bytes" warnings) and the write budget fills behind it |
+| L0 | one L0 compaction per segment at a time | `l0_max_ssts` (24 up to 2 uploads, 32 at 4, 48 at 6; Metrics 48) SSTs per segment on the object store | admission sheds from five eighths of the limit |
 | Compaction | subcompactions up to the cores; compactions as the budget fits | `memory.compaction_bytes`, a subcompaction holding about `sources × prefetch + 90 MiB` | proposals deferred for memory; L0 depth rises |
 
 ## How the stages hold each other up
@@ -32,7 +32,13 @@ the back:
    With one upload at a time this happened every few seconds at 10k logs/s
    on 4 cores, while the cores were half idle. Two uploads and 192 MiB of
    unflushed memtables leave room for one memtable filling beside two
-   uploading.
+   uploading. Each upload encodes its memtable on one task, though, so two
+   cap L0 flushes at about two cores: on S3, 2-, 4- and 6-core Logs writers
+   all flushed about 35 MB/s on under two cores and shed the rest of their
+   ingest at five eighths of 192 MiB. Logs and Traces writers therefore
+   upload one SST per core, from 2 to 6, while what the uploads past two
+   hold fits an eighth of the memory limit, with a memtable of unflushed
+   room per upload.
 3. A held SlateDB write holds the coordinator's commit, so frozen deltas
    stay in the write budget, and ingest past it waits a second and gets
    a 429. At 10k logs/s on 4 cores, the write budget turned away 88 requests
@@ -53,7 +59,8 @@ now wait in an allowance of their own.
 - **L0 limit.** Admission stops taking writes `backlog` SSTs short of
   `l0_max_ssts`, where the backlog is `max_unflushed_bytes /
   l0_sst_size_bytes` (rounded up) plus `l0_flush_parallelism`: 5 for Logs and
-  Traces, 14 for Metrics' 16 MiB SSTs. It sheds from five eighths of the
+  Traces at 2 uploads (9 at 4, 13 at 6), 14 for Metrics' 16 MiB SSTs. It
+  sheds from five eighths of the
   limit, so the limit is at least `8 (backlog + 3) / 3` for shedding to taper
   over 4 SSTs; `l0_max_ssts_for` rounds that up to a multiple of 8.
 - **Compaction memory.** SlateDB splits a compaction into ranges of at least
@@ -72,4 +79,9 @@ now wait in an allowance of their own.
   path at its resident factor, and request bodies. A Logs writer reserves
   1,096 MiB, its write path at 12 times its write budget (288 MiB on 1 core,
   768 MiB on 4) and 512 MiB of bodies, and a Logs reader 736 MiB for
-  replaying the writer's unflushed WAL.
+  replaying the writer's unflushed WAL. Every upload past two adds 250 MiB
+  to a Logs or Traces writer (a 64 MiB memtable at 2.5 times and 90 MiB of
+  parts) and 160 MiB to a Logs reader's replay. The operator renders the
+  uploads as `storage.l0_flush_parallelism` on writers above 2; the server
+  derives `max_unflushed_bytes` and `l0_max_ssts` from it, and a SlateDB
+  settings file or `SLATEDB_` variables still override any of them.

@@ -511,6 +511,7 @@ async fn open(args: &Args) -> TimeSeriesDb {
         path: "query-profile".to_string(),
         object_store: ObjectStoreConfig::InMemory,
         settings_path: Some(settings_file(args)),
+        l0_flush_parallelism: None,
         block_cache: args.block_cache.then(|| cache(512 << 20)),
         meta_cache: args.block_cache.then(|| cache(128 << 20)),
         disk: Default::default(),

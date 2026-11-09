@@ -124,6 +124,7 @@ async fn main() {
             path: dir.path().to_string_lossy().into_owned(),
         }),
         settings_path: None,
+        l0_flush_parallelism: None,
         block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
             capacity: 64 * 1024 * 1024,
             shards: None,

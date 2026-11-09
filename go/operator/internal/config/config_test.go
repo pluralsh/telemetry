@@ -34,6 +34,11 @@ const (
 	testTracesProduct       = "traces"
 	testVectorProduct       = "vector"
 	testPseudoFSName        = "files"
+	testMemory2Gi           = "2Gi"
+	testMemory4Gi           = "4Gi"
+	testMemory8Gi           = "8Gi"
+	testMemory16Gi          = "16Gi"
+	testMemory64Gi          = "64Gi"
 )
 
 func TestRenderDefaultsCredentialsAndHash(t *testing.T) {
@@ -275,10 +280,10 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 		Spec: telemetryv1alpha1.MetricsSpec{
 			Mode: telemetryv1alpha1.MetricsModeSharded,
 			Writer: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(testMemory2Gi)},
 			}},
 			Reader: telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(testMemory4Gi)},
 			}},
 		},
 	}
@@ -388,6 +393,21 @@ func TestRollupCopyBufferScalesWithMemory(t *testing.T) {
 	} {
 		if got := renderRollupConfig(memoryPlan{limit: limit}).CopyBufferBytes; got != want {
 			t.Fatalf("limit %d rendered copy buffer %d, want %d", limit, got, want)
+		}
+	}
+}
+
+func TestRollupConcurrencyScalesWithCoresAndMemory(t *testing.T) {
+	for _, tc := range []struct {
+		cores int64
+		limit string
+		want  int64
+	}{
+		{2, testMemory8Gi, 0}, {6, testMemory8Gi, 2}, {6, "6Gi", 0}, {12, testMemory16Gi, 4}, {12, "12Gi", 3}, {32, testMemory64Gi, 4},
+	} {
+		limit := resource.MustParse(tc.limit)
+		if got := renderRollupConfig(memoryPlan{cores: tc.cores, limit: limit.Value()}).Concurrency; got != tc.want {
+			t.Fatalf("%d cores, %s rendered rollup concurrency %d, want %d", tc.cores, tc.limit, got, tc.want)
 		}
 	}
 }
@@ -724,7 +744,7 @@ func TestRenderPseudoFSRemoteStoreUsesLocalWAL(t *testing.T) {
 }
 
 func TestRenderPseudoFSRejectsUnsatisfiableLimits(t *testing.T) {
-	dataSize := resource.MustParse("2Gi")
+	dataSize := resource.MustParse(testMemory2Gi)
 	tests := map[string]telemetryv1alpha1.PseudoFSSpec{
 		"blob cache exceeds data volume": {
 			Config: telemetryv1alpha1.PseudoFSConfigSpec{Blobs: telemetryv1alpha1.PseudoFSBlobsSpec{
@@ -856,14 +876,14 @@ func TestRenderGivesCompactionASubcompactionPerCore(t *testing.T) {
 	for _, tc := range []struct {
 		name, cpu, memory, expected string
 	}{
-		// (16Gi - 4Gi headroom - about 3.5Gi reserved, with 12 cores' write
-		// budget) shares about 8.5Gi: a writer's doubled 20% is 2,094Mi,
-		// below 12 × 208Mi, so the share bounds it.
-		{"cores above the share", "12", "16Gi", "compaction_bytes: 2195718144"},
-		// 64Gi shares about 44Gi: 20% is 9,048Mi, more than 12 cores take.
-		{"share above the cores", "12", "64Gi", "compaction_bytes: 9487515640"},
+		// (16Gi - 4Gi headroom - about 4.8Gi reserved, with 12 cores' write
+		// budget and 6 L0 uploads) shares about 7.2Gi: a quarter of it,
+		// 1,844Mi, is below 12 × 208Mi, so it bounds the share.
+		{"cores above the share", "12", testMemory16Gi, "compaction_bytes: 1933574144"},
+		// 64Gi shares about 43Gi: 20% is 8,848Mi, more than 12 cores take.
+		{"share above the cores", "12", testMemory64Gi, "compaction_bytes: 9277800440"},
 		// 4Gi shares 1.5Gi: 24 cores are capped at a quarter of it.
-		{"a quarter of a small limit", "24", "4Gi", "compaction_bytes: 402653184"},
+		{"a quarter of a small limit", "24", testMemory4Gi, "compaction_bytes: 402653184"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result, err := Render(Input{Logs: &telemetryv1alpha1.Logs{
@@ -871,7 +891,7 @@ func TestRenderGivesCompactionASubcompactionPerCore(t *testing.T) {
 				Spec: telemetryv1alpha1.LogsSpec{
 					Mode:   telemetryv1alpha1.ProductModeSharded,
 					Writer: workload(tc.cpu, tc.memory),
-					Reader: workload("1", "2Gi"),
+					Reader: workload("1", testMemory2Gi),
 				},
 			}, InternalToken: []byte("token")})
 			if err != nil {
@@ -895,7 +915,7 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 		Spec: telemetryv1alpha1.LogsSpec{
 			Mode:   telemetryv1alpha1.ProductModeSharded,
 			Writer: limit("6Gi"),
-			Reader: limit("2Gi"),
+			Reader: limit(testMemory2Gi),
 		},
 	}, InternalToken: []byte("token")})
 	if err != nil {
@@ -1015,8 +1035,8 @@ func TestRenderSizesVectorMemoryAroundItsReservations(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: testVectorProduct, Namespace: testMetricsNamespace},
 			Spec: telemetryv1alpha1.VectorSpec{
 				Mode:   telemetryv1alpha1.ProductModeSharded,
-				Writer: limit("4Gi"),
-				Reader: limit("2Gi"),
+				Writer: limit(testMemory4Gi),
+				Reader: limit(testMemory2Gi),
 				Config: telemetryv1alpha1.VectorConfigSpec{Embedding: embedding},
 			},
 		}, InternalToken: []byte("token")})
@@ -1159,7 +1179,7 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 	}
 	for _, product := range products {
 		for _, mode := range []telemetryv1alpha1.ProductMode{telemetryv1alpha1.ProductModeStandalone, telemetryv1alpha1.ProductModeSharded} {
-			for _, limit := range []string{"2Gi", "4Gi", "8Gi"} {
+			for _, limit := range []string{testMemory2Gi, testMemory4Gi, testMemory8Gi} {
 				t.Run(fmt.Sprintf("%s/%s/%s", product.name, mode, limit), func(t *testing.T) {
 					quantity := resource.MustParse(limit)
 					workload := telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{
@@ -1217,6 +1237,81 @@ func TestRenderedMemoryBoundsReservationsAndHeadroomFitTheLimit(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestWritersUploadOneL0SSTPerCoreThatTheirMemoryFits(t *testing.T) {
+	for _, tc := range []struct {
+		cores, uploads int64
+		memory         string
+	}{
+		{2, 2, testMemory8Gi}, {4, 4, "12Gi"}, {6, 6, testMemory16Gi}, {16, 6, testMemory64Gi},
+		// what uploads past two hold must fit an eighth of the limit
+		{6, 2, "1Gi"}, {6, 3, testMemory2Gi}, {6, 4, testMemory4Gi},
+	} {
+		memory := resource.MustParse(tc.memory)
+		if got := writerL0Uploads(tc.cores, memory.Value()); got != tc.uploads {
+			t.Errorf("%d cores / %s: %d uploads, want %d", tc.cores, tc.memory, got, tc.uploads)
+		}
+	}
+
+	workload := func(cpu, memory string) telemetryv1alpha1.WorkloadSpec {
+		return telemetryv1alpha1.WorkloadSpec{Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(memory),
+		}}}
+	}
+	rendered := func(input Input, key string) map[string]any {
+		input.InternalToken = []byte("token")
+		result, err := Render(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var config map[string]any
+		if err := yaml.Unmarshal(result.Data[key], &config); err != nil {
+			t.Fatal(err)
+		}
+		return config
+	}
+	logs := func(writer telemetryv1alpha1.WorkloadSpec) Input {
+		return Input{Logs: &telemetryv1alpha1.Logs{
+			ObjectMeta: metav1.ObjectMeta{Name: testLogsProduct, Namespace: testMetricsNamespace},
+			Spec: telemetryv1alpha1.LogsSpec{
+				Mode: telemetryv1alpha1.ProductModeSharded, Writer: writer, Reader: workload("1", testMemory4Gi),
+			},
+		}}
+	}
+	traces := func(writer telemetryv1alpha1.WorkloadSpec) Input {
+		return Input{Traces: &telemetryv1alpha1.Traces{
+			ObjectMeta: metav1.ObjectMeta{Name: testTracesProduct, Namespace: testMetricsNamespace},
+			Spec:       telemetryv1alpha1.TracesSpec{Writer: writer},
+		}}
+	}
+	const path = "storage.l0_flush_parallelism"
+
+	// when a writer has the default's cores, then nothing is rendered and its
+	// servers keep their own defaults
+	for _, config := range []map[string]any{rendered(logs(workload("2", testMemory8Gi)), LogsKey), rendered(traces(workload("2", testMemory8Gi)), TracesKey)} {
+		if value, found := lookupPath(config, path); found {
+			t.Errorf("2-core writer renders %s: %v", path, value)
+		}
+	}
+	// when it has more, then it uploads one per core, and its reader reserves
+	// for replaying the larger unflushed WAL without rendering the setting
+	for _, config := range []map[string]any{rendered(logs(workload("6", testMemory16Gi)), LogsKey), rendered(traces(workload("6", testMemory16Gi)), TracesKey)} {
+		if value, _ := lookupPath(config, path); value != 6 {
+			t.Errorf("6-core writer %s = %v, want 6", path, value)
+		}
+	}
+	reader := rendered(logs(workload("6", testMemory16Gi)), ReaderKey)
+	if value, found := lookupPath(reader, path); found {
+		t.Errorf("reader renders %s: %v", path, value)
+	}
+	readerCache := func(writer telemetryv1alpha1.WorkloadSpec) float64 {
+		value, _ := lookupPath(rendered(logs(writer), ReaderKey), "reader_cache_capacity")
+		return value
+	}
+	if small, large := readerCache(workload("2", testMemory8Gi)), readerCache(workload("6", testMemory16Gi)); large >= small {
+		t.Errorf("reader cache %v beside a 6-upload writer, want under the %v beside a 2-upload one", large, small)
 	}
 }
 

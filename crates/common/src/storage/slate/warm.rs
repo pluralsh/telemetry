@@ -1310,6 +1310,7 @@ mod tests {
                 path: dir.path().join("store").to_str().unwrap().to_owned(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(block_cache),
             meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
                 capacity: meta_capacity,

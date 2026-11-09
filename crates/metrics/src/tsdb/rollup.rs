@@ -55,23 +55,40 @@ impl Tsdb {
     /// `config.delay` before `now_ms`, first finishing any interrupted
     /// rollup. Returns the rollup buckets sealed.
     pub(crate) async fn rollup(&self, config: &RollupConfig, now_ms: i64) -> Result<usize> {
+        let slots = tokio::sync::Semaphore::new(config.concurrency.max(1));
+        self.rollup_within(config, now_ms, &slots).await
+    }
+
+    /// [`Self::rollup`], each rollup holding one of `slots`, which the
+    /// rollups of every namespace share.
+    pub(crate) async fn rollup_within(
+        &self,
+        config: &RollupConfig,
+        now_ms: i64,
+        slots: &tokio::sync::Semaphore,
+    ) -> Result<usize> {
         let _one = self.rollup_lock.lock().await;
-        let mut done = 0;
-        for wide in self.rollups().plan(
-            HOUR_NS,
-            None,
-            &config.planner(),
-            self.retention,
-            now_ms.saturating_mul(1_000_000),
-        ) {
-            let Some(wide) = bucket(wide).filter(|wide| TimeBucket::is_valid_size(wide.size))
-            else {
-                continue;
-            };
-            self.roll_up(wide, config).await?;
-            done += 1;
-        }
-        Ok(done)
+        let planned: Vec<TimeBucket> = self
+            .rollups()
+            .plan(
+                HOUR_NS,
+                None,
+                &config.planner(),
+                self.retention,
+                now_ms.saturating_mul(1_000_000),
+            )
+            .into_iter()
+            .filter_map(bucket)
+            .filter(|wide| TimeBucket::is_valid_size(wide.size))
+            .collect();
+        common::storage::rollup::run_all(planned, config.concurrency, |wide| async move {
+            let _slot = slots
+                .acquire()
+                .await
+                .map_err(|_| Error::Internal("rollup slots closed".to_owned()))?;
+            self.roll_up(wide, config).await
+        })
+        .await
     }
 
     /// This namespace's buckets as the shared planner sees them: a bucket
@@ -213,6 +230,7 @@ impl Tsdb {
                 if queued >= buffer {
                     mini.flush_written().await?;
                     queued = 0;
+                    mini.yield_to_ingest().await;
                 }
             }
         }
@@ -284,6 +302,7 @@ impl Tsdb {
                 if *queued >= buffer {
                     mini.flush_written().await?;
                     *queued = 0;
+                    mini.yield_to_ingest().await;
                 }
             }
         }

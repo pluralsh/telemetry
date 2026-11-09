@@ -125,6 +125,7 @@ fn profile_config(
                 path: store.display().to_string(),
             }),
             settings_path: std::env::var("PROFILE_SLATEDB_SETTINGS").ok(),
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),

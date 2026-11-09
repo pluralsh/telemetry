@@ -21,6 +21,7 @@ fn reader_from_db_reader(reader: DbReader) -> StorageReader {
 fn settings_config(path: Option<String>) -> SlateDbStorageConfig {
     SlateDbStorageConfig {
         settings_path: path,
+        l0_flush_parallelism: None,
         ..SlateDbStorageConfig::default()
     }
 }

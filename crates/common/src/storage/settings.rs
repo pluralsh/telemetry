@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use slatedb::config::Settings;
 
-use super::config::SlateDbStorageConfig;
+use super::config::{SlateDbStorageConfig, StorageConfig};
 use super::{StorageError, StorageResult};
 
 /// How long garbage collection keeps an SST no manifest references. SlateDB
@@ -112,6 +112,48 @@ pub fn writer_settings() -> Settings {
     }
 }
 
+/// [`writer_settings`] sized for `l0_flush_parallelism` uploads at once:
+/// `max_unflushed_bytes` holds one memtable filling beside every upload,
+/// and `l0_max_ssts` grows with the backlog that adds, so admission still
+/// tapers ingest over 4 L0 SSTs before it stops taking writes. Fewer
+/// uploads than [`DEFAULT_WRITER_L0_FLUSH_PARALLELISM`] keep its sizes.
+///
+/// A writer flushes each memtable on one task, so with two uploads a 6-core
+/// logs writer on S3 flushed about 35 MB/s on two cores and turned the rest
+/// of its ingest away at `max_unflushed_bytes`.
+pub fn writer_settings_with(l0_flush_parallelism: usize) -> Settings {
+    let defaults = writer_settings();
+    let uploads = l0_flush_parallelism.max(1);
+    if uploads <= defaults.l0_flush_parallelism {
+        return Settings {
+            l0_flush_parallelism: uploads,
+            ..defaults
+        };
+    }
+    let max_unflushed_bytes = (uploads + 1) * defaults.l0_sst_size_bytes;
+    let backlog = max_unflushed_bytes.div_ceil(defaults.l0_sst_size_bytes) + uploads;
+    let l0_max_ssts = l0_max_ssts_for(backlog).max(DEFAULT_WRITER_L0_MAX_SSTS);
+    Settings {
+        max_unflushed_bytes,
+        l0_flush_parallelism: uploads,
+        l0_max_ssts,
+        l0_max_ssts_per_key: l0_max_ssts,
+        ..defaults
+    }
+}
+
+/// The writer settings `config` asks for: [`writer_settings_with`] its
+/// `l0_flush_parallelism`, or [`writer_settings`] without one.
+pub fn writer_settings_for(config: &StorageConfig) -> Settings {
+    match config {
+        StorageConfig::SlateDb(SlateDbStorageConfig {
+            l0_flush_parallelism: Some(uploads),
+            ..
+        }) => writer_settings_with(*uploads),
+        _ => writer_settings(),
+    }
+}
+
 /// Loads SlateDB settings the way `Settings::from_file` / `Settings::load`
 /// do, but over `base` instead of SlateDB's defaults, so `base` applies
 /// wherever the file or environment leaves a key unset.
@@ -164,6 +206,7 @@ mod tests {
     fn config(path: Option<String>) -> SlateDbStorageConfig {
         SlateDbStorageConfig {
             settings_path: path,
+            l0_flush_parallelism: None,
             ..SlateDbStorageConfig::default()
         }
     }
@@ -207,6 +250,47 @@ mod tests {
         );
         assert_eq!(settings.l0_max_ssts, DEFAULT_WRITER_L0_MAX_SSTS);
         assert_eq!(settings.l0_max_ssts_per_key, DEFAULT_WRITER_L0_MAX_SSTS);
+    }
+
+    #[test]
+    fn more_l0_uploads_hold_more_unflushed_and_still_taper_admission() {
+        assert_eq!(
+            format!(
+                "{:?}",
+                writer_settings_with(DEFAULT_WRITER_L0_FLUSH_PARALLELISM)
+            ),
+            format!("{:?}", writer_settings())
+        );
+        assert_eq!(
+            writer_settings_with(1).max_unflushed_bytes,
+            DEFAULT_MAX_UNFLUSHED_BYTES
+        );
+        for (uploads, unflushed_mib, max_ssts) in [(4, 320, 32), (6, 448, 48)] {
+            let settings = writer_settings_with(uploads);
+            assert_eq!(settings.l0_flush_parallelism, uploads);
+            assert_eq!(settings.max_unflushed_bytes, unflushed_mib << 20);
+            assert_eq!(settings.l0_max_ssts, max_ssts);
+            assert_eq!(settings.l0_max_ssts_per_key, max_ssts);
+            let limit = super::super::admission::L0Limit::of(&settings);
+            assert!(limit.max_ssts.div_ceil(8) * 5 + 3 <= limit.max_ssts - limit.backlog);
+        }
+    }
+
+    #[test]
+    fn a_storage_config_sizes_its_writer_uploads() {
+        let sized = StorageConfig::SlateDb(SlateDbStorageConfig {
+            l0_flush_parallelism: Some(4),
+            ..SlateDbStorageConfig::default()
+        });
+        assert_eq!(writer_settings_for(&sized).l0_flush_parallelism, 4);
+        assert_eq!(
+            writer_settings_for(&sized.with_path_suffix("0")).l0_flush_parallelism,
+            4
+        );
+        assert_eq!(
+            writer_settings_for(&StorageConfig::InMemory).l0_flush_parallelism,
+            DEFAULT_WRITER_L0_FLUSH_PARALLELISM
+        );
     }
 
     #[test]

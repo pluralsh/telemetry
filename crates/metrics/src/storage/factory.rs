@@ -17,6 +17,7 @@ fn in_memory_config() -> common::storage::config::SlateDbStorageConfig {
         path: "test".to_string(),
         object_store: ObjectStoreConfig::InMemory,
         settings_path: None,
+        l0_flush_parallelism: None,
         block_cache: None,
         meta_cache: None,
         disk: Default::default(),
@@ -333,6 +334,7 @@ mod tests {
                 path: dir.to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: None,
             meta_cache: None,
             disk: Default::default(),
@@ -351,6 +353,7 @@ mod tests {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -385,6 +388,7 @@ mod tests {
                 path: obj_path.clone(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
@@ -432,6 +436,7 @@ mod tests {
                 path: obj_dir.to_str().unwrap().to_string(),
             }),
             settings_path: None,
+            l0_flush_parallelism: None,
             block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
                 1024 * 1024,
                 4 * 1024 * 1024,
