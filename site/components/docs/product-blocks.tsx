@@ -161,7 +161,7 @@ export function KeyLayout({ product, caption }: { product: ProductId; caption?: 
   );
 }
 
-type Next = "architecture" | "installation" | "api" | "benchmarks" | InstallMode;
+type Next = "architecture" | "installation" | "scaling" | "api" | "benchmarks" | InstallMode;
 
 const NEXT: Record<Next, { title: string; path: string; blurb: (p: ProductId) => string }> = {
   architecture: { title: "Architecture", path: "", blurb: (p) => `How ${PRODUCTS[p].name} compares with ${PRODUCTS[p].peer}.` },
@@ -169,6 +169,7 @@ const NEXT: Record<Next, { title: string; path: string; blurb: (p: ProductId) =>
   standalone: { title: "Standalone", path: "installation/standalone/", blurb: () => "One pod, data on a volume or in a bucket." },
   "read-write": { title: "Reader/writer split", path: "installation/read-write/", blurb: () => "One writer, autoscaled readers on a shared bucket." },
   sharded: { title: "Sharded", path: "installation/sharded/", blurb: () => "Several writers, one reader group per shard." },
+  scaling: { title: "Scaling", path: "scaling/", blurb: () => "Measured writer capacity and how many writers to run." },
   api: { title: "API reference", path: "api/", blurb: (p) => `Every ${PRODUCTS[p].query} and ingest route, with examples.` },
   benchmarks: { title: "Benchmarks", path: "benchmarks/", blurb: (p) => `Latency against ${PRODUCTS[p].peer}, run by run.` },
 };

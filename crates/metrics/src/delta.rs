@@ -56,9 +56,105 @@ impl FrozenTsdbDelta {
 /// One write through a bucket's coordinator.
 pub(crate) enum TsdbWrite {
     Samples(Vec<Series>),
+    /// Samples already validated and fingerprinted by [`prepare`] on the
+    /// writing task, so the coordinator, one task per bucket, only resolves
+    /// IDs and appends.
+    Prepared(PreparedWrite),
     /// Series registered without their samples, which a rollup copies
     /// afterwards; their samples and metadata are ignored.
     Register(Vec<Series>),
+}
+
+/// A series with sorted labels and their fingerprint.
+pub(crate) struct PreparedSeries {
+    labels: Vec<Label>,
+    fingerprint: SeriesFingerprint,
+    metric_name: String,
+    metric_type: Option<MetricType>,
+    unit: Option<String>,
+    samples: Vec<Sample>,
+    histograms: Vec<HistogramSample>,
+}
+
+/// The series of one write with samples, and each metric's last metadata.
+pub(crate) struct PreparedWrite {
+    series: Vec<PreparedSeries>,
+    metadata: Vec<MetricMetadata>,
+}
+
+/// Validates `series` against `bucket`, records them in `active_series` and
+/// fingerprints them. Fails without recording the rest at the first series
+/// with a sample outside the bucket.
+pub(crate) fn prepare(
+    series: Vec<Series>,
+    bucket: TimeBucket,
+    active_series: &ActiveSeriesTracker,
+) -> Result<PreparedWrite> {
+    let bucket_start_ms = i64::from(bucket.start) * 60 * 1000;
+    let bucket_end_ms = (i64::from(bucket.start) + i64::from(bucket.size_in_mins())) * 60 * 1000;
+    let mut metadata: HashMap<String, MetricMetadata> = HashMap::new();
+    let mut prepared = Vec::with_capacity(series.len());
+    for series in series {
+        let Series {
+            mut labels,
+            metric_type,
+            unit,
+            description,
+            samples,
+            histograms,
+        } = series;
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
+        let fingerprint = labels.fingerprint();
+        // HLL inserts are idempotent (fetch_max), so repeated records of the
+        // same fingerprint across batches don't inflate the estimate.
+        active_series.record(fingerprint);
+        let timestamps = samples
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .chain(histograms.iter().map(|h| h.timestamp_ms));
+        for timestamp_ms in timestamps {
+            if timestamp_ms < bucket_start_ms || timestamp_ms >= bucket_end_ms {
+                return Err(Error::InvalidInput(format!(
+                    "Sample timestamp {} is outside bucket range [{}, {})",
+                    timestamp_ms, bucket_start_ms, bucket_end_ms
+                )));
+            }
+        }
+        if samples.is_empty() && histograms.is_empty() {
+            continue;
+        }
+        let metric_name = labels
+            .iter()
+            .find(|label| label.name == "__name__")
+            .map(|label| label.value.clone());
+        if let Some(name) = &metric_name {
+            let latest = MetricMetadata {
+                metric_name: name.clone(),
+                metric_type,
+                description,
+                unit: unit.clone(),
+            };
+            match metadata.get_mut(name) {
+                Some(existing) => *existing = latest,
+                None => {
+                    metadata.insert(name.clone(), latest);
+                }
+            }
+        }
+        prepared.push(PreparedSeries {
+            labels,
+            fingerprint,
+            metric_name: metric_name.unwrap_or_default(),
+            metric_type,
+            unit,
+            samples,
+            histograms,
+        });
+    }
+    Ok(PreparedWrite {
+        series: prepared,
+        metadata: metadata.into_values().collect(),
+    })
 }
 
 impl From<Vec<Series>> for TsdbWrite {
@@ -93,71 +189,33 @@ pub(crate) struct TsdbWriteDelta {
 }
 
 impl TsdbWriteDelta {
-    fn ingest(&mut self, series: Series) -> Result<()> {
-        let Series {
-            mut labels,
-            metric_type,
-            unit,
-            description,
-            samples,
-            histograms,
-        } = series;
-        labels.sort_by(|a, b| a.name.cmp(&b.name));
-        let fingerprint = labels.fingerprint();
-
-        // Record the series in the active-series HLL once per ingest call.
-        // HLL inserts are idempotent (fetch_max), so repeated records of the
-        // same fingerprint across batches don't inflate the estimate.
-        self.active_series.record(fingerprint);
-
-        let bucket_start_ms = i64::from(self.bucket.start) * 60 * 1000;
-        let bucket_end_ms =
-            (i64::from(self.bucket.start) + i64::from(self.bucket.size_in_mins())) * 60 * 1000;
-        // Validated before registration, so a series with a rejected sample
-        // is never registered.
-        let timestamps = samples
-            .iter()
-            .map(|s| s.timestamp_ms)
-            .chain(histograms.iter().map(|h| h.timestamp_ms));
-        for timestamp_ms in timestamps {
-            if timestamp_ms < bucket_start_ms || timestamp_ms >= bucket_end_ms {
-                return Err(Error::InvalidInput(format!(
-                    "Sample timestamp {} is outside bucket range [{}, {})",
-                    timestamp_ms, bucket_start_ms, bucket_end_ms
-                )));
-            }
+    fn ingest(&mut self, write: PreparedWrite) -> Result<()> {
+        for metadata in write.metadata {
+            self.metadata.insert(metadata.metric_name.clone(), metadata);
         }
-        if samples.is_empty() && histograms.is_empty() {
-            return Ok(());
-        }
-        if let Some(metric_name) = labels
-            .iter()
-            .find(|label| label.name == "__name__")
-            .map(|label| label.value.clone())
-        {
-            self.metadata.insert(
-                metric_name.clone(),
-                MetricMetadata {
+        for series in write.series {
+            let PreparedSeries {
+                labels,
+                fingerprint,
+                metric_name,
+                metric_type,
+                unit,
+                samples,
+                histograms,
+            } = series;
+            let id = self.resolve_series(&labels, fingerprint, &unit, metric_type)?;
+            self.estimated_bytes += samples_bytes(&samples, &histograms);
+            let entry = match self.samples.entry(id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(SeriesSamples {
                     metric_name,
-                    metric_type,
-                    description,
-                    unit: unit.clone(),
-                },
-            );
+                    points: Vec::new(),
+                    histograms: Vec::new(),
+                }),
+            };
+            entry.points.extend(samples);
+            entry.histograms.extend(histograms);
         }
-        let id = self.resolve_series(&labels, fingerprint, &unit, metric_type)?;
-        let entry = self.samples.entry(id).or_insert_with(|| SeriesSamples {
-            metric_name: labels
-                .iter()
-                .find(|l| l.name == "__name__")
-                .map(|l| l.value.clone())
-                .unwrap_or_default(),
-            points: Vec::new(),
-            histograms: Vec::new(),
-        });
-        self.estimated_bytes += samples_bytes(&samples, &histograms);
-        entry.points.extend(samples);
-        entry.histograms.extend(histograms);
         Ok(())
     }
 
@@ -333,9 +391,9 @@ impl Delta for TsdbWriteDelta {
     fn apply(&mut self, write: Self::Write) -> std::result::Result<Self::ApplyResult, String> {
         let before = self.estimated_bytes;
         match write {
-            TsdbWrite::Samples(series) => series
-                .into_iter()
-                .try_for_each(|series| self.ingest(series)),
+            TsdbWrite::Samples(series) => prepare(series, self.bucket, &self.active_series)
+                .and_then(|write| self.ingest(write)),
+            TsdbWrite::Prepared(write) => self.ingest(write),
             TsdbWrite::Register(series) => series
                 .into_iter()
                 .try_for_each(|series| self.register(series)),

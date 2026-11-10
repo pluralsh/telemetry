@@ -24,8 +24,8 @@ Apply it with `kubectl apply -f traces.yaml`, then add [credentials](/traces/ins
 
 ## Scaling
 
-- **Writers:** raise `spec.writer.replicas`. New pods start first, and the new shards take traces from the next aligned hour, by each trace's earliest span. Scale-down is blocked.
+- **Writers:** raise `spec.writer.replicas`. See [scaling](/traces/scaling/) for how many writers your peak rate needs and how to size each one. New pods start first, and the new shards take traces from the next aligned hour, by each trace's earliest span. Scale-down is blocked.
 - **Readers:** `spec.reader.replicas` sets the replicas per reader group. Change it at any time, or set `spec.reader.autoscaling` to scale each group on CPU. New groups appear as writers add shards. See [reader groups](/sharding/#reader-groups).
 - **Large traces:** raise `request.maxSpansPerTrace` and reader memory together.
 
-<NextSteps product="traces" links={["architecture", "api", "benchmarks"]} />
+<NextSteps product="traces" links={["scaling", "architecture", "api"]} />

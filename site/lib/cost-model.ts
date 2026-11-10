@@ -1,3 +1,5 @@
+import { CAPACITY, LOGS_TEST_LINE_BYTES } from "./capacity";
+
 export type CostInputs = {
   gbPerDay: number;
   retentionDays: number;
@@ -26,15 +28,17 @@ const SECONDS = HOURS * 3600;
 const PUT_PER_1K = 0.005;
 const GET_PER_1K = 0.0004;
 const GP3_GB_MONTH = 0.08;
-const WRITER_VCPU = 8;
+const LOGS_WRITER = CAPACITY.logs.recommended[0];
+const LOGS_VALIDATED = CAPACITY.logs.results.find((r) => r.vcpu === LOGS_WRITER.vcpu)!.validated!;
+const WRITER_VCPU = LOGS_WRITER.vcpu;
+// Raw log bytes one writer is planned at: its validated entries/s at the test's line size.
+const WRITER_MB_PER_SECOND = (LOGS_VALIDATED * LOGS_TEST_LINE_BYTES * CAPACITY.logs.planning) / 1e6;
 const READER_VCPU = 2;
 const READER_REPLICAS_PER_GROUP = 2;
 // Cache-miss and manifest GETs per second for each (reader pod, opened shard) pair.
 const GETS_PER_READER_SHARD = 17;
 // Remote-shard query responses per day, as a fraction of raw ingest.
 const QUERY_FANOUT_FRACTION = 0.01;
-const WRITER_MIB_PER_SECOND = 40;
-const WRITER_UTILIZATION = 0.85;
 
 export type Line = { label: string; usd: number; detail: string };
 export type Estimate = { name: string; total: number; lines: Line[]; footprint?: string };
@@ -55,8 +59,7 @@ export function estimate(i: CostInputs): Estimate[] {
   const wireGbDay = i.gbPerDay / 3; // snappy/gzip on the wire
 
   // ---- Plural Telemetry ----
-  const writerMBs = WRITER_MIB_PER_SECOND * 1.048576 * WRITER_UTILIZATION;
-  const writers = Math.max(1, Math.ceil(peakMBs / writerMBs));
+  const writers = Math.max(1, Math.ceil(peakMBs / WRITER_MB_PER_SECOND));
   // One reader group per storage shard; each pod opens only its own shard.
   const readers = writers * READER_REPLICAS_PER_GROUP;
   const writerVcpu = writers * WRITER_VCPU;

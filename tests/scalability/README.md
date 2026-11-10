@@ -75,23 +75,24 @@ Each workload creates a unique run ID in labels and attributes unless
 - `traces` sends OTLP/HTTP protobuf. Its default request has 2,000 spans, five
   spans per trace, and a 256-byte payload attribute per span.
 
-Initial single-writer rate checks matching the capacity-planning guide are:
+Single-writer checks at the [capacity guide's](../../documentation/common/scaling.md)
+planning and validated rates for a 4-vCPU writer are:
 
 ```shell
-# Logs: repeat at 18,000 and 36,000 entries/s
+# Logs: repeat at 39,000 and 52,500 entries/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/loki/api/v1/push \
-  --target-rate 18000 --allow-production-write logs
+  --target-rate 39000 --allow-production-write logs
 
-# Metrics: repeat at 250,000 and 500,000 samples/s
+# Metrics: repeat at 450,000 and 599,000 samples/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/api/v1/write \
-  --target-rate 250000 --allow-production-write metrics
+  --target-rate 450000 --allow-production-write metrics --active-series 500000
 
-# Traces: repeat at 30,000 and 60,000 spans/s
+# Traces: repeat at 21,000 and 28,400 spans/s
 cargo run --release --manifest-path tests/scalability/Cargo.toml -- \
   --url https://telemetry.example/write/ns/scale/v1/traces \
-  --target-rate 30000 --allow-production-write traces
+  --target-rate 21000 --allow-production-write traces
 ```
 
 `--target-rate 0` is closed-loop saturation mode: every worker sends its next

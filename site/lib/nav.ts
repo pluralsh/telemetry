@@ -156,6 +156,7 @@ export function productNav(id: ProductId): NavGroup[] {
       items: [
         { title: "Architecture", href: `/${id}/` },
         installationItems(id),
+        { title: "Scaling", href: `/${id}/scaling/` },
       ],
     },
     {

@@ -186,6 +186,6 @@ Database records choose storage partition boundaries differently: Metrics uses
 time buckets, Logs uses time segments, and Traces uses time segments plus a
 reserved trace-locator segment.
 
-For provisional per-writer ingestion envelopes, operational headroom, and
-product-shaped benchmark requirements, see
+For measured per-writer ingestion capacity, CPU and memory recommendations,
+and the writer-count formula, see
 [Capacity planning and scaling](scaling.md).

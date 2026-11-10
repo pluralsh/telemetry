@@ -31,7 +31,7 @@ The default scenario is a mid-to-large platform team:
 2. **Cross-AZ traffic.** Two of the three replicas sit in other zones, and AWS charges $0.01/GB in each direction. At 5 TB/day that's around $2,000/month that does nothing but move bytes.
 3. **Component sprawl.** Frontends, schedulers, index gateways, rulers and three memcached fleets all need baseline capacity.
 
-**Plural Telemetry** writes each record once, to one shard owner, and lets S3 provide durability. Its cross-AZ cost comes from forwarding a request to the shard owner when an agent hits a different writer, and from queries reading other shards' [reader groups](/sharding/#reader-groups). An ingest buffer partitioned by shard would remove the first. The second carries only query results, not ingest volume, so it stays small.
+**Plural Telemetry** writes each record once, to one shard owner, and lets S3 provide durability. One 4-vCPU writer [sustains about 2.9 TB/day](/logs/scaling/) of log lines, so the default 5 TB/day at a 1.5× peak needs four writers and 16 writer vCPU, where Loki's replicated ingesters alone need about 66. Its cross-AZ cost comes from forwarding a request to the shard owner when an agent hits a different writer, and from queries reading other shards' [reader groups](/sharding/#reader-groups). An ingest buffer partitioned by shard would remove the first. The second carries only query results, not ingest volume, so it stays small.
 
 ### Reader groups
 
@@ -49,7 +49,7 @@ See [capacity planning](https://github.com/pluralsh/telemetry/blob/main/document
 | Input | Value | Source |
 | --- | --- | --- |
 | Compute | $0.0408 per vCPU-hour, memory included | m7g.2xlarge: 8 vCPU / 32 GiB at $0.3264/h |
-| Plural Telemetry writer throughput | 40 MiB/s per 8-vCPU writer, sized at 85% of that rate at peak | One-third of SlateDB's [120 MiB/s sustained-ingest result](https://benchmark.slatedb.io/0.15.0/workload/sustained-ingest/), with 15% peak headroom |
+| Plural Telemetry writer throughput | 25 MB/s of raw log lines per 4-vCPU writer at peak | 75% of the measured 52,500 entries/s (636-byte lines) a writer [sustained in the scale test](/logs/scaling/) |
 | Plural Telemetry readers | One group per storage shard, 2 replicas × 2 vCPU | Moderate query load; readers do not perform ingestion or compaction |
 | Plural Telemetry reader GETs | 17 / s per (reader pod, opened shard) | Manifest polling and cache misses |
 | Plural Telemetry query fan-out | 1% of raw ingest per day returned by remote shards | Query results only; two-thirds cross a zone |
@@ -63,5 +63,5 @@ See [capacity planning](https://github.com/pluralsh/telemetry/blob/main/document
 | Datadog | $0.10 / GB ingested + $1.06–$2.50 / M events indexed by retention | List price, annual commitment |
 
 <Callout tone="warn" title="These are planning numbers, not quotes">
-  Plural Telemetry's per-writer throughput is still a provisional estimate until the product-shaped scalability benchmarks are published. Your mix of event sizes, stream cardinality, and query load will move all three columns. Run the [scalability runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) on your own object store and instance types before committing to a size.
+  Plural Telemetry's writer throughput is measured: a 4-vCPU writer on S3 Standard sustained 52,500 entries/s, and the calculator plans each at 75% of that. See [scaling Logs](/logs/scaling/) for the full results. The query path, Loki and Datadog lines are still modeled rather than measured, and your mix of event sizes, stream cardinality and query load will move all three columns. Run the [scalability runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) on your own object store and instance types before committing to a size.
 </Callout>

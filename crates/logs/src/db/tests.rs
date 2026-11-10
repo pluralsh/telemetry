@@ -1777,6 +1777,52 @@ async fn open_segments_merge_runs_the_page_limits_cut_short() {
 }
 
 #[tokio::test]
+async fn a_backlog_of_small_objects_merges_in_one_level() {
+    use crate::codec::RecordType;
+
+    let mut config = compacting_config();
+    config.compaction.fan_in = 2;
+    config.compaction.min_age = Duration::from_millis(200);
+    config.compaction.max_object_bytes = 1 << 20;
+    config.compaction.max_object_rows = 256;
+    let db = LogDb::open(config).await.unwrap();
+    let namespace = Namespace::new("backlog").unwrap();
+    let segment = current_segment().start_ns;
+    let expected = (0..13)
+        .map(|index| format!("needle {index}"))
+        .collect::<Vec<_>>();
+    for (offset, line) in (0..).zip(&expected[..12]) {
+        write_line(&db, &namespace, "api", segment + offset, line).await;
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    write_line(&db, &namespace, "api", segment + 12, &expected[12]).await;
+
+    // Twelve one-row objects that waited out the patience merge once, not
+    // in pairs then pairs of pairs; the young thirteenth waits.
+    let mut levels = Vec::new();
+    let mut runs = db
+        .storage
+        .scan_prefix_iter(
+            crate::codec::record_type_prefix(&namespace, seg(segment), RecordType::Run),
+            BytesRange::unbounded(),
+            None,
+        )
+        .await
+        .unwrap();
+    while let Some(record) = runs.next().await.unwrap() {
+        let run = decode_run(&record.value).unwrap();
+        levels.push((run.level, run.rows));
+    }
+    levels.sort_unstable();
+    assert_eq!(levels, vec![(0, 1), (1, 12)]);
+    assert_eq!(
+        lines(&db, &namespace, segment, segment + 100).await,
+        expected
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn merges_grow_past_the_page_limits_flushes_cut_at() {
     use crate::codec::RecordType;
 

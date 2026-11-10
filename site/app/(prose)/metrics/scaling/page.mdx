@@ -1,0 +1,45 @@
+import { PageHeader } from "@/components/doc-page";
+import { NextSteps } from "@/components/docs/product-blocks";
+import { CapacityRecommendation, CapacityResults } from "@/components/docs/capacity";
+
+export const metadata = { title: "Scaling Metrics" };
+
+<PageHeader
+  title="Scaling"
+  lede="One 4-vCPU Metrics writer sustains 599,000 samples/s; a 2-vCPU writer sustains 406,000."
+/>
+
+## Sizing
+
+<CapacityRecommendation product="metrics" />
+
+```text
+writers = ceil(peak samples/s / 599,000 / 0.75)   # 4 vCPU
+writers = ceil(peak samples/s / 406,000 / 0.75)   # 2 vCPU
+```
+
+```yaml
+spec:
+  writer:
+    replicas: 2
+    resources:
+      requests: { cpu: "4", memory: 6Gi }
+      limits: { cpu: "4", memory: 6Gi }
+```
+
+- Each writer owns one shard. Add writers, not cores: 6 vCPU sustains only 7% more than 4.
+- Set requests equal to limits. Memory must be at least 6 GiB; peak RSS in the test was 1.7 GiB at 500,000 series.
+- Scale out on `429`s or memory above 65% of the limit, not CPU.
+
+## Measured capacity
+
+<CapacityResults product="metrics" />
+
+- **Workload:** Snappy remote-write, 5,000 samples per request, 500,000 stable series, about 25 bytes per sample. High series churn lowers these rates.
+- **Environment:** `m8i.2xlarge`, `us-east-2`, S3 Standard, 64 concurrent connections.
+- **Validated:** 10-minute soak with under 0.1% of requests rejected and p99 under 1 s.
+- **Knee:** the highest rate in a 15-minute ramp with under 2% of requests rejected and p99 under 1 s.
+
+[Runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) · [method](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md#how-the-numbers-were-measured)
+
+<NextSteps product="metrics" links={["sharded", "benchmarks"]} />

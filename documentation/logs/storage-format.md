@@ -383,12 +383,19 @@ counts only. Otherwise its segments are read as above.
 Each flush writes one or more level-0 objects per segment it touches, so a
 segment receiving a trickle of writes accumulates many small objects. An
 object is small while it is under half of both `compaction.max_object_bytes`
-and `compaction.max_object_rows`. The writer merges runs of `compaction.fan_in`
-adjacent same-level small objects into one object one level higher. A run cut
-short because the next object would push it past those limits merges as soon as
-it has two objects: its inputs are each under half the limits, so the result
-is no longer small, and waiting for `fan_in` inputs that cannot fit would
-leave them unmerged until the segment settles. Once
+and `compaction.max_object_rows`. The writer merges a run of adjacent
+same-level small objects, each at least `compaction.min_age` old, into one
+object one level higher once the run fills three quarters of either limit, so
+the result is no longer small even after re-blocking shrinks it and each row
+is rewritten once rather than once per `fan_in`-fold level. A busy segment
+reaches that within seconds: at about 50,000 entries/s this writes about a
+third fewer bytes to SlateDB than merging every `fan_in` objects. A slower
+segment merges a run of at least `compaction.fan_in` objects once its oldest
+has waited four times `min_age`, or once 128 have queued. A run cut short
+because the next object would push it past the limits merges as soon as it
+has two objects: its inputs are each under half the limits, so the result is
+no longer small, and waiting for inputs that cannot fit would leave them
+unmerged until the segment settles. Once
 `compaction.finalize_after_seconds` has passed after a segment's end it merges
 whatever small objects remain (with a balance rule so each row is rewritten a
 logarithmic number of times). Two objects are adjacent when the first's ID

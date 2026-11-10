@@ -1,0 +1,44 @@
+import { PageHeader } from "@/components/doc-page";
+import { NextSteps } from "@/components/docs/product-blocks";
+import { CapacityRecommendation, CapacityResults } from "@/components/docs/capacity";
+
+export const metadata = { title: "Scaling Traces" };
+
+<PageHeader
+  title="Scaling"
+  lede="One 4-vCPU Traces writer sustains 28,400 spans/s, about 14 MiB/s."
+/>
+
+## Sizing
+
+<CapacityRecommendation product="traces" />
+
+```text
+writers = ceil(peak spans/s / 28,400 / 0.75)
+```
+
+```yaml
+spec:
+  writer:
+    replicas: 5
+    resources:
+      requests: { cpu: "4", memory: 6Gi }
+      limits: { cpu: "4", memory: 6Gi }
+```
+
+- Each writer owns one shard. Add writers, not cores: 6 vCPU sustains no more than 4.
+- Set requests equal to limits. Memory must be at least 6 GiB; peak RSS in the test was 2.2 GiB.
+- Scale out on `429`s or memory above 65% of the limit, not CPU.
+
+## Measured capacity
+
+<CapacityResults product="traces" />
+
+- **Workload:** OTLP/HTTP protobuf, 2,000 spans per request, 5 spans per trace, about 512 bytes per span.
+- **Environment:** `m8i.2xlarge`, `us-east-2`, S3 Standard, 64 concurrent connections.
+- **Validated:** 10-minute soak with under 0.1% of requests rejected and p99 under 1 s.
+- **Knee:** the highest rate in a 15-minute ramp with under 2% of requests rejected and p99 under 1 s.
+
+[Runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) · [method](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md#how-the-numbers-were-measured)
+
+<NextSteps product="traces" links={["sharded", "benchmarks"]} />

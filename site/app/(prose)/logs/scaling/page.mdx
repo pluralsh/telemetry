@@ -1,0 +1,44 @@
+import { PageHeader } from "@/components/doc-page";
+import { NextSteps } from "@/components/docs/product-blocks";
+import { CapacityRecommendation, CapacityResults } from "@/components/docs/capacity";
+
+export const metadata = { title: "Scaling Logs" };
+
+<PageHeader
+  title="Scaling"
+  lede="One 4-vCPU Logs writer sustains 52,500 entries/s, about 2.9 TB/day of log lines."
+/>
+
+## Sizing
+
+<CapacityRecommendation product="logs" />
+
+```text
+writers = ceil(peak entries/s / 52,500 / 0.75)
+```
+
+```yaml
+spec:
+  writer:
+    replicas: 4
+    resources:
+      requests: { cpu: "4", memory: 8Gi }
+      limits: { cpu: "4", memory: 8Gi }
+```
+
+- Each writer owns one shard. Add writers, not cores: 6 vCPU sustains only 12% more than 4.
+- Set requests equal to limits. Memory must be at least 6 GiB; peak RSS in the test was 3.9 GiB.
+- Scale out on `429`s or memory above 65% of the limit, not CPU.
+
+## Measured capacity
+
+<CapacityResults product="logs" />
+
+- **Workload:** Loki JSON, 1,600 entries and 128 streams per request, 10,000 active streams, 636-byte average line.
+- **Environment:** `m8i.2xlarge`, `us-east-2`, S3 Standard, 64 concurrent connections.
+- **Validated:** 10-minute soak with under 0.1% of requests rejected and p99 under 1 s.
+- **Knee:** the highest rate in a 15-minute ramp with under 2% of requests rejected and p99 under 1 s.
+
+[Runner](https://github.com/pluralsh/telemetry/tree/main/tests/scalability) · [method](https://github.com/pluralsh/telemetry/blob/main/documentation/common/scaling.md#how-the-numbers-were-measured) · [cost estimates](/cost/)
+
+<NextSteps product="logs" links={["sharded", "benchmarks"]} />

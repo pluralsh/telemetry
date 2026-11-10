@@ -1,33 +1,44 @@
 # Capacity planning and scaling
 
-This page translates SlateDB's public key/value benchmarks into provisional
-capacity guidance for Metrics, Logs, and Traces. The values below are planning
-envelopes, not measured Telemetry service limits or service-level objectives.
-Run the product-shaped benchmarks described below on the intended object store
-and instance type before setting production limits.
+This page gives measured single-writer capacity for Metrics, Logs, and Traces,
+CPU and memory recommendations derived from it, and the formulas for sizing a
+sharded deployment. The numbers come from the [writer scale test](#how-the-numbers-were-measured)
+on S3 Standard; they are not service-level objectives. Re-run it on your own
+object store and instance type before committing to tight limits.
 
 ## Executive guidance
 
-Start a production writer with 8 vCPU, 32 GiB of memory, and 10 Gbit/s network
-capacity in the same region as its object store. Keep sustained ingestion below
-65% of the measured saturation point so compaction, traffic bursts, shard
-handoff, and object-store tail latency have headroom.
+Run each writer, which is one storage shard, at **4 vCPU** and plan it at the
+recommended rate below. Add writer replicas (shards) to grow, rather than
+giving a writer more cores: each product's write path has one serial stage
+per shard, so a writer stops gaining throughput at about 4 vCPU (see
+[What limits one writer](#what-limits-one-writer)).
 
-Until native product benchmarks replace these estimates, use the following
-provisional envelope for one writer:
+| Product | Recommended writer | Plan per writer at | Validated sustained | Saturation (knee) |
+|---|---|---|---|---|
+| Logs | 4 vCPU, 8 GiB | 39,000 entries/s (≈2.1 TB/day) | 52,500 entries/s | 85,400 entries/s |
+| Metrics | 2–4 vCPU, 6 GiB | 300,000 (2 vCPU) – 450,000 (4 vCPU) samples/s | 406,000 – 599,000 samples/s | 477,500 – 705,000 samples/s |
+| Traces | 4 vCPU, 6 GiB | 21,000 spans/s (≈10 MiB/s) | 28,400 spans/s | 39,400 spans/s |
 
-- Logs: 10–30 MiB/s of uncompressed log bodies, approximately 0.8–2.5 TiB/day.
-- Metrics: 250,000–500,000 samples/s for stable series; series churn can lower
-  this substantially.
-- Traces: 20,000–60,000 spans/s when a span averages approximately 500 bytes.
+The planning rate is 75% of the validated sustained rate, which leaves room for
+traffic bursts, rollups, compaction catch-up, and shard handoff. The validated
+rate is itself the highest rate a writer held for 10 minutes with no errors, a
+p99 under 1 second, and an L0 backlog that never reached admission shedding.
 
-These ranges assume batched ingestion, default `applied` durability, limited
-writer-side reads, and an object store in the same region. They are deliberately
-below SlateDB's best public results. Do not multiply the upper bound by the
-writer count without testing shared object-store, compactor, and network limits.
+For context, one 4-vCPU Logs writer at its planning rate ingests about the
+2 TB/day tier that [OpenShift's Loki profiles][openshift-loki] size at
+54 requested vCPU across a replicated cluster, and one Metrics writer covers
+roughly 5,600–8,400 node-exporter targets at a 15-second scrape interval.
 
-Increase writer replicas when any one writer sustains more than 65% of its
-validated byte, CPU, memory, or compaction capacity. Writer replicas are storage
+These numbers assume batched ingestion, default `applied` durability, no
+writer-side reads, and an object store in the same region. Do not multiply
+them by the writer count without checking shared object-store, network, and
+request-rate limits.
+
+Increase writer replicas when any one writer sustains more than its planning
+rate, starts turning writes away with `429`, or holds more than 65% of its
+memory. CPU is a poor trigger: a writer reaches its limit with half its cores
+idle. Writer replicas are storage
 shards, so an increase appends a routing epoch: records timestamped after the
 next cutover spread across the larger shard count, while existing data stays on
 its original shards. Scale-down remains blocked.
@@ -37,6 +48,93 @@ scan width, and object-store GET latency determine reader count and are not
 covered by the ingestion estimates on this page. With
 [reader groups](sharding.md#reader-groups), readers scale per storage shard:
 see [Reader groups and cost](#reader-groups-and-cost).
+
+## Measured writer capacity
+
+Each row is one writer at the given CPU limit. "Validated" is the highest
+10-minute soak that passed; "knee" is where a slow ramp first saw sustained
+rejections, latency, or falling behind the offered rate. CPU and peak RSS are
+the writer's mean cores and peak memory during the validated soak, or the
+lowest soak tried where none passed.
+
+| Writer | Validated sustained | Knee | p99 | Mean CPU | Peak RSS |
+|---|---|---|---|---|---|
+| Logs, 2 vCPU / 8 GiB | none at ≥ 40,000 entries/s | 65,200 entries/s | — | 1.3 | 2.8 GiB |
+| Logs, 4 vCPU / 12 GiB | 52,500 entries/s, 34 MiB/s | 85,400 entries/s | 13 ms | 1.7 | 2.7 GiB |
+| Logs, 6 vCPU / 16 GiB | 58,900 entries/s, 39 MiB/s | 95,900 entries/s | 14 ms | 1.8 | 3.2 GiB |
+| Metrics, 2 vCPU / 8 GiB | 406,000 samples/s | 477,500 samples/s | 161 ms | 1.1 | 0.9 GiB |
+| Metrics, 4 vCPU / 12 GiB | 599,000 samples/s | 705,000 samples/s | 60 ms | 1.8 | 1.2 GiB |
+| Metrics, 6 vCPU / 16 GiB | 644,000 samples/s | 757,500 samples/s | 70 ms | 1.9 | 1.7 GiB |
+| Traces, 2 vCPU / 8 GiB | none at ≥ 17,300 spans/s | 28,200 spans/s | — | 1.4 | 1.1 GiB |
+| Traces, 4 vCPU / 12 GiB | 28,400 spans/s, 14 MiB/s | 39,400 spans/s | 38 ms | 2.4 | 1.5 GiB |
+| Traces, 6 vCPU / 16 GiB | 26,800 spans/s, 13 MiB/s | 43,700 spans/s | 25 ms | 3.7 | 1.9 GiB |
+
+Byte rates are encoded request bodies. A Logs entry averages about 636 bytes of
+line text (688 bytes on the wire as Loki JSON), so the 4- and 6-vCPU writers
+sustain about 2.9 and 3.2 TB/day of log lines. At overload, peak RSS reached
+3.9 GiB for the 4-vCPU Logs writer and 4.6 GiB for the 6-vCPU one, and
+2.2 GiB for Traces; the memory recommendations above leave at least twice that.
+
+The smallest sizes did not pass a soak at the rates tried. The 2-vCPU Logs
+writer turned away about 11% of requests even at 40,000 entries/s, and the
+2-vCPU Traces writer turned away 6 of 5,200 requests in 10 minutes at
+17,300 spans/s, just over the 0.1% a soak allows.
+Until a lower soak validates them, plan 2-vCPU Logs writers at no more than
+25,000 entries/s and 2-vCPU Traces writers at no more than 12,000 spans/s, or
+use 4 vCPU.
+
+### What limits one writer
+
+Writers use only 2–4 of their cores at their limit because each product's
+write path has one stage that runs serially per shard, and that stage
+saturates first:
+
+- **Logs**: committing each flushed delta to SlateDB. Below the knee a commit
+  is in flight about 5% of the time; past it, one commit is always in flight
+  and each takes 0.3–0.9 seconds instead of 10 ms, so requests queue behind
+  the write buffer and are turned away with `429`.
+- **Traces**: encoding each flushed delta into pages and indexes, about
+  0.6 seconds per flush, busy 100% of the time from about 35,000 spans/s.
+- **Metrics**: applying samples to the live delta in the write coordinator,
+  busy 99% of the time from about 690,000 samples/s.
+
+More cores therefore help only until that stage is the limit: from 4 to 6 vCPU
+Logs gained 12%, Metrics 7%, and Traces nothing. Spare cores still matter for
+rollups, compaction, and recovery, which is why the recommendation is 4 vCPU
+rather than 2. To grow past one writer's rate, add writer replicas.
+
+### How the numbers were measured
+
+The [scalability runner][scalability-runner] sent traffic over 64 concurrent
+connections straight to each writer's Service, on dedicated `m8i.2xlarge`
+nodes in `us-east-2` writing to S3 Standard in the same region, with readers
+idle. For each writer it ran:
+
+1. A 15-minute linear ramp of the offered rate, from well below to well above
+   the writer's capacity, to find the knee.
+2. A 10-minute soak at 85% of the knee, retried lower up to three times until
+   one passed. Before each soak the writer drained its L0 backlog and
+   restarted, so soaks start on a populated store rather than an empty one.
+
+A 10-second window was clean when fewer than 2% of its requests got `429`,
+nothing else failed, p99 stayed under 1 second, SlateDB did not stall, and RSS
+stayed under 90% of the limit. A soak passed only if every window was clean,
+fewer than 0.1% of all its requests were turned away, and L0 depth never
+reached where admission starts shedding.
+
+The workloads were the runner's defaults except where noted:
+
+- Logs: Loki JSON, 1,600 entries per request across 128 streams, rotating
+  through 10,000 active streams; 70% 250-byte, 25% 1 KiB, and 5% 4 KiB lines.
+- Metrics: Snappy remote-write, 5,000 samples per request over 500,000 stable
+  series with no churn.
+- Traces: OTLP/HTTP protobuf, 2,000 spans per request, five spans per trace,
+  and a 256-byte attribute per span, about 512 bytes per span on the wire.
+
+The runs used release v0.3.29 and lasted about 90 minutes per writer, so they
+include compaction and the first window rollups but not the daily rollup.
+They do not measure reads, series churn, or object-store request costs; size
+readers and churn-heavy Metrics workloads separately.
 
 ## What limits a SlateDB writer
 
@@ -254,10 +352,9 @@ Use an approximately 650-byte average event for an initial mixed workload:
 - 2 TB/day is approximately 23.1 MB/s and 35,500 entries/s.
 - 4 TB/day is approximately 46.3 MB/s and 71,000 entries/s.
 
-The provisional single-writer target of 10–30 MiB/s corresponds to roughly
-16,000–48,000 entries/s for this event mix. It should cover the OpenShift
-500 GB/day tier and is intended to approach the 2 TB/day tier with efficient
-batching. Only a product benchmark can confirm that expectation.
+The scale test used a similar mix, about 636 bytes per line. One 4-vCPU writer
+sustained 52,500 entries/s, about 2.9 TB/day, and its 39,000 entries/s planning
+rate is about 2.1 TB/day: above the OpenShift 2 TB/day tier on one writer.
 
 Grafana recommends 5–10 stable labels, reasonably sized lines, and explicit
 tenant rate limits. Benchmark at least 1,000, 10,000, and 100,000 active streams
@@ -280,12 +377,11 @@ target. At a 15-second scrape interval:
 - 20,000 targets produce approximately 1.07 million samples/s and 16 million
   series.
 
-The provisional single-writer target is 250,000–500,000 samples/s for stable
-series. Compared with Mimir's distributor ratio, that is 10–20 CPU-equivalents
-of protocol ingestion before accounting for Mimir's separate replicated
-ingesters. Telemetry's 8-vCPU/32-GiB starting recommendation is plausible only
-because Metrics combines distribution and storage differently; it remains an
-estimate to validate, not evidence that it is more CPU efficient.
+One 4-vCPU writer sustained 599,000 samples/s over 500,000 stable series using
+about 1.8 cores, and plans at 450,000 samples/s. Mimir's distributor ratio
+alone would put 450,000 samples/s at 18 CPUs before its separate, replicated
+ingesters. The comparison covers ingestion only: the test held series stable,
+and churn creates schema and posting work it did not exercise.
 
 Run separate steady-state, 1% hourly churn, and 10% hourly churn tests. Report
 active series and new series/s alongside samples/s. Prometheus remote-write
@@ -306,8 +402,8 @@ At the same 500-byte average:
 - 20 MiB/s is approximately 42,000 spans/s.
 - 30 MiB/s is approximately 63,000 spans/s.
 
-The provisional Traces target of 20,000–60,000 spans/s per writer therefore
-spans roughly one to two Tempo default distributor admission envelopes. Tempo
+One 4-vCPU writer sustained 28,400 spans/s of about 512 bytes, roughly one
+Tempo default distributor admission envelope, and plans at 21,000 spans/s. Tempo
 uses separate downstream components and different durability, replication, and
 query architecture, so this comparison is a workload translation rather than a
 claim of equivalent end-to-end capacity.
@@ -316,24 +412,37 @@ Benchmark small and large traces separately. Keep average bytes/span, spans per
 trace, attributes/span, indexed attributes, and concurrently live traces fixed
 and reported.
 
-## Provisional writer profiles
+## Writer resources
 
-Use these only to select the first benchmark or staging deployment:
+Set writer requests equal to limits, so a writer's CPU is not taken by
+neighbours when a rollup or compaction catches up:
 
-- Small, 4 vCPU and 16 GiB: up to 250 GB/day logs, 100,000 samples/s, or
-  10,000 spans/s.
-- Standard, 8 vCPU and 32 GiB: target 0.5–1 TB/day logs,
-  250,000–500,000 samples/s, or 20,000–40,000 spans/s.
-- Large, 16 vCPU and 64 GiB: test toward 2 TB/day logs,
-  500,000–1 million samples/s, or 40,000–60,000 spans/s.
+```yaml
+spec:
+  writer:
+    resources:
+      requests: { cpu: "4", memory: 8Gi } # Logs; 6Gi for Metrics and Traces.
+      limits: { cpu: "4", memory: 8Gi }
+```
 
-Provide at least 1 Gbit/s for the small profile and 10 Gbit/s for standard and
-large profiles. SlateDB's public results show object-store traffic 5–8 times
-logical application write bandwidth during compaction, so application ingress
-alone understates required network capacity.
+The operator sizes the writer's memory budgets, L0 flush parallelism, and
+rollup concurrency from these limits, so they also bound what the writer
+buffers. Writers need at least a 6 GiB limit for rollups of closed days, and
+the operator does not roll out one with less. Logs' 8 GiB is about twice the
+peak RSS the scale test saw at overload; Metrics and Traces peaked under
+2.2 GiB and get the 6 GiB minimum. The test ran with more memory than this
+(12 GiB at 4 vCPU), so check RSS against the limit when first deploying.
+Metrics memory grows with active series: the test used 500,000.
 
-Do not use these profiles as Kubernetes defaults until the product benchmarks
-pass on S3 Standard and the intended cache configuration.
+Metrics is the most CPU-efficient at 2 vCPU, which reaches about 70% of a
+4-vCPU writer's rate with half the cores; use 2-vCPU Metrics writers for small
+deployments or where more shards are cheaper than larger pods. Logs and Traces
+should use 4 vCPU.
+
+Provide at least 1 Gbit/s of network per writer. SlateDB's public results show
+object-store traffic 5–8 times logical application write bandwidth during
+compaction, so application ingress alone understates required network
+capacity.
 
 ## Reader groups and cost
 
@@ -471,8 +580,8 @@ The minimum workload set is:
 8. A scale-up across a routing-epoch cutover while running at 65% of validated
    steady-state capacity.
 
-Publish both the saturation result and the recommended result after applying
-35% operational headroom.
+Publish the saturation result, the validated sustained result, and the
+planning rate after applying 25% operational headroom to the validated one.
 
 ## Scaling calculation
 
@@ -482,10 +591,14 @@ For a measured product and workload:
 required writers =
     ceil(
         peak telemetry rate
-        / measured per-writer saturation rate
-        / 0.65
+        / validated per-writer sustained rate
+        / 0.75
     )
 ```
+
+`validated sustained rate × 0.75` is the planning rate in
+[Executive guidance](#executive-guidance). For example, 150,000 log entries/s
+at peak needs `ceil(150000 / 52500 / 0.75) = 4` writers of 4 vCPU.
 
 When only byte measurements are available:
 

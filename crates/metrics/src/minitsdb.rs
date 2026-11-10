@@ -16,7 +16,7 @@ const WRITE_CHANNEL: &str = "write";
 
 use crate::Namespace;
 use crate::active_series::ActiveSeriesTracker;
-use crate::delta::{TsdbContext, TsdbWrite, TsdbWriteDelta};
+use crate::delta::{TsdbContext, TsdbWrite, TsdbWriteDelta, prepare};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
 use crate::index::{ForwardIndex, ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
@@ -1292,6 +1292,9 @@ pub(crate) struct MiniTsdb {
     write_coordinator: WriteCoordinator<TsdbWriteDelta, TsdbFlusher>,
     write_budget: Option<WriteBudget>,
     admission: common::storage::admission::Admission,
+    /// The live delta's tracker, which writes record their series in as
+    /// they are prepared.
+    active_series: Arc<ActiveSeriesTracker>,
 }
 
 /// The most `series` can add to a delta's [`TsdbWriteDelta::estimate_size`],
@@ -1366,7 +1369,7 @@ impl MiniTsdb {
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
-            active_series: delta_active_series,
+            active_series: delta_active_series.clone(),
         };
 
         let flusher = TsdbFlusher {
@@ -1392,6 +1395,7 @@ impl MiniTsdb {
             write_coordinator,
             write_budget,
             admission,
+            active_series: delta_active_series,
         })
     }
 
@@ -1423,13 +1427,9 @@ impl MiniTsdb {
         );
 
         let bytes = write_bytes(series_list, true);
-        self.write(
-            TsdbWrite::Samples(series_list.to_vec()),
-            bytes,
-            timeout,
-            false,
-        )
-        .await?;
+        let prepared = prepare(series_list.to_vec(), self.bucket, &self.active_series)?;
+        self.write(TsdbWrite::Prepared(prepared), bytes, timeout, false)
+            .await?;
 
         tracing::debug!(
             bucket = ?self.bucket,
@@ -1445,13 +1445,9 @@ impl MiniTsdb {
     /// `timeout` for its half of the write budget and for queue space.
     pub(crate) async fn copy_batch(&self, series: &[Series], timeout: Duration) -> Result<()> {
         let bytes = write_bytes(series, true);
-        self.write(
-            TsdbWrite::Samples(series.to_vec()),
-            bytes,
-            Some(timeout),
-            true,
-        )
-        .await
+        let prepared = prepare(series.to_vec(), self.bucket, &self.active_series)?;
+        self.write(TsdbWrite::Prepared(prepared), bytes, Some(timeout), true)
+            .await
     }
 
     /// Registers `series` without their samples, as a rollup copy, waiting
@@ -1632,7 +1628,7 @@ mod tests {
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
-            active_series,
+            active_series: active_series.clone(),
             postings_cache: None,
             last_generation: 0,
         };
@@ -1657,6 +1653,7 @@ mod tests {
             write_coordinator,
             write_budget: None,
             admission: common::storage::admission::Admission::unlimited(),
+            active_series,
         }
     }
 

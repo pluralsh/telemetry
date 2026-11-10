@@ -48,6 +48,14 @@ const DELETE_BATCH: usize = 1024;
 /// it in turn, which bounds what a compactor falling behind queues.
 const QUEUED_FLUSHES: usize = 64;
 
+/// The most inputs of one open-segment merge, which bounds the directories
+/// it reads; a run of this many merges even while its result is small.
+const MAX_BACKLOG_INPUTS: usize = 128;
+
+/// Multiples of `min_age` a run of `fan_in` small objects waits for more
+/// before it merges into an object that is still small.
+const PATIENCE: u64 = 4;
+
 /// An object written by a flush, reported to the compactor.
 pub(crate) struct WrittenObject {
     pub namespace: Namespace,
@@ -403,11 +411,16 @@ impl Compactor {
             <= now_ns
     }
 
-    /// The next run of `objects` to merge: `fan_in` adjacent same-level
-    /// objects, fewer when the next one would exceed the merge limits, or when
-    /// `finalize` is set the longest mergeable run of at
-    /// least two objects whose largest is at most half of it, so late writes
-    /// to a settled segment rewrite each row a logarithmic number of times.
+    /// The next run of `objects` to merge. In an open segment that is the
+    /// adjacent same-level objects up to the merge limits, once they fill
+    /// three quarters of them, so the result is no longer small even after
+    /// re-blocking shrinks it and a row is rewritten once rather than once
+    /// per `fan_in`-fold level; or, once `fan_in` of them have waited
+    /// [`PATIENCE`] times `min_age` or [`MAX_BACKLOG_INPUTS`] have
+    /// queued, those, so a slow segment still merges. When `finalize` is set,
+    /// the longest mergeable run of at least two objects whose largest is at
+    /// most half of it, so late writes to a settled segment rewrite each row
+    /// a logarithmic number of times.
     fn select(
         &self,
         objects: &[Tracked],
@@ -420,6 +433,7 @@ impl Compactor {
                 || tracked.object.level > 0
                 || now_unix_ms.saturating_sub(tracked.stored.written_at_unix_ms) >= min_age_ms
         };
+        let max_inputs = self.config.fan_in.max(MAX_BACKLOG_INPUTS);
         for start in 0..objects.len() {
             let first = &objects[start];
             if !eligible(first) {
@@ -429,22 +443,22 @@ impl Compactor {
             let mut bytes = first.stored.bytes();
             let mut end = start + 1;
             let mut full = false;
-            while end < objects.len() && (finalize || end - start < self.config.fan_in) {
+            while end < objects.len() && (finalize || end - start < max_inputs) {
                 let next = &objects[end];
-                rows += next.stored.rows();
-                bytes += next.stored.bytes();
                 if !follows(&objects[end - 1], next)
                     || !eligible(next)
                     || (!finalize && next.object.level != first.object.level)
                 {
                     break;
                 }
-                if rows > self.config.max_object_rows as u64
-                    || bytes > self.config.max_object_bytes as u64
+                if rows + next.stored.rows() > self.config.max_object_rows as u64
+                    || bytes + next.stored.bytes() > self.config.max_object_bytes as u64
                 {
                     full = true;
                     break;
                 }
+                rows += next.stored.rows();
+                bytes += next.stored.bytes();
                 end += 1;
             }
             if finalize {
@@ -454,13 +468,17 @@ impl Compactor {
                 }
             }
             // Inputs are each under half the limits, so a run that fills them
-            // merges into an object that is no longer small: waiting for
-            // `fan_in` inputs that can never fit would strand it until the
-            // segment settles.
-            let wanted = if finalize || full {
+            // merges into an object that is no longer small: waiting for more
+            // inputs that can never fit would strand it until the segment
+            // settles.
+            let waited = now_unix_ms.saturating_sub(first.stored.written_at_unix_ms)
+                >= min_age_ms.saturating_mul(PATIENCE);
+            let wanted = if finalize || full || mostly_full(&self.config, rows, bytes) {
                 2
-            } else {
+            } else if waited || end - start >= max_inputs {
                 self.config.fan_in
+            } else {
+                usize::MAX
             };
             let level = objects[start..end]
                 .iter()
@@ -651,6 +669,12 @@ fn balanced(run: &[Tracked]) -> bool {
 fn is_small(config: &CompactionConfig, stored: &StoredObject) -> bool {
     (stored.bytes() as usize).saturating_mul(2) < config.max_object_bytes
         && (stored.rows() as usize).saturating_mul(2) < config.max_object_rows
+}
+
+/// Whether a merge of `rows` and `bytes` fills three quarters of a limit.
+fn mostly_full(config: &CompactionConfig, rows: u64, bytes: u64) -> bool {
+    (bytes as usize).saturating_mul(4) >= config.max_object_bytes.saturating_mul(3)
+        || (rows as usize).saturating_mul(4) >= config.max_object_rows.saturating_mul(3)
 }
 
 fn unix_time_ms() -> Result<u64> {
