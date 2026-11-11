@@ -65,6 +65,10 @@ pub(super) const QUERIES: &[(&str, &str)] = &[
         "ratio",
         r#"sum by (namespace,pod)(rate(container_cpu_usage_seconds_total{container!=""}[5m])) / sum by (namespace,pod)(kube_pod_container_resource_requests{resource="cpu"})"#,
     ),
+    (
+        "requests",
+        r#"sum by (namespace) (kube_pod_container_resource_requests{resource="cpu",unit="core"})"#,
+    ),
 ];
 
 fn env<T: std::str::FromStr<Err: std::fmt::Debug>>(name: &str) -> Option<T> {
@@ -243,6 +247,74 @@ fn pod_series(ns: usize, pod: usize, generation: i64) -> Vec<Template> {
     out
 }
 
+const JOB_CONTAINERS: &[&str] = &["scan", "init", "fetch", "report"];
+
+/// `PROFILE_JOB_PODS` short-lived job pods start each hour, as a
+/// vulnerability scanner's do, and each is scraped once: every series it
+/// leaves holds a single sample.
+fn job_pods_per_hour() -> usize {
+    env("PROFILE_JOB_PODS").unwrap_or(0)
+}
+
+/// The kube-state-metrics series of job pod `index`, scraped once at `at`.
+fn job_series(index: u64, at: i64) -> Vec<(u64, Series)> {
+    let hash = mix(index ^ 0x6a6f_6273);
+    let pod = format!("scan-report-{:010x}-{:05x}", hash & 0xff_ffff_ffff, hash >> 44);
+    let common = [
+        ("namespace", "scan-jobs".to_string()),
+        ("pod", pod),
+        ("uid", format!("{:032x}", u128::from(hash) * 0x9e37_79b9_7f4a_7c15)),
+        ("node", format!("ip-10-0-{}-{}.ec2.internal", hash % 10, hash % NODES as u64)),
+        ("job", "kube-state-metrics".to_string()),
+        ("instance", "10.0.200.7:8080".to_string()),
+    ];
+    let mut out = Vec::new();
+    let mut push = |name: &str, extra: Vec<(&str, String)>| {
+        let mut labels: Vec<Label> = common
+            .iter()
+            .cloned()
+            .chain(extra)
+            .map(|(name, value)| Label::new(name, value))
+            .collect();
+        labels.push(Label::metric_name(name));
+        labels.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        labels.hash(&mut hasher);
+        out.push((
+            hasher.finish(),
+            Series {
+                labels,
+                unit: None,
+                metric_type: None,
+                description: None,
+                samples: vec![Sample::new(at, 1.0)],
+                histograms: Vec::new(),
+            },
+        ));
+    };
+    for name in [
+        "kube_pod_container_resource_requests",
+        "kube_pod_container_resource_limits",
+    ] {
+        for container in JOB_CONTAINERS {
+            for (resource, unit) in [("cpu", "core"), ("memory", "byte")] {
+                push(
+                    name,
+                    vec![
+                        ("container", container.to_string()),
+                        ("resource", resource.to_string()),
+                        ("unit", unit.to_string()),
+                    ],
+                );
+            }
+        }
+    }
+    for phase in PHASES {
+        push("kube_pod_status_phase", vec![("phase", phase.to_string())]);
+    }
+    out
+}
+
 /// Which incarnation of `(ns, pod)` runs at `t`, and since when.
 fn incarnation(ns: usize, pod: usize, t: i64) -> (i64, i64) {
     if !pod.is_multiple_of(CHURN_EVERY) {
@@ -303,6 +375,11 @@ impl Generator {
                 ));
             }
         }
+        let jobs = job_pods_per_hour() as u64;
+        let minute = (t / ROUND_MS) as u64;
+        for index in minute * jobs / 60..(minute + 1) * jobs / 60 {
+            series.extend(job_series(index, t));
+        }
         series.sort_unstable_by_key(|(order, _)| *order);
         series.into_iter().map(|(_, series)| series).collect()
     }
@@ -319,6 +396,9 @@ struct Meta {
     /// The [`write_layout`] switches the store was written with.
     #[serde(default)]
     layout: String,
+    /// [`job_pods_per_hour`] at ingest.
+    #[serde(default)]
+    job_pods: usize,
 }
 
 /// `arrival`, `sorted` (series IDs only) or `default` for
@@ -384,7 +464,7 @@ async fn ingest(dir: &Path, end_ms: i64, namespaces: usize, layout: String) {
     let rollup = crate::RollupConfig::default();
     let writer = TimeSeriesDb::open(config).await.unwrap();
     let namespace = namespace();
-    let start_ms = end_ms - 25 * HOUR_MS;
+    let start_ms = end_ms - (days() * 24 + 1) * HOUR_MS;
     let mut generator = Generator {
         namespaces,
         pods: HashMap::new(),
@@ -461,6 +541,7 @@ async fn ingest(dir: &Path, end_ms: i64, namespaces: usize, layout: String) {
         namespaces,
         ingest_ms: ms(started.elapsed()),
         layout,
+        job_pods: job_pods_per_hour(),
     };
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
 }
@@ -608,6 +689,16 @@ async fn reader(
         ..Default::default()
     };
     config.query_cache.result_cache_enabled = result_cache;
+    // Rendered-config sizes: `PROFILE_IO_LIMIT` I/O permits,
+    // `PROFILE_FORWARD_INDEX_MB` and `PROFILE_READER_CACHE_MB` caches, and
+    // `PROFILE_QUERY_MEMORY_MB` per query.
+    if let Some(mib) = env::<u64>("PROFILE_FORWARD_INDEX_MB") {
+        config.query_cache.forward_index_capacity_bytes = mib << 20;
+    }
+    if let Some(mib) = env::<u64>("PROFILE_QUERY_MEMORY_MB") {
+        config.query_limits.max_query_memory_bytes = mib << 20;
+        config.query_limits.memory_budget_bytes = 2 * (mib << 20);
+    }
     let inner = common::create_object_store(&config.storage.object_store).unwrap();
     let slow: Arc<dyn ObjectStore> = Arc::new(SlowStore { inner, latency });
     let store: Arc<dyn ObjectStore> = Arc::new(
@@ -615,10 +706,14 @@ async fn reader(
     );
     ShardedMetrics::open_readers_over(
         config,
-        ShardingOptions::new(1, sharding::DEFAULT_IO_CONCURRENCY_LIMIT).unwrap(),
+        ShardingOptions::new(
+            1,
+            env("PROFILE_IO_LIMIT").unwrap_or(sharding::DEFAULT_IO_CONCURRENCY_LIMIT),
+        )
+        .unwrap(),
         [ShardId::new(0)],
         options,
-        READER_CACHE_CAPACITY,
+        env::<u64>("PROFILE_READER_CACHE_MB").map_or(READER_CACHE_CAPACITY, |mib| mib << 20),
         Some(store),
     )
     .await
@@ -728,12 +823,14 @@ fn tuning(variant: &str) -> ReadTuning {
         chunk_prefetch: 0,
         scan_watermark: false,
         unproject_dense: false,
+        defer_identity: false,
     };
     for switch in switches.into_iter().filter(|switch| *switch != "base") {
         match switch {
             "clusters" => tuning.cluster_scans = true,
             "watermark" => tuning.scan_watermark = true,
             "dense" => tuning.unproject_dense = true,
+            "defer" => tuning.defer_identity = true,
             concurrency if concurrency.starts_with("conc") => {
                 tuning.point_get_concurrency = concurrency["conc".len()..].parse().unwrap();
             }
@@ -746,9 +843,17 @@ fn tuning(variant: &str) -> ReadTuning {
     tuning
 }
 
+fn days() -> i64 {
+    env("PROFILE_DAYS").unwrap_or(1)
+}
+
+fn step() -> Duration {
+    env::<u64>("PROFILE_STEP_SECS").map_or(STEP, Duration::from_secs)
+}
+
 fn day_range(end_ms: i64) -> std::ops::RangeInclusive<std::time::SystemTime> {
     let end = UNIX_EPOCH + Duration::from_millis(end_ms as u64);
-    end - Duration::from_millis(DAY_MS as u64)..=end
+    end - Duration::from_millis((days() * DAY_MS) as u64)..=end
 }
 
 /// Warms the filters and indexes of every bucket from an hour before the
@@ -802,7 +907,7 @@ async fn started_reader(
                 warm_metadata(&previous, end_ms).await;
             } else {
                 previous
-                    .query_range_with_trace(&namespace(), text, day_range(end_ms), STEP, false)
+                    .query_range_with_trace(&namespace(), text, day_range(end_ms), step(), false)
                     .await
                     .unwrap();
             }
@@ -832,12 +937,16 @@ struct Run {
     exec_gets: usize,
     /// GETs in flight at once, at most.
     peak_gets: usize,
+    /// Time reads waited for one of the shard set's I/O permits.
+    io_wait_ms: f64,
     series: usize,
     samples: usize,
     checksum: f64,
     /// `(kind, calls, bytes, wall_ms)` from the trace.
     io: Vec<(String, u64, u64, f64)>,
     subphases: Vec<(String, f64, u64)>,
+    /// Operator counters from the trace, summed over operators.
+    counters: BTreeMap<String, u64>,
     /// `(bucket, resolve_ms, series, sample_ms, batches, gets, l0 gets)`.
     buckets: Vec<(String, f64, u64, f64, u64, usize, usize)>,
 }
@@ -882,7 +991,7 @@ async fn run_once(
     start_recording();
     let started = Instant::now();
     let (result, trace) = db
-        .query_range_with_trace(&namespace(), text, range, STEP, true)
+        .query_range_with_trace(&namespace(), text, range, step(), true)
         .await
         .unwrap();
     let total = started.elapsed();
@@ -972,6 +1081,14 @@ async fn run_once(
                 .collect()
         })
         .unwrap_or_default();
+    let mut counters = BTreeMap::new();
+    for operator in trace["operators"].as_array().into_iter().flatten() {
+        for counter in operator["counters"].as_array().into_iter().flatten() {
+            *counters
+                .entry(counter["label"].as_str().unwrap().to_string())
+                .or_default() += counter["value"].as_u64().unwrap();
+        }
+    }
     let (samples, sum) = checksum(&result);
     Run {
         variant: String::new(),
@@ -989,11 +1106,13 @@ async fn run_once(
         plan_gets: gets.len() - exec_gets,
         exec_gets,
         peak_gets: peak(&gets),
+        io_wait_ms: trace["ioConcurrencyWaitMs"].as_f64().unwrap_or(0.0),
         series: result.len(),
         samples,
         checksum: sum,
         io,
         subphases,
+        counters,
         buckets,
     }
 }
@@ -1045,7 +1164,7 @@ fn stats(values: impl IntoIterator<Item = f64>) -> String {
 fn summarize(runs: &[Run]) {
     let first = &runs[0];
     eprintln!(
-        "{:<8} proj={:<5} lat={:>2}ms {}: total {} | prewarm {} setup {} plan {} exec {} | gets {} (plan {}, exec {}, peak {}) {:.1} MB | {} series {} samples",
+        "{:<8} proj={:<5} lat={:>2}ms {}: total {} | prewarm {} setup {} plan {} exec {} io-wait {} | gets {} (plan {}, exec {}, peak {}) {:.1} MB | {} series {} samples",
         first.query,
         first.projection,
         first.latency_ms,
@@ -1055,6 +1174,7 @@ fn summarize(runs: &[Run]) {
         stats(runs.iter().map(|run| run.reader_setup_ms)),
         stats(runs.iter().map(|run| run.build_physical_ms)),
         stats(runs.iter().map(|run| run.execute_ms)),
+        stats(runs.iter().map(|run| run.io_wait_ms)),
         stats(runs.iter().map(|run| run.gets as f64)),
         stats(runs.iter().map(|run| run.plan_gets as f64)),
         stats(runs.iter().map(|run| run.exec_gets as f64)),
@@ -1071,6 +1191,9 @@ fn summarize(runs: &[Run]) {
     }
     for (label, elapsed, calls) in &median.subphases {
         eprintln!("    sub {label:<25} {elapsed:>7.1}ms x{calls}");
+    }
+    for (label, value) in &median.counters {
+        eprintln!("    counter {label:<26} {value:>9}");
     }
     if std::env::var("PROFILE_BUCKETS").is_ok() {
         for (name, resolve, series, sample, batches, gets, l0) in &median.buckets {
@@ -1099,9 +1222,10 @@ async fn profile_cold_queries() {
     }
     let meta: Meta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     eprintln!(
-        "store {} ({} namespaces, {} layout, ingested in {:.0}s)",
+        "store {} ({} namespaces, {} job pods/h, {} layout, ingested in {:.0}s)",
         dir.display(),
         meta.namespaces,
+        meta.job_pods,
         meta.layout,
         meta.ingest_ms / 1000.0
     );
@@ -1582,7 +1706,7 @@ async fn profile_remote_cold_dashboard() {
             async move {
                 let began = Instant::now();
                 let (_, trace) = db
-                    .query_range_with_trace(namespace, text, day_range(end_ms), STEP, true)
+                    .query_range_with_trace(namespace, text, day_range(end_ms), step(), true)
                     .await
                     .unwrap();
                 (*name, began.elapsed(), trace.unwrap())
@@ -1630,7 +1754,7 @@ async fn profile_remote_cold_dashboard() {
         start_recording();
         let started = Instant::now();
         let (_, trace) = db
-            .query_range_with_trace(&namespace, text, day_range(end_ms), STEP, true)
+            .query_range_with_trace(&namespace, text, day_range(end_ms), step(), true)
             .await
             .unwrap();
         let total = started.elapsed();

@@ -1364,22 +1364,30 @@ enum ShardSource {
 }
 
 impl ShardSource {
+    /// Remote shards resolve a deferred projection as a plain one: their
+    /// sample reads carry no edges.
     async fn resolve_all(
         &self,
         selector: &promql_parser::parser::VectorSelector,
         time_range: TimeRange,
-        projection: Option<Arc<[String]>>,
+        projection: Option<(Arc<[String]>, bool)>,
     ) -> Vec<std::result::Result<ResolvedSeriesChunk, SourceQueryError>> {
         match (self, projection) {
             (Self::Local(source), None) => source.resolve(selector, time_range).collect().await,
             (Self::Remote(source), None) => source.resolve(selector, time_range).collect().await,
-            (Self::Local(source), Some(projection)) => {
+            (Self::Local(source), Some((projection, true))) => {
+                source
+                    .resolve_deferred(selector, time_range, projection)
+                    .collect()
+                    .await
+            }
+            (Self::Local(source), Some((projection, false))) => {
                 source
                     .resolve_projected(selector, time_range, projection)
                     .collect()
                     .await
             }
-            (Self::Remote(source), Some(projection)) => {
+            (Self::Remote(source), Some((projection, _))) => {
                 source
                     .resolve_projected(selector, time_range, projection)
                     .collect()
@@ -1428,7 +1436,7 @@ impl MultiShardSeriesSource {
         &self,
         selector: &promql_parser::parser::VectorSelector,
         time_range: TimeRange,
-        projection: Option<Arc<[String]>>,
+        projection: Option<(Arc<[String]>, bool)>,
     ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send + use<>
     {
         let selector = selector.clone();
@@ -1458,6 +1466,7 @@ impl MultiShardSeriesSource {
                                     })
                                     .collect(),
                                 fingerprints: chunk.fingerprints,
+                                span: chunk.span,
                             }
                         })
                     })
@@ -1484,7 +1493,19 @@ impl SeriesSource for MultiShardSeriesSource {
         time_range: TimeRange,
         projection: Arc<[String]>,
     ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
-        self.resolve_shards(selector, time_range, Some(projection))
+        self.resolve_shards(selector, time_range, Some((projection, false)))
+    }
+
+    fn resolve_deferred(
+        &self,
+        selector: &promql_parser::parser::VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = std::result::Result<ResolvedSeriesChunk, SourceQueryError>> + Send {
+        // A series can sit in several sources within one bucket (an epoch
+        // cutover), and only its fingerprints join those rows.
+        let defer = self.sources.len() == 1;
+        self.resolve_shards(selector, time_range, Some((projection, defer)))
     }
 
     fn samples(
@@ -1527,7 +1548,10 @@ impl SeriesSource for MultiShardSeriesSource {
                     )))];
                 };
                 source
-                    .samples_all(SamplesRequest::new(series, request.time_range))
+                    .samples_all(
+                        SamplesRequest::new(series, request.time_range)
+                            .with_edge_window(request.edge_window_ms),
+                    )
                     .await
                     .into_iter()
                     .map(|batch| {
@@ -1535,6 +1559,7 @@ impl SeriesSource for MultiShardSeriesSource {
                             series_range: (batch.series_range.start + range.start)
                                 ..(batch.series_range.end + range.start),
                             samples: batch.samples,
+                            edges: batch.edges,
                         })
                     })
                     .collect::<Vec<_>>()

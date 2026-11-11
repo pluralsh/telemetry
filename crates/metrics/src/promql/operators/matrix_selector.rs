@@ -50,9 +50,10 @@ use super::super::batch::{SchemaRef, SeriesSchema, StepBatch};
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
-    ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
+    ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesEdge, SeriesSource, TimeRange,
 };
 use super::prefetch::{ChunkLoad, Prefetch};
+use super::stitch::{Columns, RowSpan, Stitcher, Tail, orphan_run, step_bounds};
 use super::vector_selector::histogram_sample_bytes;
 
 // ---------------------------------------------------------------------------
@@ -343,6 +344,10 @@ struct ChunkSamples {
     values: Vec<Vec<f64>>,
     histogram_timestamps: Vec<Vec<i64>>,
     histograms: Vec<Vec<Arc<FloatHistogram>>>,
+    /// The source's edges, by chunk-local series.
+    edges: Vec<(usize, SeriesEdge)>,
+    /// Per-series effective times to emit at; empty for all of them.
+    spans: Vec<RowSpan>,
 }
 
 impl ChunkSamples {
@@ -357,6 +362,38 @@ impl ChunkSamples {
             values: columns(chunk_len),
             histogram_timestamps: columns(chunk_len),
             histograms: columns(chunk_len),
+            edges: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// A chunk of the orphan `tails` from the row `first`, emitting at
+    /// `spans` alone.
+    fn orphans(
+        reservation: MemoryReservation,
+        first: usize,
+        tails: Vec<Tail>,
+        spans: Vec<RowSpan>,
+    ) -> Self {
+        let mut samples = Self::new(reservation, spans.len());
+        for tail in tails {
+            let row = tail.row - first;
+            samples.bytes += tail.bytes;
+            samples.timestamps[row] = tail.timestamps;
+            samples.values[row] = tail.values;
+            samples.histogram_timestamps[row] = tail.histogram_timestamps;
+            samples.histograms[row] = tail.histograms;
+        }
+        samples.spans = spans;
+        samples
+    }
+
+    fn columns(&mut self) -> Columns<'_> {
+        Columns {
+            timestamps: &mut self.timestamps,
+            values: &mut self.values,
+            histogram_timestamps: &mut self.histogram_timestamps,
+            histograms: &mut self.histograms,
         }
     }
 
@@ -415,6 +452,7 @@ impl ChunkSamples {
             histogram_timestamps: Arc::new(histogram_timestamps),
             histograms: Arc::new(histograms),
             histogram_starts,
+            spans: std::mem::take(&mut self.spans),
         })
     }
 
@@ -452,6 +490,10 @@ impl ChunkSamples {
             self.histogram_timestamps[local_idx].append(&mut hts_col);
             self.histograms[local_idx].append(&mut h_col);
         }
+        self.edges.extend(batch.edges.into_iter().map(|edge| {
+            let local_idx = request_to_series[batch.series_range.start + edge.index];
+            (local_idx, edge)
+        }));
         Ok(())
     }
 }
@@ -476,6 +518,8 @@ struct PackedChunk {
     histogram_timestamps: Arc<Vec<i64>>,
     histograms: Arc<Vec<Arc<FloatHistogram>>>,
     histogram_starts: Vec<usize>,
+    /// Per-series effective times to emit at; empty for all of them.
+    spans: Vec<RowSpan>,
 }
 
 impl PackedChunk {
@@ -602,7 +646,7 @@ enum State<'a> {
     LoadingChunk {
         chunk_start: usize,
         chunk_len: usize,
-        future: ChunkLoad<'a, PackedChunk>,
+        future: ChunkLoad<'a, ChunkSamples>,
         /// Whether read-ahead overlapped the load, so a failure is retried
         /// alone before it is final.
         retry: bool,
@@ -618,6 +662,8 @@ enum State<'a> {
         hist_cursors: Vec<SeriesCursor>,
         /// Next step chunk's starting index within the full grid.
         next_step_chunk_start: usize,
+        /// One past the chunk's last step to emit.
+        step_end: usize,
     },
     Done,
     Errored,
@@ -657,7 +703,11 @@ pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
     /// A consumed batch's cell index, kept for the next batch. Unreserved,
     /// but never more than one batch's.
     spare_cells: Vec<CellIndex>,
-    prefetch: Prefetch<'a, PackedChunk>,
+    prefetch: Prefetch<'a, ChunkSamples>,
+    /// Set for a leaf with deferred identity.
+    stitch: Option<Stitcher>,
+    /// Tails left to emit alone, once every row has been read.
+    orphans: Option<std::collections::VecDeque<Tail>>,
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
@@ -720,7 +770,74 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             state: State::Init,
             spare_cells: Vec::new(),
             prefetch: Prefetch::new(crate::read_tuning::read_tuning().chunk_prefetch),
+            stitch: None,
+            orphans: None,
         }
+    }
+
+    /// For a leaf with deferred identity (see `resolve_leaf`), whose rows
+    /// this joins across bucket edges, reading fingerprints with their
+    /// samples where `edge_reads`.
+    pub(crate) fn with_deferred_identity(mut self, deferred: bool, edge_reads: bool) -> Self {
+        self.stitch = deferred.then(|| Stitcher::new(self.range_ms, self.reservation.clone()));
+        if deferred && edge_reads {
+            self.shape.series_chunk *= super::stitch::EDGE_READ_CHUNK_SCALE;
+        }
+        self
+    }
+
+    /// Joins a loaded chunk to the rows before it.
+    fn stitch_chunk(
+        &mut self,
+        chunk_start: usize,
+        samples: &mut ChunkSamples,
+    ) -> Result<(), QueryError> {
+        let Some(stitch) = self.stitch.as_mut() else {
+            return Ok(());
+        };
+        let mut edges = std::mem::take(&mut samples.edges);
+        edges.retain(|&(row, _)| self.request_series[chunk_start + row].len() == 1);
+        edges.sort_by_key(|&(row, _)| row);
+        let (spans, moved) = stitch.stitch(chunk_start, samples.columns(), &edges)?;
+        samples.bytes += moved;
+        samples.spans = spans;
+        Ok(())
+    }
+
+    /// Packs a chunk to emit over the steps it has samples for.
+    fn emitting(&self, chunk_start: usize, samples: ChunkSamples) -> Result<State<'a>, QueryError> {
+        let (step_start, step_end) = match &self.stitch {
+            Some(stitch) => step_bounds(
+                &self.effective_times.times,
+                stitch.window_ms(),
+                &samples.timestamps,
+                &samples.histogram_timestamps,
+                &samples.spans,
+            ),
+            None => (0, self.schema.step_grid.step_count),
+        };
+        let chunk_len = samples.timestamps.len();
+        let samples = samples.pack()?;
+        Ok(State::Emitting {
+            chunk_start,
+            chunk_len,
+            samples: Box::new(samples),
+            cursors: (0..chunk_len).map(|_| SeriesCursor::new()).collect(),
+            hist_cursors: (0..chunk_len).map(|_| SeriesCursor::new()).collect(),
+            next_step_chunk_start: step_start,
+            step_end,
+        })
+    }
+
+    /// The next chunk of tails no row took up, once every row is read.
+    fn next_orphan_chunk(&mut self) -> Option<Result<State<'a>, QueryError>> {
+        let stitch = self.stitch.as_mut()?;
+        let orphans = self
+            .orphans
+            .get_or_insert_with(|| stitch.take_orphans().into());
+        let (first, tails, spans) = orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
+        let samples = ChunkSamples::orphans(self.reservation.clone(), first, tails, spans);
+        Some(self.emitting(first, samples))
     }
 
     /// Takes back a batch this operator emitted once its consumer is done
@@ -738,8 +855,9 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
             &self.request_series[chunk_start..chunk_end],
         );
         let window = self.effective_times.time_range_with_range(self.range_ms);
+        let edge_window = self.stitch.as_ref().map(Stitcher::window_ms);
         (
-            SamplesRequest::new(Arc::from(flat), window),
+            SamplesRequest::new(Arc::from(flat), window).with_edge_window(edge_window),
             request_to_series,
         )
     }
@@ -773,7 +891,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         }
     }
 
-    fn chunk_load(&self, chunk_start: usize) -> ChunkLoad<'a, PackedChunk>
+    fn chunk_load(&self, chunk_start: usize) -> ChunkLoad<'a, ChunkSamples>
     where
         S: 'a,
     {
@@ -789,7 +907,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                 let batch = item?;
                 samples.absorb(batch, &request_to_series)?;
             }
-            samples.pack()
+            Ok(samples)
         })
     }
 
@@ -801,9 +919,9 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         cursors: &mut [SeriesCursor],
         hist_cursors: &mut [SeriesCursor],
         step_chunk_start: usize,
+        step_end: usize,
     ) -> Result<MatrixWindowBatch, QueryError> {
-        let grid = &self.schema.step_grid;
-        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(grid.step_count);
+        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(step_end);
         let step_count = step_chunk_end - step_chunk_start;
         let cell_count = step_count * chunk_len;
 
@@ -840,6 +958,16 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                         window_lo,
                         window_hi,
                     );
+                }
+                if samples
+                    .spans
+                    .get(series_off)
+                    .is_some_and(|span| !span.contains(effective))
+                {
+                    cells[cell_idx] = CellIndex::EMPTY;
+                    if let Some(out) = histogram_cells.as_mut() {
+                        out[cell_idx] = CellIndex::EMPTY;
+                    }
                 }
             }
         }
@@ -922,18 +1050,18 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                                 retry: false,
                             };
                         }
-                        Poll::Ready(Ok(samples)) => {
-                            let cursors = (0..chunk_len).map(|_| SeriesCursor::new()).collect();
-                            let hist_cursors =
-                                (0..chunk_len).map(|_| SeriesCursor::new()).collect();
-                            self.state = State::Emitting {
-                                chunk_start,
-                                chunk_len,
-                                samples: Box::new(samples),
-                                cursors,
-                                hist_cursors,
-                                next_step_chunk_start: 0,
-                            };
+                        Poll::Ready(Ok(mut samples)) => {
+                            self.prefetch.resize(samples.bytes, self.reservation.cap());
+                            let state = self
+                                .stitch_chunk(chunk_start, &mut samples)
+                                .and_then(|()| self.emitting(chunk_start, samples));
+                            match state {
+                                Ok(state) => self.state = state,
+                                Err(err) => {
+                                    self.state = State::Errored;
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                            }
                         }
                         Poll::Ready(Err(err)) => {
                             self.state = State::Errored;
@@ -948,17 +1076,29 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     mut cursors,
                     mut hist_cursors,
                     next_step_chunk_start,
+                    step_end,
                 } => {
-                    let grid = &self.schema.step_grid;
-                    if next_step_chunk_start >= grid.step_count {
+                    if next_step_chunk_start >= step_end {
                         let next_chunk_start = chunk_start + chunk_len;
                         drop(samples);
-                        if next_chunk_start >= self.total_series() {
-                            self.state = State::Done;
-                            return Poll::Ready(None);
+                        if self.orphans.is_none() && next_chunk_start < self.total_series() {
+                            self.state = self.start_chunk_load(next_chunk_start);
+                            continue;
                         }
-                        self.state = self.start_chunk_load(next_chunk_start);
-                        continue;
+                        match self.next_orphan_chunk() {
+                            Some(Ok(state)) => {
+                                self.state = state;
+                                continue;
+                            }
+                            Some(Err(err)) => {
+                                self.state = State::Errored;
+                                return Poll::Ready(Some(Err(err)));
+                            }
+                            None => {
+                                self.state = State::Done;
+                                return Poll::Ready(None);
+                            }
+                        }
                     }
                     match self.build_window_batch(
                         chunk_start,
@@ -967,6 +1107,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                         &mut cursors,
                         &mut hist_cursors,
                         next_step_chunk_start,
+                        step_end,
                     ) {
                         Ok(batch) => {
                             self.prefetch.poll(cx);
@@ -978,6 +1119,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                                 cursors,
                                 hist_cursors,
                                 next_step_chunk_start: next_step_chunk_start + step_advance,
+                                step_end,
                             };
                             return Poll::Ready(Some(Ok(batch)));
                         }

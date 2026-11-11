@@ -315,7 +315,18 @@ fn selector_time_range(
 struct ResolvedLeaf {
     schema: Arc<SeriesSchema>,
     request_series: Arc<[Arc<[ResolvedSeriesRef]>]>,
+    /// Whether some rows are one bucket's series, which the leaf joins
+    /// across bucket edges as it reads their samples.
+    deferred: bool,
+    /// Whether some of those resolved without fingerprints, which the leaf
+    /// then reads with their samples.
+    edge_reads: bool,
 }
+
+/// The widest window a deferred leaf joins across edges: the narrowest
+/// bucket, so a step's window reaches no further back than the bucket
+/// before its own.
+const MAX_DEFERRED_WINDOW_MS: i64 = 60 * 60 * 1000;
 
 /// What makes two resolved handles the same logical series.
 #[derive(PartialEq, Eq, Hash)]
@@ -336,18 +347,28 @@ enum RosterKey {
 ///
 /// With a `projection`, rows carry only the projected labels and are keyed
 /// by series fingerprint, so series sharing projected labels stay distinct
-/// rows; the parent must read nothing but those labels.
+/// rows; the parent must read nothing but those labels. A projected leaf
+/// whose `window_ms` (lookback or range) fits [`MAX_DEFERRED_WINDOW_MS`]
+/// defers identity: chunks the source answers with a span become a row per
+/// series per bucket, in bucket order, which only an aggregation over them
+/// may read, since a series spans several rows.
 async fn resolve_leaf<S>(
     source: &Arc<S>,
     selector: &parser::VectorSelector,
     time_range: TimeRange,
     reservation: &MemoryReservation,
     projection: Option<&Arc<[String]>>,
+    window_ms: i64,
 ) -> Result<ResolvedLeaf, PlanError>
 where
     S: SeriesSource + Send + Sync + 'static,
 {
+    let defer =
+        window_ms <= MAX_DEFERRED_WINDOW_MS && crate::read_tuning::read_tuning().defer_identity;
     let mut stream: BoxStream<'_, Result<ResolvedSeriesChunk, QueryError>> = match projection {
+        Some(projection) if defer => {
+            Box::pin(source.resolve_deferred(selector, time_range, projection.clone()))
+        }
         Some(projection) => {
             Box::pin(source.resolve_projected(selector, time_range, projection.clone()))
         }
@@ -358,9 +379,22 @@ where
         HashMap::default();
     let mut labels: Vec<Labels> = Vec::new();
     let mut refs: Vec<Vec<ResolvedSeriesRef>> = Vec::new();
+    let mut deferred: Vec<(i64, Labels, ResolvedSeriesRef)> = Vec::new();
+    let mut edge_reads = false;
 
     while let Some(chunk_res) = stream.next().await {
         let mut chunk = chunk_res.map_err(map_source_err)?;
+        if let Some((start_ms, _)) = chunk.span {
+            edge_reads |= chunk.fingerprints.is_none();
+            deferred.extend(
+                chunk
+                    .labels
+                    .iter()
+                    .zip(chunk.series.iter())
+                    .map(|(label, sref)| (start_ms, label.clone(), sref.clone())),
+            );
+            continue;
+        }
         if let Some(projection) = projection {
             chunk = chunk.projected(projection);
         }
@@ -381,12 +415,17 @@ where
             }
         }
     }
-    // Rows are identified by position, as in every derived schema.
-    let fingerprints: Vec<u128> = (0..labels.len() as u128).collect();
-
     for series_refs in &mut refs {
         series_refs.sort_unstable_by_key(|sref| (sref.bucket_id, sref.series_id));
     }
+    let has_deferred = !deferred.is_empty();
+    deferred.sort_unstable_by_key(|(start_ms, _, sref)| (*start_ms, sref.bucket_id, sref.series_id));
+    for (_, label, sref) in deferred {
+        labels.push(label);
+        refs.push(vec![sref]);
+    }
+    // Rows are identified by position, as in every derived schema.
+    let fingerprints: Vec<u128> = (0..labels.len() as u128).collect();
 
     // Conservative label-storage reservation: one `Label` struct per label,
     // rounded to 48 bytes (the stable shape today) + per-series overhead.
@@ -409,6 +448,8 @@ where
     Ok(ResolvedLeaf {
         schema,
         request_series,
+        deferred: has_deferred,
+        edge_reads,
     })
 }
 // ---------------------------------------------------------------------------
@@ -486,8 +527,15 @@ where
         } => {
             let lookback = lookback_ms.unwrap_or(ctx.lookback_delta_ms);
             let time_range = selector_time_range(grid, lookback, 0, at, offset);
-            let resolved =
-                resolve_leaf(source, &selector, time_range, reservation, projection).await?;
+            let resolved = resolve_leaf(
+                source,
+                &selector,
+                time_range,
+                reservation,
+                projection,
+                lookback,
+            )
+            .await?;
             let series_count = resolved.schema.len() as u64;
             let at_parser = at.map(to_parser_at);
             let off_parser = to_parser_offset(offset);
@@ -501,7 +549,8 @@ where
                 lookback,
                 reservation.clone(),
                 super::super::operators::vector_selector::BatchShape::default(),
-            );
+            )
+            .with_deferred_identity(resolved.deferred, resolved.edge_reads);
             // Unit 4.5: wrap the leaf in `ConcurrentOp` when its resolved
             // series count exceeds the configured threshold. Decouples the
             // async `samples()` pull from downstream evaluation.
@@ -658,8 +707,15 @@ where
             at,
         } => {
             let time_range = selector_time_range(grid, 0, range_ms, at, offset);
-            let resolved =
-                resolve_leaf(source, &selector, time_range, reservation, projection).await?;
+            let resolved = resolve_leaf(
+                source,
+                &selector,
+                time_range,
+                reservation,
+                projection,
+                range_ms,
+            )
+            .await?;
             let series_count = resolved.schema.len() as u64;
             let at_parser = at.map(to_parser_at);
             let off_parser = to_parser_offset(offset);
@@ -673,7 +729,8 @@ where
                 range_ms,
                 reservation.clone(),
                 super::super::operators::matrix_selector::BatchShape::default(),
-            );
+            )
+            .with_deferred_identity(resolved.deferred, resolved.edge_reads);
             let schema_snapshot = OperatorSchema::new(SchemaRef::Static(resolved.schema), grid);
             let window = MatrixWindowSource::new(matrix, schema_snapshot);
             let op = RollupOp::new(window, kind, range_ms, reservation.clone());

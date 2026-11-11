@@ -54,6 +54,7 @@ impl SeriesSource for MockSource {
             labels: Arc::from(labels),
             series: Arc::from(refs),
             fingerprints: None,
+            span: None,
         };
         stream::iter(vec![Ok(chunk)]).right_stream()
     }
@@ -75,6 +76,7 @@ impl SeriesSource for MockSource {
         stream::iter(vec![Ok(SampleBatch {
             series_range: 0..request.series.len(),
             samples: block,
+            edges: Vec::new(),
         })])
     }
 }
@@ -106,6 +108,7 @@ impl SeriesSource for ChunkedResolveSource {
         stream::iter(vec![Ok(SampleBatch {
             series_range: 0..request.series.len(),
             samples: block,
+            edges: Vec::new(),
         })])
     }
 }
@@ -203,6 +206,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
             labels: Arc::from(vec![labels_of(&[("__name__", "m"), ("pod", "a")])]),
             series: Arc::from(vec![ResolvedSeriesRef::new(10, 7, name.clone())]),
             fingerprints: None,
+            span: None,
         },
         ResolvedSeriesChunk {
             bucket_id: 20,
@@ -215,6 +219,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
                 ResolvedSeriesRef::new(20, 12, name.clone()),
             ]),
             fingerprints: None,
+            span: None,
         },
     ]));
     let reservation = MemoryReservation::new(1 << 20);
@@ -228,6 +233,7 @@ fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
             TimeRange::new(0, 1_000),
             &reservation,
             None,
+            0,
         ))
         .expect("resolved leaf");
 
@@ -273,6 +279,7 @@ fn should_keep_series_sharing_projected_labels_as_distinct_rows() {
             labels: Arc::from(vec![a.clone()]),
             series: Arc::from(vec![ResolvedSeriesRef::new(10, 7, name.clone())]),
             fingerprints: None,
+            span: None,
         },
         ResolvedSeriesChunk {
             bucket_id: 20,
@@ -282,6 +289,7 @@ fn should_keep_series_sharing_projected_labels_as_distinct_rows() {
                 ResolvedSeriesRef::new(20, 12, name.clone()),
             ]),
             fingerprints: None,
+            span: None,
         },
     ]));
     let reservation = MemoryReservation::new(1 << 20);
@@ -295,6 +303,7 @@ fn should_keep_series_sharing_projected_labels_as_distinct_rows() {
             TimeRange::new(0, 1_000),
             &reservation,
             Some(&projection),
+            0,
         ))
         .expect("resolved leaf");
 

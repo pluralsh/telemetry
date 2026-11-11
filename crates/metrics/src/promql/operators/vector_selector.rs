@@ -45,10 +45,13 @@ use super::super::batch::{BitSet, HistogramCells, SchemaRef, SeriesSchema, StepB
 use super::super::memory::{MemoryReservation, QueryError};
 use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
-    ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
+    ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesEdge, SeriesSource, TimeRange,
 };
 use super::super::trace;
 use super::prefetch::{ChunkLoad, Prefetch};
+use super::stitch::{
+    Columns, EDGE_READ_CHUNK_SCALE, RowSpan, Stitcher, Tail, orphan_run, step_bounds,
+};
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -281,6 +284,10 @@ struct ChunkSamples {
     values: Vec<Vec<f64>>,
     histogram_timestamps: Vec<Vec<i64>>,
     histograms: Vec<Vec<Arc<FloatHistogram>>>,
+    /// The source's edges, by chunk-local series.
+    edges: Vec<(usize, SeriesEdge)>,
+    /// Per-series effective times to emit at; empty for all of them.
+    spans: Vec<RowSpan>,
 }
 
 impl ChunkSamples {
@@ -295,6 +302,38 @@ impl ChunkSamples {
             values: columns(chunk_len),
             histogram_timestamps: columns(chunk_len),
             histograms: columns(chunk_len),
+            edges: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// A chunk of the orphan `tails` from the row `first`, emitting at
+    /// `spans` alone.
+    fn orphans(
+        reservation: MemoryReservation,
+        first: usize,
+        tails: Vec<Tail>,
+        spans: Vec<RowSpan>,
+    ) -> Self {
+        let mut samples = Self::new(reservation, spans.len());
+        for tail in tails {
+            let row = tail.row - first;
+            samples.bytes += tail.bytes;
+            samples.timestamps[row] = tail.timestamps;
+            samples.values[row] = tail.values;
+            samples.histogram_timestamps[row] = tail.histogram_timestamps;
+            samples.histograms[row] = tail.histograms;
+        }
+        samples.spans = spans;
+        samples
+    }
+
+    fn columns(&mut self) -> Columns<'_> {
+        Columns {
+            timestamps: &mut self.timestamps,
+            values: &mut self.values,
+            histogram_timestamps: &mut self.histogram_timestamps,
+            histograms: &mut self.histograms,
         }
     }
 
@@ -336,6 +375,10 @@ impl ChunkSamples {
             self.histogram_timestamps[local_idx].append(&mut hts_col);
             self.histograms[local_idx].append(&mut h_col);
         }
+        self.edges.extend(batch.edges.into_iter().map(|edge| {
+            let local_idx = request_to_series[batch.series_range.start + edge.index];
+            (local_idx, edge)
+        }));
         Ok(())
     }
 }
@@ -365,12 +408,13 @@ enum State<'a> {
         /// alone before it is final.
         retry: bool,
     },
-    /// Chunk loaded; step chunks emit one batch per poll.
+    /// Chunk loaded; step chunks emit one batch per poll, up to `step_end`.
     Emitting {
         chunk_start: usize,
         chunk_len: usize,
         samples: Box<ChunkSamples>,
         next_step_chunk_start: usize,
+        step_end: usize,
     },
     Done,
     /// Terminal error; subsequent polls return `Ready(None)`.
@@ -400,6 +444,10 @@ pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
     // Runtime state ---------------------------------------------------------
     state: State<'a>,
     prefetch: Prefetch<'a, ChunkSamples>,
+    /// Set for a leaf with deferred identity.
+    stitch: Option<Stitcher>,
+    /// Tails left to emit alone, once every row has been read.
+    orphans: Option<std::collections::VecDeque<Tail>>,
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
@@ -441,7 +489,21 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             reservation,
             state: State::Init,
             prefetch: Prefetch::new(crate::read_tuning::read_tuning().chunk_prefetch),
+            stitch: None,
+            orphans: None,
         }
+    }
+
+    /// For a leaf with deferred identity (see `resolve_leaf`), whose rows
+    /// this joins across bucket edges, reading fingerprints with their
+    /// samples where `edge_reads`.
+    pub(crate) fn with_deferred_identity(mut self, deferred: bool, edge_reads: bool) -> Self {
+        self.stitch =
+            deferred.then(|| Stitcher::new(self.lookback_ms, self.reservation.clone()));
+        if deferred && edge_reads {
+            self.shape.series_chunk *= EDGE_READ_CHUNK_SCALE;
+        }
+        self
     }
 
     fn total_series(&self) -> usize {
@@ -454,10 +516,60 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         let window = self
             .effective_times
             .time_range_with_lookback(self.lookback_ms);
+        let edge_window = self.stitch.as_ref().map(Stitcher::window_ms);
         (
-            SamplesRequest::new(Arc::from(flat), window),
+            SamplesRequest::new(Arc::from(flat), window).with_edge_window(edge_window),
             request_to_series,
         )
+    }
+
+    /// Joins a loaded chunk to the rows before it, returning the steps it
+    /// emits at.
+    fn stitch_chunk(
+        &mut self,
+        chunk_start: usize,
+        samples: &mut ChunkSamples,
+    ) -> Result<(usize, usize), QueryError> {
+        let Some(stitch) = self.stitch.as_mut() else {
+            return Ok((0, self.schema.step_grid.step_count));
+        };
+        let mut edges = std::mem::take(&mut samples.edges);
+        edges.retain(|&(row, _)| self.request_series[chunk_start + row].len() == 1);
+        edges.sort_by_key(|&(row, _)| row);
+        let (spans, moved) = stitch.stitch(chunk_start, samples.columns(), &edges)?;
+        samples.bytes += moved;
+        samples.spans = spans;
+        Ok(step_bounds(
+            &self.effective_times.times,
+            stitch.window_ms(),
+            &samples.timestamps,
+            &samples.histogram_timestamps,
+            &samples.spans,
+        ))
+    }
+
+    /// The next chunk of tails no row took up, once every row is read.
+    fn next_orphan_chunk(&mut self) -> Option<State<'a>> {
+        let stitch = self.stitch.as_mut()?;
+        let orphans = self
+            .orphans
+            .get_or_insert_with(|| stitch.take_orphans().into());
+        let (first, tails, spans) = orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
+        let samples = ChunkSamples::orphans(self.reservation.clone(), first, tails, spans);
+        let (step_start, step_end) = step_bounds(
+            &self.effective_times.times,
+            stitch.window_ms(),
+            &samples.timestamps,
+            &samples.histogram_timestamps,
+            &samples.spans,
+        );
+        Some(State::Emitting {
+            chunk_start: first,
+            chunk_len: samples.timestamps.len(),
+            samples: Box::new(samples),
+            next_step_chunk_start: step_start,
+            step_end,
+        })
     }
 
     fn chunk_len(&self, chunk_start: usize) -> usize {
@@ -523,9 +635,9 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         chunk_len: usize,
         samples: &ChunkSamples,
         step_chunk_start: usize,
+        step_end: usize,
     ) -> Result<StepBatch, QueryError> {
-        let grid = &self.schema.step_grid;
-        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(grid.step_count);
+        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(step_end);
         let step_count = step_chunk_end - step_chunk_start;
         let cell_count = step_count * chunk_len;
 
@@ -577,6 +689,13 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                 } else {
                     None
                 };
+                if samples
+                    .spans
+                    .get(series_off)
+                    .is_some_and(|span| !span.contains(effective))
+                {
+                    continue;
+                }
 
                 let cell = step_off * chunk_len + series_off;
                 // The newest in-window sample of either kind wins; a
@@ -693,12 +812,22 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                                 retry: false,
                             };
                         }
-                        Poll::Ready(Ok(samples)) => {
+                        Poll::Ready(Ok(mut samples)) => {
+                            self.prefetch.resize(samples.bytes, self.reservation.cap());
+                            let (step_start, step_end) =
+                                match self.stitch_chunk(chunk_start, &mut samples) {
+                                    Ok(bounds) => bounds,
+                                    Err(err) => {
+                                        self.state = State::Errored;
+                                        return Poll::Ready(Some(Err(err)));
+                                    }
+                                };
                             self.state = State::Emitting {
                                 chunk_start,
                                 chunk_len,
                                 samples: Box::new(samples),
-                                next_step_chunk_start: 0,
+                                next_step_chunk_start: step_start,
+                                step_end,
                             };
                         }
                         Poll::Ready(Err(err)) => {
@@ -712,25 +841,39 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                     chunk_len,
                     samples,
                     next_step_chunk_start,
+                    step_end,
                 } => {
-                    let grid = &self.schema.step_grid;
-                    if next_step_chunk_start >= grid.step_count {
+                    if next_step_chunk_start >= step_end {
                         // All steps for this chunk emitted — advance to
-                        // the next series chunk or finish.
+                        // the next series chunk, then any orphan tails.
                         let next_chunk_start = chunk_start + chunk_len;
                         // Drop `samples` here, releasing its reservation.
                         drop(samples);
-                        if next_chunk_start >= self.total_series() {
-                            self.state = State::Done;
-                            return Poll::Ready(None);
+                        if self.orphans.is_none() && next_chunk_start < self.total_series() {
+                            let _g = trace::Scope::enter("start_chunk_load");
+                            self.state = self.start_chunk_load(next_chunk_start);
+                            continue;
                         }
-                        let _g = trace::Scope::enter("start_chunk_load");
-                        self.state = self.start_chunk_load(next_chunk_start);
-                        continue;
+                        match self.next_orphan_chunk() {
+                            Some(state) => {
+                                self.state = state;
+                                continue;
+                            }
+                            None => {
+                                self.state = State::Done;
+                                return Poll::Ready(None);
+                            }
+                        }
                     }
                     let build_result = {
                         let _g = trace::Scope::enter("build_batch");
-                        self.build_batch(chunk_start, chunk_len, &samples, next_step_chunk_start)
+                        self.build_batch(
+                            chunk_start,
+                            chunk_len,
+                            &samples,
+                            next_step_chunk_start,
+                            step_end,
+                        )
                     };
                     let batch = match build_result {
                         Ok(batch) => batch,
@@ -748,6 +891,7 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                         chunk_len,
                         samples,
                         next_step_chunk_start: next_step_chunk_start + batch.step_count(),
+                        step_end,
                     };
                     return Poll::Ready(Some(Ok(batch)));
                 }

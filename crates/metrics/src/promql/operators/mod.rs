@@ -44,5 +44,6 @@ pub(crate) mod prefetch;
 pub(crate) mod rechunk;
 pub(crate) mod rollup;
 pub(crate) mod sort;
+pub(crate) mod stitch;
 pub(crate) mod subquery;
 pub(crate) mod vector_selector;

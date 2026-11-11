@@ -21,7 +21,15 @@ struct Load<'a, T> {
     done: Option<Result<T, QueryError>>,
 }
 
+/// The most chunks read ahead, however small. A selector's next chunks
+/// usually share storage blocks at their edges, which loads in flight
+/// together each fetch: past this depth the repeated reads cost more round
+/// trips than the overlap saves.
+const MAX_DEPTH: usize = 16;
+
 pub(crate) struct Prefetch<'a, T> {
+    /// The configured depth, below which [`Self::resize`] never goes.
+    base: usize,
     depth: usize,
     loads: VecDeque<Load<'a, T>>,
 }
@@ -29,9 +37,24 @@ pub(crate) struct Prefetch<'a, T> {
 impl<'a, T: Send + 'a> Prefetch<'a, T> {
     pub(crate) fn new(depth: usize) -> Self {
         Self {
+            base: depth,
             depth,
             loads: VecDeque::new(),
         }
+    }
+
+    /// Reads as many chunks ahead as fit a quarter of `budget` at
+    /// `chunk_bytes`, the size of the chunk just loaded, between the
+    /// configured depth and [`MAX_DEPTH`]. Chunks of series with few
+    /// samples each, such as those of short-lived pods, cost a round trip
+    /// apiece but little memory, so a fixed depth leaves a query over many
+    /// of them waiting on one round trip after another.
+    pub(crate) fn resize(&mut self, chunk_bytes: usize, budget: usize) {
+        if self.base == 0 {
+            return;
+        }
+        let fits = budget / 4 / chunk_bytes.max(1);
+        self.depth = fits.clamp(self.base, MAX_DEPTH.max(self.base));
     }
 
     /// Whether a load failing now may be an artifact of read-ahead.
@@ -42,6 +65,7 @@ impl<'a, T: Send + 'a> Prefetch<'a, T> {
     /// Drops every queued load, releasing what they reserved, and stops
     /// reading ahead.
     pub(crate) fn disable(&mut self) {
+        self.base = 0;
         self.depth = 0;
         self.loads.clear();
     }
@@ -154,6 +178,41 @@ mod tests {
 
         // then
         assert!(prefetch.take(5).is_none());
+    }
+
+    #[test]
+    fn should_read_further_ahead_while_chunks_are_small_against_the_budget() {
+        // given
+        let mut prefetch: Prefetch<'static, usize> = Prefetch::new(4);
+
+        // when / then: chunks of a sixty-fourth of the budget fill a quarter
+        // of it sixteen at a time
+        prefetch.resize(1 << 20, 64 << 20);
+        assert_eq!(prefetch.wanted(0..100).len(), 16);
+
+        // when / then: tiny chunks stop at the most read ahead
+        prefetch.resize(1, 64 << 20);
+        assert_eq!(prefetch.wanted(0..100).len(), MAX_DEPTH);
+
+        // when / then: chunks near the budget fall back to the configured depth
+        prefetch.resize(32 << 20, 64 << 20);
+        assert_eq!(prefetch.wanted(0..100).len(), 4);
+    }
+
+    #[test]
+    fn should_not_resize_a_disabled_or_unconfigured_read_ahead() {
+        // given
+        let mut disabled: Prefetch<'static, usize> = Prefetch::new(4);
+        disabled.disable();
+        let mut off: Prefetch<'static, usize> = Prefetch::new(0);
+
+        // when
+        disabled.resize(1, 64 << 20);
+        off.resize(1, 64 << 20);
+
+        // then
+        assert!(!disabled.active());
+        assert!(!off.active());
     }
 
     #[test]

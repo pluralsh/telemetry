@@ -22,8 +22,8 @@ use crate::query::{CachedSeriesResolution, QueryReader};
 use super::index_cache::IndexCache;
 use super::memory::QueryError;
 use super::source::{
-    ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesSource,
-    TimeRange,
+    ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesEdge,
+    SeriesSource, TimeRange,
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,13 @@ fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
 pub(crate) struct QueryReaderSource<R: QueryReader> {
     reader: Arc<R>,
     index_cache: Arc<IndexCache>,
+    known: Arc<KnownFingerprints>,
 }
+
+/// Fingerprints of deferred series that resolved with them anyway (from
+/// their labels, where the bucket resolved in full), so their edges need
+/// no fingerprint read.
+type KnownFingerprints = dashmap::DashMap<(TimeBucket, u32), u128, foldhash::fast::RandomState>;
 
 impl<R: QueryReader> QueryReaderSource<R> {
     /// Creates a fresh query-scoped index cache alongside the adapter.
@@ -113,6 +119,7 @@ impl<R: QueryReader> QueryReaderSource<R> {
         Self {
             reader,
             index_cache: Arc::new(IndexCache::new()),
+            known: Arc::default(),
         }
     }
 }
@@ -138,7 +145,31 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         let reader = self.reader.clone();
         let index_cache = self.index_cache.clone();
         let selector = selector.clone();
-        resolve_stream(reader, index_cache, selector, time_range, Some(projection))
+        resolve_stream(
+            reader,
+            index_cache,
+            selector,
+            time_range,
+            Some((projection, None)),
+        )
+    }
+
+    fn resolve_deferred(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
+        let reader = self.reader.clone();
+        let index_cache = self.index_cache.clone();
+        let selector = selector.clone();
+        resolve_stream(
+            reader,
+            index_cache,
+            selector,
+            time_range,
+            Some((projection, Some(self.known.clone()))),
+        )
     }
 
     fn samples(
@@ -146,22 +177,27 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         request: SamplesRequest,
     ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
         let reader = self.reader.clone();
-        samples_stream(reader, request)
+        samples_stream(reader, self.known.clone(), request)
     }
 }
+
+/// A projection, deferring identity when it comes with the map to note
+/// the fingerprints it resolves anyway.
+type Projection = Option<(Arc<[String]>, Option<Arc<KnownFingerprints>>)>;
 
 // ---------------------------------------------------------------------------
 // resolve()
 // ---------------------------------------------------------------------------
 
 /// Fan out selector resolution across overlapping buckets and emit one chunk
-/// per non-empty bucket.
+/// per non-empty bucket (see [`SeriesSource::resolve_deferred`] for a
+/// deferred `projection`).
 fn resolve_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
-    projection: Option<Arc<[String]>>,
+    projection: Projection,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
     async_stream_resolve(reader, index_cache, selector, time_range, projection)
 }
@@ -174,7 +210,7 @@ fn async_stream_resolve<R: QueryReader + 'static>(
     index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
-    projection: Option<Arc<[String]>>,
+    projection: Projection,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
     stream::once(async move {
         let buckets = reader
@@ -200,16 +236,38 @@ fn async_stream_resolve<R: QueryReader + 'static>(
                 async move {
                     let started = std::time::Instant::now();
                     let chunk = match projection {
-                        Some(projection) => {
+                        Some((projection, None)) => {
                             resolve_one_bucket_projected(
                                 reader.as_ref(),
                                 &index_cache,
                                 bucket,
                                 &selector,
                                 &projection,
+                                false,
                             )
                             .await
                         }
+                        Some((projection, Some(known))) => resolve_one_bucket_projected(
+                            reader.as_ref(),
+                            &index_cache,
+                            bucket,
+                            &selector,
+                            &projection,
+                            true,
+                        )
+                        .await
+                        .map(|chunk| {
+                            chunk.map(|chunk| {
+                                if let Some(fingerprints) = &chunk.fingerprints {
+                                    for (series, &fingerprint) in
+                                        chunk.series.iter().zip(fingerprints.iter())
+                                    {
+                                        known.insert((bucket, series.series_id), fingerprint);
+                                    }
+                                }
+                                chunk.deferred(&projection, bucket_ms_window(bucket))
+                            })
+                        }),
                         None => {
                             resolve_one_bucket(reader.as_ref(), &index_cache, bucket, &selector)
                                 .await
@@ -328,13 +386,16 @@ async fn full_resolution<R: QueryReader + ?Sized>(
 /// That needs one metric name for the whole selector (handles carry it in
 /// place of the forward-index entry) and a fingerprint for every candidate;
 /// otherwise the bucket resolves in full and the caller projects it, which
-/// yields the same chunk.
+/// yields the same chunk. `deferred` reads no fingerprints: index-resolved
+/// series then come back projected but unidentified, under a cache key of
+/// their own, and the caller marks the chunk with its span.
 async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
     reader: &R,
     index_cache: &IndexCache,
     bucket: TimeBucket,
     selector: &VectorSelector,
     projection: &[String],
+    deferred: bool,
 ) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
     let Some(metric_name) = selector_util::exact_metric_name(selector) else {
         return resolve_one_bucket(reader, index_cache, bucket, selector).await;
@@ -342,11 +403,21 @@ async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
     let metric_name: Arc<str> = Arc::from(metric_name);
     let key = selector_util::selector_cache_key(selector);
     let projected_key = selector_util::projected_cache_key(&key, projection);
+    let deferred_key: Arc<str> = Arc::from(format!("{projected_key}#deferred"));
+    let span = Some(bucket_ms_window(bucket));
     if let Some(resolution) = reader
         .cached_selector_resolution(&bucket, &projected_key)
         .await
     {
         return Ok(resolved_chunk(bucket, resolution, Some(&metric_name)));
+    }
+    if deferred
+        && let Some(resolution) = reader
+            .cached_selector_resolution(&bucket, &deferred_key)
+            .await
+    {
+        return Ok(resolved_chunk(bucket, resolution, Some(&metric_name))
+            .map(|chunk| ResolvedSeriesChunk { span, ..chunk }));
     }
     if let Some(resolution) = reader.cached_selector_resolution(&bucket, &key).await {
         return Ok(resolved_chunk(bucket, resolution, None));
@@ -374,8 +445,13 @@ async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
             .await;
         return Ok(resolved_chunk(bucket, resolution, Some(&metric_name)));
     }
-    let Some(fingerprints) = stored_fingerprints(reader, &bucket, &candidates).await? else {
-        return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
+    let fingerprints = if deferred {
+        None
+    } else {
+        let Some(fingerprints) = stored_fingerprints(reader, &bucket, &candidates).await? else {
+            return resolve_candidates(reader, index_cache, bucket, &key, candidates).await;
+        };
+        Some(Arc::from(fingerprints))
     };
     let labels = projected_labels(
         reader,
@@ -389,12 +465,17 @@ async fn resolve_one_bucket_projected<R: QueryReader + ?Sized>(
     let resolution = Arc::new(CachedSeriesResolution {
         series_ids: Arc::from(candidates),
         labels: Arc::from(labels),
-        fingerprints: Some(Arc::from(fingerprints)),
+        fingerprints,
     });
+    let (key, span) = match deferred {
+        true => (&deferred_key, span),
+        false => (&projected_key, None),
+    };
     reader
-        .cache_selector_resolution(&bucket, &projected_key, resolution.clone())
+        .cache_selector_resolution(&bucket, key, resolution.clone())
         .await;
-    Ok(resolved_chunk(bucket, resolution, Some(&metric_name)))
+    Ok(resolved_chunk(bucket, resolution, Some(&metric_name))
+        .map(|chunk| ResolvedSeriesChunk { span, ..chunk }))
 }
 
 /// A projected resolution reads a postings list per value of each
@@ -500,6 +581,7 @@ fn resolved_chunk(
         labels: resolution.labels.clone(),
         series: Arc::from(handles),
         fingerprints: resolution.fingerprints.clone(),
+        span: None,
     })
 }
 
@@ -511,10 +593,11 @@ fn resolved_chunk(
 /// slice; series spanning buckets yield one batch per bucket. Operators merge.
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
+    known: Arc<KnownFingerprints>,
     request: SamplesRequest,
 ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
     stream::once(async move {
-        match build_sample_batches(reader.as_ref(), &request).await {
+        match build_sample_batches(reader.as_ref(), &known, &request).await {
             Ok(batches) => batches.into_iter().map(Ok).collect::<Vec<_>>(),
             Err(e) => vec![Err(e)],
         }
@@ -527,6 +610,7 @@ fn samples_stream<R: QueryReader + 'static>(
 /// `series_range` indexes into the caller's `request.series`.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
+    known: &KnownFingerprints,
     request: &SamplesRequest,
 ) -> Result<Vec<SampleBatch>, QueryError> {
     if request.series.is_empty() || request.time_range.is_empty() {
@@ -538,9 +622,17 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     let runs = contiguous_bucket_runs(&request.series);
 
     let time_range = request.time_range;
+    let edge_window_ms = request.edge_window_ms;
     let out: Vec<SampleBatch> = stream::iter(runs.into_iter().map(|run| {
         let series = request.series.clone();
-        async move { build_batch_for_run(reader, run, series, time_range).await }
+        async move {
+            let mut batch = build_batch_for_run(reader, run, series.clone(), time_range).await?;
+            if let Some(window_ms) = edge_window_ms {
+                batch.edges =
+                    series_edges(reader, known, &series, &batch, time_range, window_ms).await?;
+            }
+            Ok::<_, QueryError>(batch)
+        }
     }))
     .buffered(SAMPLE_STAGE_READAHEAD)
     .try_collect()
@@ -609,7 +701,104 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
     Ok(SampleBatch {
         series_range: run.range,
         samples: block,
+        edges: Vec::new(),
     })
+}
+
+/// The edges of `batch`'s bucket inside `time_range` that a series has a
+/// sample within `window_ms` of, with the series' fingerprint: `known`,
+/// stored, or from its forward-index labels where the bucket predates
+/// stored ones.
+async fn series_edges<R: QueryReader + ?Sized>(
+    reader: &R,
+    known: &KnownFingerprints,
+    series: &[ResolvedSeriesRef],
+    batch: &SampleBatch,
+    time_range: TimeRange,
+    window_ms: i64,
+) -> Result<Vec<SeriesEdge>, QueryError> {
+    let Some(first) = series.get(batch.series_range.start) else {
+        return Ok(Vec::new());
+    };
+    let bucket = decode_bucket(first.bucket_id)
+        .ok_or_else(|| internal_err(format!("invalid bucket id: {}", first.bucket_id)))?;
+    let (start_ms, end_ms) = bucket_ms_window(bucket);
+    let head = start_ms > time_range.start_ms;
+    let tail = end_ms < time_range.end_ms_exclusive;
+    let block = &batch.samples;
+    let mut edges = Vec::new();
+    for index in 0..block.series_count() {
+        let extent = |timestamps: &[i64]| timestamps.first().copied().zip(timestamps.last().copied());
+        let (first_ms, last_ms) = match (
+            extent(&block.timestamps[index]),
+            extent(&block.histogram_timestamps[index]),
+        ) {
+            (Some((a, b)), Some((c, d))) => (a.min(c), b.max(d)),
+            (Some(extent), None) | (None, Some(extent)) => extent,
+            (None, None) => continue,
+        };
+        let head_ms = (head && first_ms < start_ms + window_ms).then_some(start_ms);
+        let tail_ms = (tail && last_ms > end_ms - window_ms).then_some(end_ms);
+        if head_ms.is_some() || tail_ms.is_some() {
+            edges.push(SeriesEdge {
+                index,
+                fingerprint: 0,
+                head_ms,
+                tail_ms,
+            });
+        }
+    }
+    let series_id = |edge: &SeriesEdge| series[batch.series_range.start + edge.index].series_id;
+    for edge in &mut edges {
+        if let Some(fingerprint) = known.get(&(bucket, series_id(edge))) {
+            edge.fingerprint = *fingerprint;
+        }
+    }
+    let (mut edges, mut unknown): (Vec<_>, Vec<_>) = edges
+        .into_iter()
+        .partition(|edge| known.contains_key(&(bucket, series_id(edge))));
+    if unknown.is_empty() {
+        return Ok(edges);
+    }
+    let ids: Vec<SeriesId> = unknown.iter().map(series_id).collect();
+    let stored = reader
+        .series_fingerprints(&bucket, &ids)
+        .await
+        .map_err(storage_err)?
+        .unwrap_or_else(|| vec![None; ids.len()]);
+    let missing: Vec<SeriesId> = ids
+        .iter()
+        .zip(&stored)
+        .filter(|(_, fingerprint)| fingerprint.is_none())
+        .map(|(&id, _)| id)
+        .collect();
+    let mut specs = if missing.is_empty() {
+        Vec::new()
+    } else {
+        reader
+            .forward_index_many(&bucket, &missing)
+            .await
+            .map_err(storage_err)?
+    }
+    .into_iter();
+    for (edge, (id, stored)) in unknown.iter_mut().zip(ids.iter().zip(stored)) {
+        edge.fingerprint = match stored {
+            Some(fingerprint) => fingerprint,
+            None => specs
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    internal_err(format!(
+                        "series {id} missing from forward index in bucket {bucket:?}"
+                    ))
+                })?
+                .labels
+                .series_fingerprint(),
+        };
+    }
+    edges.append(&mut unknown);
+    edges.sort_unstable_by_key(|edge| edge.index);
+    Ok(edges)
 }
 
 fn fill_column(block: &mut SampleBlock, col_idx: usize, samples: SeriesData) {

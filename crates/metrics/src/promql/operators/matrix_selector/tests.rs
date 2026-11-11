@@ -46,6 +46,7 @@ impl SeriesSource for MockSource {
         stream::once(ready(Ok(SampleBatch {
             series_range: 0..request.series.len(),
             samples: block,
+            edges: Vec::new(),
         })))
     }
 }

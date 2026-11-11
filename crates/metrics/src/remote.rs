@@ -330,6 +330,7 @@ fn chunk_from_wire(chunk: pb::ResolvedChunk) -> Result<ResolvedSeriesChunk, Sour
             })
             .collect(),
         fingerprints,
+        span: None,
     })
 }
 
@@ -403,6 +404,7 @@ fn batch_from_wire(
     Ok(SampleBatch {
         series_range: start..end,
         samples,
+        edges: Vec::new(),
     })
 }
 
@@ -889,6 +891,7 @@ mod tests {
         let messages = batch_to_wire(SampleBatch {
             series_range: 5..7,
             samples,
+            edges: Vec::new(),
         });
         assert_eq!(messages.len(), 1);
         let decoded = batch_from_wire(messages.into_iter().next().unwrap(), 7).unwrap();
@@ -913,6 +916,7 @@ mod tests {
                 ResolvedSeriesRef::new(3, 2, Arc::from("up")),
             ]),
             fingerprints,
+            span: None,
         };
         let fingerprints: Arc<[u128]> = Arc::from(vec![u128::MAX - 1, 7]);
 
@@ -941,6 +945,7 @@ mod tests {
         let messages = batch_to_wire(SampleBatch {
             series_range: 10..13,
             samples,
+            edges: Vec::new(),
         });
         let starts: Vec<_> = messages.iter().map(|m| m.series_start).collect();
         assert_eq!(starts, vec![10, 11, 12]);

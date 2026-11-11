@@ -972,6 +972,7 @@ impl<R: StorageRead> MiniQueryReader<R> {
             .samples_scan_worthwhile(metric_name, series_ids)
             .await?
         {
+            crate::promql::trace::record_counter("samples_point_gets", series_ids.len() as u64);
             let fetches: Vec<_> = series_ids
                 .iter()
                 .map(|&series_id| self.fetch_samples(series_id, metric_name, start_ms, end_ms))
@@ -1124,6 +1125,7 @@ impl<R: StorageRead> MiniQueryReader<R> {
             })
             .collect();
         let gets: Vec<_> = singles.iter().map(|&at| get(series_ids[at])).collect();
+        crate::promql::trace::record_counter(scan_counters(kind).point_gets, singles.len() as u64);
         let scans = futures::stream::iter(scans)
             .buffered(CLUSTER_SCAN_CONCURRENCY)
             .try_collect::<Vec<_>>();
@@ -1189,6 +1191,8 @@ impl<R: StorageRead> MiniQueryReader<R> {
             Bound::Included(key(wanted[wanted.len() - 1].0)),
         );
         let mut iter = io_trace_async(kind, self.snapshot.scan(range)).await?;
+        let counters = scan_counters(kind);
+        let mut stepped = 0;
         while next < wanted.len() {
             let Some(record) = io_trace_async(kind, iter.next())
                 .await
@@ -1196,6 +1200,7 @@ impl<R: StorageRead> MiniQueryReader<R> {
             else {
                 break;
             };
+            stepped += 1;
             let Some(series_id) = record
                 .key
                 .len()
@@ -1220,7 +1225,43 @@ impl<R: StorageRead> MiniQueryReader<R> {
                 next += 1;
             }
         }
+        crate::promql::trace::record_counter(counters.scans, 1);
+        crate::promql::trace::record_counter(counters.scan_keys, stepped);
+        crate::promql::trace::record_counter(counters.scan_wanted, wanted.len() as u64);
         Ok(out)
+    }
+}
+
+/// Trace counter labels for one kind of per-series read.
+struct ScanCounters {
+    point_gets: &'static str,
+    scans: &'static str,
+    /// Keys the scans stepped over, wanted or not.
+    scan_keys: &'static str,
+    /// Series the scans were asked for.
+    scan_wanted: &'static str,
+}
+
+fn scan_counters(kind: IoKindLocal) -> ScanCounters {
+    match kind {
+        IoKindLocal::SamplesFetch => ScanCounters {
+            point_gets: "samples_point_gets",
+            scans: "samples_scans",
+            scan_keys: "samples_scan_keys",
+            scan_wanted: "samples_scan_wanted",
+        },
+        IoKindLocal::SeriesFingerprintFetch => ScanCounters {
+            point_gets: "fingerprint_point_gets",
+            scans: "fingerprint_scans",
+            scan_keys: "fingerprint_scan_keys",
+            scan_wanted: "fingerprint_scan_wanted",
+        },
+        _ => ScanCounters {
+            point_gets: "forward_point_gets",
+            scans: "forward_scans",
+            scan_keys: "forward_scan_keys",
+            scan_wanted: "forward_scan_wanted",
+        },
     }
 }
 

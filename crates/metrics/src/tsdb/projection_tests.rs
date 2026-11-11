@@ -194,8 +194,30 @@ async fn assert_same(tsdb: &Tsdb, query: &str) -> (Run, Run) {
     let projected = run(tsdb, query, true).await;
     let full = run(tsdb, query, false).await;
     assert!(!full.series.is_empty(), "{query} matched nothing");
-    assert_eq!(projected.series, full.series, "{query}");
+    assert_same_series(&projected.series, &full.series, query);
     (projected, full)
+}
+
+/// Equal but for rounding: a deferred leaf adds a step's series in bucket
+/// order rather than in the order they were first seen.
+fn assert_same_series(
+    projected: &[(String, Vec<(i64, f64)>)],
+    full: &[(String, Vec<(i64, f64)>)],
+    query: &str,
+) {
+    let close = |a: f64, b: f64| {
+        a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-9 * a.abs().max(b.abs())
+    };
+    let same = projected.len() == full.len()
+        && projected.iter().zip(full).all(|((pl, ps), (fl, fs))| {
+            pl == fl
+                && ps.len() == fs.len()
+                && ps
+                    .iter()
+                    .zip(fs)
+                    .all(|((pt, pv), (ft, fv))| pt == ft && close(*pv, *fv))
+        });
+    assert!(same, "{query}\nprojected: {projected:?}\nfull: {full:?}");
 }
 
 async fn series_ids(tsdb: &Tsdb, bucket: TimeBucket) -> (TsdbQueryReader, Vec<SeriesId>) {
@@ -347,6 +369,90 @@ async fn should_answer_the_same_over_a_rolled_up_day() {
     }
 }
 
+/// Series whose samples end, start, go stale or pause around the edge
+/// between the two hours, and single-sample ones churning across it.
+fn edge_series() -> Vec<Series> {
+    let edge = START_MS + HOUR_MS;
+    let stale = f64::from_bits(crate::model::STALE_NAN);
+    let scrapes = |from: i64, to: i64| (from..to).step_by(30_000).map(|ts| (ts, ts as f64 / 1e3));
+    let mut shapes: Vec<(String, Vec<(i64, f64)>)> = vec![
+        ("crossing".into(), scrapes(START_MS, END_MS).collect()),
+        ("ends-before".into(), scrapes(START_MS, edge - 10_000).collect()),
+        ("starts-at".into(), scrapes(edge, END_MS).collect()),
+        ("starts-after".into(), scrapes(edge + 10_000, END_MS).collect()),
+        (
+            "paused".into(),
+            scrapes(START_MS, edge - 2 * MINUTE_MS)
+                .chain(scrapes(edge + 3 * MINUTE_MS, END_MS))
+                .collect(),
+        ),
+        (
+            "stale".into(),
+            scrapes(START_MS, edge - 30_000)
+                .chain([(edge - 30_000, stale)])
+                .chain(scrapes(edge + 30_000, END_MS))
+                .collect(),
+        ),
+    ];
+    for index in 0..40 {
+        let ts = edge - 7 * MINUTE_MS + index * 20_000;
+        shapes.push((format!("churn-{index}"), vec![(ts, index as f64)]));
+    }
+    shapes
+        .into_iter()
+        .enumerate()
+        .map(|(index, (pod, samples))| Series {
+            labels: [
+                Label::metric_name(METRIC),
+                Label::new("namespace", ["a", "b", "c"][index % 3]),
+                Label::new("pod", pod),
+            ]
+            .into_iter()
+            .collect(),
+            unit: None,
+            metric_type: Some(MetricType::Gauge),
+            description: None,
+            samples: samples
+                .into_iter()
+                .map(|(ts, value)| Sample::new(ts, value))
+                .collect(),
+            histograms: Vec::new(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn should_answer_the_same_for_series_meeting_at_bucket_edges() {
+    let queries = [
+        format!("sum by (namespace) ({METRIC})"),
+        format!("count by (namespace) ({METRIC})"),
+        format!("count({METRIC})"),
+        format!("max by (namespace) ({METRIC} offset 2m)"),
+        format!("sum by (namespace) (rate({METRIC}[5m]))"),
+        format!("count by (namespace) (count_over_time({METRIC}[10m]))"),
+        format!("sum(last_over_time({METRIC}[10m]))"),
+        format!("count by (namespace) (changes({METRIC}[1h]))"),
+    ];
+    let index_projection = crate::read_tuning::ReadTuning {
+        unproject_dense: false,
+        ..crate::read_tuning::ReadTuning::DEFAULT
+    };
+    for tuning in [crate::read_tuning::ReadTuning::DEFAULT, index_projection] {
+        let _tuning = crate::read_tuning::override_read_tuning(tuning).await;
+        for forget_first_hour in [false, true] {
+            for query in &queries {
+                let storage = Arc::new(in_memory_storage().await);
+                let tsdb = Tsdb::with_retention(storage.clone(), None);
+                ingest(&tsdb, edge_series()).await;
+                if forget_first_hour {
+                    forget_fingerprints(&tsdb, &storage, hour(0)).await;
+                }
+                assert_same(&tsdb, query).await;
+            }
+        }
+    }
+}
+
 /// Prints the cpu query's index reads with and without projection over
 /// cAdvisor-shaped series: `cargo test -p plural-metrics --lib
 /// measure_cpu_query_index_reads -- --ignored --nocapture`.
@@ -463,7 +569,7 @@ proptest! {
             }
             let projected = run(&tsdb, &query, true).await;
             let full = run(&tsdb, &query, false).await;
-            assert_eq!(projected.series, full.series, "{query}");
+            assert_same_series(&projected.series, &full.series, &query);
         });
     }
 }

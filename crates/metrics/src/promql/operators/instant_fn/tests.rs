@@ -764,6 +764,7 @@ fn should_apply_abs_over_vector_selector_pipeline() {
             stream::once(ready(Ok(SampleBatch {
                 series_range: 0..request.series.len(),
                 samples: block,
+                edges: Vec::new(),
             })))
         }
     }

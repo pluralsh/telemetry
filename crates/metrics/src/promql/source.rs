@@ -99,6 +99,13 @@ pub struct ResolvedSeriesChunk {
     /// `labels` then hold only the projected labels, so each series is
     /// identified by its [`Labels::series_fingerprint`] instead.
     pub fingerprints: Option<Arc<[u128]>>,
+    /// `[start_ms, end_ms)` of the bucket, set in an answer to
+    /// [`SeriesSource::resolve_deferred`] that deferred identity: `labels`
+    /// are projected and each series stays a row of its own, which
+    /// [`SampleBatch::edges`] later joins across bucket edges. Its series
+    /// keep any `fingerprints` they resolved with, and their edges then
+    /// need no fingerprint read.
+    pub span: Option<(i64, i64)>,
 }
 
 impl ResolvedSeriesChunk {
@@ -121,6 +128,41 @@ impl ResolvedSeriesChunk {
             ..self
         }
     }
+
+    /// This chunk projected, as an answer to
+    /// [`SeriesSource::resolve_deferred`] over a bucket covering `span`.
+    pub fn deferred(self, projection: &[String], span: (i64, i64)) -> Self {
+        if self.span.is_some() {
+            return self;
+        }
+        let labels = match self.fingerprints {
+            Some(_) => self.labels,
+            None => self
+                .labels
+                .iter()
+                .map(|labels| labels.project(projection))
+                .collect(),
+        };
+        Self {
+            labels,
+            span: Some(span),
+            ..self
+        }
+    }
+}
+
+/// The edges a series' samples come within a window of, with its
+/// fingerprint, reported by [`SeriesSource::samples`] when asked through
+/// [`SamplesRequest::edge_window_ms`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesEdge {
+    /// Series within the batch, as an offset from `series_range.start`.
+    pub index: usize,
+    pub fingerprint: u128,
+    /// The bucket's start, when a sample lies within the window after it.
+    pub head_ms: Option<i64>,
+    /// The bucket's end, when a sample lies within the window before it.
+    pub tail_ms: Option<i64>,
 }
 
 /// Request from operator to source for raw samples covering a specific
@@ -134,11 +176,25 @@ impl ResolvedSeriesChunk {
 pub struct SamplesRequest {
     pub series: Arc<[ResolvedSeriesRef]>,
     pub time_range: TimeRange,
+    /// Report [`SampleBatch::edges`] for series with a sample this close to
+    /// a bucket edge inside `time_range`.
+    pub edge_window_ms: Option<i64>,
 }
 
 impl SamplesRequest {
     pub fn new(series: Arc<[ResolvedSeriesRef]>, time_range: TimeRange) -> Self {
-        Self { series, time_range }
+        Self {
+            series,
+            time_range,
+            edge_window_ms: None,
+        }
+    }
+
+    pub fn with_edge_window(self, edge_window_ms: Option<i64>) -> Self {
+        Self {
+            edge_window_ms,
+            ..self
+        }
     }
 }
 
@@ -185,6 +241,8 @@ impl SampleBlock {
 pub struct SampleBatch {
     pub series_range: Range<usize>,
     pub samples: SampleBlock,
+    /// See [`SamplesRequest::edge_window_ms`]; empty when not asked.
+    pub edges: Vec<SeriesEdge>,
 }
 
 /// The engine's storage-facing trait. Implementations turn a selector
@@ -213,6 +271,20 @@ pub trait SeriesSource: Send + Sync {
         _projection: Arc<[String]>,
     ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
         self.resolve(selector, time_range)
+    }
+
+    /// [`Self::resolve_projected`] for a caller that can tell series apart
+    /// across buckets from [`SampleBatch::edges`]: a chunk carrying a
+    /// [`ResolvedSeriesChunk::span`] skips reading fingerprints, and its
+    /// samples must then be read with an edge window. Chunks without one
+    /// are answered as by `resolve_projected`.
+    fn resolve_deferred(
+        &self,
+        selector: &VectorSelector,
+        time_range: TimeRange,
+        projection: Arc<[String]>,
+    ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
+        self.resolve_projected(selector, time_range, projection)
     }
 
     /// Stream raw samples for a pre-resolved series roster. No step, lookback,

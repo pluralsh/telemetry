@@ -19,6 +19,10 @@ pub(crate) struct ReadTuning {
     /// are dense, where cluster scans read their forward-index entries in
     /// fewer round trips than scanning every projected label's postings.
     pub(crate) unproject_dense: bool,
+    /// Tell a label-projected selector's series apart across buckets only
+    /// where their samples meet at a bucket edge, reading those series'
+    /// fingerprints with their samples instead of every series' at planning.
+    pub(crate) defer_identity: bool,
 }
 
 impl ReadTuning {
@@ -28,6 +32,7 @@ impl ReadTuning {
         chunk_prefetch: 4,
         scan_watermark: true,
         unproject_dense: true,
+        defer_identity: true,
     };
 }
 
@@ -189,13 +194,16 @@ pub(crate) fn every_tuning() -> Vec<ReadTuning> {
             for chunk_prefetch in [0, 1, ReadTuning::DEFAULT.chunk_prefetch] {
                 for scan_watermark in [false, true] {
                     for unproject_dense in [false, true] {
-                        out.push(ReadTuning {
-                            cluster_scans,
-                            point_get_concurrency,
-                            chunk_prefetch,
-                            scan_watermark,
-                            unproject_dense,
-                        });
+                        for defer_identity in [false, true] {
+                            out.push(ReadTuning {
+                                cluster_scans,
+                                point_get_concurrency,
+                                chunk_prefetch,
+                                scan_watermark,
+                                unproject_dense,
+                                defer_identity,
+                            });
+                        }
                     }
                 }
             }
