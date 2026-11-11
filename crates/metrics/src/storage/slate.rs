@@ -24,7 +24,9 @@ use common::storage::admission::{Admission, L0Limit};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{SharedDbCache, sst_block_size};
 use common::storage::metrics_recorder::MetricsRsRecorder;
-use common::storage::slate::warm::{WarmDb, WarmPlan, metadata_estimate, payload_estimate};
+use common::storage::slate::warm::{
+    WarmDb, WarmPlan, WarmRank, metadata_estimate, payload_estimate,
+};
 use common::storage::slate::{MEMTABLE_FLUSH_INTERVAL, SlateDbStorage as CommonSlateDbStorage};
 use common::storage::{
     CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
@@ -40,7 +42,7 @@ use slatedb::config::{
 use slatedb::object_store::ObjectStore;
 use slatedb::{
     CacheTarget, Db, DbBuilder, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps, DbReader,
-    DbSnapshot, IterationOrder, WriteBatch,
+    DbSnapshot, IterationOrder, SstReader, WriteBatch,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -548,6 +550,12 @@ impl Storage {
                 .with_scheduler_supplier(policy.supplier(&slate_config.path))
         });
         let unflushed = Arc::new(AtomicU64::new(0));
+        let index = SstReader::new(
+            slate_config.path.clone(),
+            Arc::clone(&object_store),
+            cache.cache(),
+            None,
+        );
         let mut builder = DbBuilder::new(slate_config.path.clone(), object_store)
             .with_settings(settings)
             .with_sst_block_size(sst_block_size(&slate_config.disk))
@@ -576,6 +584,7 @@ impl Storage {
         let admission = Admission::follow(db.subscribe(), l0_limit);
         admission.track_unflushed(unflushed);
         let mut storage = Self::from_db(db);
+        storage.reader.index = Some(Arc::new(index));
         storage.merge_holds = merge_holds;
         storage.admission = admission;
         storage.spawn_memtable_flusher(MEMTABLE_FLUSH_INTERVAL);
@@ -588,6 +597,7 @@ impl Storage {
             reader: StorageReaderInner {
                 db: db.clone(),
                 segments: Arc::new(move || db.status().list_segments()),
+                index: None,
             },
             unflushed: Arc::new(AtomicBool::new(false)),
             merge_holds: MergeHolds::default(),
@@ -702,6 +712,7 @@ impl Storage {
             reader: StorageReaderInner {
                 db: snapshot,
                 segments: Arc::new(move || segments.clone()),
+                index: None,
             },
         })
     }

@@ -20,7 +20,7 @@ use common::discovery::{
 };
 use common::storage::compaction::{MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
-use common::storage::slate::warm::WarmPlan;
+use common::storage::slate::warm::{WarmPlan, WarmRank};
 use common::storage::{RecordOp, Storage, StorageRead, Ttl, WriteOptions};
 use common::{
     BytesRange, SharedDbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics, WarmWindow,
@@ -543,15 +543,20 @@ impl LogDb {
             .filter_map(|(prefix, _)| {
                 let (namespace, segment, len) = crate::codec::KEY_SCOPE.parse(&prefix).ok()?;
                 let segment_end = segment.end_ns().unwrap_or(i64::MAX);
+                let span_ns = segment.end_ns().map_or(0, |end| end - segment.start_ns);
+                let rank = WarmRank {
+                    end_ms: segment_end / 1_000_000,
+                    span_ms: span_ns / 1_000_000,
+                };
                 (len == prefix.len()
                     && namespaces.contains(&namespace)
                     && segment.start_ns < end_ns
                     && segment_end > start_ns)
-                    .then_some((prefix, Some(segment_end / 1_000_000)))
+                    .then_some((prefix, Some(rank)))
             })
-            .partition(|(_, end_ms)| {
+            .partition(|(_, rank)| {
                 payloads_since
-                    .is_some_and(|since| end_ms.is_some_and(|end_ms| end_ms > since / 1_000_000))
+                    .is_some_and(|since| rank.is_some_and(|rank| rank.end_ms > since / 1_000_000))
             });
         let filters = !self.tuning.unfiltered_reads;
         slate.plan_prefix_metadata(&recent, filters, true, plan);

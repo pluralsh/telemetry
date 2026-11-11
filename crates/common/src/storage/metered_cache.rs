@@ -61,6 +61,11 @@ impl CacheUsage {
         })
     }
 
+    /// Whether the cache holds `key`, as SlateDB scoped it.
+    pub(crate) fn contains(&self, key: &CachedKey) -> bool {
+        self.cache.contains(key)
+    }
+
     pub fn usage_bytes(&self) -> u64 {
         self.cache.usage() as u64
     }

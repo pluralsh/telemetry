@@ -910,7 +910,7 @@
             },
             {
               "default": "",
-              "doc": "PayloadBudgetPercent is the share of the data block cache that\npayload warming may fill, newest first: of its disk tier when it has\none, otherwise of its memory. Warmed payloads go to the disk tier\nonly, so warming never fills memory. The server default is 50.\nServers older than this field reject it, so set it only once every\nreader runs a server that knows it.",
+              "doc": "PayloadBudgetPercent is the share of the data block cache that\npayload warming may fill, newest first: of its disk tier when it has\none, otherwise of its memory. Warmed payloads go to the disk tier\nonly, so warming never fills memory. The server default is 90 with\na disk tier and 50 without.\nServers older than this field reject it, so set it only once every\nreader runs a server that knows it.",
               "name": "payloadBudgetPercent",
               "rules": [],
               "type": "integer",

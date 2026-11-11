@@ -313,12 +313,14 @@ impl SlateReadHandle {
     /// Adds to `plan` the SSTs of live segments matching `prefixes`, with
     /// every SST the manifest holds as this database's live set.
     ///
-    /// Each prefix carries its recency for [`warm::warm_planned`]; a prefix
+    /// Each prefix carries its rank for [`warm::warm_planned`]; a prefix
     /// without one, such as a segment spanning all time, ranks each SST by
     /// when it was written. Targets are those of [`Self::warm_prefixes`].
+    /// The pass checks this handle's SST indexes against the data cache
+    /// before warming data blocks; see [`warm::WarmPlan::add_index_reader`].
     pub fn plan_prefixes(
         &self,
-        prefixes: &[(Bytes, Option<i64>)],
+        prefixes: &[(Bytes, Option<warm::WarmRank>)],
         include_data: bool,
         plan: &mut warm::WarmPlan,
     ) {
@@ -330,7 +332,7 @@ impl SlateReadHandle {
     /// budget counts only them.
     pub fn plan_prefix_metadata(
         &self,
-        prefixes: &[(Bytes, Option<i64>)],
+        prefixes: &[(Bytes, Option<warm::WarmRank>)],
         filters: bool,
         include_data: bool,
         plan: &mut warm::WarmPlan,
@@ -360,7 +362,7 @@ impl SlateReadHandle {
                 )
                 .collect();
             live.extend(views.iter().map(|view| view.sst.id));
-            let Some((prefix, recency)) = prefixes
+            let Some((prefix, rank)) = prefixes
                 .iter()
                 .find(|(prefix, _)| segment.prefix() == prefix.as_ref())
             else {
@@ -378,7 +380,7 @@ impl SlateReadHandle {
             }
             let targets: Arc<[CacheTarget]> = targets.into();
             planned.extend(views.into_iter().map(|view| {
-                let recency = recency.unwrap_or_else(|| written_ms(&view.sst.id));
+                let rank = rank.unwrap_or_else(|| warm::WarmRank::at(written_ms(&view.sst.id)));
                 let estimate = if filters {
                     warm::metadata_estimate(&view.sst.info)
                 } else {
@@ -388,7 +390,7 @@ impl SlateReadHandle {
                 (
                     view.sst.clone(),
                     Arc::clone(&targets),
-                    recency,
+                    rank,
                     estimate,
                     payload,
                 )
@@ -399,8 +401,9 @@ impl SlateReadHandle {
             ManifestSource::Reader(reader) => Arc::clone(reader) as warm::WarmDb,
         };
         let db = plan.add_database(db, live);
-        for (sst, targets, recency, estimate, payload) in planned {
-            plan.push(db, sst, targets, recency, estimate, payload);
+        plan.add_index_reader(db, Arc::clone(&self.sst_reader));
+        for (sst, targets, rank, estimate, payload) in planned {
+            plan.push_ranked(db, sst, targets, rank, estimate, payload);
         }
     }
 }

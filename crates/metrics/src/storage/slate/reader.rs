@@ -13,6 +13,9 @@ use super::*;
 pub(super) struct StorageReaderInner<T: DbReadOps + Send + Sync> {
     pub(super) db: Arc<T>,
     pub(super) segments: SegmentLister,
+    /// Reads `db`'s SST indexes through its block cache, so warming can
+    /// tell which SSTs' data blocks that cache already holds.
+    pub(super) index: Option<Arc<SstReader>>,
 }
 
 impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
@@ -20,6 +23,7 @@ impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
         Self {
             db: Arc::clone(&self.db),
             segments: Arc::clone(&self.segments),
+            index: self.index.clone(),
         }
     }
 }
@@ -495,19 +499,26 @@ where
             }
             let targets: Arc<[CacheTarget]> =
                 bucket_cache_targets(&namespace, &bucket, include_samples).into();
+            let rank = WarmRank {
+                end_ms: bucket.end_ms(),
+                span_ms: bucket.end_ms() - bucket.start_ms(),
+            };
             planned.extend(views.into_iter().map(|view| {
                 (
                     view.sst.clone(),
                     Arc::clone(&targets),
-                    bucket.end_ms(),
+                    rank,
                     metadata_estimate(&view.sst.info),
                     payload_estimate(&view.sst.info),
                 )
             }));
         }
         let db = plan.add_database(Arc::clone(&self.db) as WarmDb, live);
-        for (sst, targets, recency, estimate, payload) in planned {
-            plan.push(db, sst, targets, recency, estimate, payload);
+        if let Some(index) = &self.index {
+            plan.add_index_reader(db, Arc::clone(index));
+        }
+        for (sst, targets, rank, estimate, payload) in planned {
+            plan.push_ranked(db, sst, targets, rank, estimate, payload);
         }
     }
 }
@@ -585,6 +596,12 @@ impl StorageReader {
         cache: &SharedDbCache,
     ) -> crate::util::Result<Self> {
         let adapter = CommonSlateDbStorage::merge_operator_adapter(Arc::new(OpenTsdbMergeOperator));
+        let index = SstReader::new(
+            slate_config.path.clone(),
+            Arc::clone(&object_store),
+            cache.cache(),
+            None,
+        );
         let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
             .with_options(reader_options)
             .with_merge_operator(Arc::new(adapter))
@@ -610,6 +627,7 @@ impl StorageReader {
             reader: StorageReaderInner {
                 db: reader.clone(),
                 segments: Arc::new(move || reader.status().list_segments()),
+                index: Some(Arc::new(index)),
             },
         })
     }

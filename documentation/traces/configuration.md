@@ -120,7 +120,7 @@ cache_warmer:
   concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
   include_payloads: false # true also warms segments' data blocks into block_cache.
   metadata_budget_percent: 75
-  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
+  # payload_budget_percent: 90 # Unset: 90 of block_cache disk, else 50 of its memory; newest first, never fills memory.
   continuous: # Every interval, warms SSTs that appeared since the last pass.
     enabled: true
     interval_seconds: 10

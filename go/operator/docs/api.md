@@ -325,7 +325,7 @@ _Appears in:_
 | `includePayloads` _boolean_ |  | false |  |
 | `blockReadiness` _boolean_ | BlockReadiness holds readiness until the startup pass ends. Unset<br />keeps the server default, false. |  |  |
 | `metadataBudgetPercent` _integer_ | MetadataBudgetPercent is the share of the metadata cache warming may<br />fill before it stops; the server default is 75. |  | Maximum: 100 <br />Minimum: 0 <br /> |
-| `payloadBudgetPercent` _integer_ | PayloadBudgetPercent is the share of the data block cache that<br />payload warming may fill, newest first: of its disk tier when it has<br />one, otherwise of its memory. Warmed payloads go to the disk tier<br />only, so warming never fills memory. The server default is 50.<br />Servers older than this field reject it, so set it only once every<br />reader runs a server that knows it. |  | Maximum: 100 <br />Minimum: 0 <br /> |
+| `payloadBudgetPercent` _integer_ | PayloadBudgetPercent is the share of the data block cache that<br />payload warming may fill, newest first: of its disk tier when it has<br />one, otherwise of its memory. Warmed payloads go to the disk tier<br />only, so warming never fills memory. The server default is 90 with<br />a disk tier and 50 without.<br />Servers older than this field reject it, so set it only once every<br />reader runs a server that knows it. |  | Maximum: 100 <br />Minimum: 0 <br /> |
 | `continuous` _[ContinuousCacheWarmerSpec](#continuouscachewarmerspec)_ | Continuous warms SSTs that appear in reader manifests after startup. |  |  |
 
 

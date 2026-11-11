@@ -24,6 +24,7 @@ pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
+use slatedb::manifest::SsTableId;
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use slatedb::{DbReader, FilterPolicy, PrefixExtractor, SstReader};
@@ -699,6 +700,18 @@ impl DataCacheInfo {
             (Some(hybrid), _) => hybrid.memory().usage() as u64,
             (None, Some(usage)) => usage.usage_bytes(),
             (None, None) => 0,
+        }
+    }
+
+    /// Whether either tier holds the block at `offset` of SST `id`, without
+    /// reading it. The disk tier answers from its index, so a hash collision
+    /// can make it wrongly true.
+    pub fn holds(&self, id: SsTableId, offset: u64) -> bool {
+        let key = CachedKey::from((id, offset));
+        match (&self.hybrid, &self.usage) {
+            (Some(hybrid), _) => hybrid.contains(&key),
+            (None, Some(usage)) => usage.contains(&key),
+            (None, None) => false,
         }
     }
 

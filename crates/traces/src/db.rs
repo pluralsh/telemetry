@@ -16,7 +16,7 @@ use common::coordinator::{
 use common::discovery::{self, CatalogBatch, DiscoveryCache, DiscoveryValue};
 use common::storage::compaction::{CompactionMemory, MergeHolds, SegmentCompaction};
 use common::storage::rollup::Rollups;
-use common::storage::slate::warm::WarmPlan;
+use common::storage::slate::warm::{WarmPlan, WarmRank};
 use common::storage::{RecordOp, Storage, StorageRead, Ttl};
 use common::write_budget::{INGEST_WAIT, WriteBudget, WritePermit};
 use common::{
@@ -223,10 +223,12 @@ impl TraceDb {
         for namespace in namespaces {
             for segment in self.catalog_segments(namespace, start_ns, end_ns).await? {
                 let segment_end_ns = segment.end_ns().unwrap_or(i64::MAX);
-                let prefix = (
-                    segment_prefix(namespace, segment),
-                    Some(segment_end_ns / 1_000_000),
-                );
+                let span_ns = segment.end_ns().map_or(0, |end| end - segment.start_ns);
+                let rank = WarmRank {
+                    end_ms: segment_end_ns / 1_000_000,
+                    span_ms: span_ns / 1_000_000,
+                };
+                let prefix = (segment_prefix(namespace, segment), Some(rank));
                 if payloads_since.is_some_and(|since| segment_end_ns > since) {
                     recent.push(prefix);
                 } else {

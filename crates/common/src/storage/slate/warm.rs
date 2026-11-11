@@ -6,17 +6,19 @@
 //! instead of evicting its own work, and evicts what compaction removed.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use bytes::Bytes;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::manifest::{SsTableHandle, SsTableId, SsTableInfo};
-use slatedb::{CacheTarget, DbCacheManagerOps};
+use slatedb::{CacheTarget, DbCacheManagerOps, SstReader};
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::factory::SharedDbCache;
+use crate::storage::factory::{DataCacheInfo, SharedDbCache};
 pub use crate::storage::hybrid_cache::warming_payloads;
 use crate::storage::metered_cache::{ENTRY_OVERHEAD_BYTES, attributing};
 
@@ -180,12 +182,116 @@ pub fn payload_estimate(info: &SsTableInfo) -> u64 {
     }
 }
 
+/// Where an SST ranks in [`warm_planned`]: higher warms first and keeps its
+/// room longest. Ranks by the day its data ends in, then by the span of its
+/// bucket or segment, wider first, then by when its data ends, so a day's
+/// rollups warm before that day's raw data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmRank {
+    /// When its data ends (exclusive), in epoch milliseconds.
+    pub end_ms: i64,
+    /// Time its bucket or segment covers, in milliseconds; 0 when unknown.
+    pub span_ms: i64,
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+impl WarmRank {
+    /// Data ending at `end_ms`, of no known span.
+    pub fn at(end_ms: i64) -> Self {
+        Self { end_ms, span_ms: 0 }
+    }
+
+    fn key(&self) -> (i64, i64, i64) {
+        let day = self.end_ms.saturating_sub(1).div_euclid(DAY_MS);
+        (day, self.span_ms, self.end_ms)
+    }
+}
+
+impl Ord for WarmRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for WarmRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Tells whether a data cache already holds the data blocks an SST's
+/// targets would warm, without reading them.
+#[async_trait::async_trait]
+pub trait PayloadResidency: Send + Sync {
+    async fn holds(&self, sst: &SsTableHandle, targets: &[CacheTarget]) -> bool;
+}
+
+/// [`PayloadResidency`] from an SST's block index and the data cache's own
+/// index: the index is metadata, warmed before the probe, and the data
+/// cache answers without touching its disk.
+struct IndexResidency {
+    reader: Arc<SstReader>,
+    data: DataCacheInfo,
+}
+
+#[async_trait::async_trait]
+impl PayloadResidency for IndexResidency {
+    async fn holds(&self, sst: &SsTableHandle, targets: &[CacheTarget]) -> bool {
+        let ranges: Vec<_> = targets
+            .iter()
+            .filter_map(|target| match target {
+                CacheTarget::Data(range) => Some(range),
+                _ => None,
+            })
+            .collect();
+        if ranges.is_empty() {
+            return false;
+        }
+        let Ok(file) = self.reader.open_with_handle(sst.clone()) else {
+            return false;
+        };
+        let Ok(index) = file.index().await else {
+            return false;
+        };
+        let mut blocks = index.iter().peekable();
+        while let Some((offset, first)) = blocks.next() {
+            let next = blocks.peek().map(|(_, key)| *key);
+            if ranges.iter().any(|range| overlaps(first, next, range))
+                && !self.data.holds(sst.id, offset)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Whether the block holding keys from `first` up to `next` (exclusive;
+/// unbounded for the last block) may hold keys of `range`.
+fn overlaps(
+    first: &[u8],
+    next: Option<&[u8]>,
+    (start, end): &(Bound<Bytes>, Bound<Bytes>),
+) -> bool {
+    let after_start = match (start, next) {
+        (_, None) | (Bound::Unbounded, _) => true,
+        (Bound::Included(start) | Bound::Excluded(start), Some(next)) => next > start.as_ref(),
+    };
+    let before_end = match end {
+        Bound::Unbounded => true,
+        Bound::Included(end) => first <= end.as_ref(),
+        Bound::Excluded(end) => first < end.as_ref(),
+    };
+    after_start && before_end
+}
+
 struct PlannedSst {
     db: usize,
     id: SsTableId,
     sst: SsTableHandle,
     targets: Arc<[CacheTarget]>,
-    recency: i64,
+    rank: WarmRank,
     estimate: u64,
     /// [`payload_estimate`] when `targets` warm data blocks, else 0.
     payload: u64,
@@ -206,6 +312,15 @@ impl PlannedSst {
             .cloned()
             .collect()
     }
+
+    /// Its data-block targets alone.
+    fn data_targets(&self) -> Arc<[CacheTarget]> {
+        self.targets
+            .iter()
+            .filter(|target| matches!(target, CacheTarget::Data(_)))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The SSTs one pass may warm, and every SST each database's manifest
@@ -215,6 +330,9 @@ impl PlannedSst {
 pub struct WarmPlan {
     dbs: HashMap<usize, (WarmDb, HashSet<SsTableId>)>,
     ssts: Vec<PlannedSst>,
+    /// Readers of each database's SST indexes, for [`Self::with_data_cache`].
+    readers: HashMap<usize, Arc<SstReader>>,
+    residency: HashMap<usize, Arc<dyn PayloadResidency>>,
 }
 
 impl WarmPlan {
@@ -230,16 +348,58 @@ impl WarmPlan {
         key
     }
 
-    /// Plans warming `targets` of SST `sst` of database `db`. `recency` (any
-    /// unit, larger is newer, comparable across passes) orders the pass.
-    /// `estimate` is its metadata's [`metadata_estimate`], and `payload` its
-    /// data blocks' [`payload_estimate`] when `targets` warm them.
+    /// Lets the pass read `db`'s SST indexes with `reader`, which must share
+    /// the block cache `db` warms into, to tell which SSTs' data blocks that
+    /// cache already holds; see [`Self::with_data_cache`].
+    pub fn add_index_reader(&mut self, db: usize, reader: Arc<SstReader>) {
+        self.readers.insert(db, reader);
+    }
+
+    /// Makes the pass check `data` before warming an SST's data blocks, for
+    /// every database with an index reader: an SST whose blocks it holds,
+    /// as after a restart over a recovered disk tier, is counted warmed
+    /// without reading them, and [`warm_planned`] periodically checks that
+    /// warmed SSTs are still held.
+    pub fn with_data_cache(&mut self, data: &DataCacheInfo) {
+        for (db, reader) in &self.readers {
+            self.residency.insert(
+                *db,
+                Arc::new(IndexResidency {
+                    reader: Arc::clone(reader),
+                    data: data.clone(),
+                }),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn set_residency(&mut self, db: usize, residency: Arc<dyn PayloadResidency>) {
+        self.residency.insert(db, residency);
+    }
+
+    /// [`Self::push_ranked`] at [`WarmRank::at`] `end_ms`.
     pub fn push(
         &mut self,
         db: usize,
         sst: SsTableHandle,
         targets: Arc<[CacheTarget]>,
-        recency: i64,
+        end_ms: i64,
+        estimate: u64,
+        payload: u64,
+    ) {
+        self.push_ranked(db, sst, targets, WarmRank::at(end_ms), estimate, payload);
+    }
+
+    /// Plans warming `targets` of SST `sst` of database `db`, ordered in the
+    /// pass by `rank`. `estimate` is its metadata's [`metadata_estimate`],
+    /// and `payload` its data blocks' [`payload_estimate`] when `targets`
+    /// warm them.
+    pub fn push_ranked(
+        &mut self,
+        db: usize,
+        sst: SsTableHandle,
+        targets: Arc<[CacheTarget]>,
+        rank: WarmRank,
         estimate: u64,
         payload: u64,
     ) {
@@ -248,7 +408,7 @@ impl WarmPlan {
             id: sst.id,
             sst,
             targets,
-            recency,
+            rank,
             estimate,
             payload: 0,
         };
@@ -276,8 +436,18 @@ struct Warmed {
     bytes: u64,
     /// Data-block bytes it warmed and still counts.
     payload: u64,
-    recency: i64,
+    rank: WarmRank,
 }
+
+/// Every how many armed passes [`warm_planned`] checks that warmed SSTs'
+/// data blocks are still cached: at the warmer's default 10 second
+/// interval, about every 5 minutes.
+const REPAIR_EVERY_PASSES: u64 = 30;
+
+/// Warmed SSTs one check covers, each costing an index lookup and one
+/// cache-index probe per block; successive checks resume where the last
+/// stopped.
+const REPAIR_SAMPLE_SSTS: usize = 32;
 
 /// The SSTs a budgeted warmer has warmed, with the metadata and data-block
 /// bytes they hold.
@@ -303,6 +473,10 @@ struct LedgerState {
     reserved: u64,
     payload_bytes: u64,
     payload_reserved: u64,
+    /// Armed passes run, and where the next repair check starts among the
+    /// warmed SSTs it may check.
+    passes: u64,
+    repair_cursor: usize,
 }
 
 impl LedgerState {
@@ -398,13 +572,13 @@ impl WarmLedger {
             state.reserved += sst.estimate;
             return Reservation::Fits;
         }
-        let mut older: Vec<(i64, LedgerKey)> = state
+        let mut older: Vec<(WarmRank, LedgerKey)> = state
             .warmed
             .iter()
-            .filter(|(_, warmed)| warmed.recency < sst.recency)
-            .map(|(key, warmed)| (warmed.recency, *key))
+            .filter(|(_, warmed)| warmed.rank < sst.rank)
+            .map(|(key, warmed)| (warmed.rank, *key))
             .collect();
-        older.sort_unstable_by_key(|(recency, _)| *recency);
+        older.sort_unstable_by_key(|(rank, _)| *rank);
         let releasable: u64 = older.iter().map(|(_, key)| state.warmed[key].bytes).sum();
         if state.bytes - releasable + state.reserved + sst.estimate > budget {
             return Reservation::Full;
@@ -434,13 +608,13 @@ impl WarmLedger {
             state.payload_reserved += sst.payload;
             return Some(0);
         }
-        let mut older: Vec<(i64, LedgerKey)> = state
+        let mut older: Vec<(WarmRank, LedgerKey)> = state
             .warmed
             .iter()
-            .filter(|(_, warmed)| warmed.payload > 0 && warmed.recency < sst.recency)
-            .map(|(key, warmed)| (warmed.recency, *key))
+            .filter(|(_, warmed)| warmed.payload > 0 && warmed.rank < sst.rank)
+            .map(|(key, warmed)| (warmed.rank, *key))
             .collect();
-        older.sort_unstable_by_key(|(recency, _)| *recency);
+        older.sort_unstable_by_key(|(rank, _)| *rank);
         let releasable: u64 = older.iter().map(|(_, key)| state.warmed[key].payload).sum();
         if state.payload_bytes - releasable + state.payload_reserved + sst.payload > budget {
             return None;
@@ -484,10 +658,55 @@ impl WarmLedger {
                     sst: sst.sst.clone(),
                     bytes,
                     payload,
-                    recency: sst.recency,
+                    rank: sst.rank,
                 },
             );
         }
+    }
+
+    /// Counts an armed pass. On every [`REPAIR_EVERY_PASSES`]th, returns
+    /// the indexes into `ssts` of up to [`REPAIR_SAMPLE_SSTS`] it holds
+    /// with data blocks and that `checkable` allows, resuming after the
+    /// last check's.
+    fn repair_sample(
+        &self,
+        ssts: &[PlannedSst],
+        checkable: impl Fn(&PlannedSst) -> bool,
+    ) -> Vec<usize> {
+        let mut state = self.lock();
+        state.passes += 1;
+        if !state.passes.is_multiple_of(REPAIR_EVERY_PASSES) {
+            return Vec::new();
+        }
+        let held: Vec<usize> = ssts
+            .iter()
+            .enumerate()
+            .filter(|(_, sst)| {
+                state
+                    .warmed
+                    .get(&(sst.db, sst.id))
+                    .is_some_and(|warmed| warmed.payload > 0)
+                    && checkable(sst)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if held.is_empty() {
+            return held;
+        }
+        let start = state.repair_cursor % held.len();
+        let take = REPAIR_SAMPLE_SSTS.min(held.len());
+        state.repair_cursor = start + take;
+        held.iter()
+            .cycle()
+            .skip(start)
+            .take(take)
+            .copied()
+            .collect()
+    }
+
+    /// Forgets `key`, so the next pass warms it again.
+    fn forget(&self, key: &LedgerKey) -> bool {
+        self.lock().forget(key)
     }
 }
 
@@ -516,13 +735,22 @@ pub struct WarmReport {
     /// Older warmed SSTs whose data blocks stopped counting to make room
     /// for newer ones.
     pub payload_displaced_ssts: usize,
+    /// SSTs whose data blocks the data cache already held, counted warmed
+    /// without reading them, and their estimated weight (included in
+    /// `payload_bytes`).
+    pub adopted_ssts: usize,
+    pub adopted_bytes: u64,
+    /// Warmed SSTs whose data blocks a check found evicted, forgotten so
+    /// the pass warms them again.
+    pub repaired_ssts: usize,
 }
 
 /// Shares of the caches a warmer may fill; see [`WarmBudget::of`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WarmShares {
     pub metadata_percent: u8,
-    pub payload_percent: u8,
+    /// `None` for [`PayloadBudget::default_percent`].
+    pub payload_percent: Option<u8>,
 }
 
 impl Default for WarmShares {
@@ -572,16 +800,33 @@ impl PayloadBudget {
         measured: false,
     };
 
-    /// `percent` of the tier of `cache`'s data cache that warming fills:
-    /// the disk of a hybrid cache, whose warming skips memory, or else
-    /// memory. Data blocks in flight are bounded by a quarter of its
-    /// memory. `None` when it has no data cache, which then caches no data
-    /// blocks.
-    pub fn of(cache: &SharedDbCache, percent: u8) -> Option<Self> {
+    /// Share of a disk tier warming fills by default: queries' own misses
+    /// keep the rest, and the operator sizes the tier for the warmed window.
+    pub const DEFAULT_DISK_PERCENT: u8 = 90;
+    /// Share of an in-memory data cache warming fills by default, leaving
+    /// half to queries' own misses.
+    pub const DEFAULT_MEMORY_PERCENT: u8 = 50;
+
+    /// The share of `data` warming fills unless configured.
+    pub fn default_percent(data: &DataCacheInfo) -> u8 {
+        if data.disk_capacity_bytes.is_some() {
+            Self::DEFAULT_DISK_PERCENT
+        } else {
+            Self::DEFAULT_MEMORY_PERCENT
+        }
+    }
+
+    /// `percent` (else [`Self::default_percent`]) of the tier of `cache`'s
+    /// data cache that warming fills: the disk of a hybrid cache, whose
+    /// warming skips memory, or else memory. Data blocks in flight are
+    /// bounded by a quarter of its memory. `None` when it has no data
+    /// cache, which then caches no data blocks.
+    pub fn of(cache: &SharedDbCache, percent: Option<u8>) -> Option<Self> {
         let data = cache.data()?;
         let filled = data
             .disk_capacity_bytes
             .unwrap_or(data.memory_capacity_bytes);
+        let percent = percent.unwrap_or_else(|| Self::default_percent(data));
         Some(Self {
             bytes: share(filled, percent),
             in_flight_bytes: (data.memory_capacity_bytes / 4).max(MIN_IN_FLIGHT_PAYLOAD_BYTES),
@@ -647,12 +892,16 @@ pub async fn warm_planned(
     let removed = ledger.reap(&plan);
     report.evicted_ssts = evict(product, &plan, removed, concurrency, cancel).await;
 
-    plan.ssts.sort_by_key(|sst| std::cmp::Reverse(sst.recency));
+    plan.ssts.sort_by_key(|sst| std::cmp::Reverse(sst.rank));
+    let armed = ledger.armed.swap(true, Ordering::AcqRel);
+    if armed {
+        report.repaired_ssts = repair(&plan, ledger, concurrency).await;
+    }
     let ssts: Vec<PlannedSst> = std::mem::take(&mut plan.ssts)
         .into_iter()
         .filter(|sst| !ledger.known(&(sst.db, sst.id)))
         .collect();
-    if !ledger.armed.swap(true, Ordering::AcqRel) {
+    if !armed {
         ledger.ignore(ssts.iter().map(|sst| (sst.db, sst.id)));
         record(product, &report, ledger, budget, started);
         return report;
@@ -707,13 +956,35 @@ pub async fn warm_planned(
             };
             payload_reserved += payload.unwrap_or(0);
             let db = Arc::clone(&plan.dbs[&sst.db].0);
+            let residency = plan.residency.get(&sst.db).cloned();
             in_flight.push(async move {
                 let bytes = Arc::new(AtomicU64::new(0));
                 let payload_bytes = Arc::new(AtomicU64::new(0));
-                let warm = attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets));
-                let result = match payload {
-                    Some(_) => warming_payloads(Arc::clone(&payload_bytes), warm).await,
-                    None => warm.await,
+                let mut adopted = false;
+                let result = match (payload, residency) {
+                    (Some(_), Some(residency)) => {
+                        attributing(Arc::clone(&bytes), async {
+                            db.warm_sst(sst.id, &sst.metadata_targets()).await?;
+                            if residency.holds(&sst.sst, &sst.targets).await {
+                                adopted = true;
+                                return Ok(());
+                            }
+                            warming_payloads(
+                                Arc::clone(&payload_bytes),
+                                db.warm_sst(sst.id, &sst.data_targets()),
+                            )
+                            .await
+                        })
+                        .await
+                    }
+                    (Some(_), None) => {
+                        let warm =
+                            attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets));
+                        warming_payloads(Arc::clone(&payload_bytes), warm).await
+                    }
+                    (None, _) => {
+                        attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets)).await
+                    }
                 };
                 let metadata = if budget.measured {
                     bytes.load(Ordering::Relaxed)
@@ -721,17 +992,24 @@ pub async fn warm_planned(
                     sst.estimate
                 };
                 let warmed_payload = match payload {
-                    Some(_) if budget.payload.measured => payload_bytes.load(Ordering::Relaxed),
+                    Some(_) if budget.payload.measured && !adopted => {
+                        payload_bytes.load(Ordering::Relaxed)
+                    }
                     Some(estimate) => estimate,
                     None => 0,
                 };
-                (sst, payload, result.map(|()| (metadata, warmed_payload)))
+                (
+                    sst,
+                    payload,
+                    adopted,
+                    result.map(|()| (metadata, warmed_payload)),
+                )
             });
         }
         if in_flight.is_empty() {
             break;
         }
-        let (sst, payload, result) = tokio::select! {
+        let (sst, payload, adopted, result) = tokio::select! {
             () = cancel.cancelled() => break,
             Some(done) = in_flight.next() => done,
         };
@@ -742,6 +1020,10 @@ pub async fn warm_planned(
                 report.warmed_ssts += 1;
                 report.warmed_bytes += bytes;
                 report.payload_bytes += payload;
+                if adopted {
+                    report.adopted_ssts += 1;
+                    report.adopted_bytes += payload;
+                }
                 "success"
             }
             Err(error) => {
@@ -763,6 +1045,26 @@ pub async fn warm_planned(
     ledger.release(reserved, payload_reserved);
     record(product, &report, ledger, budget, started);
     report
+}
+
+/// On the passes [`WarmLedger::repair_sample`] picks, checks a sample of
+/// warmed SSTs' data blocks against the data cache and forgets those it no
+/// longer holds, which queries' own misses evicted, so the pass warms them
+/// again. Returns how many it forgot.
+async fn repair(plan: &WarmPlan, ledger: &WarmLedger, concurrency: usize) -> usize {
+    let sample = ledger.repair_sample(&plan.ssts, |sst| {
+        sst.warms_payload() && plan.residency.contains_key(&sst.db)
+    });
+    futures::stream::iter(sample)
+        .map(|index| {
+            let sst = &plan.ssts[index];
+            let residency = &plan.residency[&sst.db];
+            async move { (sst, residency.holds(&sst.sst, &sst.targets).await) }
+        })
+        .buffer_unordered(concurrency)
+        .filter(|(sst, held)| std::future::ready(!held && ledger.forget(&(sst.db, sst.id))))
+        .count()
+        .await
 }
 
 async fn evict(
@@ -824,8 +1126,15 @@ fn record(
         .set(report.payload_skipped_ssts as f64);
     metrics::counter!("telemetry_cache_warmer_payload_displaced_ssts_total", "product" => product)
         .increment(report.payload_displaced_ssts as u64);
-    let changed =
-        report.warmed_ssts + report.failed_ssts + report.displaced_ssts + report.evicted_ssts;
+    metrics::counter!("telemetry_cache_warmer_adopted_ssts_total", "product" => product)
+        .increment(report.adopted_ssts as u64);
+    metrics::counter!("telemetry_cache_warmer_repaired_ssts_total", "product" => product)
+        .increment(report.repaired_ssts as u64);
+    let changed = report.warmed_ssts
+        + report.failed_ssts
+        + report.displaced_ssts
+        + report.evicted_ssts
+        + report.repaired_ssts;
     if changed == 0 {
         return;
     }
@@ -845,6 +1154,9 @@ fn record(
         payload_skipped_ssts = report.payload_skipped_ssts,
         payload_ledger_bytes = ledger.payload_bytes(),
         payload_budget_bytes = budget.payload.bytes,
+        adopted_ssts = report.adopted_ssts,
+        adopted_bytes = report.adopted_bytes,
+        repaired_ssts = report.repaired_ssts,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "warm pass finished"
     );
@@ -1275,49 +1587,22 @@ mod tests {
 
     /// A reader over `ssts` flushed L0 SSTs of 2,000 keys each, sharing a
     /// metered metadata cache of `meta_capacity` bytes and a 4 MiB data
-    /// cache, in memory or with a 64 MiB disk tier when `hybrid`.
+    /// cache, in memory or with a 64 MiB disk tier when `hybrid`, with an
+    /// index reader over the same cache.
     async fn reader_over_flushed_ssts(
         ssts: usize,
         meta_capacity: u64,
         hybrid: bool,
-    ) -> (tempfile::TempDir, Arc<slatedb::DbReader>, SharedDbCache) {
-        use crate::storage::config::{
-            BlockCacheConfig, FoyerHybridCacheConfig, FoyerMemoryCacheConfig,
-            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-        };
+    ) -> (
+        tempfile::TempDir,
+        Arc<slatedb::DbReader>,
+        SharedDbCache,
+        Arc<SstReader>,
+    ) {
         use slatedb::config::{FlushOptions, FlushType, Settings};
 
         let dir = tempfile::tempdir().unwrap();
-        let block_cache = if hybrid {
-            BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
-                memory_capacity: 4 << 20,
-                disk_capacity: 64 << 20,
-                disk_path: dir.path().join("cache").to_str().unwrap().to_owned(),
-                write_policy: Default::default(),
-                flushers: 1,
-                buffer_pool_size: None,
-                submit_queue_size_threshold: 1 << 20,
-            })
-        } else {
-            BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-                capacity: 4 << 20,
-                shards: Some(1),
-            })
-        };
-        let config = SlateDbStorageConfig {
-            path: "db".to_owned(),
-            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                path: dir.path().join("store").to_str().unwrap().to_owned(),
-            }),
-            settings_path: None,
-            l0_flush_parallelism: None,
-            block_cache: Some(block_cache),
-            meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
-                capacity: meta_capacity,
-                shards: None,
-            })),
-            disk: Default::default(),
-        };
+        let config = fixture_config(&dir, meta_capacity, hybrid);
         let store = crate::storage::factory::create_object_store(&config.object_store).unwrap();
         let writer = slatedb::Db::builder(config.path.clone(), Arc::clone(&store))
             .with_settings(Settings {
@@ -1343,13 +1628,66 @@ mod tests {
         }
         writer.close().await.unwrap();
 
-        let cache = SharedDbCache::from_slatedb_config(&config).await.unwrap();
+        let (reader, cache, index) = open_fixture(&config).await;
+        (dir, reader, cache, index)
+    }
+
+    /// A fresh cache, reader and index reader over the database `config`
+    /// names, as a restarted process opens them.
+    async fn open_fixture(
+        config: &crate::storage::config::SlateDbStorageConfig,
+    ) -> (Arc<slatedb::DbReader>, SharedDbCache, Arc<SstReader>) {
+        let store = crate::storage::factory::create_object_store(&config.object_store).unwrap();
+        let cache = SharedDbCache::from_slatedb_config(config).await.unwrap();
+        let index = SstReader::new(config.path.clone(), Arc::clone(&store), cache.cache(), None);
         let reader = slatedb::DbReader::builder(config.path.clone(), store)
             .with_db_cache(cache.cache().unwrap(), crate::storage::factory::DB_CACHE_ID)
             .build()
             .await
             .unwrap();
-        (dir, Arc::new(reader), cache)
+        (Arc::new(reader), cache, Arc::new(index))
+    }
+
+    fn fixture_config(
+        dir: &tempfile::TempDir,
+        meta_capacity: u64,
+        hybrid: bool,
+    ) -> crate::storage::config::SlateDbStorageConfig {
+        use crate::storage::config::{
+            BlockCacheConfig, FoyerHybridCacheConfig, FoyerMemoryCacheConfig,
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let block_cache = if hybrid {
+            BlockCacheConfig::FoyerHybrid(FoyerHybridCacheConfig {
+                memory_capacity: 4 << 20,
+                disk_capacity: 64 << 20,
+                disk_path: dir.path().join("cache").to_str().unwrap().to_owned(),
+                write_policy: Default::default(),
+                flushers: 1,
+                buffer_pool_size: None,
+                submit_queue_size_threshold: 1 << 20,
+            })
+        } else {
+            BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: 4 << 20,
+                shards: Some(1),
+            })
+        };
+        SlateDbStorageConfig {
+            path: "db".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: dir.path().join("store").to_str().unwrap().to_owned(),
+            }),
+            settings_path: None,
+            l0_flush_parallelism: None,
+            block_cache: Some(block_cache),
+            meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: meta_capacity,
+                shards: None,
+            })),
+            disk: Default::default(),
+        }
     }
 
     fn plan_l0(
@@ -1389,7 +1727,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_payload_warming_fills_the_disk_tier_within_budget_and_not_memory() {
-        let (_dir, reader, cache) = tokio::time::timeout(
+        let (_dir, reader, cache, _) = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             reader_over_flushed_ssts(12, 1 << 20, true),
         )
@@ -1399,7 +1737,7 @@ mod tests {
         assert_eq!(data.disk_capacity_bytes, Some(64 << 20));
         let shares = WarmShares {
             metadata_percent: 100,
-            payload_percent: 50,
+            payload_percent: Some(50),
         };
         let mut budget = WarmBudget::of(&cache, shares).unwrap();
         assert_eq!(budget.payload.bytes, 32 << 20, "half the disk tier");
@@ -1440,7 +1778,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_payload_warming_writes_every_warmed_block_to_disk() {
-        let (_dir, reader, cache) = tokio::time::timeout(
+        let (_dir, reader, cache, _) = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             reader_over_flushed_ssts(12, 1 << 20, true),
         )
@@ -1449,7 +1787,7 @@ mod tests {
         let data = cache.data().unwrap().clone();
         let shares = WarmShares {
             metadata_percent: 100,
-            payload_percent: 100,
+            payload_percent: Some(100),
         };
         let ledger = WarmLedger::new(true);
 
@@ -1476,7 +1814,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_metadata_warming_stays_in_budget_and_releases_removed_ssts() {
-        let (_dir, reader, cache) = tokio::time::timeout(
+        let (_dir, reader, cache, _) = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             reader_over_flushed_ssts(12, 64 << 10, false),
         )
@@ -1487,7 +1825,7 @@ mod tests {
             &cache,
             WarmShares {
                 metadata_percent: 50,
-                payload_percent: 50,
+                payload_percent: Some(50),
             },
         )
         .unwrap();
@@ -1543,6 +1881,208 @@ mod tests {
             0,
             "removed SSTs' metadata left the cache"
         );
+    }
+
+    /// A data cache that holds every SST's data blocks while `held` is set.
+    struct FakeResidency {
+        held: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl PayloadResidency for FakeResidency {
+        async fn holds(&self, _sst: &SsTableHandle, _targets: &[CacheTarget]) -> bool {
+            self.held.load(Ordering::SeqCst)
+        }
+    }
+
+    fn probed_plan(
+        db: &Arc<FakeDb>,
+        ids: std::ops::Range<u64>,
+        residency: &Arc<FakeResidency>,
+    ) -> WarmPlan {
+        let mut plan = payload_plan(db, ids);
+        plan.set_residency(
+            db_key(db),
+            Arc::clone(residency) as Arc<dyn PayloadResidency>,
+        );
+        plan
+    }
+
+    async fn probed_pass(
+        db: &Arc<FakeDb>,
+        residency: &Arc<FakeResidency>,
+        ledger: &WarmLedger,
+    ) -> WarmReport {
+        warm_planned(
+            "test",
+            probed_plan(db, 0..4, residency),
+            budget(u64::MAX),
+            true,
+            4,
+            &CancellationToken::new(),
+            ledger,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn payloads_the_data_cache_holds_are_adopted_without_reading() {
+        let db = Arc::new(FakeDb::default());
+        let residency = Arc::new(FakeResidency {
+            held: AtomicBool::new(true),
+        });
+        let ledger = WarmLedger::new(true);
+
+        let report = probed_pass(&db, &residency, &ledger).await;
+
+        assert_eq!(report.warmed_ssts, 4, "{report:?}");
+        assert_eq!(report.adopted_ssts, 4);
+        assert_eq!(report.adopted_bytes, 4 * PAYLOAD);
+        assert_eq!(ledger.payload_bytes(), 4 * PAYLOAD);
+        assert!(db.payloads.lock().unwrap().is_empty(), "no data block read");
+        assert_eq!(db.warmed.lock().unwrap().len(), 4, "metadata still warmed");
+    }
+
+    #[tokio::test]
+    async fn payloads_the_data_cache_lacks_are_read() {
+        let db = Arc::new(FakeDb::default());
+        let residency = Arc::new(FakeResidency {
+            held: AtomicBool::new(false),
+        });
+        let ledger = WarmLedger::new(true);
+
+        let report = probed_pass(&db, &residency, &ledger).await;
+
+        assert_eq!(report.adopted_ssts, 0, "{report:?}");
+        assert_eq!(db.payloads.lock().unwrap().len(), 4);
+        assert_eq!(ledger.payload_bytes(), 4 * PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn periodic_checks_rewarm_evicted_payloads() {
+        let db = Arc::new(FakeDb::default());
+        let residency = Arc::new(FakeResidency {
+            held: AtomicBool::new(false),
+        });
+        let ledger = WarmLedger::new(true);
+        probed_pass(&db, &residency, &ledger).await;
+        residency.held.store(true, Ordering::SeqCst);
+        for _ in 1..REPAIR_EVERY_PASSES - 1 {
+            let report = probed_pass(&db, &residency, &ledger).await;
+            assert_eq!(report.repaired_ssts + report.warmed_ssts, 0, "{report:?}");
+        }
+        residency.held.store(false, Ordering::SeqCst);
+
+        let report = probed_pass(&db, &residency, &ledger).await;
+
+        assert_eq!(report.repaired_ssts, 4, "{report:?}");
+        assert_eq!(report.warmed_ssts, 4);
+        assert_eq!(db.payloads.lock().unwrap().len(), 8, "read again");
+        assert_eq!(ledger.payload_bytes(), 4 * PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn a_day_warms_coarse_spans_before_fine_ones_and_newer_days_first() {
+        let db = Arc::new(FakeDb::default());
+        let mut plan = WarmPlan::default();
+        let key = plan.add_database(Arc::clone(&db) as WarmDb, (1..=4).map(id));
+        let targets: Arc<[CacheTarget]> = vec![CacheTarget::Index].into();
+        let today = 20 * DAY_MS;
+        let ranks = [
+            (1, WarmRank::at(today + 9_000)),
+            (
+                2,
+                WarmRank {
+                    end_ms: today + 1_000,
+                    span_ms: 3_600_000,
+                },
+            ),
+            (
+                3,
+                WarmRank {
+                    end_ms: today - DAY_MS,
+                    span_ms: DAY_MS,
+                },
+            ),
+            (
+                4,
+                WarmRank {
+                    end_ms: today + 5_000,
+                    span_ms: 60_000,
+                },
+            ),
+        ];
+        for (n, rank) in ranks {
+            plan.push_ranked(key, handle(n), Arc::clone(&targets), rank, ESTIMATE, 0);
+        }
+
+        warm_planned(
+            "test",
+            plan,
+            budget(u64::MAX),
+            false,
+            1,
+            &CancellationToken::new(),
+            &WarmLedger::new(true),
+        )
+        .await;
+
+        assert_eq!(*db.warmed.lock().unwrap(), [id(2), id(4), id(1), id(3)]);
+    }
+
+    #[tokio::test]
+    async fn real_restart_adopts_payloads_the_disk_tier_recovered() {
+        let (dir, reader, cache, index) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reader_over_flushed_ssts(12, 1 << 20, true),
+        )
+        .await
+        .expect("writing the SSTs stalled");
+        let shares = WarmShares {
+            metadata_percent: 100,
+            payload_percent: None,
+        };
+        let budget = WarmBudget::of(&cache, shares).unwrap();
+        assert_eq!(budget.payload.bytes, (64 << 20) * 9 / 10, "disk default");
+        let probed =
+            |reader: &Arc<slatedb::DbReader>, index: &Arc<SstReader>, cache: &SharedDbCache| {
+                let mut plan = plan_l0(reader, true, |_| true);
+                plan.add_index_reader(db_key(reader), Arc::clone(index));
+                plan.with_data_cache(cache.data().unwrap());
+                plan
+            };
+        let cancel = CancellationToken::new();
+
+        let first = WarmLedger::new(true);
+        let plan = probed(&reader, &index, &cache);
+        let report = warm_planned("test", plan, budget, true, 4, &cancel, &first).await;
+        assert_eq!(report.adopted_ssts, 0, "{report:?}");
+        assert_eq!(report.payload_skipped_ssts, 0);
+        assert!(cache.data().unwrap().disk_write_bytes().await > 0);
+        reader.close().await.unwrap();
+        cache.close().await.unwrap();
+        drop((reader, index, cache));
+
+        let (reader, cache, index) = open_fixture(&fixture_config(&dir, 1 << 20, true)).await;
+        let restarted = WarmLedger::new(true);
+        let plan = probed(&reader, &index, &cache);
+        let report = warm_planned("test", plan, budget, true, 4, &cancel, &restarted).await;
+
+        assert_eq!(report.warmed_ssts, 12, "{report:?}");
+        assert_eq!(report.adopted_ssts, 12, "{report:?}");
+        assert_eq!(
+            cache.data().unwrap().disk_write_bytes().await,
+            0,
+            "the restarted cache re-wrote nothing"
+        );
+        assert!(restarted.payload_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn payload_budget_defaults_to_half_of_memory_without_a_disk_tier() {
+        let (_dir, _reader, cache, _) = reader_over_flushed_ssts(1, 1 << 20, false).await;
+        let budget = WarmBudget::of(&cache, WarmShares::default()).unwrap();
+        assert_eq!(budget.payload.bytes, (4 << 20) / 2);
     }
 
     #[test]

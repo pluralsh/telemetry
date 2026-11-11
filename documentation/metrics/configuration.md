@@ -158,7 +158,7 @@ cache_warmer:
   concurrency: 2 # SSTs in flight, out of sharding.io_concurrency_limit.
   include_payloads: false # true also warms buckets' sample blocks into block_cache.
   metadata_budget_percent: 75
-  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
+  # payload_budget_percent: 90 # Unset: 90 of block_cache disk, else 50 of its memory; newest first, never fills memory.
   continuous: # Every interval, warms SSTs that appeared since the last pass.
     enabled: true
     interval_seconds: 10
@@ -359,11 +359,21 @@ hour" queries benefit first.
 `continuous.include_payloads` (default `true`) also warms the sample blocks
 of new buckets inside the payload range, rollups included, into
 `block_cache`. They are
-charged to their own budget, `payload_budget_percent` (default 50) of
-`block_cache`: of its disk tier with `FoyerHybrid`, otherwise of its memory.
-Since the operator sizes `block_cache` from the pod's memory limit and
-volume, the warmer sizes itself from them too.
+charged to their own budget, `payload_budget_percent` of `block_cache`: of
+its disk tier with `FoyerHybrid` (default 90), otherwise of its memory
+(default 50). Since the operator sizes `block_cache` from the pod's memory
+limit and volume, the warmer sizes itself from them too. Within each day,
+wider buckets (rollups) warm before that day's raw buckets.
 
+- Before reading an SST's data blocks, the warmer looks each block up in
+  the SST's index (warmed just before) and in the cache's own index, without
+  reading the disk tier. When every block is there, as after a restart over
+  a recovered disk tier, the SST counts as warmed at its estimate without
+  being read again (`telemetry_cache_warmer_adopted_ssts_total`).
+- About every 30 continuous passes (5 minutes at the default interval) the
+  warmer re-checks up to 32 warmed SSTs, round robin, and warms again any
+  whose blocks queries' own misses evicted
+  (`telemetry_cache_warmer_repaired_ssts_total`).
 - Before an SST's data blocks start, their estimate (the encoded length of
   the data section, ×2 when compressed) is reserved. With a hybrid cache
   the ledger then records the bytes the warm actually found or inserted.

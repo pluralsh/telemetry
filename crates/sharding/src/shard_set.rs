@@ -8,6 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use common::storage::factory::DataCacheInfo;
 use common::storage::slate::warm::{
     PayloadBudget, WarmBudget, WarmLedger, WarmPlan, WarmReport, WarmShares, warm_planned,
 };
@@ -394,6 +395,7 @@ impl<D: ShardDatabase> ShardSet<D> {
             window,
             budget,
             concurrency,
+            data: cache.data().cloned(),
             _permits: permits,
         }))
     }
@@ -408,6 +410,9 @@ pub struct ShardWarmPass<D> {
     pub window: WarmWindow,
     budget: WarmBudget,
     concurrency: usize,
+    /// The data cache the plan's index readers check; see
+    /// [`WarmPlan::with_data_cache`].
+    data: Option<DataCacheInfo>,
     _permits: OwnedSemaphorePermit,
 }
 
@@ -420,10 +425,13 @@ impl<D> ShardWarmPass<D> {
     pub async fn finish(
         self,
         product: &'static str,
-        plan: WarmPlan,
+        mut plan: WarmPlan,
         cancel: &CancellationToken,
         ledger: &WarmLedger,
     ) -> WarmReport {
+        if let Some(data) = &self.data {
+            plan.with_data_cache(data);
+        }
         warm_planned(
             product,
             plan,

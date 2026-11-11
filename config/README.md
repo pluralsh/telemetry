@@ -187,8 +187,14 @@ keep parsing and new keys need no migration).
   `0` to `100`, newest first: of the disk tier of a `FoyerHybrid` `block_cache`, otherwise of its
   memory. The warmer sizes itself from the cache capacities, which the operator derives from the
   pod's memory and volume. Older SSTs' payloads stop counting when newer ones need the room, and
-  SSTs whose payloads do not fit still warm their metadata. Default `50`. Servers older than this
-  key reject it.
+  SSTs whose payloads do not fit still warm their metadata. Default `90` with a disk tier and
+  `50` without. Servers older than this key reject it.
+
+  Before reading an SST's payloads the warmer checks, from the SST's index and the cache's own
+  index, whether the cache already holds them; a restarted reader whose disk tier recovered
+  counts those SSTs warmed without reading them again. About every 30 continuous passes it
+  re-checks a sample of warmed SSTs and warms again any whose payloads queries' own misses
+  evicted. Within each day, wider buckets and segments (rollups) warm before narrower ones.
 
   Payload warming never fills memory: with a hybrid cache, warmed blocks are written to the disk
   tier only, disk hits during warming are not promoted into memory, and warming waits for the

@@ -72,7 +72,7 @@ cache_warmer:
   timeout_seconds: 30
   concurrency: 2
   include_payloads: false
-  payload_budget_percent: 50 # Of block_cache disk (memory without one), newest first; never fills memory.
+  # payload_budget_percent: 90 # Unset: 90 of block_cache disk, else 50 of its memory; newest first, never fills memory.
   continuous:
     enabled: true
     interval_seconds: 10

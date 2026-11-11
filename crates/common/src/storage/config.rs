@@ -42,16 +42,14 @@ pub struct CacheWarmerConfig {
     /// Share of the data cache the warmer may fill with payloads, newest
     /// first: of its disk tier when it has one, else of its memory. Warmed
     /// payloads go to the disk tier only, so warming never fills memory.
-    pub payload_budget_percent: u8,
+    /// Unset, it is 90 with a disk tier and 50 without.
+    pub payload_budget_percent: Option<u8>,
     /// Periodic warming of SSTs that appear after startup.
     pub continuous: ContinuousCacheWarmerConfig,
 }
 
 /// [`CacheWarmerConfig::metadata_budget_percent`] unless configured.
 pub const DEFAULT_METADATA_BUDGET_PERCENT: u8 = 75;
-
-/// [`CacheWarmerConfig::payload_budget_percent`] unless configured.
-pub const DEFAULT_PAYLOAD_BUDGET_PERCENT: u8 = 50;
 
 impl Default for CacheWarmerConfig {
     fn default() -> Self {
@@ -64,7 +62,7 @@ impl Default for CacheWarmerConfig {
             include_payloads: false,
             block_readiness: true,
             metadata_budget_percent: DEFAULT_METADATA_BUDGET_PERCENT,
-            payload_budget_percent: DEFAULT_PAYLOAD_BUDGET_PERCENT,
+            payload_budget_percent: None,
             continuous: ContinuousCacheWarmerConfig::default(),
         }
     }
@@ -76,7 +74,10 @@ impl CacheWarmerConfig {
         if self.metadata_budget_percent > 100 {
             return Err("cache_warmer.metadata_budget_percent must be at most 100".to_owned());
         }
-        if self.payload_budget_percent > 100 {
+        if self
+            .payload_budget_percent
+            .is_some_and(|percent| percent > 100)
+        {
             return Err("cache_warmer.payload_budget_percent must be at most 100".to_owned());
         }
         if self.enabled && self.timeout_seconds == 0 {
@@ -581,7 +582,7 @@ mod tests {
                 include_payloads: false,
                 block_readiness: true,
                 metadata_budget_percent: 75,
-                payload_budget_percent: 50,
+                payload_budget_percent: None,
                 continuous: ContinuousCacheWarmerConfig {
                     enabled: true,
                     interval_seconds: DEFAULT_FLUSH_INTERVAL_SECONDS,

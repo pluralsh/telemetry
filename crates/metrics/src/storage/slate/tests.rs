@@ -14,6 +14,7 @@ fn reader_from_db_reader(reader: DbReader) -> StorageReader {
         reader: StorageReaderInner {
             db: reader,
             segments: Arc::new(move || status_reader.status().list_segments()),
+            index: None,
         },
     }
 }

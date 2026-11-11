@@ -205,7 +205,8 @@ type CacheWarmerSpec struct {
 	// PayloadBudgetPercent is the share of the data block cache that
 	// payload warming may fill, newest first: of its disk tier when it has
 	// one, otherwise of its memory. Warmed payloads go to the disk tier
-	// only, so warming never fills memory. The server default is 50.
+	// only, so warming never fills memory. The server default is 90 with
+	// a disk tier and 50 without.
 	// Servers older than this field reject it, so set it only once every
 	// reader runs a server that knows it.
 	// +kubebuilder:validation:Minimum=0
