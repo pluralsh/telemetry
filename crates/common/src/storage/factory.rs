@@ -715,6 +715,14 @@ impl DataCacheInfo {
         }
     }
 
+    /// Drops the block at `offset` of SST `id` from both tiers.
+    #[cfg(test)]
+    pub(crate) fn forget_block(&self, id: SsTableId, offset: u64) {
+        if let Some(hybrid) = &self.hybrid {
+            hybrid.remove(&CachedKey::from((id, offset)));
+        }
+    }
+
     /// Bytes its disk tier has written, once queued writes land.
     #[cfg(test)]
     pub(crate) async fn disk_write_bytes(&self) -> u64 {

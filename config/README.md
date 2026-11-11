@@ -192,9 +192,9 @@ keep parsing and new keys need no migration).
 
   Before reading an SST's payloads the warmer checks, from the SST's index and the cache's own
   index, whether the cache already holds them; a restarted reader whose disk tier recovered
-  counts those SSTs warmed without reading them again. About every 30 continuous passes it
-  re-checks a sample of warmed SSTs and warms again any whose payloads queries' own misses
-  evicted. Within each day, wider buckets and segments (rollups) warm before narrower ones.
+  counts those SSTs warmed without reading them again, and reads only the missing blocks of SSTs
+  it holds in part. About every 30 continuous passes it re-checks a sample of warmed SSTs and
+  reads again the blocks queries' own misses evicted. Within each day, wider buckets and segments (rollups) warm before narrower ones.
 
   Payload warming never fills memory: with a hybrid cache, warmed blocks are written to the disk
   tier only, disk hits during warming are not promoted into memory, and warming waits for the

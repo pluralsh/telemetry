@@ -220,11 +220,17 @@ impl PartialOrd for WarmRank {
     }
 }
 
-/// Tells whether a data cache already holds the data blocks an SST's
-/// targets would warm, without reading them.
+/// Tells which of the data blocks an SST's targets would warm a data cache
+/// lacks, without reading any.
 #[async_trait::async_trait]
 pub trait PayloadResidency: Send + Sync {
-    async fn holds(&self, sst: &SsTableHandle, targets: &[CacheTarget]) -> bool;
+    /// Data targets covering just the blocks of `targets` the cache lacks:
+    /// empty when it holds them all, `None` when it cannot tell.
+    async fn missing(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Option<Vec<CacheTarget>>;
 }
 
 /// [`PayloadResidency`] from an SST's block index and the data cache's own
@@ -237,7 +243,11 @@ struct IndexResidency {
 
 #[async_trait::async_trait]
 impl PayloadResidency for IndexResidency {
-    async fn holds(&self, sst: &SsTableHandle, targets: &[CacheTarget]) -> bool {
+    async fn missing(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Option<Vec<CacheTarget>> {
         let ranges: Vec<_> = targets
             .iter()
             .filter_map(|target| match target {
@@ -246,25 +256,54 @@ impl PayloadResidency for IndexResidency {
             })
             .collect();
         if ranges.is_empty() {
-            return false;
+            return None;
         }
-        let Ok(file) = self.reader.open_with_handle(sst.clone()) else {
-            return false;
-        };
-        let Ok(index) = file.index().await else {
-            return false;
-        };
+        let file = self.reader.open_with_handle(sst.clone()).ok()?;
+        let index = file.index().await.ok()?;
+        let mut missing = Vec::new();
+        let mut run: Option<Bytes> = None;
         let mut blocks = index.iter().peekable();
         while let Some((offset, first)) = blocks.next() {
             let next = blocks.peek().map(|(_, key)| *key);
-            if ranges.iter().any(|range| overlaps(first, next, range))
-                && !self.data.holds(sst.id, offset)
-            {
-                return false;
+            let lacking = ranges.iter().any(|range| overlaps(first, next, range))
+                && !self.data.holds(sst.id, offset);
+            match (lacking, &run) {
+                (true, None) => run = Some(Bytes::copy_from_slice(first)),
+                (false, Some(start)) if first > start.as_ref() => {
+                    let start = run.take().expect("matched");
+                    missing.push(block_run(start, Some(first)));
+                }
+                _ => {}
             }
         }
-        true
+        if let Some(start) = run {
+            missing.push(block_run(start, None));
+        }
+        Some(missing)
     }
+}
+
+/// The data target of the blocks from the one starting at `start` up to,
+/// not including, the one starting at `end`.
+fn block_run(start: Bytes, end: Option<&[u8]>) -> CacheTarget {
+    CacheTarget::Data((
+        Bound::Included(start),
+        end.map_or(Bound::Unbounded, |end| {
+            Bound::Excluded(Bytes::copy_from_slice(end))
+        }),
+    ))
+}
+
+/// How much of an SST's data blocks the data cache already held when the
+/// pass came to warm them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Found {
+    /// None, or the pass could not tell: it read them all.
+    Nothing,
+    /// Some: it read the rest.
+    Some,
+    /// All: it read none.
+    All,
 }
 
 /// Whether the block holding keys from `first` up to `next` (exclusive;
@@ -740,6 +779,10 @@ pub struct WarmReport {
     /// `payload_bytes`).
     pub adopted_ssts: usize,
     pub adopted_bytes: u64,
+    /// SSTs whose data blocks the data cache held only some of, of which
+    /// just the rest were read, and the bytes those weigh.
+    pub topped_up_ssts: usize,
+    pub topped_up_bytes: u64,
     /// Warmed SSTs whose data blocks a check found evicted, forgotten so
     /// the pass warms them again.
     pub repaired_ssts: usize,
@@ -960,18 +1003,25 @@ pub async fn warm_planned(
             in_flight.push(async move {
                 let bytes = Arc::new(AtomicU64::new(0));
                 let payload_bytes = Arc::new(AtomicU64::new(0));
-                let mut adopted = false;
+                let mut found = Found::Nothing;
                 let result = match (payload, residency) {
                     (Some(_), Some(residency)) => {
                         attributing(Arc::clone(&bytes), async {
                             db.warm_sst(sst.id, &sst.metadata_targets()).await?;
-                            if residency.holds(&sst.sst, &sst.targets).await {
-                                adopted = true;
-                                return Ok(());
-                            }
+                            let targets = match residency.missing(&sst.sst, &sst.targets).await {
+                                Some(missing) if missing.is_empty() => {
+                                    found = Found::All;
+                                    return Ok(());
+                                }
+                                Some(missing) => {
+                                    found = Found::Some;
+                                    missing.into()
+                                }
+                                None => sst.data_targets(),
+                            };
                             warming_payloads(
                                 Arc::clone(&payload_bytes),
-                                db.warm_sst(sst.id, &sst.data_targets()),
+                                db.warm_sst(sst.id, &targets),
                             )
                             .await
                         })
@@ -991,17 +1041,16 @@ pub async fn warm_planned(
                 } else {
                     sst.estimate
                 };
+                let read = payload_bytes.load(Ordering::Relaxed);
                 let warmed_payload = match payload {
-                    Some(_) if budget.payload.measured && !adopted => {
-                        payload_bytes.load(Ordering::Relaxed)
-                    }
+                    Some(_) if budget.payload.measured && found == Found::Nothing => read,
                     Some(estimate) => estimate,
                     None => 0,
                 };
                 (
                     sst,
                     payload,
-                    adopted,
+                    (found, read),
                     result.map(|()| (metadata, warmed_payload)),
                 )
             });
@@ -1009,7 +1058,7 @@ pub async fn warm_planned(
         if in_flight.is_empty() {
             break;
         }
-        let (sst, payload, adopted, result) = tokio::select! {
+        let (sst, payload, (found, read), result) = tokio::select! {
             () = cancel.cancelled() => break,
             Some(done) = in_flight.next() => done,
         };
@@ -1020,9 +1069,16 @@ pub async fn warm_planned(
                 report.warmed_ssts += 1;
                 report.warmed_bytes += bytes;
                 report.payload_bytes += payload;
-                if adopted {
-                    report.adopted_ssts += 1;
-                    report.adopted_bytes += payload;
+                match found {
+                    Found::All => {
+                        report.adopted_ssts += 1;
+                        report.adopted_bytes += payload;
+                    }
+                    Found::Some => {
+                        report.topped_up_ssts += 1;
+                        report.topped_up_bytes += read;
+                    }
+                    Found::Nothing => {}
                 }
                 "success"
             }
@@ -1049,8 +1105,8 @@ pub async fn warm_planned(
 
 /// On the passes [`WarmLedger::repair_sample`] picks, checks a sample of
 /// warmed SSTs' data blocks against the data cache and forgets those it no
-/// longer holds, which queries' own misses evicted, so the pass warms them
-/// again. Returns how many it forgot.
+/// longer holds in full, which queries' own misses evicted, so the pass
+/// reads their missing blocks again. Returns how many it forgot.
 async fn repair(plan: &WarmPlan, ledger: &WarmLedger, concurrency: usize) -> usize {
     let sample = ledger.repair_sample(&plan.ssts, |sst| {
         sst.warms_payload() && plan.residency.contains_key(&sst.db)
@@ -1059,7 +1115,13 @@ async fn repair(plan: &WarmPlan, ledger: &WarmLedger, concurrency: usize) -> usi
         .map(|index| {
             let sst = &plan.ssts[index];
             let residency = &plan.residency[&sst.db];
-            async move { (sst, residency.holds(&sst.sst, &sst.targets).await) }
+            async move {
+                let held = residency
+                    .missing(&sst.sst, &sst.targets)
+                    .await
+                    .is_some_and(|missing| missing.is_empty());
+                (sst, held)
+            }
         })
         .buffer_unordered(concurrency)
         .filter(|(sst, held)| std::future::ready(!held && ledger.forget(&(sst.db, sst.id))))
@@ -1128,6 +1190,8 @@ fn record(
         .increment(report.payload_displaced_ssts as u64);
     metrics::counter!("telemetry_cache_warmer_adopted_ssts_total", "product" => product)
         .increment(report.adopted_ssts as u64);
+    metrics::counter!("telemetry_cache_warmer_topped_up_ssts_total", "product" => product)
+        .increment(report.topped_up_ssts as u64);
     metrics::counter!("telemetry_cache_warmer_repaired_ssts_total", "product" => product)
         .increment(report.repaired_ssts as u64);
     let changed = report.warmed_ssts
@@ -1156,6 +1220,8 @@ fn record(
         payload_budget_bytes = budget.payload.bytes,
         adopted_ssts = report.adopted_ssts,
         adopted_bytes = report.adopted_bytes,
+        topped_up_ssts = report.topped_up_ssts,
+        topped_up_bytes = report.topped_up_bytes,
         repaired_ssts = report.repaired_ssts,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "warm pass finished"
@@ -1890,8 +1956,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PayloadResidency for FakeResidency {
-        async fn holds(&self, _sst: &SsTableHandle, _targets: &[CacheTarget]) -> bool {
-            self.held.load(Ordering::SeqCst)
+        async fn missing(
+            &self,
+            _sst: &SsTableHandle,
+            _targets: &[CacheTarget],
+        ) -> Option<Vec<CacheTarget>> {
+            if self.held.load(Ordering::SeqCst) {
+                Some(Vec::new())
+            } else {
+                Some(vec![CacheTarget::data::<&[u8], _>(..)])
+            }
         }
     }
 
@@ -2076,6 +2150,58 @@ mod tests {
             "the restarted cache re-wrote nothing"
         );
         assert!(restarted.payload_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn real_partly_evicted_payloads_read_only_their_missing_blocks() {
+        let (_dir, reader, cache, index) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reader_over_flushed_ssts(12, 1 << 20, true),
+        )
+        .await
+        .expect("writing the SSTs stalled");
+        let data = cache.data().unwrap().clone();
+        let budget = WarmBudget::of(&cache, WarmShares::default()).unwrap();
+        let probed = || {
+            let mut plan = plan_l0(&reader, true, |_| true);
+            plan.add_index_reader(db_key(&reader), Arc::clone(&index));
+            plan.with_data_cache(&data);
+            plan
+        };
+        let cancel = CancellationToken::new();
+        warm_planned(
+            "test",
+            probed(),
+            budget,
+            true,
+            4,
+            &cancel,
+            &WarmLedger::new(true),
+        )
+        .await;
+        let written = data.disk_write_bytes().await;
+        let sst = reader.status().current_manifest.l0()[3].sst.clone();
+        let blocks = index
+            .open_with_handle(sst.clone())
+            .unwrap()
+            .index()
+            .await
+            .unwrap();
+        assert!(blocks.len() > 4, "{} blocks", blocks.len());
+        data.forget_block(sst.id, blocks.get(2).unwrap().0);
+
+        let ledger = WarmLedger::new(true);
+        let report = warm_planned("test", probed(), budget, true, 4, &cancel, &ledger).await;
+
+        assert_eq!(report.adopted_ssts, 11, "{report:?}");
+        assert_eq!(report.topped_up_ssts, 1, "{report:?}");
+        let rewritten = data.disk_write_bytes().await - written;
+        assert!(
+            rewritten < payload_estimate(&sst.info) / 2,
+            "re-wrote {rewritten} bytes of a {} byte SST",
+            payload_estimate(&sst.info)
+        );
+        assert_eq!(ledger.ssts(), 12);
     }
 
     #[tokio::test]

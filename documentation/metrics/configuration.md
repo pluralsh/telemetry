@@ -369,10 +369,12 @@ wider buckets (rollups) warm before that day's raw buckets.
   the SST's index (warmed just before) and in the cache's own index, without
   reading the disk tier. When every block is there, as after a restart over
   a recovered disk tier, the SST counts as warmed at its estimate without
-  being read again (`telemetry_cache_warmer_adopted_ssts_total`).
+  being read again (`telemetry_cache_warmer_adopted_ssts_total`). When only
+  some are, just the missing blocks are read
+  (`telemetry_cache_warmer_topped_up_ssts_total`).
 - About every 30 continuous passes (5 minutes at the default interval) the
-  warmer re-checks up to 32 warmed SSTs, round robin, and warms again any
-  whose blocks queries' own misses evicted
+  warmer re-checks up to 32 warmed SSTs, round robin, and reads again the
+  blocks queries' own misses evicted
   (`telemetry_cache_warmer_repaired_ssts_total`).
 - Before an SST's data blocks start, their estimate (the encoded length of
   the data section, ×2 when compressed) is reserved. With a hybrid cache
