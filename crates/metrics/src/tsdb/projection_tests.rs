@@ -205,9 +205,8 @@ fn assert_same_series(
     full: &[(String, Vec<(i64, f64)>)],
     query: &str,
 ) {
-    let close = |a: f64, b: f64| {
-        a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-9 * a.abs().max(b.abs())
-    };
+    let close =
+        |a: f64, b: f64| a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-9 * a.abs().max(b.abs());
     let same = projected.len() == full.len()
         && projected.iter().zip(full).all(|((pl, ps), (fl, fs))| {
             pl == fl
@@ -377,9 +376,15 @@ fn edge_series() -> Vec<Series> {
     let scrapes = |from: i64, to: i64| (from..to).step_by(30_000).map(|ts| (ts, ts as f64 / 1e3));
     let mut shapes: Vec<(String, Vec<(i64, f64)>)> = vec![
         ("crossing".into(), scrapes(START_MS, END_MS).collect()),
-        ("ends-before".into(), scrapes(START_MS, edge - 10_000).collect()),
+        (
+            "ends-before".into(),
+            scrapes(START_MS, edge - 10_000).collect(),
+        ),
         ("starts-at".into(), scrapes(edge, END_MS).collect()),
-        ("starts-after".into(), scrapes(edge + 10_000, END_MS).collect()),
+        (
+            "starts-after".into(),
+            scrapes(edge + 10_000, END_MS).collect(),
+        ),
         (
             "paused".into(),
             scrapes(START_MS, edge - 2 * MINUTE_MS)

@@ -728,7 +728,8 @@ async fn series_edges<R: QueryReader + ?Sized>(
     let block = &batch.samples;
     let mut edges = Vec::new();
     for index in 0..block.series_count() {
-        let extent = |timestamps: &[i64]| timestamps.first().copied().zip(timestamps.last().copied());
+        let extent =
+            |timestamps: &[i64]| timestamps.first().copied().zip(timestamps.last().copied());
         let (first_ms, last_ms) = match (
             extent(&block.timestamps[index]),
             extent(&block.histogram_timestamps[index]),

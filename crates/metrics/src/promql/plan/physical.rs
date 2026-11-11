@@ -419,7 +419,8 @@ where
         series_refs.sort_unstable_by_key(|sref| (sref.bucket_id, sref.series_id));
     }
     let has_deferred = !deferred.is_empty();
-    deferred.sort_unstable_by_key(|(start_ms, _, sref)| (*start_ms, sref.bucket_id, sref.series_id));
+    deferred
+        .sort_unstable_by_key(|(start_ms, _, sref)| (*start_ms, sref.bucket_id, sref.series_id));
     for (_, label, sref) in deferred {
         labels.push(label);
         refs.push(vec![sref]);

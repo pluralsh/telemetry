@@ -259,12 +259,22 @@ fn job_pods_per_hour() -> usize {
 /// The kube-state-metrics series of job pod `index`, scraped once at `at`.
 fn job_series(index: u64, at: i64) -> Vec<(u64, Series)> {
     let hash = mix(index ^ 0x6a6f_6273);
-    let pod = format!("scan-report-{:010x}-{:05x}", hash & 0xff_ffff_ffff, hash >> 44);
+    let pod = format!(
+        "scan-report-{:010x}-{:05x}",
+        hash & 0xff_ffff_ffff,
+        hash >> 44
+    );
     let common = [
         ("namespace", "scan-jobs".to_string()),
         ("pod", pod),
-        ("uid", format!("{:032x}", u128::from(hash) * 0x9e37_79b9_7f4a_7c15)),
-        ("node", format!("ip-10-0-{}-{}.ec2.internal", hash % 10, hash % NODES as u64)),
+        (
+            "uid",
+            format!("{:032x}", u128::from(hash) * 0x9e37_79b9_7f4a_7c15),
+        ),
+        (
+            "node",
+            format!("ip-10-0-{}-{}.ec2.internal", hash % 10, hash % NODES as u64),
+        ),
         ("job", "kube-state-metrics".to_string()),
         ("instance", "10.0.200.7:8080".to_string()),
     ];

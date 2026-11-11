@@ -498,8 +498,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
     /// this joins across bucket edges, reading fingerprints with their
     /// samples where `edge_reads`.
     pub(crate) fn with_deferred_identity(mut self, deferred: bool, edge_reads: bool) -> Self {
-        self.stitch =
-            deferred.then(|| Stitcher::new(self.lookback_ms, self.reservation.clone()));
+        self.stitch = deferred.then(|| Stitcher::new(self.lookback_ms, self.reservation.clone()));
         if deferred && edge_reads {
             self.shape.series_chunk *= EDGE_READ_CHUNK_SCALE;
         }
@@ -554,7 +553,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         let orphans = self
             .orphans
             .get_or_insert_with(|| stitch.take_orphans().into());
-        let (first, tails, spans) = orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
+        let (first, tails, spans) =
+            orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
         let samples = ChunkSamples::orphans(self.reservation.clone(), first, tails, spans);
         let (step_start, step_end) = step_bounds(
             &self.effective_times.times,

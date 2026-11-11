@@ -835,7 +835,8 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         let orphans = self
             .orphans
             .get_or_insert_with(|| stitch.take_orphans().into());
-        let (first, tails, spans) = orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
+        let (first, tails, spans) =
+            orphan_run(orphans, self.shape.series_chunk, stitch.window_ms())?;
         let samples = ChunkSamples::orphans(self.reservation.clone(), first, tails, spans);
         Some(self.emitting(first, samples))
     }
@@ -918,10 +919,10 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
         samples: &PackedChunk,
         cursors: &mut [SeriesCursor],
         hist_cursors: &mut [SeriesCursor],
-        step_chunk_start: usize,
-        step_end: usize,
+        steps: std::ops::Range<usize>,
     ) -> Result<MatrixWindowBatch, QueryError> {
-        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(step_end);
+        let step_chunk_start = steps.start;
+        let step_chunk_end = (step_chunk_start + self.shape.step_chunk).min(steps.end);
         let step_count = step_chunk_end - step_chunk_start;
         let cell_count = step_count * chunk_len;
 
@@ -1106,8 +1107,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                         &samples,
                         &mut cursors,
                         &mut hist_cursors,
-                        next_step_chunk_start,
-                        step_end,
+                        next_step_chunk_start..step_end,
                     ) {
                         Ok(batch) => {
                             self.prefetch.poll(cx);

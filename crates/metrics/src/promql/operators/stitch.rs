@@ -113,7 +113,10 @@ impl Stitcher {
                 moved += tail.bytes;
                 prepend(&mut columns.timestamps[row], tail.timestamps);
                 prepend(&mut columns.values[row], tail.values);
-                prepend(&mut columns.histogram_timestamps[row], tail.histogram_timestamps);
+                prepend(
+                    &mut columns.histogram_timestamps[row],
+                    tail.histogram_timestamps,
+                );
                 prepend(&mut columns.histograms[row], tail.histograms);
                 span.from_ms = head_ms;
             }
@@ -240,7 +243,12 @@ pub(crate) fn step_bounds(
 mod tests {
     use super::*;
 
-    fn edge(index: usize, fingerprint: u128, head_ms: Option<i64>, tail_ms: Option<i64>) -> SeriesEdge {
+    fn edge(
+        index: usize,
+        fingerprint: u128,
+        head_ms: Option<i64>,
+        tail_ms: Option<i64>,
+    ) -> SeriesEdge {
         SeriesEdge {
             index,
             fingerprint,
@@ -258,7 +266,10 @@ mod tests {
 
     impl Chunk {
         fn new(rows: Vec<Vec<i64>>) -> Self {
-            let values = rows.iter().map(|ts| ts.iter().map(|&t| t as f64).collect()).collect();
+            let values = rows
+                .iter()
+                .map(|ts| ts.iter().map(|&t| t as f64).collect())
+                .collect();
             let n = rows.len();
             Self {
                 timestamps: rows,
@@ -297,9 +308,21 @@ mod tests {
 
         // then: the first row stops at the edge, the next takes over with
         // the samples a window after the edge can read
-        assert_eq!(before_spans[0], RowSpan { from_ms: i64::MIN, until_ms: 100 });
+        assert_eq!(
+            before_spans[0],
+            RowSpan {
+                from_ms: i64::MIN,
+                until_ms: 100
+            }
+        );
         assert_eq!(before_spans[1], RowSpan::ALL);
-        assert_eq!(after_spans[0], RowSpan { from_ms: 100, until_ms: i64::MAX });
+        assert_eq!(
+            after_spans[0],
+            RowSpan {
+                from_ms: 100,
+                until_ms: i64::MAX
+            }
+        );
         assert_eq!(after.timestamps[0], vec![95, 99, 102, 150]);
         assert_eq!(moved, 2 * 16);
         assert!(stitcher.take_orphans().is_empty());
@@ -328,7 +351,13 @@ mod tests {
         let (first, run, spans) = orphan_run(&mut orphans, 512, 10).unwrap();
         assert_eq!((first, run.len()), (0, 1));
         assert_eq!(run[0].timestamps, vec![95]);
-        assert_eq!(spans, vec![RowSpan { from_ms: 100, until_ms: 110 }]);
+        assert_eq!(
+            spans,
+            vec![RowSpan {
+                from_ms: 100,
+                until_ms: 110
+            }]
+        );
         assert!(orphans.is_empty());
     }
 
@@ -341,7 +370,10 @@ mod tests {
         let spans = vec![
             RowSpan::ALL,
             RowSpan::ALL,
-            RowSpan { from_ms: i64::MIN, until_ms: 100 },
+            RowSpan {
+                from_ms: i64::MIN,
+                until_ms: 100,
+            },
         ];
 
         // when
