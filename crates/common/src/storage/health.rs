@@ -229,12 +229,17 @@ mod tests {
         let health = StorageHealth::new();
         let writer = Db::builder("/fenced", store.clone()).build().await.unwrap();
         health.watch("/fenced", writer.subscribe());
-        writer.put(b"key", b"before").await.unwrap();
+        let before = writer.put(b"key", b"before").await.unwrap();
+        before.await_durable().await.unwrap();
         assert!(health.is_healthy());
 
         // A second writer on the same path takes over and fences the first.
+        // `put` can return before the writer notices; the WAL flush cannot.
         let successor = Db::builder("/fenced", store).build().await.unwrap();
-        let error = writer.put(b"key", b"after").await.unwrap_err();
+        let error = match writer.put(b"key", b"after").await {
+            Ok(handle) => handle.await_durable().await.unwrap_err(),
+            Err(error) => error,
+        };
         assert!(
             matches!(error.kind(), slatedb::ErrorKind::Closed(_)),
             "{error:?}"
