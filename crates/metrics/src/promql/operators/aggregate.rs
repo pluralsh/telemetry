@@ -61,15 +61,17 @@
 //!
 //! # Memory
 //!
-//! Streaming-kind accumulator grid is allocated once at construction and
-//! fails with [`QueryError::MemoryLimit`] if it doesn't fit. Breaker
-//! scratch is per-step, drained between steps. Output batches allocate
-//! per-poll.
+//! Streaming-kind accumulators are allocated a page of steps at a time as
+//! inputs reach them, failing with [`QueryError::MemoryLimit`] when one
+//! doesn't fit; their output is emitted in group chunks of at most
+//! [`OUTPUT_CHUNK_CELLS`]. Breaker scratch is per-step, drained between
+//! steps. Output batches allocate per-poll.
 //!
 //! Output schema is always [`SchemaRef::Static`].
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -86,6 +88,9 @@ use breaker::*;
 
 #[cfg(any(test, feature = "bench-internals"))]
 pub(crate) use accumulator::reference;
+
+/// Most cells in one streaming-kind output batch.
+const OUTPUT_CHUNK_CELLS: usize = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // AggregateKind — function selection as data
@@ -349,8 +354,10 @@ pub struct AggregateOp<C: Operator> {
     /// the breaker path. Reused for the output batches emitted on EOS.
     /// Breaker kinds only.
     breaker_step_timestamps: Option<Arc<[i64]>>,
-    /// `true` once the single output batch has been emitted on EOS.
-    emitted: bool,
+    /// `true` once the child has reached end-of-stream.
+    drained: bool,
+    /// First group of the next streaming-kind output chunk.
+    next_group: usize,
     /// `true` once at least one child batch has been absorbed. Tracked on
     /// `self` (not as a `next()`-local) so the flag survives
     /// `Poll::Pending` re-entries — under a `Concurrent` producer, `next()`
@@ -504,7 +511,7 @@ impl<C: Operator> AggregateOp<C> {
                 );
                 let bytes = AccumGrid::bytes(kind, steps, groups, inputs);
                 reservation.try_grow(bytes)?;
-                let accums = AccumGrid::new(kind, steps, groups, inputs);
+                let accums = AccumGrid::new(kind, steps, groups, inputs, reservation.clone());
                 (Some(accums), Vec::new(), Vec::new(), bytes)
             }
         };
@@ -531,7 +538,8 @@ impl<C: Operator> AggregateOp<C> {
             breaker_validity,
             breaker_grid_bytes,
             breaker_step_timestamps: None,
-            emitted: false,
+            drained: false,
+            next_group: 0,
             saw_any_batch: false,
             done: false,
             errored: false,
@@ -618,7 +626,7 @@ impl<C: Operator> AggregateOp<C> {
         let group_count = self.group_map.group_count;
 
         if let Some(accums) = self.accums.as_mut() {
-            accums.absorb_batch(input, &self.group_map.input_to_group);
+            accums.absorb_batch(input, &self.group_map.input_to_group)?;
         }
 
         let accepts_histograms = matches!(
@@ -652,15 +660,16 @@ impl<C: Operator> AggregateOp<C> {
         Ok(())
     }
 
-    /// Produce the single output batch covering the full outer grid for
-    /// streaming kinds. Called once, on child-EOS, after every batch has
-    /// been absorbed via [`Self::absorb_batch_streaming`].
-    fn finalise_streaming(&mut self) -> Result<StepBatch, QueryError> {
+    /// Produce the output batch for `groups` over the full outer grid for
+    /// streaming kinds. Called on child-EOS, after every batch has been
+    /// absorbed via [`Self::absorb_batch_streaming`], once per chunk.
+    fn finalise_streaming(&mut self, groups: Range<usize>) -> Result<StepBatch, QueryError> {
         debug_assert!(!self.kind.is_breaker());
         let grid = self.schema.step_grid;
         let step_count = grid.step_count;
         let group_count = self.group_map.group_count;
-        let out_cells = step_count.saturating_mul(group_count);
+        let width = groups.len();
+        let out_cells = step_count.saturating_mul(width);
 
         let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
         let mut histograms: Option<HistogramCells> = None;
@@ -669,12 +678,26 @@ impl<C: Operator> AggregateOp<C> {
             .as_ref()
             .expect("streaming kinds keep an accumulator grid");
 
-        accums.write_floats(self.kind, group_count, &mut out.values, &mut out.validity);
-        for (idx, hist) in self.hist_accums.iter_mut().enumerate() {
+        accums.write_floats(
+            self.kind,
+            groups.clone(),
+            &mut out.values,
+            &mut out.validity,
+        );
+        let hist_steps = if self.hist_accums.is_empty() {
+            0
+        } else {
+            step_count
+        };
+        let cells = (0..hist_steps).flat_map(|step| (0..width).map(move |column| (step, column)));
+        for (step, column) in cells {
+            let group = groups.start + column;
+            let hist = &mut self.hist_accums[step * group_count + group];
             if hist.count == 0 {
                 continue;
             }
-            let count = accums.count(accums.index(idx % group_count, idx / group_count));
+            let idx = step * width + column;
+            let count = accums.count(group, step);
             let value = match self.kind {
                 AggregateKind::Count => Some(count as f64 + hist.count as f64),
                 AggregateKind::Group => Some(1.0),
@@ -704,21 +727,24 @@ impl<C: Operator> AggregateOp<C> {
             }
         }
 
-        let step_timestamps = self.streaming_step_timestamps.take().unwrap_or_else(|| {
-            Arc::from(
-                (0..step_count)
-                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )
-        });
+        let step_timestamps = self
+            .streaming_step_timestamps
+            .get_or_insert_with(|| {
+                Arc::from(
+                    (0..step_count)
+                        .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
+            })
+            .clone();
 
         let (values, validity) = out.finish();
         let batch = StepBatch::new(
             step_timestamps,
             0..step_count,
             SchemaRef::Static(self.output_schema.clone()),
-            0..group_count,
+            groups,
             values,
             validity,
         );
@@ -791,45 +817,53 @@ impl<C: Operator> Operator for AggregateOp<C> {
         // quantile globally. Both are correct under arbitrary child tile
         // ordering (step tiles × series tiles, Concurrent / Coalesce
         // reordering).
-        if self.emitted {
-            self.done = true;
-            return Poll::Ready(None);
-        }
         let breaker = self.kind.is_breaker();
-        loop {
-            match self.child.next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => break,
-                Poll::Ready(Some(Err(err))) => {
-                    self.errored = true;
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(Some(Ok(input))) if breaker => {
-                    self.saw_any_batch = true;
-                    self.absorb_batch_breaker(&input);
-                }
-                Poll::Ready(Some(Ok(input))) => {
-                    self.saw_any_batch = true;
-                    if let Err(err) = self.absorb_batch_streaming(&input) {
+        if !self.drained {
+            loop {
+                match self.child.next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => break,
+                    Poll::Ready(Some(Err(err))) => {
                         self.errored = true;
                         return Poll::Ready(Some(Err(err)));
                     }
+                    Poll::Ready(Some(Ok(input))) if breaker => {
+                        self.saw_any_batch = true;
+                        self.absorb_batch_breaker(&input);
+                    }
+                    Poll::Ready(Some(Ok(input))) => {
+                        self.saw_any_batch = true;
+                        if let Err(err) = self.absorb_batch_streaming(&input) {
+                            self.errored = true;
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                    }
                 }
             }
-        }
-        self.emitted = true;
-        // A child that produced zero batches emits nothing — matches
-        // Prometheus behaviour when a selector has no series and preserves
-        // parity with the v1 engine (no empty grid trailing after an empty
-        // selector).
-        if !self.saw_any_batch {
-            self.done = true;
-            return Poll::Ready(None);
+            self.drained = true;
+            // A child that produced zero batches emits nothing — matches
+            // Prometheus behaviour when a selector has no series and
+            // preserves parity with the v1 engine (no empty grid trailing
+            // after an empty selector).
+            if !self.saw_any_batch {
+                self.done = true;
+                return Poll::Ready(None);
+            }
         }
         let result = if breaker {
+            self.done = true;
             self.finalise_breaker()
         } else {
-            self.finalise_streaming()
+            let group_count = self.group_map.group_count;
+            let chunk = (OUTPUT_CHUNK_CELLS / self.schema.step_grid.step_count.max(1)).max(1);
+            let groups = self.next_group..(self.next_group + chunk).min(group_count);
+            self.next_group = groups.end;
+            let result = self.finalise_streaming(groups);
+            if self.next_group >= group_count {
+                self.done = true;
+                self.accums = None;
+            }
+            result
         };
         self.errored = result.is_err();
         Poll::Ready(Some(result))

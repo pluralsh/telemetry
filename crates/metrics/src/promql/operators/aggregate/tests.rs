@@ -1877,4 +1877,92 @@ mod parity {
         // then
         assert_bits_eq(case);
     }
+
+    /// One series per group, live for `window` steps starting at a group's
+    /// day of the week, as pods churn.
+    fn churning(kind: AggregateKind, steps: usize, groups: usize, window: usize) -> Case {
+        let mut validity = vec![false; steps * groups];
+        for g in 0..groups {
+            let start = (g % (steps / window)) * window;
+            for t in start..start + window {
+                validity[t * groups + g] = true;
+            }
+        }
+        Case {
+            kind,
+            steps,
+            series: groups,
+            group_map: GroupMap::new((0..groups as u32).map(Some).collect(), groups),
+            values: (0..steps * groups).map(|i| i as f64).collect(),
+            validity,
+            step_tile: steps,
+            series_tile: 64,
+            shuffle_seed: 7,
+        }
+    }
+
+    /// Drives `case` under `reservation` and checks every output chunk
+    /// against the reference, returning the chunks' group ranges.
+    fn assert_chunks_eq(case: &Case, reservation: MemoryReservation) -> Vec<Range<usize>> {
+        let group_count = case.group_map.group_count;
+        let in_schema = mk_schema("in", case.series);
+        let input = batches(case, &in_schema);
+        let (want, want_validity) =
+            reference::aggregate(case.kind, case.steps, &case.group_map, &input);
+        let child = MockOp::new(in_schema, mk_grid(case.steps), input);
+        let mut op = AggregateOp::new(
+            child,
+            case.kind,
+            case.group_map.clone(),
+            mk_schema("out", group_count),
+            reservation,
+        )
+        .expect("operator constructs");
+        let mut ranges = Vec::new();
+        for out in drive(&mut op) {
+            let got = out.expect("batch");
+            let width = got.series_count();
+            for step in 0..case.steps {
+                for column in 0..width {
+                    let (idx, want_idx) = (
+                        step * width + column,
+                        step * group_count + got.series_range.start + column,
+                    );
+                    assert_eq!(got.validity.get(idx), want_validity.get(want_idx));
+                    assert!(
+                        same_bits(got.values[idx], want[want_idx]),
+                        "cell {want_idx}"
+                    );
+                }
+            }
+            ranges.push(got.series_range.clone());
+        }
+        ranges
+    }
+
+    #[test]
+    fn should_fit_churning_groups_in_a_budget_the_dense_grid_overflows() {
+        // given: 200 groups over 336 steps, each live for 48 of them, and a
+        // budget of half the dense max grid plus the output
+        let case = churning(AggregateKind::Max, 336, 200, 48);
+        let dense = AccumGrid::bytes(case.kind, 336, 200, 200) + 336 * 200 * 16;
+        let budget = dense / 2 + out_bytes(336 * 200);
+
+        // when / then: it reduces exactly
+        let ranges = assert_chunks_eq(&case, MemoryReservation::new(budget));
+        assert_eq!(ranges, vec![0..200]);
+    }
+
+    #[test]
+    fn should_emit_large_outputs_in_group_chunks() {
+        // given: 4000 groups over 300 steps, more cells than one chunk holds
+        let case = churning(AggregateKind::Sum, 300, 4000, 50);
+
+        // when
+        let ranges = assert_chunks_eq(&case, MemoryReservation::new(usize::MAX));
+
+        // then
+        let chunk = OUTPUT_CHUNK_CELLS / 300;
+        assert_eq!(ranges, vec![0..chunk, chunk..4000]);
+    }
 }

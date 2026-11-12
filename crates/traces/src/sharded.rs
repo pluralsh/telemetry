@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use common::discovery::DiscoveryValue;
+use common::single_flight::SingleFlight;
 use common::storage::compaction::CompactionMemory;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::write_budget::WriteBudget;
@@ -69,7 +70,11 @@ pub struct ShardedTraces {
     cache: SharedDbCache,
     /// Reads the shards other reader groups serve.
     remote: OnceLock<Arc<dyn TracesShardClient>>,
+    searches: SingleFlight<SearchKey, SharedSearch>,
 }
+
+type SearchKey = (Namespace, String, u64, u64, QueryOptions);
+type SharedSearch = std::result::Result<Vec<TraceSummary>, Arc<Error>>;
 
 impl ShardedTraces {
     pub async fn open(
@@ -124,6 +129,7 @@ impl ShardedTraces {
             shards: Arc::new(shards),
             cache,
             remote: OnceLock::new(),
+            searches: SingleFlight::new("traces"),
         })
     }
 
@@ -405,8 +411,31 @@ impl ShardedTraces {
         source: &str,
         options: QueryOptions,
     ) -> Result<Vec<TraceSummary>> {
-        self.traceql(assignment, namespace, (start_ns, end_ns), source, options)
+        let started = std::time::Instant::now();
+        let key = (
+            namespace.clone(),
+            source.to_owned(),
+            start_ns,
+            end_ns,
+            options,
+        );
+        let result = self
+            .searches
+            .run(key, || async {
+                self.traceql(assignment, namespace, (start_ns, end_ns), source, options)
+                    .await
+                    .map_err(Arc::new)
+            })
             .await
+            .map_err(|error| Arc::try_unwrap(error).unwrap_or_else(|error| error.duplicate()));
+        ::metrics::counter!("traces_queries_total", "type" => "search").increment(1);
+        ::metrics::histogram!("traces_query_duration_seconds", "type" => "search")
+            .record(started.elapsed().as_secs_f64());
+        if let Err(error) = &result {
+            ::metrics::counter!("traces_query_errors_total", "type" => "search", "reason" => error.reason())
+                .increment(1);
+        }
+        result
     }
 
     async fn local_traceql<T: Hit>(

@@ -32,7 +32,7 @@ impl ValidationError {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum QueryError {
     #[error(transparent)]
     Parse(#[from] ParseError),

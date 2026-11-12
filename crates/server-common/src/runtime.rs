@@ -2,9 +2,15 @@
 
 use std::sync::OnceLock;
 
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+/// Buckets for every database's `*_query_duration_seconds`, exported as a
+/// histogram so latency can be aggregated across readers and over time.
+const QUERY_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0,
+];
 
 /// Selects `ring` when several rustls crypto providers are compiled in.
 pub fn install_rustls_crypto_provider() -> anyhow::Result<()> {
@@ -22,6 +28,10 @@ pub fn install_rustls_crypto_provider() -> anyhow::Result<()> {
 /// metrics are captured.
 pub fn install_metrics_recorder() -> anyhow::Result<()> {
     let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Suffix("_query_duration_seconds".to_owned()),
+            QUERY_DURATION_BUCKETS,
+        )?
         .install_recorder()
         .map_err(|error| anyhow::anyhow!("failed to install Prometheus recorder: {error}"))?;
     PROMETHEUS_HANDLE
@@ -107,8 +117,12 @@ mod tests {
     async fn installed_recorder_renders_metrics() {
         install_metrics_recorder().unwrap();
         metrics::counter!("telemetry_runtime_metrics_test_total").increment(1);
+        metrics::histogram!("telemetry_runtime_test_query_duration_seconds").record(0.3);
 
         let body = scrape_metrics().await;
         assert!(body.contains("telemetry_runtime_metrics_test_total 1"));
+        assert!(
+            body.contains("telemetry_runtime_test_query_duration_seconds_bucket{le=\"0.5\"} 1")
+        );
     }
 }

@@ -8,6 +8,7 @@ pub mod display;
 pub mod namespace;
 pub mod sequence;
 pub mod serde;
+pub mod single_flight;
 pub mod storage;
 pub mod time;
 pub mod write_budget;

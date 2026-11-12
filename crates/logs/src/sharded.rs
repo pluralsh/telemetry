@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use common::single_flight::SingleFlight;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
 use sharding::{
@@ -74,7 +75,10 @@ pub struct ShardedLogs {
     remote: OnceLock<Arc<dyn LogsShardClient>>,
     results: Option<ResultCache>,
     segment_ns: i64,
+    flights: SingleFlight<(Namespace, QueryRequest, QueryOptions), SharedResult>,
 }
+
+type SharedResult = std::result::Result<QueryResult, Arc<Error>>;
 
 impl ShardedLogs {
     pub async fn open(
@@ -146,6 +150,7 @@ impl ShardedLogs {
             remote: OnceLock::new(),
             results: results.cache,
             segment_ns: results.segment_ns,
+            flights: SingleFlight::new("logs"),
         })
     }
 
@@ -230,6 +235,38 @@ impl ShardedLogs {
     }
 
     pub async fn query(
+        &self,
+        namespace: &Namespace,
+        request: &QueryRequest,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
+        let kind = if request.step_ns.is_some() {
+            "range"
+        } else {
+            "instant"
+        };
+        let started = std::time::Instant::now();
+        let key = (namespace.clone(), request.clone(), options.clone());
+        let result = self
+            .flights
+            .run(key, || async {
+                self.evaluate(namespace, request, options)
+                    .await
+                    .map_err(Arc::new)
+            })
+            .await
+            .map_err(|error| Arc::try_unwrap(error).unwrap_or_else(|error| error.duplicate()));
+        ::metrics::counter!("logs_queries_total", "type" => kind).increment(1);
+        ::metrics::histogram!("logs_query_duration_seconds", "type" => kind)
+            .record(started.elapsed().as_secs_f64());
+        if let Err(error) = &result {
+            ::metrics::counter!("logs_query_errors_total", "type" => kind, "reason" => error.reason())
+                .increment(1);
+        }
+        result
+    }
+
+    async fn evaluate(
         &self,
         namespace: &Namespace,
         request: &QueryRequest,

@@ -32,6 +32,7 @@ pub(crate) const TSDB_FLUSH_SAMPLES: &str = "tsdb_flush_samples";
 
 pub(crate) const TSDB_QUERIES: &str = "tsdb_queries_total";
 pub(crate) const TSDB_QUERY_DURATION_SECONDS: &str = "tsdb_query_duration_seconds";
+pub(crate) const TSDB_QUERY_ERRORS: &str = "tsdb_query_errors_total";
 pub(crate) const TSDB_RESULT_CACHE_STEPS: &str = "tsdb_result_cache_steps_total";
 
 // ── Ingest consumer ──
@@ -93,6 +94,10 @@ pub(crate) fn describe_engine_metrics() {
     metrics::describe_histogram!(
         TSDB_QUERY_DURATION_SECONDS,
         "PromQL query evaluation duration in seconds"
+    );
+    metrics::describe_counter!(
+        TSDB_QUERY_ERRORS,
+        "PromQL queries that failed, by type and reason (invalid, timeout, memory, execution, storage)"
     );
     metrics::describe_counter!(
         TSDB_RESULT_CACHE_STEPS,

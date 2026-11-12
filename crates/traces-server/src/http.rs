@@ -363,7 +363,7 @@ async fn search(
             },
         )
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(search_error)?;
     let traces = results
         .into_iter()
         .map(|result| {
@@ -765,6 +765,15 @@ fn legacy_tags_query(tags: &str) -> String {
 }
 
 pub(crate) use server_common::ApiError;
+
+/// A search fails as the client's fault only when its query is; storage
+/// and shard failures keep their own status.
+fn search_error(error: plural_traces::Error) -> ApiError {
+    match error {
+        plural_traces::Error::TraceQl(_) => ApiError::bad_request(error),
+        error => traces_error(error),
+    }
+}
 
 pub(crate) fn traces_error(error: plural_traces::Error) -> ApiError {
     match error {

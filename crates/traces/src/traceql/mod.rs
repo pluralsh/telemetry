@@ -22,7 +22,7 @@ pub use plan::{
     IndexField, IndexPredicate, IndexTest, PushdownClause, QueryPlan, existential, plan,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryOptions {
     pub limit: usize,
     /// Cap on verified candidate traces loaded and executed. Candidates are

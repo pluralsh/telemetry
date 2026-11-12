@@ -1,14 +1,20 @@
 //! Per-(group, step) accumulator grid shared by the streaming reducers.
 //!
-//! Each kind keeps only the lanes its reducer reads, struct-of-arrays and
-//! group-major (`lane[group * step_count + step]`), so one input series
-//! updates a contiguous run of per-step accumulators that are independent
-//! of each other. Every accumulator still sees its contributions in the
-//! order a cell-at-a-time absorb would — ascending input series within a
-//! batch, batches in arrival order — so outputs are bit-identical to it.
+//! Each kind keeps only the lanes its reducer reads, struct-of-arrays. A
+//! group's steps are split into pages of [`PAGE_STEPS`], and a page's
+//! accumulators exist only once an input has a valid cell in it: a group
+//! whose series live for a day of a week-long range (pods churning) holds
+//! about a seventh of its row. Within a page one input series updates a
+//! contiguous run of per-step accumulators that are independent of each
+//! other. Every accumulator still sees its contributions in the order a
+//! cell-at-a-time absorb would — ascending input series within a batch,
+//! batches in arrival order — so outputs are bit-identical to it.
+
+use std::ops::Range;
 
 use super::AggregateKind;
 use crate::promql::batch::{BitSet, StepBatch};
+use crate::promql::memory::{MemoryReservation, QueryError};
 use crate::util::kahan_inc;
 
 /// Transpose tile: a series' steps within it form one run.
@@ -17,35 +23,105 @@ const TILE_SERIES: usize = 64;
 /// Batches with fewer steps absorb cell by cell; runs that short don't pay
 /// for the transpose.
 const MIN_RUN_STEPS: usize = 4;
+/// Steps per page of a group's accumulators.
+const PAGE_STEPS: usize = 16;
+/// Fewest pages reserved from the query budget at once.
+const MIN_PAGE_BLOCK: usize = 64;
+const NO_PAGE: u32 = u32::MAX;
+
+/// Lane storage that grows a page at a time. `reserve` sizes the backing
+/// vectors exactly, so the bytes reserved for them are what they hold.
+trait Grow {
+    fn reserve(&mut self, cells: usize);
+    fn extend(&mut self, cells: usize);
+}
 
 /// Lanes for one reducer family. `absorb` takes one valid cell; `absorb_run`
 /// takes one series' cells for consecutive steps starting at lane `at`,
 /// masked by `valid`.
-trait Lanes {
+trait Lanes: Grow {
     fn absorb(&mut self, at: usize, v: f64);
     fn absorb_run(&mut self, at: usize, values: &[f64], valid: &[bool]);
+}
+
+fn grow<T: Clone>(lane: &mut Vec<T>, cells: usize, fill: T) {
+    lane.resize(lane.len() + cells, fill);
 }
 
 struct CountLanes {
     count: Vec<u64>,
 }
 
+impl Grow for CountLanes {
+    fn reserve(&mut self, cells: usize) {
+        self.count.reserve_exact(cells);
+    }
+
+    fn extend(&mut self, cells: usize) {
+        grow(&mut self.count, cells, 0);
+    }
+}
+
 impl CountLanes {
     /// Integer counts don't depend on contribution order and read no
     /// values, so each series counts its steps straight off the validity
     /// words, no transpose.
-    fn absorb_batch(&mut self, step_count: usize, input: &StepBatch, groups: &[Option<u32>]) {
+    fn absorb_batch(
+        &mut self,
+        pages: &mut Pages,
+        input: &StepBatch,
+        groups: &[Option<u32>],
+    ) -> Result<(), QueryError> {
         let (steps, series) = (input.step_count(), input.series_count());
         let words = input.validity.words();
+        let bit = |t: usize, s: usize| {
+            let cell = t * series + s;
+            (words[cell / 64] >> (cell % 64)) & 1
+        };
         for (s, group) in groups.iter().enumerate() {
             let Some(g) = *group else { continue };
-            let at = g as usize * step_count + input.step_range.start;
-            for (t, count) in self.count[at..at + steps].iter_mut().enumerate() {
-                let cell = t * series + s;
-                *count = count.saturating_add((words[cell / 64] >> (cell % 64)) & 1);
+            for piece in page_pieces(input.step_range.start, steps) {
+                if piece.offsets.clone().all(|t| bit(t, s) == 0) {
+                    continue;
+                }
+                let at = pages.slot(self, g as usize, piece.page)? + piece.in_page;
+                for (count, t) in self.count[at..at + piece.offsets.len()]
+                    .iter_mut()
+                    .zip(piece.offsets)
+                {
+                    *count = count.saturating_add(bit(t, s));
+                }
             }
         }
+        Ok(())
     }
+}
+
+/// The part of a batch's step span inside one page: batch step offsets
+/// `offsets`, starting `in_page` steps into page `page`.
+struct PagePiece {
+    page: usize,
+    in_page: usize,
+    offsets: Range<usize>,
+}
+
+/// Splits the `steps` steps starting at global step `first` at page edges.
+fn page_pieces(first: usize, steps: usize) -> impl Iterator<Item = PagePiece> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        (offset < steps).then(|| {
+            let step = first + offset;
+            let in_page = step % PAGE_STEPS;
+            let len = (PAGE_STEPS - in_page).min(steps - offset);
+            let piece = PagePiece {
+                page: step / PAGE_STEPS,
+                in_page,
+                offsets: offset..offset + len,
+            };
+            offset += len;
+            piece
+        })
+    })
 }
 
 /// Kahan sum.
@@ -53,6 +129,20 @@ struct SumLanes {
     count: Vec<u64>,
     sum: Vec<f64>,
     c: Vec<f64>,
+}
+
+impl Grow for SumLanes {
+    fn reserve(&mut self, cells: usize) {
+        self.count.reserve_exact(cells);
+        self.sum.reserve_exact(cells);
+        self.c.reserve_exact(cells);
+    }
+
+    fn extend(&mut self, cells: usize) {
+        grow(&mut self.count, cells, 0);
+        grow(&mut self.sum, cells, 0.0);
+        grow(&mut self.c, cells, 0.0);
+    }
 }
 
 /// `if ok { new } else { old }`, bit for bit. Spelled as a mask because
@@ -132,6 +222,22 @@ struct AvgLanes {
     c_mean: Vec<f64>,
 }
 
+impl Grow for AvgLanes {
+    fn reserve(&mut self, cells: usize) {
+        self.sum.reserve(cells);
+        self.incremental.reserve_exact(cells);
+        self.mean.reserve_exact(cells);
+        self.c_mean.reserve_exact(cells);
+    }
+
+    fn extend(&mut self, cells: usize) {
+        self.sum.extend(cells);
+        grow(&mut self.incremental, cells, false);
+        grow(&mut self.mean, cells, 0.0);
+        grow(&mut self.c_mean, cells, 0.0);
+    }
+}
+
 impl AvgLanes {
     #[inline]
     fn value(&self, at: usize) -> f64 {
@@ -198,6 +304,18 @@ struct ExtremumLanes<const MAX: bool> {
     value: Vec<f64>,
 }
 
+impl<const MAX: bool> Grow for ExtremumLanes<MAX> {
+    fn reserve(&mut self, cells: usize) {
+        self.count.reserve_exact(cells);
+        self.value.reserve_exact(cells);
+    }
+
+    fn extend(&mut self, cells: usize) {
+        grow(&mut self.count, cells, 0);
+        grow(&mut self.value, cells, f64::NAN);
+    }
+}
+
 #[inline]
 fn extremum_step<const MAX: bool>(count: &mut u64, m: &mut f64, v: f64, ok: bool) {
     let better = if MAX { v > *m } else { v < *m };
@@ -242,6 +360,32 @@ struct WelfordLanes {
     c_mean: Vec<f64>,
     m2: Vec<f64>,
     c_m2: Vec<f64>,
+}
+
+impl Grow for WelfordLanes {
+    fn reserve(&mut self, cells: usize) {
+        self.count.reserve_exact(cells);
+        for lane in [
+            &mut self.mean,
+            &mut self.c_mean,
+            &mut self.m2,
+            &mut self.c_m2,
+        ] {
+            lane.reserve_exact(cells);
+        }
+    }
+
+    fn extend(&mut self, cells: usize) {
+        grow(&mut self.count, cells, 0);
+        for lane in [
+            &mut self.mean,
+            &mut self.c_mean,
+            &mut self.m2,
+            &mut self.c_m2,
+        ] {
+            grow(lane, cells, 0.0);
+        }
+    }
 }
 
 #[inline]
@@ -329,11 +473,64 @@ enum GridLanes {
     Welford(WelfordLanes),
 }
 
-/// The `(group × step)` accumulator grid of one streaming aggregate, plus
-/// the transpose scratch its run kernels read from.
+/// Which page of accumulators, if any, each `(group, page)` has, and the
+/// query-budget bytes backing them.
+pub(super) struct Pages {
+    per_group: usize,
+    table: Vec<u32>,
+    allocated: usize,
+    reserved: usize,
+    page_bytes: usize,
+    reservation: MemoryReservation,
+}
+
+impl Pages {
+    /// First lane index of `group`'s `page`, allocating it in `lanes` the
+    /// first time. Reserves a block of pages at a time, growing with the
+    /// pages already held so the lanes reallocate a logarithmic number of
+    /// times.
+    fn slot(
+        &mut self,
+        lanes: &mut impl Grow,
+        group: usize,
+        page: usize,
+    ) -> Result<usize, QueryError> {
+        let entry = group * self.per_group + page;
+        if self.table[entry] == NO_PAGE {
+            if self.allocated == self.reserved {
+                let block = (self.allocated / 2).max(MIN_PAGE_BLOCK);
+                self.reservation
+                    .try_grow(block.saturating_mul(self.page_bytes))?;
+                self.reserved += block;
+                lanes.reserve(block * PAGE_STEPS);
+            }
+            self.table[entry] = self.allocated as u32;
+            self.allocated += 1;
+            lanes.extend(PAGE_STEPS);
+        }
+        Ok(self.table[entry] as usize * PAGE_STEPS)
+    }
+
+    #[inline]
+    fn find(&self, group: usize, page: usize) -> Option<usize> {
+        let slot = self.table[group * self.per_group + page];
+        (slot != NO_PAGE).then(|| slot as usize * PAGE_STEPS)
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        self.reservation
+            .release(self.reserved.saturating_mul(self.page_bytes));
+    }
+}
+
+/// The paged `(group × step)` accumulator grid of one streaming aggregate,
+/// plus the transpose scratch its run kernels read from.
 pub(super) struct AccumGrid {
     step_count: usize,
     lanes: GridLanes,
+    pages: Pages,
     run_values: Vec<f64>,
     run_valid: Vec<bool>,
 }
@@ -361,31 +558,35 @@ impl AccumGrid {
         TILE_STEPS.min(step_count) * TILE_SERIES.min(input_series)
     }
 
-    /// Bytes [`Self::new`] allocates for the same arguments.
+    /// Bytes [`Self::new`] allocates for the same arguments: the page table
+    /// and transpose scratch. Pages reserve their own bytes as inputs reach
+    /// them.
     pub(super) fn bytes(
         kind: AggregateKind,
         step_count: usize,
         group_count: usize,
         input_series: usize,
     ) -> usize {
-        let grid = step_count
+        let table = step_count
+            .div_ceil(PAGE_STEPS)
             .saturating_mul(group_count)
-            .saturating_mul(Self::cell_bytes(kind));
+            .saturating_mul(size_of::<u32>());
         let scratch = Self::scratch_cells(kind, step_count, input_series)
             * (size_of::<f64>() + size_of::<bool>());
-        grid.saturating_add(scratch)
+        table.saturating_add(scratch)
     }
 
-    /// Panics on breaker kinds, which keep no accumulator grid.
+    /// Panics on breaker kinds, which keep no accumulator grid. Pages are
+    /// charged to `reservation` as they are allocated.
     pub(super) fn new(
         kind: AggregateKind,
         step_count: usize,
         group_count: usize,
         input_series: usize,
+        reservation: MemoryReservation,
     ) -> Self {
-        let cells = step_count.saturating_mul(group_count);
-        let count = || vec![0u64; cells];
-        let zeros = || vec![0.0f64; cells];
+        let count = Vec::new;
+        let zeros = Vec::new;
         let lanes = match kind {
             AggregateKind::Count | AggregateKind::Group => {
                 GridLanes::Count(CountLanes { count: count() })
@@ -401,17 +602,17 @@ impl AccumGrid {
                     sum: zeros(),
                     c: zeros(),
                 },
-                incremental: vec![false; cells],
+                incremental: Vec::new(),
                 mean: zeros(),
                 c_mean: zeros(),
             }),
             AggregateKind::Min => GridLanes::Min(ExtremumLanes {
                 count: count(),
-                value: vec![f64::NAN; cells],
+                value: zeros(),
             }),
             AggregateKind::Max => GridLanes::Max(ExtremumLanes {
                 count: count(),
-                value: vec![f64::NAN; cells],
+                value: zeros(),
             }),
             AggregateKind::Stddev | AggregateKind::Stdvar => GridLanes::Welford(WelfordLanes {
                 count: count(),
@@ -425,23 +626,30 @@ impl AccumGrid {
             }
         };
         let scratch = Self::scratch_cells(kind, step_count, input_series);
+        let per_group = step_count.div_ceil(PAGE_STEPS);
         Self {
             step_count,
             lanes,
+            pages: Pages {
+                per_group,
+                table: vec![NO_PAGE; per_group.saturating_mul(group_count)],
+                allocated: 0,
+                reserved: 0,
+                page_bytes: PAGE_STEPS * Self::cell_bytes(kind),
+                reservation,
+            },
             run_values: vec![0.0; scratch],
             run_valid: vec![false; scratch],
         }
     }
 
-    /// Lane index of the accumulator for `(group, step)`.
+    /// Valid float inputs absorbed by the accumulator for `(group, step)`.
     #[inline]
-    pub(super) fn index(&self, group: usize, step: usize) -> usize {
-        group * self.step_count + step
-    }
-
-    /// Valid float inputs absorbed by the accumulator at `at`.
-    #[inline]
-    pub(super) fn count(&self, at: usize) -> u64 {
+    pub(super) fn count(&self, group: usize, step: usize) -> u64 {
+        let Some(base) = self.pages.find(group, step / PAGE_STEPS) else {
+            return 0;
+        };
+        let at = base + step % PAGE_STEPS;
         match &self.lanes {
             GridLanes::Count(l) => l.count[at],
             GridLanes::Sum(l) => l.count[at],
@@ -452,19 +660,21 @@ impl AccumGrid {
         }
     }
 
-    /// Writes the reduced value of every accumulator that absorbed a float
-    /// into step-major `values` / `validity` (`[step * group_count +
-    /// group]`), leaving the other cells untouched.
+    /// Writes the reduced value of every accumulator of `groups` that
+    /// absorbed a float into step-major `values` / `validity` (`[step *
+    /// groups.len() + group - groups.start]`), leaving the other cells
+    /// untouched.
     pub(super) fn write_floats(
         &self,
         kind: AggregateKind,
-        group_count: usize,
+        groups: Range<usize>,
         values: &mut [f64],
         validity: &mut BitSet,
     ) {
         let out = Out {
             step_count: self.step_count,
-            group_count,
+            pages: &self.pages,
+            groups,
             values,
             validity,
         };
@@ -486,50 +696,55 @@ impl AccumGrid {
 
     /// Absorb every valid float cell of `input`. `input_to_group` is the
     /// full group map, indexed by global input series.
-    pub(super) fn absorb_batch(&mut self, input: &StepBatch, input_to_group: &[Option<u32>]) {
+    pub(super) fn absorb_batch(
+        &mut self,
+        input: &StepBatch,
+        input_to_group: &[Option<u32>],
+    ) -> Result<(), QueryError> {
         let groups = &input_to_group[input.series_range.clone()];
         let Self {
-            step_count,
             lanes,
+            pages,
             run_values,
             run_valid,
+            ..
         } = self;
         let mut scratch = Scratch {
             values: run_values,
             valid: run_valid,
         };
         match lanes {
-            GridLanes::Count(l) => l.absorb_batch(*step_count, input, groups),
-            GridLanes::Sum(l) => absorb_into(l, *step_count, input, groups, &mut scratch),
-            GridLanes::Avg(l) => absorb_into(l, *step_count, input, groups, &mut scratch),
-            GridLanes::Min(l) => absorb_into(l, *step_count, input, groups, &mut scratch),
-            GridLanes::Max(l) => absorb_into(l, *step_count, input, groups, &mut scratch),
-            GridLanes::Welford(l) => absorb_into(l, *step_count, input, groups, &mut scratch),
+            GridLanes::Count(l) => l.absorb_batch(pages, input, groups),
+            GridLanes::Sum(l) => absorb_into(l, pages, input, groups, &mut scratch),
+            GridLanes::Avg(l) => absorb_into(l, pages, input, groups, &mut scratch),
+            GridLanes::Min(l) => absorb_into(l, pages, input, groups, &mut scratch),
+            GridLanes::Max(l) => absorb_into(l, pages, input, groups, &mut scratch),
+            GridLanes::Welford(l) => absorb_into(l, pages, input, groups, &mut scratch),
         }
     }
 }
 
 struct Out<'a> {
     step_count: usize,
-    group_count: usize,
+    pages: &'a Pages,
+    groups: Range<usize>,
     values: &'a mut [f64],
     validity: &'a mut BitSet,
 }
 
 impl Out<'_> {
-    /// Groups at a time per step: a cache line of output, and one cursor
-    /// per group into the group-major lanes. Walking a whole group at once
-    /// would write at a `group_count × 8` byte stride instead.
-    const GROUP_BLOCK: usize = 8;
-
     fn write(self, count: &[u64], value: impl Fn(usize) -> f64) {
-        for g0 in (0..self.group_count).step_by(Self::GROUP_BLOCK) {
-            let groups = g0..(g0 + Self::GROUP_BLOCK).min(self.group_count);
-            for step in 0..self.step_count {
-                for g in groups.clone() {
-                    let at = g * self.step_count + step;
+        let width = self.groups.len();
+        for (column, group) in self.groups.clone().enumerate() {
+            for page in 0..self.pages.per_group {
+                let Some(base) = self.pages.find(group, page) else {
+                    continue;
+                };
+                let first = page * PAGE_STEPS;
+                for step in first..(first + PAGE_STEPS).min(self.step_count) {
+                    let at = base + step - first;
                     if count[at] > 0 {
-                        let idx = step * self.group_count + g;
+                        let idx = step * width + column;
                         self.values[idx] = value(at);
                         self.validity.set(idx);
                     }
@@ -546,34 +761,43 @@ struct Scratch<'a> {
 
 fn absorb_into<L: Lanes>(
     lanes: &mut L,
-    step_count: usize,
+    pages: &mut Pages,
     input: &StepBatch,
     groups: &[Option<u32>],
     scratch: &mut Scratch<'_>,
-) {
+) -> Result<(), QueryError> {
     if input.step_count() >= MIN_RUN_STEPS {
-        absorb_runs(lanes, step_count, input, groups, scratch);
+        absorb_runs(lanes, pages, input, groups, scratch)
     } else {
-        absorb_cells(lanes, step_count, input, groups);
+        absorb_cells(lanes, pages, input, groups)
     }
 }
 
 fn absorb_cells<L: Lanes>(
     lanes: &mut L,
-    step_count: usize,
+    pages: &mut Pages,
     input: &StepBatch,
     groups: &[Option<u32>],
-) {
+) -> Result<(), QueryError> {
     let series = input.series_count();
+    let mut result = Ok(());
     for step_off in 0..input.step_count() {
         let step = input.step_range.start + step_off;
+        let (page, in_page) = (step / PAGE_STEPS, step % PAGE_STEPS);
         let row = step_off * series;
         input.validity.for_each_set_in(row..row + series, |cell| {
-            if let Some(g) = groups[cell - row] {
-                lanes.absorb(g as usize * step_count + step, input.values[cell]);
+            let Some(g) = groups[cell - row] else { return };
+            if result.is_err() {
+                return;
+            }
+            match pages.slot(lanes, g as usize, page) {
+                Ok(base) => lanes.absorb(base + in_page, input.values[cell]),
+                Err(error) => result = Err(error),
             }
         });
+        result.clone()?;
     }
+    result
 }
 
 /// Transposes `input` tile by tile into series-major runs, then feeds each
@@ -582,11 +806,11 @@ fn absorb_cells<L: Lanes>(
 /// ascending order.
 fn absorb_runs<L: Lanes>(
     lanes: &mut L,
-    step_count: usize,
+    pages: &mut Pages,
     input: &StepBatch,
     groups: &[Option<u32>],
     scratch: &mut Scratch<'_>,
-) {
+) -> Result<(), QueryError> {
     let (steps, series) = (input.step_count(), input.series_count());
     let words = input.validity.words();
     for t0 in (0..steps).step_by(TILE_STEPS) {
@@ -605,12 +829,22 @@ fn absorb_runs<L: Lanes>(
             }
             for (ds, group) in groups[s0..s0 + sn].iter().enumerate() {
                 let Some(g) = *group else { continue };
-                let at = g as usize * step_count + input.step_range.start + t0;
-                let run = ds * tn..(ds + 1) * tn;
-                lanes.absorb_run(at, &values[run.clone()], &valid[run]);
+                let (run_values, run_valid) = (
+                    &values[ds * tn..(ds + 1) * tn],
+                    &valid[ds * tn..(ds + 1) * tn],
+                );
+                for piece in page_pieces(input.step_range.start + t0, tn) {
+                    let valid = &run_valid[piece.offsets.clone()];
+                    if !valid.contains(&true) {
+                        continue;
+                    }
+                    let at = pages.slot(lanes, g as usize, piece.page)? + piece.in_page;
+                    lanes.absorb_run(at, &run_values[piece.offsets], valid);
+                }
             }
         }
     }
+    Ok(())
 }
 
 /// The cell-at-a-time all-lanes accumulator the grid replaced, kept as the

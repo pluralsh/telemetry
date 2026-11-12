@@ -14,7 +14,7 @@
 //! the rest to `crate::error::QueryError::Execution`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The engine's error type. Kept separate from
 /// [`crate::error::QueryError`] so the engine's error surface stays small and
@@ -64,6 +64,8 @@ struct Inner {
     /// Set for [`scoped`](MemoryReservation::scoped) reservations: every grow
     /// and release is mirrored into the parent ledger.
     parent: Option<MemoryReservation>,
+    /// A grow that fit this ledger's cap was refused by the parent.
+    starved: AtomicBool,
 }
 
 impl Drop for Inner {
@@ -83,6 +85,7 @@ impl MemoryReservation {
                 reserved: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
                 parent: None,
+                starved: AtomicBool::new(false),
             }),
         }
     }
@@ -105,6 +108,7 @@ impl MemoryReservation {
                 reserved: AtomicUsize::new(0),
                 high_water: AtomicUsize::new(0),
                 parent: Some(self.clone()),
+                starved: AtomicBool::new(false),
             }),
         }
     }
@@ -136,9 +140,16 @@ impl MemoryReservation {
             && let Err(error) = parent.try_grow(bytes)
         {
             self.inner.reserved.fetch_sub(bytes, Ordering::AcqRel);
+            self.inner.starved.store(true, Ordering::Release);
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Whether a grow within this ledger's own cap failed because the
+    /// parent had no room: memory other holders of the parent may return.
+    pub fn starved(&self) -> bool {
+        self.inner.starved.load(Ordering::Acquire)
     }
 
     fn grow_local(&self, bytes: usize) -> Result<(), QueryError> {
@@ -484,14 +495,16 @@ mod tests {
         let first = budget.child(60);
         let second = budget.child(60);
 
-        // when / then: each query stops at its own cap
+        // when / then: each query stops at its own cap, which isn't starving
         first.try_grow(50).unwrap();
         assert!(first.try_grow(20).is_err());
         assert_eq!(first.reserved(), 50);
+        assert!(!first.starved());
 
-        // when / then: the second stops where the budget runs out, and its
-        // failed grow leaves nothing reserved anywhere
+        // when / then: the second stops where the budget runs out, starved,
+        // and its failed grow leaves nothing reserved anywhere
         assert!(second.try_grow(60).is_err());
+        assert!(second.starved());
         assert_eq!(second.reserved(), 0);
         second.try_grow(50).unwrap();
         assert_eq!(budget.reserved(), 100);

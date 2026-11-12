@@ -112,7 +112,7 @@ impl From<crate::serde::EncodingError> for Error {
 /// Error type for PromQL query and discovery operations.
 ///
 /// This is returned by the read/query methods on `TimeSeriesDb`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum QueryError {
     /// The query string could not be parsed or is otherwise invalid.
     #[error("invalid query: {0}")]
@@ -129,6 +129,19 @@ pub enum QueryError {
     /// Reading from storage failed; the query itself may be valid.
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+impl QueryError {
+    /// The `reason` label of `tsdb_query_errors_total`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            QueryError::InvalidQuery(_) => "invalid",
+            QueryError::Timeout => "timeout",
+            QueryError::Execution(message) if message.contains("memory limit") => "memory",
+            QueryError::Execution(_) => "execution",
+            QueryError::Storage(_) => "storage",
+        }
+    }
 }
 
 impl From<Error> for QueryError {

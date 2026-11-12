@@ -44,7 +44,7 @@ use regex_cache::*;
 use units::*;
 
 /// Ordering of log entries returned by a streams query.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     #[default]
@@ -60,7 +60,7 @@ const PRESERVE_ERROR_LABEL: &str = "__preserve_error__";
 
 /// A parsed LogQL request. Log bounds are `[start_ns, end_ns)`; metric
 /// evaluations use LogQL's `(evaluation-range, evaluation]` windows.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QueryRequest {
     pub query: String,
     pub start_ns: i64,
@@ -130,7 +130,7 @@ impl QueryRequest {
 }
 
 /// Resource and presentation controls for one query.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QueryOptions {
     pub limit: usize,
     pub direction: Direction,

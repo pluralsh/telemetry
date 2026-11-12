@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
+use common::single_flight::SingleFlight;
 use common::storage::compaction::CompactionMemory;
 use common::storage::slate::warm::{WarmLedger, WarmPlan, WarmReport, WarmShares};
 use common::{SharedDbCache, WarmWindow};
@@ -35,6 +36,7 @@ use crate::tsdb::{
     TsdbQueryReader, TsdbReadEngine, duration_to_ms, execute_query_source,
     preload_ranges_for_query, query_value_to_range_samples, system_time_to_ms,
 };
+use crate::tsdb_metrics;
 use crate::{
     Config, Error, Label, Labels, MetricMetadata, Namespace, QueryCacheConfig, QueryError,
     QueryLimitsConfig, QueryValue, RangeSample, Result, Series, TimeSeriesDb, TimeSeriesDbReader,
@@ -129,6 +131,8 @@ pub struct ShardedMetrics {
     block_cache: SharedDbCache,
     result_cache: Option<ResultCache>,
     admission: QueryAdmission,
+    instant_flights: SingleFlight<(Namespace, String, i64), InstantResult>,
+    range_flights: SingleFlight<(Namespace, String, i64, i64, i64), RangeResult>,
     /// Reads the shards other reader groups serve; unset outside reader
     /// groups, where every shard is open locally.
     remote: OnceLock<Arc<dyn MetricsShardClient>>,
@@ -137,6 +141,26 @@ pub struct ShardedMetrics {
 }
 
 pub type ShardedTimeseries = ShardedMetrics;
+
+type InstantResult = std::result::Result<QueryValue, QueryError>;
+type RangeResult = std::result::Result<Vec<RangeSample>, QueryError>;
+
+/// Records a query's count, duration and failure reason as `kind`.
+async fn observed<T>(
+    kind: &'static str,
+    query: impl Future<Output = std::result::Result<T, QueryError>>,
+) -> std::result::Result<T, QueryError> {
+    let started = Instant::now();
+    let result = query.await;
+    ::metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => kind).increment(1);
+    ::metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => kind)
+        .record(started.elapsed().as_secs_f64());
+    if let Err(error) = &result {
+        ::metrics::counter!(tsdb_metrics::TSDB_QUERY_ERRORS, "type" => kind, "reason" => error.reason())
+            .increment(1);
+    }
+    result
+}
 
 impl ShardedMetrics {
     async fn new(
@@ -153,6 +177,8 @@ impl ShardedMetrics {
                 .result_cache_enabled
                 .then(|| ResultCache::new(caches.result_capacity_bytes)),
             admission: QueryAdmission::new(limits),
+            instant_flights: SingleFlight::new("metrics"),
+            range_flights: SingleFlight::new("metrics"),
             remote: OnceLock::new(),
             #[cfg(test)]
             label_projection: true,
@@ -407,20 +433,50 @@ impl ShardedMetrics {
         time: Option<SystemTime>,
         trace: bool,
     ) -> std::result::Result<(QueryValue, Option<serde_json::Value>), QueryError> {
-        let query_time = time.unwrap_or_else(SystemTime::now);
-        let at_ms = system_time_to_ms(query_time);
+        let at_ms = system_time_to_ms(time.unwrap_or_else(SystemTime::now));
+        observed("instant", async {
+            if trace {
+                return self.evaluate_instant(namespace, query, at_ms, true).await;
+            }
+            let key = (namespace.clone(), query.to_owned(), at_ms);
+            self.instant_flights
+                .run(key, || async {
+                    self.evaluate_instant(namespace, query, at_ms, false)
+                        .await
+                        .map(|(value, _)| value)
+                })
+                .await
+                .map(|value| (value, None))
+        })
+        .await
+    }
+
+    async fn evaluate_instant(
+        &self,
+        namespace: &Namespace,
+        query: &str,
+        at_ms: i64,
+        trace: bool,
+    ) -> std::result::Result<(QueryValue, Option<serde_json::Value>), QueryError> {
         let options = crate::QueryOptions::default();
         let plan = self.tuned(crate::promql::plan::LoweringContext::for_instant(
             at_ms,
             duration_to_ms(options.lookback_delta),
         ));
         let ranges = preload_ranges_for_query(query, at_ms, at_ms, options.lookback_delta)?;
-        let admitted = self.admission.admit().await?;
-        let (source, plan) = self
-            .traced_query_source(namespace, &ranges, &options, plan, trace)
+        let outcome = self
+            .admission
+            .run(|reservation| {
+                let plan = plan.clone();
+                let (ranges, options) = (&ranges, &options);
+                async move {
+                    let (source, plan) = self
+                        .traced_query_source(namespace, ranges, options, plan, trace)
+                        .await?;
+                    execute_query_source(query, source, plan, true, reservation).await
+                }
+            })
             .await?;
-        let outcome =
-            execute_query_source(query, source, plan, true, admitted.reservation.clone()).await?;
         Ok((outcome.value, trace_json(outcome.trace)))
     }
 
@@ -455,6 +511,40 @@ impl ShardedMetrics {
                 "step must be greater than zero".to_string(),
             ));
         }
+        observed("range", async {
+            if trace {
+                return self
+                    .evaluate_range(namespace, query, start_ms, end_ms, step_ms, true)
+                    .await;
+            }
+            let key = (
+                namespace.clone(),
+                query.to_owned(),
+                start_ms,
+                end_ms,
+                step_ms,
+            );
+            self.range_flights
+                .run(key, || async {
+                    self.evaluate_range(namespace, query, start_ms, end_ms, step_ms, false)
+                        .await
+                        .map(|(series, _)| series)
+                })
+                .await
+                .map(|series| (series, None))
+        })
+        .await
+    }
+
+    async fn evaluate_range(
+        &self,
+        namespace: &Namespace,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        trace: bool,
+    ) -> std::result::Result<(Vec<RangeSample>, Option<serde_json::Value>), QueryError> {
         let lookback = crate::QueryOptions::default().lookback_delta;
         let now_ms = common::time::now_ms();
         let plan = self
@@ -579,12 +669,19 @@ impl ShardedMetrics {
             duration_to_ms(options.lookback_delta),
         ));
         let ranges = preload_ranges_for_query(query, start_ms, end_ms, options.lookback_delta)?;
-        let admitted = self.admission.admit().await?;
-        let (source, plan) = self
-            .traced_query_source(namespace, &ranges, &options, plan, trace)
+        let outcome = self
+            .admission
+            .run(|reservation| {
+                let plan = plan.clone();
+                let (ranges, options) = (&ranges, &options);
+                async move {
+                    let (source, plan) = self
+                        .traced_query_source(namespace, ranges, options, plan, trace)
+                        .await?;
+                    execute_query_source(query, source, plan, false, reservation).await
+                }
+            })
             .await?;
-        let outcome =
-            execute_query_source(query, source, plan, false, admitted.reservation.clone()).await?;
         Ok((
             query_value_to_range_samples(outcome.value)?,
             trace_json(outcome.trace),

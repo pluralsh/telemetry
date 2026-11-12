@@ -33,9 +33,16 @@ pub struct ConcurrentOp {
     /// stays callable before the first `next()`.
     cached_schema: Arc<OperatorSchema>,
     rx: mpsc::Receiver<Result<StepBatch, QueryError>>,
-    /// Held so the task is cancelled on drop. End-of-stream is signalled by
-    /// the task dropping its `tx`.
-    _task: tokio::task::JoinHandle<()>,
+    /// Aborted on drop: a detached task would keep running its subtree, and
+    /// holding its memory reservation, after the query failed or was
+    /// cancelled. End-of-stream is signalled by the task dropping its `tx`.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ConcurrentOp {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl ConcurrentOp {
@@ -92,7 +99,7 @@ impl ConcurrentOp {
         Self {
             cached_schema,
             rx,
-            _task: task,
+            task,
         }
     }
 }
@@ -273,6 +280,43 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert!(outs[0].is_ok());
         assert!(matches!(outs[1], Err(QueryError::Internal(_))));
+    }
+
+    /// Never yields a batch, as a breaker draining its input does; drops
+    /// `dropped` when its task is torn down.
+    struct PendingOp {
+        schema: OperatorSchema,
+        _dropped: tokio::sync::oneshot::Sender<()>,
+    }
+
+    impl Operator for PendingOp {
+        fn schema(&self) -> &OperatorSchema {
+            &self.schema
+        }
+        fn next(&mut self, _cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn should_abort_the_child_when_dropped() {
+        // given: a child that never yields
+        let (dropped, child_gone) = tokio::sync::oneshot::channel();
+        let child = PendingOp {
+            schema: OperatorSchema::new(SchemaRef::Static(mk_schema(1)), mk_grid(1)),
+            _dropped: dropped,
+        };
+        let op = ConcurrentOp::new(child, DEFAULT_CHANNEL_BOUND);
+        tokio::task::yield_now().await;
+
+        // when
+        drop(op);
+
+        // then: the child is dropped instead of running on detached
+        tokio::time::timeout(Duration::from_secs(5), child_gone)
+            .await
+            .expect("child task was not aborted")
+            .unwrap_err();
     }
 
     #[tokio::test]
