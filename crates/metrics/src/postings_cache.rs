@@ -26,7 +26,6 @@ const DEFAULT_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 /// served, so a hot posting cannot remain visible past the records it points
 /// at.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60 * 60);
-const ENTRY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Every value of one label with its postings.
 type LabelPostings = Vec<(String, RoaringBitmap)>;
@@ -37,6 +36,9 @@ struct Versioned<T> {
     value: Arc<T>,
 }
 
+/// Its caches have no idle timeout: stamps invalidate what writes change, so
+/// entries leave only under capacity pressure, and an occasional long-range
+/// query finds its older buckets still resolved.
 pub(crate) struct PostingsCache {
     seq: AtomicU64,
     stamps: DashMap<TimeBucket, u64>,
@@ -55,7 +57,6 @@ impl PostingsCache {
             stamps: DashMap::new(),
             terms: Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, label): &(TimeBucket, Label), entry: &Versioned<Option<RoaringBitmap>>| {
                         let postings = entry
@@ -69,7 +70,6 @@ impl PostingsCache {
                 .build(),
             labels: Cache::builder()
                 .max_capacity(capacity_bytes)
-                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, name): &(TimeBucket, String), entry: &Versioned<LabelPostings>| {
                         let values: usize = entry
@@ -83,7 +83,6 @@ impl PostingsCache {
                 .build(),
             selectors: Cache::builder()
                 .max_capacity(selector_capacity_bytes)
-                .time_to_idle(ENTRY_IDLE_TIMEOUT)
                 .weigher(
                     |(_, key): &(TimeBucket, Arc<str>), entry: &Versioned<RoaringBitmap>| {
                         weight(key.len() + entry.value.serialized_size())
@@ -391,5 +390,13 @@ mod tests {
 
         // then
         assert!(cache.term(bucket, &term).await.is_none());
+    }
+
+    #[test]
+    fn should_keep_idle_entries_until_capacity_evicts_them() {
+        let cache = PostingsCache::new(None, DEFAULT_CAPACITY_BYTES);
+        assert_eq!(cache.terms.policy().time_to_idle(), None);
+        assert_eq!(cache.labels.policy().time_to_idle(), None);
+        assert_eq!(cache.selectors.policy().time_to_idle(), None);
     }
 }

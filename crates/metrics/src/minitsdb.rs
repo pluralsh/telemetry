@@ -116,11 +116,15 @@ where
     K: std::hash::Hash + Eq + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    fn new(capacity_bytes: u64, idle_timeout: Duration) -> Self {
+    /// Without an `idle_timeout`, tables leave only under capacity pressure.
+    fn new(capacity_bytes: u64, idle_timeout: Option<Duration>) -> Self {
+        let builder = moka::sync::Cache::builder().max_capacity(capacity_bytes);
+        let builder = match idle_timeout {
+            Some(idle_timeout) => builder.time_to_idle(idle_timeout),
+            None => builder,
+        };
         Self {
-            tables: moka::sync::Cache::builder()
-                .max_capacity(capacity_bytes)
-                .time_to_idle(idle_timeout)
+            tables: builder
                 .weigher(|_, table: &Arc<SeriesTable<V>>| {
                     let bytes = table.weighed.load(std::sync::atomic::Ordering::Relaxed);
                     u32::try_from(bytes.max(64)).unwrap_or(u32::MAX)
@@ -164,7 +168,9 @@ where
 /// is written once, when its series ID is allocated, and IDs are never
 /// reused within a bucket, so a cached spec stays valid for the bucket's
 /// lifetime; only found entries are cached, since a series may become
-/// visible later.
+/// visible later. Entries never go stale, so they leave only under capacity
+/// pressure: an idle timeout made every occasional long-range query, such
+/// as a 7-day dashboard opened hourly, re-resolve every bucket's series.
 pub(crate) struct ForwardIndexCache {
     specs: TableCache<(Namespace, TimeBucket), SeriesSpec>,
     fingerprints: TableCache<(Namespace, TimeBucket), u128>,
@@ -177,7 +183,6 @@ const FINGERPRINT_ENTRY_BYTES: u64 = 32;
 type ResolutionCacheKey = (Namespace, TimeBucket, u64, Arc<str>);
 
 pub(crate) const DEFAULT_FORWARD_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
-const FORWARD_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn spec_bytes(spec: &SeriesSpec) -> u64 {
     let labels: usize = spec
@@ -195,12 +200,11 @@ impl ForwardIndexCache {
         Self {
             specs: TableCache::new(
                 capacity_bytes.saturating_sub(resolution_bytes + fingerprint_bytes),
-                FORWARD_CACHE_IDLE_TIMEOUT,
+                None,
             ),
-            fingerprints: TableCache::new(fingerprint_bytes, FORWARD_CACHE_IDLE_TIMEOUT),
+            fingerprints: TableCache::new(fingerprint_bytes, None),
             resolutions: moka::future::Cache::builder()
                 .max_capacity(resolution_bytes)
-                .time_to_idle(FORWARD_CACHE_IDLE_TIMEOUT)
                 .weigher(
                     |(_, _, _, key): &ResolutionCacheKey,
                      resolution: &Arc<CachedSeriesResolution>| {
@@ -290,7 +294,7 @@ impl SeriesCache {
                     },
                 )
                 .build(),
-            series: TableCache::new(capacity_bytes - sets_bytes, SERIES_CACHE_IDLE_TIMEOUT),
+            series: TableCache::new(capacity_bytes - sets_bytes, Some(SERIES_CACHE_IDLE_TIMEOUT)),
         }
     }
 }
@@ -1636,6 +1640,21 @@ mod tests {
     use super::*;
     use crate::model::{Label, Sample, Series};
     use crate::storage::in_memory_storage;
+
+    #[test]
+    fn should_keep_forward_index_entries_until_capacity_evicts_them() {
+        // forward-index entries never go stale; decoded series tables of
+        // superseded generations are only reclaimed by going idle
+        let forward = ForwardIndexCache::new(DEFAULT_FORWARD_CACHE_CAPACITY_BYTES);
+        assert_eq!(forward.specs.tables.policy().time_to_idle(), None);
+        assert_eq!(forward.fingerprints.tables.policy().time_to_idle(), None);
+        assert_eq!(forward.resolutions.policy().time_to_idle(), None);
+        let series = SeriesCache::new(1 << 20);
+        assert_eq!(
+            series.series.tables.policy().time_to_idle(),
+            Some(SERIES_CACHE_IDLE_TIMEOUT)
+        );
+    }
 
     /// Create a MiniTsdb with a custom queue capacity.
     async fn load_with_config(
