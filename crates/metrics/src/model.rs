@@ -351,6 +351,14 @@ pub struct Series {
     pub histograms: Vec<HistogramSample>,
 }
 
+/// Longest label name, label value, unit, or description accepted on a
+/// series, in bytes of UTF-8. Stored strings carry a `u16` length.
+pub const MAX_SERIES_STRING_LEN: usize = u16::MAX as usize;
+
+/// Most labels (including `__name__`) accepted on a series. The forward
+/// index stores the count as a `u16`.
+pub const MAX_SERIES_LABELS: usize = u16::MAX as usize;
+
 impl Series {
     /// Creates a new series with the given name, labels, and samples.
     ///
@@ -403,6 +411,53 @@ impl Series {
     /// * `name` - The metric name.
     pub fn builder(name: impl Into<String>) -> SeriesBuilder {
         SeriesBuilder::new(name)
+    }
+
+    /// Rejects a series the storage encoding can't represent. Encoding one
+    /// panics in the flusher, which takes the namespace's writes down with it.
+    pub(crate) fn validate(&self) -> crate::error::Result<()> {
+        let invalid = |what: String| {
+            crate::error::Error::InvalidInput(format!(
+                "series {}: {what}",
+                self.labels
+                    .iter()
+                    .find(|l| l.name == "__name__")
+                    .map_or("<unnamed>", |l| l.value.as_str())
+            ))
+        };
+        if self.labels.len() > MAX_SERIES_LABELS {
+            return Err(invalid(format!(
+                "too many labels: {} (max {MAX_SERIES_LABELS})",
+                self.labels.len()
+            )));
+        }
+        let too_long = |what: &str, len: usize| {
+            invalid(format!(
+                "{what} is too long: {len} bytes (max {MAX_SERIES_STRING_LEN})"
+            ))
+        };
+        for label in &self.labels {
+            if label.name.len() > MAX_SERIES_STRING_LEN {
+                return Err(too_long("label name", label.name.len()));
+            }
+            if label.value.len() > MAX_SERIES_STRING_LEN {
+                return Err(too_long(
+                    &format!("value of label '{}'", label.name),
+                    label.value.len(),
+                ));
+            }
+        }
+        if let Some(unit) = &self.unit
+            && unit.len() > MAX_SERIES_STRING_LEN
+        {
+            return Err(too_long("unit", unit.len()));
+        }
+        if let Some(description) = &self.description
+            && description.len() > MAX_SERIES_STRING_LEN
+        {
+            return Err(too_long("description", description.len()));
+        }
+        Ok(())
     }
 
     /// Total float and histogram samples.

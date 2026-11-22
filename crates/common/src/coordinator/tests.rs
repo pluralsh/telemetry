@@ -119,6 +119,7 @@ impl Delta for TestDelta {
 struct TestFlusherState {
     flushed_events: Vec<Arc<EpochStamped<FrozenTestDelta>>>,
     delta_error: Option<String>,
+    delta_panic: Option<String>,
     storage_error: Option<String>,
     /// Signals when a flush starts (before blocking)
     flush_started_tx: Option<oneshot::Sender<()>>,
@@ -151,6 +152,7 @@ impl TestFlusher {
             state: Arc::new(Mutex::new(TestFlusherState {
                 flushed_events: Vec::new(),
                 delta_error: None,
+                delta_panic: None,
                 storage_error: None,
                 flush_started_tx: Some(started_tx),
                 unblock_rx: Some(unblock_rx),
@@ -164,6 +166,16 @@ impl TestFlusher {
         Self {
             state: Arc::new(Mutex::new(TestFlusherState {
                 delta_error: Some(error.to_string()),
+                ..Default::default()
+            })),
+            storage: Arc::new(InMemoryStorage::new()),
+        }
+    }
+
+    fn panicking_delta(message: &str) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TestFlusherState {
+                delta_panic: Some(message.to_string()),
                 ..Default::default()
             })),
             storage: Arc::new(InMemoryStorage::new()),
@@ -228,6 +240,10 @@ impl Flusher<TestDelta> for TestFlusher {
         }
         if let Some(error) = self.state.lock().unwrap().delta_error.clone() {
             return Err(error);
+        }
+        let delta_panic = self.state.lock().unwrap().delta_panic.clone();
+        if let Some(message) = delta_panic {
+            panic!("{message}");
         }
 
         // Write records to storage
@@ -1467,6 +1483,58 @@ async fn should_return_shutdown_error_after_coordinator_stops() {
 
     // then
     assert!(matches!(result, Err(WriteError::Shutdown)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_report_a_flusher_panic_to_waiting_and_later_writes() {
+    // given
+    let flusher = TestFlusher::panicking_delta("encoding overflow");
+    let mut coordinator = WriteCoordinator::new(
+        test_config(),
+        vec!["default".to_string()],
+        TestContext::default(),
+        flusher.initial_snapshot().await,
+        flusher.clone(),
+    );
+    let handle = coordinator.handle("default");
+    coordinator.start();
+
+    // when
+    let mut write = handle
+        .try_write(TestWrite {
+            key: "a".into(),
+            value: 1,
+            size: 10,
+        })
+        .await
+        .unwrap();
+    write.wait(Durability::Applied).await.unwrap();
+    handle.flush(false).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), write.wait(Durability::Written))
+        .await
+        .expect("Written waiter hung")
+        .unwrap_err();
+
+    // then
+    fn panicked<W>(error: &WriteError<W>) -> bool {
+        matches!(error, WriteError::FlushError(message) if message.contains("encoding overflow"))
+    }
+    assert!(panicked(&error), "unexpected error: {error:?}");
+    let later = handle
+        .try_write(TestWrite {
+            key: "b".into(),
+            value: 2,
+            size: 10,
+        })
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(panicked(&later), "unexpected error: {later:?}");
+    let stopped = coordinator.stop().await.unwrap_err();
+    assert!(
+        stopped.contains("encoding overflow"),
+        "unexpected error: {stopped}"
+    );
 }
 
 // ============================================================================

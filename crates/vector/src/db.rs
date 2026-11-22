@@ -164,6 +164,50 @@ pub struct VectorDb {
 /// Longest external id accepted, in bytes of UTF-8.
 pub const MAX_EXTERNAL_ID_LEN: usize = 256;
 
+/// Longest attribute name, string value, or string array element accepted,
+/// in bytes of UTF-8. Stored strings carry a `u16` length.
+pub const MAX_ATTRIBUTE_STRING_LEN: usize = u16::MAX as usize;
+
+/// Most elements accepted in an array attribute, and most attributes
+/// (including the vector) accepted on one row. Both are stored with a `u16`
+/// count.
+pub const MAX_ATTRIBUTE_COUNT: usize = u16::MAX as usize;
+
+/// Rejects an attribute the storage encoding can't represent. Encoding one
+/// panics in the flusher, which takes the namespace's writes down with it.
+pub(crate) fn validate_attribute(name: &str, value: &AttributeValue) -> Result<()> {
+    if name.len() > MAX_ATTRIBUTE_STRING_LEN {
+        return Err(Error::InvalidInput(format!(
+            "attribute name too long: {} bytes (max {MAX_ATTRIBUTE_STRING_LEN})",
+            name.len()
+        )));
+    }
+    let too_long = |len: usize| {
+        Error::InvalidInput(format!(
+            "attribute '{name}' is too long: {len} bytes (max {MAX_ATTRIBUTE_STRING_LEN})"
+        ))
+    };
+    let too_many = |len: usize| {
+        Error::InvalidInput(format!(
+            "attribute '{name}' has too many elements: {len} (max {MAX_ATTRIBUTE_COUNT})"
+        ))
+    };
+    match value {
+        AttributeValue::String(s) if s.len() > MAX_ATTRIBUTE_STRING_LEN => Err(too_long(s.len())),
+        AttributeValue::StringArray(vs) if vs.len() > MAX_ATTRIBUTE_COUNT => {
+            Err(too_many(vs.len()))
+        }
+        AttributeValue::StringArray(vs) => {
+            match vs.iter().find(|s| s.len() > MAX_ATTRIBUTE_STRING_LEN) {
+                Some(s) => Err(too_long(s.len())),
+                None => Ok(()),
+            }
+        }
+        AttributeValue::Int64Array(vs) if vs.len() > MAX_ATTRIBUTE_COUNT => Err(too_many(vs.len())),
+        _ => Ok(()),
+    }
+}
+
 /// Aborts the wrapped background task when dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -746,6 +790,15 @@ impl VectorDb {
 
         // Convert attributes to map for validation
         let attributes = attributes_to_map(&vector.attributes);
+        if attributes.len() > MAX_ATTRIBUTE_COUNT {
+            return Err(Error::InvalidInput(format!(
+                "too many attributes: {} (max {MAX_ATTRIBUTE_COUNT})",
+                attributes.len()
+            )));
+        }
+        for (name, value) in &attributes {
+            validate_attribute(name, value)?;
+        }
 
         // Extract and validate "vector" attribute
         let values = match attributes.get(VECTOR_FIELD_NAME) {
@@ -1199,6 +1252,49 @@ mod tests {
         let dict_key1 = IdDictionaryKey::new("vec-1").encode();
         let dict_entry1 = storage.get(dict_key1).await.unwrap();
         assert!(dict_entry1.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_reject_attributes_too_long_to_store_and_keep_writing() {
+        // given
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            VectorDbMergeOperator::new(3),
+        )));
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            create_test_config(),
+            create_test_centroids(3),
+            Some(crate::storage::compaction_scheduler::FtsDeleteTracker::shared()),
+        )
+        .await
+        .unwrap();
+        let oversized = "x".repeat(MAX_ATTRIBUTE_STRING_LEN + 1);
+
+        // when
+        let result = db
+            .write(vec![
+                Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+                    .attribute("category", oversized.as_str())
+                    .build(),
+            ])
+            .await;
+
+        // then - rejected up front, and the db still flushes later writes
+        let err = result.expect_err("expected InvalidInput");
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+        db.write(vec![
+            Vector::builder("vec-2", vec![0.0, 1.0, 0.0])
+                .attribute("category", "x".repeat(MAX_ATTRIBUTE_STRING_LEN).as_str())
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("vec-1").await.unwrap().is_none());
+        assert!(db.get("vec-2").await.unwrap().is_some());
     }
 
     #[tokio::test]

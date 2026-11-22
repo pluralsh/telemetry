@@ -91,6 +91,23 @@ impl EncodedTrace {
     }
 }
 
+/// Most [`Trace::encoded_len`] a trace may have to fit a page of
+/// `max_size_bytes` on its own, even incompressible: snappy can expand `n`
+/// bytes to `32 + n + n / 6`.
+pub(crate) fn max_continuation_bytes(max_size_bytes: usize) -> usize {
+    max_size_bytes.saturating_sub(HEADER_LEN + DIRECTORY_ENTRY_LEN + 32) / 7 * 6
+}
+
+/// Whether `trace` fits a page of `max_size_bytes` on its own. Only traces
+/// too large to fit whatever their compression are compressed to check.
+pub(crate) fn fits_page_alone(trace: &Trace, max_size_bytes: usize) -> Result<bool> {
+    if trace.encoded_len() <= max_continuation_bytes(max_size_bytes) {
+        return Ok(true);
+    }
+    let compressed = snap::raw::Encoder::new().compress_vec(&encode_trace(trace)?)?;
+    Ok(page_len(1, compressed.len()).is_some_and(|len| len <= max_size_bytes))
+}
+
 fn page_len(traces: usize, payload_bytes: usize) -> Option<usize> {
     HEADER_LEN
         .checked_add(traces.checked_mul(DIRECTORY_ENTRY_LEN)?)?

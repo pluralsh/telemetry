@@ -114,6 +114,59 @@ async fn should_ingest_and_query_single_bucket() {
 }
 
 #[tokio::test]
+async fn should_reject_series_too_long_to_store_and_keep_flushing() {
+    // given
+    let storage = Arc::new(in_memory_storage().await);
+    let tsdb = Tsdb::new(storage);
+    let max = crate::model::MAX_SERIES_STRING_LEN;
+    let oversized = "x".repeat(max + 1);
+    let mut long_unit = create_sample("http_requests", vec![], 4000000, 1.0);
+    long_unit.unit = Some(oversized.clone());
+
+    // when / then - each batch is rejected before anything is ingested
+    for batch in [
+        vec![
+            create_sample("http_requests", vec![("env", "prod")], 4000000, 1.0),
+            create_sample("http_requests", vec![("env", &oversized)], 4000000, 2.0),
+        ],
+        vec![create_sample(
+            "http_requests",
+            vec![(&oversized, "prod")],
+            4000000,
+            1.0,
+        )],
+        vec![long_unit],
+    ] {
+        let err = tsdb.ingest_samples(batch, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+    let fits = "x".repeat(max);
+    tsdb.ingest_samples(
+        vec![create_sample(
+            "http_requests",
+            vec![("env", &fits)],
+            4000000,
+            3.0,
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+    tsdb.flush().await.unwrap();
+
+    let reader = tsdb.query_reader(3600, 7200).await.unwrap();
+    let terms = vec![Label::metric_name("http_requests")];
+    let index = reader
+        .inverted_index(&TimeBucket::hour(60), &terms)
+        .await
+        .unwrap();
+    assert_eq!(index.intersect(terms).iter().count(), 1);
+}
+
+#[tokio::test]
 async fn should_match_per_series_reads_for_batched_scans() {
     // given: two metrics with interleaved series ids, so `m`'s forward-index
     // id range also covers `other`'s series

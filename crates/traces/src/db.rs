@@ -101,6 +101,7 @@ const CATALOG_VALUES_CACHE_BYTES: usize = 32 << 20;
 /// A point get costs about as much as reading seven adjacent small records,
 /// so wider gaps are cheaper as separate reads.
 const METADATA_SCAN_MAX_GAP: u64 = 6;
+use crate::page::{fits_page_alone, max_continuation_bytes};
 use crate::sidecar::PageColumns;
 use crate::traceql::{
     IndexField, IndexPredicate, IndexTest, PushdownClause, TraceFilter, span_intrinsics,
@@ -195,6 +196,8 @@ pub struct TraceDb {
     /// Holds on the merges of segments a rollup copies into.
     merge_holds: MergeHolds,
     retention: Option<Duration>,
+    /// `PageConfig::max_size_bytes`, which writes split traces to fit.
+    max_page_bytes: usize,
 }
 
 impl TraceDb {
@@ -343,6 +346,7 @@ impl TraceDb {
             rollup_lock: Mutex::new(()),
             merge_holds,
             retention: config.retention,
+            max_page_bytes: config.page.max_size_bytes,
         })
     }
 
@@ -392,6 +396,7 @@ impl TraceDb {
             rollup_lock: Mutex::new(()),
             merge_holds: MergeHolds::default(),
             retention: config.retention,
+            max_page_bytes: config.page.max_size_bytes,
         })
     }
 
@@ -480,6 +485,17 @@ impl TraceDb {
         wait: Option<Duration>,
     ) -> Result<WriteReport> {
         for traces in groups.values_mut() {
+            // A trace too large for a page fails its flush, which stops the
+            // writer, so it is split into continuations that fit here.
+            let mut fitted = Vec::with_capacity(traces.len());
+            for trace in std::mem::take(traces) {
+                if fits_page_alone(&trace, self.max_page_bytes)? {
+                    fitted.push(trace);
+                } else {
+                    fitted.extend(trace.split(max_continuation_bytes(self.max_page_bytes))?);
+                }
+            }
+            *traces = fitted;
             traces.sort_by_key(|trace| (trace.timestamp_range().0, trace.trace_id));
         }
         let bytes = groups

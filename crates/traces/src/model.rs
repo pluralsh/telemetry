@@ -6,8 +6,9 @@ use std::{fmt, str::FromStr};
 
 use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, any_value},
-    trace::v1::{ResourceSpans, Span},
+    trace::v1::{ResourceSpans, ScopeSpans, Span},
 };
+use prost::Message;
 
 use crate::{Error, Result};
 
@@ -106,6 +107,85 @@ impl Trace {
             ));
         }
         Ok(trace)
+    }
+
+    /// Bytes of this trace in a page before compression.
+    pub fn encoded_len(&self) -> usize {
+        4 + self
+            .resource_spans
+            .iter()
+            .map(|resource| 4 + resource.encoded_len())
+            .sum::<usize>()
+    }
+
+    /// Splits into continuations of at most `max_bytes` of
+    /// [`Self::encoded_len`] each, in span order, every span keeping its
+    /// resource and scope. Fails on a span too large to fit on its own.
+    pub fn split(self, max_bytes: usize) -> Result<Vec<Self>> {
+        if self.encoded_len() <= max_bytes {
+            return Ok(vec![self]);
+        }
+        let spans = self.spans().count();
+        if spans <= 1 {
+            return Err(Error::Invalid(format!(
+                "trace {}: span is {} bytes encoded, more than the {max_bytes} a trace page holds",
+                self.trace_id,
+                self.encoded_len()
+            )));
+        }
+        let (first, rest) = self.split_at(spans / 2);
+        let mut continuations = first.split(max_bytes)?;
+        continuations.extend(rest.split(max_bytes)?);
+        Ok(continuations)
+    }
+
+    /// The first `at` spans and the rest.
+    fn split_at(self, at: usize) -> (Self, Self) {
+        let (mut first, mut rest) = (Vec::new(), Vec::new());
+        let mut seen = 0;
+        for mut resource in self.resource_spans {
+            let (mut first_scopes, mut rest_scopes) = (Vec::new(), Vec::new());
+            for mut scope in std::mem::take(&mut resource.scope_spans) {
+                let mut spans = std::mem::take(&mut scope.spans);
+                let later = spans.split_off(at.saturating_sub(seen).min(spans.len()));
+                seen += spans.len() + later.len();
+                if !spans.is_empty() {
+                    first_scopes.push(ScopeSpans {
+                        spans,
+                        ..scope.clone()
+                    });
+                }
+                if !later.is_empty() {
+                    rest_scopes.push(ScopeSpans {
+                        spans: later,
+                        ..scope
+                    });
+                }
+            }
+            if !first_scopes.is_empty() {
+                first.push(ResourceSpans {
+                    scope_spans: first_scopes,
+                    ..resource.clone()
+                });
+            }
+            if !rest_scopes.is_empty() {
+                rest.push(ResourceSpans {
+                    scope_spans: rest_scopes,
+                    ..resource
+                });
+            }
+        }
+        let trace_id = self.trace_id;
+        (
+            Self {
+                trace_id,
+                resource_spans: first,
+            },
+            Self {
+                trace_id,
+                resource_spans: rest,
+            },
+        )
     }
 
     pub fn spans(&self) -> impl Iterator<Item = &Span> {

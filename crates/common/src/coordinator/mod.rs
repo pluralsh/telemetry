@@ -285,11 +285,26 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     }
 
     /// Run the coordinator event loop.
+    ///
+    /// A coordinator that stops on an error, including a panic in either
+    /// task, records it as the terminal error so writers see why it stopped
+    /// instead of a bare [`WriteError::Shutdown`].
     pub fn run(
         mut self,
         flush_task_jh: tokio::task::JoinHandle<WriteResult<()>>,
     ) -> tokio::task::JoinHandle<Result<(), String>> {
-        tokio::task::spawn(async move { self.run_coordinator(flush_task_jh).await })
+        let watermarks = self.watermarks.clone();
+        let task = tokio::task::spawn(async move { self.run_coordinator(flush_task_jh).await });
+        tokio::task::spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|e| Err(format!("write coordinator panicked: {e}")));
+            if let Err(error) = &result {
+                tracing::error!(%error, "write coordinator stopped");
+                watermarks.fail_flush(error.clone());
+            }
+            result
+        })
     }
 
     async fn run_coordinator(

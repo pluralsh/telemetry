@@ -567,6 +567,9 @@ impl Tsdb {
         series_list: Vec<Series>,
         timeout: Option<Duration>,
     ) -> Result<()> {
+        for series in &series_list {
+            series.validate()?;
+        }
         if !series_list.is_empty() {
             self.discovery_cache.clear();
         }

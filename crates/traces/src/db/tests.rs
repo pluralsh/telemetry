@@ -469,6 +469,85 @@ async fn duplicate_and_continuation_writes_merge_without_losing_spans() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn splits_traces_too_large_for_a_page_and_rejects_oversized_spans() {
+    // given - incompressible spans over two resources, ~4x the page limit
+    let db = TraceDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::default();
+    let trace_id = TraceId::new([7; 16]).unwrap();
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = |bytes: usize| {
+        (0..bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'!' + (state % 90) as u8)
+            })
+            .collect::<String>()
+    };
+    let span = |index: u64, payload: String| Span {
+        trace_id: trace_id.as_bytes().to_vec(),
+        span_id: (index + 1).to_be_bytes().to_vec(),
+        name: format!("span-{index}"),
+        start_time_unix_nano: 10 + index,
+        end_time_unix_nano: 20 + index,
+        attributes: vec![attr("payload", any_value::Value::StringValue(payload))],
+        ..Default::default()
+    };
+    let resource = |spans: Vec<Span>| ResourceSpans {
+        scope_spans: vec![ScopeSpans {
+            spans,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let large = Trace::new(
+        trace_id,
+        vec![
+            resource((0..32).map(|i| span(i, noise(8 * 1024))).collect()),
+            resource((32..64).map(|i| span(i, noise(8 * 1024))).collect()),
+        ],
+    )
+    .unwrap();
+    assert!(large.encoded_len() > 4 * test_config().page.max_size_bytes);
+
+    // when
+    db.write(&namespace, vec![TraceBatch::new(vec![large])])
+        .await
+        .unwrap();
+
+    // then - every span is stored, as several continuations
+    let stored = db.get_trace(&namespace, trace_id).await.unwrap().unwrap();
+    assert_eq!(stored.spans().count(), 64);
+    assert!(head(&db, &namespace, trace_id).await.pages > 1);
+
+    // and a span too large for any page is rejected without stopping writes
+    let oversized =
+        Trace::new(trace_id, vec![resource(vec![span(64, noise(256 * 1024))])]).unwrap();
+    let err = db
+        .write(&namespace, vec![TraceBatch::new(vec![oversized])])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("trace page"),
+        "unexpected error: {err}"
+    );
+    db.write(
+        &namespace,
+        vec![TraceBatch::new(vec![trace(
+            8,
+            10,
+            "after",
+            Vec::new(),
+            Vec::new(),
+        )])],
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+}
+
 #[test]
 fn shard_merge_drops_spans_resent_to_both_shards() {
     let first = trace(1, 10, "first", Vec::new(), Vec::new());

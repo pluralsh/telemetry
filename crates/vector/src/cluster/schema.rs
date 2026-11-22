@@ -313,6 +313,7 @@ pub(crate) fn parse_attribute(
         ),
         None => infer_attribute(name, value)?,
     };
+    crate::db::validate_attribute(name, &parsed)?;
     Ok(Some(parsed))
 }
 
@@ -507,6 +508,36 @@ mod tests {
                 false
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn should_reject_strings_too_long_to_store() {
+        // given
+        let max = crate::db::MAX_ATTRIBUTE_STRING_LEN;
+        let fits = "x".repeat(max);
+        let oversized = "x".repeat(max + 1);
+        let mut inferred = BTreeMap::new();
+        let mut parse = |row: Value| {
+            parse_row(
+                row.as_object().unwrap(),
+                Some(&meta()),
+                &mut inferred,
+                false,
+            )
+        };
+
+        // when / then
+        assert!(parse(json!({"id": "a", "data": fits})).is_ok());
+        let err = parse(json!({"id": "a", "data": oversized.clone()})).unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+        let err = parse(json!({"id": "a", "tags": ["ok", oversized]})).unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
         );
     }
 
