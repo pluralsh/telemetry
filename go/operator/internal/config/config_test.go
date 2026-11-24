@@ -302,7 +302,7 @@ func TestRenderInfersIOConcurrencyFromComponentMemoryRequests(t *testing.T) {
 	if !strings.Contains(string(result.Data[ReaderKey]), "io_concurrency_limit: 384") {
 		t.Fatalf("reader config did not infer I/O concurrency from its memory request:\n%s", result.Data[ReaderKey])
 	}
-	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 193273524") {
+	if !strings.Contains(string(result.Data[ReaderKey]), "forward_index_cache_capacity_bytes: 171127602") {
 		t.Fatalf("reader config did not infer forward-index capacity from its memory limit:\n%s", result.Data[ReaderKey])
 	}
 }
@@ -855,8 +855,8 @@ func TestRenderSizesMetricsMemoryFromTheLimit(t *testing.T) {
 	}
 	reader := string(result.Data[ReaderKey])
 	for _, expected := range []string{
-		"memory_capacity: 1771673992", "reader_cache_capacity: 1073741824",
-		"max_concurrent: 4", "max_memory_bytes: 1073741824", "memory_budget_bytes: 2576980352",
+		"memory_capacity: 1690472278", "reader_cache_capacity: 1073741824",
+		"max_concurrent: 4", "max_memory_bytes: 1073741824", "memory_budget_bytes: 2458868768",
 	} {
 		if !strings.Contains(reader, expected) {
 			t.Errorf("reader config missing %q:\n%s", expected, reader)
@@ -924,8 +924,8 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 	// Writer: its read caches and query budget at their floors, 512Mi of
 	// its reservation for request bodies, and compaction's 640Mi floor
 	// above its doubled 20% of (6Gi - 1.5Gi headroom - 1.75Gi reserved).
-	// Reader: (2Gi - 768Mi headroom - 800Mi reserved) / 100 per percent,
-	// with what is left of its 64Mi for request bodies, and compaction's floor at a
+	// Reader: (2Gi - 768Mi headroom - 640Mi reserved, the cap on its 1184Mi) / 100 per percent,
+	// with 640/1184 of its 64Mi for request bodies, and compaction's floor at a
 	// quarter of the 640Mi shared.
 	for key, expected := range map[string][]string{
 		LogsKey: {
@@ -936,7 +936,7 @@ func TestRenderSizesLogsMemoryAroundItsReservations(t *testing.T) {
 		ReaderKey: {
 			"memory_capacity: 147639492", "reader_cache_capacity: 161061264",
 			"result_cache_capacity: 40265316", "max_in_flight_query_bytes: 107374176",
-			"max_in_flight_body_bytes: 53477376", "compaction_bytes: 167772160",
+			"max_in_flight_body_bytes: 36700160", "compaction_bytes: 167772160",
 		},
 	} {
 		rendered := string(result.Data[key])

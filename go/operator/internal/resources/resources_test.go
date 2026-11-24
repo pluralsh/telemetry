@@ -973,3 +973,18 @@ func TestValidateMemoryRejectsWritersTooSmallForARollup(t *testing.T) {
 		t.Fatalf("6Gi writer with a small reader rejected: %v", err)
 	}
 }
+
+func TestValidateVolumeRejectsMemoryBackedCache(t *testing.T) {
+	memory := telemetryv1alpha1.VolumeSpec{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}
+	var volumeErr *VolumeError
+	if err := validateVolume(Component("reader"), volumeCache, memory); !errors.As(err, &volumeErr) {
+		t.Fatalf("memory-backed cache volume accepted: %v", err)
+	}
+	if err := validateVolume(Component("reader"), volumeData, memory); err != nil {
+		t.Fatalf("data volume rejected: %v", err)
+	}
+	disk := telemetryv1alpha1.VolumeSpec{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+	if err := validateVolume(Component("reader"), volumeCache, disk); err != nil {
+		t.Fatalf("disk-backed emptyDir rejected: %v", err)
+	}
+}

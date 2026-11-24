@@ -773,6 +773,9 @@ func volumeSpec(configured *telemetryv1alpha1.VolumeSpec, size resource.Quantity
 }
 
 func validateVolume(component Component, volume string, spec telemetryv1alpha1.VolumeSpec) error {
+	if volume == volumeCache && spec.EmptyDir != nil && spec.EmptyDir.Medium == corev1.StorageMediumMemory {
+		return &VolumeError{Component: component, Volume: volume, Reason: "emptyDir medium Memory counts against the container memory limit; the cache disk tier must not live in memory"}
+	}
 	if spec.PersistentVolumeClaim == nil {
 		return nil
 	}

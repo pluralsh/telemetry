@@ -153,6 +153,8 @@ func Render(input Input) (Result, error) {
 		}
 		if mode != modeReader {
 			plan.reserved, plan.writes, plan.writeFactor = metricsWriterReserved, metricsWriterWrites, metricsResidentPerWriteByte
+		} else {
+			plan.reserved = readerWarming
 		}
 		return yaml.Marshal(renderConfig{
 			Mode:                           mode,
@@ -483,6 +485,8 @@ func renderTraces(input Input) (Result, error) {
 			plan.reserved, plan.writes, plan.writeFactor = tracesWriterReserved, tracesWriterWrites, tracesResidentPerWriteByte
 			plan.l0Uploads = writerL0Uploads(plan.cores, plan.limit)
 			plan.reserved += extraL0Uploads(plan.l0Uploads) * writerBytesPerL0Upload
+		} else {
+			plan.reserved = readerWarming
 		}
 		return yaml.Marshal(renderTracesConfig{
 			Mode:       component,
@@ -866,11 +870,16 @@ const (
 	metricsWriterReserved       = metricsWriterWrites + writerMemtables + writerBodies
 )
 
+// readerWarming is what cache warming and the foyer disk tier hold outside
+// the cache budgets of every product's reader: a warm's in-flight blocks, at
+// most 256 MiB, the disk tier's 64 MiB submit queue and its buffer pool.
+const readerWarming = 256*mebibyte + 64*mebibyte + 32*mebibyte
+
 const (
 	logsWriterBodies   = 512 * mebibyte
 	logsReaderBodies   = 64 * mebibyte
 	logsWriterFixed    = 1096 * mebibyte
-	logsReaderReserved = 736*mebibyte + logsReaderBodies
+	logsReaderReserved = 736*mebibyte + logsReaderBodies + readerWarming
 	// logsWriteBytesPerCore is the logs write budget per core, at least
 	// logsMinWriteBytes. The budget holds what ingest has applied until its
 	// flush is written, so it must grow with the ingest rate a writer's
