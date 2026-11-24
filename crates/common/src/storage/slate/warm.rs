@@ -166,7 +166,17 @@ pub fn index_estimate(info: &SsTableInfo) -> u64 {
 /// Cached blocks are decompressed; the factor is a reservation only,
 /// replaced by the measured weight once warmed.
 pub fn payload_estimate(info: &SsTableInfo) -> u64 {
-    let data_end = [
+    if info.compression_codec.is_some() {
+        data_len(info).saturating_mul(2)
+    } else {
+        data_len(info)
+    }
+}
+
+/// The encoded length of an SST's data section, which ends where its filter,
+/// index or stats begin.
+fn data_len(info: &SsTableInfo) -> u64 {
+    [
         Some(info.index_offset),
         (info.filter_len > 0).then_some(info.filter_offset),
         (info.stats_len > 0).then_some(info.stats_offset),
@@ -174,12 +184,7 @@ pub fn payload_estimate(info: &SsTableInfo) -> u64 {
     .into_iter()
     .flatten()
     .min()
-    .unwrap_or(0);
-    if info.compression_codec.is_some() {
-        data_end.saturating_mul(2)
-    } else {
-        data_end
-    }
+    .unwrap_or(0)
 }
 
 /// Where an SST ranks in [`warm_planned`]: higher warms first and keeps its
@@ -220,17 +225,28 @@ impl PartialOrd for WarmRank {
     }
 }
 
+/// Data blocks to read in one go, and their encoded length.
+#[derive(Clone, Debug)]
+pub struct Run {
+    pub target: CacheTarget,
+    /// Encoded bytes of the blocks, which SlateDB reads and then decodes
+    /// all at once.
+    pub bytes: u64,
+}
+
 /// Tells which of the data blocks an SST's targets would warm a data cache
 /// lacks, without reading any.
 #[async_trait::async_trait]
 pub trait PayloadResidency: Send + Sync {
-    /// Data targets covering just the blocks of `targets` the cache lacks:
-    /// empty when it holds them all, `None` when it cannot tell.
+    /// Runs covering just the blocks of `targets` the cache lacks, none
+    /// longer than `max_run_bytes` unless a single block is: empty when it
+    /// holds them all, `None` when it cannot tell.
     async fn missing(
         &self,
         sst: &SsTableHandle,
         targets: &[CacheTarget],
-    ) -> Option<Vec<CacheTarget>>;
+        max_run_bytes: u64,
+    ) -> Option<Vec<Run>>;
 }
 
 /// [`PayloadResidency`] from an SST's block index and the data cache's own
@@ -247,7 +263,8 @@ impl PayloadResidency for IndexResidency {
         &self,
         sst: &SsTableHandle,
         targets: &[CacheTarget],
-    ) -> Option<Vec<CacheTarget>> {
+        max_run_bytes: u64,
+    ) -> Option<Vec<Run>> {
         let ranges: Vec<_> = targets
             .iter()
             .filter_map(|target| match target {
@@ -260,38 +277,52 @@ impl PayloadResidency for IndexResidency {
         }
         let file = self.reader.open_with_handle(sst.clone()).ok()?;
         let index = file.index().await.ok()?;
+        let data_len = data_len(&sst.info);
         let mut missing = Vec::new();
-        let mut run: Option<Bytes> = None;
+        let mut run: Option<(Bytes, u64)> = None;
         let mut blocks = index.iter().peekable();
         while let Some((offset, first)) = blocks.next() {
-            let next = blocks.peek().map(|(_, key)| *key);
-            let lacking = ranges.iter().any(|range| overlaps(first, next, range))
+            let next = blocks.peek().map(|(offset, key)| (*offset, *key));
+            let len = next
+                .map_or(data_len, |(next, _)| next)
+                .saturating_sub(offset);
+            let lacking = ranges
+                .iter()
+                .any(|range| overlaps(first, next.map(|(_, key)| key), range))
                 && !self.data.holds(sst.id, offset);
-            match (lacking, &run) {
-                (true, None) => run = Some(Bytes::copy_from_slice(first)),
-                (false, Some(start)) if first > start.as_ref() => {
-                    let start = run.take().expect("matched");
-                    missing.push(block_run(start, Some(first)));
+            let close = run.as_ref().is_some_and(|(start, bytes)| {
+                (!lacking || bytes.saturating_add(len) > max_run_bytes) && first > start.as_ref()
+            });
+            if close {
+                let (start, bytes) = run.take().expect("matched");
+                missing.push(block_run(start, Some(first), bytes));
+            }
+            if lacking {
+                match &mut run {
+                    None => run = Some((Bytes::copy_from_slice(first), len)),
+                    Some((_, bytes)) => *bytes += len,
                 }
-                _ => {}
             }
         }
-        if let Some(start) = run {
-            missing.push(block_run(start, None));
+        if let Some((start, bytes)) = run {
+            missing.push(block_run(start, None, bytes));
         }
         Some(missing)
     }
 }
 
-/// The data target of the blocks from the one starting at `start` up to,
-/// not including, the one starting at `end`.
-fn block_run(start: Bytes, end: Option<&[u8]>) -> CacheTarget {
-    CacheTarget::Data((
-        Bound::Included(start),
-        end.map_or(Bound::Unbounded, |end| {
-            Bound::Excluded(Bytes::copy_from_slice(end))
-        }),
-    ))
+/// The run of the blocks from the one starting at `start` up to, not
+/// including, the one starting at `end`, of `bytes` encoded bytes.
+fn block_run(start: Bytes, end: Option<&[u8]>, bytes: u64) -> Run {
+    Run {
+        target: CacheTarget::Data((
+            Bound::Included(start),
+            end.map_or(Bound::Unbounded, |end| {
+                Bound::Excluded(Bytes::copy_from_slice(end))
+            }),
+        )),
+        bytes,
+    }
 }
 
 /// How much of an SST's data blocks the data cache already held when the
@@ -818,10 +849,13 @@ pub struct WarmBudget {
 pub struct PayloadBudget {
     /// Data-cache bytes the warmer may hold.
     pub bytes: u64,
-    /// Data-block bytes being warmed at once, of SSTs in flight, beyond
-    /// which no other SST's data blocks start: SlateDB reads an SST's data
-    /// blocks in one go and holds them until they are all cached. One SST
-    /// always may.
+    /// Transient memory the data blocks being warmed may hold at once.
+    /// SlateDB reads a run of blocks in one go, decodes them all, and only
+    /// then caches them, so a run holds its encoded bytes and its decoded
+    /// blocks until it ends. [`Transient`] charges each run that, from the
+    /// SST's block index and the decoded size of what was warmed so far,
+    /// and splits an SST into runs that fit a share of this, so no SST,
+    /// however large, holds more.
     pub in_flight_bytes: u64,
     /// Whether the data cache measures warmed bytes (a hybrid cache, see
     /// [`warming_payloads`]); otherwise each SST is charged its estimate.
@@ -833,8 +867,10 @@ fn share(bytes: u64, percent: u8) -> u64 {
     (u128::from(bytes) * u128::from(percent.min(100)) / 100) as u64
 }
 
-/// Least [`PayloadBudget::in_flight_bytes`] derived from a data cache.
+/// Least and most [`PayloadBudget::in_flight_bytes`] derived from a data
+/// cache. The operator reserves the most for warming in a reader's memory.
 const MIN_IN_FLIGHT_PAYLOAD_BYTES: u64 = 16 << 20;
+pub const MAX_IN_FLIGHT_PAYLOAD_BYTES: u64 = 256 << 20;
 
 impl PayloadBudget {
     pub const UNBOUNDED: Self = Self {
@@ -862,7 +898,7 @@ impl PayloadBudget {
     /// `percent` (else [`Self::default_percent`]) of the tier of `cache`'s
     /// data cache that warming fills: the disk of a hybrid cache, whose
     /// warming skips memory, or else memory. Data blocks in flight are
-    /// bounded by a quarter of its memory. `None` when it has no data
+    /// bounded by a quarter of its memory, at most [`MAX_IN_FLIGHT_PAYLOAD_BYTES`]. `None` when it has no data
     /// cache, which then caches no data blocks.
     pub fn of(cache: &SharedDbCache, percent: Option<u8>) -> Option<Self> {
         let data = cache.data()?;
@@ -872,9 +908,113 @@ impl PayloadBudget {
         let percent = percent.unwrap_or_else(|| Self::default_percent(data));
         Some(Self {
             bytes: share(filled, percent),
-            in_flight_bytes: (data.memory_capacity_bytes / 4).max(MIN_IN_FLIGHT_PAYLOAD_BYTES),
+            in_flight_bytes: (data.memory_capacity_bytes / 4)
+                .clamp(MIN_IN_FLIGHT_PAYLOAD_BYTES, MAX_IN_FLIGHT_PAYLOAD_BYTES),
             measured: data.disk_capacity_bytes.is_some(),
         })
+    }
+}
+
+/// Bounds the transient memory of data-block warming: a pool of bytes that
+/// each run of blocks borrows while SlateDB holds it, charged by what the
+/// run's encoded blocks decode to.
+struct Transient {
+    pool: tokio::sync::Semaphore,
+    /// Pool size, in [`Self::UNIT`]s.
+    units: u32,
+    /// Decoded bytes per encoded byte of what warmed so far, times 1000;
+    /// 0 until a run measures it.
+    decoded_milli: AtomicU64,
+    concurrency: u64,
+}
+
+impl Transient {
+    const UNIT: u64 = 1024;
+    /// What a run's blocks decode to, per encoded byte, before one is
+    /// measured: compressed blocks inflate, others are copied once.
+    const COMPRESSED_DECODED: f64 = 2.0;
+    const PLAIN_DECODED: f64 = 1.0;
+
+    fn new(bytes: u64, concurrency: usize) -> Self {
+        let units = bytes.div_ceil(Self::UNIT).clamp(
+            1,
+            u64::from(u32::MAX).min(tokio::sync::Semaphore::MAX_PERMITS as u64),
+        ) as u32;
+        Self {
+            pool: tokio::sync::Semaphore::new(units as usize),
+            units,
+            decoded_milli: AtomicU64::new(0),
+            concurrency: concurrency.max(1) as u64,
+        }
+    }
+
+    fn decoded(&self, compressed: bool) -> f64 {
+        match self.decoded_milli.load(Ordering::Relaxed) {
+            0 if compressed => Self::COMPRESSED_DECODED,
+            0 => Self::PLAIN_DECODED,
+            milli => milli as f64 / 1000.0,
+        }
+    }
+
+    /// Transient bytes a run of `encoded` bytes holds: those read, and
+    /// what they decode to.
+    fn cost(&self, encoded: u64, compressed: bool) -> u64 {
+        (encoded as f64 * (1.0 + self.decoded(compressed))).ceil() as u64
+    }
+
+    /// The most encoded bytes one run may have so that `concurrency` of
+    /// them fit the pool.
+    fn max_run(&self, compressed: bool) -> u64 {
+        let share = u64::from(self.units) * Self::UNIT / self.concurrency;
+        ((share as f64 / (1.0 + self.decoded(compressed))) as u64).max(1)
+    }
+
+    /// Waits for `cost` bytes of the pool, or all of it when `cost` exceeds
+    /// it: a single block over the pool still warms, alone.
+    async fn borrow(&self, cost: u64) -> tokio::sync::SemaphorePermit<'_> {
+        let units = cost.div_ceil(Self::UNIT).clamp(1, u64::from(self.units)) as u32;
+        self.pool
+            .acquire_many(units)
+            .await
+            .expect("the pool is never closed")
+    }
+
+    /// Learns from a run that decoded `decoded` bytes out of `encoded`.
+    fn observe(&self, decoded: u64, encoded: u64) {
+        if decoded == 0 || encoded == 0 {
+            return;
+        }
+        let milli = (decoded as f64 / encoded as f64 * 1000.0).clamp(500.0, 16_000.0) as u64;
+        let _ = self
+            .decoded_milli
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(if old == 0 {
+                    milli
+                } else {
+                    (old * 3 + milli) / 4
+                })
+            });
+    }
+
+    /// Warms `chunks` of `id`'s data blocks one at a time, each holding its
+    /// share of the pool while it reads. `read` totals what they cached.
+    async fn warm(
+        &self,
+        db: &WarmDb,
+        id: SsTableId,
+        compressed: bool,
+        chunks: Vec<(Vec<CacheTarget>, u64)>,
+        read: &Arc<AtomicU64>,
+    ) -> Result<(), slatedb::Error> {
+        for (targets, encoded) in chunks {
+            let _held = self.borrow(self.cost(encoded, compressed)).await;
+            let chunk = Arc::new(AtomicU64::new(0));
+            warming_payloads(Arc::clone(&chunk), db.warm_sst(id, &targets)).await?;
+            let decoded = chunk.load(Ordering::Relaxed);
+            read.fetch_add(decoded, Ordering::Relaxed);
+            self.observe(decoded, encoded);
+        }
+        Ok(())
     }
 }
 
@@ -913,8 +1053,9 @@ impl WarmBudget {
 /// hybrid cache's memory.
 ///
 /// Transient memory is bounded by `concurrency` SSTs' filters and indexes,
-/// and by [`PayloadBudget::in_flight_bytes`] of data blocks, in flight. A
-/// cancelled pass keeps what it warmed.
+/// and by [`PayloadBudget::in_flight_bytes`] of data blocks, which an SST
+/// warms in runs that each borrow their encoded and decoded size from it
+/// (see [`Transient`]). A cancelled pass keeps what it warmed.
 #[allow(clippy::too_many_arguments)]
 pub async fn warm_planned(
     product: &'static str,
@@ -958,12 +1099,10 @@ pub async fn warm_planned(
     let mut ssts = ssts.into_iter().peekable();
     let mut in_flight = FuturesUnordered::new();
     let (mut reserved, mut payload_reserved) = (0, 0);
+    let transient = Arc::new(Transient::new(budget.payload.in_flight_bytes, concurrency));
     loop {
         while in_flight.len() < concurrency && !cancel.is_cancelled() {
-            let Some(next) = ssts.peek() else { break };
-            if payload_reserved > 0
-                && payload_reserved + next.payload > budget.payload.in_flight_bytes
-            {
+            if ssts.peek().is_none() {
                 break;
             }
             let mut sst = ssts.next().expect("peeked");
@@ -1000,39 +1139,46 @@ pub async fn warm_planned(
             payload_reserved += payload.unwrap_or(0);
             let db = Arc::clone(&plan.dbs[&sst.db].0);
             let residency = plan.residency.get(&sst.db).cloned();
+            let transient = Arc::clone(&transient);
             in_flight.push(async move {
                 let bytes = Arc::new(AtomicU64::new(0));
                 let payload_bytes = Arc::new(AtomicU64::new(0));
                 let mut found = Found::Nothing;
-                let result = match (payload, residency) {
-                    (Some(_), Some(residency)) => {
+                let compressed = sst.sst.info.compression_codec.is_some();
+                let result = match payload {
+                    Some(_) => {
                         attributing(Arc::clone(&bytes), async {
                             db.warm_sst(sst.id, &sst.metadata_targets()).await?;
-                            let targets = match residency.missing(&sst.sst, &sst.targets).await {
+                            let whole =
+                                || vec![(sst.data_targets().to_vec(), data_len(&sst.sst.info))];
+                            let max_run = transient.max_run(compressed);
+                            let missing = match &residency {
+                                Some(residency) => {
+                                    residency.missing(&sst.sst, &sst.targets, max_run).await
+                                }
+                                None => None,
+                            };
+                            let chunks = match missing {
                                 Some(missing) if missing.is_empty() => {
                                     found = Found::All;
                                     return Ok(());
                                 }
                                 Some(missing) => {
                                     found = Found::Some;
-                                    missing.into()
+                                    missing
+                                        .into_iter()
+                                        .map(|run| (vec![run.target], run.bytes))
+                                        .collect()
                                 }
-                                None => sst.data_targets(),
+                                None => whole(),
                             };
-                            warming_payloads(
-                                Arc::clone(&payload_bytes),
-                                db.warm_sst(sst.id, &targets),
-                            )
-                            .await
+                            transient
+                                .warm(&db, sst.id, compressed, chunks, &payload_bytes)
+                                .await
                         })
                         .await
                     }
-                    (Some(_), None) => {
-                        let warm =
-                            attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets));
-                        warming_payloads(Arc::clone(&payload_bytes), warm).await
-                    }
-                    (None, _) => {
+                    None => {
                         attributing(Arc::clone(&bytes), db.warm_sst(sst.id, &sst.targets)).await
                     }
                 };
@@ -1117,7 +1263,7 @@ async fn repair(plan: &WarmPlan, ledger: &WarmLedger, concurrency: usize) -> usi
             let residency = &plan.residency[&sst.db];
             async move {
                 let held = residency
-                    .missing(&sst.sst, &sst.targets)
+                    .missing(&sst.sst, &sst.targets, u64::MAX)
                     .await
                     .is_some_and(|missing| missing.is_empty());
                 (sst, held)
@@ -1395,14 +1541,12 @@ mod tests {
         ]
         .into();
         for n in ids {
-            plan.push(
-                key,
-                handle(n),
-                Arc::clone(&targets),
-                n as i64,
-                ESTIMATE,
-                PAYLOAD,
-            );
+            let mut sst = handle(n);
+            sst.info.compression_codec = None;
+            sst.info.filter_len = 0;
+            sst.info.stats_len = 0;
+            sst.info.index_offset = PAYLOAD;
+            plan.push(key, sst, Arc::clone(&targets), n as i64, ESTIMATE, PAYLOAD);
         }
         plan
     }
@@ -1481,7 +1625,7 @@ mod tests {
         let db = Arc::new(FakeDb::default());
         let ledger = WarmLedger::new(true);
 
-        let report = payload_pass(&db, 0..8, payload_budget(u64::MAX, 2_500), &ledger).await;
+        let report = payload_pass(&db, 0..8, payload_budget(u64::MAX, 4_100), &ledger).await;
 
         assert_eq!(report.warmed_ssts, 8);
         assert_eq!(ids(&db.payloads), (0..8).collect::<Vec<_>>());
@@ -1960,11 +2104,15 @@ mod tests {
             &self,
             _sst: &SsTableHandle,
             _targets: &[CacheTarget],
-        ) -> Option<Vec<CacheTarget>> {
+            _max_run_bytes: u64,
+        ) -> Option<Vec<Run>> {
             if self.held.load(Ordering::SeqCst) {
                 Some(Vec::new())
             } else {
-                Some(vec![CacheTarget::data::<&[u8], _>(..)])
+                Some(vec![Run {
+                    target: CacheTarget::data::<&[u8], _>(..),
+                    bytes: PAYLOAD,
+                }])
             }
         }
     }
@@ -2150,6 +2298,94 @@ mod tests {
             "the restarted cache re-wrote nothing"
         );
         assert!(restarted.payload_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn real_runs_split_at_the_cap_and_cover_every_block_once() {
+        let (_dir, reader, cache, index) = reader_over_flushed_ssts(1, 1 << 20, true).await;
+        let data = cache.data().unwrap().clone();
+        let sst = reader.status().current_manifest.l0()[0].sst.clone();
+        let residency = IndexResidency {
+            reader: Arc::clone(&index),
+            data,
+        };
+        let all = [CacheTarget::data::<&[u8], _>(..)];
+        let blocks = index
+            .open_with_handle(sst.clone())
+            .unwrap()
+            .index()
+            .await
+            .unwrap()
+            .len();
+        assert!(blocks > 4, "{blocks} blocks");
+
+        let whole = residency.missing(&sst, &all, u64::MAX).await.unwrap();
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].bytes, data_len(&sst.info));
+
+        let cap = data_len(&sst.info) / 4;
+        let runs = residency.missing(&sst, &all, cap).await.unwrap();
+        assert!(runs.len() >= 4, "{} runs", runs.len());
+        assert_eq!(
+            runs.iter().map(|run| run.bytes).sum::<u64>(),
+            data_len(&sst.info),
+            "runs cover the whole data section"
+        );
+        let block = data_len(&sst.info) / blocks as u64;
+        assert!(
+            runs.iter().all(|run| run.bytes <= cap + block),
+            "runs {:?} over {cap}",
+            runs.iter().map(|run| run.bytes).collect::<Vec<_>>()
+        );
+
+        let single = residency.missing(&sst, &all, 1).await.unwrap();
+        assert_eq!(
+            single.len(),
+            blocks,
+            "a cap under a block makes one-block runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_payloads_warm_in_runs_under_a_tiny_transient_cap() {
+        let (_dir, reader, cache, index) = reader_over_flushed_ssts(3, 1 << 20, true).await;
+        let data = cache.data().unwrap().clone();
+        let mut budget = WarmBudget::of(&cache, WarmShares::default()).unwrap();
+        budget.payload.in_flight_bytes = 1;
+        let mut plan = plan_l0(&reader, true, |_| true);
+        plan.add_index_reader(db_key(&reader), Arc::clone(&index));
+        plan.with_data_cache(&data);
+        let ledger = WarmLedger::new(true);
+
+        let report = warm_planned(
+            "test",
+            plan,
+            budget,
+            true,
+            4,
+            &CancellationToken::new(),
+            &ledger,
+        )
+        .await;
+
+        assert_eq!(report.warmed_ssts, 3, "{report:?}");
+        assert_eq!(report.failed_ssts, 0, "{report:?}");
+        assert!(report.payload_bytes > 0);
+
+        let mut plan = plan_l0(&reader, true, |_| true);
+        plan.add_index_reader(db_key(&reader), Arc::clone(&index));
+        plan.with_data_cache(&data);
+        let report = warm_planned(
+            "test",
+            plan,
+            budget,
+            true,
+            4,
+            &CancellationToken::new(),
+            &WarmLedger::new(true),
+        )
+        .await;
+        assert_eq!(report.adopted_ssts, 3, "every block was cached: {report:?}");
     }
 
     #[tokio::test]

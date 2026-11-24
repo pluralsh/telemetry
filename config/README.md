@@ -163,16 +163,14 @@ not fit; later passes forget, and evict from the cache, what they warmed of SSTs
 rollups or retention removed. With no metadata cache configured nothing is cached, so
 metadata-only warming does nothing.
 
-Metrics and Traces warm by default, in the background: the server is ready at once and queries
-during the pass find the cache partly warm. Logs keeps the earlier default of no startup warming,
-and when enabled holds readiness until the pass ends. A `cache_warmer` section that sets only some
+Metrics, Logs and Traces readers warm by default, in the background: the server is ready at once
+and queries during the pass find the cache partly warm. A `cache_warmer` section that sets only some
 keys keeps the product's defaults for the rest (the configs reject unknown keys, so older configs
 keep parsing and new keys need no migration).
 
-- `cache_warmer.enabled`: enables startup warming. Default `true` for Metrics and Traces, `false`
-  for Logs.
+- `cache_warmer.enabled`: enables startup warming. Default `true` for readers.
 - `cache_warmer.block_readiness`: hold readiness false until the startup pass ends or times out.
-  Default `false` for Metrics and Traces, `true` for Logs.
+  Default `false` for readers.
 - `cache_warmer.metadata_budget_percent`: the share of the metadata cache warming may fill, `0` to
   `100`. Default `75`, which leaves the rest for metadata queries fetch.
 - `cache_warmer.warm_range_seconds`: recent time range whose filters and indexes are warmed.
@@ -199,9 +197,12 @@ keep parsing and new keys need no migration).
   Payload warming never fills memory: with a hybrid cache, warmed blocks are written to the disk
   tier only, disk hits during warming are not promoted into memory, and warming waits for the
   disk tier to write what is queued rather than overflow foyer's submit queue (which drops
-  entries). SlateDB reads all of an SST's data blocks before caching them, so warming also holds
-  no more than a quarter of the data cache's memory capacity (at least 16 MiB) of data blocks in
-  flight; one SST larger than that still warms, alone.
+  entries). SlateDB reads a run of data blocks, decodes them all, and only then caches them, so
+  the warmer splits each SST's missing blocks into runs and charges each run its encoded size plus
+  what it decodes to (measured from earlier runs) against a pool of a quarter of the data cache's
+  memory capacity (at least 16 MiB, at most 256 MiB). No SST, however large, holds more than its
+  share of the pool; a single block over the pool still warms, alone. The operator reserves this
+  pool, the foyer submit queue and buffer pool in every reader's memory plan (logs, traces and metrics).
 - `cache_warmer.timeout_seconds`: maximum time warming may hold readiness false, with
   `block_readiness`. Default `30`; timeout is fail-open.
 - `cache_warmer.concurrency`: maximum concurrent SST warm operations and number of permits reserved
@@ -224,8 +225,8 @@ affect readiness.
 - `cache_warmer.continuous.warm_range_seconds`: as `cache_warmer.warm_range_seconds`, for new
   SSTs. Default `0`, all live data.
 - `cache_warmer.continuous.payload_warm_range_seconds`: as
-  `cache_warmer.payload_warm_range_seconds`, for new SSTs. Default `0`, which is `7200` unless
-  `continuous.warm_range_seconds` is set.
+  `cache_warmer.payload_warm_range_seconds`, for new SSTs. Default `0`, which is all live data
+  unless `continuous.warm_range_seconds` is set; the payload budget bounds it.
 - `cache_warmer.continuous.include_payloads`: also warms metric samples, log pages, and trace
   pages of the SSTs inside the payload range. Default `true`.
 

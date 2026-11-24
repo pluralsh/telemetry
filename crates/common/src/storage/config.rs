@@ -36,8 +36,8 @@ pub struct CacheWarmerConfig {
     /// background, newest data first.
     pub block_readiness: bool,
     /// Share of the metadata cache's memory the warmer may fill, so queries
-    /// keep the rest. Metrics and traces stop warming metadata there and
-    /// count what did not fit; logs ignores it.
+    /// keep the rest. Every product stops warming metadata there and counts
+    /// what did not fit.
     pub metadata_budget_percent: u8,
     /// Share of the data cache the warmer may fill with payloads, newest
     /// first: of its disk tier when it has one, else of its memory. Warmed
