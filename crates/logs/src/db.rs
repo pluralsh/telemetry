@@ -242,6 +242,10 @@ impl DecodePermit {
         if let Some(process) = &mut self.process {
             process.shrink_to(u64::from(keep));
         }
+        let kept = self.overdrawn.min(u64::from(keep));
+        self.overdraft
+            .fetch_sub(self.overdrawn - kept, Ordering::AcqRel);
+        self.overdrawn = kept;
         Some(self)
     }
 }

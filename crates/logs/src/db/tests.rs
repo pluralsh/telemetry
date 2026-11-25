@@ -4492,3 +4492,23 @@ async fn leading_line_filters_drop_rows_before_copying_and_match_regex_reads() {
     }
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn retaining_fewer_bytes_returns_the_rest_of_the_overdraft() {
+    use crate::memory::{MemoryBudget, MemoryConfig};
+    use std::sync::atomic::Ordering;
+
+    let memory = MemoryBudget::new(&MemoryConfig {
+        decode_bytes: 1,
+        ..MemoryConfig::default()
+    });
+    let budget = PageBudget::new(10);
+    let first = budget.decode(&memory, 1 << 20).await.unwrap();
+    let second = budget.decode(&memory, 1 << 20).await.unwrap();
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 1 << 20);
+    let kept = second.retain(4096).unwrap();
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 4096);
+    drop(kept);
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 0);
+    drop(first);
+}
