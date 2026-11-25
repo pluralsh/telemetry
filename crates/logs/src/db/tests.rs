@@ -4440,7 +4440,11 @@ async fn leading_line_filters_drop_rows_before_copying_and_match_regex_reads() {
                 labels(service, "prod"),
                 (0..40)
                     .map(|timestamp| {
-                        let word = if timestamp % 7 == 0 { "Needle here" } else { "plain" };
+                        let word = if timestamp % 7 == 0 {
+                            "Needle here"
+                        } else {
+                            "plain"
+                        };
                         LogEntry::new(timestamp, format!("{service} {word} {timestamp}"))
                     })
                     .collect(),

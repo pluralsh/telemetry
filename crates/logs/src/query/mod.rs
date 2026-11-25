@@ -470,10 +470,11 @@ pub(crate) async fn query_databases(
                         .await;
                 };
                 // Decoded rows take several times their stored size.
-                let decoded = estimate.compressed_bytes.saturating_mul(DECODED_PER_STORED_BYTE);
+                let decoded = estimate
+                    .compressed_bytes
+                    .saturating_mul(DECODED_PER_STORED_BYTE);
                 let weight =
-                    u32::try_from(decoded.max(1).min(byte_budget as u64))
-                        .unwrap_or(u32::MAX);
+                    u32::try_from(decoded.max(1).min(byte_budget as u64)).unwrap_or(u32::MAX);
                 let _permit = permits
                     .acquire_many_owned(weight)
                     .await
@@ -843,9 +844,20 @@ fn stream_filter(query: &Query) -> Result<StreamFilter> {
 
 /// The text a regex matches literally, optionally case-insensitively via a
 /// leading `(?i)`; `None` for any pattern with regex syntax.
+///
+/// `(?i)` folds Unicode case, which the analyzer's lowercasing does not: `s`
+/// matches `ſ` and `k` the Kelvin sign, lines whose terms hold neither. Such
+/// a pattern is a literal only when it is ASCII without those letters.
 fn literal_regex(pattern: &str) -> Option<&str> {
-    let literal = pattern.strip_prefix("(?i)").unwrap_or(pattern);
-    (!literal.contains(|c: char| "\\.+*?()|[]{}^$".contains(c))).then_some(literal)
+    let (literal, folded) = match pattern.strip_prefix("(?i)") {
+        Some(literal) => (literal, true),
+        None => (pattern, false),
+    };
+    if literal.contains(|c: char| "\\.+*?()|[]{}^$".contains(c)) {
+        return None;
+    }
+    let foldable = |c: char| !c.is_ascii() || matches!(c, 's' | 'S' | 'k' | 'K');
+    (!folded || !literal.contains(foldable)).then_some(literal)
 }
 
 /// Analyzed terms every row the query keeps holds in its stored line: the
@@ -1542,4 +1554,20 @@ fn selector_matches(log: &LogExpr, labels: &BTreeMap<String, String>) -> Result<
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod literal_regex_tests {
+    use super::literal_regex;
+
+    #[test]
+    fn case_insensitive_literals_skip_letters_unicode_folds_elsewhere() {
+        assert_eq!(literal_regex("Needle here"), Some("Needle here"));
+        assert_eq!(literal_regex("(?i)needle here"), Some("needle here"));
+        assert_eq!(literal_regex("status ok"), Some("status ok"));
+        assert_eq!(literal_regex("(?i)status"), None);
+        assert_eq!(literal_regex("(?i)kernel"), None);
+        assert_eq!(literal_regex("(?i)café"), None);
+        assert_eq!(literal_regex("(?i)err.r"), None);
+    }
 }

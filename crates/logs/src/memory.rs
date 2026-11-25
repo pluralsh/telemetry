@@ -145,6 +145,11 @@ impl MemoryBudget {
         self.decode.acquire(bytes).await
     }
 
+    /// Bytes the decode budget holds in all.
+    pub(crate) fn decode_capacity(&self) -> u64 {
+        u64::from(self.decode.capacity)
+    }
+
     /// [`Self::decode`] if `bytes` are free now.
     pub(crate) fn try_decode(&self, bytes: u64) -> Option<BudgetPermit> {
         let weight = self.decode.weight(bytes);

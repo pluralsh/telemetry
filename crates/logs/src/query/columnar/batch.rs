@@ -78,9 +78,14 @@ impl ColumnBatch {
             + self.timestamps.capacity() * size_of::<i64>()
             + (self.lines.capacity() + self.field_spans.capacity()) * size_of::<(u32, u32)>()
             + self.fields.capacity() * size_of::<(u32, u32, u32)>()
-            + self.row_ids.as_ref().map_or(0, |ids| ids.capacity() * size_of::<u32>())
-            + self.weights.as_ref().map_or(0, |w| w.capacity() * size_of::<(u32, u64)>()))
-            as u64
+            + self
+                .row_ids
+                .as_ref()
+                .map_or(0, |ids| ids.capacity() * size_of::<u32>())
+            + self
+                .weights
+                .as_ref()
+                .map_or(0, |w| w.capacity() * size_of::<(u32, u64)>())) as u64
     }
 
     pub(crate) fn hold(&mut self, permit: Arc<crate::db::DecodePermit>) {
@@ -120,7 +125,10 @@ impl ColumnBatch {
     }
 
     pub(super) fn tie(&self, row: usize) -> Tie {
-        let index = self.row_ids.as_ref().map_or(row as u64, |ids| u64::from(ids[row]));
+        let index = self
+            .row_ids
+            .as_ref()
+            .map_or(row as u64, |ids| u64::from(ids[row]));
         Tie {
             row: self.tie.row + index,
             ..self.tie
