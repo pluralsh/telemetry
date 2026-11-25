@@ -41,8 +41,12 @@ pub(crate) struct ColumnBatch {
     /// For a lineless batch, per row the stored rows it stands for and their
     /// line bytes.
     pub(super) weights: Option<Vec<(u32, u64)>>,
-    /// The first row's tie; row `i` follows it by `i`.
+    /// The first row's tie; row `i` follows it by `i`, or by `row_ids[i]`
+    /// when a read dropped rows before copying them.
     tie: Tie,
+    row_ids: Option<Vec<u32>>,
+    /// Decode budget held until the rows are dropped.
+    held: Option<Arc<crate::db::DecodePermit>>,
     /// Inclusive time ranges, ascending and disjoint, outside which no row
     /// repeats a stored row read elsewhere; `None` when any row may.
     repeats: Option<Arc<[(i64, i64)]>>,
@@ -61,9 +65,31 @@ impl ColumnBatch {
             names: Vec::new(),
             weights: lineless.then(Vec::new),
             tie,
+            row_ids: None,
+            held: None,
             // Lineless reads are deduplicated as they are read.
             repeats: lineless.then(|| Arc::from([])),
         }
+    }
+
+    /// Bytes this batch holds.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        (self.text.capacity()
+            + self.timestamps.capacity() * size_of::<i64>()
+            + (self.lines.capacity() + self.field_spans.capacity()) * size_of::<(u32, u32)>()
+            + self.fields.capacity() * size_of::<(u32, u32, u32)>()
+            + self
+                .row_ids
+                .as_ref()
+                .map_or(0, |ids| ids.capacity() * size_of::<u32>())
+            + self
+                .weights
+                .as_ref()
+                .map_or(0, |w| w.capacity() * size_of::<(u32, u64)>())) as u64
+    }
+
+    pub(crate) fn hold(&mut self, permit: Arc<crate::db::DecodePermit>) {
+        self.held = Some(permit);
     }
 
     pub(crate) fn set_repeats(&mut self, repeats: Arc<[(i64, i64)]>) {
@@ -99,10 +125,27 @@ impl ColumnBatch {
     }
 
     pub(super) fn tie(&self, row: usize) -> Tie {
+        let index = self
+            .row_ids
+            .as_ref()
+            .map_or(row as u64, |ids| u64::from(ids[row]));
         Tie {
-            row: self.tie.row + row as u64,
+            row: self.tie.row + index,
             ..self.tie
         }
+    }
+
+    /// Appends the row stored at `index` of its run, for a batch holding
+    /// only some of the run's rows.
+    pub(crate) fn push_stored<'m>(
+        &mut self,
+        index: u32,
+        timestamp_ns: i64,
+        line: &str,
+        metadata: impl IntoIterator<Item = (&'m str, &'m str)>,
+    ) {
+        self.row_ids.get_or_insert_with(Vec::new).push(index);
+        self.push(timestamp_ns, line, metadata, None);
     }
 
     /// Appends a row; `metadata` need not be in name order.
@@ -149,6 +192,9 @@ impl ColumnBatch {
         permute(&mut self.timestamps, &order);
         permute(&mut self.lines, &order);
         permute(&mut self.field_spans, &order);
+        if let Some(ids) = &mut self.row_ids {
+            permute(ids, &order);
+        }
         if let Some(weights) = &mut self.weights {
             permute(weights, &order);
         }

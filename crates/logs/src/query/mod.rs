@@ -258,6 +258,7 @@ impl<'a> ScanPlan<'a> {
             query,
             scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
             streams: stream_filter(query)?
+                .with_line_keep(Pipelines::new(query, request)?.line_keep().map(Arc::new))
                 .with_labels(labels)
                 .with_summaries(lineless.as_ref()),
             indexed_terms: indexed_match_terms(query),
@@ -352,6 +353,8 @@ fn exceeds_max_pages(pages: usize, read_units: usize, max_pages: usize) -> Error
          ({max_pages})",
     ))
 }
+
+const DECODED_PER_STORED_BYTE: u64 = 3;
 
 /// Queries `sources`, in shard order. A remote shard checks `max_pages`
 /// against its own pages alone.
@@ -466,9 +469,12 @@ pub(crate) async fn query_databases(
                     return ShardSource::load_remote(remote, plan, namespace, request, options)
                         .await;
                 };
+                // Decoded rows take several times their stored size.
+                let decoded = estimate
+                    .compressed_bytes
+                    .saturating_mul(DECODED_PER_STORED_BYTE);
                 let weight =
-                    u32::try_from(estimate.compressed_bytes.max(1).min(byte_budget as u64))
-                        .unwrap_or(u32::MAX);
+                    u32::try_from(decoded.max(1).min(byte_budget as u64)).unwrap_or(u32::MAX);
                 let _permit = permits
                     .acquire_many_owned(weight)
                     .await
@@ -836,6 +842,24 @@ fn stream_filter(query: &Query) -> Result<StreamFilter> {
     .with_line_terms(line_prefilter(query)))
 }
 
+/// The text a regex matches literally, optionally case-insensitively via a
+/// leading `(?i)`; `None` for any pattern with regex syntax.
+///
+/// `(?i)` folds Unicode case, which the analyzer's lowercasing does not: `s`
+/// matches `ſ` and `k` the Kelvin sign, lines whose terms hold neither. Such
+/// a pattern is a literal only when it is ASCII without those letters.
+fn literal_regex(pattern: &str) -> Option<&str> {
+    let (literal, folded) = match pattern.strip_prefix("(?i)") {
+        Some(literal) => (literal, true),
+        None => (pattern, false),
+    };
+    if literal.contains(|c: char| "\\.+*?()|[]{}^$".contains(c)) {
+        return None;
+    }
+    let foldable = |c: char| !c.is_ascii() || matches!(c, 's' | 'S' | 'k' | 'K');
+    (!folded || !literal.contains(foldable)).then_some(literal)
+}
+
 /// Analyzed terms every row the query keeps holds in its stored line: the
 /// interior terms of each single-branch `|=` that runs before the line can
 /// be rewritten. Every log expression must require the same terms.
@@ -849,10 +873,18 @@ fn line_prefilter(query: &Query) -> Option<Vec<String>> {
             match &stage.value {
                 PipelineStage::LineFilter(LineFilter { branches }) => {
                     if let [branch] = branches.as_slice()
-                        && branch.op == LineFilterOp::Contains
                         && let LineFilterTerm::String(needle) = &branch.term
                     {
-                        terms.extend(interior_terms(&DEFAULT_ANALYZER, needle));
+                        // Terms are lowercased, so a case-insensitive literal
+                        // regex requires the same terms as a plain one.
+                        let literal = match branch.op {
+                            LineFilterOp::Contains => Some(needle.as_str()),
+                            LineFilterOp::Regex => literal_regex(needle),
+                            _ => None,
+                        };
+                        if let Some(literal) = literal {
+                            terms.extend(interior_terms(&DEFAULT_ANALYZER, literal));
+                        }
                     }
                 }
                 PipelineStage::LineFormat(_)
@@ -1010,6 +1042,26 @@ fn max_lookback(query: &Query) -> Result<i64> {
     })
 }
 
+/// Line tests a read applies as it decodes, so rows no log expression keeps
+/// are never copied out of their blocks.
+#[derive(Debug)]
+pub(crate) struct LineKeep {
+    /// Per log expression, its leading line tests.
+    alternatives: Vec<Vec<PipelineStage>>,
+}
+
+impl LineKeep {
+    /// Whether some expression's line tests pass `line`. A test that fails
+    /// to run keeps the row, leaving the error to the query's pipelines.
+    pub(crate) fn keeps(&self, line: &str) -> bool {
+        self.alternatives.iter().any(|tests| {
+            tests
+                .iter()
+                .all(|test| line_test(line, test).is_none_or(|passed| passed.unwrap_or(true)))
+        })
+    }
+}
+
 /// How each of a query's log expressions runs its pipeline.
 struct Pipelines<'a> {
     logs: Vec<&'a LogExpr>,
@@ -1102,6 +1154,28 @@ impl<'a> Pipelines<'a> {
             offsets,
             skip_parsers,
         })
+    }
+
+    /// The leading line tests a stored line must pass for some expression
+    /// to keep its row; `None` when any line may be kept. Reads drop other
+    /// rows before copying them.
+    fn line_keep(&self) -> Option<LineKeep> {
+        if self.lineless || self.logs.is_empty() {
+            return None;
+        }
+        let mut alternatives = Vec::new();
+        for (log, positions) in self.logs.iter().zip(&self.line_tests) {
+            if positions.is_empty() {
+                return None;
+            }
+            alternatives.push(
+                positions
+                    .iter()
+                    .map(|&position| log.stages[position].value.clone())
+                    .collect(),
+            );
+        }
+        Some(LineKeep { alternatives })
     }
 
     /// Whether a log query's expression `index` keeps a row at `timestamp`.
@@ -1480,4 +1554,20 @@ fn selector_matches(log: &LogExpr, labels: &BTreeMap<String, String>) -> Result<
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod literal_regex_tests {
+    use super::literal_regex;
+
+    #[test]
+    fn case_insensitive_literals_skip_letters_unicode_folds_elsewhere() {
+        assert_eq!(literal_regex("Needle here"), Some("Needle here"));
+        assert_eq!(literal_regex("(?i)needle here"), Some("needle here"));
+        assert_eq!(literal_regex("status ok"), Some("status ok"));
+        assert_eq!(literal_regex("(?i)status"), None);
+        assert_eq!(literal_regex("(?i)kernel"), None);
+        assert_eq!(literal_regex("(?i)café"), None);
+        assert_eq!(literal_regex("(?i)err.r"), None);
+    }
 }

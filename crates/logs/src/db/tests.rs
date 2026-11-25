@@ -4427,3 +4427,88 @@ async fn prefiltered_line_filters_match_unfiltered_reads() {
         "{narrowed_reads} block reads with postings, {plain_reads} without"
     );
 }
+
+#[tokio::test]
+async fn leading_line_filters_drop_rows_before_copying_and_match_regex_reads() {
+    use crate::{Direction, QueryOptions, QueryRequest, QueryResult};
+
+    let db = LogDb::open(test_config()).await.unwrap();
+    let namespace = Namespace::new("line-keep").unwrap();
+    let batches = ["api", "worker"]
+        .map(|service| {
+            LogBatch::new(
+                labels(service, "prod"),
+                (0..40)
+                    .map(|timestamp| {
+                        let word = if timestamp % 7 == 0 {
+                            "Needle here"
+                        } else {
+                            "plain"
+                        };
+                        LogEntry::new(timestamp, format!("{service} {word} {timestamp}"))
+                    })
+                    .collect(),
+            )
+        })
+        .to_vec();
+    db.write(&namespace, batches).await.unwrap();
+
+    let run = |query: &'static str, direction| {
+        let (db, namespace) = (&db, &namespace);
+        async move {
+            let result = db
+                .query(
+                    namespace,
+                    &QueryRequest::range(query, 0, 40, 1),
+                    QueryOptions {
+                        limit: 1_000,
+                        direction,
+                        ..QueryOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let QueryResult::Streams(streams) = result else {
+                panic!("expected streams");
+            };
+            let mut lines = streams
+                .into_iter()
+                .flat_map(|stream| stream.entries.into_iter().map(|entry| entry.line))
+                .collect::<Vec<_>>();
+            lines.sort();
+            lines
+        }
+    };
+    for direction in [Direction::Forward, Direction::Backward] {
+        let plain = run(r#"{environment="prod"} |= "Needle here""#, direction).await;
+        assert_eq!(plain.len(), 12);
+        for query in [
+            r#"{environment="prod"} |~ "(?i)needle here""#,
+            r#"{environment="prod"} |~ "Needle here""#,
+            r#"{environment="prod"} |~ "(?i)NEEDLE" |= "here""#,
+        ] {
+            assert_eq!(run(query, direction).await, plain, "{query}");
+        }
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retaining_fewer_bytes_returns_the_rest_of_the_overdraft() {
+    use crate::memory::{MemoryBudget, MemoryConfig};
+    use std::sync::atomic::Ordering;
+
+    let memory = MemoryBudget::new(&MemoryConfig {
+        decode_bytes: 1,
+        ..MemoryConfig::default()
+    });
+    let budget = PageBudget::new(10);
+    let first = budget.decode(&memory, 1 << 20).await.unwrap();
+    let second = budget.decode(&memory, 1 << 20).await.unwrap();
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 1 << 20);
+    let kept = second.retain(4096).unwrap();
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 4096);
+    drop(kept);
+    assert_eq!(budget.overdraft.load(Ordering::Acquire), 0);
+    drop(first);
+}

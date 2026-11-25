@@ -21,7 +21,7 @@ use crate::object::{
     Block, FieldSelection, ReadNeeds, RowSample, block_header, decode_block_rows,
     decode_block_where, decode_samples_where, read_blocks,
 };
-use crate::query::{BatchSlice, ColumnBatch, StreamBatches, Tie, is_error_label};
+use crate::query::{BatchSlice, ColumnBatch, LineKeep, StreamBatches, Tie, is_error_label};
 use crate::search::{self, TermDirectory, TermStats};
 
 #[cfg(test)]
@@ -434,6 +434,7 @@ impl LogDb {
                 range: (start_ns, end_ns),
                 segments: list(visible).await?,
                 line_terms: filter.line_terms.clone(),
+                line_keep: filter.line_keep.clone(),
                 first_ordinal: 0,
             });
         };
@@ -491,6 +492,7 @@ impl LogDb {
             range: (start_ns, end_ns),
             segments,
             line_terms: filter.line_terms.clone(),
+            line_keep: filter.line_keep.clone(),
             first_ordinal: 0,
         })
     }
@@ -632,6 +634,7 @@ impl LogDb {
                 range,
                 segments: vec![(segment, found.by_ref().take(streams.max(1)).collect())],
                 line_terms: None,
+                line_keep: None,
                 first_ordinal: 0,
             });
         }
@@ -758,7 +761,7 @@ impl LogDb {
                     for run in unit.runs {
                         let first = (run.run.first_block - unit.first_block) as usize;
                         let blocks = &blocks[first..first + run.run.blocks as usize];
-                        let decoded = PendingRows::decode(&run, blocks, range, None, ordinal)?;
+                        let decoded = PendingRows::decode(&run, blocks, range, None, ordinal, None)?;
                         runs.push((run, decoded));
                     }
                     Ok::<_, Error>(runs)
@@ -819,7 +822,7 @@ impl LogDb {
                     streams,
                     targets.range,
                     budget,
-                    targets.line_terms.as_deref(),
+                    (targets.line_terms.as_deref(), targets.line_keep.as_ref()),
                     false,
                     &mut consume,
                 )
@@ -908,7 +911,7 @@ impl LogDb {
                 streams,
                 (start_ns, end_ns),
                 budget,
-                filter.line_terms.as_deref(),
+                (filter.line_terms.as_deref(), filter.line_keep.as_ref()),
                 reverse,
                 &mut consume,
             );
@@ -934,7 +937,7 @@ impl LogDb {
         streams: Vec<SegmentStream>,
         (start_ns, end_ns): (i64, i64),
         budget: &PageBudget,
-        line_terms: Option<&[String]>,
+        (line_terms, line_keep): (Option<&[String]>, Option<&Arc<LineKeep>>),
         reverse: bool,
         consume: &mut impl FnMut(P::Chunk) -> Result<ControlFlow<()>>,
     ) -> Result<ControlFlow<()>> {
@@ -954,6 +957,7 @@ impl LogDb {
             .boxed()
             .map(move |admitted| {
                 let candidates = Arc::clone(&candidates);
+                let line_keep = line_keep.cloned();
                 async move {
                     // Decoding is held until the unit's rows are pending.
                     let (unit, decoding) = admitted?;
@@ -976,8 +980,14 @@ impl LogDb {
                             let rows = candidates.as_ref().as_ref().and_then(|candidates| {
                                 candidates.get(&(run.stream_id, run.object_id))
                             });
-                            let decoded =
-                                P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
+                            let decoded = P::decode(
+                                &run,
+                                blocks,
+                                (start_ns, end_ns),
+                                rows,
+                                ordinal,
+                                line_keep.as_deref(),
+                            )?;
                             runs.push((run, decoded));
                         }
                         Ok::<_, Error>(runs)
@@ -994,10 +1004,9 @@ impl LogDb {
         let mut fetched = 0;
         while let Some((decoding, runs)) = decoded.try_next().await? {
             fetched += 1;
-            for (run, decoded) in runs {
+            for (run, decoded) in hold_decoded::<P>(decoding, runs) {
                 pending.push(run, decoded);
             }
-            drop(decoding);
             if let Some(ready) = pending.release(bounds.get(fetched).copied())
                 && consume(ready)?.is_break()
             {
@@ -1055,6 +1064,7 @@ impl LogDb {
         let now_unix_ms = unix_time_ms()?;
         let segments = self.visible_segment_ids(namespace, (start_ns, end_ns), reverse)?;
         let line_terms = filter.line_terms.as_deref();
+        let line_keep = filter.line_keep.as_ref();
         let plans = futures::stream::iter((0u32..).zip(segments))
             .map(|(ordinal, segment)| async move {
                 let streams = self
@@ -1108,6 +1118,7 @@ impl LogDb {
             // rejects the chain.
             .boxed()
             .map(|admitted| async move {
+                let line_keep = line_keep.cloned();
                 let (
                     PipelinedUnit {
                         segment,
@@ -1136,7 +1147,14 @@ impl LogDb {
                             .as_ref()
                             .as_ref()
                             .and_then(|candidates| candidates.get(&(run.stream_id, run.object_id)));
-                        let decoded = P::decode(&run, blocks, (start_ns, end_ns), rows, ordinal)?;
+                        let decoded = P::decode(
+                            &run,
+                            blocks,
+                            (start_ns, end_ns),
+                            rows,
+                            ordinal,
+                            line_keep.as_deref(),
+                        )?;
                         runs.push((run, decoded));
                     }
                     Ok::<_, Error>(runs)
@@ -1150,10 +1168,9 @@ impl LogDb {
             let mut units = std::pin::pin!(units);
             let mut pending = P::new(reverse);
             while let Some((_, next_bound, decoding, runs)) = units.try_next().await? {
-                for (run, decoded) in runs {
+                for (run, decoded) in hold_decoded::<P>(decoding, runs) {
                     pending.push(run, decoded);
                 }
-                drop(decoding);
                 if let Some(ready) = pending.release(next_bound)
                     && consume(ready)?.is_break()
                 {
@@ -2484,6 +2501,22 @@ impl PageBudget {
     }
 }
 
+/// Keeps `decoding` for as long as the decoded `runs` stay in memory, rather
+/// than only until they are pending.
+fn hold_decoded<P: PendingReads>(
+    decoding: DecodePermit,
+    mut runs: Vec<(UnitRun, P::Run)>,
+) -> Vec<(UnitRun, P::Run)> {
+    let resident = runs.iter().map(|(_, run)| P::resident(run)).sum();
+    if let Some(held) = decoding.retain(resident) {
+        let held = Arc::new(held);
+        for (_, run) in &mut runs {
+            P::hold(run, Arc::clone(&held));
+        }
+    }
+    runs
+}
+
 /// Candidate rows by `(stream, object)` run, from [`LogDb::line_candidates`].
 type Candidates = HashMap<(StreamId, u64), HashSet<u32>>;
 
@@ -3513,6 +3546,8 @@ pub(crate) struct ScanTargets {
     segments: Vec<(SegmentId, Vec<SegmentStream>)>,
     /// See [`StreamFilter`].
     line_terms: Option<Vec<String>>,
+    /// See [`StreamFilter`].
+    line_keep: Option<Arc<LineKeep>>,
     /// Position in the whole read of the first of `segments`.
     first_ordinal: usize,
 }
@@ -3541,6 +3576,7 @@ impl ScanTargets {
             range,
             segments,
             line_terms,
+            line_keep,
             first_ordinal,
         } = self;
         (first_ordinal..)
@@ -3549,6 +3585,7 @@ impl ScanTargets {
                 range,
                 segments: vec![segment],
                 line_terms: line_terms.clone(),
+                line_keep: line_keep.clone(),
                 first_ordinal: ordinal,
             })
             .collect()
@@ -3729,7 +3766,14 @@ trait PendingReads: 'static {
         range: (i64, i64),
         rows: Option<&HashSet<u32>>,
         segment: u32,
+        keep_line: Option<&LineKeep>,
     ) -> Result<Self::Run>;
+    /// Bytes `decoded` holds once pending, for the decode budget to keep.
+    fn resident(_decoded: &Self::Run) -> u64 {
+        0
+    }
+    /// Ties `permit` to `decoded`'s lifetime.
+    fn hold(_decoded: &mut Self::Run, _permit: Arc<DecodePermit>) {}
     fn new(reverse: bool) -> Self;
     fn push(&mut self, run: UnitRun, decoded: Self::Run);
     /// Rows strictly before `next_bound`; `None` releases everything.
@@ -3746,6 +3790,7 @@ impl PendingReads for PendingRows {
         range: (i64, i64),
         rows: Option<&HashSet<u32>>,
         _: u32,
+        _: Option<&LineKeep>,
     ) -> Result<Vec<LogEntry>> {
         match rows {
             Some(rows) => candidate_entries(blocks, range, |row| rows.contains(&row)),
@@ -3785,6 +3830,7 @@ impl PendingReads for PendingBatches {
         (start_ns, end_ns): (i64, i64),
         rows: Option<&HashSet<u32>>,
         segment: u32,
+        keep_line: Option<&LineKeep>,
     ) -> Result<ColumnBatch> {
         let mut batch = ColumnBatch::of_stream(
             &run.labels,
@@ -3809,8 +3855,18 @@ impl PendingReads for PendingBatches {
                 block,
                 (start_ns, end_ns),
                 |index| keep(first_row + index),
-                |_, timestamp_ns, line, fields| {
-                    batch.push(timestamp_ns, line, fields.iter().copied(), None);
+                |index, timestamp_ns, line, fields| match keep_line {
+                    Some(keep_line) => {
+                        if keep_line.keeps(line) {
+                            batch.push_stored(
+                                first_row + index,
+                                timestamp_ns,
+                                line,
+                                fields.iter().copied(),
+                            );
+                        }
+                    }
+                    None => batch.push(timestamp_ns, line, fields.iter().copied(), None),
                 },
             )?;
         }
@@ -3819,6 +3875,14 @@ impl PendingReads for PendingBatches {
         batch.sort_by_timestamp();
         batch.set_repeats(Arc::clone(&run.repeats));
         Ok(batch)
+    }
+
+    fn resident(decoded: &ColumnBatch) -> u64 {
+        decoded.resident_bytes()
+    }
+
+    fn hold(decoded: &mut ColumnBatch, permit: Arc<DecodePermit>) {
+        decoded.hold(permit);
     }
 
     fn new(reverse: bool) -> Self {
@@ -3879,6 +3943,8 @@ pub(crate) struct StreamFilter {
     /// may then skip rows whose postings lack one; such rows are dropped by
     /// the query's line filter anyway.
     line_terms: Option<Vec<String>>,
+    /// Line tests rows must pass to be kept; see [`LineKeep`].
+    line_keep: Option<Arc<LineKeep>>,
     /// Sorted names of the only stream labels the query depends on, every
     /// label the selectors match on among them. Selected streams may then
     /// carry just these labels.
@@ -3894,6 +3960,7 @@ impl StreamFilter {
             exact,
             selectors: Vec::new(),
             line_terms: None,
+            line_keep: None,
             labels: None,
             summaries: None,
         }
@@ -3908,6 +3975,10 @@ impl StreamFilter {
 
     pub(crate) fn with_line_terms(self, line_terms: Option<Vec<String>>) -> Self {
         Self { line_terms, ..self }
+    }
+
+    pub(crate) fn with_line_keep(self, line_keep: Option<Arc<LineKeep>>) -> Self {
+        Self { line_keep, ..self }
     }
 
     pub(crate) fn with_labels(self, labels: Option<Vec<String>>) -> Self {
@@ -3928,6 +3999,7 @@ impl StreamFilter {
                 .map(SeriesSelector::from_matchers)
                 .collect::<Result<_>>()?,
             line_terms: None,
+            line_keep: None,
             labels: None,
             summaries: None,
         })

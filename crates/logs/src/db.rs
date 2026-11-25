@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -102,6 +102,17 @@ const PIPELINE_UNITS: usize = 2 * PAGE_READ_CONCURRENCY;
 /// Estimated decoded bytes a budget's read units may hold at once, which
 /// bounds the memory concurrent segments add.
 const DECODE_BYTES_IN_FLIGHT: u32 = 256 << 20;
+
+/// The share of the process's decode budget one query's reads may hold
+/// beyond the budgets' free bytes, so that rows held for scan order cannot
+/// starve the units that release them.
+const DECODE_OVERDRAFT_DIVISOR: u64 = 4;
+
+/// The overdraft's floor, so a small budget still lets reads progress.
+const DECODE_OVERDRAFT_MIN: u64 = (DECODE_BYTES_IN_FLIGHT / 4) as u64;
+
+/// How long a read past its overdraft waits for budget before giving way.
+const OVERDRAFT_WAIT: Duration = Duration::from_secs(5);
 /// Segments whose discovery catalogs are scanned concurrently.
 const SEGMENT_DISCOVERY_CONCURRENCY: usize = 16;
 /// Larger per-segment stream sets are recomputed rather than cached, which
@@ -188,6 +199,10 @@ pub(crate) struct PageBudget {
     limit: usize,
     remaining: AtomicUsize,
     decoding: Arc<Semaphore>,
+    /// [`DecodePermit`]s of this budget not yet dropped.
+    outstanding: Arc<AtomicUsize>,
+    /// Bytes read units hold beyond what the decode budgets had free.
+    overdraft: Arc<AtomicU64>,
     /// Taken while a unit acquires its permits, so a unit holds both its
     /// share of this budget and of the process's or waits for them, never
     /// holding one while another of this budget's units holds the other.
@@ -202,8 +217,44 @@ pub(crate) struct PageBudget {
 /// order too, a unit at a time; see [`PageBudget::admit`].
 #[derive(Debug)]
 pub(crate) struct DecodePermit {
-    _budget: OwnedSemaphorePermit,
-    _process: BudgetPermit,
+    budget: Option<OwnedSemaphorePermit>,
+    process: Option<BudgetPermit>,
+    /// Bytes this permit counts against [`PageBudget`]'s overdraft.
+    overdrawn: u64,
+    outstanding: Arc<AtomicUsize>,
+    overdraft: Arc<AtomicU64>,
+}
+
+impl DecodePermit {
+    /// Keeps only `resident` bytes of the permit, for the decoded rows the
+    /// holder goes on to keep in memory. Nothing is kept for no rows.
+    pub(crate) fn retain(mut self, resident: u64) -> Option<Self> {
+        if resident == 0 {
+            return None;
+        }
+        let keep = u32::try_from(resident)
+            .unwrap_or(u32::MAX)
+            .clamp(1, DECODE_BYTES_IN_FLIGHT);
+        if let Some(budget) = &mut self.budget {
+            let excess = budget.num_permits().saturating_sub(keep as usize);
+            drop(budget.split(excess));
+        }
+        if let Some(process) = &mut self.process {
+            process.shrink_to(u64::from(keep));
+        }
+        let kept = self.overdrawn.min(u64::from(keep));
+        self.overdraft
+            .fetch_sub(self.overdrawn - kept, Ordering::AcqRel);
+        self.overdrawn = kept;
+        Some(self)
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        self.overdraft.fetch_sub(self.overdrawn, Ordering::AcqRel);
+    }
 }
 
 impl PageBudget {
@@ -212,6 +263,8 @@ impl PageBudget {
             limit,
             remaining: AtomicUsize::new(limit),
             decoding: Arc::new(Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize)),
+            outstanding: Arc::default(),
+            overdraft: Arc::default(),
             admission: Mutex::new(()),
         }
     }
@@ -224,13 +277,60 @@ impl PageBudget {
             .unwrap_or(u32::MAX)
             .clamp(1, DECODE_BYTES_IN_FLIGHT);
         let _admission = self.admission.lock().await;
-        let budget = Arc::clone(&self.decoding)
-            .acquire_many_owned(weight)
-            .await
-            .map_err(|_| Error::Query("decode budget closed".into()))?;
+        // A permit may be held until later units are read, since rows are
+        // handed on in scan order, so a read waiting on budget its own rows
+        // hold would never finish. A read already holding permits therefore
+        // takes what is free now, and otherwise overdraws a bounded
+        // allowance, always one unit at a time at least. Past that it waits
+        // a while for other reads to finish, then gives way with
+        // backpressure.
+        let holding = self.outstanding.load(Ordering::Acquire) > 0;
+        let mut charged = None;
+        if holding {
+            if let Ok(budget) = Arc::clone(&self.decoding).try_acquire_many_owned(weight)
+                && let Some(process) = memory.try_decode(u64::from(weight))
+            {
+                charged = Some((budget, process));
+            }
+        } else {
+            let budget = Arc::clone(&self.decoding)
+                .acquire_many_owned(weight)
+                .await
+                .map_err(|_| Error::Query("decode budget closed".into()))?;
+            charged = Some((budget, memory.decode(u64::from(weight)).await?));
+        }
+        let mut overdrawn = 0;
+        if charged.is_none() {
+            let used = self.overdraft.load(Ordering::Acquire);
+            let allowance =
+                (memory.decode_capacity() / DECODE_OVERDRAFT_DIVISOR).max(DECODE_OVERDRAFT_MIN);
+            if used == 0 || used + u64::from(weight) <= allowance {
+                overdrawn = u64::from(weight);
+                self.overdraft.fetch_add(overdrawn, Ordering::AcqRel);
+            } else {
+                let waited = tokio::time::timeout(OVERDRAFT_WAIT, async {
+                    let budget = Arc::clone(&self.decoding)
+                        .acquire_many_owned(weight)
+                        .await
+                        .map_err(|_| Error::Query("decode budget closed".into()))?;
+                    Ok::<_, Error>((budget, memory.decode(u64::from(weight)).await?))
+                })
+                .await
+                .map_err(|_| Error::Backpressure)??;
+                charged = Some(waited);
+            }
+        }
+        let (budget, process) = match charged {
+            Some((budget, process)) => (Some(budget), Some(process)),
+            None => (None, None),
+        };
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         Ok(DecodePermit {
-            _budget: budget,
-            _process: memory.decode(u64::from(weight)).await?,
+            budget,
+            process,
+            overdrawn,
+            outstanding: Arc::clone(&self.outstanding),
+            overdraft: Arc::clone(&self.overdraft),
         })
     }
 
