@@ -1,8 +1,8 @@
 apiVersion: v2
 name: telemetry-operator
 description: Kubernetes operator for managing Plural Telemetry resources
-appVersion: 0.3.37
-version: 0.1.68
+appVersion: 0.3.38
+version: 0.1.69
 sources:
   - https://github.com/pluralsh/telemetry
 type: application
