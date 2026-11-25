@@ -145,6 +145,15 @@ impl MemoryBudget {
         self.decode.acquire(bytes).await
     }
 
+    /// [`Self::decode`] if `bytes` are free now.
+    pub(crate) fn try_decode(&self, bytes: u64) -> Option<BudgetPermit> {
+        let weight = self.decode.weight(bytes);
+        let permit = Arc::clone(&self.decode.semaphore)
+            .try_acquire_many_owned(weight)
+            .ok()?;
+        Some(self.decode.held(permit))
+    }
+
     /// Holds a compactor merge of `input_bytes` stored bytes until the
     /// permit drops.
     pub(crate) async fn merge(&self, input_bytes: u64) -> Result<BudgetPermit> {
@@ -312,6 +321,18 @@ pub(crate) struct WritePermit {
 pub(crate) struct BudgetPermit {
     permit: Option<OwnedSemaphorePermit>,
     budget: Arc<Budget>,
+}
+
+impl BudgetPermit {
+    /// Gives back all but `keep` bytes of what this holds.
+    pub(crate) fn shrink_to(&mut self, keep: u64) {
+        let weight = self.budget.weight(keep);
+        if let Some(permit) = &mut self.permit {
+            let excess = permit.num_permits().saturating_sub(weight as usize);
+            drop(permit.split(excess));
+        }
+        self.budget.report();
+    }
 }
 
 impl Drop for BudgetPermit {

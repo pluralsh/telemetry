@@ -188,6 +188,8 @@ pub(crate) struct PageBudget {
     limit: usize,
     remaining: AtomicUsize,
     decoding: Arc<Semaphore>,
+    /// [`DecodePermit`]s of this budget not yet dropped.
+    outstanding: Arc<AtomicUsize>,
     /// Taken while a unit acquires its permits, so a unit holds both its
     /// share of this budget and of the process's or waits for them, never
     /// holding one while another of this budget's units holds the other.
@@ -202,8 +204,36 @@ pub(crate) struct PageBudget {
 /// order too, a unit at a time; see [`PageBudget::admit`].
 #[derive(Debug)]
 pub(crate) struct DecodePermit {
-    _budget: OwnedSemaphorePermit,
-    _process: BudgetPermit,
+    budget: Option<OwnedSemaphorePermit>,
+    process: Option<BudgetPermit>,
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl DecodePermit {
+    /// Keeps only `resident` bytes of the permit, for the decoded rows the
+    /// holder goes on to keep in memory. Nothing is kept for no rows.
+    pub(crate) fn retain(mut self, resident: u64) -> Option<Self> {
+        if resident == 0 {
+            return None;
+        }
+        let keep = u32::try_from(resident)
+            .unwrap_or(u32::MAX)
+            .clamp(1, DECODE_BYTES_IN_FLIGHT);
+        if let Some(budget) = &mut self.budget {
+            let excess = budget.num_permits().saturating_sub(keep as usize);
+            drop(budget.split(excess));
+        }
+        if let Some(process) = &mut self.process {
+            process.shrink_to(u64::from(keep));
+        }
+        Some(self)
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl PageBudget {
@@ -212,6 +242,7 @@ impl PageBudget {
             limit,
             remaining: AtomicUsize::new(limit),
             decoding: Arc::new(Semaphore::new(DECODE_BYTES_IN_FLIGHT as usize)),
+            outstanding: Arc::default(),
             admission: Mutex::new(()),
         }
     }
@@ -224,13 +255,31 @@ impl PageBudget {
             .unwrap_or(u32::MAX)
             .clamp(1, DECODE_BYTES_IN_FLIGHT);
         let _admission = self.admission.lock().await;
-        let budget = Arc::clone(&self.decoding)
-            .acquire_many_owned(weight)
-            .await
-            .map_err(|_| Error::Query("decode budget closed".into()))?;
+        // A permit may be held until later units are read, since rows are
+        // handed on in scan order. A read with one outstanding therefore
+        // never waits for more budget, or it could wait on its own rows: it
+        // proceeds without when none is free. Only its first unit waits.
+        let holding = self.outstanding.load(Ordering::Acquire) > 0;
+        let budget = if holding {
+            Arc::clone(&self.decoding).try_acquire_many_owned(weight).ok()
+        } else {
+            Some(
+                Arc::clone(&self.decoding)
+                    .acquire_many_owned(weight)
+                    .await
+                    .map_err(|_| Error::Query("decode budget closed".into()))?,
+            )
+        };
+        let process = match (&budget, holding) {
+            (None, _) => None,
+            (Some(_), true) => memory.try_decode(u64::from(weight)),
+            (Some(_), false) => Some(memory.decode(u64::from(weight)).await?),
+        };
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         Ok(DecodePermit {
-            _budget: budget,
-            _process: memory.decode(u64::from(weight)).await?,
+            budget,
+            process,
+            outstanding: Arc::clone(&self.outstanding),
         })
     }
 
