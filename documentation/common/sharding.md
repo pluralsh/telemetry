@@ -100,6 +100,66 @@ Metrics sample reads after series resolution, stay on the replica that
 answered first. Calls are bounded by `request_timeout_seconds` and carry the
 `auth.internal` credential.
 
+### Splitting one shard's read across its replicas
+
+By default each remote shard of a query is answered by one replica, and
+hedging repeats the same work on a second one. With
+`sharding.read_groups.split.enabled`, a heavy read is instead cut into
+fragments that different replicas of the shard's group run at the same time,
+including the group of the reader that coordinates the query: it runs one
+fragment itself and sends the others to its peers.
+
+```yaml
+sharding:
+  read_groups:
+    split:
+      enabled: false          # Off by default.
+      max_fragments: 4        # At most this many fragments per shard read.
+      max_local_inflight: 32  # No splitting while this reader coordinates this many queries.
+      min_fragment_cost:      # Estimated cost one fragment must carry; 0 always splits.
+        metrics: 240          # Output steps (pushdown) or hours x 60 (raw reads).
+        logs: 64              # Pages, estimated from the local shard.
+        traces: 5000          # Candidate traces, from the local shard.
+```
+
+Fragments are addressed by time range, step range or trace ID, never by
+storage ids such as buckets, series, segments or pages, which rollups change.
+A fragment runs start to finish on one replica, and a replica is chosen for it
+by rendezvous hashing of its address, so each replica's caches keep a stable
+slice of the key space across queries. A failed fragment is retried once on
+another replica, and a second failure fails the query: results are never
+partial. A single fragment is hedged as before; several are not.
+
+The number of fragments is `min(replicas, max_fragments, ceil(estimated cost /
+min_fragment_cost))`. Splitting is skipped when that is below two, when this
+reader coordinates `max_local_inflight` queries, and for groups with one
+replica. Shards are balanced by hash, so the local shard's estimate stands in
+for each remote shard's, without an extra round trip.
+
+| Product | What is split | Merged by the coordinator |
+|---|---|---|
+| Metrics, pushdown | Output steps of a range query, per shard | Concatenation by step |
+| Metrics, other queries | Hour-aligned time slices of the raw reads | The multi-source series join used at routing-epoch cutovers |
+| Logs | Row time `[a, b)` of metric queries and unindexed queries that read lines | Merged exactly as shards are |
+| Traces | Candidate trace ids, in waves | `(start, trace ID)` order, stopping at the limit |
+
+Limits keep their meaning. Logs divides `max_pages` across a shard's
+fragments, and reads the shard whole if a fragment exceeds its share, so a
+query fails only if it would fail unsplit. Traces counts `max_candidate_traces`
+over the candidates dispatched, as a whole read counts those it loads.
+Not split: Logs queries with a `limit` (they stop early), indexed searches,
+and lineless metric reads (they read page summaries, which cannot be cut at a
+row). Traces are never split by time, since results are oldest first up to the
+limit.
+
+Not yet implemented: a per-query limit on in-flight bytes across fragments,
+and a load signal from peers; splitting is gated on this reader's own load
+only. The local shard's raw Metrics reads are not split.
+
+Metrics: `telemetry_read_group_fragments`, `telemetry_read_group_fragment_seconds`,
+`logs_split_queries_total`, `traces_split_queries_total`,
+`metrics_split_reads_total`, `metrics_pushdown_total{result}`.
+
 A reader that belongs to a group reports ready once its own shard is open; it
 does not wait for other groups. A query whose remote shard has no reachable
 replica fails rather than returning partial results: Logs and Traces respond

@@ -117,3 +117,36 @@ Not supported:
 
 - Non-literal numeric parameters for `histogram_quantile` and
   `histogram_fraction`.
+
+## Pushdown to shards
+
+With `pushdown.enabled` on a reader group, the largest subtrees that can be
+computed from partial results are evaluated on each shard, and the
+coordinator evaluates the rest over what they return. Only these are pushed
+down, and only when everything below the aggregation works on one series at a
+time (selectors; `rate`, `irate`, `increase`, `delta`, `*_over_time`, the
+math functions, `label_replace`, `label_join`; arithmetic and comparisons with
+a scalar literal):
+
+| Aggregation | Each shard returns | Coordinator combines |
+|---|---|---|
+| `sum`, `min`, `max`, `group` | the same aggregation | the same again |
+| `count` | `count` | `sum` |
+| `avg` | `sum`, `count` | `sum / sum` |
+| `stddev`, `stdvar` | `sum`, sum of squares, `count` | `sqrt(clamp_min(sumsq/n - (sum/n)^2, 0))` |
+| `topk`, `bottomk` (literal `k`) | its local top `k` | the top `k` of those |
+
+Everything else takes the unchanged path: `quantile`, `count_values`,
+`absent`, `limitk`, subqueries, `@`, `timestamp`, and binary operations
+between vectors. Their operands are pushed down separately where possible,
+so in `sum(rate(a[1m])) / sum(rate(b[1m]))` both sums are pushed and only
+the division runs on the coordinator. A query whose data window contains a
+routing-epoch cutover is not pushed down at all, because a series moved by a
+scale-up has samples on two shards.
+
+Results can differ from the unpushed path in two ways: sums are added in a
+different order, which changes the last bits (compare with a relative
+tolerance, as Mimir does), and `topk`/`bottomk` break ties between equal
+values by the order partials arrive in. `stddev` and `stdvar` use the
+sum-of-squares formula, which loses precision for series whose mean is large
+compared to their spread; turn pushdown off if that matters.
