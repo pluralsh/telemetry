@@ -75,7 +75,7 @@ fn catalog_concurrency() -> usize {
 const SEARCH_BATCH_MAX: usize = 4 * MATERIALIZE_BATCH;
 
 #[cfg(not(test))]
-fn search_batch_max() -> usize {
+pub(crate) fn search_batch_max() -> usize {
     SEARCH_BATCH_MAX
 }
 
@@ -85,7 +85,7 @@ static SEARCH_BATCH_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
-fn search_batch_max() -> usize {
+pub(crate) fn search_batch_max() -> usize {
     match SEARCH_BATCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => SEARCH_BATCH_MAX,
         overridden => overridden,
@@ -120,7 +120,10 @@ mod write;
 pub use read_cache::ReadCacheConfig;
 use read_cache::{PostingEntry, ReadCache, SegmentPostings, TraceLocators};
 
-pub(crate) use query::{Hit, evaluate_traceql, execute_traceql, merge_traces};
+pub(crate) use query::{
+    Hit, evaluate_traceql, execute_traceql, execute_traceql_ids, merge_traces,
+    traceql_candidate_ids,
+};
 use write::*;
 
 const WRITE_CHANNEL: &str = "write";

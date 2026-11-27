@@ -17,13 +17,15 @@ use sharding::{
 use slatedb::config::DbReaderOptions;
 use tokio_util::sync::CancellationToken;
 
+use futures::FutureExt;
 use futures::future::{try_join, try_join_all};
 use proto::traces::internal::v1 as pb;
 
 use crate::db::Hit;
 use crate::remote::{
-    RemoteShard, SEARCH_CHUNK_TRACES, TracesShardClient, discovery_to_wire, matcher_from_wire,
-    options_from_wire, read_from_wire, scope_from_wire, trace_to_wire,
+    LocalRun, RemoteShard, SEARCH_CHUNK_TRACES, TracesShardClient, discovery_to_wire,
+    matcher_from_wire, options_from_wire, read_from_wire, scope_from_wire, trace_to_wire,
+    traceql_request,
 };
 use crate::routing::{may_be_split, route_trace, trace_shards};
 use crate::{
@@ -42,6 +44,18 @@ impl ShardDatabase for TraceDb {
     async fn close_database(self: Arc<Self>) -> Result<()> {
         self.close().await
     }
+}
+
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn scopeguard_decrement(counter: &std::sync::atomic::AtomicUsize) -> InflightGuard<'_> {
+    InflightGuard(counter)
 }
 
 fn shard_config(config: &Config, shard: ShardId) -> Config {
@@ -71,6 +85,8 @@ pub struct ShardedTraces {
     /// Reads the shards other reader groups serve.
     remote: OnceLock<Arc<dyn TracesShardClient>>,
     searches: SingleFlight<SearchKey, SharedSearch>,
+    /// TraceQL reads this reader is coordinating, which gate splitting.
+    inflight: std::sync::atomic::AtomicUsize,
 }
 
 type SearchKey = (Namespace, String, u64, u64, QueryOptions);
@@ -130,6 +146,7 @@ impl ShardedTraces {
             cache,
             remote: OnceLock::new(),
             searches: SingleFlight::new("traces"),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -468,6 +485,24 @@ impl ShardedTraces {
         if remote.is_empty() {
             return self.local_traceql(namespace, range, source, options).await;
         }
+        let inflight = self
+            .inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _guard = scopeguard_decrement(&self.inflight);
+        if let Some(mut hits) = self
+            .split_traceql::<T>(namespace, range, source, options, &remote, inflight)
+            .await?
+        {
+            return self
+                .finish_traceql(
+                    assignment,
+                    namespace,
+                    source,
+                    options,
+                    std::mem::take(&mut hits),
+                )
+                .await;
+        }
         let (mut hits, remote) = try_join(
             self.local_traceql::<T>(namespace, range, source, options),
             try_join_all(
@@ -478,7 +513,166 @@ impl ShardedTraces {
         )
         .await?;
         hits.extend(remote.into_iter().flatten());
+        self.finish_traceql(assignment, namespace, source, options, hits)
+            .await
+    }
 
+    /// Reads every shard as two phases when the local shard's candidate
+    /// count is large enough to be worth dividing across replicas: one
+    /// replica of each shard lists its candidate trace ids, then runs of
+    /// them go to the group's replicas to be evaluated whole. Shards are
+    /// balanced by hash, so the local count stands in for each remote
+    /// shard's. `None` reads shards whole instead.
+    async fn split_traceql<T: Hit>(
+        &self,
+        namespace: &Namespace,
+        range: (u64, u64),
+        source: &str,
+        options: QueryOptions,
+        remote: &[RemoteShard],
+        inflight: usize,
+    ) -> Result<Option<Vec<T>>> {
+        let Some(client) = self.remote.get() else {
+            return Ok(None);
+        };
+        if !client.splitting() {
+            return Ok(None);
+        }
+        let entries = self.shards.entries().await;
+        let [(local_shard, database)] = entries.as_slice() else {
+            return Ok(None);
+        };
+        let permits = self.shards.io_permits();
+        let local_ids = crate::db::traceql_candidate_ids(
+            &[database.as_ref()],
+            Some(&permits),
+            namespace,
+            range,
+            source,
+        )
+        .await?;
+        let candidates = local_ids.len() as u64;
+        let Some(ways) = client.split_ways(*local_shard, candidates, inflight).await else {
+            return Ok(None);
+        };
+        ::metrics::counter!("traces_split_queries_total").increment(1);
+        let local_shard = *local_shard;
+        let local = self.split_shard::<T>(
+            client.as_ref(),
+            local_shard,
+            local_ids,
+            namespace,
+            range,
+            source,
+            options,
+            ways,
+            true,
+        );
+        let remotes = try_join_all(remote.iter().map(|shard| async move {
+            let ids = shard
+                .candidate_ids(namespace, range, source, &options)
+                .await?;
+            self.split_shard::<T>(
+                client.as_ref(),
+                shard.shard,
+                ids,
+                namespace,
+                range,
+                source,
+                options,
+                ways,
+                false,
+            )
+            .await
+        }));
+        let (mut hits, remote_hits) = try_join(local, remotes).await?;
+        hits.extend(remote_hits.into_iter().flatten());
+        Ok(Some(hits))
+    }
+
+    /// One shard's `ids` evaluated in waves sized as a whole read's batches
+    /// are, each wave cut into contiguous runs across the group's replicas,
+    /// stopping once `limit` hits are found. `max_candidate_traces` counts
+    /// the candidates dispatched, as it counts those loaded by a whole read.
+    #[allow(clippy::too_many_arguments)]
+    async fn split_shard<T: Hit>(
+        &self,
+        client: &dyn TracesShardClient,
+        shard: ShardId,
+        ids: Vec<TraceId>,
+        namespace: &Namespace,
+        range: (u64, u64),
+        source: &str,
+        options: QueryOptions,
+        ways: usize,
+        is_local: bool,
+    ) -> Result<Vec<T>> {
+        let mut results = Vec::<T>::new();
+        let (mut loaded, mut previous) = (0, 0);
+        let mut remaining = ids.into_iter();
+        while results.len() < options.limit {
+            let wanted = (options.limit - results.len())
+                .max(options.max_concurrency)
+                .max(previous * 2)
+                .min(crate::db::search_batch_max());
+            previous = wanted;
+            let batch = remaining.by_ref().take(wanted).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            loaded += batch.len();
+            if loaded > options.max_candidate_traces {
+                return Err(crate::traceql::QueryError::Limit(format!(
+                    "{loaded} candidate traces exceeds maximum {}",
+                    options.max_candidate_traces
+                ))
+                .into());
+            }
+            let needed = options.limit - results.len();
+            let run_len = batch.len().div_ceil(ways.min(batch.len()));
+            let requests = batch
+                .chunks(run_len)
+                .map(|run| {
+                    let mut request =
+                        traceql_request(shard, namespace, range, source, &options, T::SUMMARIES);
+                    request.limit = needed as u64;
+                    request.candidate_ids = run.iter().map(|id| id.as_bytes().to_vec()).collect();
+                    request
+                })
+                .collect::<Vec<_>>();
+            let run_local = |request: pb::TraceQlRequest| {
+                async move {
+                    let mut response = self.serve_traceql(&request).await?;
+                    response.candidate_ids.clear();
+                    Ok(response)
+                }
+                .boxed()
+            };
+            let local: Option<LocalRun<'_>> = is_local.then_some(&run_local as _);
+            let responses = client.traceql_runs(requests, local).await?;
+            let mut found = Vec::new();
+            for response in responses {
+                for hit in response.hits {
+                    found.push(T::from_wire(hit)?);
+                }
+            }
+            found.truncate(needed);
+            results.extend(found);
+        }
+        results.sort_by_key(T::order);
+        Ok(results)
+    }
+
+    /// Merges hits of every shard into result order, evaluating whole again
+    /// the traces that may have been split across shards by a cutover.
+    async fn finish_traceql<T: Hit>(
+        &self,
+        assignment: &ShardMap,
+        namespace: &Namespace,
+        source: &str,
+        options: QueryOptions,
+        mut hits: Vec<T>,
+    ) -> Result<Vec<T>> {
         let mut split = HashMap::<TraceId, Option<T>>::new();
         for hit in &hits {
             let trace_id = hit.order().1;
@@ -619,6 +813,61 @@ impl ShardedTraces {
         let range = (request.start_ns, request.end_ns);
         let permits = self.shards.io_permits();
         let shards = [database.as_ref()];
+        if request.candidates_only {
+            let ids = crate::db::traceql_candidate_ids(
+                &shards,
+                Some(&permits),
+                &namespace,
+                range,
+                &request.query,
+            )
+            .await?;
+            return Ok(pb::TraceQlResponse {
+                hits: Vec::new(),
+                candidate_ids: ids.iter().map(|id| id.as_bytes().to_vec()).collect(),
+            });
+        }
+        if !request.candidate_ids.is_empty() {
+            let ids = request
+                .candidate_ids
+                .iter()
+                .map(|id| TraceId::from_slice(id))
+                .collect::<Result<Vec<_>>>()?;
+            let wanted = options.limit;
+            let hits = if request.summaries {
+                crate::db::execute_traceql_ids::<TraceSummary>(
+                    &database,
+                    Some(&permits),
+                    &namespace,
+                    &ids,
+                    &request.query,
+                    options,
+                    wanted,
+                )
+                .await?
+                .into_iter()
+                .map(Hit::to_wire)
+                .collect()
+            } else {
+                crate::db::execute_traceql_ids::<TraceQlResult>(
+                    &database,
+                    Some(&permits),
+                    &namespace,
+                    &ids,
+                    &request.query,
+                    options,
+                    wanted,
+                )
+                .await?
+                .into_iter()
+                .map(Hit::to_wire)
+                .collect()
+            };
+            return Ok(pb::TraceQlResponse {
+                hits,
+                candidate_ids: Vec::new(),
+            });
+        }
         let hits = if request.summaries {
             crate::db::execute_traceql::<TraceSummary>(
                 &shards,
@@ -646,7 +895,10 @@ impl ShardedTraces {
             .map(Hit::to_wire)
             .collect()
         };
-        Ok(pb::TraceQlResponse { hits })
+        Ok(pb::TraceQlResponse {
+            hits,
+            candidate_ids: Vec::new(),
+        })
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -1019,6 +1271,10 @@ mod tests {
     struct InProcessShards {
         reader: Arc<ShardedTraces>,
         asked: std::sync::Mutex<Vec<u32>>,
+        /// Runs each shard read is split into; below 2, reads are whole.
+        ways: std::sync::atomic::AtomicUsize,
+        /// Requests that evaluated a run of candidate ids.
+        runs: std::sync::atomic::AtomicUsize,
     }
 
     impl InProcessShards {
@@ -1062,7 +1318,18 @@ mod tests {
 
         async fn traceql(&self, request: pb::TraceQlRequest) -> Result<pb::TraceQlResponse> {
             self.record(request.read.as_ref());
+            if !request.candidate_ids.is_empty() {
+                self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.reader.serve_traceql(&request).await
+        }
+
+        fn splitting(&self) -> bool {
+            self.ways.load(std::sync::atomic::Ordering::SeqCst) >= 2
+        }
+
+        async fn split_ways(&self, _: ShardId, _: u64, _: usize) -> Option<usize> {
+            Some(self.ways.load(std::sync::atomic::Ordering::SeqCst)).filter(|ways| *ways >= 2)
         }
     }
 
@@ -1097,6 +1364,8 @@ mod tests {
         let shards = Arc::new(InProcessShards {
             reader: Arc::clone(everything),
             asked: Default::default(),
+            ways: Default::default(),
+            runs: Default::default(),
         });
         assert!(coordinator.connect_remote_shards(shards.clone()));
         (coordinator, shards)
@@ -1134,42 +1403,48 @@ mod tests {
                 .any(|trace| route_trace(&routing, &namespace, trace) == ShardId::new(1))
         );
 
-        for limit in [1, 5, 20] {
-            let options = QueryOptions {
-                limit,
-                ..QueryOptions::default()
-            };
-            for query in ["{}", "{ .shard > 4 }", "{ .shard = 3 }"] {
-                let expected = everything
-                    .query_traceql(&routing, &namespace, 0, 2_000, query, options)
-                    .await
-                    .unwrap();
-                assert!(!expected.is_empty(), "{query}");
-                assert_eq!(
-                    coordinator
+        for ways in [0usize, 2, 3] {
+            shards.ways.store(ways, std::sync::atomic::Ordering::SeqCst);
+            shards.runs.store(0, std::sync::atomic::Ordering::SeqCst);
+            for limit in [1, 5, 20] {
+                let options = QueryOptions {
+                    limit,
+                    ..QueryOptions::default()
+                };
+                for query in ["{}", "{ .shard > 4 }", "{ .shard = 3 }"] {
+                    let expected = everything
                         .query_traceql(&routing, &namespace, 0, 2_000, query, options)
                         .await
-                        .unwrap(),
-                    expected,
-                    "{query} limit {limit}"
-                );
+                        .unwrap();
+                    assert!(!expected.is_empty(), "{query}");
+                    assert_eq!(
+                        coordinator
+                            .query_traceql(&routing, &namespace, 0, 2_000, query, options)
+                            .await
+                            .unwrap(),
+                        expected,
+                        "{query} limit {limit}"
+                    );
+                    assert_eq!(
+                        coordinator
+                            .search_traceql(&routing, &namespace, 0, 2_000, query, options)
+                            .await
+                            .unwrap(),
+                        everything
+                            .search_traceql(&routing, &namespace, 0, 2_000, query, options)
+                            .await
+                            .unwrap(),
+                        "{query} limit {limit}"
+                    );
+                }
                 assert_eq!(
-                    coordinator
-                        .search_traceql(&routing, &namespace, 0, 2_000, query, options)
-                        .await
-                        .unwrap(),
-                    everything
-                        .search_traceql(&routing, &namespace, 0, 2_000, query, options)
-                        .await
-                        .unwrap(),
-                    "{query} limit {limit}"
+                    coordinator.scan_traces(&namespace, limit).await.unwrap(),
+                    everything.scan_traces(&namespace, limit).await.unwrap(),
+                    "limit {limit}"
                 );
             }
-            assert_eq!(
-                coordinator.scan_traces(&namespace, limit).await.unwrap(),
-                everything.scan_traces(&namespace, limit).await.unwrap(),
-                "limit {limit}"
-            );
+            let runs = shards.runs.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(runs > 0, ways >= 2, "ways {ways}: {runs} runs");
         }
         assert_eq!(
             coordinator.search(&namespace, 0, 2_000, &[]).await.unwrap(),

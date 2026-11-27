@@ -1817,6 +1817,61 @@ pub(crate) async fn execute_traceql<T: Hit>(
     Ok(results)
 }
 
+/// The ids of the traces a TraceQL query may match on `shards`, in the
+/// order [`execute_traceql`] would consider them: global `(start, trace ID)`
+/// order of the pages the index saw. They are candidates only; each must
+/// still be evaluated whole, as [`execute_traceql_ids`] does.
+pub(crate) async fn traceql_candidate_ids(
+    shards: &[&TraceDb],
+    permits: Option<&tokio::sync::Semaphore>,
+    namespace: &Namespace,
+    (start_ns, end_ns): (u64, u64),
+    source: &str,
+) -> Result<Vec<TraceId>> {
+    let query = crate::traceql::parse(source)?;
+    let plan = crate::traceql::plan(query)?;
+    let existential = crate::traceql::existential(&plan.query);
+    let now = unix_time_ms()?;
+    let per_shard = futures::future::try_join_all(shards.iter().map(|database| async {
+        let _permit = acquire(permits).await?;
+        database
+            .ordered_candidates_for(
+                namespace,
+                (start_ns, end_ns),
+                &plan.pushdown,
+                now,
+                existential,
+            )
+            .await
+    }))
+    .await?;
+    Ok(group_candidates(per_shard)
+        .into_iter()
+        .map(|group| group.trace_id)
+        .collect())
+}
+
+/// Evaluates `trace_ids` whole against `source`, each on `database` alone,
+/// and returns up to `wanted` hits in input order. A trace's pages are found
+/// through its head record, so the ids carry no storage locators.
+pub(crate) async fn execute_traceql_ids<T: Hit>(
+    database: &TraceDb,
+    permits: Option<&tokio::sync::Semaphore>,
+    namespace: &Namespace,
+    trace_ids: &[TraceId],
+    source: &str,
+    options: QueryOptions,
+    wanted: usize,
+) -> Result<Vec<T>> {
+    validate_options(&options)?;
+    let plan = crate::traceql::plan(crate::traceql::parse(source)?)?;
+    let compiled = Arc::new(crate::traceql::CompiledQuery::new(plan.query.clone()));
+    let now = unix_time_ms()?;
+    let _permit = acquire(permits).await?;
+    let traces = database.materialize(namespace, trace_ids, now).await?;
+    evaluate_batch::<T>(traces, &plan, &compiled, &options, wanted).await
+}
+
 /// The first `wanted` results of `traces` that satisfy the plan's pushdown
 /// and the query, in order.
 async fn evaluate_batch<T: Hit>(

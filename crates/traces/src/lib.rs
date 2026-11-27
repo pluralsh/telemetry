@@ -32,7 +32,7 @@ pub use model::{
 };
 pub use otlp::{trace_batches, trace_batches_from_resource_spans};
 pub use page::{Page, PageBuilder, TraceDirectoryEntry};
-pub use remote::TracesShardClient;
+pub use remote::{LocalRun, TracesShardClient};
 pub use sharded::ShardedTraces;
 pub use sharding::ShardingOptions;
 pub use traceql::{
