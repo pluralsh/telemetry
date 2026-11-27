@@ -233,8 +233,7 @@ impl ShardedMetrics {
                         .samples
                         .extend(series.timestamps.into_iter().zip(series.values));
                     for histogram in series.histograms {
-                        let sample = histogram_from_wire(histogram)
-                            .map_err(|error| QueryError::Storage(error))?;
+                        let sample = histogram_from_wire(histogram).map_err(QueryError::Storage)?;
                         entry
                             .histograms
                             .push((sample.timestamp_ms, Arc::new(sample.histogram)));
