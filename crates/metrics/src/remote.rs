@@ -38,6 +38,16 @@ const SAMPLES_PER_MESSAGE: usize = 256 * 1024;
 
 pub type WireStream<T> = BoxStream<'static, Result<T, QueryError>>;
 
+/// Evaluates one fragment of a pushed-down read of the shard this reader
+/// serves, in process.
+pub type LocalEvaluation<'a> = &'a (
+        dyn Fn(
+    pb::EvaluateRequest,
+) -> futures::future::BoxFuture<'a, Result<pb::EvaluateResponse, QueryError>>
+            + Send
+            + Sync
+    );
+
 /// Transport to the reader groups serving other shards.
 #[async_trait]
 pub trait MetricsShardClient: Send + Sync + 'static {
@@ -67,6 +77,38 @@ pub trait MetricsShardClient: Send + Sync + 'static {
         &self,
         request: pb::BucketGenerationsRequest,
     ) -> Result<pb::BucketGenerationsResponse, QueryError>;
+
+    /// Whether this transport can evaluate PromQL on shards.
+    fn pushdown(&self) -> bool {
+        false
+    }
+
+    /// How many fragments a read of `shard` over `steps` output steps
+    /// should be cut into across its group's replicas, or `None` to
+    /// evaluate it whole.
+    async fn split_ways(
+        &self,
+        _shard: ShardId,
+        _steps: u64,
+        _local_inflight: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Evaluates each of `requests`, fragments of one shard's read, and
+    /// returns the responses in order. `local` evaluates a fragment on the
+    /// shard this reader serves; the transport decides which fragments run
+    /// there.
+    async fn evaluate(
+        &self,
+        requests: Vec<pb::EvaluateRequest>,
+        _local: Option<LocalEvaluation<'_>>,
+    ) -> Result<Vec<pb::EvaluateResponse>, QueryError> {
+        let _ = requests;
+        Err(QueryError::Storage(
+            "this shard client cannot evaluate PromQL".to_owned(),
+        ))
+    }
 }
 
 /// The streaming reads of one query against one remote shard.
@@ -255,7 +297,7 @@ fn matcher_from_wire(matcher: pb::Matcher) -> Result<Matcher, QueryError> {
     }
 }
 
-fn labels_to_wire(labels: &Labels) -> pb::LabelSet {
+pub(crate) fn labels_to_wire(labels: &Labels) -> pb::LabelSet {
     pb::LabelSet {
         labels: labels
             .iter()
@@ -267,7 +309,7 @@ fn labels_to_wire(labels: &Labels) -> pb::LabelSet {
     }
 }
 
-fn labels_from_wire(labels: pb::LabelSet) -> Labels {
+pub(crate) fn labels_from_wire(labels: pb::LabelSet) -> Labels {
     Labels::new(
         labels
             .labels
@@ -658,7 +700,7 @@ impl RemoteShard {
 /// The receiving side: requests from coordinating readers, answered from
 /// this reader's own shard only.
 impl ShardedMetrics {
-    async fn served_read(
+    pub(crate) async fn served_read(
         &self,
         read: Option<pb::ShardRead>,
     ) -> Result<(ShardId, Namespace, Vec<(i64, i64)>), QueryError> {

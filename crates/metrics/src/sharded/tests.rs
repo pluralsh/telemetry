@@ -696,6 +696,10 @@ struct InProcessShards {
     /// Drops label projections, as a server or client predating them would.
     unprojected: Arc<std::sync::atomic::AtomicBool>,
     fingerprinted_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fragments each shard's pushed-down read is cut into; below 2, whole.
+    ways: Arc<std::sync::atomic::AtomicUsize>,
+    /// Pushed-down fragments evaluated.
+    evaluations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InProcessShards {
@@ -786,6 +790,38 @@ impl crate::MetricsShardClient for InProcessShards {
         self.peer(request.read.as_ref())
             .serve_bucket_generations(request)
             .await
+    }
+
+    fn pushdown(&self) -> bool {
+        true
+    }
+
+    async fn split_ways(&self, _: ShardId, _: u64, _: usize) -> Option<usize> {
+        let ways = self.ways.load(std::sync::atomic::Ordering::SeqCst);
+        (ways >= 2).then_some(ways)
+    }
+
+    async fn evaluate(
+        &self,
+        requests: Vec<proto::metrics::internal::v1::EvaluateRequest>,
+        local: Option<crate::LocalEvaluation<'_>>,
+    ) -> std::result::Result<Vec<proto::metrics::internal::v1::EvaluateResponse>, QueryError> {
+        let mut responses = Vec::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            self.evaluations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let shard = ShardId::new(request.read.as_ref().unwrap().shard);
+            responses.push(match local {
+                // Odd fragments of the local shard go to a peer replica.
+                Some(local) if index % 2 == 0 => local(request).await?,
+                _ => {
+                    self.peers.get().unwrap()[&shard]
+                        .serve_evaluate(request)
+                        .await?
+                }
+            });
+        }
+        Ok(responses)
     }
 }
 
@@ -1067,6 +1103,192 @@ async fn remote_shards_answer_projected_aggregations_whether_or_not_they_project
         assert_eq!(sent > 0, !unprojected, "fingerprinted chunks: {sent}");
     }
     everything.close().await.unwrap();
+    for group in groups.values() {
+        group.close().await.unwrap();
+    }
+}
+
+/// Whether two range results have the same series and steps, with values
+/// equal up to the rounding of summing in a different order.
+fn approx_equal(left: &[RangeSample], right: &[RangeSample]) -> bool {
+    let key = |series: &RangeSample| format!("{:?}", series.labels);
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    left.sort_by_key(|series| key(series));
+    right.sort_by_key(|series| key(series));
+    left.len() == right.len()
+        && left.iter().zip(&right).all(|(a, b)| {
+            key(a) == key(b)
+                && a.samples.len() == b.samples.len()
+                && a.samples.iter().zip(&b.samples).all(|(x, y)| {
+                    x.0 == y.0
+                        && (x.1 == y.1
+                            || (x.1.is_nan() && y.1.is_nan())
+                            || (x.1 - y.1).abs() <= 1e-9 * x.1.abs().max(y.1.abs()).max(1e-300))
+                })
+        })
+}
+
+#[tokio::test]
+async fn pushed_down_queries_answer_like_raw_evaluation() {
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: SlateDbStorageConfig {
+            path: "pushdown".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            l0_flush_parallelism: None,
+            block_cache: None,
+            meta_cache: None,
+            disk: Default::default(),
+        },
+        ..Default::default()
+    };
+    let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+    let namespace = Namespace::new("pushdown").unwrap();
+    let writers =
+        ShardedMetrics::open_writers(config.clone(), options, [ShardId::new(0), ShardId::new(1)])
+            .await
+            .unwrap();
+    let now = common::time::now_ms() / 60_000 * 60_000;
+    let from = now - 30 * 60_000;
+    let mut series = Vec::new();
+    for (shard, job, scale) in [
+        (0, "api", 1.0),
+        (1, "api", 2.0),
+        (0, "web", 3.0),
+        (1, "web", 5.0),
+        (1, "db", 7.0),
+    ] {
+        let samples = (from..=now)
+            .step_by(60_000)
+            .map(|t| Sample::new(t, ((t - from) / 60_000) as f64 * scale + scale))
+            .collect();
+        series.push(series_on_shard(
+            &writers,
+            "requests_total",
+            shard,
+            &[("job", job), ("zone", if scale > 2.5 { "a" } else { "b" })],
+            samples,
+        ));
+    }
+    writers
+        .write(&assignment(2), &namespace, series, Visibility::Durable)
+        .await
+        .unwrap();
+    writers.close().await.unwrap();
+
+    let open = |shards: Vec<ShardId>| {
+        ShardedMetrics::open_readers(
+            config.clone(),
+            options,
+            shards,
+            DbReaderOptions {
+                skip_wal_replay: false,
+                ..DbReaderOptions::default()
+            },
+            64 * 1024 * 1024,
+        )
+    };
+    let transport = InProcessShards::default();
+    let mut groups = std::collections::BTreeMap::new();
+    for shard in [ShardId::new(0), ShardId::new(1)] {
+        let group = open(vec![shard]).await.unwrap();
+        assert!(group.shards().scope_readers_to(shard));
+        assert!(group.connect_remote_shards(Arc::new(transport.clone())));
+        groups.insert(shard, Arc::new(group));
+    }
+    assert!(transport.peers.set(groups.clone()).is_ok());
+    let coordinator = &groups[&ShardId::new(0)];
+    coordinator.set_routing_cutovers(Vec::new());
+
+    let queries = [
+        "sum(requests_total)",
+        "sum by (job) (rate(requests_total[5m]))",
+        "sum without (zone) (requests_total)",
+        "count by (job) (requests_total)",
+        "avg by (zone) (requests_total)",
+        "min(requests_total)",
+        "max by (job) (requests_total)",
+        "group by (job) (requests_total)",
+        "stddev by (zone) (requests_total)",
+        "stdvar(requests_total)",
+        "topk(2, requests_total)",
+        "bottomk by (zone) (1, rate(requests_total[5m]))",
+        "sum(rate(requests_total{job=\"api\"}[5m])) / sum(rate(requests_total[5m]))",
+        "sum by (job) (requests_total) > 100",
+        "sum(abs(requests_total - 50))",
+        "sum(rate(requests_total[5m])) + 1",
+        "sum(requests_total{job=\"missing\"})",
+        "requests_total",
+        "quantile(0.5, requests_total)",
+    ];
+    let (start, end) = (now - 20 * 60_000, now);
+    for ways in [0usize, 2, 3] {
+        transport.ways.store(ways, Ordering::SeqCst);
+        for pushdown in [false, true] {
+            coordinator.set_pushdown(pushdown);
+            transport.evaluations.store(0, Ordering::SeqCst);
+            for query in queries {
+                coordinator.set_pushdown(false);
+                let expected_range = coordinator
+                    .query_range(
+                        &namespace,
+                        query,
+                        at(start)..=at(end),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                let expected_instant = coordinator.query(&namespace, query, Some(at(now))).await;
+                coordinator.set_pushdown(pushdown);
+                let actual_range = coordinator
+                    .query_range(
+                        &namespace,
+                        query,
+                        at(start)..=at(end),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    approx_equal(&actual_range, &expected_range),
+                    "range {query} ways {ways}: {actual_range:?} != {expected_range:?}"
+                );
+                let actual_instant = coordinator.query(&namespace, query, Some(at(now))).await;
+                let (expected, actual) = (
+                    expected_instant.unwrap().into_matrix(),
+                    actual_instant.unwrap().into_matrix(),
+                );
+                assert!(
+                    approx_equal(&actual, &expected),
+                    "instant {query}: {actual:?} != {expected:?}"
+                );
+            }
+            let evaluations = transport.evaluations.load(Ordering::SeqCst);
+            assert_eq!(evaluations > 0, pushdown, "ways {ways}: {evaluations}");
+        }
+    }
+
+    // A cutover inside the data a query reads sends it down the raw path.
+    coordinator.set_pushdown(true);
+    coordinator.set_routing_cutovers(vec![(now - 10 * 60_000) * 1_000_000]);
+    transport.evaluations.store(0, Ordering::SeqCst);
+    let raw = coordinator
+        .query_range(
+            &namespace,
+            "sum(requests_total)",
+            at(start)..=at(end),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.evaluations.load(Ordering::SeqCst), 0);
+    assert!(!raw.is_empty());
+    // Unknown cutovers never push down either.
     for group in groups.values() {
         group.close().await.unwrap();
     }

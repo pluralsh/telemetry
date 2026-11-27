@@ -509,6 +509,11 @@ where
             let op = ConstScalarOp::new(v, grid, reservation.clone());
             Ok(wrap_op(Box::new(op), "ConstScalar", ctx))
         }
+        LogicalPlan::Precomputed(data) => {
+            let op = crate::promql::operators::precomputed::PrecomputedOp::new(&data.0, grid)
+                .map_err(|error| PlanError::UnsupportedExpression(error.to_string()))?;
+            Ok(wrap_op(Box::new(op), "Precomputed", ctx))
+        }
         LogicalPlan::Time => {
             let op = TimeScalarOp::new(grid, reservation.clone());
             Ok(wrap_op(Box::new(op), "TimeScalar", ctx))

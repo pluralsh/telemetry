@@ -22,6 +22,7 @@ mod postings_cache;
 #[cfg(all(test, feature = "remote-write"))]
 mod profile;
 mod promql;
+mod pushdown;
 mod query;
 mod read_tuning;
 mod reader;
@@ -64,7 +65,8 @@ pub use promql::response::{
 };
 pub use reader::TimeSeriesDbReader;
 pub use remote::{
-    MetricsShardClient, MetricsShardQuery, WireStream, histogram_from_wire, histogram_to_wire,
+    LocalEvaluation, MetricsShardClient, MetricsShardQuery, WireStream, histogram_from_wire,
+    histogram_to_wire,
 };
 pub use sharded::{MetricsShard, ShardedMetrics, ShardedTimeseries};
 pub use sharding::ShardingOptions;

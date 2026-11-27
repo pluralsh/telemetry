@@ -165,6 +165,7 @@ fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
         leaf @ (LogicalPlan::VectorSelector { .. }
         | LogicalPlan::MatrixSelector { .. }
         | LogicalPlan::Scalar(_)
+        | LogicalPlan::Precomputed(_)
         | LogicalPlan::Time) => leaf,
     }
 }
@@ -340,7 +341,7 @@ fn dedupe_vector_selector_matchers(plan: LogicalPlan) -> LogicalPlan {
                 .map(dedupe_vector_selector_matchers)
                 .collect(),
         },
-        leaf @ (LogicalPlan::Scalar(_) | LogicalPlan::Time) => leaf,
+        leaf @ (LogicalPlan::Scalar(_) | LogicalPlan::Time | LogicalPlan::Precomputed(_)) => leaf,
     }
 }
 

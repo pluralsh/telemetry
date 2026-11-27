@@ -136,11 +136,32 @@ pub struct ShardedMetrics {
     /// Reads the shards other reader groups serve; unset outside reader
     /// groups, where every shard is open locally.
     remote: OnceLock<Arc<dyn MetricsShardClient>>,
+    /// Evaluates the pushable parts of queries on the shards.
+    pushdown: std::sync::atomic::AtomicBool,
+    /// Routing cutovers in milliseconds, once known.
+    cutovers_ms: std::sync::Mutex<Option<Vec<i64>>>,
+    /// Queries this reader is coordinating, which gate splitting.
+    inflight: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     label_projection: bool,
 }
 
 pub type ShardedTimeseries = ShardedMetrics;
+
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InflightGuard<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 type InstantResult = std::result::Result<QueryValue, QueryError>;
 type RangeResult = std::result::Result<Vec<RangeSample>, QueryError>;
@@ -180,6 +201,9 @@ impl ShardedMetrics {
             instant_flights: SingleFlight::new("metrics"),
             range_flights: SingleFlight::new("metrics"),
             remote: OnceLock::new(),
+            pushdown: std::sync::atomic::AtomicBool::new(false),
+            cutovers_ms: std::sync::Mutex::new(None),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             label_projection: true,
         })
@@ -470,10 +494,26 @@ impl ShardedMetrics {
                 let plan = plan.clone();
                 let (ranges, options) = (&ranges, &options);
                 async move {
+                    let _inflight = InflightGuard::new(&self.inflight);
+                    let (query, plan, ranges) = match self
+                        .pushdown(namespace, query, (at_ms, at_ms, 0), ranges)
+                        .await?
+                    {
+                        Some(pushed) => {
+                            let ranges = preload_ranges_for_query(
+                                &pushed.query,
+                                at_ms,
+                                at_ms,
+                                options.lookback_delta,
+                            )?;
+                            (pushed.query, plan.with_precomputed(pushed.partials), ranges)
+                        }
+                        None => (query.to_owned(), plan, ranges.clone()),
+                    };
                     let (source, plan) = self
-                        .traced_query_source(namespace, ranges, options, plan, trace)
+                        .traced_query_source(namespace, &ranges, options, plan, trace)
                         .await?;
-                    execute_query_source(query, source, plan, true, reservation).await
+                    execute_query_source(&query, source, plan, true, reservation).await
                 }
             })
             .await?;
@@ -675,10 +715,26 @@ impl ShardedMetrics {
                 let plan = plan.clone();
                 let (ranges, options) = (&ranges, &options);
                 async move {
+                    let _inflight = InflightGuard::new(&self.inflight);
+                    let (query, plan, ranges) = match self
+                        .pushdown(namespace, query, (start_ms, end_ms, step_ms), ranges)
+                        .await?
+                    {
+                        Some(pushed) => {
+                            let ranges = preload_ranges_for_query(
+                                &pushed.query,
+                                start_ms,
+                                end_ms,
+                                options.lookback_delta,
+                            )?;
+                            (pushed.query, plan.with_precomputed(pushed.partials), ranges)
+                        }
+                        None => (query.to_owned(), plan, ranges.clone()),
+                    };
                     let (source, plan) = self
-                        .traced_query_source(namespace, ranges, options, plan, trace)
+                        .traced_query_source(namespace, &ranges, options, plan, trace)
                         .await?;
-                    execute_query_source(query, source, plan, false, reservation).await
+                    execute_query_source(&query, source, plan, false, reservation).await
                 }
             })
             .await?;
@@ -1780,6 +1836,8 @@ impl MetricsShard {
         }
     }
 }
+
+mod pushdown;
 
 #[cfg(test)]
 mod tests;

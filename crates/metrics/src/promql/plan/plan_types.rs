@@ -300,6 +300,10 @@ pub enum LogicalPlan {
 
     /// Fan-in over parallel child streams sharing a schema.
     Coalesce { children: Vec<LogicalPlan> },
+
+    /// A subtree the shards already evaluated; see
+    /// [`crate::promql::operators::precomputed`].
+    Precomputed(crate::promql::operators::precomputed::PrecomputedRef),
 }
 
 impl LogicalPlan {
@@ -310,6 +314,7 @@ impl LogicalPlan {
                 | Self::MatrixSelector { .. }
                 | Self::Scalar(_)
                 | Self::Time
+                | Self::Precomputed(_)
         )
     }
 
@@ -328,6 +333,7 @@ impl LogicalPlan {
             | Self::Rollup { .. }
             | Self::LabelManip { .. }
             | Self::Aggregate { .. }
+            | Self::Precomputed(_)
             | Self::Sort { .. }
             | Self::Histogram { .. }
             | Self::Absent { .. }
