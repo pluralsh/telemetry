@@ -168,13 +168,22 @@ impl ReadGroups {
         } else {
             self.group_replicas(shard).await.ok()?.len()
         };
-        plan_fragments(
+        let ways = plan_fragments(
             &self.config.split,
             min_fragment_cost,
             estimated_cost,
             replicas,
             local_inflight,
-        )
+        );
+        let reason = match ways {
+            Some(_) => "split",
+            None if local_inflight >= self.config.split.max_local_inflight => "busy",
+            None if replicas < 2 => "single_replica",
+            None => "small",
+        };
+        ::metrics::counter!("telemetry_read_group_split_decisions_total", "reason" => reason)
+            .increment(1);
+        ways
     }
 
     fn own_address(&self) -> Option<String> {

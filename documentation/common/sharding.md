@@ -156,7 +156,8 @@ Not yet implemented: a per-query limit on in-flight bytes across fragments,
 and a load signal from peers; splitting is gated on this reader's own load
 only. The local shard's raw Metrics reads are not split.
 
-Metrics: `telemetry_read_group_fragments`, `telemetry_read_group_fragment_seconds`,
+Metrics: `telemetry_read_group_split_decisions_total{reason}` (`split`, `busy`, `single_replica`, `small`),
+`telemetry_read_group_fragments`, `telemetry_read_group_fragment_seconds`,
 `logs_split_queries_total`, `traces_split_queries_total`,
 `metrics_split_reads_total`, `metrics_pushdown_total{result}`.
 
