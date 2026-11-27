@@ -117,6 +117,40 @@ impl ReadGroups {
                 "shard {shard} is served in process and must not be read over gRPC"
             )));
         }
+        self.group_replicas(shard).await
+    }
+
+    /// The other replicas of this reader's own group, leaving this pod out.
+    /// Empty when the group has no peers or this pod's address is unknown.
+    pub async fn local_peers(&self) -> Result<Vec<Replica>, Status> {
+        let Some(own) = self.own_address() else {
+            return Ok(Vec::new());
+        };
+        let mut replicas = self.group_replicas(self.local).await?;
+        replicas.retain(|replica| replica.address != own);
+        Ok(replicas)
+    }
+
+    fn own_address(&self) -> Option<String> {
+        if let Some(address) = &self.config.split.self_address {
+            return Some(address.clone());
+        }
+        let ip = std::env::var("POD_IP").ok()?;
+        let endpoint = self.config.endpoint_for(self.local);
+        let port = endpoint.rsplit_once(':')?.1;
+        Some(if ip.contains(':') {
+            format!("[{ip}]:{port}")
+        } else {
+            format!("{ip}:{port}")
+        })
+    }
+
+    /// Settings for splitting shard reads.
+    pub const fn split_config(&self) -> &sharding::server::SplitConfig {
+        &self.config.split
+    }
+
+    async fn group_replicas(&self, shard: ShardId) -> Result<Vec<Replica>, Status> {
         let interval = Duration::from_secs(self.config.resolve_interval_seconds);
         let (endpoint, cached) = {
             let mut groups = self.groups.lock().unwrap_or_else(PoisonError::into_inner);
@@ -270,6 +304,98 @@ impl ReadGroups {
     }
 }
 
+/// How many fragments a shard read of `estimated_cost` should become, or
+/// `None` when it should not be split. `replicas` counts every replica that
+/// can take a fragment, `local_inflight` the queries this pod is running.
+pub fn plan_fragments(
+    config: &sharding::server::SplitConfig,
+    min_fragment_cost: u64,
+    estimated_cost: u64,
+    replicas: usize,
+    local_inflight: usize,
+) -> Option<usize> {
+    if !config.enabled || local_inflight >= config.max_local_inflight {
+        return None;
+    }
+    let by_cost = if min_fragment_cost == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(estimated_cost.div_ceil(min_fragment_cost)).unwrap_or(usize::MAX)
+    };
+    let k = replicas.min(config.max_fragments).min(by_cost);
+    (k >= 2).then_some(k)
+}
+
+/// Orders `replicas` by rendezvous hashing on `key`, best first. A key keeps
+/// its preferred replica while the group is stable, and losing a replica
+/// only moves the keys that preferred it, so each replica's caches keep a
+/// stable slice of the key space.
+pub fn rendezvous_order(replicas: &mut [Replica], key: u64) {
+    use std::hash::{Hash, Hasher};
+    let score = |replica: &Replica| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        replica.address.hash(&mut hasher);
+        hasher.finish()
+    };
+    replicas.sort_by_cached_key(|replica| std::cmp::Reverse(score(replica)));
+}
+
+impl ReadGroups {
+    /// Runs one fragment per entry of `keys` on `shard`'s group, each
+    /// start to finish on one replica chosen by rendezvous hashing on its
+    /// key, and returns the results in `keys` order. `include_local` adds
+    /// this pod's group peers (never the pod itself) to the candidates when
+    /// `shard` is the local shard. A failed fragment is retried once on the
+    /// next replica in its order; a second failure fails the whole read.
+    /// A lone fragment is hedged like [`Self::call`]; several are not.
+    pub async fn fan_out<T, F, Fut>(
+        &self,
+        shard: ShardId,
+        keys: &[u64],
+        run: F,
+    ) -> Result<Vec<T>, Status>
+    where
+        T: Send,
+        F: Fn(usize, Replica) -> Fut,
+        Fut: Future<Output = Result<T, Status>> + Send,
+    {
+        let replicas = if shard == self.local {
+            self.local_peers().await?
+        } else {
+            self.group_replicas(shard).await?
+        };
+        if replicas.is_empty() {
+            return Err(Status::unavailable("reader group has no replicas"));
+        }
+        let hedge = if keys.len() == 1 {
+            self.hedge_after()
+        } else {
+            None
+        };
+        let fragments = keys.iter().enumerate().map(|(index, key)| {
+            let mut order = replicas.clone();
+            rendezvous_order(&mut order, *key);
+            let run = &run;
+            async move {
+                let attempts = if hedge.is_some() {
+                    order.len()
+                } else {
+                    order.len().min(2)
+                };
+                order.truncate(attempts);
+                let started = Instant::now();
+                let result = race(order, hedge, |replica| run(index, replica)).await;
+                ::metrics::histogram!("telemetry_read_group_fragment_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                result.map(|(_, value)| value)
+            }
+        });
+        ::metrics::histogram!("telemetry_read_group_fragments").record(keys.len() as f64);
+        futures::future::try_join_all(fragments).await
+    }
+}
+
 /// Whether another replica may succeed where this one failed.
 pub fn is_retryable(status: &Status) -> bool {
     matches!(
@@ -345,6 +471,74 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     use super::*;
+
+    #[test]
+    fn plans_fragments() {
+        let on = sharding::server::SplitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(plan_fragments(&on, 100, 1000, 3, 0), Some(3));
+        assert_eq!(
+            plan_fragments(&on, 100, 250, 8, 0),
+            Some(3.min(on.max_fragments))
+        );
+        assert_eq!(plan_fragments(&on, 100, 150, 3, 0), Some(2));
+        assert_eq!(plan_fragments(&on, 100, 100, 3, 0), None);
+        assert_eq!(plan_fragments(&on, 0, 0, 3, 0), Some(3));
+        assert_eq!(plan_fragments(&on, 0, 0, 1, 0), None);
+        assert_eq!(plan_fragments(&on, 0, 0, 3, on.max_local_inflight), None);
+        assert_eq!(plan_fragments(&Default::default(), 0, 0, 3, 0), None);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_is_stable_and_minimally_disruptive() {
+        let all = ["a", "b", "c", "d"].map(replica);
+        let first = |set: &[Replica], key| {
+            let mut set = set.to_vec();
+            rendezvous_order(&mut set, key);
+            set[0].address.clone()
+        };
+        let without_b: Vec<_> = all.iter().filter(|r| r.address != "b").cloned().collect();
+        for key in 0..200u64 {
+            let before = first(&all, key);
+            assert_eq!(before, first(&all, key));
+            if before != "b" {
+                assert_eq!(before, first(&without_b, key));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_runs_fragments_in_order_and_retries_once() {
+        let mut config = ReadGroupsConfig {
+            shard: Some(0),
+            endpoint: "127.0.0.1:{shard}".to_owned(),
+            ..ReadGroupsConfig::default()
+        };
+        config.split.self_address = Some("0.0.0.0:0".to_owned());
+        let groups = ReadGroups::new(config, ShardId::new(0), None);
+        // Remote shard 7 resolves to one replica; failing it twice fails the read.
+        let ok = groups
+            .fan_out(
+                ShardId::new(7),
+                &[1, 2, 3],
+                |i, _| async move { Ok(i * 10) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok, vec![0, 10, 20]);
+        let calls = AtomicU32::new(0);
+        let err = groups
+            .fan_out(ShardId::new(7), &[1], |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(Status::unavailable("down")) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 1); // one replica: nothing to retry on
+    }
 
     fn groups(hedge_after_ms: u64) -> ReadGroups {
         ReadGroups::new(

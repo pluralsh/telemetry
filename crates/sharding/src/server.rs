@@ -74,6 +74,58 @@ pub struct ReadGroupsConfig {
     pub request_timeout_seconds: u64,
     /// How often a group's replica addresses are re-resolved.
     pub resolve_interval_seconds: u64,
+    /// Splitting one shard's read across the replicas of its group.
+    pub split: SplitConfig,
+}
+
+/// Splitting a shard read into fragments run on different replicas of the
+/// shard's reader group. Off by default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SplitConfig {
+    pub enabled: bool,
+    /// Upper bound on fragments per shard read.
+    pub max_fragments: usize,
+    /// Splitting is skipped while this pod runs this many queries.
+    pub max_local_inflight: usize,
+    /// Estimated cost one fragment must carry to be worth its own request;
+    /// zero forces splitting on, for tests.
+    pub min_fragment_cost: MinFragmentCost,
+    /// `host:port` this pod is reachable at within its own group, so it can
+    /// leave itself out of its peers. Defaults to `$POD_IP` with the port of
+    /// `endpoint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MinFragmentCost {
+    pub metrics: u64,
+    pub logs: u64,
+    pub traces: u64,
+}
+
+impl Default for MinFragmentCost {
+    fn default() -> Self {
+        Self {
+            metrics: 50_000,
+            logs: 64,
+            traces: 5_000,
+        }
+    }
+}
+
+impl Default for SplitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_fragments: 4,
+            max_local_inflight: 32,
+            min_fragment_cost: MinFragmentCost::default(),
+            self_address: None,
+        }
+    }
 }
 
 impl Default for ReadGroupsConfig {
@@ -84,6 +136,7 @@ impl Default for ReadGroupsConfig {
             hedge_after_ms: 250,
             request_timeout_seconds: 120,
             resolve_interval_seconds: 5,
+            split: SplitConfig::default(),
         }
     }
 }
@@ -115,6 +168,11 @@ impl ReadGroupsConfig {
             return Err(
                 "sharding.read_groups request_timeout_seconds and resolve_interval_seconds must be greater than zero"
                     .to_owned(),
+            );
+        }
+        if self.split.enabled && self.split.max_fragments == 0 {
+            return Err(
+                "sharding.read_groups.split.max_fragments must be greater than zero".to_owned(),
             );
         }
         Ok(())
