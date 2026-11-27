@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt, stream};
-use plural_logs::{Error, LogsShardClient, ShardedLogs};
+use plural_logs::{Error, LocalFragment, LogsShardClient, ShardedLogs};
 use proto::logs::internal::v1::{
     self as pb,
     shard_reader_client::ShardReaderClient,
@@ -179,6 +179,52 @@ impl LogsShardClient for GrpcLogsShards {
             .await
             .map_err(status_error)?;
         outputs.try_collect().await.map_err(status_error)
+    }
+
+    async fn split_ways(
+        &self,
+        shard: ShardId,
+        estimated_pages: u64,
+        local_inflight: usize,
+    ) -> Option<usize> {
+        let min_cost = self.groups.split_config().min_fragment_cost.logs;
+        self.groups
+            .split_ways(shard, estimated_pages, min_cost, local_inflight)
+            .await
+    }
+
+    async fn query_fragments(
+        &self,
+        requests: Vec<pb::QueryShardRequest>,
+        local: Option<LocalFragment<'_>>,
+    ) -> plural_logs::Result<Vec<Vec<pb::ShardOutput>>> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let shard = shard_of(first.read.as_ref());
+        // Fragments are addressed by their row-time start.
+        let keys = requests
+            .iter()
+            .map(|request| request.row_time_start_ns.unwrap_or_default() as u64)
+            .collect::<Vec<_>>();
+        let groups = &self.groups;
+        let requests = &requests;
+        groups
+            .fan_out(shard, &keys, |index, replica| async move {
+                let request = requests[index].clone();
+                if replica.is_self {
+                    let local = local.ok_or_else(|| Status::internal("no local fragment"))?;
+                    return local(request).await.map_err(|error| match error {
+                        Error::Query(message) => Status::invalid_argument(message),
+                        other => Status::unavailable(other.to_string()),
+                    });
+                }
+                let request = groups.request(request)?;
+                let stream = client(&replica).query(request).await?.into_inner();
+                stream.try_collect().await
+            })
+            .await
+            .map_err(status_error)
     }
 
     async fn label_names(

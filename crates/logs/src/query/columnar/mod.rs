@@ -28,7 +28,7 @@ pub(super) async fn load<'a>(
     budget: &PageBudget,
     targets: Option<ScanTargets>,
 ) -> Result<ColumnarSink<'a>> {
-    let (start, end) = (plan.scan_start, plan.request.end_ns);
+    let (start, end) = (plan.scan_start, plan.scan_end);
     if plan.early_stop_log().is_some() {
         let mut sink = ColumnarSink::new(plan, BATCH_ROWS)?;
         database
@@ -169,6 +169,8 @@ pub(super) struct ColumnarSink<'a> {
     pending_rows: usize,
     jobs: VecDeque<Job>,
     running: Arc<AtomicUsize>,
+    /// Keeps only rows with `start <= timestamp < end`.
+    row_time: Option<(i64, i64)>,
     /// Rows still run inline before batching starts: a limited log query
     /// that fills its limit early then stops reading exactly where it would
     /// in sequence.
@@ -204,11 +206,40 @@ impl<'a> ColumnarSink<'a> {
             pending_rows: 0,
             jobs: VecDeque::new(),
             running: Arc::default(),
+            row_time: plan.row_time,
             inline,
         })
     }
 
     fn push(&mut self, slice: BatchSlice) -> Result<()> {
+        let Some((start, end)) = self.row_time else {
+            return self.push_rows(slice);
+        };
+        // Keep each run of consecutive rows inside the range, as a slice of
+        // the same batch so rows keep their ties.
+        let timestamps = &slice.batch.timestamps;
+        let mut run: Option<usize> = None;
+        for row in slice.rows.clone() {
+            let inside = (start..end).contains(&timestamps[row]);
+            match (inside, run) {
+                (true, None) => run = Some(row),
+                (false, Some(first)) => {
+                    self.push_rows(BatchSlice::new(Arc::clone(&slice.batch), first..row))?;
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = run {
+            self.push_rows(BatchSlice::new(
+                Arc::clone(&slice.batch),
+                first..slice.rows.end,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn push_rows(&mut self, slice: BatchSlice) -> Result<()> {
         if self.shared.is_none() || self.inline > 0 {
             self.inline = self.inline.saturating_sub(slice.len());
             self.plan.run(&slice, &mut self.outputs)?;

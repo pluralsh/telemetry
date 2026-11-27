@@ -40,6 +40,10 @@ use crate::{auth::AuthConfig, internal_rpc};
 pub struct Replica {
     pub address: String,
     pub channel: Channel,
+    /// This pod itself, which runs fragments in process rather than over
+    /// `channel`. Only set on replicas of the local group handed to
+    /// [`ReadGroups::fan_out`].
+    pub is_self: bool,
 }
 
 struct Group {
@@ -131,6 +135,48 @@ impl ReadGroups {
         Ok(replicas)
     }
 
+    /// This pod, marked as such, followed by its peers; empty when this
+    /// pod's address is unknown, since the group could then not be split
+    /// without running a fragment twice.
+    async fn local_group(&self) -> Result<Vec<Replica>, Status> {
+        let Some(own) = self.own_address() else {
+            return Ok(Vec::new());
+        };
+        let mut group = self.local_peers().await?;
+        group.push(Replica {
+            channel: self.channel(&own)?,
+            address: own,
+            is_self: true,
+        });
+        Ok(group)
+    }
+
+    /// How many fragments a read of `shard` costing `estimated_cost` should
+    /// become, or `None` to read it whole. See [`plan_fragments`].
+    pub async fn split_ways(
+        &self,
+        shard: ShardId,
+        estimated_cost: u64,
+        min_fragment_cost: u64,
+        local_inflight: usize,
+    ) -> Option<usize> {
+        if !self.config.split.enabled {
+            return None;
+        }
+        let replicas = if shard == self.local {
+            self.local_group().await.ok()?.len()
+        } else {
+            self.group_replicas(shard).await.ok()?.len()
+        };
+        plan_fragments(
+            &self.config.split,
+            min_fragment_cost,
+            estimated_cost,
+            replicas,
+            local_inflight,
+        )
+    }
+
     fn own_address(&self) -> Option<String> {
         if let Some(address) = &self.config.split.self_address {
             return Some(address.clone());
@@ -204,6 +250,7 @@ impl ReadGroups {
                 Ok(Replica {
                     channel: self.channel(&address)?,
                     address,
+                    is_self: false,
                 })
             })
             .collect()
@@ -344,9 +391,9 @@ pub fn rendezvous_order(replicas: &mut [Replica], key: u64) {
 impl ReadGroups {
     /// Runs one fragment per entry of `keys` on `shard`'s group, each
     /// start to finish on one replica chosen by rendezvous hashing on its
-    /// key, and returns the results in `keys` order. `include_local` adds
-    /// this pod's group peers (never the pod itself) to the candidates when
-    /// `shard` is the local shard. A failed fragment is retried once on the
+    /// key, and returns the results in `keys` order. For the local shard
+    /// the candidates are this pod, marked [`Replica::is_self`], and its
+    /// peers. A failed fragment is retried once on the
     /// next replica in its order; a second failure fails the whole read.
     /// A lone fragment is hedged like [`Self::call`]; several are not.
     pub async fn fan_out<T, F, Fut>(
@@ -361,7 +408,7 @@ impl ReadGroups {
         Fut: Future<Output = Result<T, Status>> + Send,
     {
         let replicas = if shard == self.local {
-            self.local_peers().await?
+            self.local_group().await?
         } else {
             self.group_replicas(shard).await?
         };
@@ -555,6 +602,7 @@ mod tests {
 
     fn replica(address: &str) -> Replica {
         Replica {
+            is_self: false,
             address: address.to_owned(),
             channel: Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         }
