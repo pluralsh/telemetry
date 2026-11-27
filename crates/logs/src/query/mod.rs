@@ -558,11 +558,9 @@ pub(crate) async fn query_databases(
     // Shards are balanced by hash, so the pages the local shards would read
     // stand in for what each remote shard will.
     let local_estimates = estimates.iter().flatten().count();
-    let typical_pages = if local_estimates == 0 {
-        0
-    } else {
-        (total_pages / local_estimates) as u64
-    };
+    let typical_pages = total_pages
+        .checked_div(local_estimates)
+        .map_or(0, |pages| pages as u64);
     let split = split.filter(|_| plan.splittable());
     let split = split.as_ref();
     let stored = stream::iter(
