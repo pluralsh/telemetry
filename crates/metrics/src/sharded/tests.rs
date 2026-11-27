@@ -700,6 +700,8 @@ struct InProcessShards {
     ways: Arc<std::sync::atomic::AtomicUsize>,
     /// Pushed-down fragments evaluated.
     evaluations: Arc<std::sync::atomic::AtomicUsize>,
+    /// Time fragments of raw reads opened.
+    fragments: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InProcessShards {
@@ -745,6 +747,12 @@ impl crate::MetricsShardQuery for InProcessShards {
 #[async_trait]
 impl crate::MetricsShardClient for InProcessShards {
     fn query(&self, _shard: ShardId) -> Arc<dyn crate::MetricsShardQuery> {
+        Arc::new(self.clone())
+    }
+
+    fn query_keyed(&self, _shard: ShardId, _key: u64) -> Arc<dyn crate::MetricsShardQuery> {
+        self.fragments
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Arc::new(self.clone())
     }
 
@@ -1292,4 +1300,145 @@ async fn pushed_down_queries_answer_like_raw_evaluation() {
     for group in groups.values() {
         group.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn raw_reads_split_by_time_answer_exactly_like_unsplit_reads() {
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: SlateDbStorageConfig {
+            path: "time-split".to_owned(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+            }),
+            settings_path: None,
+            l0_flush_parallelism: None,
+            block_cache: None,
+            meta_cache: None,
+            disk: Default::default(),
+        },
+        ..Default::default()
+    };
+    let options = ShardingOptions::new(2, DEFAULT_IO_CONCURRENCY_LIMIT).unwrap();
+    let namespace = Namespace::new("time-split").unwrap();
+    let writers =
+        ShardedMetrics::open_writers(config.clone(), options, [ShardId::new(0), ShardId::new(1)])
+            .await
+            .unwrap();
+    let now = common::time::now_ms() / 60_000 * 60_000;
+    let from = now - 6 * HOUR_MS;
+    let mut series = Vec::new();
+    for (shard, job, scale) in [(0, "api", 1.0), (1, "api", 2.0), (1, "web", 3.0)] {
+        // A counter with a reset, so rate and increase cross fragment edges.
+        let samples = (from..=now)
+            .step_by(60_000)
+            .map(|t| {
+                let minutes = ((t - from) / 60_000) as f64;
+                Sample::new(t, (minutes % 170.0) * scale + 1.0)
+            })
+            .collect();
+        series.push(series_on_shard(
+            &writers,
+            "events_total",
+            shard,
+            &[("job", job)],
+            samples,
+        ));
+    }
+    writers
+        .write(&assignment(2), &namespace, series, Visibility::Durable)
+        .await
+        .unwrap();
+    writers.close().await.unwrap();
+
+    let open = |shards: Vec<ShardId>| {
+        ShardedMetrics::open_readers(
+            config.clone(),
+            options,
+            shards,
+            DbReaderOptions {
+                skip_wal_replay: false,
+                ..DbReaderOptions::default()
+            },
+            64 * 1024 * 1024,
+        )
+    };
+    let transport = InProcessShards::default();
+    let mut groups = std::collections::BTreeMap::new();
+    for shard in [ShardId::new(0), ShardId::new(1)] {
+        let group = open(vec![shard]).await.unwrap();
+        assert!(group.shards().scope_readers_to(shard));
+        assert!(group.connect_remote_shards(Arc::new(transport.clone())));
+        groups.insert(shard, Arc::new(group));
+    }
+    assert!(transport.peers.set(groups.clone()).is_ok());
+    let coordinator = &groups[&ShardId::new(0)];
+    let everything = open(vec![ShardId::new(0), ShardId::new(1)]).await.unwrap();
+
+    let queries = [
+        "events_total",
+        "rate(events_total[10m])",
+        "increase(events_total[2h])",
+        "irate(events_total[5m])",
+        "avg_over_time(events_total[30m])",
+        "sum by (job) (rate(events_total[15m]))",
+        "quantile_over_time(0.9, events_total[1h])",
+        "delta(events_total[3h])",
+        "max_over_time(events_total[4h])",
+    ];
+    let (start, end) = (now - 5 * HOUR_MS, now);
+    for ways in [0usize, 2, 3, 6] {
+        transport.ways.store(ways, Ordering::SeqCst);
+        transport.fragments.store(0, Ordering::SeqCst);
+        for query in queries {
+            let expected = range_normalized(
+                everything
+                    .query_range(
+                        &namespace,
+                        query,
+                        at(start)..=at(end),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let actual = range_normalized(
+                coordinator
+                    .query_range(
+                        &namespace,
+                        query,
+                        at(start)..=at(end),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(!expected.is_empty(), "{query}");
+            assert_eq!(actual, expected, "range {query} ways {ways}");
+            let expected = normalized(
+                everything
+                    .query(&namespace, query, Some(at(now)))
+                    .await
+                    .unwrap(),
+            );
+            let actual = normalized(
+                coordinator
+                    .query(&namespace, query, Some(at(now)))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(actual, expected, "instant {query} ways {ways}");
+        }
+        let fragments = transport.fragments.load(Ordering::SeqCst);
+        assert_eq!(
+            fragments > 0,
+            ways >= 2,
+            "ways {ways}: {fragments} fragments"
+        );
+    }
+    for group in groups.values() {
+        group.close().await.unwrap();
+    }
+    everything.close().await.unwrap();
 }

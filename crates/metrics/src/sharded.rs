@@ -959,16 +959,88 @@ impl ShardedMetrics {
                 (id, ShardSource::Local(source))
             })
             .collect();
-        sources.extend(self.remote_shards().into_iter().map(|shard| {
-            (
-                shard.shard,
-                ShardSource::Remote(shard.source(namespace, ranges)),
-            )
-        }));
-        sources.sort_unstable_by_key(|(id, _)| *id);
+        for shard in self.remote_shards() {
+            let fragments = self.time_fragments(shard.shard, ranges).await;
+            if fragments.is_empty() {
+                sources.push((
+                    shard.shard,
+                    ShardSource::Remote(shard.source(namespace, ranges)),
+                ));
+                continue;
+            }
+            ::metrics::counter!("metrics_split_reads_total").increment(1);
+            for (from_ms, to_ms) in fragments {
+                let narrowed = narrow_ranges(ranges, from_ms, to_ms);
+                let source = shard.fragment_source(namespace, &narrowed, from_ms as u64);
+                sources.push((
+                    shard.shard,
+                    ShardSource::Clipped(
+                        Box::new(ShardSource::Remote(source)),
+                        TimeRange::new(from_ms, to_ms),
+                    ),
+                ));
+            }
+        }
+        sources.sort_by_key(|(id, _)| *id);
         Ok(MultiShardSeriesSource::new(
             sources.into_iter().map(|(_, source)| source).collect(),
         ))
+    }
+
+    /// The hour-aligned time slices to read `shard` in, one per fragment, or
+    /// none to read it whole. Slices are logical addresses: they follow the
+    /// 1h bucket layout, never one replica's storage ids, and the outer two
+    /// are open-ended so together they cover every possible read.
+    async fn time_fragments(&self, shard: ShardId, ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+        const HOUR_MS: i64 = 3_600_000;
+        let Some(client) = self.remote.get() else {
+            return Vec::new();
+        };
+        let (Some(first), Some(last)) = (
+            ranges.iter().map(|r| r.0).min(),
+            ranges.iter().map(|r| r.1).max(),
+        ) else {
+            return Vec::new();
+        };
+        let (first_hour, last_hour) = (
+            first.saturating_mul(1000).div_euclid(HOUR_MS),
+            last.saturating_mul(1000).div_euclid(HOUR_MS),
+        );
+        let hours = u64::try_from(last_hour - first_hour + 1).unwrap_or(0);
+        let Some(ways) = client
+            .split_ways(
+                shard,
+                hours.saturating_mul(60),
+                self.inflight.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let ways = (ways as u64).min(hours);
+        if ways < 2 {
+            return Vec::new();
+        }
+        let per = hours.div_ceil(ways) as i64;
+        let mut fragments = Vec::new();
+        let mut hour = first_hour;
+        while hour <= last_hour {
+            let next = (hour + per).min(last_hour + 1);
+            fragments.push((
+                if hour == first_hour {
+                    i64::MIN
+                } else {
+                    hour * HOUR_MS
+                },
+                if next > last_hour {
+                    i64::MAX
+                } else {
+                    next * HOUR_MS
+                },
+            ));
+            hour = next;
+        }
+        fragments
     }
 
     /// A slot to serve one shard read to another reader group.
@@ -1517,6 +1589,17 @@ pub(crate) type ShardSourceReader = LimitedQueryReader<IoLimitedQueryReader<Shar
 enum ShardSource {
     Local(QueryReaderSource<ShardSourceReader>),
     Remote(RemoteShardSource),
+    /// One time fragment of a shard's read: only what lies inside `range`,
+    /// so fragments of a shard together read each sample once. They join as
+    /// separate sources, as the two shards of a routing-epoch cutover do.
+    Clipped(Box<ShardSource>, TimeRange),
+}
+
+/// `range` limited to `to`, or `None` when nothing is left.
+fn clip(range: TimeRange, to: TimeRange) -> Option<TimeRange> {
+    let start = range.start_ms.max(to.start_ms);
+    let end = range.end_ms_exclusive.min(to.end_ms_exclusive);
+    (start < end).then(|| TimeRange::new(start, end))
 }
 
 impl ShardSource {
@@ -1528,7 +1611,17 @@ impl ShardSource {
         time_range: TimeRange,
         projection: Option<(Arc<[String]>, bool)>,
     ) -> Vec<std::result::Result<ResolvedSeriesChunk, SourceQueryError>> {
+        if let Self::Clipped(inner, to) = self {
+            let Some(time_range) = clip(time_range, *to) else {
+                return Vec::new();
+            };
+            // A fragment is one of several sources of a shard, so a series'
+            // rows join by fingerprint, never deferred to its identity.
+            let projection = projection.map(|(projection, _)| (projection, false));
+            return Box::pin(inner.resolve_all(selector, time_range, projection)).await;
+        }
         match (self, projection) {
+            (Self::Clipped(..), _) => unreachable!("handled above"),
             (Self::Local(source), None) => source.resolve(selector, time_range).collect().await,
             (Self::Remote(source), None) => source.resolve(selector, time_range).collect().await,
             (Self::Local(source), Some((projection, true))) => {
@@ -1559,8 +1652,32 @@ impl ShardSource {
         match self {
             Self::Local(source) => source.samples(request).collect().await,
             Self::Remote(source) => source.samples(request).collect().await,
+            Self::Clipped(inner, to) => {
+                let Some(time_range) = clip(request.time_range, *to) else {
+                    return Vec::new();
+                };
+                let request = SamplesRequest {
+                    time_range,
+                    ..request
+                };
+                Box::pin(inner.samples_all(request)).await
+            }
         }
     }
+}
+
+/// The parts of `ranges` (seconds) within `[from_ms, to_ms)`, so a fragment's
+/// replica opens only the buckets of its own slice.
+fn narrow_ranges(ranges: &[(i64, i64)], from_ms: i64, to_ms: i64) -> Vec<(i64, i64)> {
+    let from = from_ms.div_euclid(1000);
+    let to = to_ms.saturating_add(999).div_euclid(1000);
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            let (start, end) = (start.max(from), end.min(to));
+            (start <= end).then_some((start, end))
+        })
+        .collect()
 }
 
 struct MultiShardSeriesSource {

@@ -331,6 +331,24 @@ impl ReadGroups {
         F: Fn(Replica) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Streaming<T>>, Status>> + Send,
     {
+        self.open_stream_keyed(shard, pinned, None, open).await
+    }
+
+    /// [`Self::open_stream`], trying replicas in rendezvous order of `key`
+    /// when nothing is pinned, so a fragment keeps its preferred replica
+    /// and that replica's caches stay warm for it.
+    pub async fn open_stream_keyed<T, F, Fut>(
+        &self,
+        shard: ShardId,
+        pinned: Option<&Replica>,
+        key: Option<u64>,
+        open: F,
+    ) -> Result<(Replica, BoxStream<'static, Result<T, Status>>), Status>
+    where
+        T: Send + 'static,
+        F: Fn(Replica) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Streaming<T>>, Status>> + Send,
+    {
         let first_message = |replica: Replica| {
             let opened = open(replica);
             async move {
@@ -341,7 +359,13 @@ impl ReadGroups {
         };
         let (replica, (first, rest)) = match pinned {
             Some(pinned) => self.call_pinned(shard, pinned, first_message).await?,
-            None => race(self.replicas(shard).await?, None, first_message).await?,
+            None => {
+                let mut replicas = self.replicas(shard).await?;
+                if let Some(key) = key {
+                    rendezvous_order(&mut replicas, key);
+                }
+                race(replicas, None, first_message).await?
+            }
         };
         let stream = match first {
             Some(first) => stream::once(async move { Ok(first) }).chain(rest).boxed(),

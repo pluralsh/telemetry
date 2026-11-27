@@ -207,6 +207,16 @@ impl MetricsShardClient for GrpcMetricsShards {
         Arc::new(GrpcShardQuery {
             groups: Arc::clone(&self.groups),
             shard,
+            key: None,
+            pinned: Arc::default(),
+        })
+    }
+
+    fn query_keyed(&self, shard: ShardId, key: u64) -> Arc<dyn MetricsShardQuery> {
+        Arc::new(GrpcShardQuery {
+            groups: Arc::clone(&self.groups),
+            shard,
+            key: Some(key),
             pinned: Arc::default(),
         })
     }
@@ -295,6 +305,8 @@ impl MetricsShardClient for GrpcMetricsShards {
 struct GrpcShardQuery {
     groups: Arc<ReadGroups>,
     shard: ShardId,
+    /// Addresses a fragment of a split read, for choosing its replica.
+    key: Option<u64>,
     pinned: Arc<Mutex<Option<Replica>>>,
 }
 
@@ -303,13 +315,14 @@ macro_rules! streaming {
         let groups = Arc::clone(&$self.groups);
         let shard = $self.shard;
         let pinned = Arc::clone(&$self.pinned);
+        let key = $self.key;
         stream::once(async move {
             let current = pinned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let (replica, stream) = groups
-                .open_stream(shard, current.as_ref(), |replica| {
+                .open_stream_keyed(shard, current.as_ref(), key, |replica| {
                     let request = groups.request($request.clone());
                     async move { client(&replica).$method(request?).await }
                 })

@@ -56,6 +56,12 @@ pub trait MetricsShardClient: Send + Sync + 'static {
     /// resolve warmed.
     fn query(&self, shard: ShardId) -> Arc<dyn MetricsShardQuery>;
 
+    /// [`Self::query`] for one fragment of a split read, which `key`
+    /// addresses: the same key should reach the same replica.
+    fn query_keyed(&self, shard: ShardId, _key: u64) -> Arc<dyn MetricsShardQuery> {
+        self.query(shard)
+    }
+
     async fn series(&self, request: pb::SeriesRequest) -> Result<pb::SeriesResponse, QueryError>;
 
     async fn label_names(
@@ -591,6 +597,20 @@ impl RemoteShard {
         RemoteShardSource::new(
             shard_read(self.shard, namespace, ranges),
             self.client.query(self.shard),
+        )
+    }
+
+    /// A source for one time fragment of this shard's read, on the replica
+    /// `key` addresses.
+    pub(crate) fn fragment_source(
+        &self,
+        namespace: &Namespace,
+        ranges: &[(i64, i64)],
+        key: u64,
+    ) -> RemoteShardSource {
+        RemoteShardSource::new(
+            shard_read(self.shard, namespace, ranges),
+            self.client.query_keyed(self.shard, key),
         )
     }
 
