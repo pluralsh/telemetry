@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::{StreamExt, TryStreamExt, stream};
 use plural_metrics::{
-    MetricsShardClient, MetricsShardQuery, QueryError, ShardedMetrics, WireStream,
+    LocalEvaluation, MetricsShardClient, MetricsShardQuery, QueryError, ShardedMetrics, WireStream,
 };
 use proto::metrics::internal::v1::{
     self as pb,
@@ -90,6 +90,18 @@ impl ShardReader for ShardReaderService {
             .await
             .map_err(query_status)?;
         Ok(Response::new(stream.map_err(query_status).boxed()))
+    }
+
+    async fn evaluate(
+        &self,
+        request: Request<pb::EvaluateRequest>,
+    ) -> Result<Response<pb::EvaluateResponse>, Status> {
+        self.authorize(&request)?;
+        self.readers
+            .serve_evaluate(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(query_status)
     }
 
     async fn series(
@@ -229,6 +241,52 @@ impl MetricsShardClient for GrpcMetricsShards {
         request: pb::BucketGenerationsRequest,
     ) -> Result<pb::BucketGenerationsResponse, QueryError> {
         unary!(self, request, bucket_generations)
+    }
+
+    fn pushdown(&self) -> bool {
+        true
+    }
+
+    async fn split_ways(&self, shard: ShardId, steps: u64, local_inflight: usize) -> Option<usize> {
+        let min_cost = self.groups.split_config().min_fragment_cost.metrics;
+        self.groups
+            .split_ways(shard, steps, min_cost, local_inflight)
+            .await
+    }
+
+    async fn evaluate(
+        &self,
+        requests: Vec<pb::EvaluateRequest>,
+        local: Option<LocalEvaluation<'_>>,
+    ) -> Result<Vec<pb::EvaluateResponse>, QueryError> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let shard = shard_of(first.read.as_ref());
+        // Fragments are addressed by their start time, so a replica keeps
+        // serving the same slice of a dashboard's time range and its caches
+        // stay warm.
+        let keys = requests
+            .iter()
+            .map(|request| request.start_ms as u64)
+            .collect::<Vec<_>>();
+        let groups = &self.groups;
+        let requests = &requests;
+        groups
+            .fan_out(shard, &keys, |index, replica| async move {
+                let request = requests[index].clone();
+                if replica.is_self {
+                    let local = local.ok_or_else(|| Status::internal("no local evaluation"))?;
+                    return local(request).await.map_err(query_status);
+                }
+                let request = groups.request(request)?;
+                client(&replica)
+                    .evaluate(request)
+                    .await
+                    .map(Response::into_inner)
+            })
+            .await
+            .map_err(status_query)
     }
 }
 

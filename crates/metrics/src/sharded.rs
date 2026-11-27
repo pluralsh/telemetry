@@ -140,6 +140,8 @@ pub struct ShardedMetrics {
     pushdown: std::sync::atomic::AtomicBool,
     /// Routing cutovers in milliseconds, once known.
     cutovers_ms: std::sync::Mutex<Option<Vec<i64>>>,
+    /// The live routing map, from which cutovers are read per query.
+    routing: OnceLock<Arc<tokio::sync::RwLock<sharding::ShardMap>>>,
     /// Queries this reader is coordinating, which gate splitting.
     inflight: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -203,6 +205,7 @@ impl ShardedMetrics {
             remote: OnceLock::new(),
             pushdown: std::sync::atomic::AtomicBool::new(false),
             cutovers_ms: std::sync::Mutex::new(None),
+            routing: OnceLock::new(),
             inflight: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             label_projection: true,

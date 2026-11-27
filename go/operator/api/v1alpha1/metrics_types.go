@@ -58,14 +58,26 @@ type MetricsConfigSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	ForwardIndexCacheCapacityBytes *int64 `json:"forwardIndexCacheCapacityBytes,omitempty"`
 	// Query limits PromQL evaluation across the whole process.
-	Query       *MetricsQuerySpec  `json:"query,omitempty"`
-	CacheWarmer *CacheWarmerSpec   `json:"cacheWarmer,omitempty"`
-	Write       WriteSpec          `json:"write,omitempty"`
-	Request     MetricsRequestSpec `json:"request,omitempty"`
-	Sharding    ShardingSpec       `json:"sharding,omitempty"`
-	Auth        AuthSpec           `json:"auth,omitempty"`
+	Query *MetricsQuerySpec `json:"query,omitempty"`
+	// Pushdown evaluates the aggregations a query can combine from partial
+	// results on the shards, so the reader coordinating a query receives
+	// partial results instead of every matched sample. It applies to sharded
+	// readers with read groups.
+	Pushdown    *MetricsPushdownSpec `json:"pushdown,omitempty"`
+	CacheWarmer *CacheWarmerSpec     `json:"cacheWarmer,omitempty"`
+	Write       WriteSpec            `json:"write,omitempty"`
+	Request     MetricsRequestSpec   `json:"request,omitempty"`
+	Sharding    ShardingSpec         `json:"sharding,omitempty"`
+	Auth        AuthSpec             `json:"auth,omitempty"`
 	// +kubebuilder:default={"default"}
 	Namespaces []string `json:"namespaces,omitempty"`
+}
+
+// MetricsPushdownSpec configures evaluating parts of queries on shards.
+type MetricsPushdownSpec struct {
+	// Enabled turns pushdown on.
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // MetricsQuerySpec limits the queries one Metrics process evaluates at once.

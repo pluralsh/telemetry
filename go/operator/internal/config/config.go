@@ -167,6 +167,7 @@ func Render(input Input) (Result, error) {
 			MatcherCacheCapacityBytes:      plan.matcherCache(),
 			ResultCache:                    renderResultCache{CapacityBytes: plan.resultCache()},
 			Query:                          renderMetricsQuery(input.Metrics.Spec.Config.Query, plan),
+			Pushdown:                       renderMetricsPushdown(input.Metrics.Spec.Config.Pushdown),
 			CacheWarmer:                    renderCacheWarmerConfig(input.Metrics.Spec.Config.CacheWarmer, true),
 			Write:                          renderWriteConfig(input.Metrics.Spec.Config.Write),
 			Request: renderMetricsRequest{
@@ -724,6 +725,29 @@ func renderWriteConfig(spec telemetryv1alpha1.WriteSpec) renderWrite {
 	}
 }
 
+func renderMetricsPushdown(spec *telemetryv1alpha1.MetricsPushdownSpec) *renderPushdown {
+	if spec == nil || !lo.FromPtr(spec.Enabled) {
+		return nil
+	}
+	return &renderPushdown{Enabled: true}
+}
+
+func renderSplitConfig(spec *telemetryv1alpha1.ReadGroupSplitSpec) *renderSplit {
+	if spec == nil || !lo.FromPtr(spec.Enabled) {
+		return nil
+	}
+	split := &renderSplit{
+		Enabled:          true,
+		MaxFragments:     int32Value(spec.MaxFragments, 4),
+		MaxLocalInflight: int32Value(spec.MaxLocalInflight, 32),
+	}
+	if spec.MinFragmentCost != nil {
+		cost := *spec.MinFragmentCost
+		split.MinFragmentCost = &renderMinFragmentCost{Metrics: cost, Logs: cost, Traces: cost}
+	}
+	return split
+}
+
 func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.ShardingSpec, workload telemetryv1alpha1.WorkloadSpec, grpcPort int32, component string) renderSharding {
 	ioConcurrencyLimit := inferredIOConcurrencyLimit(spec.IOConcurrencyLimit, workload)
 	if component == modeStandalone {
@@ -744,6 +768,7 @@ func renderShardingConfig(name, namespace string, spec telemetryv1alpha1.Shardin
 		if spec := workload.ReadGroups; spec != nil {
 			readGroups.HedgeAfterMs = int64Value(spec.HedgeAfterMilliseconds, readGroups.HedgeAfterMs)
 			readGroups.RequestTimeoutSeconds = int64Value(spec.RequestTimeoutSeconds, readGroups.RequestTimeoutSeconds)
+			readGroups.Split = renderSplitConfig(spec.Split)
 		}
 	}
 	return renderSharding{
@@ -1104,6 +1129,7 @@ type renderConfig struct {
 	MatcherCacheCapacityBytes      int64                `json:"matcher_cache_capacity_bytes"`
 	ResultCache                    renderResultCache    `json:"result_cache"`
 	Query                          renderQuery          `json:"query"`
+	Pushdown                       *renderPushdown      `json:"pushdown,omitempty"`
 	CacheWarmer                    renderCacheWarmer    `json:"cache_warmer"`
 	Write                          renderWrite          `json:"write"`
 	Request                        renderMetricsRequest `json:"request"`
@@ -1326,9 +1352,27 @@ type renderWrite struct {
 	RemoteRetries                   int32  `json:"remote_retries"`
 }
 type renderReadGroups struct {
-	Endpoint              string `json:"endpoint"`
-	HedgeAfterMs          int64  `json:"hedge_after_ms"`
-	RequestTimeoutSeconds int64  `json:"request_timeout_seconds"`
+	Endpoint              string       `json:"endpoint"`
+	HedgeAfterMs          int64        `json:"hedge_after_ms"`
+	RequestTimeoutSeconds int64        `json:"request_timeout_seconds"`
+	Split                 *renderSplit `json:"split,omitempty"`
+}
+type renderSplit struct {
+	Enabled          bool                   `json:"enabled"`
+	MaxFragments     int32                  `json:"max_fragments"`
+	MaxLocalInflight int32                  `json:"max_local_inflight"`
+	MinFragmentCost  *renderMinFragmentCost `json:"min_fragment_cost,omitempty"`
+}
+
+// renderMinFragmentCost carries one value for every product; a server reads
+// only its own, since each product's CRD sets its own cost.
+type renderMinFragmentCost struct {
+	Metrics int64 `json:"metrics"`
+	Logs    int64 `json:"logs"`
+	Traces  int64 `json:"traces"`
+}
+type renderPushdown struct {
+	Enabled bool `json:"enabled"`
 }
 type renderSharding struct {
 	Shards               *int32            `json:"shards,omitempty"`

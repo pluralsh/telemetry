@@ -109,7 +109,7 @@ pub struct MinFragmentCost {
 impl Default for MinFragmentCost {
     fn default() -> Self {
         Self {
-            metrics: 50_000,
+            metrics: 240,
             logs: 64,
             traces: 5_000,
         }

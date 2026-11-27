@@ -54,6 +54,12 @@ impl ShardedMetrics {
         );
     }
 
+    /// Reads routing cutovers from `routing` on every query, so a scale-up
+    /// is seen as soon as the router is. Returns false when already set.
+    pub fn set_routing(&self, routing: Arc<tokio::sync::RwLock<sharding::ShardMap>>) -> bool {
+        self.routing.set(routing).is_ok()
+    }
+
     /// Evaluates the pushable parts of `query` on every shard, or `None` to
     /// run it whole over raw samples. `ranges` are the seconds ranges the
     /// whole query reads; `step_ms` is zero for an instant query.
@@ -70,7 +76,7 @@ impl ShardedMetrics {
         let Some(client) = self.remote.get() else {
             return Ok(None);
         };
-        if !client.pushdown() || self.crosses_cutover(ranges) {
+        if !client.pushdown() || self.crosses_cutover(ranges).await {
             ::metrics::counter!("metrics_pushdown_total", "result" => "fallback").increment(1);
             return Ok(None);
         }
@@ -121,12 +127,25 @@ impl ShardedMetrics {
 
     /// Whether a cutover lies within the data `ranges` read, or cutovers
     /// are not known at all.
-    fn crosses_cutover(&self, ranges: &[(i64, i64)]) -> bool {
-        let cutovers = self
-            .cutovers_ms
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cutovers) = cutovers.as_ref() else {
+    async fn crosses_cutover(&self, ranges: &[(i64, i64)]) -> bool {
+        let cutovers = match self.routing.get() {
+            Some(routing) => Some(
+                routing
+                    .read()
+                    .await
+                    .epochs
+                    .iter()
+                    .skip(1)
+                    .map(|epoch| epoch.effective_from_ns.div_euclid(1_000_000))
+                    .collect::<Vec<_>>(),
+            ),
+            None => self
+                .cutovers_ms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        };
+        let Some(cutovers) = cutovers else {
             return true;
         };
         let start = ranges.iter().map(|r| r.0).min().unwrap_or(i64::MIN);

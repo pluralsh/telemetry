@@ -391,6 +391,33 @@ type ReadGroupsSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=120
 	RequestTimeoutSeconds *int64 `json:"requestTimeoutSeconds,omitempty"`
+	// Split divides one shard's read across every replica of its group
+	// instead of reading it on a single replica.
+	Split *ReadGroupSplitSpec `json:"split,omitempty"`
+}
+
+// ReadGroupSplitSpec cuts a shard read into fragments that different
+// replicas of the shard's reader group run, so a heavy query uses all of
+// them. Small queries, busy readers and groups with one replica read whole.
+type ReadGroupSplitSpec struct {
+	// Enabled turns splitting on.
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled,omitempty"`
+	// MaxFragments bounds the fragments of one shard read.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=4
+	MaxFragments *int32 `json:"maxFragments,omitempty"`
+	// MaxLocalInflight stops splitting while this reader coordinates this
+	// many queries.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=32
+	MaxLocalInflight *int32 `json:"maxLocalInflight,omitempty"`
+	// MinFragmentCost is the estimated cost a fragment must carry to be worth
+	// its own request: output steps for Metrics, pages for Logs, candidate
+	// traces for Traces. Zero always splits, for tests. When omitted the
+	// server's per-product default applies.
+	// +kubebuilder:validation:Minimum=0
+	MinFragmentCost *int64 `json:"minFragmentCost,omitempty"`
 }
 
 // AutoscalingSpec scales reader replicas on resource utilization. While

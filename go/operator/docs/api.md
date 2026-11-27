@@ -759,6 +759,7 @@ _Appears in:_
 | `readerCacheCapacity` _integer_ | ReaderCacheCapacity sizes each shard's query cache: half of it, in<br />bytes, holds decoded series chunks. When omitted, the operator sizes it<br />from the container memory limit. |  | Minimum: 1 <br /> |
 | `forwardIndexCacheCapacityBytes` _integer_ | ForwardIndexCacheCapacityBytes bounds forward-index entries and resolved<br />selectors. When omitted, the operator sizes it from the container<br />memory limit. |  | Minimum: 1 <br /> |
 | `query` _[MetricsQuerySpec](#metricsqueryspec)_ | Query limits PromQL evaluation across the whole process. |  |  |
+| `pushdown` _[MetricsPushdownSpec](#metricspushdownspec)_ | Pushdown evaluates the aggregations a query can combine from partial<br />results on the shards, so the reader coordinating a query receives<br />partial results instead of every matched sample. It applies to sharded<br />readers with read groups. |  |  |
 | `cacheWarmer` _[CacheWarmerSpec](#cachewarmerspec)_ |  |  |  |
 | `write` _[WriteSpec](#writespec)_ |  |  |  |
 | `request` _[MetricsRequestSpec](#metricsrequestspec)_ |  |  |  |
@@ -767,6 +768,22 @@ _Appears in:_
 | `namespaces` _string array_ |  | [default] |  |
 
 
+
+
+#### MetricsPushdownSpec
+
+
+
+MetricsPushdownSpec configures evaluating parts of queries on shards.
+
+
+
+_Appears in:_
+- [MetricsConfigSpec](#metricsconfigspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ | Enabled turns pushdown on. | false |  |
 
 
 #### MetricsQuerySpec
@@ -1137,6 +1154,27 @@ _Appears in:_
 
 
 
+#### ReadGroupSplitSpec
+
+
+
+ReadGroupSplitSpec cuts a shard read into fragments that different
+replicas of the shard's reader group run, so a heavy query uses all of
+them. Small queries, busy readers and groups with one replica read whole.
+
+
+
+_Appears in:_
+- [ReadGroupsSpec](#readgroupsspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ | Enabled turns splitting on. | false |  |
+| `maxFragments` _integer_ | MaxFragments bounds the fragments of one shard read. | 4 | Minimum: 1 <br /> |
+| `maxLocalInflight` _integer_ | MaxLocalInflight stops splitting while this reader coordinates this<br />many queries. | 32 | Minimum: 1 <br /> |
+| `minFragmentCost` _integer_ | MinFragmentCost is the estimated cost a fragment must carry to be worth<br />its own request: output steps for Metrics, pages for Logs, candidate<br />traces for Traces. Zero always splits, for tests. When omitted the<br />server's per-product default applies. |  | Minimum: 0 <br /> |
+
+
 #### ReadGroupsSpec
 
 
@@ -1157,6 +1195,7 @@ _Appears in:_
 | `enabled` _boolean_ | Enabled defaults to true. When false, every reader opens every shard. | true |  |
 | `hedgeAfterMilliseconds` _integer_ | HedgeAfterMilliseconds starts a second copy of a unary shard read on<br />another replica of its group when the first has not answered in time.<br />Streaming reads are never hedged. Zero disables hedging. | 250 | Minimum: 0 <br /> |
 | `requestTimeoutSeconds` _integer_ | RequestTimeoutSeconds bounds one shard read. | 120 | Minimum: 1 <br /> |
+| `split` _[ReadGroupSplitSpec](#readgroupsplitspec)_ | Split divides one shard's read across every replica of its group<br />instead of reading it on a single replica. |  |  |
 
 
 #### RoutingEpoch
