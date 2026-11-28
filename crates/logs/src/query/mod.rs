@@ -418,8 +418,9 @@ fn row_time_ranges(start: i64, end: i64, ways: usize) -> Vec<(i64, i64)> {
 }
 
 /// Reads one shard as `ways` row-time fragments, each on one replica of the
-/// shard's group, and merges them as one shard's output. `max_pages` is
-/// divided among them, so a read passes only if the whole would.
+/// shard's group, and merges them as one shard's output. A remote shard's
+/// `max_pages` is divided among its fragments, so a read passes only if the
+/// whole would; a local shard's pages were already checked whole.
 #[allow(clippy::too_many_arguments)]
 async fn load_split<'a>(
     context: &SplitContext,
@@ -433,13 +434,20 @@ async fn load_split<'a>(
     global_permits: &Semaphore,
 ) -> Result<columnar::ColumnarSink<'a>> {
     let ranges = row_time_ranges(plan.scan_start, plan.scan_end, ways);
-    let mut fragment_options = options.clone();
-    fragment_options.max_pages = (options.max_pages / ranges.len()).max(1);
+    let max_pages = if database.is_some() {
+        options.max_pages
+    } else {
+        options.max_pages / ranges.len()
+    };
     let requests = ranges
         .iter()
         .map(|&range| {
-            fragment_options.row_time = Some(range);
-            crate::remote::query_request(shard, namespace, request, &fragment_options)
+            let options = QueryOptions {
+                max_pages,
+                row_time: Some(range),
+                ..options.clone()
+            };
+            crate::remote::query_request(shard, namespace, request, &options)
         })
         .collect::<Vec<_>>();
     ::metrics::counter!("logs_split_queries_total").increment(1);
@@ -581,11 +589,14 @@ pub(crate) async fn query_databases(
                             ShardSource::Local(database) => Some(database),
                             ShardSource::Remote(_) => None,
                         };
+                        // A remote fragment's share of `max_pages` must be at
+                        // least one page.
                         if pages > 0
                             && let Some(ways) = context
                                 .client
                                 .split_ways(shard, pages, context.inflight)
                                 .await
+                            && (database.is_some() || ways <= options.max_pages)
                         {
                             match load_split(
                                 context,
@@ -601,10 +612,18 @@ pub(crate) async fn query_databases(
                             .await
                             {
                                 Ok(sink) => return Ok(sink),
-                                // Fragments' pages are over-counted at their
-                                // boundaries, so read the shard whole to give
-                                // exactly the unsplit answer.
-                                Err(error) if is_max_pages_error(&error) => {}
+                                // A fragment over its share of `max_pages`
+                                // (pages straddling fragment bounds count in
+                                // both, and rows may be skewed), or one that
+                                // found no replica able to run it: read the
+                                // shard whole, which gives exactly the
+                                // unsplit answer or error.
+                                Err(error)
+                                    if is_max_pages_error(&error)
+                                        || matches!(error, Error::Unavailable(_)) =>
+                                {
+                                    ::metrics::counter!("logs_split_fallbacks_total").increment(1);
+                                }
                                 Err(error) => return Err(error),
                             }
                         }

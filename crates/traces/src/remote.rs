@@ -43,9 +43,10 @@ pub trait TracesShardClient: Send + Sync + 'static {
     ) -> Result<pb::CatalogValuesResponse>;
     async fn traceql(&self, request: pb::TraceQlRequest) -> Result<pb::TraceQlResponse>;
 
-    /// Whether reads may be split across replicas at all; a cheap check
-    /// that lets coordinators skip the work a split needs when it is off.
-    fn splitting(&self) -> bool {
+    /// Whether a read may be split across replicas while this reader
+    /// coordinates `local_inflight` queries; a cheap check that lets it skip
+    /// listing candidates when it would not split anyway.
+    fn may_split(&self, _local_inflight: usize) -> bool {
         false
     }
 
@@ -477,23 +478,27 @@ impl RemoteShard {
             .collect()
     }
 
-    /// The ids of the traces the query may match on this shard, in order.
+    /// The ids of the traces the query may match on this shard, in order,
+    /// or `None` when the replica that answered predates split reads.
     pub(crate) async fn candidate_ids(
         &self,
         namespace: &Namespace,
         range: (u64, u64),
         source: &str,
         options: &QueryOptions,
-    ) -> Result<Vec<TraceId>> {
+    ) -> Result<Option<Vec<TraceId>>> {
         let mut request = traceql_request(self.shard, namespace, range, source, options, false);
         request.candidates_only = true;
-        self.client
-            .traceql(request)
-            .await?
+        let response = self.client.traceql(request).await?;
+        if !response.split_reader {
+            return Ok(None);
+        }
+        response
             .candidate_ids
             .iter()
             .map(|id| TraceId::from_slice(id))
-            .collect()
+            .collect::<Result<_>>()
+            .map(Some)
     }
 
     pub(crate) async fn traceql<T: crate::db::Hit>(

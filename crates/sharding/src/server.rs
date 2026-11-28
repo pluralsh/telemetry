@@ -92,8 +92,8 @@ pub struct SplitConfig {
     /// zero forces splitting on, for tests.
     pub min_fragment_cost: MinFragmentCost,
     /// `host:port` this pod is reachable at within its own group, so it can
-    /// leave itself out of its peers. Defaults to `$POD_IP` with the port of
-    /// `endpoint`.
+    /// leave itself out of its peers. Defaults to `$POD_IP`, else this
+    /// host's name, with the port of `endpoint`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_address: Option<String>,
 }

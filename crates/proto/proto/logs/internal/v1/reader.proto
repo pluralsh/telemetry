@@ -136,6 +136,9 @@ message ShardOutput {
     LabelRows labels = 5;
     LogLines logs = 6;
   }
+  // Set when the reader kept only the request's row-time range; an older
+  // reader ignores the range and answers the whole shard.
+  bool row_time_applied = 7;
 }
 
 message LabelNamesRequest {

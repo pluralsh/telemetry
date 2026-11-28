@@ -54,10 +54,6 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-fn scopeguard_decrement(counter: &std::sync::atomic::AtomicUsize) -> InflightGuard<'_> {
-    InflightGuard(counter)
-}
-
 fn shard_config(config: &Config, shard: ShardId) -> Config {
     let mut config = config.clone();
     config.storage = config
@@ -488,19 +484,13 @@ impl ShardedTraces {
         let inflight = self
             .inflight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _guard = scopeguard_decrement(&self.inflight);
-        if let Some(mut hits) = self
+        let _guard = InflightGuard(&self.inflight);
+        if let Some(hits) = self
             .split_traceql::<T>(namespace, range, source, options, &remote, inflight)
             .await?
         {
             return self
-                .finish_traceql(
-                    assignment,
-                    namespace,
-                    source,
-                    options,
-                    std::mem::take(&mut hits),
-                )
+                .finish_traceql(assignment, namespace, source, options, hits)
                 .await;
         }
         let (mut hits, remote) = try_join(
@@ -520,9 +510,9 @@ impl ShardedTraces {
     /// Reads every shard as two phases when the local shard's candidate
     /// count is large enough to be worth dividing across replicas: one
     /// replica of each shard lists its candidate trace ids, then runs of
-    /// them go to the group's replicas to be evaluated whole. Shards are
-    /// balanced by hash, so the local count stands in for each remote
-    /// shard's. `None` reads shards whole instead.
+    /// them go to the group's replicas to be evaluated. Each remote shard
+    /// is split by its own count; one whose replica predates split reads is
+    /// read whole. `None` reads every shard whole instead.
     async fn split_traceql<T: Hit>(
         &self,
         namespace: &Namespace,
@@ -535,13 +525,14 @@ impl ShardedTraces {
         let Some(client) = self.remote.get() else {
             return Ok(None);
         };
-        if !client.splitting() {
+        if !client.may_split(inflight) {
             return Ok(None);
         }
         let entries = self.shards.entries().await;
         let [(local_shard, database)] = entries.as_slice() else {
             return Ok(None);
         };
+        let local_shard = *local_shard;
         let permits = self.shards.io_permits();
         let local_ids = crate::db::traceql_candidate_ids(
             &[database.as_ref()],
@@ -549,16 +540,19 @@ impl ShardedTraces {
             namespace,
             range,
             source,
+            options,
         )
         .await?;
-        let candidates = local_ids.len() as u64;
-        let Some(ways) = client.split_ways(*local_shard, candidates, inflight).await else {
+        let Some(ways) = client
+            .split_ways(local_shard, local_ids.len() as u64, inflight)
+            .await
+        else {
             return Ok(None);
         };
         ::metrics::counter!("traces_split_queries_total").increment(1);
-        let local_shard = *local_shard;
+        let client = client.as_ref();
         let local = self.split_shard::<T>(
-            client.as_ref(),
+            client,
             local_shard,
             local_ids,
             namespace,
@@ -569,11 +563,18 @@ impl ShardedTraces {
             true,
         );
         let remotes = try_join_all(remote.iter().map(|shard| async move {
-            let ids = shard
+            let Some(ids) = shard
                 .candidate_ids(namespace, range, source, &options)
-                .await?;
+                .await?
+            else {
+                return shard.traceql::<T>(namespace, range, source, &options).await;
+            };
+            let ways = client
+                .split_ways(shard.shard, ids.len() as u64, inflight)
+                .await
+                .unwrap_or(1);
             self.split_shard::<T>(
-                client.as_ref(),
+                client,
                 shard.shard,
                 ids,
                 namespace,
@@ -607,6 +608,9 @@ impl ShardedTraces {
         ways: usize,
         is_local: bool,
     ) -> Result<Vec<T>> {
+        let run_local =
+            |request: pb::TraceQlRequest| async move { self.serve_traceql(&request).await }.boxed();
+        let local: Option<LocalRun<'_>> = is_local.then_some(&run_local as _);
         let mut results = Vec::<T>::new();
         let (mut loaded, mut previous) = (0, 0);
         let mut remaining = ids.into_iter();
@@ -629,9 +633,9 @@ impl ShardedTraces {
                 .into());
             }
             let needed = options.limit - results.len();
-            let run_len = batch.len().div_ceil(ways.min(batch.len()));
-            let requests = batch
-                .chunks(run_len)
+            let runs = batch.chunks(batch.len().div_ceil(ways.clamp(1, batch.len())));
+            let requests = runs
+                .clone()
                 .map(|run| {
                     let mut request =
                         traceql_request(shard, namespace, range, source, &options, T::SUMMARIES);
@@ -640,21 +644,28 @@ impl ShardedTraces {
                     request
                 })
                 .collect::<Vec<_>>();
-            let run_local = |request: pb::TraceQlRequest| {
-                async move {
-                    let mut response = self.serve_traceql(&request).await?;
-                    response.candidate_ids.clear();
-                    Ok(response)
-                }
-                .boxed()
-            };
-            let local: Option<LocalRun<'_>> = is_local.then_some(&run_local as _);
             let responses = client.traceql_runs(requests, local).await?;
+            // A run's hits come back in result order; the wave keeps the
+            // first `needed` in candidate order, as a whole read's batch does.
             let mut found = Vec::new();
-            for response in responses {
-                for hit in response.hits {
-                    found.push(T::from_wire(hit)?);
+            for (run, response) in runs.zip(responses) {
+                if !response.split_reader {
+                    return Err(Error::Unavailable(
+                        "a shard replica predates split reads; upgrade every reader before enabling sharding.read_groups.split".to_owned(),
+                    ));
                 }
+                let position = run
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| (*id, index))
+                    .collect::<HashMap<_, _>>();
+                let mut hits = response
+                    .hits
+                    .into_iter()
+                    .map(T::from_wire)
+                    .collect::<Result<Vec<_>>>()?;
+                hits.sort_by_key(|hit| position.get(&hit.order().1).copied());
+                found.extend(hits);
             }
             found.truncate(needed);
             results.extend(found);
@@ -820,11 +831,13 @@ impl ShardedTraces {
                 &namespace,
                 range,
                 &request.query,
+                options,
             )
             .await?;
             return Ok(pb::TraceQlResponse {
                 hits: Vec::new(),
                 candidate_ids: ids.iter().map(|id| id.as_bytes().to_vec()).collect(),
+                split_reader: true,
             });
         }
         if !request.candidate_ids.is_empty() {
@@ -833,16 +846,16 @@ impl ShardedTraces {
                 .iter()
                 .map(|id| TraceId::from_slice(id))
                 .collect::<Result<Vec<_>>>()?;
-            let wanted = options.limit;
+            let query = &request.query;
             let hits = if request.summaries {
                 crate::db::execute_traceql_ids::<TraceSummary>(
-                    &database,
+                    &shards,
                     Some(&permits),
                     &namespace,
+                    range,
                     &ids,
-                    &request.query,
+                    query,
                     options,
-                    wanted,
                 )
                 .await?
                 .into_iter()
@@ -850,13 +863,13 @@ impl ShardedTraces {
                 .collect()
             } else {
                 crate::db::execute_traceql_ids::<TraceQlResult>(
-                    &database,
+                    &shards,
                     Some(&permits),
                     &namespace,
+                    range,
                     &ids,
-                    &request.query,
+                    query,
                     options,
-                    wanted,
                 )
                 .await?
                 .into_iter()
@@ -866,6 +879,7 @@ impl ShardedTraces {
             return Ok(pb::TraceQlResponse {
                 hits,
                 candidate_ids: Vec::new(),
+                split_reader: true,
             });
         }
         let hits = if request.summaries {
@@ -898,6 +912,7 @@ impl ShardedTraces {
         Ok(pb::TraceQlResponse {
             hits,
             candidate_ids: Vec::new(),
+            split_reader: true,
         })
     }
 
@@ -1324,7 +1339,7 @@ mod tests {
             self.reader.serve_traceql(&request).await
         }
 
-        fn splitting(&self) -> bool {
+        fn may_split(&self, _: usize) -> bool {
             self.ways.load(std::sync::atomic::Ordering::SeqCst) >= 2
         }
 

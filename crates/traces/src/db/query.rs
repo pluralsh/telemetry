@@ -1688,188 +1688,250 @@ pub(crate) async fn execute_traceql<T: Hit>(
     shards: &[&TraceDb],
     permits: Option<&tokio::sync::Semaphore>,
     namespace: &Namespace,
-    (start_ns, end_ns): (u64, u64),
+    range: (u64, u64),
     source: &str,
     options: QueryOptions,
 ) -> Result<Vec<T>> {
-    validate_options(&options)?;
-    let query = crate::traceql::parse(source)?;
-    if let Some(name) = query.stages.iter().find_map(|stage| match stage {
-        crate::traceql::PipelineStage::Metric { name, .. } => Some(name),
-        _ => None,
-    }) {
-        return Err(crate::traceql::QueryError::Unsupported(format!(
-            "metric stage `{name}` is parsed but not executable"
-        ))
-        .into());
-    }
-    let plan = crate::traceql::plan(query)?;
-    let prefilter = crate::traceql::prefilter(&plan.query);
-    let compiled = Arc::new(crate::traceql::CompiledQuery::new(plan.query.clone()));
-    let existential = crate::traceql::existential(&plan.query);
-    let decider = crate::traceql::columns::decider(&plan.query);
-    let now = unix_time_ms()?;
-    let per_shard = futures::future::try_join_all(shards.iter().map(|database| async {
-        let _permit = acquire(permits).await?;
-        database
-            .ordered_candidates_for(
-                namespace,
-                (start_ns, end_ns),
-                &plan.pushdown,
-                now,
-                existential,
-            )
-            .await
-    }))
-    .await?;
-    let ordered = group_candidates(per_shard);
-
-    let mut results = Vec::new();
-    let mut loaded = 0;
-    let mut previous = 0;
-    let memos = shards
-        .iter()
-        .map(|_| PageMemo::default())
-        .collect::<Vec<_>>();
-    let mut remaining = ordered.into_iter();
-    while results.len() < options.limit {
-        // Low-hit queries would otherwise walk their candidates in many small
-        // sequential round trips, so batches double while they come up short.
-        let wanted = (options.limit - results.len())
-            .max(options.max_concurrency)
-            .max(previous * 2)
-            .min(search_batch_max());
-        previous = wanted;
-        let batch = remaining.by_ref().take(wanted).collect::<Vec<_>>();
-        if batch.is_empty() {
-            break;
-        }
-        loaded += batch.len();
-        if loaded > options.max_candidate_traces {
-            return Err(crate::traceql::QueryError::Limit(format!(
-                "{loaded} candidate traces exceeds maximum {}",
-                options.max_candidate_traces
-            ))
-            .into());
-        }
-        let prune = prefilter
-            .as_ref()
-            .map(|filter| (filter, options.max_spans_per_trace));
-        let sources = (shards, memos.as_slice());
-        let needed = options.limit - results.len();
-        if !existential {
-            let traces = load_batch(sources, permits, namespace, batch, prune, false).await?;
-            results.extend(evaluate_batch::<T>(traces, &plan, &compiled, &options, needed).await?);
-            continue;
-        }
-        // A part that matches proves its trace does, so only matches read
-        // heads, to load and evaluate their whole traces. Parts are decoded
-        // only when their columns cannot decide them.
-        let decided = match &decider {
-            Some(decider) => match_batch(sources, permits, namespace, &batch, decider).await?,
-            None => None,
-        };
-        let columnar = decided.is_some();
-        let matched = match decided {
-            Some(decided) => batch
-                .iter()
-                .map(|group| group.trace_id)
-                .filter(|trace_id| decided.contains(trace_id))
-                .take(needed)
-                .collect::<HashSet<_>>(),
-            None => {
-                let parts =
-                    load_batch(sources, permits, namespace, batch.clone(), prune, true).await?;
-                evaluate_batch::<TraceSummary>(parts, &plan, &compiled, &options, needed)
-                    .await?
-                    .into_iter()
-                    .map(|summary| summary.trace_id)
-                    .collect()
-            }
-        };
-        let mut batch = batch
-            .into_iter()
-            .filter(|group| matched.contains(&group.trace_id))
-            .collect::<Vec<_>>();
-        if T::SUMMARIES
-            && columnar
-            && let Some(decider) = &decider
-        {
-            let summaries = summarize_batch(
-                sources,
-                permits,
-                namespace,
-                &batch,
-                decider,
-                options.max_spans_per_trace,
-            )
-            .await?;
-            batch.retain(|group| !summaries.contains_key(&group.trace_id));
-            results.extend(summaries.into_values().filter_map(T::from_columns));
-        }
-        let needed = options.limit - results.len();
-        let traces = load_batch(sources, permits, namespace, batch, None, false).await?;
-        results.extend(evaluate_batch::<T>(traces, &plan, &compiled, &options, needed).await?);
-    }
-    // Continued candidates are ordered by the pages the index saw; their
-    // exact start is only known once loaded.
-    results.sort_by_key(T::order);
-    Ok(results)
+    let prepared = PreparedTraceQl::new(source, &options)?;
+    let ordered = prepared
+        .candidates(shards, permits, namespace, range)
+        .await?;
+    prepared
+        .evaluate(shards, permits, namespace, ordered, &options)
+        .await
 }
 
 /// The ids of the traces a TraceQL query may match on `shards`, in the
-/// order [`execute_traceql`] would consider them: global `(start, trace ID)`
-/// order of the pages the index saw. They are candidates only; each must
-/// still be evaluated whole, as [`execute_traceql_ids`] does.
+/// order [`execute_traceql`] considers them, after the same validation.
+/// Only as many are returned as `max_candidate_traces` lets a read dispatch
+/// before it fails, so the limit trips exactly where it would unsplit.
 pub(crate) async fn traceql_candidate_ids(
     shards: &[&TraceDb],
     permits: Option<&tokio::sync::Semaphore>,
     namespace: &Namespace,
-    (start_ns, end_ns): (u64, u64),
+    range: (u64, u64),
     source: &str,
+    options: QueryOptions,
 ) -> Result<Vec<TraceId>> {
-    let query = crate::traceql::parse(source)?;
-    let plan = crate::traceql::plan(query)?;
-    let existential = crate::traceql::existential(&plan.query);
-    let now = unix_time_ms()?;
-    let per_shard = futures::future::try_join_all(shards.iter().map(|database| async {
-        let _permit = acquire(permits).await?;
-        database
-            .ordered_candidates_for(
-                namespace,
-                (start_ns, end_ns),
-                &plan.pushdown,
-                now,
-                existential,
-            )
-            .await
-    }))
-    .await?;
-    Ok(group_candidates(per_shard)
+    let prepared = PreparedTraceQl::new(source, &options)?;
+    let cap = options
+        .max_candidate_traces
+        .saturating_add(search_batch_max());
+    Ok(prepared
+        .candidates(shards, permits, namespace, range)
+        .await?
         .into_iter()
+        .take(cap)
         .map(|group| group.trace_id)
         .collect())
 }
 
-/// Evaluates `trace_ids` whole against `source`, each on `database` alone,
-/// and returns up to `wanted` hits in input order. A trace's pages are found
-/// through its head record, so the ids carry no storage locators.
+/// [`execute_traceql`] over only the candidates in `trace_ids`, a run of
+/// ids [`traceql_candidate_ids`] listed, possibly on another replica.
+/// Candidates are listed again here, so each is evaluated exactly as an
+/// unsplit read would, existential matching included. A listed id this
+/// replica does not see yet fails as unavailable, so the run is retried on
+/// a replica that does rather than silently dropping the trace.
 pub(crate) async fn execute_traceql_ids<T: Hit>(
-    database: &TraceDb,
+    shards: &[&TraceDb],
     permits: Option<&tokio::sync::Semaphore>,
     namespace: &Namespace,
+    range: (u64, u64),
     trace_ids: &[TraceId],
     source: &str,
     options: QueryOptions,
-    wanted: usize,
 ) -> Result<Vec<T>> {
-    validate_options(&options)?;
-    let plan = crate::traceql::plan(crate::traceql::parse(source)?)?;
-    let compiled = Arc::new(crate::traceql::CompiledQuery::new(plan.query.clone()));
-    let now = unix_time_ms()?;
-    let _permit = acquire(permits).await?;
-    let traces = database.materialize(namespace, trace_ids, now).await?;
-    evaluate_batch::<T>(traces, &plan, &compiled, &options, wanted).await
+    let prepared = PreparedTraceQl::new(source, &options)?;
+    let wanted = trace_ids.iter().copied().collect::<HashSet<_>>();
+    let ordered = prepared
+        .candidates(shards, permits, namespace, range)
+        .await?
+        .into_iter()
+        .filter(|group| wanted.contains(&group.trace_id))
+        .collect::<Vec<_>>();
+    if ordered.len() != wanted.len() {
+        return Err(Error::Unavailable(format!(
+            "{} of {} candidate traces are not visible on this replica yet",
+            wanted.len() - ordered.len(),
+            wanted.len()
+        )));
+    }
+    prepared
+        .evaluate(shards, permits, namespace, ordered, &options)
+        .await
+}
+
+/// A validated, planned TraceQL query.
+struct PreparedTraceQl {
+    plan: crate::traceql::QueryPlan,
+    prefilter: Option<TraceFilter>,
+    compiled: Arc<crate::traceql::CompiledQuery>,
+    existential: bool,
+    decider: Option<crate::traceql::columns::Decider>,
+    now: u64,
+}
+
+impl PreparedTraceQl {
+    fn new(source: &str, options: &QueryOptions) -> Result<Self> {
+        validate_options(options)?;
+        let query = crate::traceql::parse(source)?;
+        if let Some(name) = query.stages.iter().find_map(|stage| match stage {
+            crate::traceql::PipelineStage::Metric { name, .. } => Some(name),
+            _ => None,
+        }) {
+            return Err(crate::traceql::QueryError::Unsupported(format!(
+                "metric stage `{name}` is parsed but not executable"
+            ))
+            .into());
+        }
+        let plan = crate::traceql::plan(query)?;
+        Ok(Self {
+            prefilter: crate::traceql::prefilter(&plan.query),
+            compiled: Arc::new(crate::traceql::CompiledQuery::new(plan.query.clone())),
+            existential: crate::traceql::existential(&plan.query),
+            decider: crate::traceql::columns::decider(&plan.query),
+            now: unix_time_ms()?,
+            plan,
+        })
+    }
+
+    /// Candidates from every shard, merged into global result order
+    /// `(start, trace ID)`.
+    async fn candidates(
+        &self,
+        shards: &[&TraceDb],
+        permits: Option<&tokio::sync::Semaphore>,
+        namespace: &Namespace,
+        range: (u64, u64),
+    ) -> Result<Vec<CandidateGroup>> {
+        let per_shard = futures::future::try_join_all(shards.iter().map(|database| async {
+            let _permit = acquire(permits).await?;
+            database
+                .ordered_candidates_for(
+                    namespace,
+                    range,
+                    &self.plan.pushdown,
+                    self.now,
+                    self.existential,
+                )
+                .await
+        }))
+        .await?;
+        Ok(group_candidates(per_shard))
+    }
+
+    /// Loads and evaluates `ordered` in growing batches until `limit`
+    /// results are found.
+    async fn evaluate<T: Hit>(
+        &self,
+        shards: &[&TraceDb],
+        permits: Option<&tokio::sync::Semaphore>,
+        namespace: &Namespace,
+        ordered: Vec<CandidateGroup>,
+        options: &QueryOptions,
+    ) -> Result<Vec<T>> {
+        let Self {
+            plan,
+            prefilter,
+            compiled,
+            existential,
+            decider,
+            ..
+        } = self;
+        let options = *options;
+        let mut results = Vec::new();
+        let mut loaded = 0;
+        let mut previous = 0;
+        let memos = shards
+            .iter()
+            .map(|_| PageMemo::default())
+            .collect::<Vec<_>>();
+        let mut remaining = ordered.into_iter();
+        while results.len() < options.limit {
+            // Low-hit queries would otherwise walk their candidates in many small
+            // sequential round trips, so batches double while they come up short.
+            let wanted = (options.limit - results.len())
+                .max(options.max_concurrency)
+                .max(previous * 2)
+                .min(search_batch_max());
+            previous = wanted;
+            let batch = remaining.by_ref().take(wanted).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            loaded += batch.len();
+            if loaded > options.max_candidate_traces {
+                return Err(crate::traceql::QueryError::Limit(format!(
+                    "{loaded} candidate traces exceeds maximum {}",
+                    options.max_candidate_traces
+                ))
+                .into());
+            }
+            let prune = prefilter
+                .as_ref()
+                .map(|filter| (filter, options.max_spans_per_trace));
+            let sources = (shards, memos.as_slice());
+            let needed = options.limit - results.len();
+            if !existential {
+                let traces = load_batch(sources, permits, namespace, batch, prune, false).await?;
+                results
+                    .extend(evaluate_batch::<T>(traces, plan, compiled, &options, needed).await?);
+                continue;
+            }
+            // A part that matches proves its trace does, so only matches read
+            // heads, to load and evaluate their whole traces. Parts are decoded
+            // only when their columns cannot decide them.
+            let decided = match decider {
+                Some(decider) => match_batch(sources, permits, namespace, &batch, decider).await?,
+                None => None,
+            };
+            let columnar = decided.is_some();
+            let matched = match decided {
+                Some(decided) => batch
+                    .iter()
+                    .map(|group| group.trace_id)
+                    .filter(|trace_id| decided.contains(trace_id))
+                    .take(needed)
+                    .collect::<HashSet<_>>(),
+                None => {
+                    let parts =
+                        load_batch(sources, permits, namespace, batch.clone(), prune, true).await?;
+                    evaluate_batch::<TraceSummary>(parts, plan, compiled, &options, needed)
+                        .await?
+                        .into_iter()
+                        .map(|summary| summary.trace_id)
+                        .collect()
+                }
+            };
+            let mut batch = batch
+                .into_iter()
+                .filter(|group| matched.contains(&group.trace_id))
+                .collect::<Vec<_>>();
+            if T::SUMMARIES
+                && columnar
+                && let Some(decider) = decider
+            {
+                let summaries = summarize_batch(
+                    sources,
+                    permits,
+                    namespace,
+                    &batch,
+                    decider,
+                    options.max_spans_per_trace,
+                )
+                .await?;
+                batch.retain(|group| !summaries.contains_key(&group.trace_id));
+                results.extend(summaries.into_values().filter_map(T::from_columns));
+            }
+            let needed = options.limit - results.len();
+            let traces = load_batch(sources, permits, namespace, batch, None, false).await?;
+            results.extend(evaluate_batch::<T>(traces, plan, compiled, &options, needed).await?);
+        }
+        // Continued candidates are ordered by the pages the index saw; their
+        // exact start is only known once loaded.
+        results.sort_by_key(T::order);
+        Ok(results)
+    }
 }
 
 /// The first `wanted` results of `traces` that satisfy the plan's pushdown

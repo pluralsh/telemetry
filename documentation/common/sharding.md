@@ -120,6 +120,9 @@ sharding:
         metrics: 240          # Output steps (pushdown) or hours x 60 (raw reads).
         logs: 64              # Pages, estimated from the local shard.
         traces: 5000          # Candidate traces, from the local shard.
+      # self_address: "10.0.0.7:9090"  # How this reader appears in its own group's
+      #                                # DNS; defaults to $POD_IP, else the host name,
+      #                                # with the endpoint's port.
 ```
 
 Fragments are addressed by time range, step range or trace ID, never by
@@ -143,14 +146,24 @@ for each remote shard's, without an extra round trip.
 | Logs | Row time `[a, b)` of metric queries and unindexed queries that read lines | Merged exactly as shards are |
 | Traces | Candidate trace ids, in waves | `(start, trace ID)` order, stopping at the limit |
 
-Limits keep their meaning. Logs divides `max_pages` across a shard's
-fragments, and reads the shard whole if a fragment exceeds its share, so a
-query fails only if it would fail unsplit. Traces counts `max_candidate_traces`
-over the candidates dispatched, as a whole read counts those it loads.
+Limits keep their meaning. Logs divides a remote shard's `max_pages` across
+its fragments (the local shard's pages are checked whole before splitting),
+and reads the shard whole if a fragment exceeds its share or finds no replica
+to run on, so a query fails only if it would fail unsplit. Traces counts `max_candidate_traces`
+over the candidates dispatched, as a whole read counts those it loads. Each
+Traces run lists its shard's candidates again and evaluates its own exactly
+as a whole read would; a replica that does not see a listed candidate yet
+fails the run, which is retried elsewhere, instead of dropping the trace.
 Not split: Logs queries with a `limit` (they stop early), indexed searches,
 and lineless metric reads (they read page summaries, which cannot be cut at a
 row). Traces are never split by time, since results are oldest first up to the
 limit.
+
+Enable splitting only after every reader is upgraded. Readers mark split
+responses, so a replica that predates them is detected rather than answering
+the whole shard for each fragment: Logs then reads that shard whole, Traces
+reads a remote shard whole when its candidate listing is unmarked and
+otherwise fails the query, which is retried once on another replica first.
 
 Not yet implemented: a per-query limit on in-flight bytes across fragments,
 and a load signal from peers; splitting is gated on this reader's own load

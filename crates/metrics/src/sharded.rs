@@ -969,9 +969,9 @@ impl ShardedMetrics {
                 continue;
             }
             ::metrics::counter!("metrics_split_reads_total").increment(1);
-            for (from_ms, to_ms) in fragments {
+            for (from_ms, to_ms, key) in fragments {
                 let narrowed = narrow_ranges(ranges, from_ms, to_ms);
-                let source = shard.fragment_source(namespace, &narrowed, from_ms as u64);
+                let source = shard.fragment_source(namespace, &narrowed, key);
                 sources.push((
                     shard.shard,
                     ShardSource::Clipped(
@@ -991,7 +991,8 @@ impl ShardedMetrics {
     /// none to read it whole. Slices are logical addresses: they follow the
     /// 1h bucket layout, never one replica's storage ids, and the outer two
     /// are open-ended so together they cover every possible read.
-    async fn time_fragments(&self, shard: ShardId, ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    /// Each slice comes with its replica key, the start of its first hour.
+    async fn time_fragments(&self, shard: ShardId, ranges: &[(i64, i64)]) -> Vec<(i64, i64, u64)> {
         const HOUR_MS: i64 = 3_600_000;
         let Some(client) = self.remote.get() else {
             return Vec::new();
@@ -1037,6 +1038,7 @@ impl ShardedMetrics {
                 } else {
                     next * HOUR_MS
                 },
+                (hour * HOUR_MS) as u64,
             ));
             hour = next;
         }

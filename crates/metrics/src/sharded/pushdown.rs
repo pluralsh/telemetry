@@ -309,23 +309,25 @@ impl ShardedMetrics {
         let lookback = duration_to_ms(options.lookback_delta);
         let source = Arc::new(self.local_source(shard, namespace, ranges).await?);
         let instant = step_ms == 0;
-        let mut results = Vec::with_capacity(queries.len());
-        for query in queries {
+        try_join_all(queries.iter().map(|query| {
             let plan = self.tuned(if instant {
                 crate::promql::plan::LoweringContext::for_instant(start_ms, lookback)
             } else {
                 crate::promql::plan::LoweringContext::new(start_ms, end_ms, step_ms, lookback)
             });
-            let outcome = execute_query_source(
-                query,
-                Arc::clone(&source),
-                plan,
-                instant,
-                MemoryReservation::new(DEFAULT_MEMORY_CAP_BYTES),
-            )
-            .await?;
-            results.push(query_value_to_range_samples(outcome.value)?);
-        }
-        Ok(results)
+            let source = Arc::clone(&source);
+            async move {
+                let outcome = execute_query_source(
+                    query,
+                    source,
+                    plan,
+                    instant,
+                    MemoryReservation::new(DEFAULT_MEMORY_CAP_BYTES),
+                )
+                .await?;
+                query_value_to_range_samples(outcome.value)
+            }
+        }))
+        .await
     }
 }

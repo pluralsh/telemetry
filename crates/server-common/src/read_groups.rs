@@ -60,6 +60,7 @@ pub struct ReadGroups {
     groups: Mutex<HashMap<ShardId, Group>>,
     channels: Mutex<HashMap<String, Channel>>,
     next: AtomicUsize,
+    own: tokio::sync::OnceCell<Vec<String>>,
 }
 
 impl ReadGroups {
@@ -71,6 +72,7 @@ impl ReadGroups {
             groups: Mutex::default(),
             channels: Mutex::default(),
             next: AtomicUsize::new(0),
+            own: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -124,28 +126,20 @@ impl ReadGroups {
         self.group_replicas(shard).await
     }
 
-    /// The other replicas of this reader's own group, leaving this pod out.
-    /// Empty when the group has no peers or this pod's address is unknown.
-    pub async fn local_peers(&self) -> Result<Vec<Replica>, Status> {
-        let Some(own) = self.own_address() else {
-            return Ok(Vec::new());
-        };
-        let mut replicas = self.group_replicas(self.local).await?;
-        replicas.retain(|replica| replica.address != own);
-        Ok(replicas)
-    }
-
-    /// This pod, marked as such, followed by its peers; empty when this
-    /// pod's address is unknown, since the group could then not be split
-    /// without running a fragment twice.
+    /// This pod's replicas of its own group: every resolved replica, with
+    /// this pod's own entries replaced by one marked [`Replica::is_self`].
+    /// Empty when this pod's address is unknown, since the group could then
+    /// not be split without running a fragment twice.
     async fn local_group(&self) -> Result<Vec<Replica>, Status> {
-        let Some(own) = self.own_address() else {
+        let own = self.own_addresses().await;
+        let Some(first) = own.first() else {
             return Ok(Vec::new());
         };
-        let mut group = self.local_peers().await?;
+        let mut group = self.group_replicas(self.local).await?;
+        group.retain(|replica| !own.contains(&replica.address));
         group.push(Replica {
-            channel: self.channel(&own)?,
-            address: own,
+            channel: self.channel(first)?,
+            address: first.clone(),
             is_self: true,
         });
         Ok(group)
@@ -186,18 +180,47 @@ impl ReadGroups {
         ways
     }
 
-    fn own_address(&self) -> Option<String> {
-        if let Some(address) = &self.config.split.self_address {
-            return Some(address.clone());
-        }
-        let ip = std::env::var("POD_IP").ok()?;
-        let endpoint = self.config.endpoint_for(self.local);
-        let port = endpoint.rsplit_once(':')?.1;
-        Some(if ip.contains(':') {
-            format!("[{ip}]:{port}")
-        } else {
-            format!("{ip}:{port}")
-        })
+    /// The `ip:port` addresses this pod is listed under in its own group:
+    /// `split.self_address`, else `$POD_IP`, else this host's name, each
+    /// resolved and paired with the port of the group's endpoint. Resolved
+    /// once; empty when none of them resolves.
+    async fn own_addresses(&self) -> &[String] {
+        self.own
+            .get_or_init(|| async {
+                let endpoint = self.config.endpoint_for(self.local);
+                let port = endpoint.rsplit_once(':').map(|(_, port)| port);
+                let candidate = self.config.split.self_address.clone().or_else(|| {
+                    let host = std::env::var("POD_IP")
+                        .ok()
+                        .or_else(|| std::env::var("HOSTNAME").ok())
+                        .or_else(|| {
+                            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                                .ok()
+                                .map(|name| name.trim().to_owned())
+                        })
+                        .filter(|host| !host.is_empty())?;
+                    let host = if host.contains(':') && !host.starts_with('[') {
+                        format!("[{host}]")
+                    } else {
+                        host
+                    };
+                    Some(format!("{host}:{}", port?))
+                });
+                let Some(candidate) = candidate else {
+                    return Vec::new();
+                };
+                let mut addresses: Vec<String> = match tokio::net::lookup_host(&candidate).await {
+                    Ok(addresses) => addresses.map(|address| address.to_string()).collect(),
+                    Err(error) => {
+                        tracing::warn!(%error, candidate, "could not resolve this reader's own address; its shard reads will not be split");
+                        Vec::new()
+                    }
+                };
+                addresses.sort_unstable();
+                addresses.dedup();
+                addresses
+            })
+            .await
     }
 
     /// Settings for splitting shard reads.
@@ -426,8 +449,9 @@ impl ReadGroups {
     /// start to finish on one replica chosen by rendezvous hashing on its
     /// key, and returns the results in `keys` order. For the local shard
     /// the candidates are this pod, marked [`Replica::is_self`], and its
-    /// peers. A failed fragment is retried once on the
-    /// next replica in its order; a second failure fails the whole read.
+    /// peers. A failed fragment is retried once on the next replica in its
+    /// order, and on this pod as a last resort when it holds the shard; a
+    /// failure after that fails the whole read.
     /// A lone fragment is hedged like [`Self::call`]; several are not.
     pub async fn fan_out<T, F, Fut>(
         &self,
@@ -463,7 +487,15 @@ impl ReadGroups {
                 } else {
                     order.len().min(2)
                 };
+                // This pod holds the local shard itself, so it is always
+                // the last resort for a fragment of it.
+                let own = order
+                    .iter()
+                    .skip(attempts)
+                    .find(|replica| replica.is_self)
+                    .cloned();
                 order.truncate(attempts);
+                order.extend(own);
                 let started = Instant::now();
                 let result = race(order, hedge, |replica| run(index, replica)).await;
                 ::metrics::histogram!("telemetry_read_group_fragment_seconds")

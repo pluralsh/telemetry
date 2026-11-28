@@ -215,8 +215,9 @@ impl TracesShardClient for GrpcTracesShards {
         unary!(self, request, trace_ql)
     }
 
-    fn splitting(&self) -> bool {
-        self.groups.split_config().enabled
+    fn may_split(&self, local_inflight: usize) -> bool {
+        let split = self.groups.split_config();
+        split.enabled && local_inflight < split.max_local_inflight
     }
 
     async fn split_ways(

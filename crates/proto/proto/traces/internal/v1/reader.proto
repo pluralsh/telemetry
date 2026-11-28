@@ -174,4 +174,7 @@ message TraceQlHit {
 message TraceQlResponse {
   repeated TraceQlHit hits = 1;
   repeated bytes candidate_ids = 2;
+  // Set by readers that understand `candidates_only` and `candidate_ids`;
+  // an older reader ignores both and answers the whole query.
+  bool split_reader = 3;
 }

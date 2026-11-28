@@ -130,13 +130,21 @@ a scalar literal):
 
 | Aggregation | Each shard returns | Coordinator combines |
 |---|---|---|
-| `sum`, `min`, `max`, `group` | the same aggregation | the same again |
+| `min`, `max`, `group` | the same aggregation | the same again |
+| `sum` | `sum`, groups it drops | `sum`, less groups any shard dropped |
 | `count` | `count` | `sum` |
-| `avg` | `sum`, `count` | `sum / sum` |
-| `stddev`, `stdvar` | `sum`, sum of squares, `count` | `sqrt(clamp_min(sumsq/n - (sum/n)^2, 0))` |
+| `avg` | `sum`, `count`, groups it drops | `sum / sum`, less groups any shard dropped |
 | `topk`, `bottomk` (literal `k`) | its local top `k` | the top `k` of those |
 
-Everything else takes the unchanged path: `quantile`, `count_values`,
+`sum` and `avg` drop a group that mixes floats and native histograms, so a
+shard reports the groups it dropped (`count unless sum`) and the coordinator
+drops them too. `avg by (__name__)` is not pushed down, since the division
+would drop the metric name, and nothing is pushed down whose query text the
+parser does not print back faithfully (string escapes, quoted label names).
+
+Everything else takes the unchanged path: `stddev`, `stdvar` (combining them
+from sums of squares loses all precision when a group's mean is large next to
+its spread), `quantile`, `count_values`,
 `absent`, `limitk`, subqueries, `@`, `timestamp`, and binary operations
 between vectors. Their operands are pushed down separately where possible,
 so in `sum(rate(a[1m])) / sum(rate(b[1m]))` both sums are pushed and only
@@ -147,6 +155,8 @@ scale-up has samples on two shards.
 Results can differ from the unpushed path in two ways: sums are added in a
 different order, which changes the last bits (compare with a relative
 tolerance, as Mimir does), and `topk`/`bottomk` break ties between equal
-values by the order partials arrive in. `stddev` and `stdvar` use the
-sum-of-squares formula, which loses precision for series whose mean is large
-compared to their spread; turn pushdown off if that matters.
+values by the order partials arrive in.
+
+Enable pushdown only once every reader runs a version that serves the
+`Evaluate` RPC; an older replica answers it `UNIMPLEMENTED` and fails the
+query.

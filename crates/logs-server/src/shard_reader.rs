@@ -68,11 +68,16 @@ impl ShardReader for ShardReaderService {
         request: Request<pb::QueryShardRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
         self.authorize(&request)?;
-        let outputs = self
+        let mut outputs = self
             .readers
             .serve_query(request.get_ref())
             .await
             .map_err(error_status)?;
+        if request.get_ref().row_time_start_ns.is_some() {
+            for output in &mut outputs {
+                output.row_time_applied = true;
+            }
+        }
         Ok(Response::new(
             stream::iter(outputs.into_iter().map(Ok)).boxed(),
         ))
@@ -214,14 +219,18 @@ impl LogsShardClient for GrpcLogsShards {
                 let request = requests[index].clone();
                 if replica.is_self {
                     let local = local.ok_or_else(|| Status::internal("no local fragment"))?;
-                    return local(request).await.map_err(|error| match error {
-                        Error::Query(message) => Status::invalid_argument(message),
-                        other => Status::unavailable(other.to_string()),
-                    });
+                    return local(request).await.map_err(error_status);
                 }
                 let request = groups.request(request)?;
                 let stream = client(&replica).query(request).await?.into_inner();
-                stream.try_collect().await
+                let outputs: Vec<pb::ShardOutput> = stream.try_collect().await?;
+                if outputs.iter().any(|output| !output.row_time_applied) {
+                    return Err(Status::failed_precondition(format!(
+                        "shard reader {} predates split reads; upgrade every reader before enabling sharding.read_groups.split",
+                        replica.address
+                    )));
+                }
+                Ok(outputs)
             })
             .await
             .map_err(status_error)

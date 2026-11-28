@@ -327,7 +327,7 @@ mod tests {
         .unwrap();
         let split = &config.sharding.read_groups.unwrap().split;
         assert!(split.enabled);
-        assert_eq!(split.min_fragment_cost.metrics, 0);
+        assert_eq!(split.min_fragment_cost.traces, 0);
     }
 
     use super::*;

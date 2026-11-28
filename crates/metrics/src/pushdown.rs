@@ -11,13 +11,24 @@
 //! Anything off the support list is left for the coordinator to evaluate
 //! over raw samples, as without pushdown.
 //!
-//! | Aggregation        | Each shard returns         | Coordinator combines    |
-//! |--------------------|----------------------------|-------------------------|
-//! | sum, min, max, group | the same aggregation     | the same again          |
-//! | count              | count                      | sum                     |
-//! | avg                | sum, count                 | sum ÷ sum               |
-//! | stddev, stdvar     | sum, sum of squares, count | the usual formula       |
-//! | topk, bottomk      | its local top k            | the top k of those      |
+//! | Aggregation   | Each shard returns          | Coordinator combines            |
+//! |---------------|-----------------------------|---------------------------------|
+//! | min, max, group | the same aggregation      | the same again                  |
+//! | sum           | sum, mixed groups           | sum, less mixed groups          |
+//! | count         | count                       | sum                             |
+//! | avg           | sum, count, mixed groups    | sum ÷ sum, less mixed groups    |
+//! | topk, bottomk | its local top k             | the top k of those              |
+//!
+//! `sum` and `avg` return nothing for a group that mixes floats and native
+//! histograms. A shard that sees such a group alone reports it as "mixed"
+//! (`count unless sum`), so the coordinator drops the group too instead of
+//! combining the other shards' partials. `stddev` and `stdvar` are not
+//! pushed down: combining them from sums of squares loses all precision
+//! when a group's mean is large next to its spread.
+//!
+//! Every query text built here is parsed back and compared with what it was
+//! printed from, so a construct the parser does not print faithfully (such
+//! as a string escape) is never pushed down.
 
 use promql_parser::parser::{self, Expr, LabelModifier};
 
@@ -118,10 +129,15 @@ pub fn plan(query: &str) -> Option<Pushdown> {
     if fragments.is_empty() {
         return None;
     }
-    Some(Pushdown {
-        query: expr.to_string(),
-        fragments,
-    })
+    let query = reprinted(&expr)?;
+    Some(Pushdown { query, fragments })
+}
+
+/// `expr` as query text, or `None` when that text does not parse back to
+/// `expr`.
+fn reprinted(expr: &Expr) -> Option<String> {
+    let text = expr.to_string();
+    (parser::parse(&text).ok()? == *expr).then_some(text)
 }
 
 fn rewrite(expr: &mut Expr, fragments: &mut Vec<Fragment>, next_index: &mut usize) {
@@ -180,11 +196,11 @@ fn split_aggregate(aggregate: &parser::AggregateExpr) -> Option<(Vec<String>, Co
         return None;
     }
     let op = aggregate.op.to_string();
-    let grouping = grouping(aggregate.modifier.as_ref());
-    let inner = aggregate.expr.to_string();
+    let grouping = grouping(aggregate.modifier.as_ref())?;
+    let inner = reprinted(&aggregate.expr)?;
     let pd = |index: usize| pushdown_selector_name(index);
     match op.as_str() {
-        "sum" | "min" | "max" | "group" => {
+        "min" | "max" | "group" => {
             if aggregate.param.is_some() {
                 return None;
             }
@@ -192,6 +208,22 @@ fn split_aggregate(aggregate: &parser::AggregateExpr) -> Option<(Vec<String>, Co
             Some((
                 queries,
                 Box::new(move |first| format!("{op}{grouping}({})", pd(first))),
+            ))
+        }
+        "sum" => {
+            if aggregate.param.is_some() {
+                return None;
+            }
+            let queries = vec![format!("sum{grouping}({inner})"), mixed(&grouping, &inner)];
+            Some((
+                queries,
+                Box::new(move |first| {
+                    format!(
+                        "sum{grouping}({}) unless sum{grouping}({})",
+                        pd(first),
+                        pd(first + 1)
+                    )
+                }),
             ))
         }
         "count" => {
@@ -205,49 +237,25 @@ fn split_aggregate(aggregate: &parser::AggregateExpr) -> Option<(Vec<String>, Co
             ))
         }
         "avg" => {
-            if aggregate.param.is_some() {
+            // Division drops the metric name, which `avg by (__name__)`
+            // keeps.
+            if aggregate.param.is_some() || keeps_name(aggregate.modifier.as_ref()) {
                 return None;
             }
             let queries = vec![
                 format!("sum{grouping}({inner})"),
                 format!("count{grouping}({inner})"),
+                mixed(&grouping, &inner),
             ];
             Some((
                 queries,
                 Box::new(move |first| {
                     format!(
-                        "sum{grouping}({}) / sum{grouping}({})",
+                        "(sum{grouping}({}) / sum{grouping}({})) unless sum{grouping}({})",
                         pd(first),
-                        pd(first + 1)
+                        pd(first + 1),
+                        pd(first + 2)
                     )
-                }),
-            ))
-        }
-        "stddev" | "stdvar" => {
-            if aggregate.param.is_some() {
-                return None;
-            }
-            let queries = vec![
-                format!("sum{grouping}({inner})"),
-                format!("sum{grouping}(({inner}) ^ 2)"),
-                format!("count{grouping}({inner})"),
-            ];
-            let root = op == "stddev";
-            Some((
-                queries,
-                Box::new(move |first| {
-                    let (sum, squares, count) = (
-                        format!("sum{grouping}({})", pd(first)),
-                        format!("sum{grouping}({})", pd(first + 1)),
-                        format!("sum{grouping}({})", pd(first + 2)),
-                    );
-                    let variance =
-                        format!("clamp_min(({squares} / {count}) - (({sum} / {count}) ^ 2), 0)");
-                    if root {
-                        format!("sqrt({variance})")
-                    } else {
-                        variance
-                    }
                 }),
             ))
         }
@@ -267,13 +275,39 @@ fn split_aggregate(aggregate: &parser::AggregateExpr) -> Option<(Vec<String>, Co
     }
 }
 
-fn grouping(modifier: Option<&LabelModifier>) -> String {
-    let list = |labels: &promql_parser::label::Labels| labels.labels.join(", ");
-    match modifier {
+/// The groups a shard sees but `sum` drops, because they mix floats and
+/// native histograms there.
+fn mixed(grouping: &str, inner: &str) -> String {
+    format!("count{grouping}({inner}) unless sum{grouping}({inner})")
+}
+
+/// The ` by (...)`/` without (...)` clause, or `None` when a label needs
+/// quoting, which the combine text would not survive.
+fn grouping(modifier: Option<&LabelModifier>) -> Option<String> {
+    let list = |labels: &promql_parser::label::Labels| {
+        labels
+            .labels
+            .iter()
+            .all(|label| is_identifier(label))
+            .then(|| labels.labels.join(", "))
+    };
+    Some(match modifier {
         None => String::new(),
-        Some(LabelModifier::Include(labels)) => format!(" by ({})", list(labels)),
-        Some(LabelModifier::Exclude(labels)) => format!(" without ({})", list(labels)),
-    }
+        Some(LabelModifier::Include(labels)) => format!(" by ({})", list(labels)?),
+        Some(LabelModifier::Exclude(labels)) => format!(" without ({})", list(labels)?),
+    })
+}
+
+fn is_identifier(label: &str) -> bool {
+    let mut chars = label.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn keeps_name(modifier: Option<&LabelModifier>) -> bool {
+    matches!(modifier, Some(LabelModifier::Include(labels)) if labels.labels.iter().any(|label| label == "__name__"))
 }
 
 fn unparen(expr: &Expr) -> &Expr {
@@ -354,8 +388,8 @@ mod tests {
     fn sum_of_rates_is_pushed_and_reapplied() {
         let plan = pushed("sum by (job) (rate(http_requests_total[5m]))");
         assert_eq!(
-            plan.queries(),
-            vec!["sum by (job)(rate(http_requests_total[5m]))"]
+            plan.queries()[0],
+            "sum by (job)(rate(http_requests_total[5m]))"
         );
         assert!(plan.query.contains("__pushdown_0"), "{}", plan.query);
         assert!(plan.query.contains("sum by (job)"), "{}", plan.query);
@@ -365,16 +399,36 @@ mod tests {
     fn binary_operands_are_pushed_separately() {
         let plan = pushed("sum(rate(a[1m])) / sum(rate(b[1m]))");
         assert_eq!(plan.fragments.len(), 2);
-        assert_eq!(plan.queries(), vec!["sum(rate(a[1m]))", "sum(rate(b[1m]))"]);
+        let queries = plan.queries();
+        assert_eq!(
+            (queries[0], queries[2]),
+            ("sum(rate(a[1m]))", "sum(rate(b[1m]))")
+        );
         assert!(plan.query.contains("__pushdown_0"));
-        assert!(plan.query.contains("__pushdown_1"));
+        assert!(plan.query.contains("__pushdown_2"));
     }
 
     #[test]
-    fn avg_and_variance_split_into_parts() {
-        assert_eq!(pushed("avg(x)").queries().len(), 2);
-        assert_eq!(pushed("stddev by (a) (x)").queries().len(), 3);
+    fn sum_and_avg_report_mixed_groups() {
+        assert_eq!(
+            pushed("sum by (a) (x)").queries(),
+            vec!["sum by (a)(x)", "count by (a)(x) unless sum by (a)(x)"]
+        );
+        assert_eq!(pushed("avg(x)").queries().len(), 3);
         assert_eq!(pushed("count without (a) (x)").queries().len(), 1);
+    }
+
+    #[test]
+    fn unfaithfully_printed_queries_are_left_alone() {
+        // The parser prints string values without re-escaping them.
+        for query in [
+            r#"sum(rate(x{path=~"\\d+"}[5m]))"#,
+            r#"sum(x{a="\\n"})"#,
+            r#"sum by ("service.name") (x)"#,
+        ] {
+            assert!(plan(query).is_none(), "{query}");
+        }
+        assert!(plan(r#"sum(x{a="plain"})"#).is_some());
     }
 
     #[test]
@@ -398,6 +452,9 @@ mod tests {
             "sum(absent(x))",
             "sum(max_over_time(rate(x[1m])[10m:1m]))",
             "sum(histogram_quantile(0.9, x))",
+            "stddev(x)",
+            "stdvar by (a) (x)",
+            "avg by (__name__) (x)",
         ] {
             assert!(plan(query).is_none(), "{query}");
         }
