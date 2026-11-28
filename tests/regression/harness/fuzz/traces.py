@@ -40,6 +40,7 @@ from ..traces.normalize import (
     normalize_trace,
 )
 from ..traces.wire import protobuf_body
+from . import split
 from .cold import ColdProduct, ColdService, ColdStack
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
@@ -71,12 +72,18 @@ ORACLE_CONFIGS = {"tempo": "tempo.yaml", "tempo-s3": "tempo-s3.yaml"}
 # (1h segments, 1 MiB pages of up to 1024 traces, its cache sizes, buffered
 # writes), the shape of the single-binary oracle, for benchmarks.
 # `production-sharded` runs the operator's settings as two writers and a
-# reader, to measure what sharding costs against `production`.
-IMPL_CONFIGS = ("regression", "production", "production-sharded")
+# reader, to measure what sharding costs against `production`. `split` runs
+# the regression writers and reads through two reader groups of two replicas
+# each, splitting every shard read across a group (`reader-group-split.yaml`).
+IMPL_CONFIGS = ("regression", "production", "production-sharded", split.SPLIT)
 WRITER_URL = service_url("traces-writer-0", 3200, 13201)
 WRITER_1_URL = service_url("traces-writer-1", 3200, 13202)
 READER_URL = service_url("traces-reader", 3200, 13203)
 STANDALONE_S3_URL = service_url("traces-s3", 3200, 13205)
+SPLIT_URLS = {
+    name: service_url(name, 3200, port)
+    for name, port in zip(split.replicas("traces"), range(13207, 13211), strict=True)
+}
 RESERVOIR = 5000
 TEMPO_URL = service_url("tempo", 3200, 13200)
 HOUR = 3600 * SECOND
@@ -341,6 +348,7 @@ class TracesFuzz(FuzzProduct, ColdProduct):
         "traces-writer-1": "impl",
         "traces-reader": "impl",
         "traces-s3": "impl",
+        **dict.fromkeys(SPLIT_URLS, "impl"),
     }
 
     def __init__(self, config: FuzzConfig) -> None:
@@ -351,11 +359,16 @@ class TracesFuzz(FuzzProduct, ColdProduct):
         self.impl_config = os.environ.get("FUZZ_TRACES_CONFIG") or "regression"
         if self.impl_config not in IMPL_CONFIGS:
             raise ValueError(f"FUZZ_TRACES_CONFIG must be one of {IMPL_CONFIGS}")
+        if self.impl_config == split.SPLIT:
+            split.validate(self.name, config)
+            self.readers = SPLIT_URLS
+        else:
+            self.readers = {"traces-reader": READER_URL}
         self.standalone = self.impl_config == "production"
         write_url, read_url = (
             (STANDALONE_S3_URL, STANDALONE_S3_URL)
             if self.standalone
-            else (WRITER_URL, READER_URL)
+            else (WRITER_URL, next(iter(self.readers.values())))
         )
         self.oracle_read = endpoint_from_env(
             "traces",
@@ -422,9 +435,11 @@ class TracesFuzz(FuzzProduct, ColdProduct):
         os.environ.setdefault("TEMPO_IMAGE", "grafana/tempo:2.10.8")
         os.environ["TEMPO_CONFIG"] = ORACLE_CONFIGS[self.oracle]
 
+        profiles: tuple[str, ...] = ()
         if self.standalone:
             impl_services: tuple[str, ...] = ("traces-s3",)
             impl_ready = (f"{STANDALONE_S3_URL}/-/ready",)
+            profiles = ("standalone-s3",)
         else:
             # Read by compose when interpolating the writer and reader mounts.
             os.environ["TRACES_CONFIG_DIR"] = (
@@ -432,6 +447,8 @@ class TracesFuzz(FuzzProduct, ColdProduct):
             )
             impl_services = ("traces-writer-0", "traces-writer-1")
             impl_ready = (f"{WRITER_URL}/-/ready", f"{WRITER_1_URL}/-/ready")
+            if self.impl_config == split.SPLIT:
+                profiles = (split.SPLIT,)
 
         @contextmanager
         def managed() -> Iterator[object]:
@@ -441,7 +458,7 @@ class TracesFuzz(FuzzProduct, ColdProduct):
                     file=PRODUCT_DIR / "docker-compose.yml",
                     name="traces-fuzz",
                     services=("tempo", "minio", "minio-init", *impl_services),
-                    profiles=("standalone-s3",) if self.standalone else (),
+                    profiles=profiles,
                     readiness_urls=(
                         f"{service_url('tempo', 3200, 13200)}/ready",
                         *impl_ready,
@@ -462,7 +479,7 @@ class TracesFuzz(FuzzProduct, ColdProduct):
         urls["traces-writer-0"] = f"{WRITER_URL}/-/ready"
         urls["traces-writer-1"] = f"{WRITER_1_URL}/-/ready"
         if self._reader_started:
-            urls["traces-reader"] = f"{READER_URL}/-/ready"
+            urls.update({name: f"{url}/-/ready" for name, url in self.readers.items()})
         return {**urls, **minio_floor_url()}
 
     def after_ingest(self, index: int) -> None:
@@ -471,9 +488,17 @@ class TracesFuzz(FuzzProduct, ColdProduct):
         if self.standalone:
             return
         if self._project is not None and not self._reader_started:
-            self._project.up("traces-reader")
-            wait_http(f"{READER_URL}/-/ready")
+            self._project.up(*self.readers)
+            for url in self.readers.values():
+                wait_http(f"{url}/-/ready")
             self._reader_started = True
+
+    def report(self) -> tuple[dict[str, Any], list[str]]:
+        if self.impl_config != split.SPLIT:
+            return {}, []
+        return split.report(
+            {name: f"{url}/metrics" for name, url in SPLIT_URLS.items()}
+        )
 
     # Cold reads --------------------------------------------------------------
 

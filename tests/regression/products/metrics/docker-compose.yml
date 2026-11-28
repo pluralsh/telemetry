@@ -19,6 +19,18 @@ x-metrics: &metrics
     minio-init:
       condition: service_completed_successfully
 
+# `split` profile: a reader group replica with splitting forced on and PromQL
+# pushdown. Each group's replicas share a network alias, the group endpoint in
+# reader-group-split.yaml, which resolves to both; a replica leaves itself out
+# of its peers by its own address ($HOSTNAME with the endpoint's port).
+x-metrics-split: &metrics-split
+  <<: *metrics
+  profiles: ["split"]
+  command: ["--config", "/app/regression/reader-group-split.yaml"]
+  volumes:
+    - ./reader-group-split.yaml:/app/regression/reader-group-split.yaml:ro
+    - ./jwks.json:/app/regression/jwks.json:ro
+
 services:
   prometheus:
     # Native histogram rate extrapolation clips at the zero point from v3.6.
@@ -188,6 +200,47 @@ services:
       - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["18086:8080"]
+
+  # Reader groups of two replicas per shard; the fuzzer reads through 0a.
+  metrics-split-0a:
+    <<: *metrics-split
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [metrics-split-0]
+    ports: ["18087:8080"]
+
+  metrics-split-0b:
+    <<: *metrics-split
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [metrics-split-0]
+    ports: ["18088:8080"]
+
+  metrics-split-1a:
+    <<: *metrics-split
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [metrics-split-1]
+    ports: ["18089:8080"]
+
+  metrics-split-1b:
+    <<: *metrics-split
+    environment:
+      <<: *metrics-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [metrics-split-1]
+    ports: ["18090:8080"]
 
   # One process and shard over MinIO, the shape of the single-binary oracles;
   # benchmarks use it so reads skip the split topology's per-shard fan-out.

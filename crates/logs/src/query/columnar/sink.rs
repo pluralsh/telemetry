@@ -873,6 +873,7 @@ pub(super) mod wire {
         rows: pb::shard_output::Rows,
     ) -> pb::ShardOutput {
         pb::ShardOutput {
+            row_time_applied: false,
             expr: expr as u32,
             series,
             rows: Some(rows),

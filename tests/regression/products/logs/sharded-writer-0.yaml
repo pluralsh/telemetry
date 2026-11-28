@@ -12,7 +12,9 @@ storage:
   block_cache: { type: FoyerMemory, capacity: 67108864 }
   meta_cache: { type: FoyerMemory, capacity: 16777216 }
 segment_duration_seconds: 60
-retention_seconds: 3600
+# As logs-s3.yaml: multi-hour fuzz runs (FUZZ_LOGS_CONFIG=split) never
+# compare against expired pages.
+retention_seconds: 86400
 page:
   target_size_bytes: 16384
   max_rows: 128

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use proto::logs::internal::v1 as pb;
 use sharding::ShardId;
 
@@ -16,11 +17,48 @@ use crate::{
     Error, Label, Labels, Namespace, QueryOptions, QueryRequest, Result, query::Direction,
 };
 
+/// Runs one fragment of a split read of the shard this reader serves, in
+/// process.
+pub type LocalFragment<'a> = &'a (
+        dyn Fn(pb::QueryShardRequest) -> BoxFuture<'a, Result<Vec<pb::ShardOutput>>> + Send + Sync
+    );
+
 /// Transport to the reader groups serving other shards.
 #[async_trait]
 pub trait LogsShardClient: Send + Sync + 'static {
     /// Every message of the shard's streamed query response.
     async fn query(&self, request: pb::QueryShardRequest) -> Result<Vec<pb::ShardOutput>>;
+
+    /// How many fragments a read of `shard` that the coordinator estimates
+    /// at `estimated_pages` should be split into across the replicas of its
+    /// group, or `None` to read it whole. `local_inflight` counts the
+    /// queries this pod is coordinating.
+    async fn split_ways(
+        &self,
+        _shard: ShardId,
+        _estimated_pages: u64,
+        _local_inflight: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Runs each of `requests`, fragments of one shard read, and returns
+    /// their outputs in request order. `local` runs a fragment in process
+    /// where the shard is the one this reader serves; the transport decides
+    /// which fragments run there.
+    async fn query_fragments(
+        &self,
+        requests: Vec<pb::QueryShardRequest>,
+        local: Option<LocalFragment<'_>>,
+    ) -> Result<Vec<Vec<pb::ShardOutput>>> {
+        futures::future::try_join_all(requests.into_iter().map(|request| async move {
+            match local {
+                Some(local) => local(request).await,
+                None => self.query(request).await,
+            }
+        }))
+        .await
+    }
     async fn label_names(&self, request: pb::LabelNamesRequest) -> Result<pb::StringsResponse>;
     async fn label_values(&self, request: pb::LabelValuesRequest) -> Result<pb::StringsResponse>;
     async fn series(&self, request: pb::SeriesRequest) -> Result<pb::SeriesResponse>;
@@ -56,6 +94,8 @@ pub(crate) fn query_request(
         max_pages: options.max_pages as u64,
         max_concurrency: options.max_concurrency as u64,
         max_in_flight_bytes: options.max_in_flight_bytes as u64,
+        row_time_start_ns: options.row_time.map(|(start, _)| start),
+        row_time_end_ns: options.row_time.map(|(_, end)| end),
     }
 }
 
@@ -78,6 +118,7 @@ pub(crate) fn query_from_wire(request: &pb::QueryShardRequest) -> (QueryRequest,
             max_pages: size(request.max_pages),
             max_concurrency: size(request.max_concurrency).max(1),
             max_in_flight_bytes: size(request.max_in_flight_bytes).max(1),
+            row_time: request.row_time_start_ns.zip(request.row_time_end_ns),
         },
     )
 }

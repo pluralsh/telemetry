@@ -110,6 +110,7 @@ impl AppState {
         {
             readers.shards().scope_readers_to(groups.local_shard());
             readers.connect_remote_shards(Arc::new(GrpcMetricsShards::new(Arc::new(groups))));
+            readers.set_pushdown(config.pushdown.enabled);
         }
         let cache_warmed =
             !readiness_waits(&config.cache_warmer, config.mode != ServerMode::Writer);
@@ -121,6 +122,9 @@ impl AppState {
                 remote_retries: config.write.remote_retries,
             },
         );
+        if let Some(readers) = &readers {
+            readers.set_routing(Arc::clone(router.assignment()));
+        }
         let (ingest, ingest_tasks) = IngestPipeline::standard(
             Signal::Metrics,
             config.namespaces.iter().map(|namespace| {

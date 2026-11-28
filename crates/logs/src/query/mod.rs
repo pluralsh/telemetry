@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -139,6 +139,10 @@ pub struct QueryOptions {
     pub max_pages: usize,
     pub max_concurrency: usize,
     pub max_in_flight_bytes: usize,
+    /// Reads only rows with `start <= timestamp < end`, as one fragment of
+    /// a shard read split by row time. Bucketing, lookback and the query's
+    /// own range are unchanged.
+    pub row_time: Option<(i64, i64)>,
 }
 
 impl Default for QueryOptions {
@@ -149,6 +153,7 @@ impl Default for QueryOptions {
             max_pages: 10_000,
             max_concurrency: 16,
             max_in_flight_bytes: 128 * 1024 * 1024,
+            row_time: None,
         }
     }
 }
@@ -234,6 +239,11 @@ pub(crate) struct ScanPlan<'a> {
     request: &'a QueryRequest,
     query: &'a Query,
     pub(crate) scan_start: i64,
+    /// The end of the range to read; the query's end, or an earlier one
+    /// when reading only a fragment's row time.
+    pub(crate) scan_end: i64,
+    /// Rows outside `start <= timestamp < end` belong to another fragment.
+    pub(crate) row_time: Option<(i64, i64)>,
     pub(crate) streams: StreamFilter,
     indexed_terms: Option<Vec<String>>,
     /// Set for metric queries that read no lines.
@@ -252,11 +262,18 @@ impl<'a> ScanPlan<'a> {
     ) -> Result<Self> {
         let lineless = lineless_read(query, request)?;
         let labels = lineless.as_ref().and_then(|_| lineless_labels(query));
+        let scan_start = request.start_ns.saturating_sub(max_lookback(query)?);
+        let (scan_start, scan_end) = match options.row_time {
+            Some((start, end)) => (scan_start.max(start), request.end_ns.min(end)),
+            None => (scan_start, request.end_ns),
+        };
         Ok(Self {
+            scan_start,
+            scan_end,
+            row_time: options.row_time,
             shared: parallel::enabled().then(|| Arc::new((query.clone(), request.clone()))),
             request,
             query,
-            scan_start: request.start_ns.saturating_sub(max_lookback(query)?),
             streams: stream_filter(query)?
                 .with_line_keep(Pipelines::new(query, request)?.line_keep().map(Arc::new))
                 .with_labels(labels)
@@ -310,6 +327,15 @@ impl<'a> ScanPlan<'a> {
         }
     }
 
+    /// Whether a shard read of this query can be split by row time, with
+    /// each fragment reading rows from storage and keeping those in its
+    /// range: not a limited log query, which stops early; not an indexed
+    /// search, which ranks across rows; and not a lineless metric read,
+    /// whose page summaries cannot be cut at a row.
+    pub(crate) fn splittable(&self) -> bool {
+        self.early_stop_log().is_none() && self.indexed_terms.is_none() && self.lineless.is_none()
+    }
+
     pub(crate) fn is_lineless(&self) -> bool {
         self.lineless.is_some()
     }
@@ -356,6 +382,88 @@ fn exceeds_max_pages(pages: usize, read_units: usize, max_pages: usize) -> Error
 
 const DECODED_PER_STORED_BYTE: u64 = 3;
 
+/// What splitting a shard's read across its group's replicas needs.
+pub(crate) struct SplitContext {
+    pub(crate) client: Arc<dyn crate::remote::LogsShardClient>,
+    /// The shard of each source, in source order.
+    pub(crate) shards: Vec<sharding::ShardId>,
+    /// Queries this pod is coordinating.
+    pub(crate) inflight: usize,
+}
+
+fn is_max_pages_error(error: &Error) -> bool {
+    matches!(error, Error::Query(message) if message.contains("exceeding max_pages"))
+}
+
+/// Cuts `[start, end]` into `ways` consecutive row-time ranges `[a, b)`
+/// that together cover it.
+fn row_time_ranges(start: i64, end: i64, ways: usize) -> Vec<(i64, i64)> {
+    let last = end.saturating_add(1);
+    let span = i128::from(last) - i128::from(start);
+    let ways = i128::try_from(ways).unwrap_or(1).min(span.max(1));
+    let bound =
+        |index: i128| i64::try_from(i128::from(start) + span * index / ways).unwrap_or(last);
+    (0..ways)
+        .map(|index| {
+            (
+                bound(index),
+                if index + 1 == ways {
+                    last
+                } else {
+                    bound(index + 1)
+                },
+            )
+        })
+        .collect()
+}
+
+/// Reads one shard as `ways` row-time fragments, each on one replica of the
+/// shard's group, and merges them as one shard's output. A remote shard's
+/// `max_pages` is divided among its fragments, so a read passes only if the
+/// whole would; a local shard's pages were already checked whole.
+#[allow(clippy::too_many_arguments)]
+async fn load_split<'a>(
+    context: &SplitContext,
+    shard: sharding::ShardId,
+    database: Option<&Arc<LogDb>>,
+    ways: usize,
+    plan: &ScanPlan<'a>,
+    namespace: &Namespace,
+    request: &QueryRequest,
+    options: &QueryOptions,
+    global_permits: &Semaphore,
+) -> Result<columnar::ColumnarSink<'a>> {
+    let ranges = row_time_ranges(plan.scan_start, plan.scan_end, ways);
+    let max_pages = if database.is_some() {
+        options.max_pages
+    } else {
+        options.max_pages / ranges.len()
+    };
+    let requests = ranges
+        .iter()
+        .map(|&range| {
+            let options = QueryOptions {
+                max_pages,
+                row_time: Some(range),
+                ..options.clone()
+            };
+            crate::remote::query_request(shard, namespace, request, &options)
+        })
+        .collect::<Vec<_>>();
+    ::metrics::counter!("logs_split_queries_total").increment(1);
+    let run_local = |fragment: proto::logs::internal::v1::QueryShardRequest| {
+        async move {
+            let database = database.ok_or_else(|| Error::Query("no local shard".into()))?;
+            let (query, options) = crate::remote::query_from_wire(&fragment);
+            serve_shard_query(database, namespace, &query, options, global_permits).await
+        }
+        .boxed()
+    };
+    let local: Option<crate::remote::LocalFragment<'_>> = database.map(|_| &run_local as _);
+    let outputs = context.client.query_fragments(requests, local).await?;
+    columnar::ColumnarSink::from_wire(plan, outputs.into_iter().flatten().collect())
+}
+
 /// Queries `sources`, in shard order. A remote shard checks `max_pages`
 /// against its own pages alone.
 pub(crate) async fn query_databases(
@@ -364,6 +472,7 @@ pub(crate) async fn query_databases(
     request: &QueryRequest,
     options: QueryOptions,
     global_permits: Arc<Semaphore>,
+    split: Option<SplitContext>,
 ) -> Result<QueryResult> {
     validate_request(request, &options)?;
     let query = logql::parse(&request.query).map_err(|error| Error::Query(error.to_string()))?;
@@ -418,7 +527,7 @@ pub(crate) async fn query_databases(
                     .await
                     .map_err(|_| scheduler_closed())?;
                 database
-                    .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
+                    .scan_targets(namespace, plan.scan_start, plan.scan_end, &plan.streams)
                     .await
                     .map(Some)
             }
@@ -454,45 +563,104 @@ pub(crate) async fn query_databases(
             options.max_pages,
         ));
     }
-    let stored = stream::iter(sources.into_iter().zip(targets).zip(estimates).map(
-        |((source, targets), estimate)| {
-            let permits = Arc::clone(&permits);
-            let global_permits = Arc::clone(&global_permits);
-            let (plan, options) = (&plan, &options);
-            async move {
-                let (ShardSource::Local(database), Some(targets), Some(estimate)) =
-                    (&source, targets, estimate)
-                else {
-                    let ShardSource::Remote(remote) = &source else {
-                        unreachable!("local shards have scan targets");
+    // Shards are balanced by hash, so the pages the local shards would read
+    // stand in for what each remote shard will.
+    let local_estimates = estimates.iter().flatten().count();
+    let typical_pages = total_pages
+        .checked_div(local_estimates)
+        .map_or(0, |pages| pages as u64);
+    let split = split.filter(|_| plan.splittable());
+    let split = split.as_ref();
+    let stored = stream::iter(
+        sources
+            .into_iter()
+            .zip(targets)
+            .zip(estimates)
+            .enumerate()
+            .map(|(index, ((source, targets), estimate))| {
+                let permits = Arc::clone(&permits);
+                let global_permits = Arc::clone(&global_permits);
+                let (plan, options) = (&plan, &options);
+                async move {
+                    if let Some(context) = split {
+                        let shard = context.shards[index];
+                        let pages = estimate.as_ref().map_or(typical_pages, |e| e.pages as u64);
+                        let database = match &source {
+                            ShardSource::Local(database) => Some(database),
+                            ShardSource::Remote(_) => None,
+                        };
+                        // A remote fragment's share of `max_pages` must be at
+                        // least one page.
+                        if pages > 0
+                            && let Some(ways) = context
+                                .client
+                                .split_ways(shard, pages, context.inflight)
+                                .await
+                            && (database.is_some() || ways <= options.max_pages)
+                        {
+                            match load_split(
+                                context,
+                                shard,
+                                database,
+                                ways,
+                                plan,
+                                namespace,
+                                request,
+                                options,
+                                &global_permits,
+                            )
+                            .await
+                            {
+                                Ok(sink) => return Ok(sink),
+                                // A fragment over its share of `max_pages`
+                                // (pages straddling fragment bounds count in
+                                // both, and rows may be skewed), or one that
+                                // found no replica able to run it: read the
+                                // shard whole, which gives exactly the
+                                // unsplit answer or error.
+                                Err(error)
+                                    if is_max_pages_error(&error)
+                                        || matches!(error, Error::Unavailable(_)) =>
+                                {
+                                    ::metrics::counter!("logs_split_fallbacks_total").increment(1);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                    let (ShardSource::Local(database), Some(targets), Some(estimate)) =
+                        (&source, targets, estimate)
+                    else {
+                        let ShardSource::Remote(remote) = &source else {
+                            unreachable!("local shards have scan targets");
+                        };
+                        return ShardSource::load_remote(remote, plan, namespace, request, options)
+                            .await;
                     };
-                    return ShardSource::load_remote(remote, plan, namespace, request, options)
-                        .await;
-                };
-                // Decoded rows take several times their stored size.
-                let decoded = estimate
-                    .compressed_bytes
-                    .saturating_mul(DECODED_PER_STORED_BYTE);
-                let weight =
-                    u32::try_from(decoded.max(1).min(byte_budget as u64)).unwrap_or(u32::MAX);
-                let _permit = permits
-                    .acquire_many_owned(weight)
+                    // Decoded rows take several times their stored size.
+                    let decoded = estimate
+                        .compressed_bytes
+                        .saturating_mul(DECODED_PER_STORED_BYTE);
+                    let weight =
+                        u32::try_from(decoded.max(1).min(byte_budget as u64)).unwrap_or(u32::MAX);
+                    let _permit = permits
+                        .acquire_many_owned(weight)
+                        .await
+                        .map_err(|_| Error::Query("query scheduler closed".into()))?;
+                    let _global_permit = global_permits
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| scheduler_closed())?;
+                    plan.load(
+                        database,
+                        namespace,
+                        &PageBudget::new(estimate.read_units),
+                        Some(targets),
+                    )
                     .await
-                    .map_err(|_| Error::Query("query scheduler closed".into()))?;
-                let _global_permit = global_permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| scheduler_closed())?;
-                plan.load(
-                    database,
-                    namespace,
-                    &PageBudget::new(estimate.read_units),
-                    Some(targets),
-                )
-                .await
-            }
-        },
-    ))
+                }
+            }),
+    )
     .buffered(options.max_concurrency)
     .collect::<Vec<_>>()
     .await
@@ -527,7 +695,7 @@ pub(crate) async fn serve_shard_query(
         .await?
     } else {
         let targets = database
-            .scan_targets(namespace, plan.scan_start, request.end_ns, &plan.streams)
+            .scan_targets(namespace, plan.scan_start, plan.scan_end, &plan.streams)
             .await?;
         let estimate = targets.estimate(plan.is_lineless());
         if estimate.pages > options.max_pages {

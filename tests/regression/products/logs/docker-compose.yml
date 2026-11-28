@@ -8,6 +8,24 @@ x-logs-sharded-environment: &logs-sharded-environment
   AWS_ALLOW_HTTP: "true"
   LOGS_INTERNAL_TOKEN: internal-regression-token
 
+# `split` profile: a reader group replica over the sharded writers with
+# splitting forced on. Each group's replicas share a network alias, the group
+# endpoint in sharded-reader-group-split.yaml, which resolves to both; a
+# replica leaves itself out of its peers by its own address ($HOSTNAME with
+# the endpoint's port).
+x-logs-split: &logs-split
+  profiles: ["split"]
+  image: telemetry-regression/plural-logs-server:local
+  build:
+    context: ../../../..
+    dockerfile: crates/logs-server/Dockerfile
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+  command: ["--config", "/app/regression/sharded-reader-group-split.yaml"]
+  volumes:
+    - ./sharded-reader-group-split.yaml:/app/regression/sharded-reader-group-split.yaml:ro
+
 services:
   loki:
     # Pin the multi-architecture image index so local and CI oracles are identical.
@@ -59,7 +77,7 @@ services:
     ports: ["13110:3100"]
 
   minio:
-    profiles: ["fuzz", "sharded"]
+    profiles: ["fuzz", "sharded", "split"]
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     command: server /data --address ${MINIO_ADDRESS:-:9000} --console-address :9001
     environment:
@@ -89,7 +107,7 @@ services:
     depends_on: [minio]
 
   minio-init:
-    profiles: ["fuzz", "sharded"]
+    profiles: ["fuzz", "sharded", "split"]
     image: cgr.dev/chainguard/minio-client@sha256:b8b144ab34694ecea25aa352c4be9de4c26ee2a02701521dce02ee5593c57338
     environment:
       MC_HOST_local: http://logs:logs-fuzz-secret@minio:9000
@@ -124,7 +142,7 @@ services:
 
   # Two static-shard writers and one reader group per shard over MinIO.
   logs-writer-0:
-    profiles: ["sharded"]
+    profiles: ["sharded", "split"]
     image: telemetry-regression/plural-logs-server:local
     build:
       context: ../../../..
@@ -140,7 +158,7 @@ services:
     ports: ["13103:3100"]
 
   logs-writer-1:
-    profiles: ["sharded"]
+    profiles: ["sharded", "split"]
     image: telemetry-regression/plural-logs-server:local
     build:
       context: ../../../..
@@ -188,6 +206,47 @@ services:
     volumes:
       - ./sharded-reader-group.yaml:/app/regression/sharded-reader-group.yaml:ro
     ports: ["13106:3100"]
+
+  # Reader groups of two replicas per shard; the fuzzer reads through 0a.
+  logs-split-0a:
+    <<: *logs-split
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [logs-split-0]
+    ports: ["13112:3100"]
+
+  logs-split-0b:
+    <<: *logs-split
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [logs-split-0]
+    ports: ["13113:3100"]
+
+  logs-split-1a:
+    <<: *logs-split
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [logs-split-1]
+    ports: ["13114:3100"]
+
+  logs-split-1b:
+    <<: *logs-split
+    environment:
+      <<: *logs-sharded-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [logs-split-1]
+    ports: ["13115:3100"]
 
 volumes:
   loki-data:

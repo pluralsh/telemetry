@@ -109,6 +109,13 @@ message TraceQlRequest {
   uint64 max_concurrency = 8;
   // Hits without their matched spans, as a search response lists them.
   bool summaries = 9;
+  // Phase A of a split read: answer with `candidate_ids`, the ids of the
+  // traces the query may match in (start, trace ID) order, and no hits.
+  bool candidates_only = 10;
+  // Phase B of a split read: evaluate exactly these traces whole, in order,
+  // and return up to `limit` hits. Their pages are found through the
+  // trace-head records, never through storage ids from another replica.
+  repeated bytes candidate_ids = 11;
 }
 
 enum SpanStatus {
@@ -166,4 +173,8 @@ message TraceQlHit {
 
 message TraceQlResponse {
   repeated TraceQlHit hits = 1;
+  repeated bytes candidate_ids = 2;
+  // Set by readers that understand `candidates_only` and `candidate_ids`;
+  // an older reader ignores both and answers the whole query.
+  bool split_reader = 3;
 }

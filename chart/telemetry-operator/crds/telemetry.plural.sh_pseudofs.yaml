@@ -9553,6 +9553,40 @@ spec:
                         format: int64
                         minimum: 1
                         type: integer
+                      split:
+                        description: |-
+                          Split divides one shard's read across every replica of its group
+                          instead of reading it on a single replica.
+                        properties:
+                          enabled:
+                            default: false
+                            description: Enabled turns splitting on.
+                            type: boolean
+                          maxFragments:
+                            default: 4
+                            description: MaxFragments bounds the fragments of one
+                              shard read.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          maxLocalInflight:
+                            default: 32
+                            description: |-
+                              MaxLocalInflight stops splitting while this reader coordinates this
+                              many queries.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          minFragmentCost:
+                            description: |-
+                              MinFragmentCost is the estimated cost a fragment must carry to be worth
+                              its own request: output steps for Metrics, pages for Logs, candidate
+                              traces for Traces. Zero always splits, for tests. When omitted the
+                              server's per-product default applies.
+                            format: int64
+                            minimum: 0
+                            type: integer
+                        type: object
                     type: object
                   replicas:
                     description: |-

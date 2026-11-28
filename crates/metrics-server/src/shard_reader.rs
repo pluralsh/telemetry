@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::{StreamExt, TryStreamExt, stream};
 use plural_metrics::{
-    MetricsShardClient, MetricsShardQuery, QueryError, ShardedMetrics, WireStream,
+    LocalEvaluation, MetricsShardClient, MetricsShardQuery, QueryError, ShardedMetrics, WireStream,
 };
 use proto::metrics::internal::v1::{
     self as pb,
@@ -90,6 +90,18 @@ impl ShardReader for ShardReaderService {
             .await
             .map_err(query_status)?;
         Ok(Response::new(stream.map_err(query_status).boxed()))
+    }
+
+    async fn evaluate(
+        &self,
+        request: Request<pb::EvaluateRequest>,
+    ) -> Result<Response<pb::EvaluateResponse>, Status> {
+        self.authorize(&request)?;
+        self.readers
+            .serve_evaluate(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(query_status)
     }
 
     async fn series(
@@ -195,6 +207,16 @@ impl MetricsShardClient for GrpcMetricsShards {
         Arc::new(GrpcShardQuery {
             groups: Arc::clone(&self.groups),
             shard,
+            key: None,
+            pinned: Arc::default(),
+        })
+    }
+
+    fn query_keyed(&self, shard: ShardId, key: u64) -> Arc<dyn MetricsShardQuery> {
+        Arc::new(GrpcShardQuery {
+            groups: Arc::clone(&self.groups),
+            shard,
+            key: Some(key),
             pinned: Arc::default(),
         })
     }
@@ -230,6 +252,52 @@ impl MetricsShardClient for GrpcMetricsShards {
     ) -> Result<pb::BucketGenerationsResponse, QueryError> {
         unary!(self, request, bucket_generations)
     }
+
+    fn pushdown(&self) -> bool {
+        true
+    }
+
+    async fn split_ways(&self, shard: ShardId, steps: u64, local_inflight: usize) -> Option<usize> {
+        let min_cost = self.groups.split_config().min_fragment_cost.metrics;
+        self.groups
+            .split_ways(shard, steps, min_cost, local_inflight)
+            .await
+    }
+
+    async fn evaluate(
+        &self,
+        requests: Vec<pb::EvaluateRequest>,
+        local: Option<LocalEvaluation<'_>>,
+    ) -> Result<Vec<pb::EvaluateResponse>, QueryError> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let shard = shard_of(first.read.as_ref());
+        // Fragments are addressed by their start time, so a replica keeps
+        // serving the same slice of a dashboard's time range and its caches
+        // stay warm.
+        let keys = requests
+            .iter()
+            .map(|request| request.start_ms as u64)
+            .collect::<Vec<_>>();
+        let groups = &self.groups;
+        let requests = &requests;
+        groups
+            .fan_out(shard, &keys, |index, replica| async move {
+                let request = requests[index].clone();
+                if replica.is_self {
+                    let local = local.ok_or_else(|| Status::internal("no local evaluation"))?;
+                    return local(request).await.map_err(query_status);
+                }
+                let request = groups.request(request)?;
+                client(&replica)
+                    .evaluate(request)
+                    .await
+                    .map(Response::into_inner)
+            })
+            .await
+            .map_err(status_query)
+    }
 }
 
 /// One query's reads of one shard, kept on the replica that answered the
@@ -237,6 +305,8 @@ impl MetricsShardClient for GrpcMetricsShards {
 struct GrpcShardQuery {
     groups: Arc<ReadGroups>,
     shard: ShardId,
+    /// Addresses a fragment of a split read, for choosing its replica.
+    key: Option<u64>,
     pinned: Arc<Mutex<Option<Replica>>>,
 }
 
@@ -245,13 +315,14 @@ macro_rules! streaming {
         let groups = Arc::clone(&$self.groups);
         let shard = $self.shard;
         let pinned = Arc::clone(&$self.pinned);
+        let key = $self.key;
         stream::once(async move {
             let current = pinned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let (replica, stream) = groups
-                .open_stream(shard, current.as_ref(), |replica| {
+                .open_stream_keyed(shard, current.as_ref(), key, |replica| {
                     let request = groups.request($request.clone());
                     async move { client(&replica).$method(request?).await }
                 })

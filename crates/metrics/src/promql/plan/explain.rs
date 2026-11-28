@@ -102,6 +102,9 @@ pub fn describe_logical(plan: &LogicalPlan) -> PlanNode {
             n
         }
         LogicalPlan::Scalar(v) => PlanNode::new("Scalar").with_arg("value", *v),
+        LogicalPlan::Precomputed(data) => {
+            PlanNode::new("Precomputed").with_arg("series", data.0.series.len())
+        }
         LogicalPlan::Time => PlanNode::new("Time"),
         LogicalPlan::Scalarize { child } => {
             PlanNode::new("Scalarize").with_children(vec![describe_logical(child)])
@@ -218,6 +221,9 @@ fn describe_physical_inner(
 ) -> PlanNode {
     match plan {
         LogicalPlan::Scalar(v) => PlanNode::new("ConstScalarOp").with_arg("value", *v),
+        LogicalPlan::Precomputed(data) => {
+            PlanNode::new("PrecomputedOp").with_arg("series", data.0.series.len())
+        }
         LogicalPlan::Time => PlanNode::new("TimeScalarOp"),
         LogicalPlan::Scalarize { child } => PlanNode::new("ScalarizeOp")
             .with_children(vec![describe_physical_inner(child, ctx, false)]),

@@ -19,6 +19,18 @@ x-traces: &traces
     minio-init:
       condition: service_completed_successfully
 
+# `split` profile: a reader group replica with splitting forced on. Each
+# group's replicas share a network alias, the group endpoint in
+# reader-group-split.yaml, which resolves to both; a replica leaves itself out
+# of its peers by its own address ($HOSTNAME with the endpoint's port).
+x-traces-split: &traces-split
+  <<: *traces
+  profiles: ["split"]
+  command: ["--config", "/app/regression/reader-group-split.yaml"]
+  volumes:
+    - ./reader-group-split.yaml:/app/regression/reader-group-split.yaml:ro
+    - ./jwks.json:/app/regression/jwks.json:ro
+
 services:
   tempo:
     # The fuzzer overrides this with a release that has Tempo's empty-LHS
@@ -134,6 +146,47 @@ services:
       - ./reader-group.yaml:/app/regression/reader-group.yaml:ro
       - ./jwks.json:/app/regression/jwks.json:ro
     ports: ["13206:3200"]
+
+  # Reader groups of two replicas per shard; the fuzzer reads through 0a.
+  traces-split-0a:
+    <<: *traces-split
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [traces-split-0]
+    ports: ["13207:3200"]
+
+  traces-split-0b:
+    <<: *traces-split
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "0"
+    networks:
+      default:
+        aliases: [traces-split-0]
+    ports: ["13208:3200"]
+
+  traces-split-1a:
+    <<: *traces-split
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [traces-split-1]
+    ports: ["13209:3200"]
+
+  traces-split-1b:
+    <<: *traces-split
+    environment:
+      <<: *traces-environment
+      READER_SHARD: "1"
+    networks:
+      default:
+        aliases: [traces-split-1]
+    ports: ["13210:3200"]
 
   # One process and shard over MinIO, the shape of the single-binary oracle;
   # benchmarks use it so reads skip the split topology's per-shard fan-out.

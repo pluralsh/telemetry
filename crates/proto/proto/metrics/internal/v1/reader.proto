@@ -17,6 +17,8 @@ service ShardReader {
   rpc LabelValues(LabelValuesRequest) returns (StringsResponse);
   rpc Metadata(MetadataRequest) returns (MetadataResponse);
   rpc BucketGenerations(BucketGenerationsRequest) returns (BucketGenerationsResponse);
+  // Evaluates PromQL over this shard alone and returns the partial result.
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
 }
 
 // The shard and namespace a call reads, plus the query's preload ranges in
@@ -180,4 +182,33 @@ message Generation {
 // Parallel to the request's `bucket_ids`.
 message BucketGenerationsResponse {
   repeated Generation generations = 1;
+}
+
+// Evaluates each query over the shard's own series on the step grid
+// start_ms, start_ms + step_ms, .. end_ms, or at start_ms alone when
+// step_ms is zero. The coordinator names only the queries and the range:
+// no storage ids cross between replicas.
+message EvaluateRequest {
+  ShardRead read = 1;
+  repeated string queries = 2;
+  int64 start_ms = 3;
+  int64 end_ms = 4;
+  int64 step_ms = 5;
+}
+
+// One series' samples at step timestamps; a step with no sample is absent.
+message EvaluatedSeries {
+  LabelSet labels = 1;
+  repeated int64 timestamps = 2;
+  repeated double values = 3;
+  repeated HistogramSample histograms = 4;
+}
+
+message EvaluatedQuery {
+  repeated EvaluatedSeries series = 1;
+}
+
+// One result per request query, in order.
+message EvaluateResponse {
+  repeated EvaluatedQuery results = 1;
 }

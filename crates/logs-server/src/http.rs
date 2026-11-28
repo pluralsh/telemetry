@@ -712,6 +712,7 @@ fn query_options(
         max_pages: state.config.request.max_query_pages,
         max_concurrency: state.config.request.query_concurrency,
         max_in_flight_bytes: state.config.request.max_in_flight_query_bytes,
+        row_time: None,
     })
 }
 

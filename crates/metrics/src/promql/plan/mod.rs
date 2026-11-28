@@ -47,6 +47,6 @@ pub use error::PlanError;
 #[cfg(any(test, feature = "testing"))]
 pub use explain::PlanNode;
 pub use explain::{ExplainResult, SCHEMA_VERSION, describe_logical, describe_physical};
-pub use lowering::{LoweringContext, lower};
+pub use lowering::{LoweringContext, lower, pushdown_selector_name};
 pub use optimize::optimize;
 pub use physical::{InstantVectorSort, PhysicalPlan, build_physical_plan};

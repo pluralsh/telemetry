@@ -21,6 +21,14 @@ use crate::{
     Result, Trace, TraceId, TraceQlResult, TraceSummary,
 };
 
+/// Runs one run of a split read's candidate traces in process, on the shard
+/// this reader serves.
+pub type LocalRun<'a> = &'a (
+        dyn Fn(pb::TraceQlRequest) -> futures::future::BoxFuture<'a, Result<pb::TraceQlResponse>>
+            + Send
+            + Sync
+    );
+
 /// Transport to the reader groups serving other shards.
 #[async_trait]
 pub trait TracesShardClient: Send + Sync + 'static {
@@ -34,6 +42,42 @@ pub trait TracesShardClient: Send + Sync + 'static {
         request: pb::CatalogValuesRequest,
     ) -> Result<pb::CatalogValuesResponse>;
     async fn traceql(&self, request: pb::TraceQlRequest) -> Result<pb::TraceQlResponse>;
+
+    /// Whether a read may be split across replicas while this reader
+    /// coordinates `local_inflight` queries; a cheap check that lets it skip
+    /// listing candidates when it would not split anyway.
+    fn may_split(&self, _local_inflight: usize) -> bool {
+        false
+    }
+
+    /// How many runs a shard's `candidates` traces should be evaluated in,
+    /// across its group's replicas, or `None` to read the shard whole.
+    async fn split_ways(
+        &self,
+        _shard: ShardId,
+        _candidates: u64,
+        _local_inflight: usize,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Evaluates each of `requests`, runs of one shard's candidate traces,
+    /// and returns the responses in request order. `local` runs a request on
+    /// this reader's own shard in process; the transport decides which
+    /// requests run there.
+    async fn traceql_runs(
+        &self,
+        requests: Vec<pb::TraceQlRequest>,
+        local: Option<LocalRun<'_>>,
+    ) -> Result<Vec<pb::TraceQlResponse>> {
+        futures::future::try_join_all(requests.into_iter().map(|request| async move {
+            match local {
+                Some(local) => local(request).await,
+                None => self.traceql(request).await,
+            }
+        }))
+        .await
+    }
 }
 
 /// Traces per streamed search message.
@@ -176,6 +220,8 @@ pub(crate) fn traceql_request(
         max_spans_per_trace: options.max_spans_per_trace as u64,
         max_concurrency: options.max_concurrency as u64,
         summaries,
+        candidates_only: false,
+        candidate_ids: Vec::new(),
     }
 }
 
@@ -430,6 +476,29 @@ impl RemoteShard {
             .into_iter()
             .map(discovery_from_wire)
             .collect()
+    }
+
+    /// The ids of the traces the query may match on this shard, in order,
+    /// or `None` when the replica that answered predates split reads.
+    pub(crate) async fn candidate_ids(
+        &self,
+        namespace: &Namespace,
+        range: (u64, u64),
+        source: &str,
+        options: &QueryOptions,
+    ) -> Result<Option<Vec<TraceId>>> {
+        let mut request = traceql_request(self.shard, namespace, range, source, options, false);
+        request.candidates_only = true;
+        let response = self.client.traceql(request).await?;
+        if !response.split_reader {
+            return Ok(None);
+        }
+        response
+            .candidate_ids
+            .iter()
+            .map(|id| TraceId::from_slice(id))
+            .collect::<Result<_>>()
+            .map(Some)
     }
 
     pub(crate) async fn traceql<T: crate::db::Hit>(

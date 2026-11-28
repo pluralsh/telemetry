@@ -28,6 +28,7 @@ from ..metrics.normalize import (
 )
 from ..metrics.wire import remote_write_body
 from ..process import wait_http
+from . import split
 from .cold import ColdProduct, ColdService, ColdStack
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
@@ -61,8 +62,10 @@ STORAGES = ("s3", "local")
 # (its cache sizes, buffered writes flushed every 10s), the shape of the
 # single-binary oracles, for benchmarks. `production-sharded` runs the
 # operator's settings as two writers and a reader, to measure what sharding
-# costs against `production`.
-IMPL_CONFIGS = ("regression", "production", "production-sharded")
+# costs against `production`. `split` runs the regression writers and reads
+# through two reader groups of two replicas each, splitting every shard read
+# across a group, with PromQL pushdown on (`reader-group-split.yaml`).
+IMPL_CONFIGS = ("regression", "production", "production-sharded", split.SPLIT)
 STANDALONE_URL = service_url("metrics-standalone", 8080, 18083)
 STANDALONE_S3_URL = service_url("metrics-s3", 8080, 18084)
 MIMIR_URL = service_url("mimir", 8080, 19009)
@@ -72,6 +75,10 @@ WRITER_URLS = (
     service_url("metrics-writer-1", 8080, 18081),
 )
 READER_URL = service_url("metrics-reader", 8080, 18082)
+SPLIT_URLS = {
+    name: service_url(name, 8080, port)
+    for name, port in zip(split.replicas("metrics"), range(18087, 18091), strict=True)
+}
 MIMIR_BLOCKS_ENVIRONMENT = {
     "MIMIR_QUERY_INGESTERS_WITHIN": "1s",
     "MIMIR_QUERY_STORE_AFTER": "0s",
@@ -346,6 +353,7 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
         "metrics-reader": "impl",
         "metrics-standalone": "impl",
         "metrics-s3": "impl",
+        **dict.fromkeys(SPLIT_URLS, "impl"),
     }
     # Prometheus rejects samples older than its head max time minus 1h.
     default_window = "30m"
@@ -383,10 +391,14 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
                 f"FUZZ_METRICS_CONFIG={self.impl_config} requires "
                 "FUZZ_METRICS_STORAGE=s3"
             )
+        if self.impl_config == split.SPLIT:
+            split.validate(self.name, config)
         if self.storage == "local":
             write_url = read_url = STANDALONE_URL
         elif self.impl_config == "production":
             write_url = read_url = STANDALONE_S3_URL
+        elif self.impl_config == split.SPLIT:
+            write_url, read_url = WRITER_URLS[0], next(iter(SPLIT_URLS.values()))
         else:
             write_url, read_url = WRITER_URLS[0], READER_URL
         if self.oracle == "prometheus":
@@ -419,10 +431,17 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
         self.cold_samples: dict[str, int] = defaultdict(int)
 
     def stack(self) -> AbstractContextManager[object]:
+        readers = (
+            SPLIT_URLS
+            if self.impl_config == split.SPLIT
+            else {"metrics-reader": READER_URL}
+        )
+
         def start_reader(project: ComposeProject) -> None:
             # Readers require every writer-created shard manifest to exist.
-            project.up("metrics-reader")
-            wait_http(f"{READER_URL}/-/ready")
+            project.up(*readers)
+            for url in readers.values():
+                wait_http(f"{url}/-/ready")
 
         if self.oracle == "prometheus":
             oracle_service, oracle_ready, profiles = (
@@ -462,6 +481,8 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
                 "production" if self.impl_config == "production-sharded" else "."
             )
             services += ("metrics-writer-0", "metrics-writer-1")
+            if self.impl_config == split.SPLIT:
+                profiles += (split.SPLIT,)
             impl_ready = tuple(f"{url}/-/ready" for url in WRITER_URLS)
             after_start = start_reader
         return fuzz_stack(
@@ -490,7 +511,10 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
         else:
             for index, url in enumerate(WRITER_URLS):
                 urls[f"metrics-writer-{index}"] = f"{url}/-/ready"
-            urls["metrics-reader"] = f"{READER_URL}/-/ready"
+            if self.impl_config == split.SPLIT:
+                urls.update({name: f"{u}/-/ready" for name, u in SPLIT_URLS.items()})
+            else:
+                urls["metrics-reader"] = f"{READER_URL}/-/ready"
         if self.storage == "s3" or self.oracle != "prometheus":
             urls.update(minio_floor_url(19000))
         return urls
@@ -556,6 +580,14 @@ class MetricsFuzz(FuzzProduct, ColdProduct):
             "impl_config": self.impl_config,
             **super().describe(),
         }
+
+    def report(self) -> tuple[dict[str, Any], list[str]]:
+        if self.impl_config != split.SPLIT:
+            return {}, []
+        return split.report(
+            {name: f"{url}/metrics" for name, url in SPLIT_URLS.items()},
+            split.METRICS_COUNTERS,
+        )
 
     # Cold reads --------------------------------------------------------------
 

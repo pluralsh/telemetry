@@ -64,6 +64,21 @@ fn shard_config(config: &Config, shard: ShardId) -> Config {
     config
 }
 
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InflightGuard<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A facade over independently opened storage-shard databases.
 ///
 /// Every shard shares one SlateDB block and metadata cache, so the configured
@@ -76,6 +91,8 @@ pub struct ShardedLogs {
     results: Option<ResultCache>,
     segment_ns: i64,
     flights: SingleFlight<(Namespace, QueryRequest, QueryOptions), SharedResult>,
+    /// Queries this reader is coordinating, which gate splitting.
+    inflight: std::sync::atomic::AtomicUsize,
 }
 
 type SharedResult = std::result::Result<QueryResult, Arc<Error>>;
@@ -151,6 +168,7 @@ impl ShardedLogs {
             results: results.cache,
             segment_ns: results.segment_ns,
             flights: SingleFlight::new("logs"),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -246,6 +264,7 @@ impl ShardedLogs {
             "instant"
         };
         let started = std::time::Instant::now();
+        let _inflight = InflightGuard::new(&self.inflight);
         let key = (namespace.clone(), request.clone(), options.clone());
         let result = self
             .flights
@@ -308,12 +327,18 @@ impl ShardedLogs {
         request: &QueryRequest,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        let split = self.remote.get().map(|client| crate::query::SplitContext {
+            client: Arc::clone(client),
+            shards: sources.iter().map(|(shard, _)| *shard).collect(),
+            inflight: self.inflight.load(std::sync::atomic::Ordering::Relaxed),
+        });
         query_databases(
             sources.into_iter().map(|(_, source)| source).collect(),
             namespace,
             request,
             options,
             self.shards.io_permits(),
+            split,
         )
         .await
     }
@@ -1061,6 +1086,10 @@ mod tests {
     struct InProcessShards {
         reader: Arc<ShardedLogs>,
         asked: std::sync::Mutex<Vec<u32>>,
+        /// Fragments each shard read is split into; below 2, reads are whole.
+        ways: std::sync::atomic::AtomicUsize,
+        /// Fragments served with a row-time range.
+        fragments: std::sync::atomic::AtomicUsize,
     }
 
     impl InProcessShards {
@@ -1073,7 +1102,16 @@ mod tests {
     impl LogsShardClient for InProcessShards {
         async fn query(&self, request: pb::QueryShardRequest) -> Result<Vec<pb::ShardOutput>> {
             self.record(request.read.as_ref());
+            if request.row_time_start_ns.is_some() {
+                self.fragments
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.reader.serve_query(&request).await
+        }
+
+        async fn split_ways(&self, _: ShardId, _: u64, _: usize) -> Option<usize> {
+            let ways = self.ways.load(std::sync::atomic::Ordering::SeqCst);
+            (ways >= 2).then_some(ways)
         }
 
         async fn label_names(&self, request: pb::LabelNamesRequest) -> Result<pb::StringsResponse> {
@@ -1255,6 +1293,8 @@ mod tests {
         let shards = Arc::new(InProcessShards {
             reader: Arc::clone(&peer),
             asked: Default::default(),
+            ways: Default::default(),
+            fragments: Default::default(),
         });
         assert!(coordinator.connect_remote_shards(shards.clone()));
 
@@ -1267,6 +1307,18 @@ mod tests {
                 start,
                 end,
                 50,
+            ),
+            QueryRequest::range(
+                r#"sum by (app) (count_over_time({app=~".+"} |= "line" [300ns]))"#,
+                start,
+                end,
+                77,
+            ),
+            QueryRequest::range(
+                r#"sum by (level) (rate({app=~".+"} | logfmt | status="201" [250ns]))"#,
+                start,
+                end,
+                60,
             ),
             QueryRequest::range(
                 r#"topk(2, sum by (level) (rate({app=~".+"}[200ns])))"#,
@@ -1285,33 +1337,47 @@ mod tests {
                 end,
             ),
         ];
-        for request in &queries {
-            for (limit, direction) in [
-                (1000, crate::Direction::Forward),
-                (7, crate::Direction::Backward),
-            ] {
-                let options = QueryOptions {
-                    limit,
-                    direction,
-                    ..QueryOptions::default()
-                };
-                let expected = everything
-                    .query(&namespace, request, options.clone())
-                    .await
-                    .unwrap();
-                let actual = coordinator
-                    .query(&namespace, request, options)
-                    .await
-                    .unwrap();
-                assert_eq!(actual, expected, "{}", request.query);
-                let empty = match &expected {
-                    QueryResult::Streams(streams) => streams.is_empty(),
-                    QueryResult::Vector(samples) => samples.is_empty(),
-                    QueryResult::Matrix(series) => series.is_empty(),
-                    QueryResult::Scalar(_) => false,
-                };
-                assert!(!empty, "{}", request.query);
+        for ways in [0usize, 2, 3, 7] {
+            shards.ways.store(ways, std::sync::atomic::Ordering::SeqCst);
+            for request in &queries {
+                // A distinct step per round keeps the result cache from
+                // answering a round without reading shards.
+                let mut request = request.clone();
+                request.step_ns = request.step_ns.map(|step| step + ways as i64);
+                let request = &request;
+                for (limit, direction) in [
+                    (1000, crate::Direction::Forward),
+                    (7, crate::Direction::Backward),
+                ] {
+                    let options = QueryOptions {
+                        limit,
+                        direction,
+                        ..QueryOptions::default()
+                    };
+                    let expected = everything
+                        .query(&namespace, request, options.clone())
+                        .await
+                        .unwrap();
+                    let actual = coordinator
+                        .query(&namespace, request, options)
+                        .await
+                        .unwrap();
+                    assert_eq!(actual, expected, "{}", request.query);
+                    let empty = match &expected {
+                        QueryResult::Streams(streams) => streams.is_empty(),
+                        QueryResult::Vector(samples) => samples.is_empty(),
+                        QueryResult::Matrix(series) => series.is_empty(),
+                        QueryResult::Scalar(_) => false,
+                    };
+                    assert!(!empty, "{}", request.query);
+                }
             }
+            let fragments = shards.fragments.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                fragments > 0,
+                ways >= 2,
+                "ways {ways}: {fragments} fragments"
+            );
         }
         assert_eq!(
             coordinator

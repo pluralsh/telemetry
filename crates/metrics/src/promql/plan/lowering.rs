@@ -72,7 +72,17 @@ pub struct LoweringContext {
     /// Lets the physical planner resolve only the grouping labels of
     /// aggregations that read nothing else. Results are the same either way.
     pub label_projection: bool,
+    /// Subtrees the shards already evaluated, which selectors named
+    /// `__pushdown_<index>` stand for.
+    pub precomputed: Arc<Vec<super::super::operators::precomputed::PrecomputedRef>>,
 }
+
+/// Name of the selector standing for pushed-down subtree `index`.
+pub fn pushdown_selector_name(index: usize) -> String {
+    format!("{PUSHDOWN_PREFIX}{index}")
+}
+
+const PUSHDOWN_PREFIX: &str = "__pushdown_";
 
 impl PartialEq for LoweringContext {
     fn eq(&self, other: &Self) -> bool {
@@ -99,6 +109,7 @@ impl LoweringContext {
             parallelism: super::parallelism::Parallelism::default(),
             trace: None,
             label_projection: true,
+            precomputed: Arc::default(),
         }
     }
 
@@ -113,6 +124,7 @@ impl LoweringContext {
             parallelism: super::parallelism::Parallelism::default(),
             trace: None,
             label_projection: true,
+            precomputed: Arc::default(),
         }
     }
 
@@ -123,6 +135,15 @@ impl LoweringContext {
 
     pub fn with_label_projection(mut self, label_projection: bool) -> Self {
         self.label_projection = label_projection;
+        self
+    }
+
+    /// The shard-evaluated subtrees `__pushdown_<index>` selectors stand for.
+    pub fn with_precomputed(
+        mut self,
+        precomputed: Vec<super::super::operators::precomputed::PrecomputedRef>,
+    ) -> Self {
+        self.precomputed = Arc::new(precomputed);
         self
     }
 
@@ -143,11 +164,33 @@ impl LoweringContext {
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn is_pushdown_name(name: &str) -> bool {
+    name.strip_prefix(PUSHDOWN_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Lower a parsed PromQL expression into a [`LogicalPlan`].
 ///
 /// See the module docs for the lowering rules.
 pub fn lower(expr: &parser::Expr, ctx: &LoweringContext) -> Result<LogicalPlan, PlanError> {
     match expr {
+        parser::Expr::VectorSelector(vs) if vs.name.as_deref().is_some_and(is_pushdown_name) => {
+            let index = vs
+                .name
+                .as_deref()
+                .and_then(|name| name.strip_prefix(PUSHDOWN_PREFIX))
+                .and_then(|index| index.parse::<usize>().ok())
+                .ok_or_else(|| PlanError::UnsupportedExpression("bad pushdown selector".into()))?;
+            ctx.precomputed
+                .get(index)
+                .cloned()
+                .map(LogicalPlan::Precomputed)
+                .ok_or_else(|| {
+                    PlanError::UnsupportedExpression(format!(
+                        "pushdown selector {index} has no precomputed data"
+                    ))
+                })
+        }
         parser::Expr::VectorSelector(vs) => Ok(LogicalPlan::VectorSelector {
             selector: vs.clone(),
             offset: offset_from_parser(vs.offset.as_ref()),
@@ -1095,6 +1138,7 @@ fn describe_logical_plan(plan: &LogicalPlan) -> String {
         LogicalPlan::VectorSelector { .. } => "instant-vector".to_string(),
         LogicalPlan::MatrixSelector { .. } => "range-vector (matrix)".to_string(),
         LogicalPlan::Scalar(v) => format!("scalar {v}"),
+        LogicalPlan::Precomputed(data) => format!("precomputed {}", data.0.series.len()),
         LogicalPlan::Time => "scalar (time)".to_string(),
         LogicalPlan::Scalarize { .. } => "scalar (from scalar())".to_string(),
         LogicalPlan::Vectorize { .. } => "instant-vector (from vector())".to_string(),

@@ -236,6 +236,12 @@ sharding:
   #   hedge_after_ms: 250  # Second replica after this delay; 0 disables hedging.
   #   request_timeout_seconds: 120
   #   resolve_interval_seconds: 5 # Re-resolve each group's replica addresses.
+  #   split: {enabled: false}     # See Sharding: splitting a shard's read across replicas.
+
+# Evaluates parts of a query on the shards that hold the series and sends the
+# coordinator partial results. Reader groups only; off by default.
+pushdown:
+  enabled: false
 
 auth:
   unauthenticated: false # Require credentials for namespace APIs.

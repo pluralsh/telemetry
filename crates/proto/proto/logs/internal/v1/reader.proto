@@ -36,6 +36,11 @@ message QueryShardRequest {
   uint64 max_pages = 8;
   uint64 max_concurrency = 9;
   uint64 max_in_flight_bytes = 10;
+  // Keeps only rows with start <= timestamp < end. The request keeps its
+  // full start, end and step, so window buckets and lookback are the same
+  // on every fragment of a split shard read.
+  optional int64 row_time_start_ns = 11;
+  optional int64 row_time_end_ns = 12;
 }
 
 message LabelSet {
@@ -131,6 +136,9 @@ message ShardOutput {
     LabelRows labels = 5;
     LogLines logs = 6;
   }
+  // Set when the reader kept only the request's row-time range; an older
+  // reader ignores the range and answers the whole shard.
+  bool row_time_applied = 7;
 }
 
 message LabelNamesRequest {

@@ -319,6 +319,17 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_forced_split_regression_config_is_valid() {
+        let config = Config::from_yaml(include_str!(
+            "../../../tests/regression/products/traces/reader-group-split.yaml"
+        ))
+        .unwrap();
+        let split = &config.sharding.read_groups.unwrap().split;
+        assert!(split.enabled);
+        assert_eq!(split.min_fragment_cost.traces, 0);
+    }
+
     use super::*;
 
     #[test]

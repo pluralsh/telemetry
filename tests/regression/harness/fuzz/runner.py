@@ -133,6 +133,11 @@ class FuzzProduct(ABC):
         """URL scheme -> sender for this product's non-HTTP endpoints."""
         return {}
 
+    def report(self) -> tuple[dict[str, Any], list[str]]:
+        """Summary sections and failure reasons gathered once the round loop
+        ends, while the stack is still up."""
+        return {}, []
+
     def describe(self) -> dict[str, object]:
         return {
             "oracle_read": self.oracle_read.describe(),
@@ -323,7 +328,10 @@ class Runner:
         finally:
             elapsed_s = self.budget.elapsed()
             resources = self.sampler.stop() if self.sampler is not None else None
-            summary = self.recorder.finish(elapsed_s=elapsed_s, resources=resources)
+            extra, reasons = self.product.report()
+            summary = self.recorder.finish(
+                elapsed_s=elapsed_s, resources=resources, extra=extra, reasons=reasons
+            )
         return summary
 
     def _out_of_time(self) -> bool:

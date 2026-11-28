@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt, stream};
-use plural_traces::{Error, ShardedTraces, TracesShardClient, traceql::QueryError};
+use plural_traces::{Error, LocalRun, ShardedTraces, TracesShardClient, traceql::QueryError};
 use proto::traces::internal::v1::{
     self as pb,
     shard_reader_client::ShardReaderClient,
@@ -213,6 +213,64 @@ impl TracesShardClient for GrpcTracesShards {
         request: pb::TraceQlRequest,
     ) -> plural_traces::Result<pb::TraceQlResponse> {
         unary!(self, request, trace_ql)
+    }
+
+    fn may_split(&self, local_inflight: usize) -> bool {
+        let split = self.groups.split_config();
+        split.enabled && local_inflight < split.max_local_inflight
+    }
+
+    async fn split_ways(
+        &self,
+        shard: ShardId,
+        candidates: u64,
+        local_inflight: usize,
+    ) -> Option<usize> {
+        let min_cost = self.groups.split_config().min_fragment_cost.traces;
+        self.groups
+            .split_ways(shard, candidates, min_cost, local_inflight)
+            .await
+    }
+
+    async fn traceql_runs(
+        &self,
+        requests: Vec<pb::TraceQlRequest>,
+        local: Option<LocalRun<'_>>,
+    ) -> plural_traces::Result<Vec<pb::TraceQlResponse>> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let shard = shard_of(first.read.as_ref());
+        // Runs are addressed by their first trace id, so a trace keeps its
+        // preferred replica's caches warm across queries.
+        let keys = requests
+            .iter()
+            .map(|request| {
+                let mut key = [0u8; 8];
+                if let Some(id) = request.candidate_ids.first() {
+                    let len = id.len().min(8);
+                    key[..len].copy_from_slice(&id[..len]);
+                }
+                u64::from_be_bytes(key)
+            })
+            .collect::<Vec<_>>();
+        let groups = &self.groups;
+        let requests = &requests;
+        groups
+            .fan_out(shard, &keys, |index, replica| async move {
+                let request = requests[index].clone();
+                if replica.is_self {
+                    let local = local.ok_or_else(|| Status::internal("no local run"))?;
+                    return local(request).await.map_err(error_status);
+                }
+                let request = groups.request(request)?;
+                client(&replica)
+                    .trace_ql(request)
+                    .await
+                    .map(Response::into_inner)
+            })
+            .await
+            .map_err(status_error)
     }
 }
 

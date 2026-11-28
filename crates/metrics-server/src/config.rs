@@ -209,6 +209,15 @@ impl ReaderDiskCacheConfig {
     }
 }
 
+/// Evaluates the aggregations a query can combine from partial results on
+/// the shards, so the coordinating reader receives partial results rather
+/// than every matched sample. Only reader groups use it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushdownConfig {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -228,6 +237,8 @@ pub struct Config {
     pub forward_index_cache_capacity_bytes: u64,
     pub result_cache: ResultCacheConfig,
     pub query: QueryConfig,
+    /// Evaluating parts of queries on the shards that hold the series.
+    pub pushdown: PushdownConfig,
     pub rollup: RollupConfig,
     /// Estimated bytes SlateDB's compactions of every shard hold at once;
     /// it caps their concurrency, subcompactions and prefetch. Defaults to
@@ -269,6 +280,7 @@ impl Default for Config {
                 .forward_index_capacity_bytes,
             result_cache: ResultCacheConfig::default(),
             query: QueryConfig::default(),
+            pushdown: PushdownConfig::default(),
             rollup: RollupConfig::default(),
             compaction_memory_bytes: None,
             write_budget_bytes: None,
@@ -416,6 +428,17 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_forced_split_regression_config_is_valid() {
+        let config = Config::from_yaml(include_str!(
+            "../../../tests/regression/products/metrics/reader-group-split.yaml"
+        ))
+        .unwrap();
+        let split = &config.sharding.read_groups.unwrap().split;
+        assert!(split.enabled);
+        assert_eq!(split.min_fragment_cost.metrics, 0);
+    }
+
     use super::*;
 
     #[test]

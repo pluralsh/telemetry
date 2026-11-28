@@ -390,11 +390,13 @@ class Recorder:
         elapsed_s: float,
         resources: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
+        reasons: list[str] | None = None,
     ) -> Summary:
-        """`extra` adds scenario-specific top-level sections, such as `cold`."""
+        """`extra` adds scenario-specific top-level sections, such as `cold`,
+        and `reasons` failures found outside the recorded cases."""
         for handle in (self._cases, self._ingest, self._rounds):
             handle.close()
-        reasons = self._failure_reasons()
+        reasons = self._failure_reasons() + (reasons or [])
         families = {}
         for family in sorted(self.families):
             families[family] = {
@@ -560,6 +562,8 @@ def render_markdown(value: dict[str, Any]) -> str:
             )
     if cold := value.get("cold"):
         lines += cold_markdown(cold)
+    if split := value.get("split"):
+        lines += split_markdown(split)
     if latency["top_outliers"]:
         lines += ["", "Slowest relative to the oracle:", ""]
         for item in latency["top_outliers"][:10]:
@@ -620,6 +624,28 @@ def cold_markdown(cold: dict[str, Any]) -> list[str]:
         )
         + ".",
     ]
+    return lines
+
+
+def split_markdown(split: dict[str, Any]) -> list[str]:
+    """What the `split` reader replicas recorded about splitting."""
+    lines = [
+        "",
+        "Read-group splitting over every reader replica: decisions "
+        + (
+            ", ".join(
+                f"{reason} {count:g}" for reason, count in split["decisions"].items()
+            )
+            or "none"
+        )
+        + f"; {split['fragmented_reads']:g} reads split into "
+        f"{split['fragments']:g} fragments, {split['hedges']:g} hedges.",
+    ]
+    if split["counters"]:
+        lines += ["", "| counter | value |", "| --- | ---: |"]
+        lines += [f"| `{name}` | {n:g} |" for name, n in split["counters"].items()]
+    if split["unreachable"]:
+        lines += ["", f"Could not scrape: {', '.join(split['unreachable'])}."]
     return lines
 
 

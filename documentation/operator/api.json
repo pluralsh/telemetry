@@ -2116,6 +2116,14 @@
             },
             {
               "default": "",
+              "doc": "Pushdown evaluates the aggregations a query can combine from partial\nresults on the shards, so the reader coordinating a query receives\npartial results instead of every matched sample. It applies to sharded\nreaders with read groups.",
+              "name": "pushdown",
+              "rules": [],
+              "type": "[MetricsPushdownSpec](#metricspushdownspec)",
+              "validation": []
+            },
+            {
+              "default": "",
               "doc": "",
               "name": "cacheWarmer",
               "rules": [],
@@ -2175,6 +2183,29 @@
           ],
           "kind": "",
           "name": "MetricsConfigSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
+            "MetricsConfigSpec"
+          ],
+          "doc": "MetricsPushdownSpec configures evaluating parts of queries on shards.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "false",
+              "doc": "Enabled turns pushdown on.",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            }
+          ],
+          "kind": "",
+          "name": "MetricsPushdownSpec",
           "resource": {},
           "rules": [],
           "underlying": "",
@@ -3326,6 +3357,59 @@
         },
         {
           "appearsIn": [
+            "ReadGroupsSpec"
+          ],
+          "doc": "ReadGroupSplitSpec cuts a shard read into fragments that different\nreplicas of the shard's reader group run, so a heavy query uses all of\nthem. Small queries, busy readers and groups with one replica read whole.",
+          "enumValues": [],
+          "fields": [
+            {
+              "default": "false",
+              "doc": "Enabled turns splitting on.",
+              "name": "enabled",
+              "rules": [],
+              "type": "boolean",
+              "validation": []
+            },
+            {
+              "default": "4",
+              "doc": "MaxFragments bounds the fragments of one shard read.",
+              "name": "maxFragments",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "32",
+              "doc": "MaxLocalInflight stops splitting while this reader coordinates this\nmany queries.",
+              "name": "maxLocalInflight",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 1"
+              ]
+            },
+            {
+              "default": "",
+              "doc": "MinFragmentCost is the estimated cost a fragment must carry to be worth\nits own request: output steps for Metrics, pages for Logs, candidate\ntraces for Traces. Zero always splits, for tests. When omitted the\nserver's per-product default applies.",
+              "name": "minFragmentCost",
+              "rules": [],
+              "type": "integer",
+              "validation": [
+                "Minimum: 0"
+              ]
+            }
+          ],
+          "kind": "",
+          "name": "ReadGroupSplitSpec",
+          "resource": {},
+          "rules": [],
+          "underlying": "",
+          "validation": []
+        },
+        {
+          "appearsIn": [
             "WorkloadSpec"
           ],
           "doc": "ReadGroupsSpec splits sharded readers into one group per storage shard.\nEach group is a StatefulSet that opens only its own shard; a query sent\nto any reader reads its own shard in process and every other shard from\nthat shard's group over gRPC. Replicas, resources, and autoscaling apply\nto each group.",
@@ -3358,6 +3442,14 @@
               "validation": [
                 "Minimum: 1"
               ]
+            },
+            {
+              "default": "",
+              "doc": "Split divides one shard's read across every replica of its group\ninstead of reading it on a single replica.",
+              "name": "split",
+              "rules": [],
+              "type": "[ReadGroupSplitSpec](#readgroupsplitspec)",
+              "validation": []
             }
           ],
           "kind": "",
