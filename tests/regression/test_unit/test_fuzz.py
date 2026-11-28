@@ -35,6 +35,7 @@ from harness.fuzz.runner import (
     classify,
     settle_mismatch,
 )
+from harness.fuzz.split import split_evidence
 from harness.fuzz.traces import TracesFuzz, format_duration
 from harness.fuzz.transport import Exchange, Request
 from harness.metrics.wire import decode_remote_write
@@ -482,6 +483,19 @@ def test_runner_records_outcomes_and_artifacts(servers, config) -> None:
     assert len(list((root / "data").iterdir())) == 3
     assert json.loads((root / "summary.json").read_text())["cases"] == 25
     assert "fake.echo" in (root / "summary.md").read_text()
+
+
+def test_runner_adds_the_products_report_to_the_summary(servers, config) -> None:
+    oracle, _ = servers
+    settings = config("fake", FUZZ_DURATION="20s", FUZZ_MAX_CASES="3", FUZZ_SETTLE="0")
+    product = _FakeProduct(settings, oracle, oracle)
+    evidence = split_evidence({"fake-split-0a": ""})
+    product.report = lambda: ({"split": evidence}, ["no read was split"])
+    summary = Runner(product, settings).run()
+    assert summary.failed and summary.reasons == ["no read was split"]
+    value = json.loads((settings.output_dir / "summary.json").read_text())
+    assert value["split"] == evidence and value["reasons"] == ["no read was split"]
+    assert "Read-group splitting" in (settings.output_dir / "summary.md").read_text()
 
 
 def test_runner_calls_an_unstable_oracle_unstable(config) -> None:

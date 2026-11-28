@@ -18,7 +18,8 @@ from typing import Any
 
 from ..canonical import assert_equivalent
 from ..compose import ComposeProject
-from . import cold
+from ..process import wait_http
+from . import cold, split
 from .cold import ColdProduct, ColdService, ColdStack, scrape
 from .config import Endpoint, FuzzConfig, endpoint_from_env
 from .network import minio_floor_url, service_url
@@ -49,8 +50,18 @@ from .transport import Exchange, Request
 PRODUCT_DIR = Path(__file__).resolve().parents[2] / "products" / "logs"
 # `production` uses what the operator deploys (1h segments, 1 MiB pages, its
 # cache sizes and buffered writes) instead of the small values that exercise
-# edge cases.
-IMPL_CONFIG_DIRS = {"regression": ".", "production": "production"}
+# edge cases. `split` writes to the two sharded writers and reads through two
+# reader groups of two replicas each, splitting every shard read across a
+# group (`sharded-reader-group-split.yaml`).
+IMPL_CONFIG_DIRS = {"regression": ".", "production": "production", split.SPLIT: "."}
+WRITER_URLS = {
+    "logs-writer-0": service_url("logs-writer-0", 3100, 13103),
+    "logs-writer-1": service_url("logs-writer-1", 3100, 13104),
+}
+SPLIT_URLS = {
+    name: service_url(name, 3100, port)
+    for name, port in zip(split.replicas("logs"), range(13112, 13116), strict=True)
+}
 SECOND = 1_000_000_000
 MAX_LIMIT = 5000
 MAX_POINTS = 10_000
@@ -392,7 +403,13 @@ def loki_compactor_config(config: Path) -> str:
 class LogsFuzz(FuzzProduct, ColdProduct):
     name = "logs"
     default_window = "20m"
-    resource_roles = {"loki-fuzz": "oracle", "logs": "impl", "logs-s3": "impl"}
+    resource_roles = {
+        "loki-fuzz": "oracle",
+        "logs": "impl",
+        "logs-s3": "impl",
+        **dict.fromkeys(WRITER_URLS, "impl"),
+        **dict.fromkeys(SPLIT_URLS, "impl"),
+    }
 
     def __init__(self, config: FuzzConfig) -> None:
         super().__init__(config)
@@ -406,8 +423,11 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             )
         if self.impl_config != "regression" and self.storage != "s3":
             raise ValueError(
-                "FUZZ_LOGS_CONFIG=production requires FUZZ_LOGS_STORAGE=s3"
+                f"FUZZ_LOGS_CONFIG={self.impl_config} requires FUZZ_LOGS_STORAGE=s3"
             )
+        self.split = self.impl_config == split.SPLIT
+        if self.split:
+            split.validate(self.name, config)
         if config.object_store and self.storage != "s3":
             raise ValueError(
                 f"FUZZ_SCENARIO={config.scenario} requires FUZZ_LOGS_STORAGE=s3"
@@ -418,15 +438,18 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             self.impl_service, 3100, 13111 if self.storage == "s3" else 13101
         )
         self.loki_url = service_url("loki-fuzz", 3100, 13110)
-        impl = self.impl_url
+        read_url = write_url = self.impl_url
+        if self.split:
+            write_url = WRITER_URLS["logs-writer-0"]
+            read_url = next(iter(SPLIT_URLS.values()))
         oracle = Endpoint(self.loki_url)
         self.oracle_read = endpoint_from_env("logs", "oracle_read", oracle)
         self.oracle_write = endpoint_from_env("logs", "oracle_write", oracle)
         self.impl_read = endpoint_from_env(
-            "logs", "impl_read", Endpoint(f"{impl}/read/ns/{namespace}")
+            "logs", "impl_read", Endpoint(f"{read_url}/read/ns/{namespace}")
         )
         self.impl_write = endpoint_from_env(
-            "logs", "impl_write", Endpoint(f"{impl}/write/ns/{namespace}")
+            "logs", "impl_write", Endpoint(f"{write_url}/write/ns/{namespace}")
         )
         # Exact (timestamp, line) re-sends within a stream, which both sides
         # collapse at query time.
@@ -438,21 +461,35 @@ class LogsFuzz(FuzzProduct, ColdProduct):
         self.cold_counts: dict[str, int] = defaultdict(int)
 
     def stack(self) -> AbstractContextManager[object]:
-        services = ["loki-fuzz", self.impl_service]
+        impl = list(WRITER_URLS) if self.split else [self.impl_service]
+        services = ["loki-fuzz", *impl]
         if self.storage == "s3":
             services[1:1] = ["minio", "minio-init"]
         os.environ["LOGS_CONFIG_DIR"] = IMPL_CONFIG_DIRS[self.impl_config]
         os.environ["LOKI_FUZZ_CONFIG"] = LOKI_CONFIGS[self.config.scenario]
+        # Reader replicas open the shard manifests the writers create.
+        readers = SPLIT_URLS if self.split else {}
+
+        def start_readers(project: ComposeProject) -> None:
+            project.up(*readers)
+            for url in readers.values():
+                wait_http(f"{url}/-/ready")
+
         return fuzz_stack(
             self.config,
             lambda: ComposeProject(
                 file=PRODUCT_DIR / "docker-compose.yml",
                 name="logs-fuzz",
                 services=tuple(services),
-                profiles=("fuzz",),
-                readiness_urls=tuple(self.floor_urls().values()),
+                profiles=("fuzz", split.SPLIT) if self.split else ("fuzz",),
+                readiness_urls=tuple(
+                    url
+                    for service, url in self.floor_urls().items()
+                    if service not in readers
+                ),
             ),
             roles=self.resource_roles,
+            after_start=start_readers if self.split else None,
         )
 
     def after_ingest(self, index: int) -> None:
@@ -479,9 +516,14 @@ class LogsFuzz(FuzzProduct, ColdProduct):
         raise RuntimeError(f"Loki did not flush {what} within {FLUSH_TIMEOUT_S}s")
 
     def floor_urls(self) -> dict[str, str]:
+        impl = (
+            {**WRITER_URLS, **SPLIT_URLS}
+            if self.split
+            else {self.impl_service: self.impl_url}
+        )
         urls = {
             "loki-fuzz": f"{self.loki_url}/ready",
-            self.impl_service: f"{self.impl_url}/-/ready",
+            **{service: f"{url}/-/ready" for service, url in impl.items()},
         }
         if self.storage == "s3":
             urls.update(minio_floor_url())
@@ -493,6 +535,13 @@ class LogsFuzz(FuzzProduct, ColdProduct):
             "storage": self.storage,
             "impl_config": self.impl_config,
         }
+
+    def report(self) -> tuple[dict[str, Any], list[str]]:
+        if not self.split:
+            return {}, []
+        return split.report(
+            {name: f"{url}/metrics" for name, url in SPLIT_URLS.items()}
+        )
 
     # Cold reads --------------------------------------------------------------
 

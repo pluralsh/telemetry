@@ -25,7 +25,7 @@ sharding:
     - { id: traces-writer-1, ordinal: 1, endpoint: "traces-writer-1:9092", start_shard: 1, end_shard: 2 }
   # One reader group per shard; READER_SHARD selects this replica's shard.
   read_groups:
-    endpoint: "traces-reader-{shard}:9092"
+    endpoint: "traces-split-{shard}:9092"
     hedge_after_ms: 250
     # Forced on so every fragmentable read is split across replicas.
     split:

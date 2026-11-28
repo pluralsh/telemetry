@@ -25,7 +25,7 @@ sharding:
     - { id: metrics-writer-1, ordinal: 1, endpoint: "metrics-writer-1:9090", start_shard: 1, end_shard: 2 }
   # One reader group per shard; READER_SHARD selects this replica's shard.
   read_groups:
-    endpoint: "metrics-reader-{shard}:9090"
+    endpoint: "metrics-split-{shard}:9090"
     hedge_after_ms: 250
     # Forced on so every fragmentable read is split across replicas.
     split:

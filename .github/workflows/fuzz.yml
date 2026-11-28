@@ -17,6 +17,12 @@ on:
       logs_storage:
         description: Logs implementation backend (s3 or local)
         default: s3
+      impl_config:
+        description: >-
+          Metrics, Logs and Traces implementation config (FUZZ_<PRODUCT>_CONFIG):
+          regression, production, production-sharded (Metrics and Traces) or
+          split (reader groups with forced splitting); pseudofs ignores it
+        default: regression
 
 permissions:
   contents: read
@@ -59,6 +65,9 @@ jobs:
           FUZZ_DURATION: ${{ inputs.duration || '30m' }}
           FUZZ_SEED: ${{ inputs.seed }}
           FUZZ_LOGS_STORAGE: ${{ inputs.logs_storage || 's3' }}
+          FUZZ_METRICS_CONFIG: ${{ inputs.impl_config || 'regression' }}
+          FUZZ_LOGS_CONFIG: ${{ inputs.impl_config || 'regression' }}
+          FUZZ_TRACES_CONFIG: ${{ inputs.impl_config || 'regression' }}
           FUZZ_OUTPUT_DIR: target/fuzz/${{ matrix.product }}
           FUZZ_RECORD_DATA: "1"
           # Uploaded with the artifact; copy history/<product>/*.json into

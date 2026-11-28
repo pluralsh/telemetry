@@ -102,6 +102,24 @@ returning partial results, then recovers.
 Reader-group ports are Metrics `18085`/`18086`, Traces `13205`/`13206`, and
 Logs writers `13103`/`13104` and readers `13105`/`13106`.
 
+The fuzzer's `split` implementation config (`FUZZ_<PRODUCT>_CONFIG=split`
+for Metrics, Logs and Traces; profile `split`) runs the two writers plus two
+reader groups of two replicas each, `<product>-split-0a`/`0b` and
+`-1a`/`1b`, with `READER_SHARD` per group and a network alias per group
+(`<product>-split-0`, `-1`) that the group endpoint in `*-split.yaml`
+resolves to both replicas. Those configs force splitting on
+(`min_fragment_cost: 0`; Metrics also enables PromQL pushdown). Writes go to
+writer 0 and reads through `-0a`. At the end of the run the harness scrapes
+every replica's `/metrics` and records
+`telemetry_read_group_split_decisions_total` by reason,
+`telemetry_read_group_fragments` (`_count` split reads, `_sum` fragments),
+`telemetry_read_group_hedges_total` and, for Metrics,
+`metrics_pushdown_total` by result and `metrics_split_reads_total` under
+`split` in `summary.json`/`summary.md`; the run fails when no replica
+counted a `reason="split"` decision. `split` needs S3 storage and a compose
+stack, and is rejected in the `cold` scenario. Replica host ports are
+Metrics `18087`-`18090`, Traces `13207`-`13210` and Logs `13112`-`13115`.
+
 ## Differential fuzzing
 
 `harness/fuzz/` is a time-boxed differential fuzzer that runs alongside the
@@ -187,16 +205,16 @@ the seed, although wall-clock time still shifts the data windows.
 | `FUZZ_HISTORY_HOST_LABEL` | unset | Short machine name stored in history entries |
 | `FUZZ_HISTORY_BATCH` | unset | Groups entries from one benchmark; set by `harness.fuzz.bench` |
 | `FUZZ_LOGS_STORAGE` | `s3` | Logs implementation backend: `s3` (MinIO) or `local` |
-| `FUZZ_LOGS_CONFIG` | `regression` | Logs implementation config (S3 storage only): `regression` (60s segments, 16 KiB/128-row pages, 2m discovery rollups, fast compaction, to exercise segment, page and rollup boundaries) or `production` (the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments, 1 MiB/8192-row pages, 24h rollups) |
+| `FUZZ_LOGS_CONFIG` | `regression` | Logs implementation config (S3 storage only): `regression` (60s segments, 16 KiB/128-row pages, 2m discovery rollups, fast compaction, to exercise segment, page and rollup boundaries), `production` (the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments, 1 MiB/8192-row pages, 24h rollups), or `split` (two sharded writers and two reader groups of two replicas with splitting forced on; see [Reader groups](#reader-groups)) |
 | `FUZZ_LOGS_DUPLICATE_RATE` | `0.02` | Fraction of log entries re-sent with an identical timestamp and line |
 | `FUZZ_TRACES_DUPLICATE_RATE` | `0` | Fraction of spans re-sent in a later request. Opt-in: Tempo returns the copies until it compacts the trace, while Traces deduplicates them at query time |
 | `FUZZ_TRACES_ORACLE` | `tempo` | Traces oracle: `tempo` (local-disk blocks; with the default frontend settings recent data is served from ingester memory) or `tempo-s3` (blocks in the shared MinIO, search and tag lookups read only flushed blocks, ingesters drop flushed blocks after 15s; the like-for-like object-store comparison) |
-| `FUZZ_TRACES_CONFIG` | `regression` | Traces implementation: `regression` (two writers and a reader with 60s segments, two-trace pages, IO concurrency 2, to exercise sharding, page and segment boundaries) or `production` (one standalone process and shard over MinIO, like the single-binary Tempo, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments and 1 MiB/4 MiB pages of up to 1024 traces) |
+| `FUZZ_TRACES_CONFIG` | `regression` | Traces implementation: `regression` (two writers and a reader with 60s segments, two-trace pages, IO concurrency 2, to exercise sharding, page and segment boundaries) or `production` (one standalone process and shard over MinIO, like the single-binary Tempo, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s, 1h segments and 1 MiB/4 MiB pages of up to 1024 traces), or `split` (the regression writers and two reader groups of two replicas with splitting forced on; see [Reader groups](#reader-groups)) |
 | `FUZZ_LOGS_UNALIGNED_RATE` | `0.5` | Fraction of LogQL metric range queries sent unaligned to their step, exercising frontend step alignment |
 | `TEMPO_IMAGE` | `grafana/tempo:2.10.8` | Tempo oracle for traces fuzzing; the live regression suite keeps `2.8.2`, which returns nothing for negated structural operators when the left side matches no spans |
 | `FUZZ_METRICS_ORACLE` | `prometheus` | Metrics oracle: `prometheus` (local-disk TSDB), `mimir` (Mimir 3.2.1 on the shared MinIO, stock read path serving recent data from ingester memory), or `mimir-blocks` (flushes each round to MinIO and reads only through the store-gateway, the like-for-like object-store comparison; adds ~30s of visibility wait per round). Mimir runs with its ingester postings-for-matchers caches off, since with query sharding they hide series created within the last 10s. Where MQE answers a query Prometheus rejects for duplicate series, the case is `inconclusive`. `MIMIR_QUERY_ENGINE=prometheus` swaps Mimir's default MQE engine for the Prometheus engine |
 | `FUZZ_METRICS_STORAGE` | `s3` | Metrics under test: `s3` (two writers and a reader over MinIO) or `local` (one standalone process on a local-disk volume with the same caches, durability, and flush interval, so a Prometheus comparison leaves out the object store) |
-| `FUZZ_METRICS_CONFIG` | `regression` | Metrics implementation (S3 storage only): `regression` (two writers and a reader with 64 MiB caches and durable writes flushed every second, to exercise sharding) or `production` (one standalone process and shard over MinIO, like the single-process oracles, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s and a 256 MiB reader cache) |
+| `FUZZ_METRICS_CONFIG` | `regression` | Metrics implementation (S3 storage only): `regression` (two writers and a reader with 64 MiB caches and durable writes flushed every second, to exercise sharding) or `production` (one standalone process and shard over MinIO, like the single-process oracles, with the operator's defaults: 512 MiB memory + 10 GiB disk block cache, 128 MiB metadata cache, `applied` writes flushed every 10s and a 256 MiB reader cache), or `split` (the regression writers and two reader groups of two replicas with splitting and PromQL pushdown forced on; see [Reader groups](#reader-groups)) |
 | `FUZZ_PSEUDOFS_CONFIG` | `regression` | PseudoFS implementation: `regression` (4 KiB inline threshold, 64 KiB chunks, 64 MiB blob cache, 2 upload workers, compaction every 8 appends, to exercise inline/blob, eviction and compaction boundaries), `production` (the operator's defaults over MinIO), or `local` (production settings on a local-disk object store, without MinIO) |
 | `FUZZ_PSEUDOFS_CRASH_EVERY` | `4` (compose), `0` (external) | SIGKILL and restart the server after every this many rounds; `0` disables |
 | `FUZZ_PSEUDOFS_RACE_RATE` | `0.5` | Fraction of rounds that also run a race scenario |
